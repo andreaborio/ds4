@@ -205,6 +205,7 @@ static uint64_t g_stream_expert_cache_evict_advise_bytes;
 static uint64_t g_stream_expert_cache_willneed_advise_bytes;
 static uint64_t g_stream_expert_cache_pread_bytes;
 static double g_stream_expert_cache_pread_ms;
+static double g_stream_expert_cache_split_resident_wait_ms;
 static uint64_t g_stream_expert_cache_mlock_bytes;
 static uint64_t g_stream_expert_cache_mlock_fail_bytes;
 static uint64_t g_stream_expert_cache_mlock_failures;
@@ -7574,6 +7575,18 @@ uint32_t ds4_gpu_stream_expert_cache_current_count(void) {
     return g_stream_expert_cache_entry_count;
 }
 
+void ds4_gpu_stream_expert_cache_stats(uint64_t *hits, uint64_t *misses,
+                                       uint64_t *pread_bytes, double *pread_ms,
+                                       double *split_resident_wait_ms) {
+    if (hits) *hits = g_stream_expert_cache_hits;
+    if (misses) *misses = g_stream_expert_cache_misses;
+    if (pread_bytes) *pread_bytes = g_stream_expert_cache_pread_bytes;
+    if (pread_ms) *pread_ms = g_stream_expert_cache_pread_ms;
+    if (split_resident_wait_ms) {
+        *split_resident_wait_ms = g_stream_expert_cache_split_resident_wait_ms;
+    }
+}
+
 uint32_t ds4_gpu_stream_expert_cache_budget_for_expert_size(
         uint64_t gate_expert_bytes,
         uint64_t down_expert_bytes) {
@@ -9672,6 +9685,7 @@ static void ds4_gpu_stream_expert_cache_clear_all(int reset_stats) {
         g_stream_expert_cache_willneed_advise_bytes = 0;
         g_stream_expert_cache_pread_bytes = 0;
         g_stream_expert_cache_pread_ms = 0.0;
+        g_stream_expert_cache_split_resident_wait_ms = 0.0;
         g_stream_expert_cache_mlock_bytes = 0;
         g_stream_expert_cache_mlock_fail_bytes = 0;
         g_stream_expert_cache_mlock_failures = 0;
@@ -24163,13 +24177,16 @@ int ds4_gpu_routed_moe_one_tensor(
                              * accumulation order stable regardless of the
                              * resident/missing split.
                              */
+                            const double exposed_wait_t0 = ds4_gpu_now_ms();
                             ok = ds4_gpu_wait_pending_command_buffers(
                                     "streaming expert split resident");
+                            const double exposed_wait_t1 = ds4_gpu_now_ms();
+                            g_stream_expert_cache_split_resident_wait_ms +=
+                                exposed_wait_t1 - exposed_wait_t0;
                             if (stream_split_timing) {
-                                const double now_ms = ds4_gpu_now_ms();
                                 stream_split_missing_wait_ms =
-                                    now_ms - stream_split_t0;
-                                stream_split_t0 = now_ms;
+                                    exposed_wait_t1 - stream_split_t0;
+                                stream_split_t0 = exposed_wait_t1;
                             }
                         }
                         const double stream_split_missing_ms =

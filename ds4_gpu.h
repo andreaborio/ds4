@@ -80,6 +80,17 @@ uint64_t ds4_gpu_recommended_working_set_size(void);
 int ds4_gpu_host_memory_snapshot(ds4_ssd_host_memory *out);
 uint32_t ds4_gpu_stream_expert_cache_configured_count(void);
 uint32_t ds4_gpu_stream_expert_cache_current_count(void);
+
+/* Cumulative routed-expert streaming counters since model load. Snapshot the
+   delta across exactly the decode loop to attribute SSD traffic to generation.
+   pread_ms is parallel-read wall time, not the sum of worker times;
+   split_resident_wait_ms is time spent waiting for the already-submitted
+   resident-expert GPU stage after missing-expert I/O completed. Any out pointer
+   may be NULL. Zero on non-streaming or non-Metal backends. */
+void ds4_gpu_stream_expert_cache_stats(uint64_t *hits, uint64_t *misses,
+                                       uint64_t *pread_bytes, double *pread_ms,
+                                       double *split_resident_wait_ms);
+
 typedef struct ds4_gpu_stream_expert_table {
     const void *model_map;
     uint64_t    model_size;

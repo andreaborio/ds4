@@ -2805,6 +2805,17 @@ extern "C" void ds4_gpu_stream_expert_cache_release_resident(void) {
     cuda_stream_expert_cache_release_all();
 }
 
+extern "C" void ds4_gpu_stream_expert_cache_stats(uint64_t *hits, uint64_t *misses,
+                                                  uint64_t *pread_bytes,
+                                                  double *pread_ms,
+                                                  double *split_resident_wait_ms) {
+    if (hits) *hits = 0;
+    if (misses) *misses = 0;
+    if (pread_bytes) *pread_bytes = 0;
+    if (pread_ms) *pread_ms = 0.0;
+    if (split_resident_wait_ms) *split_resident_wait_ms = 0.0;
+}
+
 extern "C" uint32_t ds4_gpu_stream_expert_cache_budget_for_expert_size(
         uint64_t gate_expert_bytes,
         uint64_t down_expert_bytes) {

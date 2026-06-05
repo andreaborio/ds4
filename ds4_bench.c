@@ -1,6 +1,9 @@
 #include "ds4.h"
 #include "ds4_distributed.h"
 #include "ds4_help.h"
+#ifndef DS4_NO_GPU
+#include "ds4_gpu.h"
+#endif
 
 /* Purpose-built throughput benchmark.
  *
@@ -589,7 +592,7 @@ int main(int argc, char **argv) {
             return 1;
         }
     }
-    fprintf(out, "ctx_tokens,prefill_tokens,prefill_tps,gen_tokens,gen_tps,kvcache_bytes\n");
+    fprintf(out, "ctx_tokens,prefill_tokens,prefill_tps,gen_tokens,gen_tps,kvcache_bytes,gen_hit_rate,gen_pread_gib_per_tok,gen_pread_ms_per_tok,gen_split_resident_wait_ms_per_tok\n");
     fflush(out);
 
     const int eos = ds4_token_eos(engine);
@@ -629,6 +632,21 @@ int main(int argc, char **argv) {
             }
         }
 
+        /* Decode-window streaming-expert-cache attribution: snapshot the cumulative
+           counters across exactly the gen loop so hit-rate and exposed miss-wait are
+           scoped to decode (Metal streaming only; zero elsewhere). */
+        uint64_t gen_cache_hits = 0, gen_cache_misses = 0;
+        uint64_t gen_pread_bytes = 0;
+        double gen_pread_ms = 0.0;
+        double gen_split_resident_wait_ms = 0.0;
+#ifndef DS4_NO_GPU
+        uint64_t cache_hits0 = 0, cache_misses0 = 0;
+        uint64_t cache_pread_bytes0 = 0;
+        double cache_pread0 = 0.0, cache_split_resident_wait0 = 0.0;
+        ds4_gpu_stream_expert_cache_stats(&cache_hits0, &cache_misses0,
+                                           &cache_pread_bytes0, &cache_pread0,
+                                           &cache_split_resident_wait0);
+#endif
         const double gen_t0 = bench_now_sec();
         for (int i = 0; i < cfg.gen_tokens; i++) {
             if (ds4_session_pos(session) + 1 >= ds4_session_ctx(session)) {
@@ -649,6 +667,22 @@ int main(int argc, char **argv) {
             }
         }
         const double gen_t1 = bench_now_sec();
+#ifndef DS4_NO_GPU
+        {
+            uint64_t cache_hits1 = 0, cache_misses1 = 0;
+            uint64_t cache_pread_bytes1 = 0;
+            double cache_pread1 = 0.0, cache_split_resident_wait1 = 0.0;
+            ds4_gpu_stream_expert_cache_stats(&cache_hits1, &cache_misses1,
+                                               &cache_pread_bytes1, &cache_pread1,
+                                               &cache_split_resident_wait1);
+            gen_cache_hits = cache_hits1 - cache_hits0;
+            gen_cache_misses = cache_misses1 - cache_misses0;
+            gen_pread_bytes = cache_pread_bytes1 - cache_pread_bytes0;
+            gen_pread_ms = cache_pread1 - cache_pread0;
+            gen_split_resident_wait_ms =
+                cache_split_resident_wait1 - cache_split_resident_wait0;
+        }
+#endif
         if (rc != 0) break;
 
         if (cfg.gen_tokens == 0) {
@@ -668,14 +702,28 @@ int main(int argc, char **argv) {
         }
 
         const double gen_sec = gen_t1 - gen_t0;
+        const uint64_t gen_lookups = gen_cache_hits + gen_cache_misses;
+        const double gen_hit_rate = gen_lookups ?
+            (double)gen_cache_hits / (double)gen_lookups : 0.0;
+        const double gen_pread_gib_per_tok = cfg.gen_tokens > 0 ?
+            ((double)gen_pread_bytes / (1024.0 * 1024.0 * 1024.0)) /
+                (double)cfg.gen_tokens : 0.0;
+        const double gen_pread_ms_per_tok = cfg.gen_tokens > 0 ?
+            gen_pread_ms / (double)cfg.gen_tokens : 0.0;
+        const double gen_split_resident_wait_ms_per_tok = cfg.gen_tokens > 0 ?
+            gen_split_resident_wait_ms / (double)cfg.gen_tokens : 0.0;
         fprintf(out,
-                "%d,%d,%.2f,%d,%.2f,%llu\n",
+                "%d,%d,%.2f,%d,%.2f,%llu,%.4f,%.6f,%.4f,%.4f\n",
                 frontier,
                 prefill_tokens,
                 prefill_sec > 0.0 ? (double)prefill_tokens / prefill_sec : 0.0,
                 cfg.gen_tokens,
                 gen_sec > 0.0 ? (double)cfg.gen_tokens / gen_sec : 0.0,
-                (unsigned long long)(distributed ? 0 : snap.len));
+                (unsigned long long)(distributed ? 0 : snap.len),
+                gen_hit_rate,
+                gen_pread_gib_per_tok,
+                gen_pread_ms_per_tok,
+                gen_split_resident_wait_ms_per_tok);
         fflush(out);
 
         previous = frontier;
