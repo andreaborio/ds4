@@ -19258,7 +19258,10 @@ static bool imatrix_collect_layer_batch(
 }
 
 static void imatrix_write_i32(FILE *fp, int32_t v) {
-    if (fwrite(&v, sizeof(v), 1, fp) != 1) ds4_die("failed to write imatrix");
+    /* Write errors are not fatal here: this runs on the live server worker as a
+     * recurring snapshot, so a transient ENOSPC must not exit() the process.
+     * Failures surface via ferror(fp), checked once in imatrix_collector_save. */
+    (void)fwrite(&v, sizeof(v), 1, fp);
 }
 
 static void imatrix_write_entry(
@@ -19272,7 +19275,7 @@ static void imatrix_write_entry(
     const int32_t ncall = 1;
     const int32_t nval = (int32_t)((uint64_t)n_expert * n_col);
     imatrix_write_i32(fp, len);
-    if (fwrite(name, 1, (size_t)len, fp) != (size_t)len) ds4_die("failed to write imatrix name");
+    (void)fwrite(name, 1, (size_t)len, fp);
     imatrix_write_i32(fp, ncall);
     imatrix_write_i32(fp, nval);
 
@@ -19286,7 +19289,7 @@ static void imatrix_write_entry(
             const float inv = 1.0f / (float)count;
             for (uint32_t i = 0; i < n_col; i++) tmp[i] = src[i] * inv;
         }
-        if (fwrite(tmp, sizeof(tmp[0]), n_col, fp) != n_col) ds4_die("failed to write imatrix values");
+        (void)fwrite(tmp, sizeof(tmp[0]), n_col, fp);
     }
     free(tmp);
 }
@@ -19331,10 +19334,13 @@ static bool imatrix_collector_save(
     const char *dataset = c->dataset_path ? c->dataset_path : "";
     const int32_t dataset_len = (int32_t)strlen(dataset);
     imatrix_write_i32(fp, dataset_len);
-    if (dataset_len && fwrite(dataset, 1, (size_t)dataset_len, fp) != (size_t)dataset_len) {
-        ds4_die("failed to write imatrix dataset name");
-    }
+    if (dataset_len) (void)fwrite(dataset, 1, (size_t)dataset_len, fp);
 
+    if (ferror(fp)) {
+        fprintf(stderr, "ds4: failed to write imatrix output %s: %s\n", path, strerror(errno));
+        fclose(fp);
+        return false;
+    }
     if (fclose(fp) != 0) {
         fprintf(stderr, "ds4: failed to close imatrix output %s: %s\n", path, strerror(errno));
         return false;
@@ -22217,6 +22223,9 @@ struct ds4_session {
     void *display_progress_ud;
     ds4_session_cancel_fn cancel;
     void *cancel_ud;
+#ifndef DS4_NO_GPU
+    ds4_imatrix_collector *imatrix;   /* on-edge adaptive imatrix; NULL unless enabled */
+#endif
     uint32_t prefill_cap;
     int ctx_size;
     bool checkpoint_valid;
@@ -25031,6 +25040,7 @@ void ds4_session_free(ds4_session *s) {
     else {
         metal_graph_free(&s->graph);
     }
+    ds4_session_imatrix_disable(s);   /* frees the on-edge imatrix collector if enabled */
 #endif
     token_vec_free(&s->checkpoint);
     free(s->logits);
@@ -25094,6 +25104,49 @@ void ds4_session_report_progress(ds4_session *s, const char *event, int current,
     if (!s || !s->progress || !event) return;
     s->progress(s->progress_ud, event, current, total);
 }
+
+/* On-edge adaptive imatrix (privacy-first): the collector lives in the session and
+ * accumulates aggregate routed-MoE second-moment stats during live prefills. No prompt
+ * text is ever stored — only per-expert importance vectors. Metal backend only. */
+#ifndef DS4_NO_GPU
+int ds4_session_imatrix_enable(ds4_session *s) {
+    if (!s) return 1;
+    if (!s->engine || s->engine->backend != DS4_BACKEND_METAL) return 2;  /* Metal backend only: the
+        collector reads Metal graph readback tensors; CUDA/ROCm/CPU are not wired and must be rejected */
+    if (s->imatrix) return 0;              /* idempotent */
+    s->imatrix = xmalloc(sizeof(ds4_imatrix_collector));
+    /* cap_tokens = prefill chunk width: only sizes per-chunk scratch; the per-expert
+     * accumulators are model-shaped and grow additively forever (constant memory for an
+     * unbounded stream). dataset_path = NULL so no label leaks into the file. */
+    if (!imatrix_collector_init(s->imatrix, s->prefill_cap, NULL)) {
+        ds4_session_imatrix_disable(s);
+        return 1;
+    }
+    return 0;
+}
+
+int ds4_session_imatrix_save(ds4_session *s, const char *path) {
+    if (!s || !s->imatrix || !path) return 1;
+    /* non-destructive snapshot (collector is const here); full-rewrite each call */
+    return imatrix_collector_save(s->imatrix, &s->engine->weights, path) ? 0 : 1;
+}
+
+uint64_t ds4_session_imatrix_observed_tokens(const ds4_session *s) {
+    return (s && s->imatrix) ? s->imatrix->observed_tokens : 0;
+}
+
+void ds4_session_imatrix_disable(ds4_session *s) {
+    if (!s || !s->imatrix) return;
+    imatrix_collector_free(s->imatrix);
+    free(s->imatrix);
+    s->imatrix = NULL;
+}
+#else
+int ds4_session_imatrix_enable(ds4_session *s) { (void)s; return 2; }
+int ds4_session_imatrix_save(ds4_session *s, const char *path) { (void)s; (void)path; return 1; }
+uint64_t ds4_session_imatrix_observed_tokens(const ds4_session *s) { (void)s; return 0; }
+void ds4_session_imatrix_disable(ds4_session *s) { (void)s; }
+#endif
 
 int ds4_session_layer_slice_reset(ds4_session *s, char *err, size_t errlen) {
     if (!s) {
@@ -25626,7 +25679,7 @@ int ds4_session_sync(ds4_session *s, const ds4_tokens *prompt, char *err, size_t
                                                         &progress,
                                                         s->display_progress,
                                                         s->display_progress_ud,
-                                                        NULL,
+                                                        s->imatrix,
                                                         ds4_session_cancelled_cb,
                                                         s,
                                                         &cancelled);
@@ -25683,18 +25736,29 @@ int ds4_session_sync(ds4_session *s, const ds4_tokens *prompt, char *err, size_t
             .user = s->progress,
             .user_ud = s->progress_ud,
         };
-        ok = metal_graph_prefill_chunked(&s->graph, &e->model, &e->weights,
-                                         prompt, prompt->len, s->logits, false,
-                                         ds4_session_note_prefill_progress, &progress,
-                                         s->display_progress,
-                                         s->display_progress_ud,
-                                         ds4_session_cancelled_cb,
-                                         s,
-                                         &cancelled);
+        ok = metal_graph_prefill_chunked_range(&s->graph, &e->model, &e->weights,
+                                               prompt, 0, (uint32_t)prompt->len, s->logits, false,
+                                               ds4_session_note_prefill_progress, &progress,
+                                               s->display_progress,
+                                               s->display_progress_ud, s->imatrix,
+                                               ds4_session_cancelled_cb, s, &cancelled);
         if (cancelled) {
             snprintf(err, errlen, "interrupted");
             s->checkpoint_valid = s->checkpoint.len > 0;
             s->mtp_draft_valid = false;
+            return DS4_SESSION_SYNC_INTERRUPTED;
+        }
+    } else if (s->imatrix) {
+        /* on-edge imatrix needs the layer-major readback path; raw_swa has no hook */
+        bool cancelled = false;
+        ok = metal_graph_prefill_chunked_range(&s->graph, &e->model, &e->weights,
+                                               prompt, 0, (uint32_t)prompt->len, s->logits, false,
+                                               NULL, NULL,
+                                               s->display_progress,
+                                               s->display_progress_ud, s->imatrix,
+                                               ds4_session_cancelled_cb, s, &cancelled);
+        if (cancelled) {
+            snprintf(err, errlen, "interrupted");
             return DS4_SESSION_SYNC_INTERRUPTED;
         }
     } else {

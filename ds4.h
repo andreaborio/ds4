@@ -231,6 +231,13 @@ void ds4_session_set_display_progress(ds4_session *s, ds4_session_progress_fn fn
  * valid token prefix, and returns DS4_SESSION_SYNC_INTERRUPTED when it stops. */
 void ds4_session_set_cancel(ds4_session *s, ds4_session_cancel_fn fn, void *ud);
 void ds4_session_report_progress(ds4_session *s, const char *event, int current, int total);
+/* On-edge adaptive imatrix: accumulate aggregate routed-MoE second-moment statistics
+ * from live prefills, so a locally-run quantized model can self-calibrate to its real
+ * workload. No prompt text is ever stored — only per-expert importance vectors. */
+int  ds4_session_imatrix_enable(ds4_session *s);
+int  ds4_session_imatrix_save(ds4_session *s, const char *path);
+uint64_t ds4_session_imatrix_observed_tokens(const ds4_session *s);
+void ds4_session_imatrix_disable(ds4_session *s);
 /* Distributed coordinator sessions return 1 when the full layer route is
  * available, 0 when it is still incomplete, and -1 for a local API error. */
 int ds4_session_distributed_route_ready(ds4_session *s, char *err, size_t errlen);

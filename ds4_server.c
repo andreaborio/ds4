@@ -7720,6 +7720,10 @@ struct server {
     FILE *trace;
     pthread_mutex_t trace_mu;
     uint64_t trace_seq;
+    const char *imatrix_path;    /* NULL = on-edge imatrix off */
+    int imatrix_every;
+    int imatrix_min_requests;
+    uint64_t imatrix_req_count;  /* completed requests since enable; worker-thread only */
 };
 
 /* Jobs are stack-owned by the client thread.  The worker signals completion
@@ -10955,6 +10959,20 @@ static void *worker_main(void *arg) {
         job *j = dequeue(s);
         if (!j) break;
         generate_job(s, j);
+        if (s->imatrix_path) {
+            /* on-edge imatrix: periodic snapshot, on the worker thread (no lock needed:
+             * this is the only thread touching the collector). prompts are NOT stored. */
+            s->imatrix_req_count++;
+            if (s->imatrix_every > 0 &&
+                (s->imatrix_req_count % (uint64_t)s->imatrix_every) == 0 &&
+                s->imatrix_req_count >= (uint64_t)s->imatrix_min_requests &&
+                ds4_session_imatrix_observed_tokens(s->session) > 0) {
+                if (ds4_session_imatrix_save(s->session, s->imatrix_path) == 0)
+                    server_log(DS4_LOG_DEFAULT,
+                               "ds4-server: imatrix snapshot written to %s (%llu requests)",
+                               s->imatrix_path, (unsigned long long)s->imatrix_req_count);
+            }
+        }
         pthread_mutex_lock(&j->mu);
         j->done = true;
         pthread_cond_signal(&j->cv);
@@ -11280,6 +11298,9 @@ typedef struct {
     int default_tokens;
     const char *chdir_path;
     const char *trace_path;
+    const char *imatrix_out;       /* NULL = on-edge imatrix disabled */
+    int imatrix_every;             /* dump cadence in completed requests; 0 = shutdown-only */
+    int imatrix_min_requests;      /* min completed requests before any dump */
     const char *kv_disk_dir;
     uint64_t kv_disk_space_mb;
     kv_cache_options kv_cache;
@@ -11408,6 +11429,8 @@ static server_config parse_options(int argc, char **argv) {
         .ctx_size = 32768,
         .default_tokens = 393216,
         .tool_memory_max_ids = DS4_TOOL_MEMORY_DEFAULT_MAX_IDS,
+        .imatrix_every = 64,
+        .imatrix_min_requests = 8,
     };
     c.kv_cache = kv_cache_default_options();
 
@@ -11461,6 +11484,12 @@ static server_config parse_options(int argc, char **argv) {
             c.enable_cors = true;
         } else if (!strcmp(arg, "--trace")) {
             c.trace_path = need_arg(&i, argc, argv, arg);
+        } else if (!strcmp(arg, "--imatrix-out")) {
+            c.imatrix_out = need_arg(&i, argc, argv, arg);
+        } else if (!strcmp(arg, "--imatrix-every")) {
+            c.imatrix_every = parse_nonneg_int_arg(need_arg(&i, argc, argv, arg), arg);  /* 0 = shutdown-only */
+        } else if (!strcmp(arg, "--imatrix-min-requests")) {
+            c.imatrix_min_requests = parse_nonneg_int_arg(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "--kv-disk-dir")) {
             c.kv_disk_dir = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--kv-disk-space-mb")) {
@@ -11650,6 +11679,20 @@ int main(int argc, char **argv) {
         server_log(DS4_LOG_DEFAULT, "ds4-server: tracing session to %s", cfg.trace_path);
     }
 
+    if (cfg.imatrix_out) {
+        if (ds4_session_imatrix_enable(s.session) != 0) {
+            server_log(DS4_LOG_DEFAULT,
+                       "ds4-server: --imatrix-out requires the Metal backend; on-edge imatrix disabled");
+        } else {
+            s.imatrix_path = cfg.imatrix_out;
+            s.imatrix_every = cfg.imatrix_every;
+            s.imatrix_min_requests = cfg.imatrix_min_requests;
+            server_log(DS4_LOG_DEFAULT,
+                       "ds4-server: on-edge imatrix -> %s (every=%d, min-prompts=%d); prompts are NOT persisted",
+                       cfg.imatrix_out, cfg.imatrix_every, cfg.imatrix_min_requests);
+        }
+    }
+
     pthread_t worker;
     if (pthread_create(&worker, NULL, worker_main, &s) != 0) die("failed to start worker");
 
@@ -11713,6 +11756,14 @@ int main(int argc, char **argv) {
     pthread_mutex_lock(&s.mu);
     while (s.clients > 0) pthread_cond_wait(&s.clients_cv, &s.mu);
     pthread_mutex_unlock(&s.mu);
+
+    if (s.imatrix_path && s.imatrix_req_count >= (uint64_t)s.imatrix_min_requests &&
+        ds4_session_imatrix_observed_tokens(s.session) > 0) {
+        /* worker has joined: no concurrent prefill, safe to snapshot without a lock */
+        if (ds4_session_imatrix_save(s.session, s.imatrix_path) == 0)
+            server_log(DS4_LOG_DEFAULT, "ds4-server: final imatrix written to %s (%llu requests)",
+                       s.imatrix_path, (unsigned long long)s.imatrix_req_count);
+    }
 
     const ds4_tokens *tokens = ds4_session_tokens(s.session);
     if (s.kv.enabled && tokens && tokens->len >= s.kv.opt.min_tokens) {
