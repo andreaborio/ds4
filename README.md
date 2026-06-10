@@ -28,6 +28,58 @@ opportunistic depending on what open weight models exist in a given moment.
 If a new model will be supported, the old one may be removed completely and
 no longer supported, unless there is some kind of overlap of abilities.
 
+## This fork (andreaborio/ds4)
+
+This is a fork of [antirez/ds4 (DwarfStar)](https://github.com/antirez/ds4) that tracks
+upstream, with **two additions** used by
+[forgequant](https://github.com/andreaborio/forgequant). Everything else is upstream
+DwarfStar (sections below); these are the only deltas.
+
+### 1. On-edge / real-time imatrix collection — `ds4-server --imatrix-out`
+
+Upstream collects the routed-MoE importance matrix (imatrix) **offline** from a fixed corpus
+(`ds4 --imatrix-dataset … --imatrix-out …`). This fork lets **`ds4-server` collect it from the
+live prompt stream on the device**, so a quantized model can be **re-calibrated to its actual
+workload** — *without ever storing a single user prompt*. The only artifact is the imatrix:
+aggregate per-(layer, expert) activation statistics (squared activations + hit counts), which
+is structurally incapable of holding prompt text.
+
+```sh
+ds4-server -m model.gguf --imatrix-out edge.dat                  # collect from live traffic
+ds4-server -m model.gguf --imatrix-out edge.dat --imatrix-every 128 --imatrix-min-requests 32
+```
+
+Default **off** → zero behavioral change; opt-in via `--imatrix-out`, with periodic snapshots
+(`--imatrix-every`) and a minimum-requests guard (`--imatrix-min-requests`). Full design,
+wiring, limits and privacy verification in [`ONEDGE_IMATRIX.md`](ONEDGE_IMATRIX.md).
+
+### 2. Incremental re-quantization — `deepseek4-quantize --reuse PRIOR.gguf`
+
+Re-forging a *variant* — e.g. adding a per-layer Q4 "boost" on top of an IQ2 build that used
+the same imatrix — normally regenerates **every** routed-expert tensor from FP, even the ones
+that don't change. Quantization is deterministic in (FP weights, target type, imatrix slice),
+so those tensors are **byte-identical** to a prior build and can be *copied* instead of
+recomputed.
+
+```sh
+# build the base once, then every boost variant reuses its 37 unchanged layers
+gguf-tools/deepseek4-quantize --hf FP --template base.gguf --imatrix coder.dat \
+  --reuse DeepSeek-V4-Flash-coder-iq2.gguf \
+  --tensor-type blk.30.ffn_gate_exps.weight=q4_k ...   --out coder-q4boost.gguf
+```
+
+`--reuse PRIOR.gguf` copies a planned output tensor from PRIOR when its **name, target type and
+shape** match; only changed tensors (the boosted layers, at a new type) are quantized —
+skipping ~85% of the expert work on a moderate boost.
+
+**Correctness:** every build stamps a `quantize.reuse_key` GGUF KV (an fnv1a64 over the
+safetensors index + the imatrix content + a template structural salt). `--reuse` copies a
+tensor only when PRIOR's key matches this build **and** the per-tensor type/shape match — so a
+boosted tensor (different target type) is regenerated, and a stale / foreign / keyless prior
+safely falls back to a full quantize. Copied bytes are size-checked against the plan (hard
+error on any mismatch). This is **not** present in llama.cpp (which always requantizes from
+source); the closest prior art is manual GGUF tensor splicing.
+
 ## Motivations
 
 * Very capable open weight models finally exist. DeepSeek v4 Flash feels quasi-frontier. The PRO is even better. Both resist 2 bit quantization very well.
