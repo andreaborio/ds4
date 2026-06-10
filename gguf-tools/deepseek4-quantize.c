@@ -36,6 +36,8 @@
 #include <stdlib.h>
 #include <string.h>
 #include <pthread.h>
+#include <dirent.h>
+#include <sys/stat.h>
 
 #if defined(_WIN32)
 #error "deepseek4-quantize.c currently targets POSIX systems"
@@ -1604,12 +1606,38 @@ static uint64_t fnv1a64_file(uint64_t h, const char *path) {
     return h;
 }
 
+/* Fold each *.safetensors shard's (name, size, mtime) into a salt — order-independent (XOR
+ * of per-file hashes). Cheap (stat only, no reads), and an in-place weight change (which bumps
+ * mtime/size) invalidates the reuse key, so --reuse won't copy stale tensors from a build made
+ * against different weights at the same --hf path. */
+static uint64_t shard_stat_salt(const char *hf_dir) {
+    DIR *d = opendir(hf_dir);
+    if (!d) return 0;
+    uint64_t salt = 0;
+    struct dirent *de;
+    while ((de = readdir(d))) {
+        if (!str_ends(de->d_name, ".safetensors")) continue;
+        char *full = path_join(hf_dir, de->d_name);
+        struct stat sb;
+        if (stat(full, &sb) == 0) {
+            uint64_t fh = fnv1a64_bytes((const uint8_t *)de->d_name, strlen(de->d_name));
+            int64_t sz = (int64_t)sb.st_size, mt = (int64_t)sb.st_mtime;
+            fh = fnv1a64_update(fh, (const uint8_t *)&sz, sizeof(sz));
+            fh = fnv1a64_update(fh, (const uint8_t *)&mt, sizeof(mt));
+            salt ^= fh;
+        }
+        free(full);
+    }
+    closedir(d);
+    return salt;
+}
+
 /* A reuse key identifies the (model weights, imatrix, template structure) a build came from.
  * Two builds with the same key produce byte-identical tensors for any tensor of the same
  * target type+shape (quantization is deterministic), so --reuse can copy them instead of
- * regenerating. Cheap: hashes the safetensors index (structure) + the imatrix content + a
- * structural salt — NOT the multi-GB weight bytes (it assumes, like the rest of the tool,
- * that the same --hf path holds the same weights). The key is always 16 hex chars. */
+ * regenerating. Cheap: hashes the safetensors index (structure) + each shard's size/mtime +
+ * the imatrix content + a structural salt — NOT the multi-GB weight bytes. The key is 16 hex
+ * chars. (If you overwrite shards in place without touching mtime/size, see the caveat.) */
 static char *compute_reuse_key(const char *hf_dir, const char *imatrix_file, const gguf_file *tmpl) {
     uint64_t h = 1469598103934665603ull;
     char *idx = path_join(hf_dir, "model.safetensors.index.json");
@@ -1618,6 +1646,8 @@ static char *compute_reuse_key(const char *hf_dir, const char *imatrix_file, con
     h = fnv1a64_update(h, (const uint8_t *)buf, n);
     free(buf);
     free(idx);
+    uint64_t shards = shard_stat_salt(hf_dir);
+    h = fnv1a64_update(h, (const uint8_t *)&shards, sizeof(shards));
     if (imatrix_file) h = fnv1a64_file(h, imatrix_file);
     uint64_t salt[2] = { (uint64_t)tmpl->n_tensors, (uint64_t)tmpl->alignment };
     h = fnv1a64_update(h, (const uint8_t *)salt, sizeof(salt));
@@ -1969,6 +1999,15 @@ int main(int argc, char **argv) {
     output_context out_ctx = build_output_context(&tmpl, &p.policy, &imatrix);
     print_plan(&tmpl, &out_ctx);
     if (p.dry_run) return 0;
+
+    /* --reuse must not alias --out: the output is opened "wb" (truncated) before the prior's
+     * tensors are read, so reusing from the output file would read a zeroed file. Fail fast. */
+    if (p.reuse_gguf && p.out_gguf) {
+        struct stat ra, rb;
+        bool same = (stat(p.reuse_gguf, &ra) == 0 && stat(p.out_gguf, &rb) == 0 &&
+                     ra.st_dev == rb.st_dev && ra.st_ino == rb.st_ino);
+        if (same || strcmp(p.reuse_gguf, p.out_gguf) == 0) die("--reuse and --out must not be the same file");
+    }
 
     /* This build's reuse identity (stamped into the output as quantize.reuse_key). Resolved
      * before the slow db_open so a missing/mismatched --reuse prior is reported fast. Does
