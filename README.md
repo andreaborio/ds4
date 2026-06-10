@@ -35,50 +35,61 @@ upstream, with **two additions** used by
 [forgequant](https://github.com/andreaborio/forgequant). Everything else is upstream
 DwarfStar (sections below); these are the only deltas.
 
-### 1. On-edge / real-time imatrix collection — `ds4-server --imatrix-out`
+### 1. On-edge / real-time imatrix collection: `ds4-server --imatrix-out`
 
 Upstream collects the routed-MoE importance matrix (imatrix) **offline** from a fixed corpus
 (`ds4 --imatrix-dataset … --imatrix-out …`). This fork lets **`ds4-server` collect it from the
 live prompt stream on the device**, so a quantized model can be **re-calibrated to its actual
-workload** — *without ever storing a single user prompt*. The only artifact is the imatrix:
-aggregate per-(layer, expert) activation statistics (squared activations + hit counts), which
-is structurally incapable of holding prompt text.
+workload**, without ever storing a single user prompt. The only artifact is the imatrix:
+aggregate per-(layer, expert) activation statistics (squared activations + hit counts), a
+structure that cannot hold prompt text.
 
 ```sh
 ds4-server -m model.gguf --imatrix-out edge.dat                  # collect from live traffic
 ds4-server -m model.gguf --imatrix-out edge.dat --imatrix-every 128 --imatrix-min-requests 32
 ```
 
-Default **off** → zero behavioral change; opt-in via `--imatrix-out`, with periodic snapshots
+Default **off** (zero behavioral change); opt-in via `--imatrix-out`, with periodic snapshots
 (`--imatrix-every`) and a minimum-requests guard (`--imatrix-min-requests`). Full design,
 wiring, limits and privacy verification in [`ONEDGE_IMATRIX.md`](ONEDGE_IMATRIX.md).
 
-### 2. Incremental re-quantization — `deepseek4-quantize --reuse PRIOR.gguf`
+### 2. Incremental re-quantization: `deepseek4-quantize --reuse PRIOR.gguf`
 
-Re-forging a *variant* — e.g. adding a per-layer Q4 "boost" on top of an IQ2 build that used
-the same imatrix — normally regenerates **every** routed-expert tensor from FP, even the ones
-that don't change. Quantization is deterministic in (FP weights, target type, imatrix slice),
-so those tensors are **byte-identical** to a prior build and can be *copied* instead of
-recomputed.
+Re-forging a *variant* (say, adding a per-layer Q4 "boost" on top of an IQ2 build that used the
+same imatrix) normally regenerates **every** routed-expert tensor from the FP weights, even the
+ones that don't change. But quantization is deterministic in (FP weights, target type, imatrix
+slice), so an unchanged tensor is **byte-identical** to the one already sitting in a prior
+build. Recomputing it is pure waste.
+
+`--reuse PRIOR.gguf` copies a planned output tensor straight from PRIOR when its **name, target
+type and shape** match, and quantizes only the tensors that actually changed (the boosted
+layers, at their new type).
 
 ```sh
-# build the base once, then every boost variant reuses its 37 unchanged layers
+# 1. build the 2-bit base once
 gguf-tools/deepseek4-quantize --hf FP --template base.gguf --imatrix coder.dat \
-  --reuse DeepSeek-V4-Flash-coder-iq2.gguf \
-  --tensor-type blk.30.ffn_gate_exps.weight=q4_k ...   --out coder-q4boost.gguf
+  --out coder-iq2.gguf
+
+# 2. every boost variant reuses the base's unchanged layers, re-quantizing only the boosted ones
+gguf-tools/deepseek4-quantize --hf FP --template base.gguf --imatrix coder.dat \
+  --reuse coder-iq2.gguf \
+  --tensor-type blk.30.ffn_gate_exps.weight=q4_k …  --out coder-q4boost.gguf
 ```
 
-`--reuse PRIOR.gguf` copies a planned output tensor from PRIOR when its **name, target type and
-shape** match; only changed tensors (the boosted layers, at a new type) are quantized —
-skipping ~85% of the expert work on a moderate boost.
+**Measured** (DeepSeek-V4-Flash, a 6-of-43-layer Q4 boost over an IQ2 base): a full build is
+~80 minutes; the same variant via `--reuse` took **5.5 minutes** (1,310 of 1,328 tensors copied,
+18 regenerated), about a **14× speedup**. The output was verified **byte-for-byte identical** to
+a from-scratch build across all 1,328 tensors. The fast build is not an approximation, it is the
+same file.
 
-**Correctness:** every build stamps a `quantize.reuse_key` GGUF KV (an fnv1a64 over the
-safetensors index + the imatrix content + a template structural salt). `--reuse` copies a
-tensor only when PRIOR's key matches this build **and** the per-tensor type/shape match — so a
-boosted tensor (different target type) is regenerated, and a stale / foreign / keyless prior
-safely falls back to a full quantize. Copied bytes are size-checked against the plan (hard
-error on any mismatch). This is **not** present in llama.cpp (which always requantizes from
-source); the closest prior art is manual GGUF tensor splicing.
+**Correctness.** Every build stamps a `quantize.reuse_key` GGUF KV: an fnv1a64 over the
+safetensors index, each weight shard's size and mtime, the imatrix content, and a template
+structural salt. `--reuse` copies a tensor only when PRIOR's key matches this build **and** the
+per-tensor type and shape match, so a boosted tensor (different target type) is regenerated, and
+a stale / foreign / keyless prior (changed weights, imatrix, or recipe) safely falls back to a
+full quantize. Copied bytes are size-checked against the plan (a hard error on any mismatch),
+and `--reuse` refuses to alias `--out`. This is **not** present in llama.cpp, which always
+requantizes from the source weights; the closest prior art is splicing GGUF tensors by hand.
 
 ## Motivations
 
