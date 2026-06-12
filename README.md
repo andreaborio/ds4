@@ -109,8 +109,16 @@ The dependence test is conservative and mirrors the generators' own imatrix look
 `*_exps.*` families always count as steered; regular tensors are probed with the exact same
 name resolution `generate_regular()` uses), so over-approximation can only cost an unneeded
 regeneration, never a stale byte. Priors built before this change carry only the old key and
-keep the old all-or-nothing behavior. First measured exercise pending (a re-calibrated build);
-the expected saving is the non-routed share of the file.
+keep the old all-or-nothing behavior.
+
+Measured (DeepSeek-V4-Flash, 1,328 tensors, M5 Pro): a full re-calibration — same recipe,
+`coder.dat` → `general.dat` — copied **1,199 of 1,328 tensors** and regenerated the 129
+routed-expert tensors with the new imatrix, in **~45 minutes vs ~80 for the full quantize**.
+Byte-level verification: 40/40 sampled imatrix-independent tensors identical to the prior,
+16/16 sampled expert tensors changed, tensor tables identical. The change went through an
+adversarial 3-lens review that rejected the first cut (two stale-byte paths, one strict-mode
+abort — all reachable, all fixed before this exercise: the no-imatrix gate, the coverage
+fingerprint, the I32 probe exclusion).
 
 ## Motivations
 
