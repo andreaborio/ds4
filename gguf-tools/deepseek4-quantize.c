@@ -1331,6 +1331,7 @@ typedef struct {
     int n_experts;
     size_t data_offset;
     char *reuse_key;          /* quantize.reuse_key KV, if present (for --reuse) */
+    char *reuse_key_weights;  /* quantize.reuse_key_weights KV (imatrix-independent half) */
     tensor_meta *tensors;
     hmap tensor_map;
 } gguf_file;
@@ -1469,6 +1470,23 @@ static void write_reuse_key_kv(FILE *fp, const char *reuse_key) {
     write_gguf_string(fp, reuse_key);
 }
 
+/*
+ * quantize.reuse_key_weights: the imatrix-INDEPENDENT half of the reuse identity
+ * (safetensors index + shard stats + template salt, no imatrix). Tensors whose
+ * quantization never reads the imatrix are byte-identical across builds that share
+ * this key even when the imatrix differs — so a re-calibration can still copy them
+ * from a prior build instead of regenerating.
+ */
+static size_t reuse_key_weights_kv_size(void) {
+    return gguf_string_size("quantize.reuse_key_weights") + 4 + sizeof(uint64_t) + DS4_REUSE_KEY_HEXLEN;
+}
+
+static void write_reuse_key_weights_kv(FILE *fp, const char *key) {
+    write_gguf_string(fp, "quantize.reuse_key_weights");
+    write_u32(fp, GGUF_TYPE_STRING);
+    write_gguf_string(fp, key);
+}
+
 static gguf_file load_gguf_metadata(const char *path) {
     gguf_file g = {0};
     g.path = xstrdup(path);
@@ -1504,6 +1522,9 @@ static gguf_file load_gguf_metadata(const char *path) {
         } else if (strcmp(key, "quantize.reuse_key") == 0 && type == GGUF_TYPE_STRING) {
             free(g.reuse_key);
             g.reuse_key = read_gguf_string_fp(fp);
+        } else if (strcmp(key, "quantize.reuse_key_weights") == 0 && type == GGUF_TYPE_STRING) {
+            free(g.reuse_key_weights);
+            g.reuse_key_weights = read_gguf_string_fp(fp);
         } else {
             skip_gguf_value_fp(fp, type);
         }
@@ -1516,7 +1537,8 @@ static gguf_file load_gguf_metadata(const char *path) {
          * otherwise the output can contain duplicate GGUF metadata with stale
          * and new values.
          */
-        if (!is_imatrix_kv_key(key) && strcmp(key, "quantize.reuse_key") != 0) {
+        if (!is_imatrix_kv_key(key) && strcmp(key, "quantize.reuse_key") != 0 &&
+            strcmp(key, "quantize.reuse_key_weights") != 0) {
             kv_keep[n_kv_keep++] = (byte_span){
                 .start = (size_t)(rec_start - kv_start),
                 .end = (size_t)(rec_end - kv_start),
@@ -1659,7 +1681,7 @@ static char *compute_reuse_key(const char *hf_dir, const char *imatrix_file, con
 static output_context build_output_context(const gguf_file *tmpl, const quant_policy *policy, const imatrix_store *im) {
     output_context out = {0};
     out.n_tensors = tmpl->n_tensors;
-    out.n_kv_extra = extra_imatrix_kv_count(im) + 1;   /* +1: quantize.reuse_key (always written) */
+    out.n_kv_extra = extra_imatrix_kv_count(im) + 2;   /* +2: quantize.reuse_key + .reuse_key_weights */
     out.alignment = tmpl->alignment;
     out.tensors = xcalloc((size_t)out.n_tensors, sizeof(out.tensors[0]));
     size_t tensor_info = 0;
@@ -1680,7 +1702,8 @@ static output_context build_output_context(const gguf_file *tmpl, const quant_po
         tensor_info += gguf_string_size(dst->name) + 4 + (size_t)dst->n_dims * 8 + 4 + 8;
     }
     out.tensor_bytes = off;
-    out.meta_size = 4 + 4 + 8 + 8 + tmpl->kv_raw_len + extra_imatrix_kv_size(im) + reuse_key_kv_size() + tensor_info;
+    out.meta_size = 4 + 4 + 8 + 8 + tmpl->kv_raw_len + extra_imatrix_kv_size(im) + reuse_key_kv_size()
+                    + reuse_key_weights_kv_size() + tensor_info;
     out.data_offset = ds4q_pad(out.meta_size, tmpl->alignment);
     return out;
 }
@@ -1707,9 +1730,27 @@ static bool reuse_eligible(const gguf_file *prior, const tensor_meta *dst) {
     return true;
 }
 
+/*
+ * Conservative imatrix-dependence test for the per-tensor reuse gate. Mirrors the
+ * lookups the generators perform: routed expert families (".._exps.") are always
+ * imatrix-steered when an imatrix is loaded; for regular tensors we probe the same
+ * name candidates generate_regular() would. Over-approximation is safe (a tensor
+ * wrongly marked dependent is merely regenerated); under-approximation is not.
+ */
+static bool tensor_uses_imatrix(const imatrix_store *im, const tensor_meta *dst) {
+    if (!imatrix_enabled(im)) return false;
+    if (strstr(dst->name, "_exps.") != NULL) return true;
+    char *hf = hf_name_for_regular(dst->name);
+    const char *names[2] = { dst->name, hf };
+    const float *hit = imatrix_find(im, names, 2, dst->ne[0], -1, 0);
+    free(hf);
+    return hit != NULL;
+}
+
 static void write_full_gguf(st_db *db, const gguf_file *tmpl, const output_context *out_ctx,
                             const char *out_path, int n_experts, int n_threads,
                             const imatrix_store *imatrix, const char *reuse_key,
+                            const char *reuse_key_weights, bool reuse_weights_only,
                             const gguf_file *prior) {
     FILE *fp = fopen(out_path, "wb");
     if (!fp) die_errno("open output", out_path);
@@ -1720,6 +1761,7 @@ static void write_full_gguf(st_db *db, const gguf_file *tmpl, const output_conte
     if (fwrite(tmpl->kv_raw, 1, tmpl->kv_raw_len, fp) != tmpl->kv_raw_len) die("write GGUF KV failed");
     write_imatrix_kvs(fp, imatrix);
     write_reuse_key_kv(fp, reuse_key);
+    write_reuse_key_weights_kv(fp, reuse_key_weights);
     for (uint64_t i = 0; i < out_ctx->n_tensors; i++) {
         const tensor_meta *t = &out_ctx->tensors[i];
         write_gguf_string(fp, t->name);
@@ -1738,7 +1780,8 @@ static void write_full_gguf(st_db *db, const gguf_file *tmpl, const output_conte
         const tensor_meta *src = &tmpl->tensors[i];
         const tensor_meta *dst = &out_ctx->tensors[i];
         byte_buf data;
-        bool reused = reuse_eligible(prior, dst);
+        bool reused = reuse_eligible(prior, dst) &&
+                      (!reuse_weights_only || !tensor_uses_imatrix(imatrix, dst));
         if (reused) {
             data = read_gguf_tensor_data(prior, prior->path, dst->name);
             n_reused++;
@@ -1931,6 +1974,7 @@ static void free_gguf_file(gguf_file *g) {
     free(g->path);
     free(g->kv_raw);
     free(g->reuse_key);
+    free(g->reuse_key_weights);
     for (uint64_t i = 0; i < g->n_tensors; i++) free(g->tensors[i].name);
     free(g->tensors);
     hmap_free(&g->tensor_map);
@@ -2013,14 +2057,26 @@ int main(int argc, char **argv) {
      * before the slow db_open so a missing/mismatched --reuse prior is reported fast. Does
      * not need the FP weights — only the safetensors index, the imatrix, and the template. */
     char *reuse_key = compute_reuse_key(p.hf_dir, p.imatrix_file, &tmpl);
+    /* the imatrix-independent half: same hash with no imatrix folded in */
+    char *reuse_key_weights = compute_reuse_key(p.hf_dir, NULL, &tmpl);
     gguf_file prior = {0};
     const gguf_file *prior_use = NULL;
+    bool reuse_weights_only = false;
     if (p.reuse_gguf) {
         prior = load_gguf_metadata(p.reuse_gguf);
         if (prior.reuse_key && strcmp(prior.reuse_key, reuse_key) == 0) {
             prior_use = &prior;
             fprintf(stderr, "reuse: %s matches this build (key %s) — copying unchanged tensors\n",
                     p.reuse_gguf, reuse_key);
+        } else if (prior.reuse_key_weights &&
+                   strcmp(prior.reuse_key_weights, reuse_key_weights) == 0) {
+            /* same FP weights + template, different imatrix: only imatrix-steered
+             * tensors change; everything else is byte-identical and copyable. */
+            prior_use = &prior;
+            reuse_weights_only = true;
+            fprintf(stderr, "reuse: %s shares the weights key (%s) but not the imatrix — "
+                            "copying imatrix-independent tensors, regenerating the steered ones\n",
+                    p.reuse_gguf, reuse_key_weights);
         } else {
             fprintf(stderr, "reuse: %s has key %s but this build is %s — regenerating all tensors\n",
                     p.reuse_gguf, prior.reuse_key ? prior.reuse_key : "(none)", reuse_key);
@@ -2033,6 +2089,7 @@ int main(int argc, char **argv) {
         compare_one_tensor(&db, &tmpl, &out_ctx, &p, &imatrix);
         if (p.reuse_gguf) free_gguf_file(&prior);
         free(reuse_key);
+        free(reuse_key_weights);
         db_close(&db);
         imatrix_free(&imatrix);
         free_gguf_file(&tmpl);
@@ -2041,11 +2098,12 @@ int main(int argc, char **argv) {
     }
 
     write_full_gguf(&db, &tmpl, &out_ctx, p.out_gguf, p.n_experts, p.n_threads, &imatrix,
-                    reuse_key, prior_use);
+                    reuse_key, reuse_key_weights, reuse_weights_only, prior_use);
     fprintf(stderr, "wrote %s\n", p.out_gguf);
 
     if (p.reuse_gguf) free_gguf_file(&prior);
     free(reuse_key);
+    free(reuse_key_weights);
     db_close(&db);
     imatrix_free(&imatrix);
     free_gguf_file(&tmpl);

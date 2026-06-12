@@ -91,6 +91,27 @@ full quantize. Copied bytes are size-checked against the plan (a hard error on a
 and `--reuse` refuses to alias `--out`. This is **not** present in llama.cpp, which always
 requantizes from the source weights; the closest prior art is splicing GGUF tensors by hand.
 
+**Re-calibration reuse (per-tensor key).** Changing the *imatrix* only changes the tensors the
+imatrix actually steers (the routed expert families: the importance vectors re-allocate bits
+inside those tensors). Everything else — attention, shared experts, norms, embeddings, output —
+is byte-identical across builds that share the same FP weights and template. So every build now
+also stamps `quantize.reuse_key_weights`: the same fnv1a64 **without** the imatrix folded in.
+When PRIOR matches the full key, behavior is unchanged; when it matches only the weights key
+(same weights, different imatrix — the re-calibration case), `--reuse` copies the
+imatrix-independent tensors and regenerates only the steered ones:
+
+```
+reuse: PRIOR.gguf shares the weights key (…) but not the imatrix — copying
+       imatrix-independent tensors, regenerating the steered ones
+```
+
+The dependence test is conservative and mirrors the generators' own imatrix lookups (routed
+`*_exps.*` families always count as steered; regular tensors are probed with the exact same
+name resolution `generate_regular()` uses), so over-approximation can only cost an unneeded
+regeneration, never a stale byte. Priors built before this change carry only the old key and
+keep the old all-or-nothing behavior. First measured exercise pending (a re-calibrated build);
+the expected saving is the non-routed share of the file.
+
 ## Motivations
 
 * Very capable open weight models finally exist. DeepSeek v4 Flash feels quasi-frontier. The PRO is even better. Both resist 2 bit quantization very well.
