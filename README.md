@@ -31,7 +31,7 @@ no longer supported, unless there is some kind of overlap of abilities.
 ## This fork (andreaborio/ds4)
 
 This is a fork of [antirez/ds4 (DwarfStar)](https://github.com/antirez/ds4) that tracks
-upstream, with **two additions** used by
+upstream, with **four additions** used by
 [forgequant](https://github.com/andreaborio/forgequant). Everything else is upstream
 DwarfStar (sections below); these are the only deltas.
 
@@ -91,7 +91,9 @@ full quantize. Copied bytes are size-checked against the plan (a hard error on a
 and `--reuse` refuses to alias `--out`. This is **not** present in llama.cpp, which always
 requantizes from the source weights; the closest prior art is splicing GGUF tensors by hand.
 
-**Re-calibration reuse (per-tensor key).** Changing the *imatrix* only changes the tensors the
+### 3. Re-calibration reuse: `quantize.reuse_key_weights`
+
+Changing the *imatrix* only changes the tensors the
 imatrix actually steers (the routed expert families: the importance vectors re-allocate bits
 inside those tensors). Everything else — attention, shared experts, norms, embeddings, output —
 is byte-identical across builds that share the same FP weights and template. So every build now
@@ -119,6 +121,24 @@ Byte-level verification: 40/40 sampled imatrix-independent tensors identical to 
 adversarial 3-lens review that rejected the first cut (two stale-byte paths, one strict-mode
 abort — all reachable, all fixed before this exercise: the no-imatrix gate, the coverage
 fingerprint, the I32 probe exclusion).
+
+### 4. Mixed-precision routed experts under SSD streaming
+
+Upstream `--ssd-streaming` assumes routed-expert tensors are quantized uniformly across
+layers. A GGUF with a few layers boosted to Q4_K over an IQ2 base (the forgequant boost
+recipe) failed **every** request under streaming (`model range … is not covered by mapped
+model views`) while serving fine with full residency. Two compounding uniformity
+assumptions are fixed: the streaming prefill span set now also maps the exps tensors of
+off-class ("boosted") layers, so they are read through mmap'd no-copy views; and the
+single-size-class expert cache pre-seeds its slab size at startup and **rejects** off-size
+layers (which use the mapped path) instead of silently adopting their size and corrupting
+the slot accounting.
+
+Uniform models are verified **byte-identical** under the change (3/3 builds), full-residency
+paths are untouched, and mixed models were validated with the canary benchmark plus entire
+eval suites. Full diagnosis, design and behavior guarantees in
+[`STREAMING_MIXED_PRECISION.md`](STREAMING_MIXED_PRECISION.md); reported upstream with
+diagnosis and workaround in [antirez/ds4#388](https://github.com/antirez/ds4/issues/388).
 
 ## Motivations
 
