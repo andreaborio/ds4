@@ -1012,7 +1012,10 @@ static void ds4_expert_profile_write_layer(FILE *fp, uint32_t il) {
             avg_jaccard);
 
     fputs("      \"top_experts\": [", fp);
-    const uint32_t top_n = unique < 16u ? unique : 16u;
+    /* Default: compact top-16. With DS4_EXPERT_PROFILE_FULL set, emit the full
+     * per-expert ranking so a static prune/keep-set can be chosen per layer. */
+    const uint32_t top_n = getenv("DS4_EXPERT_PROFILE_FULL") ? unique :
+                           (unique < 16u ? unique : 16u);
     for (uint32_t i = 0; i < top_n; i++) {
         const double pct = selections ?
             100.0 * (double)entries[i].count / (double)selections : 0.0;
@@ -13625,6 +13628,38 @@ static bool metal_graph_decode_set_hash_selected_override(
     return ds4_gpu_routed_moe_set_selected_override(selected_i32, DS4_N_EXPERT_USED) != 0;
 }
 
+/* Optional static expert prune-mask for coding-specialized eval. Point
+ * DS4_EXPERT_PRUNE_MASK at a 43-line x N_EXPERT grid of '0'/'1' ('1' = prune).
+ * Applied to the CPU router's probs before top-k, so masked experts are never
+ * selected (the token routes to its next-best surviving expert). Off by default;
+ * only routed (non-hash) layers are affected. */
+static int8_t g_expert_prune_mask[DS4_MAX_LAYER][DS4_MAX_EXPERT];
+static int g_expert_prune_mask_state = -1; /* -1 unchecked, 0 inactive, 1 active */
+static void ds4_expert_prune_mask_ensure(void) {
+    if (g_expert_prune_mask_state >= 0) return;
+    g_expert_prune_mask_state = 0;
+    const char *path = getenv("DS4_EXPERT_PRUNE_MASK");
+    if (!path || !path[0]) return;
+    FILE *f = fopen(path, "r");
+    if (!f) { fprintf(stderr, "ds4: prune mask open failed: %s\n", path); return; }
+    long pruned = 0;
+    for (uint32_t il = 0; il < DS4_MAX_LAYER; il++) {
+        int c; uint32_t e = 0;
+        while ((c = fgetc(f)) != EOF && c != '\n') {
+            if ((c == '0' || c == '1') && e < DS4_MAX_EXPERT) {
+                g_expert_prune_mask[il][e] = (int8_t)(c == '1');
+                if (c == '1') pruned++;
+                e++;
+            }
+        }
+        if (c == EOF) break;
+    }
+    fclose(f);
+    g_expert_prune_mask_state = pruned > 0 ? 1 : 0;
+    fprintf(stderr, "ds4: expert prune mask %s (%ld experts pruned) from %s\n",
+            g_expert_prune_mask_state ? "ACTIVE" : "empty", pruned, path);
+}
+
 static bool metal_graph_decode_cpu_router(
         ds4_gpu_graph          *g,
         const ds4_model        *model,
@@ -13659,6 +13694,14 @@ static bool metal_graph_decode_cpu_router(
         layer_hash_selected_experts(selected, model, layer, (int)token);
         layer_hash_router_weights_from_probs(weights, probs, selected);
     } else {
+        ds4_expert_prune_mask_ensure();
+        if (g_expert_prune_mask_state == 1 && il < DS4_MAX_LAYER) {
+            for (uint32_t e = 0; e < DS4_N_EXPERT; e++) {
+                /* -ffast-math: use a large finite sentinel, not -INFINITY.
+                 * probs are sqrt(softplus(.)) >= 0, so this never wins top-k. */
+                if (g_expert_prune_mask[il][e]) probs[e] = -1e30f;
+            }
+        }
         layer_topk_selected_experts_from_probs(selected, weights, model, layer, probs);
     }
     for (uint32_t i = 0; i < DS4_N_EXPERT_USED; i++) {
