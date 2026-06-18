@@ -4,8 +4,8 @@ UNAME_S := $(shell uname -s)
 ifeq ($(UNAME_S),Darwin)
 NATIVE_CPU_FLAG ?= -mcpu=native
 QUALITY_LDLIBS := -lm -pthread -framework Foundation -framework Metal
-QUALITY_TARGETS := ds4.o ds4_metal.o
-QUALITY_OBJS := ../ds4.o ../ds4_metal.o
+QUALITY_TARGETS := ds4.o ds4_distributed.o ds4_ssd.o ds4_metal.o
+QUALITY_OBJS := ../ds4.o ../ds4_distributed.o ../ds4_ssd.o ../ds4_metal.o
 QUALITY_LINK := $(CC) $(CFLAGS) -I.. -o
 else
 NATIVE_CPU_FLAG ?= -march=native

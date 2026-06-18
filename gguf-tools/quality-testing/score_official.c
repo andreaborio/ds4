@@ -57,6 +57,12 @@ int main(int argc, char **argv) {
         .n_threads = 0,
         .warm_weights = false,
         .quality = false,
+        /* The Flash GGUF (~86 GB) doesn't fit in this box's RAM, so stream experts
+         * from SSD with a 40 GiB resident cache — mirrors ds4-server's
+         * `--ssd-streaming --ssd-streaming-cache-experts 40GB`. Without this the
+         * engine maps the whole model and the OS SIGKILLs the process (exit 137). */
+        .ssd_streaming = true,
+        .ssd_streaming_cache_bytes = 40ULL << 30,
     };
 
     ds4_engine *engine = NULL;
