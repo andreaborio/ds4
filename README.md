@@ -31,9 +31,10 @@ no longer supported, unless there is some kind of overlap of abilities.
 ## This fork (andreaborio/ds4)
 
 This is a fork of [antirez/ds4 (DwarfStar)](https://github.com/antirez/ds4) that tracks
-upstream, with **four additions** used by
+upstream, with **five additions** used by
 [forgequant](https://github.com/andreaborio/forgequant). Everything else is upstream
-DwarfStar (sections below); these are the only deltas.
+DwarfStar (sections below); these are the only deltas. Last synced with upstream `main`
+at the merge recorded in [`MERGE_LOG.md`](MERGE_LOG.md).
 
 ### 1. On-edge / real-time imatrix collection: `ds4-server --imatrix-out`
 
@@ -139,6 +140,36 @@ paths are untouched, and mixed models were validated with the canary benchmark p
 eval suites. Full diagnosis, design and behavior guarantees in
 [`STREAMING_MIXED_PRECISION.md`](STREAMING_MIXED_PRECISION.md); reported upstream with
 diagnosis and workaround in [antirez/ds4#388](https://github.com/antirez/ds4/issues/388).
+
+**Update (upstream converged):** antirez has since implemented equivalent mixed-precision
+streaming upstream. After the latest sync this fork **takes upstream's implementation** of
+`weights_streaming_layer_experts_uniform` (the only merge conflict; the two designs converged) —
+see [`MERGE_LOG.md`](MERGE_LOG.md). This addition is effectively now upstream.
+
+### 5. Coding-eval expert tooling: prune mask + full expert profile
+
+Two small, opt-in hooks for studying *which* experts a domain actually needs, used by the
+forgequant layer/expert A/B work:
+
+- **`DS4_EXPERT_PROFILE_FULL`** — the expert profiler (`ds4_expert_profile_write_layer`) emits
+  the *full* per-expert ranking instead of the top-16, so a static prune/keep set can be chosen
+  per layer from real routing statistics.
+- **`DS4_EXPERT_PRUNE_MASK`** — point it at a `43 × N_EXPERT` grid of `'0'/'1'` (`'1'` = prune).
+  The mask is applied to the CPU router's `probs` **before top-k** (masked experts get a
+  large-negative sentinel so they never win), letting each token route to its next-best
+  surviving expert. This measures "how much of the domain lives in a few experts" without
+  re-quantizing anything.
+
+```sh
+# the mask lives in the CPU router, so enable it (streaming-IQ2 path), then prune:
+DS4_METAL_ENABLE_STREAMING_IQ2_CPU_ROUTER=1 DS4_EXPERT_PRUNE_MASK=mask.txt \
+  ds4 -m coder-iq2.gguf -p "…" --ssd-streaming
+# -> "ds4: expert prune mask ACTIVE (N experts pruned) from mask.txt"
+```
+
+Both default **off** (zero behavioral change). The mask affects only routed (non-hash) layers,
+and only when the CPU router is active (streaming-IQ2 or PRO-Q4 paths). Details in
+[`EXPERT_PRUNE.md`](EXPERT_PRUNE.md).
 
 ## Motivations
 
