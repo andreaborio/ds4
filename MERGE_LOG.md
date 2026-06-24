@@ -9,7 +9,7 @@ fork's engine additions were preserved across upstream refactors. See
 
 ## 2026-06-24 — publish sync with upstream `main` @ `80ebbc3`
 
-**Result: ✅ ready to land on `origin/main`.** `sync-fix` still contains upstream
+**Result: ✅ landed on `origin/main`.** `sync-fix` still contains upstream
 `main` plus the fork's five mainline additions. The README now also points to the
 separate experimental GLM-5.2 branch
 `wip/glm52-metal64-strict-probe`, clearly scoped as Apple Silicon / Metal
@@ -18,6 +18,45 @@ short-context bring-up rather than a mainline feature.
 No new upstream commits were present after `80ebbc3` during the 2026-06-24
 refresh; the work here is publishing the already-validated sync and bringing the
 fork README up to date before pushing `andreaborio/ds4`.
+
+### 2026-06-24 verification on M5 Pro / 64 GB
+
+The available full-size DeepSeek V4 Flash GGUF was larger than resident memory,
+so model tests were run through Metal SSD streaming instead of default full
+residency. A global `DS4_TEST_SSD_STREAMING=1 make test` is not a valid local
+substitute for upstream's normal full-residency suite: it over-applies streaming
+to tests that open multiple engines and, with a 16 GiB cache under macOS lock
+pressure, reduced the runtime cache to pathological sizes. The accepted local
+matrix was therefore split by test surface:
+
+| check | local command/config | result |
+|---|---|---|
+| build | `make clean && make && make ds4_test` | ✅ OK |
+| CPU portability | `make cpu` | ✅ OK (CPU-only unused warnings) |
+| eval extractor self-test | `./ds4-eval --self-test-extractors` | ✅ OK |
+| agent unit tests | `./ds4_agent_test` | ✅ OK |
+| Q4_K dot unit tests | `make q4k-dot-test` | ✅ OK |
+| server unit tests | `./ds4_test --server` | ✅ OK |
+| Metal kernel unit tests | `./ds4_test --metal-kernels` | ✅ OK |
+| official logprob vectors | SSD streaming, requested 40 GiB cache, capped to 36 GiB | ✅ OK |
+| streaming decode/prefill correctness | SSD streaming, 11 GiB cache | ✅ OK |
+| Metal tensor equivalence | SSD streaming, 11 GiB cache | ✅ OK |
+| local golden vectors | SSD streaming, 11 GiB cache | ✅ OK |
+| Metal short prefill | SSD streaming, 11 GiB cache | ✅ OK |
+| long-context recall | SSD streaming, 11 GiB cache | ✅ OK |
+| Metal SSD cache-pressure repro | test's built-in 16 GiB cache | ✅ OK |
+| MTP verify depth | no local `DS4_TEST_MTP` GGUF | ✅ OK / self-skipped |
+
+Two model-behavior tests were **not** green in SSD streaming on this 64 GB Mac:
+
+- `./ds4_test --tool-call-quality`: the exact path tried to access dense Metal
+  model ranges that are not mapped by this SSD-streaming configuration.
+- `./ds4_test --think-tool-recovery`: recovery triggered and generated the
+  expected-looking DSML stanza, but the parser saw `calls=0`.
+
+Those two should be re-run on a machine/configuration that can execute the
+normal full-residency upstream suite. They are documented here so the fork sync
+does not claim a stronger test result than the local hardware can support.
 
 ---
 
