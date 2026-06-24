@@ -31,10 +31,16 @@ no longer supported, unless there is some kind of overlap of abilities.
 ## This fork (andreaborio/ds4)
 
 This is a fork of [antirez/ds4 (DwarfStar)](https://github.com/antirez/ds4) that tracks
-upstream, with **five additions** used by
+upstream, with **five mainline additions** used by
 [forgequant](https://github.com/andreaborio/forgequant). Everything else is upstream
 DwarfStar (sections below); these are the only deltas. Last synced with upstream `main`
 at the merge recorded in [`MERGE_LOG.md`](MERGE_LOG.md).
+
+There is also an experimental GLM-5.2 line of work on
+[`wip/glm52-metal64-strict-probe`](https://github.com/andreaborio/ds4/tree/wip/glm52-metal64-strict-probe).
+It is not part of this mainline branch yet: it targets a ds4-native GLM-5.2 GGUF,
+has only been locally exercised on Apple Silicon / Metal, and should be treated as
+short-context bring-up work rather than general or production-ready GLM support.
 
 ### 1. On-edge / real-time imatrix collection: `ds4-server --imatrix-out`
 

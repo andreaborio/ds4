@@ -7,13 +7,26 @@ fork's engine additions were preserved across upstream refactors. See
 
 ---
 
+## 2026-06-24 — publish sync with upstream `main` @ `80ebbc3`
+
+**Result: ✅ ready to land on `origin/main`.** `sync-fix` still contains upstream
+`main` plus the fork's five mainline additions. The README now also points to the
+separate experimental GLM-5.2 branch
+`wip/glm52-metal64-strict-probe`, clearly scoped as Apple Silicon / Metal
+short-context bring-up rather than a mainline feature.
+
+No new upstream commits were present after `80ebbc3` during the 2026-06-24
+refresh; the work here is publishing the already-validated sync and bringing the
+fork README up to date before pushing `andreaborio/ds4`.
+
+---
+
 ## 2026-06-18 — sync with upstream `main` @ `80ebbc3`
 
 **Result: ✅ synced and re-validated.** Branch `sync-fix` = upstream `main` + the fork's
 non-streaming features (imatrix-collection API, expert prune mask, PROFILE_FULL). The fork's
 streaming feature (#4) was **dropped** because it converged upstream. Passes the same
-`ds4_test` correctness suite as pre-merge `main`. **Left on the branch for review before
-landing on `main` / pushing.**
+`ds4_test` correctness suite as pre-merge `main`.
 
 ### Divergence
 
