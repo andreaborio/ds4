@@ -6053,7 +6053,7 @@ static bool glm_stream_resident_decode_layer_enabled(
            il - DS4_N_LEADING_DENSE < g_glm_streaming_full_resident_layers;
 }
 
-static bool glm_stream_expert_cache_addr_supported(
+static bool glm_stream_expert_cache_addr_layout_supported(
         const ds4_weights       *w,
         const ds4_layer_weights *l,
         uint32_t                 il) {
@@ -6064,7 +6064,11 @@ static bool glm_stream_expert_cache_addr_supported(
         il < DS4_N_LEADING_DENSE ||
         !l->ffn_gate_exps ||
         !l->ffn_up_exps ||
-        !l->ffn_down_exps) {
+        !l->ffn_down_exps ||
+        DS4_N_EXPERT_USED == 0 ||
+        DS4_N_EXPERT_USED > 8 ||
+        DS4_N_EXPERT < 128 ||
+        getenv("DS4_METAL_GLM_DISABLE_STREAMING_EXPERT_CACHE") != NULL) {
         return false;
     }
     if (!weights_streaming_layer_experts_uniform(w, il)) return false;
@@ -6076,7 +6080,16 @@ static bool glm_stream_expert_cache_addr_supported(
     const bool q4_addr =
         l->ffn_gate_exps->type == DS4_TENSOR_Q4_K &&
         l->ffn_down_exps->type == DS4_TENSOR_Q4_K;
-    if (!q2_addr && !q4_addr) return false;
+    return q2_addr || q4_addr;
+}
+
+static bool glm_stream_expert_cache_addr_supported(
+        const ds4_weights       *w,
+        const ds4_layer_weights *l,
+        uint32_t                 il) {
+    if (!glm_stream_expert_cache_addr_layout_supported(w, l, il)) {
+        return false;
+    }
 
 #ifdef DS4_NO_GPU
     return false;
@@ -6131,7 +6144,7 @@ static bool glm_stream_decode_experts_are_streamed(
         const ds4_layer_weights *l,
         uint32_t                 il) {
     if (DS4_MODEL_FAMILY != DS4_MODEL_FAMILY_GLM_DSA) return false;
-    return glm_stream_expert_cache_addr_supported(w, l, il) ||
+    return glm_stream_expert_cache_addr_layout_supported(w, l, il) ||
            glm_stream_selected_expert_cache_supported(l, il);
 }
 
