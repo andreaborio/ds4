@@ -6094,6 +6094,47 @@ static bool glm_stream_expert_cache_addr_supported(
 #endif
 }
 
+static bool glm_stream_selected_expert_cache_supported(
+        const ds4_layer_weights *l,
+        uint32_t                 il) {
+    if (DS4_MODEL_FAMILY != DS4_MODEL_FAMILY_GLM_DSA ||
+        !l ||
+        il < DS4_N_LEADING_DENSE ||
+        !l->ffn_gate_exps ||
+        !l->ffn_up_exps ||
+        !l->ffn_down_exps ||
+        DS4_N_EXPERT_USED == 0 ||
+        DS4_N_EXPERT_USED > 8 ||
+        DS4_N_EXPERT < 128 ||
+        getenv("DS4_METAL_MOE_WRITE_CLAMPED_ACT") != NULL ||
+        getenv("DS4_METAL_DISABLE_ROUTED_PAIR_SWIGLU_FUSION") != NULL ||
+        getenv("DS4_METAL_GLM_DISABLE_STREAMING_EXPERT_CACHE") != NULL) {
+        return false;
+    }
+
+    if (l->ffn_gate_exps->type != DS4_TENSOR_IQ2_XXS ||
+        l->ffn_up_exps->type != DS4_TENSOR_IQ2_XXS) {
+        return false;
+    }
+
+    if (l->ffn_down_exps->type == DS4_TENSOR_Q2_K) {
+        return getenv("DS4_METAL_DISABLE_IQ2_SELECTED_EXPERT_VIEWS") == NULL;
+    }
+    if (l->ffn_down_exps->type == DS4_TENSOR_IQ2_XXS) {
+        return getenv("DS4_METAL_DISABLE_IQ2_STREAM_ADDR_TABLE") == NULL;
+    }
+    return false;
+}
+
+static bool glm_stream_decode_experts_are_streamed(
+        const ds4_weights       *w,
+        const ds4_layer_weights *l,
+        uint32_t                 il) {
+    if (DS4_MODEL_FAMILY != DS4_MODEL_FAMILY_GLM_DSA) return false;
+    return glm_stream_expert_cache_addr_supported(w, l, il) ||
+           glm_stream_selected_expert_cache_supported(l, il);
+}
+
 /*
  * Decode-time spans for one layer. The static set excludes routed expert
  * tensors only when the streaming expert-cache path can really serve them.
@@ -6109,7 +6150,7 @@ static void model_map_span_vec_include_layer_decode(
     model_map_span_vec_include_layer_decode_static(spans, l);
     if (!weights_streaming_layer_experts_uniform(w, il) ||
         (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_GLM_DSA &&
-         !glm_stream_expert_cache_addr_supported(w, l, il)) ||
+         !glm_stream_decode_experts_are_streamed(w, l, il)) ||
         glm_stream_resident_decode_layer_enabled(l, il)) {
         model_map_span_vec_include_one(spans, l->ffn_gate_exps);
         model_map_span_vec_include_one(spans, l->ffn_up_exps);
@@ -34439,7 +34480,7 @@ static bool glm_graph_stream_layer_expert_cache_supported(
         uint32_t                 il) {
     if (!weights || !l) return false;
     if (il < DS4_N_LEADING_DENSE) return true;
-    return glm_stream_expert_cache_addr_supported(weights, l, il);
+    return glm_stream_decode_experts_are_streamed(weights, l, il);
 }
 
 static bool glm_graph_stream_prefill_expert_addr_supported(
@@ -34447,12 +34488,9 @@ static bool glm_graph_stream_prefill_expert_addr_supported(
         const ds4_layer_weights *l,
         uint32_t                 il,
         uint32_t                 n_tokens) {
-    if (!glm_graph_stream_layer_expert_cache_supported(weights, l, il)) {
-        return false;
-    }
     if (il < DS4_N_LEADING_DENSE) return true;
     if (n_tokens <= 1) return false;
-    return true;
+    return glm_stream_expert_cache_addr_supported(weights, l, il);
 }
 
 static bool glm_graph_stream_map_decode_layer(
@@ -39487,7 +39525,7 @@ static bool glm_graph_prefill_range(
  * path users expect for interactive prompts. --quality and the env escape hatch
  * keep canonical prefill available for strict-vector diagnostics.
  */
-enum { DS4_GLM_STREAM_PREFILL_TOKEN_MAJOR_MAX_TOKENS = 48 };
+enum { DS4_GLM_STREAM_PREFILL_TOKEN_MAJOR_MAX_TOKENS = 64 };
 
 static bool glm_graph_use_streaming_token_prefill(
         const ds4_glm_gpu_graph *g,
@@ -50456,12 +50494,44 @@ int ds4_session_sync(ds4_session *s, const ds4_tokens *prompt, char *err, size_t
                 return DS4_SESSION_SYNC_INTERRUPTED;
             }
             if (!s->glm_graph.full_kv_cache || (uint32_t)i >= s->glm_graph.ctx_cap) {
+                const uint32_t remaining = (uint32_t)(prompt->len - i);
+                const bool use_token_major_prefill =
+                    glm_graph_use_streaming_token_prefill(&s->glm_graph,
+                                                          (uint32_t)i,
+                                                          remaining);
                 const bool use_indexed_batch =
+                    !use_token_major_prefill &&
                     glm_graph_indexed_prefill_batch_ready(&s->glm_graph,
                                                           (uint32_t)i);
                 uint32_t chunk = 1;
                 bool prefill_ok = false;
-                if (use_indexed_batch) {
+                if (use_token_major_prefill) {
+                    chunk = remaining;
+                    if (chunk > DS4_GLM_STREAM_PREFILL_TOKEN_MAJOR_MAX_TOKENS) {
+                        chunk = DS4_GLM_STREAM_PREFILL_TOKEN_MAJOR_MAX_TOKENS;
+                    }
+                    float *chunk_logits =
+                        (i + (int)chunk >= prompt->len) ? s->logits : NULL;
+                    if (sync_trace) {
+                        fprintf(stderr,
+                                "ds4: GLM sync branch=full_compact_token_major pos=%d chunk=%u logits=%d\n",
+                                i,
+                                chunk,
+                                chunk_logits ? 1 : 0);
+                    }
+                    prefill_ok = glm_graph_prefill_token_major(&s->glm_graph,
+                                                               &e->model,
+                                                               &e->weights,
+                                                               prompt->v + i,
+                                                               (uint32_t)i,
+                                                               chunk,
+                                                               chunk_logits,
+                                                               s->display_progress,
+                                                               s->display_progress_ud,
+                                                               full_work_start,
+                                                               (uint32_t)i - full_work_start,
+                                                               full_work_total);
+                } else if (use_indexed_batch) {
                     chunk = (uint32_t)(prompt->len - i);
                     if (chunk > s->glm_graph.indexed_prefill_cap) {
                         chunk = s->glm_graph.indexed_prefill_cap;
