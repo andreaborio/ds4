@@ -47420,7 +47420,6 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
                             "expert-cache hit rate will be catastrophic\n",
                             boosted, routed);
                 }
-
                 /*
                  * Validate only after AUTO or an NGB byte budget has resolved
                  * to an exact expert count.  A cache at or below one token's
