@@ -13342,3 +13342,20 @@ extern "C" int ds4_gpu_glm_stream_expert_prefetch_hint(
     (void)gate_expert_bytes; (void)down_expert_bytes;
     return 0;
 }
+
+extern "C" int ds4_gpu_glm_stream_expert_prefetch_load_begin(
+        const ds4_gpu_stream_expert_table *table,
+        uint32_t                           current_layer,
+        const int32_t                     *predicted_ids,
+        uint32_t                           n_predicted) {
+    (void)table; (void)current_layer; (void)predicted_ids; (void)n_predicted;
+    return 0;
+}
+
+extern "C" int ds4_gpu_glm_stream_prefetch_note_predicted(
+        uint32_t       layer,
+        const int32_t *expert_ids,
+        uint32_t       n_experts) {
+    (void)layer; (void)expert_ids; (void)n_experts;
+    return 0;
+}

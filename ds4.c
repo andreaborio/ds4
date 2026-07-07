@@ -35902,19 +35902,48 @@ typedef struct {
     float              x[DS4_MAX_EMBD];
 } glm_router_ahead_job;
 
+typedef struct {
+    uint32_t il;
+    int32_t  ids[DS4_MAX_EXPERT_USED];
+    bool     ready;
+} glm_router_ahead_result;
+
 static pthread_mutex_t g_glm_router_ahead_mutex = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t g_glm_router_ahead_cond = PTHREAD_COND_INITIALIZER;
 static glm_router_ahead_job g_glm_router_ahead_job;
+static glm_router_ahead_result g_glm_router_ahead_result;
 static bool g_glm_router_ahead_job_pending;
 static bool g_glm_router_ahead_worker_started;
 static const ds4_weights *g_glm_router_ahead_weights;
 
-static bool glm_router_ahead_prefetch_enabled(void) {
+/* 0 = off, 1 = advisory OS readahead for the predicted next-layer experts,
+ * 2 = additionally stream them into the expert cache (install mode). */
+static int glm_router_ahead_prefetch_level(void) {
     static int cached = -1;
     if (cached < 0) {
-        cached = getenv("DS4_GLM_ROUTER_AHEAD_PREFETCH") != NULL ? 1 : 0;
+        const char *v = getenv("DS4_GLM_ROUTER_AHEAD_PREFETCH");
+        cached = !v ? 0 : (atoi(v) >= 2 ? 2 : 1);
     }
-    return cached != 0;
+    return cached;
+}
+
+static bool glm_router_ahead_prefetch_enabled(void) {
+    return glm_router_ahead_prefetch_level() != 0;
+}
+
+/* Advisory mode: how many layers ahead the worker predicts and warms.
+ * 1 gives the OS ~one layer of readahead runway, 2 doubles it at a small
+ * prediction-accuracy cost (the gating-input proxy drifts with distance). */
+static uint32_t glm_router_ahead_prefetch_lookahead(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char *v = getenv("DS4_GLM_ROUTER_AHEAD_LOOKAHEAD");
+        int parsed = v ? atoi(v) : 1;
+        if (parsed < 1) parsed = 1;
+        if (parsed > 4) parsed = 4;
+        cached = parsed;
+    }
+    return (uint32_t)cached;
 }
 
 static void *glm_router_ahead_worker(void *arg) {
@@ -35947,19 +35976,86 @@ static void *glm_router_ahead_worker(void *arg) {
         for (uint32_t i = 0; i < DS4_N_EXPERT_USED; i++) {
             ids[i] = (int32_t)selected[i];
         }
-        (void)ds4_gpu_glm_stream_expert_prefetch_hint(
-                job.il,
-                ids,
-                DS4_N_EXPERT_USED,
-                job.model->map,
-                job.model->size,
-                l->ffn_gate_exps->abs_offset,
-                l->ffn_up_exps->abs_offset,
-                l->ffn_down_exps->abs_offset,
-                gate_out * gate_row_bytes,
-                down_out * down_row_bytes);
+        if (glm_router_ahead_prefetch_level() >= 2) {
+            /* Install mode: publish the prediction immediately so the decode
+             * thread's poll can start the cache load; the real preads make
+             * advisory hints redundant. */
+            pthread_mutex_lock(&g_glm_router_ahead_mutex);
+            g_glm_router_ahead_result.il = job.il;
+            memcpy(g_glm_router_ahead_result.ids, ids, sizeof(ids));
+            g_glm_router_ahead_result.ready = true;
+            pthread_mutex_unlock(&g_glm_router_ahead_mutex);
+            (void)ds4_gpu_glm_stream_prefetch_note_predicted(
+                    job.il,
+                    ids,
+                    DS4_N_EXPERT_USED);
+        } else {
+            (void)ds4_gpu_glm_stream_expert_prefetch_hint(
+                    job.il,
+                    ids,
+                    DS4_N_EXPERT_USED,
+                    job.model->map,
+                    job.model->size,
+                    l->ffn_gate_exps->abs_offset,
+                    l->ffn_up_exps->abs_offset,
+                    l->ffn_down_exps->abs_offset,
+                    gate_out * gate_row_bytes,
+                    down_out * down_row_bytes);
+        }
     }
     return NULL;
+}
+
+/* Decode thread, called after the current layer's routed-MoE dispatch (pread
+ * pool idle, this layer's expert buffers already bound): if the worker's
+ * prediction for layer il+1 is ready, start streaming those experts into the
+ * cache so the next layer's selected load mostly hits. */
+static void glm_router_ahead_prefetch_install_poll(
+        const ds4_model *model,
+        uint32_t         il) {
+    if (glm_router_ahead_prefetch_level() < 2) return;
+    const ds4_weights *weights = g_glm_router_ahead_weights;
+    if (!model || !weights) return;
+    const uint32_t il_next = il + 1u;
+    if (il_next < DS4_N_LEADING_DENSE) return;
+    if (il_next >= glm_graph_normal_layer_count()) return;
+    const ds4_layer_weights *l = &weights->layer[il_next];
+    if (!l->ffn_gate_exps || !l->ffn_up_exps || !l->ffn_down_exps) return;
+    if (glm_stream_resident_decode_layer_enabled(l, il_next)) return;
+
+    int32_t ids[DS4_MAX_EXPERT_USED];
+    bool have = false;
+    pthread_mutex_lock(&g_glm_router_ahead_mutex);
+    if (g_glm_router_ahead_result.ready &&
+        g_glm_router_ahead_result.il == il_next) {
+        memcpy(ids, g_glm_router_ahead_result.ids, sizeof(ids));
+        g_glm_router_ahead_result.ready = false;
+        have = true;
+    }
+    pthread_mutex_unlock(&g_glm_router_ahead_mutex);
+    if (!have) return;
+
+    uint64_t gate_in = 0, gate_out = 0, gate_row_bytes = 0;
+    uint64_t down_in = 0, down_out = 0, down_row_bytes = 0;
+    (void)tensor_expert_bytes(model, l->ffn_gate_exps, 0,
+                              &gate_in, &gate_out, &gate_row_bytes);
+    (void)tensor_expert_bytes(model, l->ffn_down_exps, 0,
+                              &down_in, &down_out, &down_row_bytes);
+    const ds4_gpu_stream_expert_table table = {
+        .model_map = model->map,
+        .model_size = model->size,
+        .layer = il_next,
+        .n_total_expert = DS4_N_EXPERT,
+        .gate_offset = l->ffn_gate_exps->abs_offset,
+        .up_offset = l->ffn_up_exps->abs_offset,
+        .down_offset = l->ffn_down_exps->abs_offset,
+        .gate_expert_bytes = gate_out * gate_row_bytes,
+        .down_expert_bytes = down_out * down_row_bytes,
+    };
+    (void)ds4_gpu_glm_stream_expert_prefetch_load_begin(&table,
+                                                        il,
+                                                        ids,
+                                                        DS4_N_EXPERT_USED);
 }
 
 static bool glm_router_ahead_ensure_worker(void) {
@@ -36142,8 +36238,15 @@ static bool glm_graph_encode_sparse_ffn_one(
                     DS4_N_EXPERT_USED) != 0;
             if (ok && glm_router_ahead_prefetch_enabled()) {
                 /* Commands were just synced by the early-load readback, so
-                 * this ffn_norm read is cheap; predict L+1 off-thread. */
-                glm_router_ahead_prefetch_submit(model, il + 1u, ffn_norm);
+                 * this ffn_norm read is cheap; predict ahead off-thread.
+                 * Install mode consumes the prediction at il+1, so its
+                 * lookahead is pinned to 1. */
+                const uint32_t lookahead =
+                    glm_router_ahead_prefetch_level() >= 2 ?
+                        1u : glm_router_ahead_prefetch_lookahead();
+                glm_router_ahead_prefetch_submit(model,
+                                                 il + lookahead,
+                                                 ffn_norm);
             }
             if (async_profile) {
                 g_glm_streaming_async_profile.sync_early_load_ms +=
@@ -36231,6 +36334,11 @@ static bool glm_graph_encode_sparse_ffn_one(
             g->router_weights,
             ffn_norm,
             resident_decode_layer) != 0;
+    if (ok && uniform_streaming_selected_cache && !resident_decode_layer) {
+        /* Uniform (sync) path only: the generic path's selected load runs on
+         * the async worker, which would race the decode-thread-only harvest. */
+        glm_router_ahead_prefetch_install_poll(model, il);
+    }
     if (async_profile) {
         const double now_ms = glm_graph_streaming_async_profile_ms();
         if (async_path_profiled) {

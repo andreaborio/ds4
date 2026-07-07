@@ -313,6 +313,18 @@ int ds4_gpu_glm_stream_expert_prefetch_hint(
         uint64_t        down_offset,
         uint64_t        gate_expert_bytes,
         uint64_t        down_expert_bytes);
+int ds4_gpu_glm_stream_prefetch_note_predicted(
+        uint32_t       layer,
+        const int32_t *expert_ids,
+        uint32_t       n_experts);
+/* Router-ahead prefetch install mode: stream the predicted next-layer experts
+ * into the cache on a second pending-load slot while the GPU runs the current
+ * layer.  Decode thread only; harvested by the next begin_selected_load. */
+int ds4_gpu_glm_stream_expert_prefetch_load_begin(
+        const ds4_gpu_stream_expert_table *table,
+        uint32_t                           current_layer,
+        const int32_t                     *predicted_ids,
+        uint32_t                           n_predicted);
 #if defined(DS4_ROCM_BUILD) || (!defined(DS4_NO_GPU) && !defined(__APPLE__))
 int ds4_gpu_stream_expert_cache_prepare_selected_batch(
         const ds4_gpu_stream_expert_table *table,
