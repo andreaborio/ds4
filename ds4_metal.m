@@ -13241,6 +13241,41 @@ static int ds4_gpu_stream_expert_cache_entry_reusable(
            e->down_expert_bytes == down_expert_bytes;
 }
 
+static int ds4_gpu_stream_expert_evict_layer_staleness_enabled(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        cached = getenv("DS4_METAL_STREAM_EVICT_LAYER_STALENESS") != NULL ? 1 : 0;
+    }
+    return cached;
+}
+
+static uint32_t ds4_gpu_stream_expert_evict_fwd_distance(
+        uint32_t entry_layer,
+        uint32_t current_layer) {
+    if (current_layer >= DS4_METAL_STREAM_EXPERT_CACHE_MAX_LAYER) return 0;
+    return (entry_layer + DS4_METAL_STREAM_EXPERT_CACHE_MAX_LAYER - current_layer) %
+           DS4_METAL_STREAM_EXPERT_CACHE_MAX_LAYER;
+}
+
+/* Returns nonzero when the candidate is a better eviction victim than the
+ * incumbent.  Primary key stays route hotness.  With
+ * DS4_METAL_STREAM_EVICT_LAYER_STALENESS the recency tie-break is replaced by
+ * forward layer distance: decode sweeps layers in order, so an expert of a
+ * just-passed layer is not needed for ~n_layers more steps, while plain LRU
+ * under a cache smaller than one sweep evicts exactly the upcoming layers. */
+static int ds4_gpu_stream_expert_evict_better(
+        uint32_t hotness_c, uint32_t layer_c, uint64_t last_c,
+        uint32_t hotness_i, uint32_t layer_i, uint64_t last_i,
+        uint32_t current_layer) {
+    if (hotness_c != hotness_i) return hotness_c < hotness_i;
+    if (ds4_gpu_stream_expert_evict_layer_staleness_enabled() &&
+        layer_c != layer_i) {
+        return ds4_gpu_stream_expert_evict_fwd_distance(layer_c, current_layer) >
+               ds4_gpu_stream_expert_evict_fwd_distance(layer_i, current_layer);
+    }
+    return last_c < last_i;
+}
+
 static int ds4_gpu_stream_expert_cache_take_reusable(
         int                                     force_reuse,
         uint32_t                                protect_layer,
@@ -13301,8 +13336,14 @@ retry:
             }
             const uint32_t hotness =
                 g_stream_expert_cache_route_hotness[layer][expert];
-            if (hotness < lowest_hotness ||
-                (hotness == lowest_hotness && e->last_used < oldest)) {
+            if (victim_layer == UINT32_MAX ||
+                ds4_gpu_stream_expert_evict_better(hotness,
+                                                   layer,
+                                                   e->last_used,
+                                                   lowest_hotness,
+                                                   victim_layer,
+                                                   oldest,
+                                                   protect_layer)) {
                 lowest_hotness = hotness;
                 oldest = e->last_used;
                 victim_layer = layer;
@@ -13531,15 +13572,23 @@ retry:
 
             uint32_t worst = 0;
             for (uint32_t i = 1; i < victim_count; i++) {
-                if (victim_hotness[i] > victim_hotness[worst] ||
-                    (victim_hotness[i] == victim_hotness[worst] &&
-                     victim_last_used[i] > victim_last_used[worst])) {
+                if (ds4_gpu_stream_expert_evict_better(victim_hotness[worst],
+                                                       victim_layers[worst],
+                                                       victim_last_used[worst],
+                                                       victim_hotness[i],
+                                                       victim_layers[i],
+                                                       victim_last_used[i],
+                                                       protect_layer)) {
                     worst = i;
                 }
             }
-            if (hotness < victim_hotness[worst] ||
-                (hotness == victim_hotness[worst] &&
-                 last_used < victim_last_used[worst])) {
+            if (ds4_gpu_stream_expert_evict_better(hotness,
+                                                   layer,
+                                                   last_used,
+                                                   victim_hotness[worst],
+                                                   victim_layers[worst],
+                                                   victim_last_used[worst],
+                                                   protect_layer)) {
                 victim_layers[worst] = layer;
                 victim_experts[worst] = expert;
                 victim_hotness[worst] = hotness;
@@ -13839,8 +13888,14 @@ static void ds4_gpu_stream_expert_cache_prune_global(
                 }
                 const uint32_t hotness =
                     g_stream_expert_cache_route_hotness[layer][expert];
-                if (hotness < lowest_hotness ||
-                    (hotness == lowest_hotness && e->last_used < oldest)) {
+                if (victim_layer == UINT32_MAX ||
+                    ds4_gpu_stream_expert_evict_better(hotness,
+                                                       layer,
+                                                       e->last_used,
+                                                       lowest_hotness,
+                                                       victim_layer,
+                                                       oldest,
+                                                       protect_layer)) {
                     lowest_hotness = hotness;
                     oldest = e->last_used;
                     victim_layer = layer;
