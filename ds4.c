@@ -35886,6 +35886,130 @@ static double glm_graph_streaming_async_profile_ms(void) {
     return now_sec() * 1000.0;
 }
 
+/* Router-ahead prefetch (GLM streaming decode).
+ *
+ * While layer L's selected experts stream in, a worker thread predicts layer
+ * L+1's selection by running L+1's router on L's ffn_norm activation (the
+ * residual-stream similarity of consecutive gating inputs makes this a good
+ * proxy) and issues advisory OS readahead for the predicted experts.  The
+ * prediction never touches cache or compute state: mispredicted hints only
+ * waste SSD bandwidth, and the real load path is unchanged.
+ * Enable with DS4_GLM_ROUTER_AHEAD_PREFETCH=1. */
+typedef struct {
+    const ds4_model   *model;
+    const ds4_weights *weights;
+    uint32_t           il;
+    float              x[DS4_MAX_EMBD];
+} glm_router_ahead_job;
+
+static pthread_mutex_t g_glm_router_ahead_mutex = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t g_glm_router_ahead_cond = PTHREAD_COND_INITIALIZER;
+static glm_router_ahead_job g_glm_router_ahead_job;
+static bool g_glm_router_ahead_job_pending;
+static bool g_glm_router_ahead_worker_started;
+static const ds4_weights *g_glm_router_ahead_weights;
+
+static bool glm_router_ahead_prefetch_enabled(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        cached = getenv("DS4_GLM_ROUTER_AHEAD_PREFETCH") != NULL ? 1 : 0;
+    }
+    return cached != 0;
+}
+
+static void *glm_router_ahead_worker(void *arg) {
+    (void)arg;
+    for (;;) {
+        pthread_mutex_lock(&g_glm_router_ahead_mutex);
+        while (!g_glm_router_ahead_job_pending) {
+            pthread_cond_wait(&g_glm_router_ahead_cond,
+                              &g_glm_router_ahead_mutex);
+        }
+        glm_router_ahead_job job = g_glm_router_ahead_job;
+        g_glm_router_ahead_job_pending = false;
+        pthread_mutex_unlock(&g_glm_router_ahead_mutex);
+
+        const ds4_layer_weights *l = &job.weights->layer[job.il];
+        int selected[DS4_MAX_EXPERT_USED];
+        float expert_weight[DS4_MAX_EXPERT_USED];
+        layer_glm_router_selected_experts(selected,
+                                          expert_weight,
+                                          job.model,
+                                          l,
+                                          job.x);
+        uint64_t gate_in = 0, gate_out = 0, gate_row_bytes = 0;
+        uint64_t down_in = 0, down_out = 0, down_row_bytes = 0;
+        (void)tensor_expert_bytes(job.model, l->ffn_gate_exps, 0,
+                                  &gate_in, &gate_out, &gate_row_bytes);
+        (void)tensor_expert_bytes(job.model, l->ffn_down_exps, 0,
+                                  &down_in, &down_out, &down_row_bytes);
+        int32_t ids[DS4_MAX_EXPERT_USED];
+        for (uint32_t i = 0; i < DS4_N_EXPERT_USED; i++) {
+            ids[i] = (int32_t)selected[i];
+        }
+        (void)ds4_gpu_glm_stream_expert_prefetch_hint(
+                job.il,
+                ids,
+                DS4_N_EXPERT_USED,
+                job.model->map,
+                job.model->size,
+                l->ffn_gate_exps->abs_offset,
+                l->ffn_up_exps->abs_offset,
+                l->ffn_down_exps->abs_offset,
+                gate_out * gate_row_bytes,
+                down_out * down_row_bytes);
+    }
+    return NULL;
+}
+
+static bool glm_router_ahead_ensure_worker(void) {
+    if (g_glm_router_ahead_worker_started) return true;
+    pthread_t tid;
+    if (pthread_create(&tid, NULL, glm_router_ahead_worker, NULL) != 0) {
+        return false;
+    }
+    pthread_detach(tid);
+    g_glm_router_ahead_worker_started = true;
+    return true;
+}
+
+static void glm_router_ahead_prefetch_submit(
+        const ds4_model      *model,
+        uint32_t              il_next,
+        const ds4_gpu_tensor *ffn_norm) {
+    const ds4_weights *weights = g_glm_router_ahead_weights;
+    if (!model || !weights || !ffn_norm) return;
+    if (il_next < DS4_N_LEADING_DENSE) return;
+    if (il_next >= glm_graph_normal_layer_count()) return;
+    const ds4_layer_weights *l = &weights->layer[il_next];
+    if (!l->ffn_gate_inp || !l->ffn_exp_probs_b ||
+        !l->ffn_gate_exps || !l->ffn_up_exps || !l->ffn_down_exps) {
+        return;
+    }
+    if (glm_stream_resident_decode_layer_enabled(l, il_next)) return;
+    if (!glm_router_ahead_ensure_worker()) return;
+
+    pthread_mutex_lock(&g_glm_router_ahead_mutex);
+    if (g_glm_router_ahead_job_pending) {
+        /* Worker still busy with an older prediction: drop, best-effort. */
+        pthread_mutex_unlock(&g_glm_router_ahead_mutex);
+        return;
+    }
+    const bool read_ok = ds4_gpu_tensor_read(
+            (ds4_gpu_tensor *)ffn_norm,
+            0,
+            g_glm_router_ahead_job.x,
+            (uint64_t)DS4_N_EMBD * sizeof(float)) != 0;
+    if (read_ok) {
+        g_glm_router_ahead_job.model = model;
+        g_glm_router_ahead_job.weights = weights;
+        g_glm_router_ahead_job.il = il_next;
+        g_glm_router_ahead_job_pending = true;
+        pthread_cond_signal(&g_glm_router_ahead_cond);
+    }
+    pthread_mutex_unlock(&g_glm_router_ahead_mutex);
+}
+
 static bool glm_graph_encode_sparse_ffn_one(
         ds4_glm_gpu_graph       *g,
         const ds4_model         *model,
@@ -36016,6 +36140,11 @@ static bool glm_graph_encode_sparse_ffn_one(
                     &table,
                     g->router_selected,
                     DS4_N_EXPERT_USED) != 0;
+            if (ok && glm_router_ahead_prefetch_enabled()) {
+                /* Commands were just synced by the early-load readback, so
+                 * this ffn_norm read is cheap; predict L+1 off-thread. */
+                glm_router_ahead_prefetch_submit(model, il + 1u, ffn_norm);
+            }
             if (async_profile) {
                 g_glm_streaming_async_profile.sync_early_load_ms +=
                     glm_graph_streaming_async_profile_ms() - stream_t0;
@@ -39749,6 +39878,7 @@ static bool glm_graph_forward_token(
     }
     if (!input_hc && !g->has_token_embd) return false;
     if (logits_out && !g->has_output_head) return false;
+    g_glm_router_ahead_weights = weights;
     const bool use_indexed_attention =
         glm_graph_decode_uses_indexed_attention(g, pos, logits_out);
     uint32_t decode_layer_flush_interval = 0;

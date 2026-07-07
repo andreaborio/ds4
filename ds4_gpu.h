@@ -298,6 +298,21 @@ int ds4_gpu_qwen35_stream_batch_route_ready_select(
  * the generation. abort() waits for workers but never installs staging. */
 int ds4_gpu_qwen35_stream_batch_finish(uint64_t generation);
 int ds4_gpu_qwen35_stream_batch_abort(uint64_t generation);
+
+/* Router-ahead prefetch: advisory OS readahead for the experts a predictor
+ * expects the NEXT layer to select.  Never touches cache state; safe to call
+ * from a worker thread while the decode thread streams the current layer. */
+int ds4_gpu_glm_stream_expert_prefetch_hint(
+        uint32_t        layer,
+        const int32_t  *expert_ids,
+        uint32_t        n_experts,
+        const void     *model_map,
+        uint64_t        model_size,
+        uint64_t        gate_offset,
+        uint64_t        up_offset,
+        uint64_t        down_offset,
+        uint64_t        gate_expert_bytes,
+        uint64_t        down_expert_bytes);
 #if defined(DS4_ROCM_BUILD) || (!defined(DS4_NO_GPU) && !defined(__APPLE__))
 int ds4_gpu_stream_expert_cache_prepare_selected_batch(
         const ds4_gpu_stream_expert_table *table,

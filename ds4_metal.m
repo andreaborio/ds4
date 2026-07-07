@@ -724,6 +724,21 @@ static uint64_t g_stream_expert_measure_unique_bytes;
 static int g_stream_expert_measure_enabled;
 static uint32_t
     g_stream_expert_cache_route_hotness[DS4_METAL_STREAM_EXPERT_CACHE_MAX_LAYER][DS4_METAL_STREAM_EXPERT_CACHE_MAX_EXPERT];
+/* Router-ahead prefetch state: predictions stashed per layer for accuracy
+ * accounting, plus counters reported by ds4_gpu_print_memory_report.  The
+ * mutex only guards the prediction arrays; the advisory fcntl hints
+ * themselves are thread-safe. */
+static pthread_mutex_t g_glm_prefetch_mutex = PTHREAD_MUTEX_INITIALIZER;
+static int32_t g_glm_prefetch_predicted
+        [DS4_METAL_STREAM_EXPERT_CACHE_MAX_LAYER]
+        [DS4_METAL_STREAM_EXPERT_CACHE_MAX_SELECTED];
+static uint32_t g_glm_prefetch_predicted_n
+        [DS4_METAL_STREAM_EXPERT_CACHE_MAX_LAYER];
+static uint64_t g_glm_prefetch_hint_experts;
+static uint64_t g_glm_prefetch_skip_cached;
+static uint64_t g_glm_prefetch_pred_compared;
+static uint64_t g_glm_prefetch_pred_matched;
+static double g_glm_prefetch_hint_ms;
 static id<MTLBuffer> g_stream_expert_cache_gate_addr_buffers[DS4_METAL_STREAM_EXPERT_CACHE_MAX_LAYER];
 static id<MTLBuffer> g_stream_expert_cache_up_addr_buffers[DS4_METAL_STREAM_EXPERT_CACHE_MAX_LAYER];
 static id<MTLBuffer> g_stream_expert_cache_down_addr_buffers[DS4_METAL_STREAM_EXPERT_CACHE_MAX_LAYER];
@@ -3513,6 +3528,20 @@ void ds4_gpu_print_memory_report(const char *label) {
                     (unsigned long long)g_stream_expert_cache_evictions,
                     (unsigned long long)g_stream_expert_cache_buffer_allocs,
                     (unsigned long long)g_stream_expert_cache_buffer_reuses);
+        }
+        if (g_glm_prefetch_hint_experts != 0 ||
+            g_glm_prefetch_pred_compared != 0) {
+            const double pred_acc = g_glm_prefetch_pred_compared ?
+                (double)g_glm_prefetch_pred_matched /
+                (double)g_glm_prefetch_pred_compared : 0.0;
+            fprintf(stderr,
+                    "ds4:   router-ahead prefetch hinted=%llu skip_cached=%llu predicted_match=%llu/%llu acc=%.3f hint_ms=%.3f\n",
+                    (unsigned long long)g_glm_prefetch_hint_experts,
+                    (unsigned long long)g_glm_prefetch_skip_cached,
+                    (unsigned long long)g_glm_prefetch_pred_matched,
+                    (unsigned long long)g_glm_prefetch_pred_compared,
+                    pred_acc,
+                    g_glm_prefetch_hint_ms);
         }
         if (ds4_gpu_stream_expert_timing_summary_enabled()) {
             const ds4_gpu_stream_expert_timing_snapshot total =
@@ -14460,6 +14489,110 @@ static int ds4_gpu_stream_expert_pending_load_matches(
     return 1;
 }
 
+static void ds4_gpu_glm_stream_prefetch_rdadvise(uint64_t offset, uint64_t len) {
+    if (g_model_fd < 0 || len == 0) return;
+#if defined(F_RDADVISE)
+    uint64_t pos = offset;
+    uint64_t rem = len;
+    while (rem > 0) {
+        const uint64_t chunk64 =
+            rem > (uint64_t)INT_MAX ? (uint64_t)INT_MAX : rem;
+        if (pos > (uint64_t)LLONG_MAX) break;
+        struct radvisory ra;
+        ra.ra_offset = (off_t)pos;
+        ra.ra_count = (int)chunk64;
+        (void)fcntl(g_model_fd, F_RDADVISE, &ra);
+        pos += chunk64;
+        rem -= chunk64;
+    }
+#else
+    (void)offset;
+    (void)len;
+#endif
+}
+
+int ds4_gpu_glm_stream_expert_prefetch_hint(
+        uint32_t        layer,
+        const int32_t  *expert_ids,
+        uint32_t        n_experts,
+        const void     *model_map,
+        uint64_t        model_size,
+        uint64_t        gate_offset,
+        uint64_t        up_offset,
+        uint64_t        down_offset,
+        uint64_t        gate_expert_bytes,
+        uint64_t        down_expert_bytes) {
+    if (!g_ssd_streaming_mode ||
+        !expert_ids ||
+        n_experts == 0 ||
+        n_experts > DS4_METAL_STREAM_EXPERT_CACHE_MAX_SELECTED ||
+        layer >= DS4_METAL_STREAM_EXPERT_CACHE_MAX_LAYER ||
+        gate_expert_bytes == 0 ||
+        down_expert_bytes == 0) {
+        return 0;
+    }
+    const double t0 = ds4_gpu_now_ms();
+    int hinted = 0;
+    pthread_mutex_lock(&g_glm_prefetch_mutex);
+    g_glm_prefetch_predicted_n[layer] = 0;
+    for (uint32_t i = 0; i < n_experts; i++) {
+        if (expert_ids[i] < 0 ||
+            (uint32_t)expert_ids[i] >= DS4_METAL_STREAM_EXPERT_CACHE_MAX_EXPERT) {
+            continue;
+        }
+        const uint32_t expert = (uint32_t)expert_ids[i];
+        g_glm_prefetch_predicted[layer][g_glm_prefetch_predicted_n[layer]++] =
+            (int32_t)expert;
+        const uint64_t gate_abs = gate_offset + (uint64_t)expert * gate_expert_bytes;
+        const uint64_t up_abs = up_offset + (uint64_t)expert * gate_expert_bytes;
+        const uint64_t down_abs = down_offset + (uint64_t)expert * down_expert_bytes;
+        const ds4_gpu_stream_expert_cache_entry *e =
+            &g_stream_expert_cache[layer][expert];
+        if (ds4_gpu_stream_expert_cache_entry_matches(e,
+                                                      model_map,
+                                                      model_size,
+                                                      gate_abs,
+                                                      up_abs,
+                                                      down_abs,
+                                                      gate_expert_bytes,
+                                                      down_expert_bytes)) {
+            g_glm_prefetch_skip_cached++;
+            continue;
+        }
+        ds4_gpu_glm_stream_prefetch_rdadvise(gate_abs, gate_expert_bytes);
+        ds4_gpu_glm_stream_prefetch_rdadvise(up_abs, gate_expert_bytes);
+        ds4_gpu_glm_stream_prefetch_rdadvise(down_abs, down_expert_bytes);
+        hinted++;
+    }
+    g_glm_prefetch_hint_experts += (uint64_t)hinted;
+    g_glm_prefetch_hint_ms += ds4_gpu_now_ms() - t0;
+    pthread_mutex_unlock(&g_glm_prefetch_mutex);
+    return hinted;
+}
+
+/* Called with the layer's REAL selection to score the last prediction. */
+static void ds4_gpu_glm_stream_prefetch_note_selected(
+        uint32_t       layer,
+        const int32_t *selected_ids,
+        uint32_t       n_selected) {
+    if (layer >= DS4_METAL_STREAM_EXPERT_CACHE_MAX_LAYER || !selected_ids) return;
+    pthread_mutex_lock(&g_glm_prefetch_mutex);
+    const uint32_t n_pred = g_glm_prefetch_predicted_n[layer];
+    if (n_pred != 0) {
+        for (uint32_t i = 0; i < n_selected; i++) {
+            g_glm_prefetch_pred_compared++;
+            for (uint32_t j = 0; j < n_pred; j++) {
+                if (g_glm_prefetch_predicted[layer][j] == selected_ids[i]) {
+                    g_glm_prefetch_pred_matched++;
+                    break;
+                }
+            }
+        }
+        g_glm_prefetch_predicted_n[layer] = 0;
+    }
+    pthread_mutex_unlock(&g_glm_prefetch_mutex);
+}
+
 int ds4_gpu_stream_expert_cache_begin_selected_load(
         const ds4_gpu_stream_expert_table *table,
         const int32_t                     *selected_ids,
@@ -14508,6 +14641,8 @@ int ds4_gpu_stream_expert_cache_begin_selected_load(
                                                    down_expert_bytes)) {
         return 1;
     }
+
+    ds4_gpu_glm_stream_prefetch_note_selected(layer, selected_ids, n_selected);
 
     ds4_gpu_stream_expert_pending_load_clear();
     ds4_gpu_stream_expert_pending_load *p = &g_stream_expert_pending_load;

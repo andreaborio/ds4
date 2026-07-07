@@ -13323,3 +13323,22 @@ extern "C" int ds4_gpu_matmul_q8_0_hc_expand_tensor(
            ds4_gpu_hc_expand_split_tensor(out_hc, block_out, residual_hc,
                                             split, n_embd, n_hc);
 }
+
+extern "C" int ds4_gpu_glm_stream_expert_prefetch_hint(
+        uint32_t        layer,
+        const int32_t  *expert_ids,
+        uint32_t        n_experts,
+        const void     *model_map,
+        uint64_t        model_size,
+        uint64_t        gate_offset,
+        uint64_t        up_offset,
+        uint64_t        down_offset,
+        uint64_t        gate_expert_bytes,
+        uint64_t        down_expert_bytes) {
+    /* Advisory-only hook; the CUDA backend has no OS readahead path yet. */
+    (void)layer; (void)expert_ids; (void)n_experts;
+    (void)model_map; (void)model_size;
+    (void)gate_offset; (void)up_offset; (void)down_offset;
+    (void)gate_expert_bytes; (void)down_expert_bytes;
+    return 0;
+}
