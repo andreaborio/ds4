@@ -30818,15 +30818,58 @@ static bool glm_graph_forward_indexed_tokens(
     } while (0)
     ds4_gpu_tensor *last_indexer_selected = NULL;
     uint32_t last_indexer_selected_count = 0;
+    /* The indexed prefill maps each full layer and then pays the sweep as GPU
+     * demand faults during the kernels (~2.6 GB/s measured on an M5 Pro
+     * against ~7 GB/s the SSD can sustain).  Reuse the full-attention layer
+     * prepare (pread pool warming the next layer while this one computes):
+     * measured 3.5 -> 8.5 t/s prefill on a 271-token prompt, decode
+     * unaffected, identical greedy output.  Opt-in while it soaks. */
+    metal_graph_stream_prepare_slot idx_prepare_slots[DS4_STREAM_PREFILL_MAX_PREPARE_AHEAD];
+    memset(idx_prepare_slots, 0, sizeof(idx_prepare_slots));
+    const bool idx_prepare =
+        g->ssd_streaming &&
+        full_layer_prefill &&
+        getenv("DS4_METAL_ENABLE_GLM_INDEXED_PREFILL_PREPARE") != NULL;
     for (uint32_t il = g->layer_start; ok && il <= g->layer_end; il++) {
         const uint32_t slice_layer_done = il - g->layer_start + 1u;
         if (g->ssd_streaming) {
+            if (idx_prepare &&
+                !metal_graph_stream_prepare_join_layer(NULL,
+                                                       model,
+                                                       weights,
+                                                       il,
+                                                       n_tokens,
+                                                       false,
+                                                       true,
+                                                       false,
+                                                       false,
+                                                       idx_prepare_slots,
+                                                       DS4_STREAM_PREFILL_MAX_PREPARE_AHEAD)) {
+                ok = false;
+                break;
+            }
             ok = glm_graph_stream_map_prefill_layer(g,
                                                     model,
                                                     weights,
                                                     il,
                                                     n_tokens,
                                                     full_layer_prefill);
+            if (ok && idx_prepare && il < g->layer_end) {
+                if (!metal_graph_stream_prepare_start_if_needed(
+                            NULL,
+                            model,
+                            weights,
+                            il + 1,
+                            n_tokens,
+                            false,
+                            true,
+                            false,
+                            false,
+                            idx_prepare_slots,
+                            DS4_STREAM_PREFILL_MAX_PREPARE_AHEAD)) {
+                    ok = false;
+                }
+            }
             if (ok) ok = ds4_gpu_begin_commands() != 0;
         }
         const ds4_layer_weights *l = &weights->layer[il];
@@ -31745,6 +31788,11 @@ static bool glm_graph_forward_indexed_tokens(
                     (now_sec() - trace_chunk_t0) * 1000.0);
         }
         (void)ds4_gpu_synchronize();
+    }
+    if (idx_prepare &&
+        !metal_graph_stream_prepare_join_all(idx_prepare_slots,
+                                             DS4_STREAM_PREFILL_MAX_PREPARE_AHEAD)) {
+        ok = false;
     }
     if (ok) {
         glm_graph_report_prefill_display_progress(display_progress,
