@@ -88,8 +88,8 @@ Two caveats, both measured:
 - **Upstream's whole `glm5.2` line decodes DeepSeek Flash ~2.8× slower than `main`**
   (DeepSeek-V4-Flash IQ2XXS: 7-8 → ~2-3 tok/s on an M5 Pro 64 GB under
   `--ssd-streaming`, first token ~5-7 s; bisected to the first commit of the line,
-  verified twice on separate days). Keep DeepSeek work on `main`; an upstream issue
-  report is in preparation.
+  verified twice on separate days). Keep DeepSeek work on `main`; reported upstream as
+  [antirez/ds4#532](https://github.com/antirez/ds4/issues/532).
 - **Speculative decode (MTP) on streamed GLM is a measured NO-GO**: the `blk.78` nextn
   acceptance probe (branch
   [`feat/glm-mtp-probe`](https://github.com/andreaborio/ds4/tree/feat/glm-mtp-probe),
