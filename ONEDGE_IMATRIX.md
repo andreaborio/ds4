@@ -70,13 +70,23 @@ gguf-tools/deepseek4-quantize --hf <fp-source> --template model.gguf \
   prompt length. It is opt-in via `--imatrix-out`, so the default serving path pays nothing. Profile
   with `DS4_METAL_GRAPH_PREFILL_PROFILE=1`.
 
-## Verification
+## Verification (measured 2026-06-08 — DeepSeek-V4-Flash IQ2, M5 64 GB)
 
-1. **Default bit-identical (structural):** without `--imatrix-out`, `s->imatrix` stays NULL, so every
-   prefill site behaves exactly as before, and collecting is a pure read-side-channel that never writes
-   back into the graph. Confirm by diffing greedy token output with vs. without the patch.
-2. **Valid `.dat`:** run with `--imatrix-every 4 --imatrix-min-requests 2`, send ≥4 prompts, confirm
-   the file appears; header `int32 entries == DS4_N_LAYER*3`, gate/up/down per layer; feed it to
-   `deepseek4-quantize` as a calibration imatrix and confirm it loads.
-3. **Privacy:** grep the produced `.dat` for any prompt substring — absent (binary floats + static
-   tensor names only); confirm no other file is written on the prefill path.
+1. **Bit-identical:** the same 8 MedXpertQA prompts run with the collector ON and OFF gave
+   **8/8 identical predictions**. The collection is a pure side-channel — it does not perturb the
+   forward pass. (The default OFF path is also a NULL-guarded no-op by construction: without
+   `--imatrix-out`, `s->imatrix` stays NULL and every prefill site behaves exactly as before.)
+2. **Valid `.dat`:** `--imatrix-every 4 --imatrix-min-requests 2`, 12 live prompts → snapshots fired
+   at 4 and 8 prompts; `edge.dat` = 430 MB, **129 entries** (= 43 layers × 3, identical structure to
+   an offline-collected imatrix); `deepseek4-quantize` loads it (`loaded imatrix …: 129 entries`).
+3. **Privacy:** grep of the `.dat` for prompt keywords (patient, emergency, year-old, diagnosis,
+   treatment) → **0 occurrences**; only binary float bytes + static tensor names. No other file is
+   written on the prefill path.
+4. **Slowdown (prefill only; decode unaffected).** Measured on the server path, same prompts OFF vs
+   ON, fresh restarts. Short MCQ prompts (~300 tok): **+6 %** (SSD-streaming-dominated). Long prompts
+   (~4 k tok, 4 distinct, mean): **+31 %** (OFF 26.0 s → ON 34.1 s) — once the prefill is
+   compute-bound the layer-major path penalty dominates, so the cost **grows with prompt length**.
+   Opt-in via `--imatrix-out`: the default serving path pays nothing.
+5. **Re-verified 2026-07-10 on current main:** `ds4_test --server` OK with the feature compiled in
+   and disabled; live smoke with `--imatrix-out --imatrix-every 2 --imatrix-min-requests 2` writes a
+   valid 129-entry snapshot from real requests.
