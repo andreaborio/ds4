@@ -1,5 +1,28 @@
 # DwarfStar
 
+> **This is [`andreaborio/ds4`](https://github.com/andreaborio/ds4), a fork of
+> [antirez/ds4](https://github.com/antirez/ds4).** What differs from upstream, at a glance:
+>
+> - **Five mainline additions**, all default-off or behavior-preserving, everything else
+>   tracks upstream: on-edge/live imatrix collection in `ds4-server`, incremental
+>   re-quantization (`--reuse`, measured ~14× faster variant builds), re-calibration reuse,
+>   a mixed-precision streaming fix (since converged upstream), and expert prune/profile
+>   hooks — details in [This fork](#this-fork-andreaboriods4) below, plus a quality-score
+>   build/scorer fix proposed as [antirez/ds4#434](https://github.com/antirez/ds4/pull/434).
+> - **A GLM 5.2 SSD-streaming line** (branch
+>   [`codex/glm52-upstream-clean-bench`](https://github.com/andreaborio/ds4/tree/codex/glm52-upstream-clean-bench),
+>   not mainline): correctness fixes and prefill performance work for streamed GLM 5.2 on
+>   64 GB Apple Silicon, proposed upstream as
+>   [antirez/ds4#520](https://github.com/antirez/ds4/pull/520) and
+>   [antirez/ds4#528](https://github.com/antirez/ds4/pull/528).
+> - **Every performance claim is documented with its repro commands**: measured verification
+>   in [`SSD_STREAMING_VERIFICATION.md`](SSD_STREAMING_VERIFICATION.md), upstreamability
+>   status per change in [`FORK_NOTES.md`](FORK_NOTES.md), sync history in
+>   [`MERGE_LOG.md`](MERGE_LOG.md).
+> - **Upstream PRs currently open**: [#434](https://github.com/antirez/ds4/pull/434)
+>   (build fix), [#520](https://github.com/antirez/ds4/pull/520) (GLM streaming prefill fix),
+>   [#528](https://github.com/antirez/ds4/pull/528) (GLM indexed prefill prepare).
+
 **DwarfStar** is a small native inference engine optimized first for
 **DeepSeek V4 Flash**, with support for **DeepSeek V4 PRO** on very high-memory
 machines. It is
@@ -33,14 +56,49 @@ no longer supported, unless there is some kind of overlap of abilities.
 This is a fork of [antirez/ds4 (DwarfStar)](https://github.com/antirez/ds4) that tracks
 upstream, with **five mainline additions** used by
 [forgequant](https://github.com/andreaborio/forgequant). Everything else is upstream
-DwarfStar (sections below); these are the only deltas. Last synced with upstream `main`
-at the merge recorded in [`MERGE_LOG.md`](MERGE_LOG.md).
+DwarfStar (sections below); these are the only inference-engine deltas on `main`. The
+remaining fork commits are the quality-score build/scorer fix under `gguf-tools/`
+(proposed upstream as [antirez/ds4#434](https://github.com/antirez/ds4/pull/434)) and
+documentation ([`FORK_NOTES.md`](FORK_NOTES.md), [`MERGE_LOG.md`](MERGE_LOG.md),
+[`SSD_STREAMING_VERIFICATION.md`](SSD_STREAMING_VERIFICATION.md)).
+Last synced with upstream `main` at the merge recorded in [`MERGE_LOG.md`](MERGE_LOG.md).
 
-There is also an experimental GLM-5.2 line of work on
-[`wip/glm52-metal64-strict-probe`](https://github.com/andreaborio/ds4/tree/wip/glm52-metal64-strict-probe).
-It is not part of this mainline branch yet: it targets a ds4-native GLM-5.2 GGUF,
-has only been locally exercised on Apple Silicon / Metal, and should be treated as
-short-context bring-up work rather than general or production-ready GLM support.
+### The GLM 5.2 SSD-streaming line (not mainline)
+
+The fork also carries a GLM 5.2 line on
+[`codex/glm52-upstream-clean-bench`](https://github.com/andreaborio/ds4/tree/codex/glm52-upstream-clean-bench):
+upstream's `glm5.2` branch (`bd89932`) plus eleven commits — the streaming prefill
+correctness fixes proposed as
+[antirez/ds4#520](https://github.com/antirez/ds4/pull/520) (real-size prompts were
+failing under `--ssd-streaming`; independently validated by a third party on an M4 Max
+128 GB), the indexed-prefill layer-prepare overlap proposed as
+[antirez/ds4#528](https://github.com/antirez/ds4/pull/528) (measured prefill ×1.6-2.0
+across a 2048-8192 sweep in the PR, ×2.4-2.5 re-measured on short prompts, decode
+unchanged, greedy output byte-identical), the ds4-native GLM 5.2 GGUF layout support the
+line runs on, a copy of the RAM guard (upstreamed separately, see
+[`FORK_NOTES.md`](FORK_NOTES.md)), and a set of default-off streaming experiments
+(router-ahead prefetch, expert prune/profile hooks, virtual resident decode layers).
+The short-prompt speedup, the regression below and the MTP gate were re-verified
+independently with paired A/B runs
+([`SSD_STREAMING_VERIFICATION.md`](SSD_STREAMING_VERIFICATION.md)); the sweep figures
+are from [#528](https://github.com/antirez/ds4/pull/528)'s benchmark.
+
+Two caveats, both measured:
+
+- **Upstream's whole `glm5.2` line decodes DeepSeek Flash ~2.8× slower than `main`**
+  (DeepSeek-V4-Flash IQ2XXS: 7-8 → ~2-3 tok/s on an M5 Pro 64 GB under
+  `--ssd-streaming`, first token ~5-7 s; bisected to the first commit of the line,
+  verified twice on separate days). Keep DeepSeek work on `main`; an upstream issue
+  report is in preparation.
+- **Speculative decode (MTP) on streamed GLM is a measured NO-GO**: the `blk.78` nextn
+  acceptance probe (branch
+  [`feat/glm-mtp-probe`](https://github.com/andreaborio/ds4/tree/feat/glm-mtp-probe),
+  a reusable measurement tool; GLM 5.2 ds4-native build) reads ~55% acceptance against
+  the ~75% needed to pay for the extra I/O.
+
+The older bring-up branch
+[`wip/glm52-metal64-strict-probe`](https://github.com/andreaborio/ds4/tree/wip/glm52-metal64-strict-probe)
+predates this line and is kept as history.
 
 ### 1. On-edge / real-time imatrix collection: `ds4-server --imatrix-out`
 
