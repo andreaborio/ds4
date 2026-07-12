@@ -1477,7 +1477,10 @@ static cli_config parse_options(int argc, char **argv) {
         } else if (!strcmp(arg, "--quality")) {
             c.engine.quality = true;
         } else if (!strcmp(arg, "--ssd-streaming")) {
-            c.engine.ssd_streaming = true;
+            c.engine.residency = DS4_RESIDENCY_SSD;
+        } else if (!strcmp(arg, "--resident") ||
+                   !strcmp(arg, "--no-ssd-streaming")) {
+            c.engine.residency = DS4_RESIDENCY_RESIDENT;
         } else if (!strcmp(arg, "--ssd-streaming-cold")) {
             c.engine.ssd_streaming_cold = true;
         } else if (!strcmp(arg, "--ssd-streaming-cache-experts")) {
@@ -1625,6 +1628,7 @@ static cli_config parse_options(int argc, char **argv) {
         fprintf(stderr, "ds4: --perplexity-file does not use -p/--prompt-file\n");
         exit(2);
     }
+    c.engine.context_size = (uint32_t)c.gen.ctx_size;
     char dist_err[256];
     if (ds4_dist_prepare_engine_options(c.dist, &c.engine, dist_err, sizeof(dist_err)) != 0) {
         fprintf(stderr, "ds4: %s\n", dist_err);
@@ -1635,6 +1639,10 @@ static cli_config parse_options(int argc, char **argv) {
 }
 
 int main(int argc, char **argv) {
+    if (ds4_build_info_requested(argc, argv)) {
+        ds4_build_info_print(stdout);
+        return 0;
+    }
     cli_config cfg = parse_options(argc, argv);
     if (cfg.gen.dump_tokens) {
         if (cfg.gen.prompt == NULL) {

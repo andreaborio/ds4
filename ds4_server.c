@@ -11628,7 +11628,10 @@ static server_config parse_options(int argc, char **argv) {
         } else if (!strcmp(arg, "--quality")) {
             c.engine.quality = true;
         } else if (!strcmp(arg, "--ssd-streaming")) {
-            c.engine.ssd_streaming = true;
+            c.engine.residency = DS4_RESIDENCY_SSD;
+        } else if (!strcmp(arg, "--resident") ||
+                   !strcmp(arg, "--no-ssd-streaming")) {
+            c.engine.residency = DS4_RESIDENCY_RESIDENT;
         } else if (!strcmp(arg, "--ssd-streaming-cold")) {
             c.engine.ssd_streaming_cold = true;
         } else if (!strcmp(arg, "--ssd-streaming-cache-experts")) {
@@ -11710,6 +11713,7 @@ static server_config parse_options(int argc, char **argv) {
     if (c.engine.directional_steering_file && !directional_steering_scale_set) {
         c.engine.directional_steering_ffn = 1.0f;
     }
+    c.engine.context_size = (uint32_t)c.ctx_size;
     char dist_err[256];
     if (ds4_dist_prepare_engine_options(&c.engine.distributed,
                                         &c.engine,
@@ -11723,6 +11727,10 @@ static server_config parse_options(int argc, char **argv) {
 
 #ifndef DS4_SERVER_TEST
 int main(int argc, char **argv) {
+    if (ds4_build_info_requested(argc, argv)) {
+        ds4_build_info_print(stdout);
+        return 0;
+    }
     signal(SIGPIPE, SIG_IGN);
     struct sigaction sa;
     memset(&sa, 0, sizeof(sa));

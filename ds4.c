@@ -98,6 +98,16 @@ static bool ds4_backend_supports_streaming_auto_cache(ds4_backend backend) {
     return false;
 }
 
+static bool ds4_backend_available_in_build(ds4_backend backend) {
+#ifdef DS4_NO_GPU
+    return backend == DS4_BACKEND_CPU;
+#elif defined(__APPLE__)
+    return backend == DS4_BACKEND_METAL || backend == DS4_BACKEND_CPU;
+#else
+    return backend == DS4_BACKEND_CUDA || backend == DS4_BACKEND_CPU;
+#endif
+}
+
 /* =========================================================================
  * DeepSeek V4 Shape Profiles.
  * =========================================================================
@@ -3393,27 +3403,6 @@ static ds4_gpu_stream_expert_table graph_stream_expert_table_make(
     return table;
 }
 #endif
-
-static uint64_t ds4_streaming_manual_cache_safe_bytes(void) {
-#ifdef DS4_NO_GPU
-    return 0;
-#else
-    const uint64_t gib = 1024ull * 1024ull * 1024ull;
-    const uint64_t recommended = ds4_gpu_recommended_working_set_size();
-    if (recommended == 0) return 0;
-
-    /*
-     * Explicit NGB budgets name only the routed expert cache.  Keep that cache
-     * below the full Metal working-set recommendation so non-routed weights,
-     * scratch buffers, KV, and macOS wired-memory overhead do not force expert
-     * slots out of mlock during decode.
-     */
-    uint64_t safe = recommended > UINT64_MAX / 7ull ?
-        UINT64_MAX : (recommended * 7ull) / 10ull;
-    safe = (safe / gib) * gib;
-    return safe;
-#endif
-}
 
 static void tensor_expect_routed_expert(
         const ds4_tensor *t,
@@ -21873,6 +21862,9 @@ struct ds4_engine {
     uint64_t ssd_streaming_cache_bytes;
     uint32_t ssd_streaming_preload_experts;
     ds4_ssd_memory_lock simulated_memory;
+    ds4_residency_mode residency_requested;
+    ds4_residency_mode residency;
+    ds4_residency_plan residency_plan;
     bool quality;
     bool ssd_streaming;
     bool ssd_streaming_cold;
@@ -25449,7 +25441,39 @@ static bool ds4_engine_configure_streaming_auto_cache(ds4_engine *e) {
     if (recommended == 0) {
         fprintf(stderr,
                 "ds4: SSD streaming auto cache: recommended working set unavailable; "
-                "set --ssd-streaming-cache-experts N or NGB explicitly\n");
+                "cannot choose a safe cache automatically; set "
+                "--ssd-streaming-cache-experts N or NGB explicitly\n");
+        return false;
+    }
+
+    uint64_t headroom_bytes = e->residency_plan.headroom_bytes;
+    if (headroom_bytes == 0) {
+        headroom_bytes = recommended / 5u;
+        const uint64_t min_headroom = 2ull * 1024ull * 1024ull * 1024ull;
+        if (headroom_bytes < min_headroom) headroom_bytes = min_headroom;
+    }
+    uint64_t external_and_headroom =
+        e->residency_plan.external_reserved_bytes;
+    if (external_and_headroom > UINT64_MAX -
+                                headroom_bytes) {
+        external_and_headroom = UINT64_MAX;
+    } else {
+        external_and_headroom += headroom_bytes;
+    }
+    uint64_t reserved_bytes = 0;
+    uint64_t model_target_bytes = 0;
+    if (!ds4_ssd_working_set_after_reserve(
+            recommended,
+            e->residency_plan.runtime_bytes,
+            external_and_headroom,
+            &model_target_bytes,
+            &reserved_bytes)) {
+        fprintf(stderr,
+                "ds4: SSD streaming auto cache: context/runtime plus external "
+                "reserve (%.2f GiB) consumes the %.2f GiB recommended working set; "
+                "reduce context or set an explicit cache budget\n",
+                (double)reserved_bytes / 1073741824.0,
+                (double)recommended / 1073741824.0);
         return false;
     }
 
@@ -25467,13 +25491,24 @@ static bool ds4_engine_configure_streaming_auto_cache(ds4_engine *e) {
         return false;
     }
 
+    if (model_target_bytes <= non_routed_bytes ||
+        model_target_bytes - non_routed_bytes < per_expert_bytes) {
+        fprintf(stderr,
+                "ds4: SSD streaming auto cache: safe %.2f GiB model target "
+                "cannot fit %.2f GiB non-routed weights plus one %.2f MiB expert\n",
+                (double)model_target_bytes / 1073741824.0,
+                (double)non_routed_bytes / 1073741824.0,
+                (double)per_expert_bytes / 1048576.0);
+        return false;
+    }
+
     const uint64_t max_model_experts = (uint64_t)DS4_N_LAYER * (uint64_t)DS4_N_EXPERT;
     ds4_ssd_cache_plan plan;
-    if (!ds4_ssd_auto_cache_plan(recommended,
-                                 non_routed_bytes,
-                                 per_expert_bytes,
-                                 max_model_experts,
-                                 &plan)) {
+    if (!ds4_ssd_cache_plan_for_model_target(model_target_bytes,
+                                              non_routed_bytes,
+                                              per_expert_bytes,
+                                              max_model_experts,
+                                              &plan)) {
         fprintf(stderr,
                 "ds4: SSD streaming auto cache could not compute a valid cache budget\n");
         return false;
@@ -25487,7 +25522,12 @@ static bool ds4_engine_configure_streaming_auto_cache(ds4_engine *e) {
             ds4_backend_name(e->backend),
             (double)recommended / 1073741824.0);
     fprintf(stderr,
-            "ds4:   using 80%% total for model + cached experts: %.2f GiB\n",
+            "ds4:   reserving %.2f GiB for context/KV/scratch, external pressure, "
+            "and backend headroom; %.2f GiB remains for the streaming model plan\n",
+            (double)reserved_bytes / 1073741824.0,
+            (double)model_target_bytes / 1073741824.0);
+    fprintf(stderr,
+            "ds4:   model + cached expert target after reserves: %.2f GiB\n",
             (double)plan.model_target_bytes / 1073741824.0);
     fprintf(stderr,
             "ds4:   non-routed weights: %.2f GiB\n",
@@ -25499,12 +25539,164 @@ static bool ds4_engine_configure_streaming_auto_cache(ds4_engine *e) {
             "ds4:   cached expert count: %u (%.2f GiB)\n",
             e->ssd_streaming_cache_experts,
             (double)plan.effective_cache_bytes / 1073741824.0);
-    if (plan.model_target_bytes <= non_routed_bytes) {
-        fprintf(stderr,
-                "ds4:   note: non-routed weights already fill the 80%% target; keeping a one-expert cache\n");
-    }
     return true;
 #endif
+}
+
+static bool ds4_engine_normalize_residency_request(
+        const ds4_engine_options *opt,
+        ds4_residency_mode       *mode_out) {
+    if (!opt || !mode_out || opt->residency < DS4_RESIDENCY_AUTO ||
+        opt->residency > DS4_RESIDENCY_SSD) {
+        fprintf(stderr, "ds4: invalid residency mode\n");
+        return false;
+    }
+
+    ds4_residency_mode mode = opt->residency;
+    const bool has_ssd_specific_options =
+        opt->ssd_streaming_cold ||
+        opt->ssd_streaming_cache_experts != 0 ||
+        opt->ssd_streaming_cache_bytes != 0 ||
+        opt->ssd_streaming_preload_experts != 0;
+
+    if (opt->ssd_streaming || has_ssd_specific_options) {
+        if (mode == DS4_RESIDENCY_RESIDENT) {
+            fprintf(stderr,
+                    "ds4: resident mode conflicts with SSD streaming options\n");
+            return false;
+        }
+        mode = DS4_RESIDENCY_SSD;
+    }
+    *mode_out = mode;
+    return true;
+}
+
+static uint64_t ds4_model_tensor_bytes(const ds4_model *model) {
+    if (!model) return 0;
+    uint64_t bytes = 0;
+    for (uint64_t i = 0; i < model->n_tensors; i++) {
+        const uint64_t tensor_bytes = model->tensors[i].bytes;
+        if (bytes > UINT64_MAX - tensor_bytes) return UINT64_MAX;
+        bytes += tensor_bytes;
+    }
+    return bytes;
+}
+
+static bool ds4_file_size_bytes(const char *path, uint64_t *bytes_out) {
+    if (bytes_out) *bytes_out = 0;
+    if (!path || !path[0] || !bytes_out) return false;
+    struct stat st;
+    if (stat(path, &st) != 0 || st.st_size < 0) return false;
+    *bytes_out = (uint64_t)st.st_size;
+    return true;
+}
+
+static bool ds4_engine_resolve_residency(ds4_engine               *e,
+                                         const ds4_engine_options *opt,
+                                         bool                      load_slice,
+                                         uint32_t                  load_layer_start,
+                                         uint32_t                  load_layer_end,
+                                         bool                      load_output) {
+    if (!e || !opt) return false;
+
+    if (opt->inspect_only) {
+        memset(&e->residency_plan, 0, sizeof(e->residency_plan));
+        e->residency_plan.requested = e->residency_requested;
+        e->residency_plan.resolved =
+            e->residency_requested == DS4_RESIDENCY_SSD ?
+            DS4_RESIDENCY_SSD : DS4_RESIDENCY_RESIDENT;
+        e->residency_plan.reason = DS4_RESIDENCY_REASON_INSPECT_ONLY;
+        e->residency = e->residency_plan.resolved;
+        e->ssd_streaming = e->residency == DS4_RESIDENCY_SSD;
+        fprintf(stderr,
+                "ds4: residency requested=%s deferred: %s\n",
+                ds4_residency_mode_name(e->residency_requested),
+                ds4_residency_reason_name(e->residency_plan.reason));
+        return true;
+    }
+
+    uint64_t model_bytes = 0;
+    if (load_slice) {
+        ds4_model_map_span_vec spans;
+        if (!weights_model_map_spans(&e->weights,
+                                     load_layer_start,
+                                     load_layer_end,
+                                     load_output,
+                                     &spans)) {
+            fprintf(stderr,
+                    "ds4: could not measure resident model slice %u:%u\n",
+                    load_layer_start,
+                    load_layer_end);
+            return false;
+        }
+        model_bytes = model_map_span_vec_total_bytes(&spans);
+        free(spans.v);
+    } else {
+        model_bytes = ds4_model_tensor_bytes(&e->model);
+    }
+    if (opt->mtp_path && opt->mtp_path[0]) {
+        uint64_t mtp_bytes = 0;
+        if (!ds4_file_size_bytes(opt->mtp_path, &mtp_bytes)) {
+            fprintf(stderr,
+                    "ds4: cannot stat MTP model while planning residency: %s\n",
+                    opt->mtp_path);
+            return false;
+        }
+        model_bytes = model_bytes > UINT64_MAX - mtp_bytes ?
+                      UINT64_MAX : model_bytes + mtp_bytes;
+    }
+
+    const uint32_t context_size = opt->context_size != 0 ?
+                                  opt->context_size : 32768u;
+    const ds4_context_memory context =
+        ds4_context_memory_estimate_with_prefill(e->backend,
+                                                 (int)context_size,
+                                                 opt->prefill_chunk);
+    uint64_t recommended = 0;
+#ifndef DS4_NO_GPU
+    if (e->backend == DS4_BACKEND_METAL &&
+        e->residency_requested != DS4_RESIDENCY_RESIDENT) {
+        recommended = ds4_gpu_recommended_working_set_size();
+    }
+#endif
+
+    if (!ds4_residency_plan_make(e->backend == DS4_BACKEND_METAL,
+                                 e->residency_requested,
+                                 model_bytes,
+                                 context.total_bytes,
+                                 recommended,
+                                 opt->simulate_used_memory_bytes,
+                                 &e->residency_plan)) {
+        fprintf(stderr, "ds4: could not resolve residency plan\n");
+        return false;
+    }
+    e->residency = e->residency_plan.resolved;
+    e->ssd_streaming = e->residency == DS4_RESIDENCY_SSD;
+
+    fprintf(stderr,
+            "ds4: residency requested=%s resolved=%s: %s\n",
+            ds4_residency_mode_name(e->residency_requested),
+            ds4_residency_mode_name(e->residency),
+            ds4_residency_reason_name(e->residency_plan.reason));
+    if (e->residency_requested == DS4_RESIDENCY_AUTO &&
+        e->backend == DS4_BACKEND_METAL) {
+        fprintf(stderr,
+                "ds4:   model %.2f GiB + context/KV/scratch %.2f GiB + "
+                "headroom %.2f GiB = %.2f GiB required; budget %.2f GiB",
+                (double)e->residency_plan.model_bytes / 1073741824.0,
+                (double)e->residency_plan.runtime_bytes / 1073741824.0,
+                (double)e->residency_plan.headroom_bytes / 1073741824.0,
+                (double)e->residency_plan.required_bytes / 1073741824.0,
+                (double)e->residency_plan.budget_bytes / 1073741824.0);
+        if (e->residency_plan.external_reserved_bytes != 0) {
+            fprintf(stderr,
+                    " after %.2f GiB external reserve",
+                    (double)e->residency_plan.external_reserved_bytes /
+                    1073741824.0);
+        }
+        fputc('\n', stderr);
+    }
+    return true;
 }
 
 static bool ds4_engine_preload_pro_q4_expert_tables(
@@ -25596,12 +25788,48 @@ static bool ds4_engine_preload_pro_q4_expert_tables(
 }
 
 int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
+    if (!out || !opt || !opt->model_path || !opt->model_path[0]) {
+        fprintf(stderr, "ds4: engine open needs a model path and output pointer\n");
+        if (out) *out = NULL;
+        return 1;
+    }
+    *out = NULL;
+    if (!ds4_backend_available_in_build(opt->backend)) {
+        fprintf(stderr,
+                "ds4: %s backend requested but it is unavailable in this build\n",
+                ds4_backend_name(opt->backend));
+        return 1;
+    }
+    fprintf(stderr,
+            "ds4: build git=%s compiled=%s-%s runtime=%s\n",
+            ds4_build_git_sha(),
+            ds4_build_backend(),
+            ds4_build_arch(),
+            ds4_backend_name(opt->backend));
+    ds4_residency_mode residency_requested = DS4_RESIDENCY_AUTO;
+    if (!ds4_engine_normalize_residency_request(opt,
+                                                &residency_requested)) {
+        return 1;
+    }
+    if (residency_requested == DS4_RESIDENCY_SSD &&
+        !ds4_backend_supports_ssd_streaming(opt->backend)) {
+        fprintf(stderr,
+                "ds4: SSD residency is currently supported only with "
+                "Metal, CUDA, or ROCm\n");
+        return 1;
+    }
+    if (residency_requested == DS4_RESIDENCY_SSD &&
+        opt->mtp_path && opt->mtp_path[0]) {
+        fprintf(stderr, "ds4: SSD residency is not compatible with --mtp yet\n");
+        return 1;
+    }
+
     ds4_engine *e = xcalloc(1, sizeof(*e));
     e->model.fd = -1;
     e->mtp_model.fd = -1;
     e->backend = opt->backend;
     e->quality = opt->quality;
-    e->ssd_streaming = opt->ssd_streaming;
+    e->residency_requested = residency_requested;
     e->ssd_streaming_cold = opt->ssd_streaming_cold;
     e->distributed = opt->distributed;
     e->power_percent = opt->power_percent > 0 ? opt->power_percent : 100;
@@ -25656,14 +25884,41 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
     const bool graph_backend = ds4_backend_uses_graph(opt->backend);
     if (graph_backend) ds4_linux_graph_backend_set_oom_score(opt->backend);
     model_open(&e->model, opt->model_path, graph_backend, !opt->inspect_only);
-    if (opt->warm_weights) model_warm_weights(&e->model);
     if (!opt->inspect_only) vocab_load(&e->vocab, &e->model);
     config_validate_model(&e->model);
-    if (e->ssd_streaming && !ds4_backend_supports_ssd_streaming(e->backend)) {
-        fprintf(stderr, "ds4: --ssd-streaming is currently supported only with --metal/--cuda/--rocm\n");
+    weights_bind(&e->weights,
+                 &e->model,
+                 load_slice,
+                 load_layer_start,
+                 load_layer_end,
+                 load_output,
+                 load_output_optional);
+    const bool resident_map_output =
+        load_output ||
+        (load_output_optional && weights_have_output_head(&e->weights));
+    if (!ds4_engine_resolve_residency(e,
+                                      opt,
+                                      load_slice,
+                                      load_layer_start,
+                                      load_layer_end,
+                                      resident_map_output)) {
         ds4_engine_close(e);
-        *out = NULL;
         return 1;
+    }
+    if (e->ssd_streaming && opt->mtp_path && opt->mtp_path[0]) {
+        fprintf(stderr,
+                "ds4: AUTO selected SSD residency, which is not compatible "
+                "with --mtp yet; use --resident only if the logged plan is safe\n");
+        ds4_engine_close(e);
+        return 1;
+    }
+    if (opt->warm_weights) {
+        if (e->ssd_streaming) {
+            fprintf(stderr,
+                    "ds4: --warm-weights ignored because residency resolved to SSD\n");
+        } else {
+            model_warm_weights(&e->model);
+        }
     }
     const char *expert_profile_path = opt->expert_profile_path;
     if (!expert_profile_path || !expert_profile_path[0]) {
@@ -25680,26 +25935,71 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
                     ds4_backend_name(e->backend));
         }
     }
-    weights_bind(&e->weights,
-                 &e->model,
-                 load_slice,
-                 load_layer_start,
-                 load_layer_end,
-                 load_output,
-                 load_output_optional);
     if (e->ssd_streaming && e->ssd_streaming_cache_bytes != 0) {
         const uint64_t requested_cache_bytes = e->ssd_streaming_cache_bytes;
-        const uint64_t safe_cache_bytes =
-            ds4_streaming_manual_cache_safe_bytes();
-        if (safe_cache_bytes != 0 &&
-            e->ssd_streaming_cache_bytes > safe_cache_bytes) {
-            e->ssd_streaming_cache_bytes = safe_cache_bytes;
-            fprintf(stderr,
-                    "ds4: %s SSD streaming cache budget %.2f GiB capped to %.2f GiB "
-                    "to keep expert buffers lockable\n",
-                    ds4_backend_name(e->backend),
-                    (double)requested_cache_bytes / 1073741824.0,
-                    (double)e->ssd_streaming_cache_bytes / 1073741824.0);
+        if (ds4_backend_supports_streaming_auto_cache(e->backend)) {
+            uint64_t recommended_bytes =
+                e->residency_plan.recommended_bytes;
+#ifndef DS4_NO_GPU
+            if (recommended_bytes == 0) {
+                recommended_bytes = ds4_gpu_recommended_working_set_size();
+            }
+#endif
+            if (recommended_bytes == 0) {
+                fprintf(stderr,
+                        "ds4: %s recommended working set is unavailable; "
+                        "honoring the explicit SSD cache budget without an automatic cap\n",
+                        ds4_backend_name(e->backend));
+            } else {
+                uint64_t headroom_bytes = e->residency_plan.headroom_bytes;
+                if (headroom_bytes == 0) {
+                    headroom_bytes = recommended_bytes / 5u;
+                    const uint64_t min_headroom =
+                        2ull * 1024ull * 1024ull * 1024ull;
+                    if (headroom_bytes < min_headroom) {
+                        headroom_bytes = min_headroom;
+                    }
+                }
+                uint64_t external_and_headroom =
+                    e->residency_plan.external_reserved_bytes;
+                if (external_and_headroom > UINT64_MAX -
+                                            headroom_bytes) {
+                    external_and_headroom = UINT64_MAX;
+                } else {
+                    external_and_headroom += headroom_bytes;
+                }
+                uint64_t model_target_bytes = 0;
+                uint64_t reserved_bytes = 0;
+                uint64_t non_routed_bytes = 0;
+                if (!ds4_ssd_working_set_after_reserve(
+                        recommended_bytes,
+                        e->residency_plan.runtime_bytes,
+                        external_and_headroom,
+                        &model_target_bytes,
+                        &reserved_bytes) ||
+                    !weights_streaming_non_routed_bytes(&e->weights,
+                                                        &non_routed_bytes) ||
+                    model_target_bytes <= non_routed_bytes) {
+                    fprintf(stderr,
+                            "ds4: requested SSD cache has no safe %s budget after "
+                            "context, non-routed weights, and headroom\n",
+                            ds4_backend_name(e->backend));
+                    ds4_engine_close(e);
+                    return 1;
+                }
+                const uint64_t safe_cache_bytes =
+                    model_target_bytes - non_routed_bytes;
+                if (e->ssd_streaming_cache_bytes > safe_cache_bytes) {
+                    e->ssd_streaming_cache_bytes = safe_cache_bytes;
+                    fprintf(stderr,
+                            "ds4: %s SSD streaming cache budget %.2f GiB capped to %.2f GiB "
+                            "after reserving %.2f GiB for context and backend headroom\n",
+                            ds4_backend_name(e->backend),
+                            (double)requested_cache_bytes / 1073741824.0,
+                            (double)e->ssd_streaming_cache_bytes / 1073741824.0,
+                            (double)reserved_bytes / 1073741824.0);
+                }
+            }
         }
         uint64_t per_expert_bytes = 0;
         const uint32_t budget =
@@ -25733,12 +26033,6 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
     }
     if (opt->mtp_path && opt->mtp_path[0] &&
         opt->distributed.role == DS4_DISTRIBUTED_NONE) {
-        if (e->ssd_streaming) {
-            fprintf(stderr, "ds4: --ssd-streaming is not compatible with --mtp yet\n");
-            ds4_engine_close(e);
-            *out = NULL;
-            return 1;
-        }
         model_open(&e->mtp_model, opt->mtp_path, graph_backend, true);
         mtp_weights_bind(&e->mtp_weights, &e->mtp_model);
         e->mtp_ready = true;
@@ -25748,22 +26042,6 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
     }
 
 #ifndef DS4_NO_GPU
-    if (e->backend == DS4_BACKEND_CUDA) {
-#ifdef __APPLE__
-        fprintf(stderr, "ds4: CUDA backend requested but this build is linked with Metal, not CUDA\n");
-        ds4_engine_close(e);
-        *out = NULL;
-        return 1;
-#endif
-    }
-    if (e->backend == DS4_BACKEND_METAL) {
-#ifndef __APPLE__
-        fprintf(stderr, "ds4: Metal backend requested but this build is linked with CUDA, not Metal\n");
-        ds4_engine_close(e);
-        *out = NULL;
-        return 1;
-#endif
-    }
     if (graph_backend) {
         e->metal_ready = ds4_gpu_init() != 0;
         if (!e->metal_ready) {

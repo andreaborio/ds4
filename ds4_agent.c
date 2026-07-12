@@ -475,9 +475,18 @@ static float parse_float_range(const char *s, const char *opt, float min, float 
 
 static ds4_backend parse_backend(const char *s) {
     if (!strcmp(s, "metal")) return DS4_BACKEND_METAL;
+#ifdef DS4_ROCM_BUILD
+    if (!strcmp(s, "rocm")) return DS4_BACKEND_CUDA;
+#else
     if (!strcmp(s, "cuda")) return DS4_BACKEND_CUDA;
+#endif
     if (!strcmp(s, "cpu")) return DS4_BACKEND_CPU;
     fprintf(stderr, "ds4-agent: invalid backend: %s\n", s);
+#ifdef DS4_ROCM_BUILD
+    fprintf(stderr, "ds4-agent: valid backends are: metal, rocm, cpu\n");
+#else
+    fprintf(stderr, "ds4-agent: valid backends are: metal, cuda, cpu\n");
+#endif
     exit(2);
 }
 
@@ -592,8 +601,13 @@ static agent_config parse_options(int argc, char **argv) {
             c.engine.backend = parse_backend(need_arg(&i, argc, argv, arg));
         } else if (!strcmp(arg, "--metal")) {
             c.engine.backend = DS4_BACKEND_METAL;
+#ifdef DS4_ROCM_BUILD
+        } else if (!strcmp(arg, "--rocm")) {
+            c.engine.backend = DS4_BACKEND_CUDA;
+#else
         } else if (!strcmp(arg, "--cuda")) {
             c.engine.backend = DS4_BACKEND_CUDA;
+#endif
         } else if (!strcmp(arg, "--cpu")) {
             c.engine.backend = DS4_BACKEND_CPU;
         } else if (!strcmp(arg, "-t") || !strcmp(arg, "--threads")) {
@@ -603,7 +617,10 @@ static agent_config parse_options(int argc, char **argv) {
         } else if (!strcmp(arg, "--quality")) {
             c.engine.quality = true;
         } else if (!strcmp(arg, "--ssd-streaming")) {
-            c.engine.ssd_streaming = true;
+            c.engine.residency = DS4_RESIDENCY_SSD;
+        } else if (!strcmp(arg, "--resident") ||
+                   !strcmp(arg, "--no-ssd-streaming")) {
+            c.engine.residency = DS4_RESIDENCY_RESIDENT;
         } else if (!strcmp(arg, "--ssd-streaming-cold")) {
             c.engine.ssd_streaming_cold = true;
         } else if (!strcmp(arg, "--ssd-streaming-cache-experts")) {
@@ -663,6 +680,7 @@ static agent_config parse_options(int argc, char **argv) {
 
     if (c.engine.directional_steering_file && !steering_scale_set)
         c.engine.directional_steering_ffn = 1.0f;
+    c.engine.context_size = (uint32_t)c.gen.ctx_size;
     char dist_err[256];
     if (ds4_dist_prepare_engine_options(&c.engine.distributed,
                                         &c.engine,
@@ -10213,6 +10231,10 @@ static int run_agent(ds4_engine *engine, agent_config *cfg) {
 
 #ifndef DS4_AGENT_TEST_NO_MAIN
 int main(int argc, char **argv) {
+    if (ds4_build_info_requested(argc, argv)) {
+        ds4_build_info_print(stdout);
+        return 0;
+    }
     agent_config cfg = parse_options(argc, argv);
     if (cfg.chdir_path && chdir(cfg.chdir_path) != 0) {
         fprintf(stderr, "ds4-agent: failed to chdir to %s: %s\n",

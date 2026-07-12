@@ -47,7 +47,7 @@ typedef struct {
     ds4_dist_options dist;
     bool warm_weights;
     bool quality;
-    bool ssd_streaming;
+    ds4_residency_mode residency;
     bool ssd_streaming_cold;
 } bench_config;
 
@@ -246,7 +246,10 @@ static bench_config parse_options(int argc, char **argv) {
         } else if (!strcmp(arg, "--quality")) {
             c.quality = true;
         } else if (!strcmp(arg, "--ssd-streaming")) {
-            c.ssd_streaming = true;
+            c.residency = DS4_RESIDENCY_SSD;
+        } else if (!strcmp(arg, "--resident") ||
+                   !strcmp(arg, "--no-ssd-streaming")) {
+            c.residency = DS4_RESIDENCY_RESIDENT;
         } else if (!strcmp(arg, "--ssd-streaming-cold")) {
             c.ssd_streaming_cold = true;
         } else if (!strcmp(arg, "--ssd-streaming-cache-experts")) {
@@ -506,12 +509,17 @@ static void maybe_warn_distributed_step_shape(const bench_config *cfg, ds4_sessi
 }
 
 int main(int argc, char **argv) {
+    if (ds4_build_info_requested(argc, argv)) {
+        ds4_build_info_print(stdout);
+        return 0;
+    }
     bench_config cfg = parse_options(argc, argv);
 
     ds4_engine_options opt = {
         .model_path = cfg.model_path,
         .backend = cfg.backend,
         .n_threads = cfg.threads,
+        .context_size = (uint32_t)cfg.ctx_alloc,
         .prefill_chunk = cfg.prefill_chunk,
         .ssd_streaming_cache_experts = cfg.ssd_streaming_cache_experts,
         .ssd_streaming_cache_bytes = cfg.ssd_streaming_cache_bytes,
@@ -520,7 +528,7 @@ int main(int argc, char **argv) {
         .power_percent = cfg.power_percent,
         .warm_weights = cfg.warm_weights,
         .quality = cfg.quality,
-        .ssd_streaming = cfg.ssd_streaming,
+        .residency = cfg.residency,
         .ssd_streaming_cold = cfg.ssd_streaming_cold,
         .expert_profile_path = cfg.expert_profile_path,
         .distributed = cfg.dist,

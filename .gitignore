@@ -6,6 +6,11 @@
 /ds4_native
 /ds4_server_test
 /ds4_test
+/ds4_agent_test
+/tests/test_q4k_dot
+/tests/test_ssd_residency
+/tests/cuda_long_context_smoke
+/build/
 /ds4flash.gguf
 /TODO.md
 /gguf/

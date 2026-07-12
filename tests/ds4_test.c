@@ -90,6 +90,7 @@ static ds4_engine *test_open_engine(bool quality) {
     /* DS4_TEST_MTP loads the MTP head on the fast engine so the speculative
      * verify regression can reuse it; draft=4 hits the multi-row verify path. */
     const char *mtp = getenv("DS4_TEST_MTP");
+    const bool streaming = test_env_bool("DS4_TEST_SSD_STREAMING");
     ds4_engine_options opt = {
         .model_path = test_model_path(),
 #ifdef __APPLE__
@@ -97,8 +98,12 @@ static ds4_engine *test_open_engine(bool quality) {
 #else
         .backend = DS4_BACKEND_CUDA,
 #endif
+        /* Preserve the historical deterministic test lane. AUTO has its own
+         * resolver coverage and must not silently switch this suite's path
+         * according to the host's current memory budget. */
+        .residency = streaming ? DS4_RESIDENCY_SSD : DS4_RESIDENCY_RESIDENT,
+        .context_size = 100000,
         .quality = quality,
-        .ssd_streaming = test_env_bool("DS4_TEST_SSD_STREAMING"),
         .ssd_streaming_cold = test_env_bool("DS4_TEST_SSD_STREAMING_COLD"),
         .ssd_streaming_cache_experts =
             test_env_u32("DS4_TEST_SSD_STREAMING_CACHE_EXPERTS"),

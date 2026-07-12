@@ -1220,7 +1220,7 @@ typedef struct {
     bool plain;
     bool warm_weights;
     bool quality;
-    bool ssd_streaming;
+    ds4_residency_mode residency;
     bool ssd_streaming_cold;
     bool self_test_extractors;
 } eval_config;
@@ -1588,7 +1588,10 @@ static eval_config parse_options(int argc, char **argv) {
         } else if (!strcmp(arg, "--quality")) {
             c.quality = true;
         } else if (!strcmp(arg, "--ssd-streaming")) {
-            c.ssd_streaming = true;
+            c.residency = DS4_RESIDENCY_SSD;
+        } else if (!strcmp(arg, "--resident") ||
+                   !strcmp(arg, "--no-ssd-streaming")) {
+            c.residency = DS4_RESIDENCY_RESIDENT;
         } else if (!strcmp(arg, "--ssd-streaming-cold")) {
             c.ssd_streaming_cold = true;
         } else if (!strcmp(arg, "--ssd-streaming-cache-experts")) {
@@ -4099,7 +4102,28 @@ static void print_eval_report(const eval_ui *ui, int ncases, int passed, int fai
     }
 }
 
+static uint32_t eval_residency_context_hint(const eval_config *cfg) {
+    if (!cfg) return 32768u;
+    if (cfg->ctx_size > 0) return (uint32_t)cfg->ctx_size;
+
+    /* AUTO context is finalized only after the model tokenizer is available.
+     * Reserve a generous prompt allowance now so residency planning does not
+     * assume 32K while a large generation budget or Think Max is requested. */
+    uint64_t hint = 32768u;
+    if (cfg->max_tokens > 0) hint += (uint32_t)cfg->max_tokens;
+    if (cfg->think_mode == DS4_THINK_MAX &&
+        hint < ds4_think_max_min_context()) {
+        hint = ds4_think_max_min_context();
+    }
+    if (hint > EVAL_MAX_CONTEXT) hint = EVAL_MAX_CONTEXT;
+    return (uint32_t)hint;
+}
+
 int main(int argc, char **argv) {
+    if (ds4_build_info_requested(argc, argv)) {
+        ds4_build_info_print(stdout);
+        return 0;
+    }
     eval_config cfg = parse_options(argc, argv);
     if (cfg.self_test_extractors) return run_extractor_self_tests();
     if (cfg.regrade_trace_path) return regrade_trace_file(cfg.regrade_trace_path);
@@ -4139,6 +4163,7 @@ int main(int argc, char **argv) {
         .mtp_path = cfg.mtp_path,
         .backend = cfg.backend,
         .n_threads = cfg.threads,
+        .context_size = eval_residency_context_hint(&cfg),
         .mtp_draft_tokens = 1,
         .mtp_margin = 3.0f,
         .power_percent = cfg.power_percent,
@@ -4149,7 +4174,7 @@ int main(int argc, char **argv) {
         .simulate_used_memory_bytes = cfg.simulate_used_memory_bytes,
         .warm_weights = cfg.warm_weights,
         .quality = cfg.quality,
-        .ssd_streaming = cfg.ssd_streaming,
+        .residency = cfg.residency,
         .ssd_streaming_cold = cfg.ssd_streaming_cold,
         .distributed = cfg.dist,
     };

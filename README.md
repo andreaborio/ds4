@@ -282,6 +282,8 @@ next sections.
 
 - [CONTRIBUTING.md](CONTRIBUTING.md): correctness and speed regression testing
   guide for contributors. **Read this before sending a pull request**.
+- [GOLD_METAL_SSD.md](GOLD_METAL_SSD.md): Metal-first build identity, AUTO
+  residency policy, backend isolation, and benchmark promotion gates.
 - [gguf-tools/README.md](gguf-tools/README.md): offline GGUF generation,
   imatrix collection, quantization tooling, and quality checks.
 - [gguf-tools/imatrix/README.md](gguf-tools/imatrix/README.md): how the
@@ -352,10 +354,15 @@ Then build:
 make                  # macOS Metal
 make cuda-spark       # Linux CUDA, DGX Spark / GB10
 make cuda-generic     # Linux CUDA, other local CUDA GPUs
-make cpu              # CPU-only diagnostics build
+make cpu              # CPU-only diagnostics in build/cpu-<arch>/bin on macOS
 ```
 
-`./ds4flash.gguf` is the default model path used by both binaries. Pass `-m` to
+On macOS, Metal and CPU objects/binaries live in separate build profiles.
+`make cpu` never replaces the root Metal commands.  Use
+`build/cpu-$(uname -m)/bin/ds4` for the CPU-only binary and `./ds4 --build-info`
+to verify build provenance.
+
+`./ds4flash.gguf` is the default model path used by the runtime commands. Pass `-m` to
 select another supported GGUF from `./gguf/`. Run `./ds4 --help` and
 `./ds4-server --help` for the full flag list.
 
@@ -386,12 +393,12 @@ Q4 requires the larger-memory machine class, so M3 Max Q4 numbers are `N/A`.
 
 ## Running models larger than RAM
 
-The normal Metal path tries to make the model resident in GPU-addressable
-memory. This is the fastest path and should remain your default when the model
-fits. When it does not fit, DwarfStar also has a Metal-only **SSD streaming**
-capacity mode. In this mode the non-routed model weights stay resident, while
-routed MoE experts are kept in an in-memory cache and loaded from the GGUF file
-on cache misses.
+The normal macOS invocation uses Metal with **AUTO residency**. It estimates
+the model plus context/KV/scratch requirement and keeps the model resident when
+that fits a conservative Metal working-set budget. Otherwise it selects
+**SSD streaming** automatically. In streaming mode the non-routed model weights
+stay resident, while routed MoE experts are kept in an in-memory cache and
+loaded from the GGUF file on cache misses.
 
 Streaming is not as fast as fitting the full model in RAM. It still needs memory
 for non-routed weights, KV cache, graph scratch, activations, and the routed
@@ -400,11 +407,14 @@ Mac SSDs are fast enough to make cache misses tolerable. Long prefills can still
 be fast; generation is more sensitive to cache misses because every new token
 routes through experts again.
 
-Start with the automatic cache budget:
+Start with AUTO residency and the automatic cache budget:
 
 ```sh
-./ds4 -m ./ds4flash.gguf --ssd-streaming
+./ds4 -m ./ds4flash.gguf
 ```
+
+Use `--ssd-streaming` to force streaming, or `--resident` to force full
+residency.  Startup logs report the resolved mode and the memory-plan reason.
 
 If startup reports that the expert cache is too large, or if you want to reserve
 more memory for context, set the routed expert cache explicitly:
@@ -416,9 +426,10 @@ more memory for context, set the routed expert cache explicitly:
 The `32GB` value is a memory budget for complete routed experts, not a generic
 byte cache. DwarfStar converts it to the number of full experts that fit for the
 current GGUF. Non-routed weights, KV cache, graph scratch, and activations need
-additional memory. Only the automatic cache budget does the subtraction for you:
-it takes 80% of the Metal recommended working set, subtracts non-routed weights,
-then uses the rest for routed experts. Leave the hot expert preload enabled for
+additional memory. Only the automatic cache budget does the full subtraction
+for you: it reserves context/KV/scratch, external pressure, and 20% backend
+headroom (at least 2 GiB), then subtracts non-routed weights and uses the safe
+remainder for routed experts. Leave the hot expert preload enabled for
 normal use; use `--ssd-streaming-cold` and `--ssd-streaming-preload-experts N`
 only for measurements.
 
@@ -1403,8 +1414,8 @@ There is also a CPU reference/debug path:
 ```sh
 ./ds4 -p "Hello" --cpu
 make cpu
-./ds4
-./ds4 -p "Hello"
+build/cpu-$(uname -m)/bin/ds4 -p "Hello"  # macOS CPU-only build
+./ds4 --build-info                        # root command remains Metal
 ```
 
 Do not treat the CPU path as the production target. The CLI and `ds4-server`

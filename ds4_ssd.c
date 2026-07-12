@@ -15,6 +15,105 @@
 
 static const uint64_t DS4_GIB = 1024ull * 1024ull * 1024ull;
 
+static uint64_t saturating_add_u64(uint64_t a, uint64_t b) {
+    return a > UINT64_MAX - b ? UINT64_MAX : a + b;
+}
+
+const char *ds4_residency_mode_name(ds4_residency_mode mode) {
+    switch (mode) {
+    case DS4_RESIDENCY_AUTO:     return "auto";
+    case DS4_RESIDENCY_RESIDENT: return "resident";
+    case DS4_RESIDENCY_SSD:      return "ssd";
+    }
+    return "invalid";
+}
+
+const char *ds4_residency_reason_name(ds4_residency_reason reason) {
+    switch (reason) {
+    case DS4_RESIDENCY_REASON_EXPLICIT_RESIDENT:
+        return "explicit resident override";
+    case DS4_RESIDENCY_REASON_EXPLICIT_SSD:
+        return "explicit SSD override";
+    case DS4_RESIDENCY_REASON_NON_METAL_AUTO:
+        return "AUTO currently preserves resident mode outside Metal";
+    case DS4_RESIDENCY_REASON_METAL_FITS:
+        return "estimated Metal residency plan fits the conservative budget";
+    case DS4_RESIDENCY_REASON_METAL_EXCEEDS:
+        return "estimated Metal residency plan exceeds the conservative budget";
+    case DS4_RESIDENCY_REASON_METAL_BUDGET_UNAVAILABLE:
+        return "Metal recommended working-set budget is unavailable";
+    case DS4_RESIDENCY_REASON_INSPECT_ONLY:
+        return "model inspection defers runtime residency selection";
+    }
+    return "unknown reason";
+}
+
+bool ds4_residency_plan_make(bool                metal_backend,
+                             ds4_residency_mode  requested,
+                             uint64_t            model_bytes,
+                             uint64_t            runtime_bytes,
+                             uint64_t            recommended_bytes,
+                             uint64_t            external_reserved_bytes,
+                             ds4_residency_plan *out) {
+    if (!out || requested < DS4_RESIDENCY_AUTO ||
+        requested > DS4_RESIDENCY_SSD) {
+        return false;
+    }
+
+    memset(out, 0, sizeof(*out));
+    out->requested = requested;
+    out->recommended_bytes = recommended_bytes;
+    out->external_reserved_bytes = external_reserved_bytes;
+    out->model_bytes = model_bytes;
+    out->runtime_bytes = runtime_bytes;
+
+    if (recommended_bytes > external_reserved_bytes) {
+        out->budget_bytes = recommended_bytes - external_reserved_bytes;
+    }
+
+    if (metal_backend && recommended_bytes != 0) {
+        out->headroom_bytes = recommended_bytes / 5u;
+        if (out->headroom_bytes < 2u * DS4_GIB) {
+            out->headroom_bytes = 2u * DS4_GIB;
+        }
+    }
+    out->required_bytes = saturating_add_u64(model_bytes, runtime_bytes);
+    out->required_bytes = saturating_add_u64(out->required_bytes,
+                                             out->headroom_bytes);
+
+    if (requested == DS4_RESIDENCY_RESIDENT) {
+        out->resolved = DS4_RESIDENCY_RESIDENT;
+        out->reason = DS4_RESIDENCY_REASON_EXPLICIT_RESIDENT;
+        return true;
+    }
+    if (requested == DS4_RESIDENCY_SSD) {
+        out->resolved = DS4_RESIDENCY_SSD;
+        out->reason = DS4_RESIDENCY_REASON_EXPLICIT_SSD;
+        return true;
+    }
+    if (!metal_backend) {
+        out->resolved = DS4_RESIDENCY_RESIDENT;
+        out->reason = DS4_RESIDENCY_REASON_NON_METAL_AUTO;
+        return true;
+    }
+    if (recommended_bytes == 0) {
+        /* AUTO is conservative: if Metal cannot report a budget, do not risk
+         * attempting to map a model whose residency has not been proven. */
+        out->resolved = DS4_RESIDENCY_SSD;
+        out->reason = DS4_RESIDENCY_REASON_METAL_BUDGET_UNAVAILABLE;
+        return true;
+    }
+
+    if (out->required_bytes <= out->budget_bytes) {
+        out->resolved = DS4_RESIDENCY_RESIDENT;
+        out->reason = DS4_RESIDENCY_REASON_METAL_FITS;
+    } else {
+        out->resolved = DS4_RESIDENCY_SSD;
+        out->reason = DS4_RESIDENCY_REASON_METAL_EXCEEDS;
+    }
+    return true;
+}
+
 bool ds4_parse_gib_arg(const char *s, uint64_t *bytes) {
     if (bytes) *bytes = 0;
     if (!s || !s[0] || !bytes) return false;
@@ -82,19 +181,33 @@ bool ds4_ssd_auto_cache_plan(uint64_t            recommended_bytes,
                              uint64_t            per_expert_bytes,
                              uint64_t            max_model_experts,
                              ds4_ssd_cache_plan *out) {
-    if (!out) return false;
-    memset(out, 0, sizeof(*out));
     if (recommended_bytes == 0 || per_expert_bytes == 0) return false;
 
-    out->model_target_bytes =
+    const uint64_t model_target_bytes =
         recommended_bytes > UINT64_MAX / 4ull ?
             UINT64_MAX : (recommended_bytes * 4ull) / 5ull;
-    if (out->model_target_bytes > non_routed_bytes) {
-        out->cache_bytes = out->model_target_bytes - non_routed_bytes;
-    }
+    return ds4_ssd_cache_plan_for_model_target(model_target_bytes,
+                                                non_routed_bytes,
+                                                per_expert_bytes,
+                                                max_model_experts,
+                                                out);
+}
+
+bool ds4_ssd_cache_plan_for_model_target(uint64_t            model_target_bytes,
+                                         uint64_t            non_routed_bytes,
+                                         uint64_t            per_expert_bytes,
+                                         uint64_t            max_model_experts,
+                                         ds4_ssd_cache_plan *out) {
+    if (!out) return false;
+    memset(out, 0, sizeof(*out));
+    if (model_target_bytes == 0 || per_expert_bytes == 0) return false;
+
+    out->model_target_bytes = model_target_bytes;
+    if (out->model_target_bytes <= non_routed_bytes) return false;
+    out->cache_bytes = out->model_target_bytes - non_routed_bytes;
 
     uint64_t cache_experts = out->cache_bytes / per_expert_bytes;
-    if (cache_experts == 0) cache_experts = 1;
+    if (cache_experts == 0) return false;
     if (max_model_experts != 0 && cache_experts > max_model_experts) {
         cache_experts = max_model_experts;
     }
@@ -103,6 +216,25 @@ bool ds4_ssd_auto_cache_plan(uint64_t            recommended_bytes,
     out->cache_experts = (uint32_t)cache_experts;
     out->effective_cache_bytes = cache_experts * per_expert_bytes;
     return out->cache_experts != 0;
+}
+
+bool ds4_ssd_working_set_after_reserve(uint64_t  recommended_bytes,
+                                       uint64_t  runtime_bytes,
+                                       uint64_t  external_reserved_bytes,
+                                       uint64_t *available_bytes,
+                                       uint64_t *reserved_bytes) {
+    if (available_bytes) *available_bytes = 0;
+    if (reserved_bytes) *reserved_bytes = 0;
+    if (!available_bytes || !reserved_bytes || recommended_bytes == 0) {
+        return false;
+    }
+
+    const uint64_t reserved = saturating_add_u64(runtime_bytes,
+                                                  external_reserved_bytes);
+    *reserved_bytes = reserved;
+    if (reserved >= recommended_bytes) return false;
+    *available_bytes = recommended_bytes - reserved;
+    return true;
 }
 
 bool ds4_ssd_memory_lock_acquire(ds4_ssd_memory_lock *lock,

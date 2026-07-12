@@ -72,6 +72,10 @@ For CPU portability, at least verify that the CPU target still builds:
 make cpu
 ```
 
+On macOS, also run `make build-isolation-test`. The CPU-only binaries live in
+`build/cpu-$(uname -m)/bin`; `make cpu` intentionally leaves the root Metal
+commands unchanged.
+
 The CPU backend is a reference/debug path, not the production performance
 target. Remember that executing the CPU path on Metal can crash the system
 because of a kernel bug in macOS.

@@ -96,6 +96,9 @@ typedef struct {
     const char *mtp_path;
     ds4_backend backend;
     int n_threads;
+    /* Context hint used by AUTO residency planning.  Zero uses the normal
+     * 32K startup context; front-ends should pass their configured context. */
+    uint32_t context_size;
     uint32_t prefill_chunk;
     int mtp_draft_tokens;
     float mtp_margin;
@@ -110,6 +113,9 @@ typedef struct {
     uint64_t simulate_used_memory_bytes;
     bool warm_weights;
     bool quality;
+    ds4_residency_mode residency;
+    /* Legacy source-compatible opt-in. New callers should set residency to
+     * DS4_RESIDENCY_SSD; true here is normalized to that mode by the core. */
     bool ssd_streaming;
     bool ssd_streaming_cold;
     bool inspect_only;
@@ -159,6 +165,11 @@ uint64_t ds4_engine_hidden_f32_values(ds4_engine *e);
  * Pro and later shapes must use nonzero ids. */
 int ds4_engine_model_id(ds4_engine *e);
 const char *ds4_backend_name(ds4_backend backend);
+const char *ds4_build_backend(void);
+const char *ds4_build_arch(void);
+const char *ds4_build_git_sha(void);
+void ds4_build_info_print(FILE *fp);
+bool ds4_build_info_requested(int argc, char **argv);
 bool ds4_think_mode_enabled(ds4_think_mode mode);
 const char *ds4_think_mode_name(ds4_think_mode mode);
 const char *ds4_think_max_prefix(void);

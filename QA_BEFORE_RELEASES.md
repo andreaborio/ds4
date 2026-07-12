@@ -34,8 +34,12 @@ in this system.
   `git status --short`.
 - Build the normal local target:
   `make clean && make`.
-- Build CPU-only binaries as a compile check only:
-  `make clean && make cpu`.
+- Prove macOS Metal/CPU artifact isolation:
+  `make build-isolation-test`.
+- Build CPU-only binaries as a compile check. On macOS they remain under
+  `build/cpu-$(uname -m)/bin` and must not replace the root Metal commands:
+  `make cpu`.
+- Record `./ds4 --build-info` and the CPU binary's `--build-info` output.
 - Run whitespace checks before committing:
   `git diff --check`.
 - Confirm `./ds4 --help`, `./ds4-server --help`, and `./ds4-agent --help` render
@@ -45,6 +49,8 @@ in this system.
 
 - Run the default suite:
   `make test`.
+- Without a local GGUF, run the complete model-free gate:
+  `make model-free-test`.
 - Run the vector checks explicitly after any tokenizer, template, KV, kernel,
   quantization, or prompt-rendering change:
   `./ds4_test --logprob-vectors`
