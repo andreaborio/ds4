@@ -62,6 +62,8 @@ typedef struct {
     uint64_t physical_bytes;
     uint64_t recommended_bytes;
     uint64_t task_footprint_bytes;
+    /* Directly reclaimable free pages.  On Darwin, Mach free_count already
+     * includes speculative pages; collectors must not add them again. */
     uint64_t free_bytes;
     uint64_t purgeable_bytes;
     uint64_t inactive_bytes;

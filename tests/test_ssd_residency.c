@@ -186,9 +186,9 @@ int main(void) {
     assert(adaptive.current_headroom_bytes == 2 * GIB);
     assert(adaptive.pressure_margin_bytes == GIB / 4u);
     assert(adaptive.platform_headroom_bytes == 2 * GIB);
-    assert(adaptive.current_wire_budget_bytes == 13 * GIB / 4u);
+    assert(adaptive.current_wire_budget_bytes == 11 * GIB / 4u);
     assert(adaptive.platform_wire_budget_bytes == 19 * GIB / 2u);
-    assert(adaptive.wire_budget_bytes == 13 * GIB / 4u);
+    assert(adaptive.wire_budget_bytes == 11 * GIB / 4u);
     assert(adaptive.cache_experts == 259);
     assert(adaptive.cache_bytes == UINT64_C(259) * flash_expert_bytes);
     assert(adaptive.floor.working_set_experts == 258);
@@ -224,6 +224,24 @@ int main(void) {
                                              flash_max_cacheable,
                                              &adaptive));
     assert(adaptive.cache_experts == 517);
+
+    /* Engine-open planning happens before the session allocates its modeled
+     * runtime footprint.  At the 517-entry boundary on a 16 GiB host, a future
+     * 512 MiB session must be charged to the current-pressure constraint too;
+     * otherwise AUTO jumps from 259 to 517 entries. */
+    memory = (ds4_ssd_host_memory){
+        .physical_bytes = 16 * GIB,
+        .recommended_bytes = 12 * GIB,
+        .free_bytes = 9 * GIB / 4u +
+                      UINT64_C(517) * flash_expert_bytes,
+    };
+    assert(ds4_ssd_adaptive_cache_plan_make(&memory, 512 * MIB, 43, 6,
+                                             flash_expert_bytes,
+                                             flash_max_cacheable,
+                                             &adaptive));
+    assert(adaptive.cache_experts == 259);
+    assert(adaptive.current_wire_budget_bytes ==
+           UINT64_C(517) * flash_expert_bytes - 512 * MIB);
     memory = memory_for_raw_experts(775, flash_expert_bytes);
     assert(ds4_ssd_adaptive_cache_plan_make(&memory, 0, 43, 6,
                                              flash_expert_bytes,
@@ -240,6 +258,15 @@ int main(void) {
                                              &adaptive));
     assert(adaptive.cache_experts == 259);
 
+    /* A budget that fits every cacheable expert is terminal: rounding to
+     * 1+k*working_set would needlessly leave one partial cycle uncached. */
+    memory = memory_for_raw_experts(6, 1);
+    assert(ds4_ssd_adaptive_cache_plan_make(&memory, 0, 2, 1,
+                                             1, 6, &adaptive));
+    assert(adaptive.floor.working_set_experts == 2);
+    assert(adaptive.cache_experts == 6);
+    assert(adaptive.cache_bytes == 6);
+
     memory = (ds4_ssd_host_memory){
         .physical_bytes = UINT64_MAX,
         .recommended_bytes = UINT64_MAX,
@@ -253,8 +280,7 @@ int main(void) {
                                              flash_max_cacheable,
                                              &adaptive));
     assert(adaptive.reclaimable_bytes == UINT64_MAX);
-    assert(adaptive.cache_experts >= 259);
-    assert((adaptive.cache_experts - 1u) % 258u == 0);
+    assert(adaptive.cache_experts == flash_max_cacheable);
 
     memory = (ds4_ssd_host_memory){0};
     assert(!ds4_ssd_adaptive_cache_plan_make(&memory, 0, 43, 6,
@@ -275,6 +301,12 @@ int main(void) {
                                               flash_expert_bytes,
                                               flash_max_cacheable,
                                               &adaptive));
+    assert(adaptive.platform_wire_budget_bytes == 0);
+    assert(!ds4_ssd_adaptive_cache_plan_make(&memory, UINT64_MAX, 43, 6,
+                                              flash_expert_bytes,
+                                              flash_max_cacheable,
+                                              &adaptive));
+    assert(adaptive.current_wire_budget_bytes == 0);
     assert(adaptive.platform_wire_budget_bytes == 0);
     assert(!ds4_ssd_adaptive_cache_plan_make(&memory, 0, 43, 6,
                                               flash_expert_bytes,

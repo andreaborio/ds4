@@ -292,9 +292,15 @@ bool ds4_ssd_adaptive_cache_plan_make(
         out->platform_headroom_bytes = two_gib;
     }
 
-    const uint64_t current_reserve =
+    uint64_t current_reserve =
         saturating_add_u64(out->current_headroom_bytes,
                            out->pressure_margin_bytes);
+    /* The host snapshot is taken while the engine is opened, before a session
+     * allocates its modeled KV/cache/scratch footprint.  Reserve that future
+     * allocation in both independent safety constraints: subtracting it only
+     * from the platform working-set limit can overcommit whenever current
+     * memory pressure is the tighter bound. */
+    current_reserve = saturating_add_u64(current_reserve, runtime_bytes);
     if (reclaimable > current_reserve) {
         out->current_wire_budget_bytes = reclaimable - current_reserve;
     }
@@ -319,9 +325,13 @@ bool ds4_ssd_adaptive_cache_plan_make(
     /* Grow only by complete per-token working sets.  Besides leaving useful
      * pressure slack, this prevents small changes in free pages from buying a
      * cache which still cannot retain one more token's routed-expert cycle. */
+    /* Once every cacheable expert fits, retain the exact full-model count.
+     * There is no eviction cycle to round away in that terminal state. */
     const uint64_t cache_experts =
-        1u + out->floor.working_set_experts *
-                 ((raw_experts - 1u) / out->floor.working_set_experts);
+        raw_experts == max_cacheable_experts ?
+            raw_experts :
+            1u + out->floor.working_set_experts *
+                     ((raw_experts - 1u) / out->floor.working_set_experts);
     if (cache_experts < out->floor.minimum_cache_experts ||
         cache_experts > UINT32_MAX ||
         cache_experts > UINT64_MAX / per_expert_bytes) {

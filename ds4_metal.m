@@ -3022,9 +3022,10 @@ int ds4_gpu_host_memory_snapshot(ds4_ssd_host_memory *out) {
         return 0;
     }
 
-    uint64_t free_pages = (uint64_t)vm.free_count;
-    if (free_pages > UINT64_MAX - (uint64_t)vm.speculative_count) return 0;
-    free_pages += (uint64_t)vm.speculative_count;
+    /* Mach already includes speculative pages in free_count.  Adding
+     * speculative_count again can materially overstate reclaimable RAM after
+     * streaming I/O and select a cache one full working-set tier too large. */
+    const uint64_t free_pages = (uint64_t)vm.free_count;
 
     ds4_ssd_host_memory snapshot = {
         .physical_bytes = physical_bytes,
