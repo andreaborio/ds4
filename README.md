@@ -497,6 +497,7 @@ comparable.
 | --- | --- | --- | ---: | ---: |
 | M1 Pro, 16 GB / [`2f95e67`](https://github.com/andreaborio/ds4/commit/2f95e67fdec1db988fe8b1a699330f387de66004) | exact 259, 8,192 | DSBox API, 9 prompt + 2 output tokens | — | 0.30 t/s cold; 0.53 / 0.51 / 0.51 t/s warm (~0.52 t/s) |
 | M1 Pro, 16 GB / [`bf4201c`](https://github.com/andreaborio/ds4/commit/bf4201c47b901f0f479dc4af3f3df77330fabacf) | exact 259, 8,192 | extremely hot CLI, 14 + 2 tokens | 1.02–1.64 t/s | 2.13–2.46 t/s |
+| M5 Pro, 64 GB / `6aa496d` | AUTO 3,613, 32,768 | DSBox API, two sequential 22–23 prompt + 64 output-token requests | — | 9.88 / 12.86 t/s |
 | M5 Pro, 64 GB / [`f4e0e64`](https://github.com/andreaborio/ds4/commit/f4e0e64e76ab62151700f9ea404297ea1769c550) | AUTO 4,387, 32,768 | `ds4-bench`, 128 + 64 tokens, ABBA legs A1/A2 | 21.63 / 22.21 t/s | 13.05 / 13.59 t/s (13.3173 geomean) |
 | M5 Pro, 64 GB / [`f4e0e64`](https://github.com/andreaborio/ds4/commit/f4e0e64e76ab62151700f9ea404297ea1769c550) | exact 4,342, 32,768 | same bounded ABBA, legs B1/B2 | 22.22 / 22.13 t/s | 13.74 / 13.78 t/s (13.7600 geomean) |
 
@@ -505,6 +506,13 @@ identical frontier logits and zero new swapout. The generic default remains
 AUTO: the small gap does not justify applying one GGUF's exact expert count to
 other quantizations. On 16 GB, AUTO uses the 259-expert floor only when the
 live memory budget can safely admit it; otherwise startup fails closed.
+
+The current DSBox server canary was run on the same M5 Pro under a lower live
+memory budget, so AUTO selected 3,613 experts / 23.82 GiB rather than 4,387.
+Both 64-token requests completed at normal macOS pressure with zero new
+swapout; the second, warmer but different prompt reached 12.86 t/s. This row is
+a service-path observation, while the 4,387/4,342 rows are controlled
+`ds4-bench` comparisons.
 
 The M1 `2f95e67` server build was later reverted by
 [`8a2a53f`](https://github.com/andreaborio/ds4/commit/8a2a53f323d29e5afd99010852f99019ef0cc8f4)
