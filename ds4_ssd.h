@@ -73,11 +73,22 @@ typedef struct {
 typedef struct {
     ds4_ssd_expert_cache_floor floor;
     uint64_t reclaimable_bytes;
+    /* Pageable static weights compete with the wired expert cache for the
+     * same unified-memory budget.  On hosts above the low-RAM tier, AUTO
+     * preserves at least this much headroom unless those weights were already
+     * pinned and therefore visible in the live host-memory snapshot. */
+    uint64_t pageable_static_reserve_bytes;
+    /* recommendedMaxWorkingSetSize is a fixed platform limit, so pinned
+     * static bytes remain charged here even though a post-pin current-memory
+     * snapshot already reflects them. */
+    uint64_t platform_static_reserve_bytes;
     uint64_t current_headroom_bytes;
     uint64_t pressure_margin_bytes;
     uint64_t platform_headroom_bytes;
     uint64_t current_wire_budget_bytes;
     uint64_t platform_wire_budget_bytes;
+    uint64_t safety_wire_budget_bytes;
+    uint64_t cache_envelope_bytes;
     uint64_t wire_budget_bytes;
     uint64_t cache_bytes;
     bool low_ram_floor_ceiling_active;
@@ -114,6 +125,18 @@ bool ds4_ssd_adaptive_cache_plan_make(
         uint64_t                    per_expert_bytes,
         uint64_t                    max_cacheable_experts,
         ds4_ssd_adaptive_cache_plan *out);
+bool ds4_ssd_adaptive_cache_plan_make_with_static_reserve(
+        const ds4_ssd_host_memory  *memory,
+        uint64_t                    runtime_bytes,
+        uint64_t                    static_working_set_bytes,
+        bool                        static_already_pinned,
+        uint64_t                    cacheable_routed_layers,
+        uint64_t                    experts_per_token,
+        uint64_t                    per_expert_bytes,
+        uint64_t                    max_cacheable_experts,
+        ds4_ssd_adaptive_cache_plan *out);
+bool ds4_ssd_low_ram_cache_policy(uint64_t physical_bytes);
+bool ds4_ssd_static_pin_host_supported(uint64_t physical_bytes);
 bool ds4_ssd_working_set_after_reserve(uint64_t  recommended_bytes,
                                        uint64_t  runtime_bytes,
                                        uint64_t  external_reserved_bytes,

@@ -182,6 +182,13 @@ int main(void) {
 
     const uint64_t flash_expert_bytes = UINT64_C(7077888);
     const uint64_t flash_max_cacheable = UINT64_C(43) * 256u;
+    assert(!ds4_ssd_low_ram_cache_policy(0));
+    assert(ds4_ssd_low_ram_cache_policy(16 * GIB));
+    assert(!ds4_ssd_low_ram_cache_policy(16 * GIB + 1u));
+    assert(!ds4_ssd_static_pin_host_supported(0));
+    assert(!ds4_ssd_static_pin_host_supported(16 * GIB));
+    assert(!ds4_ssd_static_pin_host_supported(64 * GIB - 1u));
+    assert(ds4_ssd_static_pin_host_supported(64 * GIB));
     ds4_ssd_host_memory memory = {
         .physical_bytes = 16 * GIB,
         .recommended_bytes = 12 * GIB,
@@ -207,6 +214,23 @@ int main(void) {
     assert(adaptive.cache_bytes == UINT64_C(259) * flash_expert_bytes);
     assert(adaptive.floor.working_set_experts == 258);
     assert(adaptive.low_ram_floor_ceiling_active);
+    assert(adaptive.pageable_static_reserve_bytes == 0);
+
+    /* Static pinning is never part of the low-RAM policy.  Even if a caller
+     * supplies Flash's full always-used static set, the 16 GiB tier leaves it
+     * pageable and preserves only the measured 259-expert correctness floor. */
+    memory = (ds4_ssd_host_memory){
+        .physical_bytes = 16 * GIB,
+        .recommended_bytes = 12 * GIB,
+        .free_bytes = 11 * GIB / 2u,
+    };
+    assert(ds4_ssd_adaptive_cache_plan_make_with_static_reserve(
+        &memory, 512 * MIB, 8 * GIB, false, 43, 6,
+        flash_expert_bytes, flash_max_cacheable, &adaptive));
+    assert(adaptive.low_ram_floor_ceiling_active);
+    assert(adaptive.pageable_static_reserve_bytes == 0);
+    assert(adaptive.current_headroom_bytes == 2 * GIB);
+    assert(adaptive.cache_experts == 259);
 
     /* High free memory does not buy the slower second tier on a 16 GiB host.
      * The same policy still fails closed when even the correctness floor does
@@ -275,6 +299,142 @@ int main(void) {
                                              &adaptive));
     assert(!adaptive.low_ram_floor_ceiling_active);
     assert(adaptive.cache_experts == 517);
+
+    /* Above 16 GiB, AUTO grows with the point-in-time reclaimable budget but
+     * first protects the unpinned static working set.  max(static, baseline)
+     * is intentional: adding both reserves would underfill the cache. */
+    memory = (ds4_ssd_host_memory){
+        .physical_bytes = 24 * GIB,
+        .recommended_bytes = 18 * GIB,
+        .free_bytes = 18 * GIB,
+    };
+    assert(ds4_ssd_adaptive_cache_plan_make_with_static_reserve(
+        &memory, 512 * MIB, 8 * GIB, false, 43, 6,
+        flash_expert_bytes, flash_max_cacheable, &adaptive));
+    assert(!adaptive.low_ram_floor_ceiling_active);
+    assert(adaptive.pageable_static_reserve_bytes == 8 * GIB);
+    assert(adaptive.current_headroom_bytes == 8 * GIB);
+    assert(adaptive.platform_headroom_bytes == 8 * GIB);
+    assert(adaptive.cache_experts == 1291);
+
+    memory = (ds4_ssd_host_memory){
+        .physical_bytes = 32 * GIB,
+        .recommended_bytes = 24 * GIB,
+        .free_bytes = 24 * GIB,
+    };
+    assert(ds4_ssd_adaptive_cache_plan_make_with_static_reserve(
+        &memory, 512 * MIB, 8 * GIB, false, 43, 6,
+        flash_expert_bytes, flash_max_cacheable, &adaptive));
+    assert(adaptive.pageable_static_reserve_bytes == 8 * GIB);
+    assert(adaptive.current_headroom_bytes == 8 * GIB);
+    assert(adaptive.platform_headroom_bytes == 8 * GIB);
+    assert(adaptive.cache_envelope_bytes == 27 * GIB / 2u);
+    assert(adaptive.cache_experts == 1807);
+
+    memory.recommended_bytes = 32 * GIB;
+    assert(ds4_ssd_adaptive_cache_plan_make_with_static_reserve(
+        &memory, 512 * MIB, 8 * GIB, false, 43, 6,
+        flash_expert_bytes, flash_max_cacheable, &adaptive));
+    assert(adaptive.cache_envelope_bytes == 18 * GIB);
+    assert(adaptive.cache_experts == 2065);
+
+    /* A smaller static set is covered by the ordinary host headroom; it is
+     * not added a second time. */
+    memory = (ds4_ssd_host_memory){
+        .physical_bytes = 64 * GIB,
+        .recommended_bytes = 52 * GIB,
+        .free_bytes = 40 * GIB,
+    };
+    assert(ds4_ssd_adaptive_cache_plan_make_with_static_reserve(
+        &memory, 0, 2 * GIB, false, 43, 6,
+        flash_expert_bytes, flash_max_cacheable, &adaptive));
+    assert(adaptive.pageable_static_reserve_bytes == 2 * GIB);
+    assert(adaptive.current_headroom_bytes == 4 * GIB);
+    assert(adaptive.platform_headroom_bytes == 8 * GIB);
+
+    /* Reproduce the bounded M5 canary snapshot.  The safety budget alone can
+     * fit the old 4903-expert tier, while the stable envelope and the strict
+     * static reserve independently hold AUTO at the nearby measured sweet
+     * spot, 4387 experts / 28.92 GiB. */
+    memory = (ds4_ssd_host_memory){
+        .physical_bytes = 64 * GIB,
+        .recommended_bytes = 51 * GIB + 84 * GIB / 100u,
+        .free_bytes = 39 * GIB + 76 * GIB / 100u,
+    };
+    assert(ds4_ssd_adaptive_cache_plan_make(&memory,
+                                             86 * GIB / 100u,
+                                             43, 6,
+                                             flash_expert_bytes,
+                                             flash_max_cacheable,
+                                             &adaptive));
+    assert(adaptive.safety_wire_budget_bytes /
+           flash_expert_bytes > 4903);
+    assert(adaptive.cache_experts == 4387);
+    assert(ds4_ssd_adaptive_cache_plan_make_with_static_reserve(
+        &memory, 86 * GIB / 100u, 8 * GIB + GIB / 5u, false, 43, 6,
+        flash_expert_bytes, flash_max_cacheable, &adaptive));
+    assert(adaptive.pageable_static_reserve_bytes ==
+           8 * GIB + GIB / 5u);
+    assert(adaptive.cache_experts == 4387);
+
+    /* A warmer launch exposes more file-backed pages as reclaimable.  The
+     * safety budget can now fit 4645, but the envelope prevents startup-order
+     * feedback from growing the wired cache. */
+    memory.free_bytes = 41 * GIB + 27 * GIB / 100u;
+    assert(ds4_ssd_adaptive_cache_plan_make_with_static_reserve(
+        &memory, 86 * GIB / 100u, 8 * GIB + GIB / 5u, false, 43, 6,
+        flash_expert_bytes, flash_max_cacheable, &adaptive));
+    assert(adaptive.safety_wire_budget_bytes /
+           flash_expert_bytes > 4645);
+    assert(adaptive.cache_experts == 4387);
+
+    /* The envelope is a ceiling, not a fixed allocation: genuine pressure
+     * still shrinks AUTO by complete working-set tiers. */
+    memory.free_bytes = 38 * GIB;
+    assert(ds4_ssd_adaptive_cache_plan_make_with_static_reserve(
+        &memory, 86 * GIB / 100u, 8 * GIB + GIB / 5u, false, 43, 6,
+        flash_expert_bytes, flash_max_cacheable, &adaptive));
+    assert(adaptive.safety_wire_budget_bytes <
+           adaptive.cache_envelope_bytes);
+    assert(adaptive.cache_experts == 4129);
+
+    /* Once the static set is pinned, the live snapshot reflects it in the
+     * current-pressure constraint.  The fixed platform working-set limit must
+     * still retain the static charge. */
+    memory = (ds4_ssd_host_memory){
+        .physical_bytes = 64 * GIB,
+        .recommended_bytes = 32 * GIB,
+        .free_bytes = 40 * GIB,
+    };
+    assert(ds4_ssd_adaptive_cache_plan_make_with_static_reserve(
+        &memory, 1 * GIB, 10 * GIB, true, 43, 6,
+        flash_expert_bytes, flash_max_cacheable, &adaptive));
+    assert(adaptive.pageable_static_reserve_bytes == 0);
+    assert(adaptive.platform_static_reserve_bytes == 10 * GIB);
+    assert(adaptive.current_headroom_bytes == 0);
+    assert(adaptive.platform_headroom_bytes == 18 * GIB);
+    assert(adaptive.platform_wire_budget_bytes == 13 * GIB);
+    assert(adaptive.safety_wire_budget_bytes == 13 * GIB);
+
+    /* If the post-pin snapshot falls by exactly the pinned set, current
+     * pressure must yield the same budget as the equivalent pre-pin plan. */
+    memory = (ds4_ssd_host_memory){
+        .physical_bytes = 64 * GIB,
+        .recommended_bytes = 52 * GIB,
+        .free_bytes = 40 * GIB,
+    };
+    assert(ds4_ssd_adaptive_cache_plan_make_with_static_reserve(
+        &memory, 1 * GIB, 8 * GIB, false, 43, 6,
+        flash_expert_bytes, flash_max_cacheable, &adaptive));
+    const uint64_t pre_pin_current_budget =
+        adaptive.current_wire_budget_bytes;
+    assert(adaptive.current_headroom_bytes == 8 * GIB);
+    memory.free_bytes -= 8 * GIB;
+    assert(ds4_ssd_adaptive_cache_plan_make_with_static_reserve(
+        &memory, 1 * GIB, 8 * GIB, true, 43, 6,
+        flash_expert_bytes, flash_max_cacheable, &adaptive));
+    assert(adaptive.current_headroom_bytes == 0);
+    assert(adaptive.current_wire_budget_bytes == pre_pin_current_budget);
 
     /* Engine-open planning happens before the session allocates its modeled
      * runtime footprint.  Use a host above the low-RAM ceiling so this test

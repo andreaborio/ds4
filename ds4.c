@@ -3366,6 +3366,50 @@ static DS4_MAYBE_UNUSED bool weights_streaming_layer_experts_uniform(
     return bytes == base;
 }
 
+typedef struct {
+    uint64_t per_expert_bytes;
+    uint64_t max_cacheable_experts;
+    uint32_t routed_layers;
+    uint32_t boosted_layers;
+    uint32_t cacheable_layers;
+} ds4_streaming_cache_geometry;
+
+static DS4_MAYBE_UNUSED bool ds4_streaming_cache_geometry_make(
+        const ds4_weights             *weights,
+        ds4_streaming_cache_geometry  *out) {
+    if (!out) return false;
+    memset(out, 0, sizeof(*out));
+    if (!weights ||
+        !ds4_streaming_routed_expert_bytes(weights,
+                                           &out->per_expert_bytes)) {
+        return false;
+    }
+
+    for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+        const ds4_layer_weights *layer = &weights->layer[il];
+        if (!layer->ffn_gate_exps ||
+            !layer->ffn_up_exps ||
+            !layer->ffn_down_exps) {
+            continue;
+        }
+        out->routed_layers++;
+        if (!weights_streaming_layer_experts_uniform(weights, il)) {
+            out->boosted_layers++;
+        }
+    }
+    if (out->routed_layers == 0 ||
+        out->boosted_layers >= out->routed_layers) {
+        return false;
+    }
+    out->cacheable_layers = out->routed_layers - out->boosted_layers;
+    if ((uint64_t)out->cacheable_layers > UINT64_MAX / DS4_N_EXPERT) {
+        return false;
+    }
+    out->max_cacheable_experts =
+        (uint64_t)out->cacheable_layers * (uint64_t)DS4_N_EXPERT;
+    return out->max_cacheable_experts != 0;
+}
+
 static uint32_t ds4_streaming_cache_experts_for_byte_budget(
         const ds4_weights *weights,
         uint64_t           bytes,
@@ -4441,58 +4485,97 @@ static DS4_MAYBE_UNUSED bool weights_model_map_non_routed_spans(
     return model_map_span_vec_finish(spans);
 }
 
+static DS4_MAYBE_UNUSED bool weights_model_map_non_routed_page_spans(
+        const ds4_model   *m,
+        const ds4_weights *w,
+        ds4_model_map_span_vec *spans,
+        uint64_t          *bytes_out) {
+    if (bytes_out) *bytes_out = 0;
+    if (!m || !m->map || m->size == 0 || !w || !spans || !bytes_out) {
+        return false;
+    }
+
+    if (!weights_model_map_non_routed_spans(w, spans)) return false;
+
+    const uint64_t page = (uint64_t)sysconf(_SC_PAGESIZE);
+    if (page == 0 || (page & (page - 1u)) != 0) {
+        free(spans->v);
+        memset(spans, 0, sizeof(*spans));
+        return false;
+    }
+    if (m->size > UINT64_MAX - (page - 1u)) {
+        free(spans->v);
+        memset(spans, 0, sizeof(*spans));
+        return false;
+    }
+    const uint64_t mapped_page_end =
+        (m->size + page - 1u) & ~(page - 1u);
+
+    /* Page-align and merge again: separate tensor spans can share one VM
+     * page.  AUTO and the optional pin must budget identical coverage. */
+    uint32_t aligned_count = 0;
+    for (uint32_t i = 0; i < spans->len; i++) {
+        uint64_t lo = spans->v[i].off & ~(page - 1u);
+        uint64_t hi = spans->v[i].end;
+        if (hi > UINT64_MAX - (page - 1u)) {
+            free(spans->v);
+            memset(spans, 0, sizeof(*spans));
+            return false;
+        }
+        hi = (hi + page - 1u) & ~(page - 1u);
+        if (hi > mapped_page_end) hi = mapped_page_end;
+        if (hi <= lo) continue;
+        if (aligned_count != 0 &&
+            lo <= spans->v[aligned_count - 1u].end) {
+            if (hi > spans->v[aligned_count - 1u].end) {
+                spans->v[aligned_count - 1u].end = hi;
+            }
+            continue;
+        }
+        spans->v[aligned_count++] =
+            (ds4_model_map_span){lo, hi, false};
+    }
+    spans->len = aligned_count;
+
+    const uint64_t bytes = model_map_span_vec_total_bytes(spans);
+    if (bytes == 0 || bytes == UINT64_MAX) {
+        free(spans->v);
+        memset(spans, 0, sizeof(*spans));
+        return false;
+    }
+    *bytes_out = bytes;
+    return true;
+}
+
+static DS4_MAYBE_UNUSED bool weights_strict_non_routed_bytes(
+        const ds4_model   *m,
+        const ds4_weights *w,
+        uint64_t          *bytes_out) {
+    ds4_model_map_span_vec spans;
+    if (!weights_model_map_non_routed_page_spans(m, w, &spans, bytes_out)) {
+        return false;
+    }
+    free(spans.v);
+    return true;
+}
+
 /* Experimental A/B arm for unified-memory Macs.  mlock() is performed once at
  * startup and adds no work to prefill or decode.  It faults and wires the page
  * coverage of non-routed tensors, leaving routed experts under the normal SSD
  * cache policy.  A few boundary pages may contain bytes from both classes. */
-static bool model_pin_non_routed_weights(
+static DS4_MAYBE_UNUSED bool model_pin_non_routed_weights(
         const ds4_model *m,
         const ds4_weights *w) {
     if (!m || !m->map || m->size == 0 || !w) return false;
 
     ds4_model_map_span_vec spans;
-    if (!weights_model_map_non_routed_spans(w, &spans)) {
+    uint64_t total_bytes = 0;
+    if (!weights_model_map_non_routed_page_spans(m,
+                                                 w,
+                                                 &spans,
+                                                 &total_bytes)) {
         fprintf(stderr, "ds4: could not build non-routed pin spans\n");
         return false;
-    }
-
-    const uint64_t page = (uint64_t)sysconf(_SC_PAGESIZE);
-    if (page == 0 || (page & (page - 1u)) != 0) {
-        fprintf(stderr, "ds4: invalid host page size for non-routed pinning\n");
-        free(spans.v);
-        return false;
-    }
-
-    /* Page-align and merge again: separate tensor spans can share one VM page. */
-    uint32_t aligned_count = 0;
-    for (uint32_t i = 0; i < spans.len; i++) {
-        uint64_t lo = spans.v[i].off & ~(page - 1u);
-        uint64_t hi = spans.v[i].end;
-        if (hi > UINT64_MAX - (page - 1u)) {
-            free(spans.v);
-            return false;
-        }
-        hi = (hi + page - 1u) & ~(page - 1u);
-        if (hi > m->size) hi = m->size;
-        if (hi <= lo) continue;
-        if (aligned_count != 0 && lo <= spans.v[aligned_count - 1u].end) {
-            if (hi > spans.v[aligned_count - 1u].end) {
-                spans.v[aligned_count - 1u].end = hi;
-            }
-            continue;
-        }
-        spans.v[aligned_count++] = (ds4_model_map_span){lo, hi, false};
-    }
-    spans.len = aligned_count;
-
-    uint64_t total_bytes = 0;
-    for (uint32_t i = 0; i < spans.len; i++) {
-        const uint64_t bytes = spans.v[i].end - spans.v[i].off;
-        if (total_bytes > UINT64_MAX - bytes) {
-            free(spans.v);
-            return false;
-        }
-        total_bytes += bytes;
     }
 
     const uint64_t chunk_bytes = 256ull * 1024ull * 1024ull;
@@ -21976,6 +22059,7 @@ struct ds4_engine {
     uint32_t ssd_streaming_cache_experts;
     uint64_t ssd_streaming_cache_bytes;
     uint32_t ssd_streaming_preload_experts;
+    bool non_routed_weights_pinned;
     ds4_ssd_memory_lock simulated_memory;
     ds4_residency_mode residency_requested;
     ds4_residency_mode residency;
@@ -25677,47 +25761,33 @@ static bool ds4_engine_configure_streaming_auto_cache(ds4_engine *e) {
         return false;
     }
 
-    uint64_t non_routed_bytes = 0;
-    if (!weights_streaming_non_routed_bytes(&e->weights, &non_routed_bytes)) {
+    uint64_t strict_non_routed_bytes = 0;
+    if (!weights_strict_non_routed_bytes(&e->model,
+                                         &e->weights,
+                                         &strict_non_routed_bytes)) {
         fprintf(stderr,
-                "ds4: SSD streaming auto cache could not measure non-routed model weights\n");
+                "ds4: SSD streaming auto cache could not measure strict non-routed model weights\n");
         return false;
     }
 
-    uint64_t per_expert_bytes = 0;
-    if (!ds4_streaming_routed_expert_bytes(&e->weights, &per_expert_bytes)) {
+    ds4_streaming_cache_geometry geometry;
+    if (!ds4_streaming_cache_geometry_make(&e->weights, &geometry)) {
         fprintf(stderr,
-                "ds4: SSD streaming auto cache could not measure routed expert size\n");
+                "ds4: SSD streaming auto cache could not determine a cacheable routed-expert geometry\n");
         return false;
     }
 
-    uint32_t routed_layers = 0;
-    uint32_t boosted_layers = 0;
-    for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
-        const ds4_layer_weights *l = &e->weights.layer[il];
-        if (!l->ffn_gate_exps || !l->ffn_up_exps || !l->ffn_down_exps) continue;
-        routed_layers++;
-        if (!weights_streaming_layer_experts_uniform(&e->weights, il)) {
-            boosted_layers++;
-        }
-    }
-    if (routed_layers == 0 || boosted_layers >= routed_layers) {
-        fprintf(stderr,
-                "ds4: SSD streaming auto cache found no cacheable routed layers\n");
-        return false;
-    }
-
-    const uint32_t cacheable_layers = routed_layers - boosted_layers;
-    const uint64_t max_cacheable_experts =
-        (uint64_t)cacheable_layers * (uint64_t)DS4_N_EXPERT;
     ds4_ssd_adaptive_cache_plan plan;
-    const bool plan_ok = ds4_ssd_adaptive_cache_plan_make(
+    const bool plan_ok =
+        ds4_ssd_adaptive_cache_plan_make_with_static_reserve(
         &memory,
         e->residency_plan.runtime_bytes,
-        cacheable_layers,
+        strict_non_routed_bytes,
+        e->non_routed_weights_pinned,
+        geometry.cacheable_layers,
         DS4_N_EXPERT_USED,
-        per_expert_bytes,
-        max_cacheable_experts,
+        geometry.per_expert_bytes,
+        geometry.max_cacheable_experts,
         &plan);
     if (!plan_ok) {
         fprintf(stderr,
@@ -25759,13 +25829,21 @@ static bool ds4_engine_configure_streaming_auto_cache(ds4_engine *e) {
             (double)plan.platform_headroom_bytes / 1073741824.0,
             (double)plan.wire_budget_bytes / 1073741824.0);
     fprintf(stderr,
-            "ds4:   non-routed weights: %.2f GiB streamed/pageable "
-            "(not charged as wired cache)\n",
-            (double)non_routed_bytes / 1073741824.0);
+            "ds4:   safety cache budget %.2f GiB; stable AUTO envelope "
+            "%.2f GiB (9/16 of recommended)\n",
+            (double)plan.safety_wire_budget_bytes / 1073741824.0,
+            (double)plan.cache_envelope_bytes / 1073741824.0);
+    fprintf(stderr,
+            "ds4:   strict non-routed weights %.2f GiB (%s); "
+            "pageable static reserve %.2f GiB\n",
+            (double)strict_non_routed_bytes / 1073741824.0,
+            e->non_routed_weights_pinned ?
+                "already pinned and reflected in snapshot" : "pageable",
+            (double)plan.pageable_static_reserve_bytes / 1073741824.0);
     fprintf(stderr,
             "ds4:   routed expert size %.2f MiB; per-token working set "
             "%" PRIu64 ", safe floor %" PRIu64 " experts\n",
-            (double)per_expert_bytes / 1048576.0,
+            (double)geometry.per_expert_bytes / 1048576.0,
             plan.floor.working_set_experts,
             plan.floor.minimum_cache_experts);
     fprintf(stderr,
@@ -26027,6 +26105,133 @@ static bool ds4_engine_preload_pro_q4_expert_tables(
 #endif
 }
 
+#ifndef DS4_NO_GPU
+static bool ds4_engine_preflight_non_routed_pin(
+        ds4_engine                *e,
+        const ds4_ssd_host_memory *memory) {
+    if (!e || !memory) return false;
+    if (!ds4_ssd_static_pin_host_supported(memory->physical_bytes)) {
+        fprintf(stderr,
+                "ds4: refusing non-routed pin on %.2f GiB RAM; the static "
+                "pin is validated only on hosts with at least 64 GiB\n",
+                (double)memory->physical_bytes / 1073741824.0);
+        return false;
+    }
+
+    uint64_t strict_non_routed_bytes = 0;
+    if (!weights_strict_non_routed_bytes(&e->model,
+                                         &e->weights,
+                                         &strict_non_routed_bytes)) {
+        fprintf(stderr,
+                "ds4: non-routed pin preflight could not measure strict page coverage\n");
+        return false;
+    }
+
+    ds4_streaming_cache_geometry geometry;
+    if (!ds4_streaming_cache_geometry_make(&e->weights, &geometry)) {
+        fprintf(stderr,
+                "ds4: non-routed pin preflight could not determine expert-cache geometry\n");
+        return false;
+    }
+
+    ds4_ssd_adaptive_cache_plan plan;
+    if (!ds4_ssd_adaptive_cache_plan_make_with_static_reserve(
+            memory,
+            e->residency_plan.runtime_bytes,
+            strict_non_routed_bytes,
+            false,
+            geometry.cacheable_layers,
+            DS4_N_EXPERT_USED,
+            geometry.per_expert_bytes,
+            geometry.max_cacheable_experts,
+            &plan)) {
+        fprintf(stderr,
+                "ds4: refusing non-routed pin: current RAM pressure cannot "
+                "fit the static %.2f GiB set plus the %.2f GiB minimum "
+                "expert-cache tier and runtime\n",
+                (double)strict_non_routed_bytes / 1073741824.0,
+                (double)plan.floor.minimum_cache_bytes / 1073741824.0);
+        return false;
+    }
+    /* The pre-pin snapshot still contains no wired static pages.  Re-run only
+     * the fixed platform constraint in pinned mode, where those bytes are
+     * additive, while retaining the pre-pin current-pressure constraint from
+     * the pageable plan above. */
+    ds4_ssd_adaptive_cache_plan pinned_platform_plan;
+    if (!ds4_ssd_adaptive_cache_plan_make_with_static_reserve(
+            memory,
+            e->residency_plan.runtime_bytes,
+            strict_non_routed_bytes,
+            true,
+            geometry.cacheable_layers,
+            DS4_N_EXPERT_USED,
+            geometry.per_expert_bytes,
+            geometry.max_cacheable_experts,
+            &pinned_platform_plan)) {
+        fprintf(stderr,
+                "ds4: refusing non-routed pin: the fixed platform working-set "
+                "limit cannot fit pinned static weights plus the minimum cache\n");
+        return false;
+    }
+    const uint64_t pin_safety_budget_bytes =
+        plan.current_wire_budget_bytes <
+                pinned_platform_plan.platform_wire_budget_bytes ?
+            plan.current_wire_budget_bytes :
+            pinned_platform_plan.platform_wire_budget_bytes;
+
+    uint64_t requested_cache_bytes = plan.cache_bytes;
+    const char *request_kind = "AUTO";
+    if (e->ssd_streaming_cache_experts != 0) {
+        if ((uint64_t)e->ssd_streaming_cache_experts <
+                plan.floor.minimum_cache_experts ||
+            (uint64_t)e->ssd_streaming_cache_experts >
+                UINT64_MAX / geometry.per_expert_bytes) {
+            fprintf(stderr,
+                    "ds4: refusing non-routed pin before an invalid explicit "
+                    "expert-cache count of %u (minimum safe count is %" PRIu64 ")\n",
+                    e->ssd_streaming_cache_experts,
+                    plan.floor.minimum_cache_experts);
+            return false;
+        }
+        requested_cache_bytes =
+            (uint64_t)e->ssd_streaming_cache_experts *
+            geometry.per_expert_bytes;
+        request_kind = "explicit expert count";
+    } else if (e->ssd_streaming_cache_bytes != 0) {
+        if (e->ssd_streaming_cache_bytes < plan.floor.minimum_cache_bytes) {
+            fprintf(stderr,
+                    "ds4: refusing non-routed pin before an explicit cache "
+                    "budget below the %.2f GiB minimum safe tier\n",
+                    (double)plan.floor.minimum_cache_bytes / 1073741824.0);
+            return false;
+        }
+        requested_cache_bytes = e->ssd_streaming_cache_bytes;
+        request_kind = "explicit byte budget";
+    }
+
+    if (requested_cache_bytes > pin_safety_budget_bytes) {
+        fprintf(stderr,
+                "ds4: refusing non-routed pin: %s requests %.2f GiB of "
+                "expert cache but only %.2f GiB remains after static weights, "
+                "runtime, pressure margin, and platform headroom\n",
+                request_kind,
+                (double)requested_cache_bytes / 1073741824.0,
+                (double)pin_safety_budget_bytes / 1073741824.0);
+        return false;
+    }
+
+    fprintf(stderr,
+            "ds4: non-routed pin preflight: host %.2f GiB, static %.2f GiB, "
+            "%s cache %.2f GiB, safety budget %.2f GiB\n",
+            (double)memory->physical_bytes / 1073741824.0,
+            (double)strict_non_routed_bytes / 1073741824.0,
+            request_kind,
+            (double)requested_cache_bytes / 1073741824.0,
+            (double)pin_safety_budget_bytes / 1073741824.0);
+    return true;
+}
+#endif
+
 int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
     if (!out || !opt || !opt->model_path || !opt->model_path[0]) {
         fprintf(stderr, "ds4: engine open needs a model path and output pointer\n");
@@ -26154,11 +26359,51 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
     }
     const char *pin_non_routed =
         getenv("DS4_METAL_STREAMING_PIN_NON_ROUTED");
-    if (pin_non_routed && pin_non_routed[0] &&
-        strcmp(pin_non_routed, "0") != 0) {
+    bool pin_non_routed_requested = false;
+    if (pin_non_routed && pin_non_routed[0]) {
+        if (strcmp(pin_non_routed, "1") == 0) {
+            pin_non_routed_requested = true;
+        } else if (strcmp(pin_non_routed, "0") != 0) {
+            fprintf(stderr,
+                    "ds4: DS4_METAL_STREAMING_PIN_NON_ROUTED must be 0 or 1\n");
+            ds4_engine_close(e);
+            return 1;
+        }
+    }
+    if (pin_non_routed_requested) {
+        if (opt->inspect_only) {
+            fprintf(stderr,
+                    "ds4: refusing non-routed pin in --inspect mode; inspection must not wire model pages\n");
+            ds4_engine_close(e);
+            return 1;
+        }
         if (!e->ssd_streaming || e->backend != DS4_BACKEND_METAL) {
             fprintf(stderr,
                     "ds4: DS4_METAL_STREAMING_PIN_NON_ROUTED requires Metal SSD streaming\n");
+            ds4_engine_close(e);
+            return 1;
+        }
+#ifdef DS4_NO_GPU
+        fprintf(stderr,
+                "ds4: DS4_METAL_STREAMING_PIN_NON_ROUTED is unavailable in this build\n");
+        ds4_engine_close(e);
+        return 1;
+#else
+        ds4_ssd_host_memory pin_memory;
+        if (!ds4_gpu_init()) {
+            fprintf(stderr,
+                    "ds4: Metal backend unavailable while validating non-routed pin\n");
+            ds4_engine_close(e);
+            return 1;
+        }
+        e->metal_ready = true;
+        if (!ds4_gpu_host_memory_snapshot(&pin_memory)) {
+            fprintf(stderr,
+                    "ds4: refusing non-routed pin without a host-memory snapshot\n");
+            ds4_engine_close(e);
+            return 1;
+        }
+        if (!ds4_engine_preflight_non_routed_pin(e, &pin_memory)) {
             ds4_engine_close(e);
             return 1;
         }
@@ -26166,6 +26411,8 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
             ds4_engine_close(e);
             return 1;
         }
+        e->non_routed_weights_pinned = true;
+#endif
     }
     if (opt->warm_weights) {
         if (e->ssd_streaming) {

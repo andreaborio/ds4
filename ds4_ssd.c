@@ -247,9 +247,22 @@ bool ds4_ssd_expert_cache_floor_make(
     return true;
 }
 
-bool ds4_ssd_adaptive_cache_plan_make(
+bool ds4_ssd_low_ram_cache_policy(uint64_t physical_bytes) {
+    return physical_bytes != 0 && physical_bytes <= 16u * DS4_GIB;
+}
+
+bool ds4_ssd_static_pin_host_supported(uint64_t physical_bytes) {
+    /* The static pin is an experimental performance arm, not a correctness
+     * requirement.  It has only been validated on a 64 GiB unified-memory
+     * host; smaller machines keep these weights pageable. */
+    return physical_bytes >= 64u * DS4_GIB;
+}
+
+bool ds4_ssd_adaptive_cache_plan_make_with_static_reserve(
         const ds4_ssd_host_memory   *memory,
         uint64_t                     runtime_bytes,
+        uint64_t                     static_working_set_bytes,
+        bool                         static_already_pinned,
         uint64_t                     cacheable_routed_layers,
         uint64_t                     experts_per_token,
         uint64_t                     per_expert_bytes,
@@ -268,7 +281,17 @@ bool ds4_ssd_adaptive_cache_plan_make(
         return false;
     }
     out->low_ram_floor_ceiling_active =
-        memory->physical_bytes <= 16u * DS4_GIB;
+        ds4_ssd_low_ram_cache_policy(memory->physical_bytes);
+    /* A 16 GiB host cannot retain Flash's complete static working set and a
+     * useful expert cache simultaneously.  The measured winner there is the
+     * minimum safe expert tier, with static tensors left pageable.  Larger
+     * hosts reserve the strict always-used static set before spending the
+     * remaining reclaimable memory on wired experts. */
+    const uint64_t static_reserve_bytes =
+        out->low_ram_floor_ceiling_active ? 0 : static_working_set_bytes;
+    out->pageable_static_reserve_bytes =
+        static_already_pinned ? 0 : static_reserve_bytes;
+    out->platform_static_reserve_bytes = static_reserve_bytes;
 
     const uint64_t file_inactive_bytes =
         memory->inactive_bytes < memory->file_backed_bytes ?
@@ -285,6 +308,17 @@ bool ds4_ssd_adaptive_cache_plan_make(
     if (out->current_headroom_bytes < two_gib) {
         out->current_headroom_bytes = two_gib;
     }
+    if (static_already_pinned) {
+        /* The live snapshot has already fallen by the pinned bytes.  Preserve
+         * the same pre-pin max(base, static) policy by charging only the
+         * residual base slack not covered by that drop. */
+        out->current_headroom_bytes =
+            out->current_headroom_bytes > static_reserve_bytes ?
+                out->current_headroom_bytes - static_reserve_bytes : 0;
+    } else if (out->current_headroom_bytes <
+               out->pageable_static_reserve_bytes) {
+        out->current_headroom_bytes = out->pageable_static_reserve_bytes;
+    }
     out->pressure_margin_bytes = memory->physical_bytes / 64u;
     if (out->pressure_margin_bytes < quarter_gib) {
         out->pressure_margin_bytes = quarter_gib;
@@ -292,6 +326,17 @@ bool ds4_ssd_adaptive_cache_plan_make(
     out->platform_headroom_bytes = memory->physical_bytes / 8u;
     if (out->platform_headroom_bytes < two_gib) {
         out->platform_headroom_bytes = two_gib;
+    }
+    if (static_already_pinned) {
+        /* Pinned pages are irreversible pressure and therefore additive to
+         * the ordinary platform slack.  Pageable static pages can instead
+         * occupy that slack and remain reclaimable, so max() is sufficient. */
+        out->platform_headroom_bytes = saturating_add_u64(
+            out->platform_headroom_bytes,
+            out->platform_static_reserve_bytes);
+    } else if (out->platform_headroom_bytes <
+               out->platform_static_reserve_bytes) {
+        out->platform_headroom_bytes = out->platform_static_reserve_bytes;
     }
 
     uint64_t current_reserve =
@@ -314,9 +359,21 @@ bool ds4_ssd_adaptive_cache_plan_make(
             memory->recommended_bytes - platform_reserve;
     }
 
-    out->wire_budget_bytes =
+    out->safety_wire_budget_bytes =
         out->current_wire_budget_bytes < out->platform_wire_budget_bytes ?
             out->current_wire_budget_bytes : out->platform_wire_budget_bytes;
+    /* A warm model mapping can turn useful file-backed pages into apparently
+     * reclaimable memory and make AUTO grow between identical launches.  The
+     * 9/16 envelope is just above the measured M5 Flash winner (55.21% of the
+     * Metal recommended set), but below the larger tier which consumed 3.57
+     * GiB more wired memory without improving decode.  Current pressure can
+     * still shrink below this hardware-scaled ceiling. */
+    out->cache_envelope_bytes =
+        (memory->recommended_bytes / 16u) * 9u +
+        ((memory->recommended_bytes % 16u) * 9u) / 16u;
+    out->wire_budget_bytes =
+        out->safety_wire_budget_bytes < out->cache_envelope_bytes ?
+            out->safety_wire_budget_bytes : out->cache_envelope_bytes;
     uint64_t raw_experts = out->wire_budget_bytes / per_expert_bytes;
     if (raw_experts > max_cacheable_experts) {
         raw_experts = max_cacheable_experts;
@@ -353,6 +410,26 @@ bool ds4_ssd_adaptive_cache_plan_make(
     out->cache_experts = (uint32_t)cache_experts;
     out->cache_bytes = cache_experts * per_expert_bytes;
     return true;
+}
+
+bool ds4_ssd_adaptive_cache_plan_make(
+        const ds4_ssd_host_memory   *memory,
+        uint64_t                     runtime_bytes,
+        uint64_t                     cacheable_routed_layers,
+        uint64_t                     experts_per_token,
+        uint64_t                     per_expert_bytes,
+        uint64_t                     max_cacheable_experts,
+        ds4_ssd_adaptive_cache_plan *out) {
+    return ds4_ssd_adaptive_cache_plan_make_with_static_reserve(
+        memory,
+        runtime_bytes,
+        0,
+        false,
+        cacheable_routed_layers,
+        experts_per_token,
+        per_expert_bytes,
+        max_cacheable_experts,
+        out);
 }
 
 bool ds4_ssd_working_set_after_reserve(uint64_t  recommended_bytes,
