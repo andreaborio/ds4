@@ -3033,6 +3033,20 @@ int ds4_gpu_host_memory_snapshot(ds4_ssd_host_memory *out) {
         .recommended_bytes = recommended_bytes,
         .task_footprint_bytes = (uint64_t)task_vm.phys_footprint,
     };
+    int pressure_level = 0;
+    size_t pressure_level_size = sizeof(pressure_level);
+    if (sysctlbyname("kern.memorystatus_vm_pressure_level",
+                     &pressure_level,
+                     &pressure_level_size,
+                     NULL,
+                     0) == 0 &&
+        pressure_level_size == sizeof(pressure_level) &&
+        (pressure_level == DS4_SSD_MEMORY_PRESSURE_NORMAL ||
+         pressure_level == DS4_SSD_MEMORY_PRESSURE_WARNING ||
+         pressure_level == DS4_SSD_MEMORY_PRESSURE_CRITICAL)) {
+        snapshot.memory_pressure =
+            (ds4_ssd_memory_pressure_level)pressure_level;
+    }
     const uint64_t page_bytes = (uint64_t)page_size;
     if (!ds4_gpu_page_count_bytes(free_pages,
                                   page_bytes,

@@ -55,6 +55,13 @@ typedef struct {
     uint64_t warning_cache_experts;
 } ds4_ssd_expert_cache_floor;
 
+typedef enum {
+    DS4_SSD_MEMORY_PRESSURE_UNKNOWN  = 0,
+    DS4_SSD_MEMORY_PRESSURE_NORMAL   = 1,
+    DS4_SSD_MEMORY_PRESSURE_WARNING  = 2,
+    DS4_SSD_MEMORY_PRESSURE_CRITICAL = 4,
+} ds4_ssd_memory_pressure_level;
+
 /* Point-in-time host memory state used by the SSD expert-cache planner.
  * The platform backend owns collection; the planner below is pure so policy
  * can be tested without depending on live machine pressure. */
@@ -68,6 +75,10 @@ typedef struct {
     uint64_t purgeable_bytes;
     uint64_t inactive_bytes;
     uint64_t file_backed_bytes;
+    /* Darwin's point-in-time memorystatus pressure level.  UNKNOWN keeps
+     * optional low-RAM reclamation policy fail-closed on other platforms or
+     * when the sysctl is unavailable. */
+    ds4_ssd_memory_pressure_level memory_pressure;
 } ds4_ssd_host_memory;
 
 typedef struct {
@@ -85,6 +96,10 @@ typedef struct {
     uint64_t current_headroom_bytes;
     uint64_t pressure_margin_bytes;
     uint64_t platform_headroom_bytes;
+    /* On <= 16 GiB hosts, AUTO may count additional inactive file-backed
+     * pages only to reach the measured minimum cache tier.  It never uses
+     * this bridge to grow beyond that floor. */
+    uint64_t low_ram_floor_bridge_bytes;
     uint64_t current_wire_budget_bytes;
     uint64_t platform_wire_budget_bytes;
     uint64_t safety_wire_budget_bytes;

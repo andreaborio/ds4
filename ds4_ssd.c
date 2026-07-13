@@ -359,6 +359,38 @@ bool ds4_ssd_adaptive_cache_plan_make_with_static_reserve(
             memory->recommended_bytes - platform_reserve;
     }
 
+    /* A warm low-RAM launch can have almost no free pages because the model
+     * mapping has become inactive file cache.  The ordinary planner counts
+     * only half of min(inactive, file-backed), which is deliberately a proxy:
+     * Darwin does not expose their exact intersection here.  Permit the other
+     * half to bridge only the measured Flash 259-entry floor, only while the
+     * kernel reports normal memory pressure, and never above 2 GiB.  Keep both
+     * the current-pressure reserve and Metal's independent working-set limit
+     * intact; every unknown/unmeasured case remains fail-closed. */
+    if (out->low_ram_floor_ceiling_active &&
+        !static_already_pinned &&
+        memory->memory_pressure == DS4_SSD_MEMORY_PRESSURE_NORMAL &&
+        out->floor.minimum_cache_experts == 259u &&
+        out->floor.minimum_cache_bytes <= two_gib &&
+        out->current_wire_budget_bytes < out->floor.minimum_cache_bytes &&
+        out->platform_wire_budget_bytes >= out->floor.minimum_cache_bytes) {
+        uint64_t floor_reclaimable = saturating_add_u64(
+            memory->free_bytes,
+            memory->purgeable_bytes);
+        floor_reclaimable = saturating_add_u64(floor_reclaimable,
+                                               file_inactive_bytes);
+        const uint64_t floor_current_budget =
+            floor_reclaimable > current_reserve ?
+                floor_reclaimable - current_reserve : 0;
+        if (floor_current_budget >= out->floor.minimum_cache_bytes) {
+            out->low_ram_floor_bridge_bytes =
+                out->floor.minimum_cache_bytes -
+                out->current_wire_budget_bytes;
+            out->current_wire_budget_bytes =
+                out->floor.minimum_cache_bytes;
+        }
+    }
+
     out->safety_wire_budget_bytes =
         out->current_wire_budget_bytes < out->platform_wire_budget_bytes ?
             out->current_wire_budget_bytes : out->platform_wire_budget_bytes;
