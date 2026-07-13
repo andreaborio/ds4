@@ -2784,6 +2784,11 @@ extern "C" uint64_t ds4_gpu_recommended_working_set_size(void) {
     return 0;
 }
 
+extern "C" int ds4_gpu_host_memory_snapshot(ds4_ssd_host_memory *out) {
+    if (out) memset(out, 0, sizeof(*out));
+    return 0;
+}
+
 extern "C" uint32_t ds4_gpu_stream_expert_cache_configured_count(void) {
     if (!cuda_stream_expert_cache_budget_visible_to_shared()) return 0;
     return cuda_stream_expert_cache_configured_budget();

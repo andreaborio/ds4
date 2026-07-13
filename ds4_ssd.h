@@ -55,6 +55,32 @@ typedef struct {
     uint64_t warning_cache_experts;
 } ds4_ssd_expert_cache_floor;
 
+/* Point-in-time host memory state used by the SSD expert-cache planner.
+ * The platform backend owns collection; the planner below is pure so policy
+ * can be tested without depending on live machine pressure. */
+typedef struct {
+    uint64_t physical_bytes;
+    uint64_t recommended_bytes;
+    uint64_t task_footprint_bytes;
+    uint64_t free_bytes;
+    uint64_t purgeable_bytes;
+    uint64_t inactive_bytes;
+    uint64_t file_backed_bytes;
+} ds4_ssd_host_memory;
+
+typedef struct {
+    ds4_ssd_expert_cache_floor floor;
+    uint64_t reclaimable_bytes;
+    uint64_t current_headroom_bytes;
+    uint64_t pressure_margin_bytes;
+    uint64_t platform_headroom_bytes;
+    uint64_t current_wire_budget_bytes;
+    uint64_t platform_wire_budget_bytes;
+    uint64_t wire_budget_bytes;
+    uint64_t cache_bytes;
+    uint32_t cache_experts;
+} ds4_ssd_adaptive_cache_plan;
+
 bool ds4_parse_gib_arg(const char *s, uint64_t *bytes);
 bool ds4_parse_streaming_cache_experts_arg(const char *s,
                                            uint32_t   *experts,
@@ -77,6 +103,14 @@ bool ds4_ssd_expert_cache_floor_make(
         uint64_t                    experts_per_token,
         uint64_t                    per_expert_bytes,
         ds4_ssd_expert_cache_floor *out);
+bool ds4_ssd_adaptive_cache_plan_make(
+        const ds4_ssd_host_memory  *memory,
+        uint64_t                    runtime_bytes,
+        uint64_t                    cacheable_routed_layers,
+        uint64_t                    experts_per_token,
+        uint64_t                    per_expert_bytes,
+        uint64_t                    max_cacheable_experts,
+        ds4_ssd_adaptive_cache_plan *out);
 bool ds4_ssd_working_set_after_reserve(uint64_t  recommended_bytes,
                                        uint64_t  runtime_bytes,
                                        uint64_t  external_reserved_bytes,

@@ -2973,6 +2973,84 @@ uint64_t ds4_gpu_recommended_working_set_size(void) {
     return (uint64_t)[g_device recommendedMaxWorkingSetSize];
 }
 
+static int ds4_gpu_page_count_bytes(uint64_t pages,
+                                    uint64_t page_bytes,
+                                    uint64_t *bytes_out) {
+    if (!bytes_out || page_bytes == 0 || pages > UINT64_MAX / page_bytes) {
+        return 0;
+    }
+    *bytes_out = pages * page_bytes;
+    return 1;
+}
+
+int ds4_gpu_host_memory_snapshot(ds4_ssd_host_memory *out) {
+    if (!out) return 0;
+    memset(out, 0, sizeof(*out));
+    if (!g_initialized && !ds4_gpu_init()) return 0;
+    if (!g_device) return 0;
+
+    const uint64_t physical_bytes = ds4_gpu_system_memory_bytes();
+    const uint64_t recommended_bytes =
+        (uint64_t)[g_device recommendedMaxWorkingSetSize];
+    if (physical_bytes == 0 || recommended_bytes == 0) return 0;
+
+    mach_port_t host = mach_host_self();
+    vm_size_t page_size = 0;
+    vm_statistics64_data_t vm = {0};
+    mach_msg_type_number_t vm_count = HOST_VM_INFO64_COUNT;
+    const kern_return_t page_kr = host_page_size(host, &page_size);
+    const kern_return_t vm_kr = host_statistics64(
+        host,
+        HOST_VM_INFO64,
+        (host_info64_t)&vm,
+        &vm_count);
+    (void)mach_port_deallocate(mach_task_self(), host);
+    if (page_kr != KERN_SUCCESS ||
+        vm_kr != KERN_SUCCESS ||
+        page_size == 0 ||
+        vm_count < HOST_VM_INFO64_COUNT) {
+        return 0;
+    }
+
+    task_vm_info_data_t task_vm = {0};
+    mach_msg_type_number_t task_count = TASK_VM_INFO_COUNT;
+    if (task_info(mach_task_self(),
+                  TASK_VM_INFO,
+                  (task_info_t)&task_vm,
+                  &task_count) != KERN_SUCCESS ||
+        task_count < TASK_VM_INFO_REV1_COUNT) {
+        return 0;
+    }
+
+    uint64_t free_pages = (uint64_t)vm.free_count;
+    if (free_pages > UINT64_MAX - (uint64_t)vm.speculative_count) return 0;
+    free_pages += (uint64_t)vm.speculative_count;
+
+    ds4_ssd_host_memory snapshot = {
+        .physical_bytes = physical_bytes,
+        .recommended_bytes = recommended_bytes,
+        .task_footprint_bytes = (uint64_t)task_vm.phys_footprint,
+    };
+    const uint64_t page_bytes = (uint64_t)page_size;
+    if (!ds4_gpu_page_count_bytes(free_pages,
+                                  page_bytes,
+                                  &snapshot.free_bytes) ||
+        !ds4_gpu_page_count_bytes((uint64_t)vm.purgeable_count,
+                                  page_bytes,
+                                  &snapshot.purgeable_bytes) ||
+        !ds4_gpu_page_count_bytes((uint64_t)vm.inactive_count,
+                                  page_bytes,
+                                  &snapshot.inactive_bytes) ||
+        !ds4_gpu_page_count_bytes((uint64_t)vm.external_page_count,
+                                  page_bytes,
+                                  &snapshot.file_backed_bytes)) {
+        return 0;
+    }
+
+    *out = snapshot;
+    return 1;
+}
+
 static int ds4_gpu_model_map_log_enabled(void) {
     if (!g_ssd_streaming_mode) return 1;
     const char *trace = getenv("DS4_METAL_STREAMING_MAP_TRACE");

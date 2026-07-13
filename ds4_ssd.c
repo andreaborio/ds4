@@ -247,6 +247,92 @@ bool ds4_ssd_expert_cache_floor_make(
     return true;
 }
 
+bool ds4_ssd_adaptive_cache_plan_make(
+        const ds4_ssd_host_memory   *memory,
+        uint64_t                     runtime_bytes,
+        uint64_t                     cacheable_routed_layers,
+        uint64_t                     experts_per_token,
+        uint64_t                     per_expert_bytes,
+        uint64_t                     max_cacheable_experts,
+        ds4_ssd_adaptive_cache_plan *out) {
+    if (!out) return false;
+    memset(out, 0, sizeof(*out));
+    if (!memory ||
+        memory->physical_bytes == 0 ||
+        memory->recommended_bytes == 0 ||
+        max_cacheable_experts == 0 ||
+        !ds4_ssd_expert_cache_floor_make(cacheable_routed_layers,
+                                          experts_per_token,
+                                          per_expert_bytes,
+                                          &out->floor)) {
+        return false;
+    }
+
+    const uint64_t file_inactive_bytes =
+        memory->inactive_bytes < memory->file_backed_bytes ?
+            memory->inactive_bytes : memory->file_backed_bytes;
+    uint64_t reclaimable = saturating_add_u64(memory->free_bytes,
+                                               memory->purgeable_bytes);
+    reclaimable = saturating_add_u64(reclaimable,
+                                      file_inactive_bytes / 2u);
+    out->reclaimable_bytes = reclaimable;
+
+    const uint64_t two_gib = 2u * DS4_GIB;
+    const uint64_t quarter_gib = DS4_GIB / 4u;
+    out->current_headroom_bytes = memory->physical_bytes / 16u;
+    if (out->current_headroom_bytes < two_gib) {
+        out->current_headroom_bytes = two_gib;
+    }
+    out->pressure_margin_bytes = memory->physical_bytes / 64u;
+    if (out->pressure_margin_bytes < quarter_gib) {
+        out->pressure_margin_bytes = quarter_gib;
+    }
+    out->platform_headroom_bytes = memory->physical_bytes / 8u;
+    if (out->platform_headroom_bytes < two_gib) {
+        out->platform_headroom_bytes = two_gib;
+    }
+
+    const uint64_t current_reserve =
+        saturating_add_u64(out->current_headroom_bytes,
+                           out->pressure_margin_bytes);
+    if (reclaimable > current_reserve) {
+        out->current_wire_budget_bytes = reclaimable - current_reserve;
+    }
+
+    const uint64_t platform_reserve =
+        saturating_add_u64(runtime_bytes, out->platform_headroom_bytes);
+    if (memory->recommended_bytes > platform_reserve) {
+        out->platform_wire_budget_bytes =
+            memory->recommended_bytes - platform_reserve;
+    }
+
+    out->wire_budget_bytes =
+        out->current_wire_budget_bytes < out->platform_wire_budget_bytes ?
+            out->current_wire_budget_bytes : out->platform_wire_budget_bytes;
+    uint64_t raw_experts = out->wire_budget_bytes / per_expert_bytes;
+    if (raw_experts > max_cacheable_experts) {
+        raw_experts = max_cacheable_experts;
+    }
+    if (raw_experts > UINT32_MAX) raw_experts = UINT32_MAX;
+    if (raw_experts < out->floor.minimum_cache_experts) return false;
+
+    /* Grow only by complete per-token working sets.  Besides leaving useful
+     * pressure slack, this prevents small changes in free pages from buying a
+     * cache which still cannot retain one more token's routed-expert cycle. */
+    const uint64_t cache_experts =
+        1u + out->floor.working_set_experts *
+                 ((raw_experts - 1u) / out->floor.working_set_experts);
+    if (cache_experts < out->floor.minimum_cache_experts ||
+        cache_experts > UINT32_MAX ||
+        cache_experts > UINT64_MAX / per_expert_bytes) {
+        return false;
+    }
+
+    out->cache_experts = (uint32_t)cache_experts;
+    out->cache_bytes = cache_experts * per_expert_bytes;
+    return true;
+}
+
 bool ds4_ssd_working_set_after_reserve(uint64_t  recommended_bytes,
                                        uint64_t  runtime_bytes,
                                        uint64_t  external_reserved_bytes,

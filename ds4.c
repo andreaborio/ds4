@@ -25552,43 +25552,12 @@ static bool ds4_engine_configure_streaming_auto_cache(ds4_engine *e) {
         return true;
     }
 
-    const uint64_t recommended = ds4_gpu_recommended_working_set_size();
-    if (recommended == 0) {
+    ds4_ssd_host_memory memory;
+    if (!ds4_gpu_host_memory_snapshot(&memory)) {
         fprintf(stderr,
-                "ds4: SSD streaming auto cache: recommended working set unavailable; "
-                "cannot choose a safe cache automatically; set "
+                "ds4: SSD streaming auto cache: host memory snapshot unavailable; "
+                "refusing to guess a cache size; set "
                 "--ssd-streaming-cache-experts N or NGB explicitly\n");
-        return false;
-    }
-
-    uint64_t headroom_bytes = e->residency_plan.headroom_bytes;
-    if (headroom_bytes == 0) {
-        headroom_bytes = recommended / 5u;
-        const uint64_t min_headroom = 2ull * 1024ull * 1024ull * 1024ull;
-        if (headroom_bytes < min_headroom) headroom_bytes = min_headroom;
-    }
-    uint64_t external_and_headroom =
-        e->residency_plan.external_reserved_bytes;
-    if (external_and_headroom > UINT64_MAX -
-                                headroom_bytes) {
-        external_and_headroom = UINT64_MAX;
-    } else {
-        external_and_headroom += headroom_bytes;
-    }
-    uint64_t reserved_bytes = 0;
-    uint64_t model_target_bytes = 0;
-    if (!ds4_ssd_working_set_after_reserve(
-            recommended,
-            e->residency_plan.runtime_bytes,
-            external_and_headroom,
-            &model_target_bytes,
-            &reserved_bytes)) {
-        fprintf(stderr,
-                "ds4: SSD streaming auto cache: context/runtime plus external "
-                "reserve (%.2f GiB) consumes the %.2f GiB recommended working set; "
-                "reduce context or set an explicit cache budget\n",
-                (double)reserved_bytes / 1073741824.0,
-                (double)recommended / 1073741824.0);
         return false;
     }
 
@@ -25606,54 +25575,88 @@ static bool ds4_engine_configure_streaming_auto_cache(ds4_engine *e) {
         return false;
     }
 
-    if (model_target_bytes <= non_routed_bytes ||
-        model_target_bytes - non_routed_bytes < per_expert_bytes) {
+    uint32_t routed_layers = 0;
+    uint32_t boosted_layers = 0;
+    for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+        const ds4_layer_weights *l = &e->weights.layer[il];
+        if (!l->ffn_gate_exps || !l->ffn_up_exps || !l->ffn_down_exps) continue;
+        routed_layers++;
+        if (!weights_streaming_layer_experts_uniform(&e->weights, il)) {
+            boosted_layers++;
+        }
+    }
+    if (routed_layers == 0 || boosted_layers >= routed_layers) {
         fprintf(stderr,
-                "ds4: SSD streaming auto cache: safe %.2f GiB model target "
-                "cannot fit %.2f GiB non-routed weights plus one %.2f MiB expert\n",
-                (double)model_target_bytes / 1073741824.0,
-                (double)non_routed_bytes / 1073741824.0,
-                (double)per_expert_bytes / 1048576.0);
+                "ds4: SSD streaming auto cache found no cacheable routed layers\n");
         return false;
     }
 
-    const uint64_t max_model_experts = (uint64_t)DS4_N_LAYER * (uint64_t)DS4_N_EXPERT;
-    ds4_ssd_cache_plan plan;
-    if (!ds4_ssd_cache_plan_for_model_target(model_target_bytes,
-                                              non_routed_bytes,
-                                              per_expert_bytes,
-                                              max_model_experts,
-                                              &plan)) {
+    const uint32_t cacheable_layers = routed_layers - boosted_layers;
+    const uint64_t max_cacheable_experts =
+        (uint64_t)cacheable_layers * (uint64_t)DS4_N_EXPERT;
+    ds4_ssd_adaptive_cache_plan plan;
+    const bool plan_ok = ds4_ssd_adaptive_cache_plan_make(
+        &memory,
+        e->residency_plan.runtime_bytes,
+        cacheable_layers,
+        DS4_N_EXPERT_USED,
+        per_expert_bytes,
+        max_cacheable_experts,
+        &plan);
+    if (!plan_ok) {
         fprintf(stderr,
-                "ds4: SSD streaming auto cache could not compute a valid cache budget\n");
+                "ds4: SSD streaming auto cache: current RAM pressure permits "
+                "%.2f GiB of wired expert cache, below the safe per-token floor "
+                "of %.2f GiB (%" PRIu64 " experts); refusing AUTO. Reduce "
+                "memory pressure/context or set an explicit safe cache budget\n",
+                (double)plan.wire_budget_bytes / 1073741824.0,
+                (double)plan.floor.minimum_cache_bytes / 1073741824.0,
+                plan.floor.minimum_cache_experts);
         return false;
     }
 
     e->ssd_streaming_cache_experts = plan.cache_experts;
     fprintf(stderr,
-            "ds4: SSD streaming auto cache budget\n");
+            "ds4: SSD streaming adaptive cache budget\n");
     fprintf(stderr,
-            "ds4:   %s recommends %.2f GiB working set\n",
+            "ds4:   host physical %.2f GiB, %s recommended %.2f GiB, "
+            "task footprint %.2f GiB\n",
+            (double)memory.physical_bytes / 1073741824.0,
             ds4_backend_name(e->backend),
-            (double)recommended / 1073741824.0);
+            (double)memory.recommended_bytes / 1073741824.0,
+            (double)memory.task_footprint_bytes / 1073741824.0);
     fprintf(stderr,
-            "ds4:   reserving %.2f GiB for context/KV/scratch, external pressure, "
-            "and backend headroom; %.2f GiB remains for the streaming model plan\n",
-            (double)reserved_bytes / 1073741824.0,
-            (double)model_target_bytes / 1073741824.0);
+            "ds4:   free/speculative %.2f GiB, purgeable %.2f GiB, "
+            "inactive %.2f GiB, file-backed %.2f GiB; conservative "
+            "reclaimable %.2f GiB\n",
+            (double)memory.free_bytes / 1073741824.0,
+            (double)memory.purgeable_bytes / 1073741824.0,
+            (double)memory.inactive_bytes / 1073741824.0,
+            (double)memory.file_backed_bytes / 1073741824.0,
+            (double)plan.reclaimable_bytes / 1073741824.0);
     fprintf(stderr,
-            "ds4:   model + cached expert target after reserves: %.2f GiB\n",
-            (double)plan.model_target_bytes / 1073741824.0);
+            "ds4:   current-pressure reserve %.2f + %.2f GiB, platform "
+            "headroom %.2f GiB, modeled runtime %.2f GiB; wired budget %.2f GiB\n",
+            (double)plan.current_headroom_bytes / 1073741824.0,
+            (double)plan.pressure_margin_bytes / 1073741824.0,
+            (double)plan.platform_headroom_bytes / 1073741824.0,
+            (double)e->residency_plan.runtime_bytes / 1073741824.0,
+            (double)plan.wire_budget_bytes / 1073741824.0);
     fprintf(stderr,
-            "ds4:   non-routed weights: %.2f GiB\n",
+            "ds4:   non-routed weights: %.2f GiB streamed/pageable "
+            "(not charged as wired cache)\n",
             (double)non_routed_bytes / 1073741824.0);
     fprintf(stderr,
-            "ds4:   routed expert size: %.2f MiB\n",
-            (double)per_expert_bytes / 1048576.0);
+            "ds4:   routed expert size %.2f MiB; per-token working set "
+            "%" PRIu64 ", safe floor %" PRIu64 " experts\n",
+            (double)per_expert_bytes / 1048576.0,
+            plan.floor.working_set_experts,
+            plan.floor.minimum_cache_experts);
     fprintf(stderr,
-            "ds4:   cached expert count: %u (%.2f GiB)\n",
+            "ds4:   cached expert count: %u (%.2f GiB), rounded to complete "
+            "working-set cycles\n",
             e->ssd_streaming_cache_experts,
-            (double)plan.effective_cache_bytes / 1073741824.0);
+            (double)plan.cache_bytes / 1073741824.0);
     return true;
 #endif
 }
