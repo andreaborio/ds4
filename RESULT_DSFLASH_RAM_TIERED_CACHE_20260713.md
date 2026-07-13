@@ -71,6 +71,51 @@ not throughput on those machines.  With an 18 GiB Metal recommendation, the
 must be measured on real hardware before being described as performance
 optima.
 
+## M1 Pro 16 GiB live check
+
+The old `fc28b9c` and new `f4e0e64` binaries were run on the same M1 Pro with
+the DSBox production command: Metal SSD streaming, context 8,192, AUTO cache,
+no pin, and the same deterministic 21-prompt-token / 8-generation-token
+request.  Both binaries selected exactly 259 experts / `1.707 GiB`.
+
+Launch-order results were:
+
+| Binary | Prefill s | Decode s | Decode t/s | Total s |
+|---|---:|---:|---:|---:|
+| old `fc28b9c` | 10.210 | 62.860 | 0.127 | 73.070 |
+| new `f4e0e64` | 8.239 | 48.033 | 0.167 | 56.272 |
+| new `f4e0e64` | 8.067 | 20.212 | 0.396 | 28.279 |
+| old `fc28b9c` | 8.057 | 18.819 | 0.425 | 26.877 |
+| new `f4e0e64` | 8.046 | 10.055 | 0.796 | 18.101 |
+
+This sequence does **not** establish a code-speedup.  Throughput rose strongly
+with launch order across both binaries as macOS retained the repeated routed
+reads in file-backed page cache.  The returning old binary was faster than the
+immediately preceding new run, while the next new run was faster again.  The
+low-RAM patch therefore remains a safety/policy change, not a claimed token-loop
+performance win.  No leg added swapout, and all responses had the same token
+count and text.
+
+The apparently unused RAM was not idle.  After a 259-expert run, `vm_stat`
+showed about `9.29 GiB` file-backed pages and `4.03 GiB` wired globally; macOS
+can display much of the file cache as available because it is reclaimable.
+
+A direct 517-expert arm tested the proposal to reserve another `1.707 GiB` for
+the expert cache.  With the same warm prompt it produced:
+
+| Cache | Prefill s | Decode s | Decode t/s | Total s | New swapout |
+|---|---:|---:|---:|---:|---:|
+| 259 | 8.046 | 10.055 | 0.796 | 18.101 | 0 |
+| 517 | 8.027 | 61.635 | 0.130 | 69.663 | 0 |
+
+The 517 arm was `83.69%` slower (`6.13x` longer per generated token).  Its
+process RSS rose from about `1.72` to `3.42 GiB`; global wired memory was about
+`7.10 GiB`, while file-backed pages fell to about `6.50 GiB`.  This reproduces
+the earlier finding with a much hotter page cache: wiring more expert slots
+evicts the more valuable SSD L2 cache.  The second 517 leg was cancelled as a
+safety/stopping-rule decision rather than repeating a large, mechanistically
+explained loss.
+
 ## Pin and safety status
 
 The pin parser now accepts only `0` or `1`, rejects inspect mode and hosts below
