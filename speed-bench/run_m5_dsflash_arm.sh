@@ -7,13 +7,15 @@
 set -u
 
 if (( $# < 2 || $# > 3 )); then
-    print -u2 -- "usage: $0 LABEL auto|exact4342|auto_pin|exact4342_pin [GEN_TOKENS]"
+    print -u2 -- "usage: $0 LABEL auto|exact259|exact4342|auto_pin|exact4342_pin [GEN_TOKENS]"
     exit 2
 fi
 
 label=$1
 mode=$2
 gen_tokens=${3:-64}
+ctx_start=${DS4_M5_CTX_START:-128}
+ctx_alloc=${DS4_M5_CTX_ALLOC:-32768}
 root=${0:A:h:h}
 bin=${DS4_M5_BIN:-$root/build/metal-arm64/bin/ds4-bench}
 model=${DS4_M5_MODEL:-/Users/chinaski/Desktop/ds4/DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix.gguf}
@@ -27,6 +29,7 @@ max_wired_gib=${DS4_M5_MAX_WIRED_GIB:-46}
 
 case $mode in
     auto)          cache=auto; pin=0 ;;
+    exact259)      cache=259; pin=0 ;;
     exact4342)     cache=4342; pin=0 ;;
     auto_pin)      cache=auto; pin=1 ;;
     exact4342_pin) cache=4342; pin=1 ;;
@@ -97,6 +100,13 @@ require_uint DS4_M5_MAX_SECONDS "$max_seconds"
 require_uint DS4_M5_MIN_FREE_PERCENT "$min_free_percent"
 require_uint DS4_M5_MAX_SWAPOUT_PAGES "$max_swapout_pages"
 require_uint DS4_M5_MAX_WIRED_GIB "$max_wired_gib"
+require_uint DS4_M5_CTX_START "$ctx_start"
+require_uint DS4_M5_CTX_ALLOC "$ctx_alloc"
+(( ctx_start > 0 )) || { print -u2 -- "DS4_M5_CTX_START must be positive"; exit 2; }
+(( ctx_alloc > ctx_start + gen_tokens )) || {
+    print -u2 -- "DS4_M5_CTX_ALLOC must exceed ctx_start + gen_tokens"
+    exit 2
+}
 
 page_size=$(pagesize)
 require_uint page_size "$page_size"
@@ -174,14 +184,14 @@ trap 'abort_reason=signal_hup; terminate_tree; exit 130' HUP
 trap 'abort_reason=signal_int; terminate_tree; exit 130' INT
 trap 'abort_reason=signal_term; terminate_tree; exit 130' TERM
 
-print -- "START label=$label mode=$mode cache=$cache preload=$preload gen=$gen_tokens"
+print -- "START label=$label mode=$mode cache=$cache preload=$preload gen=$gen_tokens ctx_start=$ctx_start ctx_alloc=$ctx_alloc"
 "$bin" \
     --metal --ssd-streaming \
     "${cache_args[@]}" \
     --ssd-streaming-preload-experts "$preload" \
     -m "$model" \
     --prompt-file "$prompt" \
-    --ctx-start 128 --ctx-max 128 --ctx-alloc 32768 \
+    --ctx-start "$ctx_start" --ctx-max "$ctx_start" --ctx-alloc "$ctx_alloc" \
     --gen-tokens "$gen_tokens" \
     --dump-frontier-logits-dir "$prefix.logits" \
     --csv "$prefix.csv" \
@@ -290,6 +300,8 @@ fi
     print -- "cache=$cache"
     print -- "preload=$preload"
     print -- "gen_tokens=$gen_tokens"
+    print -- "ctx_start=$ctx_start"
+    print -- "ctx_alloc=$ctx_alloc"
     print -- "pid=$run_pid"
     print -- "process_rc=$rc"
     print -- "rc=$final_rc"
