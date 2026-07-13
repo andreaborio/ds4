@@ -7,16 +7,30 @@
 #define GIB (UINT64_C(1024) * 1024u * 1024u)
 #define MIB (UINT64_C(1024) * 1024u)
 
-static ds4_ssd_host_memory memory_for_raw_experts(uint64_t raw_experts,
-                                                   uint64_t per_expert_bytes) {
-    /* On a 64 GiB host Hcurrent=4 GiB and margin=1 GiB.  Make the
-     * reclaimable side of the min() land exactly on the requested count. */
+static ds4_ssd_host_memory memory_for_raw_experts_on_host(
+        uint64_t physical_bytes,
+        uint64_t recommended_bytes,
+        uint64_t raw_experts,
+        uint64_t per_expert_bytes) {
+    uint64_t current_headroom = physical_bytes / 16u;
+    if (current_headroom < 2 * GIB) current_headroom = 2 * GIB;
+    uint64_t pressure_margin = physical_bytes / 64u;
+    if (pressure_margin < GIB / 4u) pressure_margin = GIB / 4u;
     ds4_ssd_host_memory memory = {
-        .physical_bytes = 64 * GIB,
-        .recommended_bytes = 64 * GIB,
-        .free_bytes = 5 * GIB + raw_experts * per_expert_bytes,
+        .physical_bytes = physical_bytes,
+        .recommended_bytes = recommended_bytes,
+        .free_bytes = current_headroom + pressure_margin +
+                      raw_experts * per_expert_bytes,
     };
     return memory;
+}
+
+static ds4_ssd_host_memory memory_for_raw_experts(uint64_t raw_experts,
+                                                   uint64_t per_expert_bytes) {
+    return memory_for_raw_experts_on_host(64 * GIB,
+                                          64 * GIB,
+                                          raw_experts,
+                                          per_expert_bytes);
 }
 
 static ds4_residency_plan plan(bool metal,
@@ -192,6 +206,31 @@ int main(void) {
     assert(adaptive.cache_experts == 259);
     assert(adaptive.cache_bytes == UINT64_C(259) * flash_expert_bytes);
     assert(adaptive.floor.working_set_experts == 258);
+    assert(adaptive.low_ram_floor_ceiling_active);
+
+    /* High free memory does not buy the slower second tier on a 16 GiB host.
+     * The same policy still fails closed when even the correctness floor does
+     * not fit. */
+    memory = memory_for_raw_experts_on_host(16 * GIB,
+                                            12 * GIB,
+                                            517,
+                                            flash_expert_bytes);
+    assert(ds4_ssd_adaptive_cache_plan_make(&memory, 0, 43, 6,
+                                             flash_expert_bytes,
+                                             flash_max_cacheable,
+                                             &adaptive));
+    assert(adaptive.low_ram_floor_ceiling_active);
+    assert(adaptive.wire_budget_bytes / flash_expert_bytes == 517);
+    assert(adaptive.cache_experts == 259);
+    memory = memory_for_raw_experts_on_host(16 * GIB,
+                                            12 * GIB,
+                                            258,
+                                            flash_expert_bytes);
+    assert(!ds4_ssd_adaptive_cache_plan_make(&memory, 0, 43, 6,
+                                              flash_expert_bytes,
+                                              flash_max_cacheable,
+                                              &adaptive));
+    assert(adaptive.low_ram_floor_ceiling_active);
 
     /* The planner never recreates AUTO=119.  Below the correctness floor it
      * fails closed; above it, capacity advances only in complete 258-entry
@@ -224,21 +263,32 @@ int main(void) {
                                              flash_max_cacheable,
                                              &adaptive));
     assert(adaptive.cache_experts == 517);
+    assert(!adaptive.low_ram_floor_ceiling_active);
+
+    memory = memory_for_raw_experts_on_host(32 * GIB,
+                                            24 * GIB,
+                                            517,
+                                            flash_expert_bytes);
+    assert(ds4_ssd_adaptive_cache_plan_make(&memory, 0, 43, 6,
+                                             flash_expert_bytes,
+                                             flash_max_cacheable,
+                                             &adaptive));
+    assert(!adaptive.low_ram_floor_ceiling_active);
+    assert(adaptive.cache_experts == 517);
 
     /* Engine-open planning happens before the session allocates its modeled
-     * runtime footprint.  At the 517-entry boundary on a 16 GiB host, a future
-     * 512 MiB session must be charged to the current-pressure constraint too;
-     * otherwise AUTO jumps from 259 to 517 entries. */
-    memory = (ds4_ssd_host_memory){
-        .physical_bytes = 16 * GIB,
-        .recommended_bytes = 12 * GIB,
-        .free_bytes = 9 * GIB / 4u +
-                      UINT64_C(517) * flash_expert_bytes,
-    };
+     * runtime footprint.  Use a host above the low-RAM ceiling so this test
+     * isolates the runtime reserve: a future 512 MiB session must prevent the
+     * 517-entry tier. */
+    memory = memory_for_raw_experts_on_host(32 * GIB,
+                                            24 * GIB,
+                                            517,
+                                            flash_expert_bytes);
     assert(ds4_ssd_adaptive_cache_plan_make(&memory, 512 * MIB, 43, 6,
                                              flash_expert_bytes,
                                              flash_max_cacheable,
                                              &adaptive));
+    assert(!adaptive.low_ram_floor_ceiling_active);
     assert(adaptive.cache_experts == 259);
     assert(adaptive.current_wire_budget_bytes ==
            UINT64_C(517) * flash_expert_bytes - 512 * MIB);

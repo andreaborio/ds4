@@ -80,6 +80,7 @@ typedef struct {
     uint64_t platform_wire_budget_bytes;
     uint64_t wire_budget_bytes;
     uint64_t cache_bytes;
+    bool low_ram_floor_ceiling_active;
     uint32_t cache_experts;
 } ds4_ssd_adaptive_cache_plan;
 

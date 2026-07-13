@@ -25773,6 +25773,12 @@ static bool ds4_engine_configure_streaming_auto_cache(ds4_engine *e) {
             "working-set cycles\n",
             e->ssd_streaming_cache_experts,
             (double)plan.cache_bytes / 1073741824.0);
+    if (plan.low_ram_floor_ceiling_active) {
+        fprintf(stderr,
+                "ds4:   low-RAM AUTO ceiling active (host <= 16 GiB): "
+                "holding cache at the correctness floor; explicit cache "
+                "overrides remain available for benchmarking\n");
+    }
     return true;
 #endif
 }

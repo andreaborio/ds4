@@ -267,6 +267,8 @@ bool ds4_ssd_adaptive_cache_plan_make(
                                           &out->floor)) {
         return false;
     }
+    out->low_ram_floor_ceiling_active =
+        memory->physical_bytes <= 16u * DS4_GIB;
 
     const uint64_t file_inactive_bytes =
         memory->inactive_bytes < memory->file_backed_bytes ?
@@ -321,6 +323,16 @@ bool ds4_ssd_adaptive_cache_plan_make(
     }
     if (raw_experts > UINT32_MAX) raw_experts = UINT32_MAX;
     if (raw_experts < out->floor.minimum_cache_experts) return false;
+
+    /* Measured M1 16 GiB runs show that the second complete cache tier loses
+     * end-to-end time despite reducing expert reads: page-cache displacement
+     * dominates.  AUTO therefore uses only the correctness floor on hosts of
+     * this size, while an explicit cache count remains available for controlled
+     * experiments. */
+    if (out->low_ram_floor_ceiling_active &&
+        raw_experts > out->floor.minimum_cache_experts) {
+        raw_experts = out->floor.minimum_cache_experts;
+    }
 
     /* Grow only by complete per-token working sets.  Besides leaving useful
      * pressure slack, this prevents small changes in free pages from buying a
