@@ -4425,6 +4425,121 @@ static DS4_MAYBE_UNUSED bool weights_model_map_output_spans(
     return model_map_span_vec_finish(spans);
 }
 
+/* Strict non-routed model spans: token/output plus the static per-layer
+ * tensors used on every pass.  Unlike decode_static_spans(), this deliberately
+ * never adds boosted routed experts that bypass the normal slab cache. */
+static DS4_MAYBE_UNUSED bool weights_model_map_non_routed_spans(
+        const ds4_weights *w,
+        ds4_model_map_span_vec *spans) {
+    if (!w || !spans) return false;
+    memset(spans, 0, sizeof(*spans));
+    model_map_span_vec_include_one(spans, w->token_embd);
+    for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+        model_map_span_vec_include_layer_decode_static(spans, &w->layer[il]);
+    }
+    model_map_span_vec_include_output(spans, w);
+    return model_map_span_vec_finish(spans);
+}
+
+/* Experimental A/B arm for unified-memory Macs.  mlock() is performed once at
+ * startup and adds no work to prefill or decode.  It faults and wires the page
+ * coverage of non-routed tensors, leaving routed experts under the normal SSD
+ * cache policy.  A few boundary pages may contain bytes from both classes. */
+static bool model_pin_non_routed_weights(
+        const ds4_model *m,
+        const ds4_weights *w) {
+    if (!m || !m->map || m->size == 0 || !w) return false;
+
+    ds4_model_map_span_vec spans;
+    if (!weights_model_map_non_routed_spans(w, &spans)) {
+        fprintf(stderr, "ds4: could not build non-routed pin spans\n");
+        return false;
+    }
+
+    const uint64_t page = (uint64_t)sysconf(_SC_PAGESIZE);
+    if (page == 0 || (page & (page - 1u)) != 0) {
+        fprintf(stderr, "ds4: invalid host page size for non-routed pinning\n");
+        free(spans.v);
+        return false;
+    }
+
+    /* Page-align and merge again: separate tensor spans can share one VM page. */
+    uint32_t aligned_count = 0;
+    for (uint32_t i = 0; i < spans.len; i++) {
+        uint64_t lo = spans.v[i].off & ~(page - 1u);
+        uint64_t hi = spans.v[i].end;
+        if (hi > UINT64_MAX - (page - 1u)) {
+            free(spans.v);
+            return false;
+        }
+        hi = (hi + page - 1u) & ~(page - 1u);
+        if (hi > m->size) hi = m->size;
+        if (hi <= lo) continue;
+        if (aligned_count != 0 && lo <= spans.v[aligned_count - 1u].end) {
+            if (hi > spans.v[aligned_count - 1u].end) {
+                spans.v[aligned_count - 1u].end = hi;
+            }
+            continue;
+        }
+        spans.v[aligned_count++] = (ds4_model_map_span){lo, hi, false};
+    }
+    spans.len = aligned_count;
+
+    uint64_t total_bytes = 0;
+    for (uint32_t i = 0; i < spans.len; i++) {
+        const uint64_t bytes = spans.v[i].end - spans.v[i].off;
+        if (total_bytes > UINT64_MAX - bytes) {
+            free(spans.v);
+            return false;
+        }
+        total_bytes += bytes;
+    }
+
+    const uint64_t chunk_bytes = 256ull * 1024ull * 1024ull;
+    const double t0 = now_sec();
+    uint32_t complete_ranges = 0;
+    uint64_t locked_total = 0;
+    uint64_t current_locked = 0;
+    for (uint32_t i = 0; i < spans.len; i++) {
+        const uint64_t range_bytes = spans.v[i].end - spans.v[i].off;
+        current_locked = 0;
+        while (current_locked < range_bytes) {
+            uint64_t bytes = range_bytes - current_locked;
+            if (bytes > chunk_bytes) bytes = chunk_bytes;
+            void *addr = (void *)(m->map + spans.v[i].off + current_locked);
+            if (mlock(addr, (size_t)bytes) != 0) {
+                const int saved_errno = errno;
+                if (current_locked != 0) {
+                    (void)munlock((void *)(m->map + spans.v[i].off),
+                                  (size_t)current_locked);
+                }
+                for (uint32_t j = 0; j < complete_ranges; j++) {
+                    (void)munlock((void *)(m->map + spans.v[j].off),
+                                  (size_t)(spans.v[j].end - spans.v[j].off));
+                }
+                fprintf(stderr,
+                        "ds4: non-routed mlock failed after %.2f/%.2f GiB: %s\n",
+                        (double)(locked_total + current_locked) / 1073741824.0,
+                        (double)total_bytes / 1073741824.0,
+                        strerror(saved_errno));
+                free(spans.v);
+                return false;
+            }
+            current_locked += bytes;
+        }
+        locked_total += range_bytes;
+        complete_ranges++;
+    }
+
+    fprintf(stderr,
+            "ds4: pinned non-routed page coverage: %.6f GiB across %u page-aligned spans in %.3fs (startup-only)\n",
+            (double)total_bytes / 1073741824.0,
+            spans.len,
+            now_sec() - t0);
+    free(spans.v);
+    return true;
+}
+
 static void mtp_weights_bind(ds4_mtp_weights *w, const ds4_model *m) {
     memset(w, 0, sizeof(*w));
 
@@ -25911,6 +26026,21 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
                 "with --mtp yet; use --resident only if the logged plan is safe\n");
         ds4_engine_close(e);
         return 1;
+    }
+    const char *pin_non_routed =
+        getenv("DS4_METAL_STREAMING_PIN_NON_ROUTED");
+    if (pin_non_routed && pin_non_routed[0] &&
+        strcmp(pin_non_routed, "0") != 0) {
+        if (!e->ssd_streaming || e->backend != DS4_BACKEND_METAL) {
+            fprintf(stderr,
+                    "ds4: DS4_METAL_STREAMING_PIN_NON_ROUTED requires Metal SSD streaming\n");
+            ds4_engine_close(e);
+            return 1;
+        }
+        if (!model_pin_non_routed_weights(&e->model, &e->weights)) {
+            ds4_engine_close(e);
+            return 1;
+        }
     }
     if (opt->warm_weights) {
         if (e->ssd_streaming) {
