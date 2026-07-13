@@ -485,6 +485,36 @@ is stable, re-enable thinking with a conservative generation limit:
 The important startup line is the cache report. Start conservative, then
 increase the cache if the machine has headroom.
 
+### Measured Flash SSD-streaming tiers (July 2026)
+
+These measurements use the same 86.72 GB (80.76 GiB) DeepSeek V4 Flash
+IQ2XXS/SExpQ8 GGUF on AC power, without static-weight pinning. The workload is
+shown because short decode rates depend heavily on prompt length and the macOS
+file-backed page cache; rows with different workloads are not directly
+comparable.
+
+| Mac / tested ds4 build | Cache and context | Bounded workload | Prefill | Generation |
+| --- | --- | --- | ---: | ---: |
+| M1 Pro, 16 GB / [`2f95e67`](https://github.com/andreaborio/ds4/commit/2f95e67fdec1db988fe8b1a699330f387de66004) | exact 259, 8,192 | DSBox API, 9 prompt + 2 output tokens | — | 0.30 t/s cold; 0.53 / 0.51 / 0.51 t/s warm (~0.52 t/s) |
+| M1 Pro, 16 GB / [`bf4201c`](https://github.com/andreaborio/ds4/commit/bf4201c47b901f0f479dc4af3f3df77330fabacf) | exact 259, 8,192 | extremely hot CLI, 14 + 2 tokens | 1.02–1.64 t/s | 2.13–2.46 t/s |
+| M5 Pro, 64 GB / [`f4e0e64`](https://github.com/andreaborio/ds4/commit/f4e0e64e76ab62151700f9ea404297ea1769c550) | AUTO 4,387, 32,768 | `ds4-bench`, 128 + 64 tokens, ABBA legs A1/A2 | 21.63 / 22.21 t/s | 13.05 / 13.59 t/s (13.3173 geomean) |
+| M5 Pro, 64 GB / [`f4e0e64`](https://github.com/andreaborio/ds4/commit/f4e0e64e76ab62151700f9ea404297ea1769c550) | exact 4,342, 32,768 | same bounded ABBA, legs B1/B2 | 22.22 / 22.13 t/s | 13.74 / 13.78 t/s (13.7600 geomean) |
+
+The M5 exact 4,342 arm was 3.32% faster in decode than AUTO 4,387, with
+identical frontier logits and zero new swapout. The generic default remains
+AUTO: the small gap does not justify applying one GGUF's exact expert count to
+other quantizations. On 16 GB, AUTO uses the 259-expert floor only when the
+live memory budget can safely admit it; otherwise startup fails closed.
+
+The M1 `2f95e67` server build was later reverted by
+[`8a2a53f`](https://github.com/andreaborio/ds4/commit/8a2a53f323d29e5afd99010852f99019ef0cc8f4)
+because its startup bridge could admit the cache under insufficient sustained
+headroom. The token loop and effective 259-entry cache in that bounded trace
+were unchanged, but the row is historical rather than a current-release
+guarantee. The 2.13–2.46 t/s row is a two-token, extremely hot micro-canary,
+not sustained DSBox throughput; the repeatable short-server observation before
+pressure was about 0.5 t/s.
+
 ## Distributed Inference
 
 Distributed inference lets DwarfStar **run a model that is too large for one machine** by
