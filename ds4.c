@@ -25838,14 +25838,6 @@ static bool ds4_engine_configure_streaming_auto_cache(ds4_engine *e) {
             (double)memory.inactive_bytes / 1073741824.0,
             (double)memory.file_backed_bytes / 1073741824.0,
             (double)plan.reclaimable_bytes / 1073741824.0);
-    if (plan.low_ram_floor_bridge_bytes != 0) {
-        fprintf(stderr,
-                "ds4:   low-RAM floor bridge: allowing %.2f GiB more from "
-                "the inactive/file-backed proxy, capped at the %" PRIu64
-                "-expert tier\n",
-                (double)plan.low_ram_floor_bridge_bytes / 1073741824.0,
-                plan.floor.minimum_cache_experts);
-    }
     fprintf(stderr,
             "ds4:   current-pressure reserve %.2f + %.2f GiB + modeled "
             "runtime %.2f GiB; platform headroom %.2f GiB; wired budget %.2f GiB\n",
