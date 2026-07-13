@@ -26188,7 +26188,6 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
             *out = NULL;
             return 1;
         }
-        ds4_gpu_set_streaming_expert_cache_budget(e->ssd_streaming_cache_experts);
         if (e->ssd_streaming) {
             /*
              * Pin the expert cache's slab size class to the model's uniform
@@ -26220,8 +26219,60 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
                             "expert-cache hit rate will be catastrophic\n",
                             boosted, routed);
                 }
+
+                /*
+                 * Validate only after AUTO or an NGB byte budget has resolved
+                 * to an exact expert count.  A cache at or below one token's
+                 * cacheable routed working set must recycle a slab entry while
+                 * that token is still in flight; measured streamed models can
+                 * then produce silently different logits and output.
+                 */
+                const uint32_t cacheable = routed - boosted;
+                if (cacheable != 0 && e->ssd_streaming_cache_experts != 0) {
+                    ds4_ssd_expert_cache_floor floor;
+                    if (!ds4_ssd_expert_cache_floor_make(
+                            cacheable,
+                            DS4_N_EXPERT_USED,
+                            slab_expert_bytes,
+                            &floor)) {
+                        fprintf(stderr,
+                                "ds4: SSD streaming expert-cache floor calculation overflowed\n");
+                        ds4_engine_close(e);
+                        *out = NULL;
+                        return 1;
+                    }
+                    if ((uint64_t)e->ssd_streaming_cache_experts <=
+                        floor.working_set_experts) {
+                        fprintf(stderr,
+                                "ds4: SSD streaming expert cache of %u experts is at or below "
+                                "the per-token cacheable routed working set (%u layers x %u "
+                                "experts = %" PRIu64 "); this regime can silently change "
+                                "outputs. Use at least %" PRIu64 " experts (%" PRIu64
+                                " bytes, %.2f GiB)\n",
+                                e->ssd_streaming_cache_experts,
+                                cacheable,
+                                DS4_N_EXPERT_USED,
+                                floor.working_set_experts,
+                                floor.minimum_cache_experts,
+                                floor.minimum_cache_bytes,
+                                (double)floor.minimum_cache_bytes / 1073741824.0);
+                        ds4_engine_close(e);
+                        *out = NULL;
+                        return 1;
+                    }
+                    if ((uint64_t)e->ssd_streaming_cache_experts <
+                        floor.warning_cache_experts) {
+                        fprintf(stderr,
+                                "ds4: WARNING: SSD streaming expert cache (%u experts) is "
+                                "under twice the per-token cacheable routed working set "
+                                "(%" PRIu64 "); expect heavy thrashing\n",
+                                e->ssd_streaming_cache_experts,
+                                floor.working_set_experts);
+                    }
+                }
             }
         }
+        ds4_gpu_set_streaming_expert_cache_budget(e->ssd_streaming_cache_experts);
         (void)ds4_gpu_set_model_fd(e->model.fd);
         int model_map_ok = 0;
         uint64_t *load_offsets = NULL;

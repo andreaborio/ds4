@@ -218,6 +218,35 @@ bool ds4_ssd_cache_plan_for_model_target(uint64_t            model_target_bytes,
     return out->cache_experts != 0;
 }
 
+bool ds4_ssd_expert_cache_floor_make(
+        uint64_t                    cacheable_routed_layers,
+        uint64_t                    experts_per_token,
+        uint64_t                    per_expert_bytes,
+        ds4_ssd_expert_cache_floor *out) {
+    if (!out) return false;
+    memset(out, 0, sizeof(*out));
+    if (cacheable_routed_layers == 0 ||
+        experts_per_token == 0 ||
+        per_expert_bytes == 0 ||
+        cacheable_routed_layers > UINT64_MAX / experts_per_token) {
+        return false;
+    }
+
+    const uint64_t working_set =
+        cacheable_routed_layers * experts_per_token;
+    if (working_set == UINT64_MAX || working_set > UINT64_MAX / 2u) {
+        return false;
+    }
+    const uint64_t minimum_cache = working_set + 1u;
+    if (minimum_cache > UINT64_MAX / per_expert_bytes) return false;
+
+    out->working_set_experts = working_set;
+    out->minimum_cache_experts = minimum_cache;
+    out->minimum_cache_bytes = minimum_cache * per_expert_bytes;
+    out->warning_cache_experts = working_set * 2u;
+    return true;
+}
+
 bool ds4_ssd_working_set_after_reserve(uint64_t  recommended_bytes,
                                        uint64_t  runtime_bytes,
                                        uint64_t  external_reserved_bytes,

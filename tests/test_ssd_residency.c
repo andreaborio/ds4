@@ -117,6 +117,41 @@ int main(void) {
                                                  1 * GIB,
                                                  100,
                                                  &cache));
+
+    ds4_ssd_expert_cache_floor floor;
+    assert(ds4_ssd_expert_cache_floor_make(43,
+                                            6,
+                                            UINT64_C(7077888),
+                                            &floor));
+    assert(floor.working_set_experts == 258);
+    assert(floor.minimum_cache_experts == 259);
+    assert(floor.minimum_cache_bytes == UINT64_C(1833172992));
+    assert(floor.warning_cache_experts == 516);
+
+    /* PRO has 61 routed layers.  Mixed-precision layers which bypass the
+     * uniform expert slab are excluded by passing the cacheable count. */
+    assert(ds4_ssd_expert_cache_floor_make(61, 6, 1, &floor));
+    assert(floor.working_set_experts == 366);
+    assert(floor.minimum_cache_experts == 367);
+    assert(floor.warning_cache_experts == 732);
+    assert(ds4_ssd_expert_cache_floor_make(55, 6, 1, &floor));
+    assert(floor.working_set_experts == 330);
+    assert(floor.minimum_cache_experts == 331);
+
+    assert(!ds4_ssd_expert_cache_floor_make(0, 6, 1, &floor));
+    assert(!ds4_ssd_expert_cache_floor_make(1, 0, 1, &floor));
+    assert(!ds4_ssd_expert_cache_floor_make(1, 1, 0, &floor));
+    assert(!ds4_ssd_expert_cache_floor_make(UINT64_MAX, 2, 1, &floor));
+    assert(!ds4_ssd_expert_cache_floor_make(UINT64_MAX, 1, 1, &floor));
+    assert(!ds4_ssd_expert_cache_floor_make(UINT64_MAX / 2u + 1u,
+                                             1,
+                                             1,
+                                             &floor));
+    assert(!ds4_ssd_expert_cache_floor_make(1,
+                                             1,
+                                             UINT64_MAX,
+                                             &floor));
+    assert(!ds4_ssd_expert_cache_floor_make(1, 1, 1, NULL));
     puts("ssd residency resolver: ok");
     return 0;
 }

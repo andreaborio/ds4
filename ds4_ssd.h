@@ -48,6 +48,13 @@ typedef struct {
     uint32_t cache_experts;
 } ds4_ssd_cache_plan;
 
+typedef struct {
+    uint64_t working_set_experts;
+    uint64_t minimum_cache_experts;
+    uint64_t minimum_cache_bytes;
+    uint64_t warning_cache_experts;
+} ds4_ssd_expert_cache_floor;
+
 bool ds4_parse_gib_arg(const char *s, uint64_t *bytes);
 bool ds4_parse_streaming_cache_experts_arg(const char *s,
                                            uint32_t   *experts,
@@ -65,6 +72,11 @@ bool ds4_ssd_cache_plan_for_model_target(uint64_t            model_target_bytes,
                                          uint64_t            per_expert_bytes,
                                          uint64_t            max_model_experts,
                                          ds4_ssd_cache_plan *out);
+bool ds4_ssd_expert_cache_floor_make(
+        uint64_t                    cacheable_routed_layers,
+        uint64_t                    experts_per_token,
+        uint64_t                    per_expert_bytes,
+        ds4_ssd_expert_cache_floor *out);
 bool ds4_ssd_working_set_after_reserve(uint64_t  recommended_bytes,
                                        uint64_t  runtime_bytes,
                                        uint64_t  external_reserved_bytes,
