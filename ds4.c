@@ -16012,22 +16012,13 @@ static bool metal_graph_encode_decode_layer(
         if (ok) ok = ds4_gpu_signal_selected_readback_ready(&selected_event) != 0;
         metal_graph_selected_async_load async_load = {0};
         bool async_load_started = false;
+        bool shared_flushed_for_async = false;
         const bool async_early_commit =
             async_selected_load &&
             metal_graph_use_iq2_selected_async_early_commit(g);
-        if (ok && async_selected_load) {
-            ok = metal_graph_selected_async_load_start(&async_load,
-                                                       g,
-                                                       model,
-                                                       layer,
-                                                       il,
-                                                       selected_event,
-                                                       gate_expert_bytes,
-                                                       down_expert_bytes);
-            async_load_started = ok;
-        }
         if (ok && async_early_commit) {
             ok = ds4_gpu_flush_commands() != 0;
+            shared_flushed_for_async = ok;
         }
         if (ok && fuse_shared_gate_up) {
             ok = ds4_gpu_shared_gate_up_swiglu_q8_0_tensor(g->shared_gate,
@@ -16061,14 +16052,41 @@ static bool metal_graph_encode_decode_layer(
                                               g->shared_mid, 1) != 0;
         }
         DS4_METAL_PROFILE_DECODE_STAGE("shared_down");
+        if (ok && async_selected_load) {
+            /*
+             * Submit the shared FFN before the loader thread can enter the
+             * expert cache.  The cache may need to flush/wait in-flight Metal
+             * buffers while choosing a victim; starting it while this thread
+             * is still encoding shared work races the process-global command
+             * buffer state.  Starting after the submit keeps Metal ownership
+             * on this thread while pread still overlaps the executing shared
+             * command buffer.
+             */
+            ok = ds4_gpu_flush_commands() != 0;
+            if (ok) {
+                async_load_started =
+                    metal_graph_selected_async_load_start(&async_load,
+                                                           g,
+                                                           model,
+                                                           layer,
+                                                           il,
+                                                           selected_event,
+                                                           gate_expert_bytes,
+                                                           down_expert_bytes);
+            }
+        }
         if (async_load_started) {
-            const bool flush_ok = ds4_gpu_flush_commands() != 0;
             const bool finish_ok =
                 metal_graph_selected_async_load_finish(&async_load);
-            ok = ok && flush_ok && finish_ok;
+            ok = ok && finish_ok;
         } else if (ok) {
-            ok = ds4_gpu_commit_and_wait_selected_readback(selected_event,
-                                                           "selected-id shared-overlap") != 0;
+            ok = shared_flushed_for_async ?
+                ds4_gpu_wait_selected_readback_ready(
+                    selected_event,
+                    "selected-id shared-overlap") != 0 :
+                ds4_gpu_commit_and_wait_selected_readback(
+                    selected_event,
+                    "selected-id shared-overlap") != 0;
         }
         if (ok && !async_load_started) {
             int32_t selected_ids[DS4_MAX_EXPERT_USED];
