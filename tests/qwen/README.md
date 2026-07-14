@@ -116,7 +116,7 @@ permutation, including QKV/conv, Z, controls, and output-projection columns.
 It does not execute the converter, bind a GGUF, test quantization, or validate
 the complete Qwen graph.
 
-## Model-backed DS4/llama.cpp logits gate
+## Model-backed DS4/llama.cpp logits comparator and smoke gate
 
 `compare_logits.py` compares one full DS4 `--dump-logits` JSON file with the
 final-position logits saved by llama.cpp `llama-debug`.  The gate is
@@ -157,7 +157,7 @@ without adding a trailing byte:
 
 ```sh
 ROOT=$PWD
-MODEL=/absolute/path/to/Qwen3.6-35B-A3B-DS4-Q4_K.gguf
+MODEL=/absolute/path/to/Qwen3.6-35B-A3B-ds4-Q4_K_S.gguf
 LLAMA_SOURCE=/absolute/path/to/llama.cpp-qwen36
 LLAMA_DEBUG=/absolute/path/to/llama-debug
 OUT=/tmp/qwen36-logits-oracle
@@ -169,7 +169,7 @@ python3 -c \
 
 ./ds4 -m "$MODEL" --dump-tokens \
   --prompt-file "$OUT/prompt.txt" > "$OUT/ds4-tokens.txt"
-./ds4 -m "$MODEL" --cpu --ctx 256 \
+DS4_QWEN_EXPERIMENTAL_CPU=1 ./ds4 -m "$MODEL" --cpu --ctx 256 \
   --dump-logits "$OUT/ds4-logits.json" \
   --prompt-file "$OUT/prompt.txt"
 
@@ -210,15 +210,38 @@ python3 tests/qwen/test_compare_logits.py -v
 
 ## Experimental Qwen Metal + SSD runtime
 
-The current experimental runtime supports exactly one text model and one
-normalized layout: `Qwen3.6-35B-A3B-ds4-Q4_K_S.gguf`, GGUF architecture
-`qwen35moe`, with 733 tensors and no vision or MTP payload.  It is not a
-generic Qwen runner.  A community GGUF with the same architecture label is not
-accepted unless its metadata, tensor inventory, types, and offsets match this
-layout.  Qwen3.7 and separate Coder variants are not aliases for this model.
+The current experimental runtime qualifies one text model and one normalized
+layout: `Qwen3.6-35B-A3B-ds4-Q4_K_S.gguf`, GGUF architecture `qwen35moe`, with
+733 tensors and no vision or MTP payload.  It is not a generic Qwen runner.
+Runtime validation checks the required Qwen3.6 geometry and tokenizer controls,
+the complete tensor name/shape/type inventory, the blessed static payload size,
+and aligned, in-bounds, non-overlapping tensor ranges.  Absolute offsets need
+not match the reference artifact, and runtime acceptance is not a file-SHA
+attestation.  Qwen3.7 and separate Coder variants are not aliases for this
+model.
 
-The Metal path is deliberately double opt-in.  It requires an Apple Metal build,
-the exact environment guard, explicit Metal, and explicit SSD residency:
+### Qualified artifact provenance
+
+The measured artifact starts from the prebuilt Unsloth
+`unsloth/Qwen3.6-35B-A3B-GGUF` repository at revision
+`a483e9e6cbd595906af30beda3187c2663a1118c`, file
+`Qwen3.6-35B-A3B-UD-Q4_K_S.gguf`.  The 20,893,015,008-byte source has SHA-256
+`a8138f183e3993f12cdc23afd2babb8cdb084e64088ce4a256d49101d47b949c`.
+It was used as the base rather than downloading the full BF16 safetensors.
+
+Normalization restores the official padding ID and chat template, converts
+three routed `ffn_down_exps` banks from Q6_K to the uniform Q4_K cache layout,
+and converts `output.weight` from Q6_K to Q8_0.  The other 729 tensor payloads
+are byte-identical to the Unsloth source.  The resulting 20,808,563,424-byte
+artifact has SHA-256
+`c33efb67bde86c9ba1f9e79c2dc42627170963bef0e915ab9b91a55cfb6d0fcd`.
+This exact hash is the artifact qualified by the evidence below; the raw
+Unsloth GGUF is not a drop-in substitute for this experimental DS4 path.
+
+The two true explicit opt-ins are the literal environment guard and explicit
+SSD residency.  The Metal backend is mandatory but already defaults on Apple
+builds; `--metal` is shown for clarity.  Effective power must be 100;
+`--power 100` is shown for reproducibility but is also the default:
 
 ```sh
 export DS4_QWEN_EXPERIMENTAL_METAL=1
@@ -226,9 +249,9 @@ export DS4_QWEN_EXPERIMENTAL_METAL=1
   --metal --ssd-streaming --power 100 ...
 ```
 
-Omitting the environment guard, `--metal`, or `--ssd-streaming` fails closed.
-Resident Qwen Metal inference is not enabled by this experiment.  `--power`
-must remain 100.
+Omitting the environment guard or explicit `--ssd-streaming` fails closed, as
+does selecting a non-Metal backend or an effective power setting below 100.
+Resident Qwen Metal inference is not enabled by this experiment.
 
 ### Expert-cache tiers
 
@@ -236,7 +259,10 @@ Each routed Q4_K expert instance contains gate, up, and down matrices and is
 1,769,472 bytes (1.6875 MiB).  One token selects 40 x 8 = 320 instances.
 The safe floor is therefore 321 complete experts, or 568,000,512 bytes
 (0.529 GiB): one full route plus one slot so the next load cannot evict an
-in-flight expert.  Requests below 321 are rejected.
+in-flight expert.  Requests below 321 are rejected.  The floor is checked
+against the effective locked budget, not only the requested count: the Metal
+kernel test forces the first lazy `mlock` to fail and verifies rejection before
+readahead, `pread`, cache installation, miss accounting, or token accounting.
 
 The recommended starting tier is 640 experts (1.055 GiB), covering two complete
 routes.  A smaller accepted cache emits an anti-thrashing warning.  This is a
@@ -269,17 +295,19 @@ DS4_MOE_RECORD_SELECTED_IDS="$OUT/selected-ids.bin" \
     > "$OUT/stdout.log" 2> "$OUT/stderr.log"
 ```
 
-At commit `70d515e51ebe7e168f36bf718c8ccff9d6393f3f` on an Apple M5
-Pro with 64 GiB unified memory, this command completed a real Metal graph and
+At runtime build `8ea5e6dc8252` on an Apple M5 Pro with 64 GiB unified memory,
+this command completed a real Metal graph and
 SSD-selected-expert forward.  The backend recorded 40 routed-MoE selections,
 320 cold misses, 0.53 GiB of logical expert `pread` demand, no non-finite
-logits, and argmax token 846 (`user`) at 25.9613953.  Wall time was 0.67 s
-and `/usr/bin/time -l` reported 704,462,848 bytes maximum RSS.
+logits, and argmax token 846 (`user`) at 25.9613953.  The confirmatory rerun
+completed in 0.26 s and `/usr/bin/time -l` reported 704,069,632 bytes maximum
+RSS and zero swap.  The OS page cache was not flushed after preceding model
+runs, so this timing is correctness/footprint evidence, not a cold-start
+benchmark.
 
-The Metal vector was compared offline over all 248,077 non-padding IDs with the
-CPU vector and the pinned llama.cpp oracle described above.  The Metal vector
-is from `70d515e51ebe`; the unchanged CPU reference vector was captured at
-`c2e34ccd579d`, and llama.cpp was pinned to
+The Metal vector was compared offline over all 248,077 non-padding IDs with a
+CPU vector captured from the same `8ea5e6dc8252` runtime build and the pinned
+llama.cpp oracle described above.  llama.cpp was pinned to
 `bf2c86ddc0685f580595954056c2e77ebabfab4f`.
 
 | Pair | Top-1 | Top-5 | Top-20 | Top-64 | Cosine | RMSE | Max abs |
@@ -314,14 +342,14 @@ DS4_MOE_RECORD_SELECTED_IDS="$OUT/selected-ids.bin" \
     > "$OUT/stdout.log" 2> "$OUT/stderr.log"
 ```
 
-At commit `f0f62b2f0850` on the same M5 Pro 64 GiB machine, the prompt
+At runtime build `8ea5e6dc8252` on the same M5 Pro 64 GiB machine, the prompt
 contained 43 tokens and the 96-token cap produced a complete iterative
 `fibonacci(n)` implementation through `return curr`.  The closing Markdown
 fence was not emitted before the cap; this is recorded as truncation, not
 presented as an EOS-complete answer.
 
-The same prompt, sampling arguments, context, model, and commit were also run
-through the separately built CPU reference.  This diagnostic mapped
+The same prompt, sampling arguments, context, model, and runtime build were also
+run through the separately built CPU reference.  This diagnostic reported
 13.59 GB maximum RSS and should not be repeated on a 16 GiB target; use the
 CPU-only binary below only on a machine with sufficient headroom.
 
@@ -336,8 +364,13 @@ DS4_QWEN_EXPERIMENTAL_CPU=1 \
 
 | Backend | Prefill | Generation | Wall | Maximum RSS |
 | --- | ---: | ---: | ---: | ---: |
-| Metal + SSD, cache 640 | 14.62 t/s | 15.61 t/s | 9.48 s | 1,276,805,120 B |
-| DS4 CPU reference | 25.54 t/s | 25.47 t/s | 5.65 s | 13,585,776,640 B |
+| Metal + SSD, cache 640 | 19.63 t/s | 19.75 t/s | 7.14 s | 1,276,821,504 B |
+| DS4 CPU reference | 27.45 t/s | 26.83 t/s | 5.33 s | 13,585,793,024 B |
+
+These post-rebase confirmations followed earlier model runs without flushing
+the macOS page cache; `--ssd-streaming-cold` clears DS4's expert cache, not the
+OS cache.  Treat the throughput as warm-page-cache confirmation, not a fresh
+cold-disk benchmark.
 
 The two stdout files are byte-identical, both with SHA-256
 `a650b56ceb47dc8715f87c125c7eeab506bc4a510512cedbd190e38c46df5f33`.
@@ -358,23 +391,24 @@ counters reported by `/usr/bin/time -l`, not device-level storage telemetry.
 
 The normalized GGUF used by both model-backed runs has SHA-256
 `c33efb67bde86c9ba1f9e79c2dc42627170963bef0e915ab9b91a55cfb6d0fcd`.
-The local evidence bundle used to prepare this record was kept outside the
-worktree at `../qwen36-ds4-artifact/logs/metal-ssd-smoke-20260714T213430/`.
+The post-rebase runtime-build evidence bundle used to prepare this record was
+kept outside the worktree at
+`../qwen36-ds4-artifact/logs/metal-ssd-final-8ea5e6d/`.
 It is intentionally not committed because it contains model-run artifacts.
 Its primary files have these hashes:
 
 - `metal-logits.json`:
   `decc87665fc08665946d296d0936a5c89913511cb88098f805fd6587b61d450c`;
-- `metal-logits.stderr.log`:
-  `06cf1f3705cd4df98f304b6d75fa7cfab625d96b859ee8b226f0e6af0c1927fa`;
+- `stderr.log`:
+  `bf438bf8b60754de42a664e87ccee1f893a7095f70a9b0da9de198f9d0396a35`;
 - `coding-640-n96.stdout.log`:
   `a650b56ceb47dc8715f87c125c7eeab506bc4a510512cedbd190e38c46df5f33`;
 - `coding-640-n96.stderr.log`:
-  `df8609e3c1db2ff3313adb4c61c6375dc53ea41d306ddb9d7cdd8d1e3a155f91`;
+  `1d5188d890b807ecf279adf76ec72d62044536b58f3bd8b2ff9f3620f3bb3b37`;
 - `coding-cpu-n96.stdout.log`:
   `a650b56ceb47dc8715f87c125c7eeab506bc4a510512cedbd190e38c46df5f33`;
 - `coding-cpu-n96.stderr.log`:
-  `d45694627341cf4da06e5d7ee5baecf742ebb65a2d9f3edb6210fe01135627f1`.
+  `d11b8356c8eefce276574e39297126bb1f39b23f988ed7c402068638df5b98ca`.
 
 Both measurements are from an M5 Pro with 64 GiB unified memory.  They do not
 prove operation on a physical 16 GiB Mac.  Prefill is scalar
@@ -387,8 +421,10 @@ runtime currently rejects or leaves unsupported:
 - expert profiles/hotlists, expert preloading, and directional steering;
 - non-routed pin profiles and power settings below 100.
 
-Longer continuations, resident/SSD equivalence, disk snapshot restore, server
-tool-call sessions, 8K/32K context, and physical 16 GiB pressure/swap tests
-remain release gates.  The one-token and bounded coding runs prove an alive,
-numerically close Metal+SSD path; they do not by themselves promote it to the
-general Qwen release path.
+The preregistered normalized-vs-original-Unsloth multi-position NLL/top-1 gate,
+a complete multi-position oracle, longer continuations, resident/SSD
+equivalence, disk snapshot restore, server tool-call sessions, 8K/32K context,
+and physical 16 GiB pressure/swap tests remain release gates.  The one-token
+oracle is a smoke-tolerance result; together with the bounded coding run it
+proves an alive, numerically close Metal+SSD path, not the general Qwen release
+path.

@@ -45,7 +45,7 @@ this dated snapshot drifts.
 |---|---|---|
 | Resident-map overcommit guard | Published branch `fix/refuse-oversized-resident-maps` at `06fd005`; tested, not yet on fork `main` | Open upstream as a standalone PR; do not claim mainline protection until it lands here or upstream. |
 | GLM 5.2 | Published experimental branch; streamed prefill fixes and optimization measured on M5 Pro 64 GB | Keep whole-line claims separate from DeepSeek `main`; #520 and #528 are already open upstream. |
-| Qwen3.6-35B-A3B (`qwen35moe`) | Experimental branch `feat/qwen-support`; the normalized Q4_K_S artifact passes the pinned CPU/llama.cpp logits gate and real Metal + SSD logits/generation on M5 Pro 64 GB | Keep isolated and opt-in. No 16 GB support claim until a physical 8K cold/warm zero-swap run passes; server tools, exact rewind/snapshots, long context, and cross-backend production parity remain release gates. Review reusable primitives for focused upstream PRs only after those measurements. |
+| Qwen3.6-35B-A3B (`qwen35moe`) | Experimental branch `feat/qwen-support`; the normalized Q4_K_S artifact passes a one-token CPU/llama.cpp logits smoke gate and real Metal + SSD logits/generation on M5 Pro 64 GB | Keep isolated and opt-in. No 16 GB support claim until a physical 8K cold/warm zero-swap run passes; the normalized-vs-Unsloth multi-position quality gate, server tools, exact rewind/snapshots, long context, and cross-backend production parity remain release gates. Review reusable primitives for focused upstream PRs only after those measurements. |
 
 ## DO NOT UPSTREAM (without clearing the bar below): per-expert / mixed-precision expert quantization
 
