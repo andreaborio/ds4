@@ -142,6 +142,32 @@ enum {
     DS4_MAX_HC_SINKHORN_ITER = 20,
 };
 
+enum {
+    QWEN35_N_LAYER                    = 40,
+    QWEN35_N_TENSOR                   = 733,
+    QWEN35_N_EMBD                     = 2048,
+    QWEN35_N_VOCAB                    = 248320,
+    QWEN35_N_MERGE                    = 247587,
+    QWEN35_N_HEAD                     = 16,
+    QWEN35_N_HEAD_KV                  = 2,
+    QWEN35_N_HEAD_DIM                 = 256,
+    QWEN35_N_ROT                      = 64,
+    QWEN35_N_EXPERT                   = 256,
+    QWEN35_N_EXPERT_USED              = 8,
+    QWEN35_N_FF_EXP                   = 512,
+    QWEN35_N_FF_SHARED                = 512,
+    QWEN35_SSM_CONV_KERNEL            = 4,
+    QWEN35_SSM_STATE                  = 128,
+    QWEN35_SSM_GROUP                  = 16,
+    QWEN35_SSM_DT_RANK                = 32,
+    QWEN35_SSM_INNER                  = 4096,
+    QWEN35_FULL_ATTENTION_INTERVAL    = 4,
+    QWEN35_CONTEXT_LENGTH             = 262144,
+    QWEN35_BOS_PAD_ID                 = 248044,
+    QWEN35_EOS_ID                     = 248046,
+    QWEN35_MODEL_ID                   = 2,
+};
+
 typedef enum {
     DS4_VARIANT_FLASH = 0,
     DS4_VARIANT_PRO   = 1,
@@ -661,6 +687,16 @@ static void ds4_die_errno(const char *what, const char *path) {
 static bool ds4_streq(ds4_str s, const char *z) {
     size_t n = strlen(z);
     return s.len == n && memcmp(s.ptr, z, n) == 0;
+}
+
+static bool ds4_str_contains(ds4_str s, const char *needle) {
+    const size_t n = strlen(needle);
+    if (n == 0) return true;
+    if (s.len < n) return false;
+    for (uint64_t i = 0; i <= s.len - n; i++) {
+        if (memcmp(s.ptr + i, needle, n) == 0) return true;
+    }
+    return false;
 }
 
 static bool ds4_str_eq(ds4_str a, ds4_str b) {
@@ -1626,6 +1662,12 @@ typedef struct {
     uint64_t bytes;
 } ds4_tensor;
 
+typedef enum {
+    DS4_MODEL_FAMILY_UNKNOWN = 0,
+    DS4_MODEL_FAMILY_DEEPSEEK4,
+    DS4_MODEL_FAMILY_QWEN35_MOE,
+} ds4_model_family;
+
 typedef struct {
     int fd;
     const uint8_t *map;
@@ -1637,6 +1679,8 @@ typedef struct {
     uint64_t alignment;
     uint64_t tensor_data_pos;
     uint64_t max_tensor_bytes;
+
+    ds4_model_family family;
 
     ds4_kv *kv;
     ds4_tensor *tensors;
@@ -1746,6 +1790,16 @@ static bool model_get_string(const ds4_model *m, const char *key, ds4_str *out) 
     if (!kv || kv->type != GGUF_VALUE_STRING) return false;
     ds4_cursor c = cursor_at(m, kv->value_pos);
     return cursor_string(&c, out);
+}
+
+static ds4_model_family model_family_from_metadata(const ds4_model *m) {
+    ds4_str arch = {0};
+    if (!model_get_string(m, "general.architecture", &arch)) {
+        return DS4_MODEL_FAMILY_UNKNOWN;
+    }
+    if (ds4_streq(arch, "deepseek4")) return DS4_MODEL_FAMILY_DEEPSEEK4;
+    if (ds4_streq(arch, "qwen35moe")) return DS4_MODEL_FAMILY_QWEN35_MOE;
+    return DS4_MODEL_FAMILY_UNKNOWN;
 }
 
 static bool model_get_u32(const ds4_model *m, const char *key, uint32_t *out) {
@@ -1998,9 +2052,13 @@ static void model_open(ds4_model *m, const char *path, bool metal_mapping,
     if (m->version != 3) ds4_die("only GGUF v3 is supported");
 
     parse_metadata(m, &c);
+    m->family = model_family_from_metadata(m);
     parse_tensors(m, &c);
 
-    if (!metal_mapping && prefetch_cpu) model_prefetch_cpu_mapping(m);
+    if (!metal_mapping && prefetch_cpu &&
+        m->family == DS4_MODEL_FAMILY_DEEPSEEK4) {
+        model_prefetch_cpu_mapping(m);
+    }
 }
 
 static void print_size(uint64_t bytes) {
@@ -2024,24 +2082,42 @@ static void model_summary(const ds4_model *m) {
     uint32_t n_expert_used = 0;
     uint32_t n_expert_groups = 0;
     uint32_t n_group_used = 0;
+    uint32_t n_mtp = 0;
+    uint32_t full_attention_interval = 0;
+    uint32_t ssm_state = 0;
+    uint32_t ssm_inner = 0;
     uint64_t tensor_bytes = 0;
     uint64_t params = 0;
 
     model_get_string(m, "general.name", &name);
     model_get_string(m, "general.architecture", &arch);
-    model_get_u32(m, "deepseek4.block_count", &layers);
-    model_get_u64(m, "deepseek4.context_length", &ctx_train);
-    model_get_u32(m, "deepseek4.attention.head_count", &n_head);
-    model_get_u32(m, "deepseek4.attention.head_count_kv", &n_head_kv);
-    model_get_u32(m, "deepseek4.attention.key_length", &head_dim);
-    model_get_u32(m, "deepseek4.attention.sliding_window", &n_swa);
-    model_get_u32(m, "deepseek4.attention.indexer.head_count", &indexer_heads);
-    model_get_u32(m, "deepseek4.attention.indexer.key_length", &indexer_head_dim);
-    model_get_u32(m, "deepseek4.attention.indexer.top_k", &indexer_top_k);
-    model_get_u32(m, "deepseek4.expert_count", &n_expert);
-    model_get_u32(m, "deepseek4.expert_used_count", &n_expert_used);
-    model_get_u32(m, "deepseek4.expert_group_count", &n_expert_groups);
-    model_get_u32(m, "deepseek4.expert_group_used_count", &n_group_used);
+    if (m->family == DS4_MODEL_FAMILY_QWEN35_MOE) {
+        model_get_u32(m, "qwen35moe.block_count", &layers);
+        model_get_u64_compat(m, "qwen35moe.context_length", &ctx_train);
+        model_get_u32(m, "qwen35moe.attention.head_count", &n_head);
+        model_get_u32(m, "qwen35moe.attention.head_count_kv", &n_head_kv);
+        model_get_u32(m, "qwen35moe.attention.key_length", &head_dim);
+        model_get_u32(m, "qwen35moe.expert_count", &n_expert);
+        model_get_u32(m, "qwen35moe.expert_used_count", &n_expert_used);
+        model_get_u32(m, "qwen35moe.nextn_predict_layers", &n_mtp);
+        model_get_u32(m, "qwen35moe.full_attention_interval", &full_attention_interval);
+        model_get_u32(m, "qwen35moe.ssm.state_size", &ssm_state);
+        model_get_u32(m, "qwen35moe.ssm.inner_size", &ssm_inner);
+    } else {
+        model_get_u32(m, "deepseek4.block_count", &layers);
+        model_get_u64(m, "deepseek4.context_length", &ctx_train);
+        model_get_u32(m, "deepseek4.attention.head_count", &n_head);
+        model_get_u32(m, "deepseek4.attention.head_count_kv", &n_head_kv);
+        model_get_u32(m, "deepseek4.attention.key_length", &head_dim);
+        model_get_u32(m, "deepseek4.attention.sliding_window", &n_swa);
+        model_get_u32(m, "deepseek4.attention.indexer.head_count", &indexer_heads);
+        model_get_u32(m, "deepseek4.attention.indexer.key_length", &indexer_head_dim);
+        model_get_u32(m, "deepseek4.attention.indexer.top_k", &indexer_top_k);
+        model_get_u32(m, "deepseek4.expert_count", &n_expert);
+        model_get_u32(m, "deepseek4.expert_used_count", &n_expert_used);
+        model_get_u32(m, "deepseek4.expert_group_count", &n_expert_groups);
+        model_get_u32(m, "deepseek4.expert_group_used_count", &n_group_used);
+    }
 
     for (uint64_t i = 0; i < m->n_tensors; i++) {
         tensor_bytes += m->tensors[i].bytes;
@@ -2052,7 +2128,11 @@ static void model_summary(const ds4_model *m) {
     printf("arch:  %.*s\n", (int)arch.len, arch.ptr);
     printf("gguf:  v%u, %" PRIu64 " metadata keys, %" PRIu64 " tensors\n",
         m->version, m->n_kv, m->n_tensors);
-    if (layers) printf("layers: %u\n", layers);
+    if (layers && n_mtp && layers >= n_mtp) {
+        printf("layers: %u main + %u MTP\n", layers - n_mtp, n_mtp);
+    } else if (layers) {
+        printf("layers: %u\n", layers);
+    }
     if (ctx_train) printf("train context: %" PRIu64 "\n", ctx_train);
     if (n_head || n_head_kv || head_dim || n_swa) {
         printf("attention: heads=%u kv_heads=%u head_dim=%u swa=%u\n",
@@ -2065,6 +2145,10 @@ static void model_summary(const ds4_model *m) {
     if (n_expert || n_expert_used || n_expert_groups || n_group_used) {
         printf("experts: count=%u used=%u groups=%u groups_used=%u\n",
                n_expert, n_expert_used, n_expert_groups, n_group_used);
+    }
+    if (full_attention_interval || ssm_state || ssm_inner) {
+        printf("hybrid: full_attention_interval=%u ssm_state=%u ssm_inner=%u\n",
+               full_attention_interval, ssm_state, ssm_inner);
     }
     printf("file size: ");
     print_size(m->size);
@@ -3075,6 +3159,46 @@ typedef struct {
 } ds4_weights;
 
 typedef struct {
+    ds4_tensor *attn_norm;
+    ds4_tensor *post_attention_norm;
+
+    /* Gated DeltaNet blocks (all layers except 3, 7, ..., 39). */
+    ds4_tensor *attn_gate;
+    ds4_tensor *attn_qkv;
+    ds4_tensor *ssm_a;
+    ds4_tensor *ssm_alpha;
+    ds4_tensor *ssm_beta;
+    ds4_tensor *ssm_conv1d;
+    ds4_tensor *ssm_dt;
+    ds4_tensor *ssm_norm;
+    ds4_tensor *ssm_out;
+
+    /* Gated full-attention blocks (3, 7, ..., 39). */
+    ds4_tensor *attn_q;
+    ds4_tensor *attn_k;
+    ds4_tensor *attn_v;
+    ds4_tensor *attn_output;
+    ds4_tensor *attn_q_norm;
+    ds4_tensor *attn_k_norm;
+
+    ds4_tensor *ffn_gate_inp;
+    ds4_tensor *ffn_gate_exps;
+    ds4_tensor *ffn_up_exps;
+    ds4_tensor *ffn_down_exps;
+    ds4_tensor *ffn_gate_inp_shexp;
+    ds4_tensor *ffn_gate_shexp;
+    ds4_tensor *ffn_up_shexp;
+    ds4_tensor *ffn_down_shexp;
+} ds4_qwen35_layer_weights;
+
+typedef struct {
+    ds4_tensor *token_embd;
+    ds4_tensor *output_norm;
+    ds4_tensor *output;
+    ds4_qwen35_layer_weights layer[QWEN35_N_LAYER];
+} ds4_qwen35_weights;
+
+typedef struct {
     ds4_tensor *e_proj;
     ds4_tensor *h_proj;
     ds4_tensor *enorm;
@@ -3919,9 +4043,206 @@ static void config_validate_fixed_shape(uint32_t n_layer) {
     config_expect_u32("block_count",                  n_layer,                 DS4_N_LAYER);
 }
 
+static void qwen35_expect_u32(const char *name, uint32_t got, uint32_t expected) {
+    if (got == expected) return;
+    fprintf(stderr, "ds4: expected %s=%u for Qwen3.6-35B-A3B, got %u\n",
+            name, expected, got);
+    exit(1);
+}
+
+static void qwen35_expect_f32(const char *name, float got, float expected) {
+    const float tolerance = fmaxf(1.0e-12f, fabsf(expected) * 1.0e-7f);
+    if (fabsf(got - expected) <= tolerance) return;
+    fprintf(stderr, "ds4: expected %s=%.9g for Qwen3.6-35B-A3B, got %.9g\n",
+            name, (double)expected, (double)got);
+    exit(1);
+}
+
+static void qwen35_expect_string(const ds4_model *m,
+                                 const char *key,
+                                 const char *expected) {
+    ds4_str got = {0};
+    if (!model_get_string(m, key, &got)) {
+        fprintf(stderr, "ds4: required string metadata key is missing: %s\n", key);
+        exit(1);
+    }
+    if (ds4_streq(got, expected)) return;
+    fprintf(stderr,
+            "ds4: expected %s=%s for Qwen3.6-35B-A3B, got %.*s\n",
+            key, expected, (int)got.len, got.ptr);
+    exit(1);
+}
+
+static ds4_array_ref qwen35_expect_array(const ds4_model *m,
+                                         const char *key,
+                                         uint32_t type,
+                                         uint64_t len) {
+    ds4_array_ref arr = {0};
+    if (!model_get_array(m, key, &arr) || arr.type != type) {
+        fprintf(stderr, "ds4: required metadata array has the wrong type: %s\n", key);
+        exit(1);
+    }
+    if (arr.len != len) {
+        fprintf(stderr,
+                "ds4: expected %s length=%" PRIu64
+                " for Qwen3.6-35B-A3B, got %" PRIu64 "\n",
+                key, len, arr.len);
+        exit(1);
+    }
+    return arr;
+}
+
+static void qwen35_validate_rope_sections(const ds4_model *m) {
+    static const int32_t expected[] = {11, 11, 10, 0};
+    ds4_array_ref arr = qwen35_expect_array(
+        m, "qwen35moe.rope.dimension_sections", GGUF_VALUE_INT32, 4);
+    ds4_cursor c = cursor_at(m, arr.data_pos);
+    for (uint32_t i = 0; i < 4; i++) {
+        int32_t got = 0;
+        if (!cursor_read(&c, &got, sizeof(got))) ds4_die(c.error);
+        if (got != expected[i]) {
+            fprintf(stderr,
+                    "ds4: expected qwen35moe.rope.dimension_sections[%u]=%d, got %d\n",
+                    i, expected[i], got);
+            exit(1);
+        }
+    }
+}
+
+static void qwen35_validate_recurrent_layers(const ds4_model *m) {
+    const char *key = "qwen35moe.attention.recurrent_layers";
+    if (!model_find_kv(m, key)) return;
+
+    ds4_array_ref arr = qwen35_expect_array(
+        m, key, GGUF_VALUE_BOOL, QWEN35_N_LAYER);
+    ds4_cursor c = cursor_at(m, arr.data_pos);
+    for (uint32_t il = 0; il < QWEN35_N_LAYER; il++) {
+        uint8_t got = 0;
+        if (!cursor_read(&c, &got, sizeof(got))) ds4_die(c.error);
+        const bool expected = ((il + 1u) % QWEN35_FULL_ATTENTION_INTERVAL) != 0;
+        if ((got != 0) != expected) {
+            fprintf(stderr,
+                    "ds4: qwen35moe.attention.recurrent_layers[%u] "
+                    "does not match the required 3:1 GDN/full-attention pattern\n",
+                    il);
+            exit(1);
+        }
+    }
+}
+
+/* This is the one Qwen shape selected for the small-Mac release.  It is
+ * deliberately stricter than a generic qwen35moe loader: SSD cache geometry,
+ * recurrent state, and the Metal graph all depend on these exact values. */
+static void config_validate_qwen35moe_model(const ds4_model *m) {
+    const uint32_t n_layer = required_u32(m, "qwen35moe.block_count");
+    uint32_t n_mtp = 0;
+    if (model_find_kv(m, "qwen35moe.nextn_predict_layers")) {
+        n_mtp = required_u32(m, "qwen35moe.nextn_predict_layers");
+    }
+    if (n_layer == QWEN35_N_LAYER + 1u && n_mtp == 1u) {
+        fprintf(stderr,
+                "ds4: Qwen GGUF contains the bundled MTP block (40 main + 1 MTP); "
+                "the supported text artifact must be converted with --no-mtp\n");
+        exit(1);
+    }
+    qwen35_expect_u32("qwen35moe.block_count", n_layer, QWEN35_N_LAYER);
+    qwen35_expect_u32("qwen35moe.nextn_predict_layers", n_mtp, 0);
+
+    qwen35_expect_u32("qwen35moe.context_length",
+                      required_u32(m, "qwen35moe.context_length"),
+                      QWEN35_CONTEXT_LENGTH);
+    qwen35_expect_u32("qwen35moe.embedding_length",
+                      required_u32(m, "qwen35moe.embedding_length"),
+                      QWEN35_N_EMBD);
+    qwen35_expect_u32("qwen35moe.attention.head_count",
+                      required_u32(m, "qwen35moe.attention.head_count"),
+                      QWEN35_N_HEAD);
+    qwen35_expect_u32("qwen35moe.attention.head_count_kv",
+                      required_u32(m, "qwen35moe.attention.head_count_kv"),
+                      QWEN35_N_HEAD_KV);
+    qwen35_expect_u32("qwen35moe.attention.key_length",
+                      required_u32(m, "qwen35moe.attention.key_length"),
+                      QWEN35_N_HEAD_DIM);
+    qwen35_expect_u32("qwen35moe.attention.value_length",
+                      required_u32(m, "qwen35moe.attention.value_length"),
+                      QWEN35_N_HEAD_DIM);
+    qwen35_expect_u32("qwen35moe.rope.dimension_count",
+                      required_u32(m, "qwen35moe.rope.dimension_count"),
+                      QWEN35_N_ROT);
+    qwen35_validate_rope_sections(m);
+    qwen35_expect_f32("qwen35moe.rope.freq_base",
+                      required_f32(m, "qwen35moe.rope.freq_base"),
+                      10000000.0f);
+    qwen35_expect_f32("qwen35moe.attention.layer_norm_rms_epsilon",
+                      required_f32(m, "qwen35moe.attention.layer_norm_rms_epsilon"),
+                      1.0e-6f);
+
+    qwen35_expect_u32("qwen35moe.expert_count",
+                      required_u32(m, "qwen35moe.expert_count"),
+                      QWEN35_N_EXPERT);
+    qwen35_expect_u32("qwen35moe.expert_used_count",
+                      required_u32(m, "qwen35moe.expert_used_count"),
+                      QWEN35_N_EXPERT_USED);
+    qwen35_expect_u32("qwen35moe.expert_feed_forward_length",
+                      required_u32(m, "qwen35moe.expert_feed_forward_length"),
+                      QWEN35_N_FF_EXP);
+    qwen35_expect_u32("qwen35moe.expert_shared_feed_forward_length",
+                      required_u32(m, "qwen35moe.expert_shared_feed_forward_length"),
+                      QWEN35_N_FF_SHARED);
+
+    qwen35_expect_u32("qwen35moe.ssm.conv_kernel",
+                      required_u32(m, "qwen35moe.ssm.conv_kernel"),
+                      QWEN35_SSM_CONV_KERNEL);
+    qwen35_expect_u32("qwen35moe.ssm.state_size",
+                      required_u32(m, "qwen35moe.ssm.state_size"),
+                      QWEN35_SSM_STATE);
+    qwen35_expect_u32("qwen35moe.ssm.group_count",
+                      required_u32(m, "qwen35moe.ssm.group_count"),
+                      QWEN35_SSM_GROUP);
+    qwen35_expect_u32("qwen35moe.ssm.time_step_rank",
+                      required_u32(m, "qwen35moe.ssm.time_step_rank"),
+                      QWEN35_SSM_DT_RANK);
+    qwen35_expect_u32("qwen35moe.ssm.inner_size",
+                      required_u32(m, "qwen35moe.ssm.inner_size"),
+                      QWEN35_SSM_INNER);
+    qwen35_expect_u32("qwen35moe.full_attention_interval",
+                      required_u32(m, "qwen35moe.full_attention_interval"),
+                      QWEN35_FULL_ATTENTION_INTERVAL);
+    qwen35_validate_recurrent_layers(m);
+
+    qwen35_expect_string(m, "tokenizer.ggml.model", "gpt2");
+    qwen35_expect_string(m, "tokenizer.ggml.pre", "qwen35");
+    qwen35_expect_array(m, "tokenizer.ggml.tokens", GGUF_VALUE_STRING,
+                        QWEN35_N_VOCAB);
+    qwen35_expect_array(m, "tokenizer.ggml.token_type", GGUF_VALUE_INT32,
+                        QWEN35_N_VOCAB);
+    qwen35_expect_array(m, "tokenizer.ggml.merges", GGUF_VALUE_STRING,
+                        QWEN35_N_MERGE);
+    qwen35_expect_u32("tokenizer.ggml.bos_token_id",
+                      required_u32(m, "tokenizer.ggml.bos_token_id"),
+                      QWEN35_BOS_PAD_ID);
+    qwen35_expect_u32("tokenizer.ggml.padding_token_id",
+                      required_u32(m, "tokenizer.ggml.padding_token_id"),
+                      QWEN35_BOS_PAD_ID);
+    qwen35_expect_u32("tokenizer.ggml.eos_token_id",
+                      required_u32(m, "tokenizer.ggml.eos_token_id"),
+                      QWEN35_EOS_ID);
+    if (required_bool(m, "tokenizer.ggml.add_bos_token")) {
+        ds4_die("expected tokenizer.ggml.add_bos_token=false for Qwen3.6-35B-A3B");
+    }
+
+    ds4_str chat_template = {0};
+    if (!model_get_string(m, "tokenizer.chat_template", &chat_template) ||
+        !ds4_str_contains(chat_template, "<|im_start|>") ||
+        !ds4_str_contains(chat_template, "<|im_end|>") ||
+        !ds4_str_contains(chat_template, "<think>")) {
+        ds4_die("Qwen tokenizer.chat_template is missing the canonical chat markers");
+    }
+}
+
 /* Validate metadata values that affect semantics: attention shape, HC count,
  * expert routing, RoPE scaling, compression ratios, and SwiGLU clamp. */
-static void config_validate_model(const ds4_model *m) {
+static void config_validate_deepseek4_model(const ds4_model *m) {
     const uint32_t n_layer = required_u32(m, "deepseek4.block_count");
     const uint32_t n_embd = required_u32(m, "deepseek4.embedding_length");
     const uint32_t n_vocab = required_u32(m, "deepseek4.vocab_size");
@@ -4031,6 +4352,152 @@ static void config_validate_model(const ds4_model *m) {
     config_expect_f32("hyper_connection.epsilon", hc_eps, DS4_HC_EPS);
     const bool expert_weight_norm = required_bool(m, "deepseek4.expert_weights_norm");
     config_expect_bool("expert_weights_norm", expert_weight_norm, true);
+}
+
+static void config_validate_model(const ds4_model *m) {
+    switch (m->family) {
+    case DS4_MODEL_FAMILY_DEEPSEEK4:
+        config_validate_deepseek4_model(m);
+        return;
+    case DS4_MODEL_FAMILY_QWEN35_MOE:
+        config_validate_qwen35moe_model(m);
+        return;
+    case DS4_MODEL_FAMILY_UNKNOWN:
+        break;
+    }
+
+    ds4_str arch = {0};
+    if (!model_get_string(m, "general.architecture", &arch)) {
+        ds4_die("required string metadata key is missing: general.architecture");
+    }
+    fprintf(stderr, "ds4: unsupported GGUF architecture: %.*s\n",
+            (int)arch.len, arch.ptr);
+    exit(1);
+}
+
+static bool qwen35_layer_is_full_attention(uint32_t il) {
+    return ((il + 1u) % QWEN35_FULL_ATTENTION_INTERVAL) == 0;
+}
+
+static void qwen35_weights_validate_layout(const ds4_qwen35_weights *w) {
+    tensor_expect_f16_or_q8_0_layout(w->token_embd, 2,
+                                      QWEN35_N_EMBD, QWEN35_N_VOCAB, 0);
+    tensor_expect_layout(w->output_norm, DS4_TENSOR_F32, 1,
+                         QWEN35_N_EMBD, 0, 0);
+    tensor_expect_f16_or_q8_0_layout(w->output, 2,
+                                      QWEN35_N_EMBD, QWEN35_N_VOCAB, 0);
+
+    for (uint32_t il = 0; il < QWEN35_N_LAYER; il++) {
+        const ds4_qwen35_layer_weights *l = &w->layer[il];
+        tensor_expect_layout(l->attn_norm, DS4_TENSOR_F32, 1,
+                             QWEN35_N_EMBD, 0, 0);
+        tensor_expect_layout(l->post_attention_norm, DS4_TENSOR_F32, 1,
+                             QWEN35_N_EMBD, 0, 0);
+
+        if (qwen35_layer_is_full_attention(il)) {
+            /* Q contains both 16 x 256 queries and a same-width output gate. */
+            tensor_expect_f16_or_q8_0_layout(l->attn_q, 2,
+                                              QWEN35_N_EMBD, 8192, 0);
+            tensor_expect_f16_or_q8_0_layout(l->attn_k, 2,
+                                              QWEN35_N_EMBD, 512, 0);
+            tensor_expect_f16_or_q8_0_layout(l->attn_v, 2,
+                                              QWEN35_N_EMBD, 512, 0);
+            tensor_expect_f16_or_q8_0_layout(l->attn_output, 2,
+                                              4096, QWEN35_N_EMBD, 0);
+            tensor_expect_layout(l->attn_q_norm, DS4_TENSOR_F32, 1,
+                                 QWEN35_N_HEAD_DIM, 0, 0);
+            tensor_expect_layout(l->attn_k_norm, DS4_TENSOR_F32, 1,
+                                 QWEN35_N_HEAD_DIM, 0, 0);
+        } else {
+            /* The converter tiles 16 Q/K heads with 32 V heads into 8192
+             * channels.  That ordering is part of the GGUF contract. */
+            tensor_expect_f16_or_q8_0_layout(l->attn_gate, 2,
+                                              QWEN35_N_EMBD, 4096, 0);
+            tensor_expect_f16_or_q8_0_layout(l->attn_qkv, 2,
+                                              QWEN35_N_EMBD, 8192, 0);
+            tensor_expect_layout(l->ssm_a, DS4_TENSOR_F32, 1, 32, 0, 0);
+            tensor_expect_layout(l->ssm_alpha, DS4_TENSOR_F32, 2,
+                                 QWEN35_N_EMBD, 32, 0);
+            tensor_expect_layout(l->ssm_beta, DS4_TENSOR_F32, 2,
+                                 QWEN35_N_EMBD, 32, 0);
+            tensor_expect_layout(l->ssm_conv1d, DS4_TENSOR_F32, 2,
+                                 QWEN35_SSM_CONV_KERNEL, 8192, 0);
+            tensor_expect_layout(l->ssm_dt, DS4_TENSOR_F32, 1, 32, 0, 0);
+            tensor_expect_layout(l->ssm_norm, DS4_TENSOR_F32, 1,
+                                 QWEN35_SSM_STATE, 0, 0);
+            tensor_expect_f16_or_q8_0_layout(l->ssm_out, 2,
+                                              4096, QWEN35_N_EMBD, 0);
+        }
+
+        tensor_expect_layout(l->ffn_gate_inp, DS4_TENSOR_F32, 2,
+                             QWEN35_N_EMBD, QWEN35_N_EXPERT, 0);
+        tensor_expect_layout(l->ffn_gate_exps, DS4_TENSOR_Q4_K, 3,
+                             QWEN35_N_EMBD, QWEN35_N_FF_EXP, QWEN35_N_EXPERT);
+        tensor_expect_layout(l->ffn_up_exps, DS4_TENSOR_Q4_K, 3,
+                             QWEN35_N_EMBD, QWEN35_N_FF_EXP, QWEN35_N_EXPERT);
+        tensor_expect_layout(l->ffn_down_exps, DS4_TENSOR_Q4_K, 3,
+                             QWEN35_N_FF_EXP, QWEN35_N_EMBD, QWEN35_N_EXPERT);
+        tensor_expect_layout(l->ffn_gate_inp_shexp, DS4_TENSOR_F32, 1,
+                             QWEN35_N_EMBD, 0, 0);
+        tensor_expect_f16_or_q8_0_layout(l->ffn_gate_shexp, 2,
+                                         QWEN35_N_EMBD, QWEN35_N_FF_SHARED, 0);
+        tensor_expect_f16_or_q8_0_layout(l->ffn_up_shexp, 2,
+                                         QWEN35_N_EMBD, QWEN35_N_FF_SHARED, 0);
+        tensor_expect_f16_or_q8_0_layout(l->ffn_down_shexp, 2,
+                                         QWEN35_N_FF_SHARED, QWEN35_N_EMBD, 0);
+    }
+}
+
+static void qwen35_weights_bind(ds4_qwen35_weights *w, const ds4_model *m) {
+    if (m->n_tensors != QWEN35_N_TENSOR) {
+        fprintf(stderr,
+                "ds4: expected %u tensors for the Qwen3.6 text-only no-MTP layout, got %" PRIu64 "\n",
+                QWEN35_N_TENSOR, m->n_tensors);
+        exit(1);
+    }
+
+    memset(w, 0, sizeof(*w));
+    w->token_embd = required_tensor(m, "token_embd.weight");
+    w->output_norm = required_tensor(m, "output_norm.weight");
+    w->output = required_tensor(m, "output.weight");
+
+    for (uint32_t il = 0; il < QWEN35_N_LAYER; il++) {
+        ds4_qwen35_layer_weights *l = &w->layer[il];
+        l->attn_norm = required_tensorf(m, "blk.%u.attn_norm.weight", il);
+        l->post_attention_norm = required_tensorf(
+            m, "blk.%u.post_attention_norm.weight", il);
+
+        if (qwen35_layer_is_full_attention(il)) {
+            l->attn_q = required_tensorf(m, "blk.%u.attn_q.weight", il);
+            l->attn_k = required_tensorf(m, "blk.%u.attn_k.weight", il);
+            l->attn_v = required_tensorf(m, "blk.%u.attn_v.weight", il);
+            l->attn_output = required_tensorf(m, "blk.%u.attn_output.weight", il);
+            l->attn_q_norm = required_tensorf(m, "blk.%u.attn_q_norm.weight", il);
+            l->attn_k_norm = required_tensorf(m, "blk.%u.attn_k_norm.weight", il);
+        } else {
+            l->attn_gate = required_tensorf(m, "blk.%u.attn_gate.weight", il);
+            l->attn_qkv = required_tensorf(m, "blk.%u.attn_qkv.weight", il);
+            l->ssm_a = required_tensorf(m, "blk.%u.ssm_a", il);
+            l->ssm_alpha = required_tensorf(m, "blk.%u.ssm_alpha.weight", il);
+            l->ssm_beta = required_tensorf(m, "blk.%u.ssm_beta.weight", il);
+            l->ssm_conv1d = required_tensorf(m, "blk.%u.ssm_conv1d.weight", il);
+            l->ssm_dt = required_tensorf(m, "blk.%u.ssm_dt.bias", il);
+            l->ssm_norm = required_tensorf(m, "blk.%u.ssm_norm.weight", il);
+            l->ssm_out = required_tensorf(m, "blk.%u.ssm_out.weight", il);
+        }
+
+        l->ffn_gate_inp = required_tensorf(m, "blk.%u.ffn_gate_inp.weight", il);
+        l->ffn_gate_exps = required_tensorf(m, "blk.%u.ffn_gate_exps.weight", il);
+        l->ffn_up_exps = required_tensorf(m, "blk.%u.ffn_up_exps.weight", il);
+        l->ffn_down_exps = required_tensorf(m, "blk.%u.ffn_down_exps.weight", il);
+        l->ffn_gate_inp_shexp = required_tensorf(
+            m, "blk.%u.ffn_gate_inp_shexp.weight", il);
+        l->ffn_gate_shexp = required_tensorf(m, "blk.%u.ffn_gate_shexp.weight", il);
+        l->ffn_up_shexp = required_tensorf(m, "blk.%u.ffn_up_shexp.weight", il);
+        l->ffn_down_shexp = required_tensorf(m, "blk.%u.ffn_down_shexp.weight", il);
+    }
+
+    qwen35_weights_validate_layout(w);
 }
 
 static void weights_bind_output(ds4_weights *w, const ds4_model *m, bool required, bool optional) {
@@ -22064,6 +22531,7 @@ struct ds4_engine {
     ds4_model mtp_model;
     ds4_vocab vocab;
     ds4_weights weights;
+    ds4_qwen35_weights qwen35_weights;
     ds4_mtp_weights mtp_weights;
     ds4_backend backend;
     int mtp_draft_tokens;
@@ -26347,8 +26815,23 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
     const bool graph_backend = ds4_backend_uses_graph(opt->backend);
     if (graph_backend) ds4_linux_graph_backend_set_oom_score(opt->backend);
     model_open(&e->model, opt->model_path, graph_backend, !opt->inspect_only);
-    if (!opt->inspect_only) vocab_load(&e->vocab, &e->model);
+    if (!opt->inspect_only &&
+        e->model.family == DS4_MODEL_FAMILY_DEEPSEEK4) {
+        vocab_load(&e->vocab, &e->model);
+    }
     config_validate_model(&e->model);
+    if (e->model.family == DS4_MODEL_FAMILY_QWEN35_MOE) {
+        qwen35_weights_bind(&e->qwen35_weights, &e->model);
+        if (opt->inspect_only) {
+            *out = e;
+            return 0;
+        }
+        fprintf(stderr,
+                "ds4: Qwen3.6-35B-A3B metadata is valid, but inference is "
+                "disabled until the Qwen Gated DeltaNet and top-8 runtime is available\n");
+        ds4_engine_close(e);
+        return 1;
+    }
     weights_bind(&e->weights,
                  &e->model,
                  load_slice,
@@ -26880,6 +27363,9 @@ void ds4_engine_summary(ds4_engine *e) {
 }
 
 int ds4_engine_vocab_size(ds4_engine *e) {
+    if (e && e->model.family == DS4_MODEL_FAMILY_QWEN35_MOE) {
+        return QWEN35_N_VOCAB;
+    }
     return e ? e->vocab.n_vocab : 0;
 }
 
@@ -26894,28 +27380,39 @@ int ds4_engine_set_power(ds4_engine *e, int power_percent) {
 }
 
 const char *ds4_engine_model_name(ds4_engine *e) {
-    (void)e;
+    if (e && e->model.family == DS4_MODEL_FAMILY_QWEN35_MOE) {
+        return "Qwen3.6 35B A3B";
+    }
     return DS4_MODEL_SHAPE_NAME;
 }
 
 int ds4_engine_layer_count(ds4_engine *e) {
-    (void)e;
+    if (e && e->model.family == DS4_MODEL_FAMILY_QWEN35_MOE) {
+        return QWEN35_N_LAYER;
+    }
     return (int)DS4_N_LAYER;
 }
 
 uint32_t ds4_engine_layer_compress_ratio(ds4_engine *e, uint32_t layer) {
-    (void)e;
+    if (e && e->model.family == DS4_MODEL_FAMILY_QWEN35_MOE) {
+        (void)layer;
+        return 0;
+    }
     if (layer >= DS4_N_LAYER) return 0;
     return ds4_layer_compress_ratio(layer);
 }
 
 uint64_t ds4_engine_hidden_f32_values(ds4_engine *e) {
-    (void)e;
+    if (e && e->model.family == DS4_MODEL_FAMILY_QWEN35_MOE) {
+        return QWEN35_N_EMBD;
+    }
     return (uint64_t)DS4_N_HC * DS4_N_EMBD;
 }
 
 int ds4_engine_model_id(ds4_engine *e) {
-    (void)e;
+    if (e && e->model.family == DS4_MODEL_FAMILY_QWEN35_MOE) {
+        return QWEN35_MODEL_ID;
+    }
     return (int)DS4_MODEL_VARIANT;
 }
 

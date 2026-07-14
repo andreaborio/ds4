@@ -1,0 +1,444 @@
+#!/usr/bin/env python3
+"""Exercise qwen35moe parser/dispatch using small synthetic GGUF files."""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import os
+import struct
+import subprocess
+import sys
+import tempfile
+from collections import OrderedDict
+from collections.abc import Callable
+from dataclasses import dataclass
+from pathlib import Path
+
+
+UINT32 = 4
+INT32 = 5
+FLOAT32 = 6
+BOOL = 7
+STRING = 8
+ARRAY = 9
+
+TENSOR_F32 = 0
+TENSOR_F16 = 1
+TENSOR_Q8_0 = 8
+TENSOR_Q4_K = 12
+TENSOR_Q5_K = 13
+
+
+class RepeatedArray:
+    def __init__(self, item_type: int, count: int, value: object) -> None:
+        self.item_type = item_type
+        self.count = count
+        self.value = value
+
+
+@dataclass(frozen=True)
+class Tensor:
+    name: str
+    dims: tuple[int, ...]
+    value_type: int
+
+
+def pack_string(value: str) -> bytes:
+    data = value.encode("utf-8")
+    return struct.pack("<Q", len(data)) + data
+
+
+def pack_scalar(value_type: int, value: object) -> bytes:
+    if value_type == UINT32:
+        return struct.pack("<I", int(value))
+    if value_type == INT32:
+        return struct.pack("<i", int(value))
+    if value_type == FLOAT32:
+        return struct.pack("<f", float(value))
+    if value_type == BOOL:
+        return struct.pack("<B", bool(value))
+    if value_type == STRING:
+        return pack_string(str(value))
+    raise ValueError(f"unsupported scalar type {value_type}")
+
+
+def pack_value(value_type: int, value: object) -> bytes:
+    if value_type != ARRAY:
+        return pack_scalar(value_type, value)
+
+    if isinstance(value, RepeatedArray):
+        item = pack_scalar(value.item_type, value.value)
+        return (
+            struct.pack("<IQ", value.item_type, value.count)
+            + item * value.count
+        )
+
+    item_type, items = value
+    return (
+        struct.pack("<IQ", item_type, len(items))
+        + b"".join(pack_scalar(item_type, item) for item in items)
+    )
+
+
+def qwen_metadata() -> OrderedDict[str, tuple[int, object]]:
+    # These values are pinned to Qwen/Qwen3.6-35B-A3B.  The large tokenizer
+    # arrays contain empty test strings: this test validates metadata shape and
+    # family dispatch, while tokenizer byte-for-byte goldens live separately.
+    return OrderedDict(
+        [
+            ("general.architecture", (STRING, "qwen35moe")),
+            ("general.name", (STRING, "Qwen3.6 35B A3B synthetic")),
+            ("qwen35moe.block_count", (UINT32, 40)),
+            ("qwen35moe.context_length", (UINT32, 262144)),
+            ("qwen35moe.embedding_length", (UINT32, 2048)),
+            ("qwen35moe.attention.head_count", (UINT32, 16)),
+            ("qwen35moe.attention.head_count_kv", (UINT32, 2)),
+            ("qwen35moe.attention.key_length", (UINT32, 256)),
+            ("qwen35moe.attention.value_length", (UINT32, 256)),
+            ("qwen35moe.attention.layer_norm_rms_epsilon", (FLOAT32, 1.0e-6)),
+            ("qwen35moe.rope.dimension_count", (UINT32, 64)),
+            ("qwen35moe.rope.dimension_sections", (ARRAY, (INT32, [11, 11, 10, 0]))),
+            ("qwen35moe.rope.freq_base", (FLOAT32, 10000000.0)),
+            ("qwen35moe.expert_count", (UINT32, 256)),
+            ("qwen35moe.expert_used_count", (UINT32, 8)),
+            ("qwen35moe.expert_feed_forward_length", (UINT32, 512)),
+            ("qwen35moe.expert_shared_feed_forward_length", (UINT32, 512)),
+            ("qwen35moe.ssm.conv_kernel", (UINT32, 4)),
+            ("qwen35moe.ssm.state_size", (UINT32, 128)),
+            ("qwen35moe.ssm.group_count", (UINT32, 16)),
+            ("qwen35moe.ssm.time_step_rank", (UINT32, 32)),
+            ("qwen35moe.ssm.inner_size", (UINT32, 4096)),
+            ("qwen35moe.full_attention_interval", (UINT32, 4)),
+            ("tokenizer.ggml.model", (STRING, "gpt2")),
+            ("tokenizer.ggml.pre", (STRING, "qwen35")),
+            ("tokenizer.ggml.tokens", (ARRAY, RepeatedArray(STRING, 248320, ""))),
+            ("tokenizer.ggml.token_type", (ARRAY, RepeatedArray(INT32, 248320, 0))),
+            ("tokenizer.ggml.merges", (ARRAY, RepeatedArray(STRING, 247587, ""))),
+            ("tokenizer.ggml.bos_token_id", (UINT32, 248044)),
+            ("tokenizer.ggml.padding_token_id", (UINT32, 248044)),
+            ("tokenizer.ggml.eos_token_id", (UINT32, 248046)),
+            ("tokenizer.ggml.add_bos_token", (BOOL, False)),
+            (
+                "tokenizer.chat_template",
+                (STRING, "<|im_start|>user\\n{{ content }}<|im_end|>\\n<think>\\n"),
+            ),
+        ]
+    )
+
+
+def qwen_tensors() -> list[Tensor]:
+    tensors = [
+        Tensor("token_embd.weight", (2048, 248320), TENSOR_Q8_0),
+        Tensor("output_norm.weight", (2048,), TENSOR_F32),
+        Tensor("output.weight", (2048, 248320), TENSOR_Q8_0),
+    ]
+    for layer in range(40):
+        prefix = f"blk.{layer}."
+        tensors += [
+            Tensor(prefix + "attn_norm.weight", (2048,), TENSOR_F32),
+            Tensor(prefix + "post_attention_norm.weight", (2048,), TENSOR_F32),
+        ]
+        if (layer + 1) % 4 == 0:
+            tensors += [
+                Tensor(prefix + "attn_q.weight", (2048, 8192), TENSOR_Q8_0),
+                Tensor(prefix + "attn_k.weight", (2048, 512), TENSOR_Q8_0),
+                Tensor(prefix + "attn_v.weight", (2048, 512), TENSOR_Q8_0),
+                Tensor(prefix + "attn_output.weight", (4096, 2048), TENSOR_Q8_0),
+                Tensor(prefix + "attn_q_norm.weight", (256,), TENSOR_F32),
+                Tensor(prefix + "attn_k_norm.weight", (256,), TENSOR_F32),
+            ]
+        else:
+            tensors += [
+                Tensor(prefix + "attn_gate.weight", (2048, 4096), TENSOR_Q8_0),
+                Tensor(prefix + "attn_qkv.weight", (2048, 8192), TENSOR_Q8_0),
+                Tensor(prefix + "ssm_a", (32,), TENSOR_F32),
+                Tensor(prefix + "ssm_alpha.weight", (2048, 32), TENSOR_F32),
+                Tensor(prefix + "ssm_beta.weight", (2048, 32), TENSOR_F32),
+                Tensor(prefix + "ssm_conv1d.weight", (4, 8192), TENSOR_F32),
+                Tensor(prefix + "ssm_dt.bias", (32,), TENSOR_F32),
+                Tensor(prefix + "ssm_norm.weight", (128,), TENSOR_F32),
+                Tensor(prefix + "ssm_out.weight", (4096, 2048), TENSOR_Q8_0),
+            ]
+        tensors += [
+            Tensor(prefix + "ffn_gate_inp.weight", (2048, 256), TENSOR_F32),
+            Tensor(prefix + "ffn_gate_exps.weight", (2048, 512, 256), TENSOR_Q4_K),
+            Tensor(prefix + "ffn_up_exps.weight", (2048, 512, 256), TENSOR_Q4_K),
+            Tensor(prefix + "ffn_down_exps.weight", (512, 2048, 256), TENSOR_Q4_K),
+            Tensor(prefix + "ffn_gate_inp_shexp.weight", (2048,), TENSOR_F32),
+            Tensor(prefix + "ffn_gate_shexp.weight", (2048, 512), TENSOR_Q8_0),
+            Tensor(prefix + "ffn_up_shexp.weight", (2048, 512), TENSOR_Q8_0),
+            Tensor(prefix + "ffn_down_shexp.weight", (512, 2048), TENSOR_Q8_0),
+        ]
+    assert len(tensors) == 733
+    return tensors
+
+
+def tensor_bytes(tensor: Tensor) -> int:
+    elements = 1
+    for dim in tensor.dims:
+        elements *= dim
+    block_elems, block_bytes = {
+        TENSOR_F32: (1, 4),
+        TENSOR_F16: (1, 2),
+        TENSOR_Q8_0: (32, 34),
+        TENSOR_Q4_K: (256, 144),
+        TENSOR_Q5_K: (256, 176),
+    }[tensor.value_type]
+    return ((elements + block_elems - 1) // block_elems) * block_bytes
+
+
+def write_gguf(
+    path: Path,
+    metadata: OrderedDict[str, tuple[int, object]],
+    tensors: list[Tensor],
+) -> None:
+    data = bytearray()
+    data += struct.pack("<IIQQ", 0x46554747, 3, len(tensors), len(metadata))
+    for key, (value_type, value) in metadata.items():
+        data += pack_string(key)
+        data += struct.pack("<I", value_type)
+        data += pack_value(value_type, value)
+
+    # All synthetic tensors may overlap at relative offset zero: the loader
+    # validates their names, types, and dimensions, but --inspect never reads
+    # weight bytes.  A sparse tail equal to the largest tensor keeps this
+    # model-free test below a megabyte of physical disk use.
+    for tensor in tensors:
+        data += pack_string(tensor.name)
+        data += struct.pack("<I", len(tensor.dims))
+        for dim in tensor.dims:
+            data += struct.pack("<Q", dim)
+        data += struct.pack("<IQ", tensor.value_type, 0)
+    data += b"\x00" * ((32 - len(data) % 32) % 32)
+    max_tensor_bytes = max(tensor_bytes(tensor) for tensor in tensors)
+    with path.open("wb") as model:
+        model.write(data)
+        model.truncate(len(data) + max_tensor_bytes)
+
+
+def run_ds4(binary: Path, model: Path, lock: Path, inspect: bool = True) -> subprocess.CompletedProcess[str]:
+    command = [str(binary), "-m", str(model), "--cpu"]
+    if inspect:
+        command.append("--inspect")
+    else:
+        command += ["-p", "metadata gate"]
+    env = os.environ.copy()
+    env["DS4_LOCK_FILE"] = str(lock)
+    return subprocess.run(command, env=env, text=True, capture_output=True, check=False)
+
+
+def require(condition: bool, message: str, result: subprocess.CompletedProcess[str]) -> None:
+    if condition:
+        return
+    raise AssertionError(
+        f"{message}\nreturncode={result.returncode}\nstdout:\n{result.stdout}\nstderr:\n{result.stderr}"
+    )
+
+
+def check_frozen_reference() -> None:
+    path = Path(__file__).with_name("qwen") / "qwen36_tokenizer_chat_golden.json"
+    raw = path.read_bytes()
+    assert hashlib.sha256(raw).hexdigest() == (
+        "599ca96451a666468e1afc2b575f93323f86ff4b6a6bcc48cf95cb59ff4e6ffe"
+    )
+    data = json.loads(raw)
+    assert data["source"] == {
+        "model": "Qwen/Qwen3.6-35B-A3B",
+        "revision": "995ad96eacd98c81ed38be0c5b274b04031597b0",
+    }
+    tokenizer = data["tokenizer"]
+    assert tokenizer["class"] == "Qwen2Tokenizer"
+    assert tokenizer["length"] == 248077
+    assert tokenizer["model_vocab_size"] == 248320
+    assert tokenizer["special_token_ids"] == {
+        "<|endoftext|>": 248044,
+        "<|im_start|>": 248045,
+        "<|im_end|>": 248046,
+        "<tool_call>": 248058,
+        "</tool_call>": 248059,
+        "<|fim_prefix|>": 248060,
+        "<|fim_middle|>": 248061,
+        "<|fim_suffix|>": 248062,
+        "<tool_response>": 248066,
+        "</tool_response>": 248067,
+        "<think>": 248068,
+        "</think>": 248069,
+    }
+    assert {case["name"] for case in data["text_vectors"]} == {
+        "ascii",
+        "italian",
+        "cjk",
+        "whitespace",
+        "digits_and_contractions",
+        "source_code",
+        "emoji_zwj_and_nfc",
+        "fim_specials",
+        "thinking_specials",
+        "tool_specials",
+    }
+    chat = {case["name"]: case for case in data["chat_vectors"]}
+    assert set(chat) == {
+        "plain_thinking",
+        "plain_no_thinking",
+        "system_and_user",
+        "tools_prompt",
+        "tool_roundtrip",
+    }
+    assert chat["plain_thinking"]["rendered"].endswith("<think>\n")
+    assert "<think>\n\n</think>\n\n" in chat["plain_no_thinking"]["rendered"]
+    assert "<function=get_weather>" in chat["tool_roundtrip"]["rendered"]
+    assert all(case["token_ids"] for case in data["text_vectors"])
+    assert all(case["token_ids"] for case in data["chat_vectors"])
+
+
+def main() -> int:
+    if len(sys.argv) != 2:
+        print(f"usage: {sys.argv[0]} /path/to/ds4", file=sys.stderr)
+        return 2
+    binary = Path(sys.argv[1]).resolve()
+    check_frozen_reference()
+
+    with tempfile.TemporaryDirectory(prefix="ds4-qwen-metadata-") as tmp_name:
+        tmp = Path(tmp_name)
+
+        def check(
+            name: str,
+            mutate: Callable[[OrderedDict[str, tuple[int, object]]], None] | None,
+            expected: str,
+            success: bool = False,
+            inspect: bool = True,
+            tensor_mutate: Callable[[list[Tensor]], None] | None = None,
+        ) -> None:
+            metadata = qwen_metadata()
+            if mutate is not None:
+                mutate(metadata)
+            tensors = qwen_tensors()
+            if tensor_mutate is not None:
+                tensor_mutate(tensors)
+            model = tmp / f"{name}.gguf"
+            write_gguf(model, metadata, tensors)
+            result = run_ds4(binary, model, tmp / f"{name}.lock", inspect=inspect)
+            model.unlink()
+            combined = result.stdout + result.stderr
+            require((result.returncode == 0) == success, f"unexpected result for {name}", result)
+            require(expected in combined, f"missing diagnostic for {name}: {expected!r}", result)
+
+        check("valid", None, "arch:  qwen35moe", success=True)
+        check("valid-summary", None, "experts: count=256 used=8", success=True)
+        check(
+            "unknown-family",
+            lambda m: m.__setitem__("general.architecture", (STRING, "qwen35moe_typo")),
+            "unsupported GGUF architecture: qwen35moe_typo",
+        )
+        check(
+            "missing-family",
+            lambda m: m.pop("general.architecture"),
+            "required string metadata key is missing: general.architecture",
+        )
+        check(
+            "wrong-top-k",
+            lambda m: m.__setitem__("qwen35moe.expert_used_count", (UINT32, 6)),
+            "expected qwen35moe.expert_used_count=8",
+        )
+        check(
+            "wrong-ssm-state",
+            lambda m: m.__setitem__("qwen35moe.ssm.state_size", (UINT32, 64)),
+            "expected qwen35moe.ssm.state_size=128",
+        )
+        check(
+            "wrong-rms-epsilon",
+            lambda m: m.__setitem__(
+                "qwen35moe.attention.layer_norm_rms_epsilon", (FLOAT32, 0.0)
+            ),
+            "expected qwen35moe.attention.layer_norm_rms_epsilon=9.99999997e-07",
+        )
+        check(
+            "wrong-attention-interval",
+            lambda m: m.__setitem__("qwen35moe.full_attention_interval", (UINT32, 3)),
+            "expected qwen35moe.full_attention_interval=4",
+        )
+
+        def add_recurrent_mask(
+            metadata: OrderedDict[str, tuple[int, object]], *, valid: bool
+        ) -> None:
+            mask = [(layer + 1) % 4 != 0 for layer in range(40)]
+            if not valid:
+                mask[3] = True
+            metadata["qwen35moe.attention.recurrent_layers"] = (ARRAY, (BOOL, mask))
+
+        check(
+            "valid-recurrent-mask",
+            lambda m: add_recurrent_mask(m, valid=True),
+            "arch:  qwen35moe",
+            success=True,
+        )
+        check(
+            "wrong-recurrent-mask",
+            lambda m: add_recurrent_mask(m, valid=False),
+            "recurrent_layers[3] does not match the required 3:1",
+        )
+
+        def add_mtp(metadata: OrderedDict[str, tuple[int, object]]) -> None:
+            metadata["qwen35moe.block_count"] = (UINT32, 41)
+            metadata["qwen35moe.nextn_predict_layers"] = (UINT32, 1)
+
+        check("bundled-mtp", add_mtp, "must be converted with --no-mtp")
+
+        def replace_tensor(
+            tensors: list[Tensor],
+            name: str,
+            *,
+            dims: tuple[int, ...] | None = None,
+            value_type: int | None = None,
+            replacement_name: str | None = None,
+        ) -> None:
+            for index, tensor in enumerate(tensors):
+                if tensor.name == name:
+                    tensors[index] = Tensor(
+                        replacement_name or tensor.name,
+                        dims or tensor.dims,
+                        tensor.value_type if value_type is None else value_type,
+                    )
+                    return
+            raise AssertionError(f"test tensor not found: {name}")
+
+        check(
+            "wrong-full-attention-shape",
+            None,
+            "blk.3.attn_output.weight has dim[0]=2048, expected 4096",
+            tensor_mutate=lambda tensors: replace_tensor(
+                tensors, "blk.3.attn_output.weight", dims=(2048, 4096)
+            ),
+        )
+        check(
+            "unsupported-community-down-quant",
+            None,
+            "blk.0.ffn_down_exps.weight has type q5_k, expected q4_k",
+            tensor_mutate=lambda tensors: replace_tensor(
+                tensors, "blk.0.ffn_down_exps.weight", value_type=TENSOR_Q5_K
+            ),
+        )
+        check(
+            "missing-linear-attention-tensor",
+            None,
+            "required tensor is missing: blk.0.ssm_conv1d.weight",
+            tensor_mutate=lambda tensors: replace_tensor(
+                tensors,
+                "blk.0.ssm_conv1d.weight",
+                replacement_name="blk.0.ssm_conv1d.missing",
+            ),
+        )
+        check(
+            "runtime-closed",
+            None,
+            "inference is disabled until the Qwen Gated DeltaNet and top-8 runtime is available",
+            inspect=False,
+        )
+
+    print("qwen metadata tests: OK")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
