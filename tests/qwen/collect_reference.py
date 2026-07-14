@@ -8,11 +8,49 @@ import json
 from pathlib import Path
 from typing import Any
 
+from huggingface_hub import hf_hub_download
+from tokenizers import AddedToken, Tokenizer
 from transformers import AutoTokenizer
 
 
 MODEL = "Qwen/Qwen3.6-35B-A3B"
 REVISION = "995ad96eacd98c81ed38be0c5b274b04031597b0"
+
+CONTROL_TOKENS = [
+    "<|endoftext|>",
+    "<|im_start|>",
+    "<|im_end|>",
+    "<|object_ref_start|>",
+    "<|object_ref_end|>",
+    "<|box_start|>",
+    "<|box_end|>",
+    "<|quad_start|>",
+    "<|quad_end|>",
+    "<|vision_start|>",
+    "<|vision_end|>",
+    "<|vision_pad|>",
+    "<|image_pad|>",
+    "<|video_pad|>",
+    "<tool_call>",
+    "</tool_call>",
+    "<|fim_prefix|>",
+    "<|fim_middle|>",
+    "<|fim_suffix|>",
+    "<|fim_pad|>",
+    "<|repo_name|>",
+    "<|file_sep|>",
+    "<tool_response>",
+    "</tool_response>",
+    "<think>",
+    "</think>",
+    "<|audio_start|>",
+    "<|audio_end|>",
+    "<tts_pad>",
+    "<tts_text_bos>",
+    "<tts_text_eod>",
+    "<tts_text_bos_single>",
+    "<|audio_pad|>",
+]
 
 TEXT_CASES = {
     "ascii": "Hello, world!",
@@ -22,9 +60,14 @@ TEXT_CASES = {
     "digits_and_contractions": "I'm 1234, we're coding.",
     "source_code": 'def f(x: int) -> str:\n    return f"{x=}"\n',
     "emoji_zwj_and_nfc": "👩‍💻 café e\u0301",
+    # Distinguishes the official qwen35 pre-tokenizer (which keeps Unicode
+    # marks with letters) from Transformers' legacy Qwen2 Python regex.
+    "leading_combining_mark": "\u0301!I",
     "fim_specials": "<|fim_prefix|>left<|fim_suffix|>right<|fim_middle|>",
     "thinking_specials": "<think>penso</think>",
     "tool_specials": "<tool_call>get_weather</tool_call>",
+    "audio_control_tokens": "<|audio_start|>omesso<|audio_end|>",
+    "all_control_tokens": "".join(CONTROL_TOKENS),
 }
 
 TOOLS = [
@@ -95,30 +138,39 @@ CHAT_CASES: dict[str, dict[str, Any]] = {
     },
 }
 
-SPECIAL_TOKENS = [
-    "<|endoftext|>",
-    "<|im_start|>",
-    "<|im_end|>",
-    "<tool_call>",
-    "</tool_call>",
-    "<|fim_prefix|>",
-    "<|fim_middle|>",
-    "<|fim_suffix|>",
-    "<tool_response>",
-    "</tool_response>",
-    "<think>",
-    "</think>",
-]
-
-
 def collect() -> dict[str, Any]:
-    tokenizer = AutoTokenizer.from_pretrained(
+    chat_tokenizer = AutoTokenizer.from_pretrained(
         MODEL,
         revision=REVISION,
         trust_remote_code=True,
     )
-    if type(tokenizer).__name__ != "Qwen2Tokenizer":
-        raise RuntimeError(f"unexpected tokenizer class: {type(tokenizer).__name__}")
+    if type(chat_tokenizer).__name__ != "Qwen2Tokenizer":
+        raise RuntimeError(
+            f"unexpected tokenizer class: {type(chat_tokenizer).__name__}"
+        )
+    tokenizer_json = hf_hub_download(
+        MODEL,
+        "tokenizer.json",
+        revision=REVISION,
+    )
+    # tokenizer.json is the artifact converted into GGUF and contains the
+    # authoritative qwen35 pre-tokenizer/NFC pipeline.  AutoTokenizer is kept
+    # only as the canonical Jinja chat renderer: its Qwen2Tokenizer class still
+    # hardcodes the older Qwen2 regex in Transformers 5.13.1.
+    tokenizer = Tokenizer.from_file(tokenizer_json)
+    tokenizer_json_vocab_size = tokenizer.get_vocab_size(with_added_tokens=True)
+    # tokenizer_config.json contributes seven more official control tokens
+    # after tokenizer.json.  Preserve their assigned IDs exactly; the GGUF has
+    # the same controls followed by UNUSED padding up to the model vocabulary.
+    for token_id in range(tokenizer.get_vocab_size(), len(chat_tokenizer)):
+        token = chat_tokenizer.convert_ids_to_tokens(token_id)
+        tokenizer.add_special_tokens(
+            [AddedToken(token, special=True, normalized=False)]
+        )
+        if tokenizer.token_to_id(token) != token_id:
+            raise RuntimeError(
+                f"official added token {token!r} did not retain id {token_id}"
+            )
 
     text_vectors = []
     for name, text in TEXT_CASES.items():
@@ -126,13 +178,15 @@ def collect() -> dict[str, Any]:
             {
                 "name": name,
                 "text": text,
-                "token_ids": tokenizer.encode(text, add_special_tokens=False),
+                "token_ids": tokenizer.encode(
+                    text, add_special_tokens=False
+                ).ids,
             }
         )
 
     chat_vectors = []
     for name, case in CHAT_CASES.items():
-        rendered = tokenizer.apply_chat_template(
+        rendered = chat_tokenizer.apply_chat_template(
             case["messages"], tokenize=False, **case["kwargs"]
         )
         chat_vectors.append(
@@ -141,22 +195,30 @@ def collect() -> dict[str, Any]:
                 "messages": case["messages"],
                 "kwargs": case["kwargs"],
                 "rendered": rendered,
-                "token_ids": tokenizer.encode(rendered, add_special_tokens=False),
+                "token_ids": tokenizer.encode(
+                    rendered, add_special_tokens=False
+                ).ids,
             }
         )
 
     return {
         "source": {"model": MODEL, "revision": REVISION},
         "tokenizer": {
-            "class": type(tokenizer).__name__,
-            "length": len(tokenizer),
+            "chat_template_class": type(chat_tokenizer).__name__,
+            "encoding_source": "tokenizer.json:qwen35 + tokenizer_config controls",
+            "base_bpe_vocab_size": 248044,
+            "tokenizer_json_vocab_size": tokenizer_json_vocab_size,
+            "effective_vocab_size": tokenizer.get_vocab_size(
+                with_added_tokens=True
+            ),
             "model_vocab_size": 248320,
-            "bos_token_id": tokenizer.bos_token_id,
-            "eos_token_id": tokenizer.eos_token_id,
-            "pad_token_id": tokenizer.pad_token_id,
+            "unused_model_vocab_slots": 248320 - len(chat_tokenizer),
+            "bos_token_id": chat_tokenizer.bos_token_id,
+            "eos_token_id": chat_tokenizer.eos_token_id,
+            "pad_token_id": chat_tokenizer.pad_token_id,
             "special_token_ids": {
-                token: tokenizer.convert_tokens_to_ids(token)
-                for token in SPECIAL_TOKENS
+                token: tokenizer.token_to_id(token)
+                for token in CONTROL_TOKENS
             },
         },
         "text_vectors": text_vectors,

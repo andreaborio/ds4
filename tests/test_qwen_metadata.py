@@ -240,7 +240,7 @@ def check_frozen_reference() -> None:
     path = Path(__file__).with_name("qwen") / "qwen36_tokenizer_chat_golden.json"
     raw = path.read_bytes()
     assert hashlib.sha256(raw).hexdigest() == (
-        "599ca96451a666468e1afc2b575f93323f86ff4b6a6bcc48cf95cb59ff4e6ffe"
+        "87606fc0f98911e4ccaba9f7179ed11dffda79d11a9b12795f6f9bb961218ec2"
     )
     data = json.loads(raw)
     assert data["source"] == {
@@ -248,22 +248,52 @@ def check_frozen_reference() -> None:
         "revision": "995ad96eacd98c81ed38be0c5b274b04031597b0",
     }
     tokenizer = data["tokenizer"]
-    assert tokenizer["class"] == "Qwen2Tokenizer"
-    assert tokenizer["length"] == 248077
+    assert tokenizer["chat_template_class"] == "Qwen2Tokenizer"
+    assert tokenizer["encoding_source"] == (
+        "tokenizer.json:qwen35 + tokenizer_config controls"
+    )
+    assert tokenizer["base_bpe_vocab_size"] == 248044
+    assert tokenizer["tokenizer_json_vocab_size"] == 248070
+    assert tokenizer["effective_vocab_size"] == 248077
     assert tokenizer["model_vocab_size"] == 248320
+    assert tokenizer["unused_model_vocab_slots"] == 243
+    assert tokenizer["bos_token_id"] is None
+    assert tokenizer["eos_token_id"] == 248046
+    assert tokenizer["pad_token_id"] == 248044
     assert tokenizer["special_token_ids"] == {
         "<|endoftext|>": 248044,
         "<|im_start|>": 248045,
         "<|im_end|>": 248046,
+        "<|object_ref_start|>": 248047,
+        "<|object_ref_end|>": 248048,
+        "<|box_start|>": 248049,
+        "<|box_end|>": 248050,
+        "<|quad_start|>": 248051,
+        "<|quad_end|>": 248052,
+        "<|vision_start|>": 248053,
+        "<|vision_end|>": 248054,
+        "<|vision_pad|>": 248055,
+        "<|image_pad|>": 248056,
+        "<|video_pad|>": 248057,
         "<tool_call>": 248058,
         "</tool_call>": 248059,
         "<|fim_prefix|>": 248060,
         "<|fim_middle|>": 248061,
         "<|fim_suffix|>": 248062,
+        "<|fim_pad|>": 248063,
+        "<|repo_name|>": 248064,
+        "<|file_sep|>": 248065,
         "<tool_response>": 248066,
         "</tool_response>": 248067,
         "<think>": 248068,
         "</think>": 248069,
+        "<|audio_start|>": 248070,
+        "<|audio_end|>": 248071,
+        "<tts_pad>": 248072,
+        "<tts_text_bos>": 248073,
+        "<tts_text_eod>": 248074,
+        "<tts_text_bos_single>": 248075,
+        "<|audio_pad|>": 248076,
     }
     assert {case["name"] for case in data["text_vectors"]} == {
         "ascii",
@@ -273,9 +303,12 @@ def check_frozen_reference() -> None:
         "digits_and_contractions",
         "source_code",
         "emoji_zwj_and_nfc",
+        "leading_combining_mark",
         "fim_specials",
         "thinking_specials",
         "tool_specials",
+        "audio_control_tokens",
+        "all_control_tokens",
     }
     chat = {case["name"]: case for case in data["chat_vectors"]}
     assert set(chat) == {
@@ -290,6 +323,14 @@ def check_frozen_reference() -> None:
     assert "<function=get_weather>" in chat["tool_roundtrip"]["rendered"]
     assert all(case["token_ids"] for case in data["text_vectors"])
     assert all(case["token_ids"] for case in data["chat_vectors"])
+    text = {case["name"]: case for case in data["text_vectors"]}
+    assert text["leading_combining_mark"]["token_ids"] == [52033, 87383]
+    assert text["audio_control_tokens"]["token_ids"] == [
+        248070, 315, 9531, 248071
+    ]
+    assert text["all_control_tokens"]["token_ids"] == list(
+        range(248044, 248077)
+    )
 
 
 def main() -> int:

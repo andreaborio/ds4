@@ -4,9 +4,13 @@
     "revision": "995ad96eacd98c81ed38be0c5b274b04031597b0"
   },
   "tokenizer": {
-    "class": "Qwen2Tokenizer",
-    "length": 248077,
+    "chat_template_class": "Qwen2Tokenizer",
+    "encoding_source": "tokenizer.json:qwen35 + tokenizer_config controls",
+    "base_bpe_vocab_size": 248044,
+    "tokenizer_json_vocab_size": 248070,
+    "effective_vocab_size": 248077,
     "model_vocab_size": 248320,
+    "unused_model_vocab_slots": 243,
     "bos_token_id": null,
     "eos_token_id": 248046,
     "pad_token_id": 248044,
@@ -14,15 +18,36 @@
       "<|endoftext|>": 248044,
       "<|im_start|>": 248045,
       "<|im_end|>": 248046,
+      "<|object_ref_start|>": 248047,
+      "<|object_ref_end|>": 248048,
+      "<|box_start|>": 248049,
+      "<|box_end|>": 248050,
+      "<|quad_start|>": 248051,
+      "<|quad_end|>": 248052,
+      "<|vision_start|>": 248053,
+      "<|vision_end|>": 248054,
+      "<|vision_pad|>": 248055,
+      "<|image_pad|>": 248056,
+      "<|video_pad|>": 248057,
       "<tool_call>": 248058,
       "</tool_call>": 248059,
       "<|fim_prefix|>": 248060,
       "<|fim_middle|>": 248061,
       "<|fim_suffix|>": 248062,
+      "<|fim_pad|>": 248063,
+      "<|repo_name|>": 248064,
+      "<|file_sep|>": 248065,
       "<tool_response>": 248066,
       "</tool_response>": 248067,
       "<think>": 248068,
-      "</think>": 248069
+      "</think>": 248069,
+      "<|audio_start|>": 248070,
+      "<|audio_end|>": 248071,
+      "<tts_pad>": 248072,
+      "<tts_text_bos>": 248073,
+      "<tts_text_eod>": 248074,
+      "<tts_text_bos_single>": 248075,
+      "<|audio_pad|>": 248076
     }
   },
   "text_vectors": [
@@ -136,6 +161,14 @@
       ]
     },
     {
+      "name": "leading_combining_mark",
+      "text": "́!I",
+      "token_ids": [
+        52033,
+        87383
+      ]
+    },
+    {
       "name": "fim_specials",
       "text": "<|fim_prefix|>left<|fim_suffix|>right<|fim_middle|>",
       "token_ids": [
@@ -164,6 +197,55 @@
         447,
         67017,
         248059
+      ]
+    },
+    {
+      "name": "audio_control_tokens",
+      "text": "<|audio_start|>omesso<|audio_end|>",
+      "token_ids": [
+        248070,
+        315,
+        9531,
+        248071
+      ]
+    },
+    {
+      "name": "all_control_tokens",
+      "text": "<|endoftext|><|im_start|><|im_end|><|object_ref_start|><|object_ref_end|><|box_start|><|box_end|><|quad_start|><|quad_end|><|vision_start|><|vision_end|><|vision_pad|><|image_pad|><|video_pad|><tool_call></tool_call><|fim_prefix|><|fim_middle|><|fim_suffix|><|fim_pad|><|repo_name|><|file_sep|><tool_response></tool_response><think></think><|audio_start|><|audio_end|><tts_pad><tts_text_bos><tts_text_eod><tts_text_bos_single><|audio_pad|>",
+      "token_ids": [
+        248044,
+        248045,
+        248046,
+        248047,
+        248048,
+        248049,
+        248050,
+        248051,
+        248052,
+        248053,
+        248054,
+        248055,
+        248056,
+        248057,
+        248058,
+        248059,
+        248060,
+        248061,
+        248062,
+        248063,
+        248064,
+        248065,
+        248066,
+        248067,
+        248068,
+        248069,
+        248070,
+        248071,
+        248072,
+        248073,
+        248074,
+        248075,
+        248076
       ]
     }
   ],
