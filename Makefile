@@ -57,6 +57,7 @@ METAL_TEST_BINS := \
 	$(METAL_BINDIR)/ds4_test \
 	$(METAL_BINDIR)/ds4_agent_test \
 	$(METAL_BINDIR)/test_q4k_dot \
+	$(METAL_BINDIR)/test_q4k_top8 \
 	$(METAL_BINDIR)/test_qwen_gdn_ref \
 	$(METAL_BINDIR)/test_qwen_attention_ref \
 	$(METAL_BINDIR)/test_qwen_state \
@@ -188,6 +189,12 @@ $(METAL_OBJDIR)/test_q4k_dot.o: tests/test_q4k_dot.c
 	@mkdir -p "$(@D)"
 	$(CC) -O2 -Wall -Wextra -std=c99 $(DEPFLAGS) -c -o $@ $<
 
+$(METAL_OBJDIR)/test_q4k_top8.o: tests/test_q4k_top8.c ds4.c ds4.h \
+		ds4_ssd.h ds4_distributed.h ds4_gpu.h ds4_qwen.h
+	@mkdir -p "$(@D)"
+	$(CC) $(CFLAGS) $(QWEN_CFLAGS) $(DEPFLAGS) -DDS4_NO_GPU \
+		-Wno-unused-function -Wno-unused-parameter -I. -c -o $@ $<
+
 $(METAL_OBJDIR)/test_ssd_residency.o: tests/test_ssd_residency.c
 	@mkdir -p "$(@D)"
 	$(CC) $(CFLAGS) $(DEPFLAGS) -I. -c -o $@ $<
@@ -226,6 +233,13 @@ $(METAL_BINDIR)/ds4_agent_test: \
 $(METAL_BINDIR)/test_q4k_dot: $(METAL_OBJDIR)/test_q4k_dot.o
 	@mkdir -p "$(@D)"
 	$(CC) -O2 -o $@ $^ -lm -pthread
+
+$(METAL_BINDIR)/test_q4k_top8: \
+		$(METAL_OBJDIR)/test_q4k_top8.o $(METAL_OBJDIR)/ds4_build.o \
+		$(METAL_OBJDIR)/ds4_distributed.o $(METAL_OBJDIR)/ds4_ssd.o \
+		$(METAL_OBJDIR)/ds4_qwen.o
+	@mkdir -p "$(@D)"
+	$(CC) $(CFLAGS) -o $@ $^ $(LDLIBS)
 
 $(METAL_BINDIR)/test_ssd_residency: \
 	$(METAL_OBJDIR)/test_ssd_residency.o $(METAL_OBJDIR)/ds4_ssd.o
@@ -274,6 +288,7 @@ qwen-reference-test: $(METAL_BINDIR)/test_qwen_gdn_ref \
 	$(METAL_BINDIR)/test_qwen_attention_ref
 
 model-free-test: metal ds4_test ds4_agent_test $(METAL_BINDIR)/test_q4k_dot \
+		$(METAL_BINDIR)/test_q4k_top8 \
 		$(METAL_BINDIR)/test_qwen_gdn_ref \
 		$(METAL_BINDIR)/test_qwen_attention_ref \
 		$(METAL_BINDIR)/test_qwen_state \
@@ -282,6 +297,7 @@ model-free-test: metal ds4_test ds4_agent_test $(METAL_BINDIR)/test_q4k_dot \
 	$(METAL_BINDIR)/ds4_agent_test
 	$(METAL_BINDIR)/ds4_test --server
 	$(METAL_BINDIR)/test_q4k_dot
+	$(METAL_BINDIR)/test_q4k_top8
 	$(METAL_BINDIR)/test_qwen_gdn_ref
 	$(METAL_BINDIR)/test_qwen_attention_ref
 	$(METAL_BINDIR)/test_qwen_state
@@ -477,12 +493,14 @@ ds4_agent_test: ds4_agent_test.o ds4_help.o ds4_web.o ds4_kvstore.o linenoise.o 
 	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
 
 model-free-test: ds4 ds4_test ds4_agent_test ds4-eval q4k-dot-test \
+		tests/test_q4k_top8 \
 		tests/test_qwen_gdn_ref tests/test_qwen_attention_ref \
 		tests/test_qwen_state \
 		tests/test_ssd_residency
 	./ds4-eval --self-test-extractors
 	./ds4_agent_test
 	./ds4_test --server
+	./tests/test_q4k_top8
 	./tests/test_qwen_gdn_ref
 	./tests/test_qwen_attention_ref
 	./tests/test_qwen_state
@@ -498,6 +516,14 @@ test: model-free-test
 q4k-dot-test: tests/test_q4k_dot.c
 	$(CC) -O2 -Wall -Wextra -std=c99 -o tests/test_q4k_dot tests/test_q4k_dot.c -lm -pthread
 	./tests/test_q4k_dot
+
+tests/test_q4k_top8: tests/test_q4k_top8.c ds4.c ds4.h ds4_ssd.h \
+		ds4_distributed.h ds4_gpu.h ds4_qwen.h ds4_build.c \
+		ds4_distributed.c ds4_ssd.c ds4_qwen.c
+	$(CC) $(CFLAGS) $(QWEN_CFLAGS) -DDS4_NO_GPU \
+		-Wno-unused-function -Wno-unused-parameter -I. -o $@ \
+		tests/test_q4k_top8.c ds4_build.c ds4_distributed.c ds4_ssd.c \
+		ds4_qwen.c $(LDLIBS)
 
 qwen-metadata-test: ds4 tests/test_qwen_metadata.py
 	python3 tests/test_qwen_metadata.py ./ds4
@@ -530,6 +556,7 @@ clean:
 	rm -rf "$(BUILD_ROOT)"
 	rm -f ds4 ds4-server ds4-bench ds4-eval ds4-agent ds4_cpu ds4_native \
 		ds4_server_test ds4_test ds4_agent_test tests/test_q4k_dot \
+		tests/test_q4k_top8 \
 		tests/test_qwen_gdn_ref tests/test_qwen_attention_ref \
 		tests/test_qwen_state \
 		tests/test_ssd_residency tests/cuda_long_context_smoke \

@@ -6671,6 +6671,7 @@ typedef struct {
     float *out;
     const uint8_t *base[DS4_MAX_EXPERT_USED];
     const block_q8_K *xq[DS4_MAX_EXPERT_USED];
+    float expert_weight[DS4_MAX_EXPERT_USED];
     uint64_t in_dim;
     uint64_t row_bytes[DS4_MAX_EXPERT_USED];
     int n_expert;
@@ -6685,18 +6686,19 @@ static void matvec_q4_k_accum_worker(void *vctx, uint64_t row0, uint64_t row1) {
             float v = 0.0f;
             const block_q4_K *br = (const block_q4_K *)(ctx->base[i] + row * ctx->row_bytes[i]);
             ds4_vec_dot_q4_K_q8_K((int)ctx->in_dim, &v, br, ctx->xq[i]);
-            acc += v;
+            acc += v * ctx->expert_weight[i];
         }
         ctx->out[row] = acc;
     }
 }
 
-static void matvec_q4_k_experts_accum_prequant(
+static void matvec_q4_k_experts_accum_weighted_prequant(
         float            *out,
         const ds4_model  *m,
         const ds4_tensor *w,
         const block_q8_K *xq,
         const int        *selected,
+        const float      *expert_weight,
         int               n_expert) {
     if (w->type != DS4_TENSOR_Q4_K) ds4_die("expected a Q4_K expert tensor");
     if (n_expert < 1 || (uint32_t)n_expert > DS4_MAX_EXPERT_USED) ds4_die("unexpected routed expert count");
@@ -6728,9 +6730,21 @@ static void matvec_q4_k_experts_accum_prequant(
         ctx.base[i] = base[i];
         ctx.row_bytes[i] = row_bytes[i];
         ctx.xq[i] = xq + (uint64_t)i * n_blocks;
+        ctx.expert_weight[i] = expert_weight ? expert_weight[i] : 1.0f;
     }
 
     ds4_parallel_for(out_dim0, matvec_q4_k_accum_worker, &ctx);
+}
+
+static void matvec_q4_k_experts_accum_prequant(
+        float            *out,
+        const ds4_model  *m,
+        const ds4_tensor *w,
+        const block_q8_K *xq,
+        const int        *selected,
+        int               n_expert) {
+    matvec_q4_k_experts_accum_weighted_prequant(
+        out, m, w, xq, selected, NULL, n_expert);
 }
 
 /* Q4_K batch mid worker: same structure as IQ2_XXS batch but uses Q4_K dot. */
@@ -10855,6 +10869,470 @@ static void output_logits_one_decode_scratch(
                     tensor_data(model, weights->output_norm),
                     DS4_N_EMBD, DS4_RMS_EPS);
     matvec_q8_0_decode_scratch(logits, model, weights->output, scratch->output_norm, scratch);
+}
+
+/* =========================================================================
+ * Qwen3.6 Scalar CPU Forward.
+ * =========================================================================
+ *
+ * This is the bounded correctness path for the one supported Qwen shape.  It
+ * deliberately reuses ds4's existing F16/Q8_0/Q4_K row kernels while keeping
+ * Qwen state and dimensions independent from the global DeepSeek profile.
+ * All temporary storage comes from ds4_qwen35_cpu_scratch; callers reserve the
+ * persistent cache before entering the token loop.
+ */
+
+static bool qwen35_cpu_embed_token(
+        float                      out[QWEN35_N_EMBD],
+        const ds4_model           *model,
+        const ds4_tensor          *embedding,
+        int                        token) {
+    if (!out || !model || !embedding || embedding->ndim != 2 ||
+        embedding->dim[0] != QWEN35_N_EMBD ||
+        token < 0 || (uint64_t)token >= embedding->dim[1]) {
+        return false;
+    }
+
+    if (embedding->type == DS4_TENSOR_F16) {
+        const uint16_t *base = tensor_data(model, embedding);
+        const uint16_t *row = base + (uint64_t)token * QWEN35_N_EMBD;
+        for (uint32_t i = 0; i < QWEN35_N_EMBD; i++) {
+            out[i] = f16_to_f32(row[i]);
+        }
+        return true;
+    }
+
+    if (embedding->type == DS4_TENSOR_Q8_0) {
+        const uint64_t blocks = QWEN35_N_EMBD / 32u;
+        const uint64_t row_bytes = blocks * 34u;
+        const uint8_t *row = (const uint8_t *)tensor_data(model, embedding) +
+                             (uint64_t)token * row_bytes;
+        for (uint64_t block = 0; block < blocks; block++) {
+            uint16_t scale_bits = 0;
+            memcpy(&scale_bits, row + block * 34u, sizeof(scale_bits));
+            const float scale = f16_to_f32(scale_bits);
+            const int8_t *quant =
+                (const int8_t *)(row + block * 34u + sizeof(scale_bits));
+            for (uint32_t i = 0; i < 32u; i++) {
+                out[block * 32u + i] = scale * (float)quant[i];
+            }
+        }
+        return true;
+    }
+
+    return false;
+}
+
+static void qwen35_cpu_quantize_dense(
+        const float              *input,
+        uint64_t                  n,
+        ds4_qwen35_cpu_scratch   *scratch) {
+    if (!input || !scratch || n == 0 || n > QWEN35_SSM_INNER) {
+        ds4_die("Qwen dense Q8_0 scratch capacity exceeded");
+    }
+    quantize_q8_0_activation(input, scratch->dense_q8,
+                             scratch->dense_q8_scale, n);
+}
+
+static void qwen35_cpu_matvec(
+        float                      *out,
+        const ds4_model            *model,
+        const ds4_tensor           *weight,
+        const float                *input,
+        ds4_qwen35_cpu_scratch     *scratch) {
+    if (!out || !model || !weight || !input || !scratch || out == input ||
+        weight->ndim != 2) {
+        ds4_die("invalid Qwen dense projection");
+    }
+    switch (weight->type) {
+    case DS4_TENSOR_F32:
+        matvec_f32(out, model, weight, input);
+        return;
+    case DS4_TENSOR_F16:
+        matvec_f16(out, model, weight, input);
+        return;
+    case DS4_TENSOR_Q8_0:
+        qwen35_cpu_quantize_dense(input, weight->dim[0], scratch);
+        matvec_q8_0_prequant(out, model, weight,
+                             scratch->dense_q8,
+                             scratch->dense_q8_scale);
+        return;
+    default:
+        ds4_die("unsupported Qwen dense tensor type");
+    }
+}
+
+static void qwen35_cpu_matvec_pair(
+        float                      *out0,
+        float                      *out1,
+        const ds4_model            *model,
+        const ds4_tensor           *weight0,
+        const ds4_tensor           *weight1,
+        const float                *input,
+        ds4_qwen35_cpu_scratch     *scratch) {
+    if (!weight0 || !weight1 || weight0->ndim != 2 || weight1->ndim != 2 ||
+        weight0->dim[0] != weight1->dim[0]) {
+        ds4_die("Qwen paired projections do not share an input layout");
+    }
+    if (weight0->type == DS4_TENSOR_Q8_0 &&
+        weight1->type == DS4_TENSOR_Q8_0 &&
+        weight0->dim[1] == weight1->dim[1]) {
+        qwen35_cpu_quantize_dense(input, weight0->dim[0], scratch);
+        matvec_q8_0_pair_prequant(out0, out1, model, weight0, weight1,
+                                  scratch->dense_q8,
+                                  scratch->dense_q8_scale);
+        return;
+    }
+    qwen35_cpu_matvec(out0, model, weight0, input, scratch);
+    qwen35_cpu_matvec(out1, model, weight1, input, scratch);
+}
+
+static float qwen35_cpu_dot_f32_tensor(
+        const ds4_model  *model,
+        const ds4_tensor *weight,
+        const float      *input,
+        uint64_t          n) {
+    if (!model || !weight || !input || weight->type != DS4_TENSOR_F32 ||
+        weight->ndim != 1 || weight->dim[0] != n) {
+        ds4_die("invalid Qwen scalar gate tensor");
+    }
+    const float *w = tensor_data(model, weight);
+    double total = 0.0;
+    for (uint64_t i = 0; i < n; i++) total += (double)w[i] * input[i];
+    return (float)total;
+}
+
+static bool qwen35_cpu_gdn_one(
+        float                           out[QWEN35_N_EMBD],
+        const ds4_model                *model,
+        const ds4_qwen35_layer_weights *layer,
+        ds4_qwen35_cpu_layer_state     *state,
+        const float                     input[QWEN35_N_EMBD],
+        ds4_qwen35_cpu_scratch         *scratch) {
+    if (!out || !model || !layer || !state || !input || !scratch ||
+        !state->conv || !state->recurrent) {
+        return false;
+    }
+
+    rms_norm_weight(scratch->norm, input,
+                    tensor_data(model, layer->attn_norm),
+                    QWEN35_N_EMBD, 1.0e-6f);
+    qwen35_cpu_matvec(scratch->projection, model, layer->attn_qkv,
+                      scratch->norm, scratch);
+    qwen35_cpu_matvec(scratch->gate, model, layer->attn_gate,
+                      scratch->norm, scratch);
+    qwen35_cpu_matvec_pair(scratch->alpha_logit, scratch->beta_logit,
+                           model, layer->ssm_alpha, layer->ssm_beta,
+                           scratch->norm, scratch);
+
+    if (!ds4_qwen35_cpu_causal_conv_step_f32(
+            scratch->projection,
+            state->conv,
+            scratch->projection,
+            tensor_data(model, layer->ssm_conv1d),
+            QWEN35_SSM_CONV_CHANNEL,
+            QWEN35_SSM_CONV_KERNEL) ||
+        !ds4_qwen35_cpu_gated_delta_controls_f32(
+            scratch->log_decay,
+            scratch->beta,
+            scratch->alpha_logit,
+            scratch->beta_logit,
+            tensor_data(model, layer->ssm_a),
+            tensor_data(model, layer->ssm_dt),
+            QWEN35_SSM_VALUE_HEAD)) {
+        return false;
+    }
+
+    float *query = scratch->projection;
+    float *key = query +
+        (uint64_t)QWEN35_SSM_GROUP * QWEN35_SSM_STATE;
+    float *value = key +
+        (uint64_t)QWEN35_SSM_GROUP * QWEN35_SSM_STATE;
+    if (!ds4_qwen35_cpu_gated_delta_step_f32(
+            value,
+            state->recurrent,
+            query,
+            key,
+            value,
+            scratch->log_decay,
+            scratch->beta,
+            QWEN35_SSM_GROUP,
+            QWEN35_SSM_VALUE_HEAD,
+            QWEN35_SSM_STATE,
+            QWEN35_SSM_STATE) ||
+        !ds4_qwen35_cpu_rmsnorm_gated_f32(
+            value,
+            value,
+            scratch->gate,
+            tensor_data(model, layer->ssm_norm),
+            QWEN35_SSM_VALUE_HEAD,
+            QWEN35_SSM_STATE,
+            1.0e-6f)) {
+        return false;
+    }
+
+    qwen35_cpu_matvec(out, model, layer->ssm_out, value, scratch);
+    return true;
+}
+
+static bool qwen35_cpu_full_attention_one(
+        float                           out[QWEN35_N_EMBD],
+        const ds4_model                *model,
+        const ds4_qwen35_layer_weights *layer,
+        ds4_qwen35_cpu_layer_state     *state,
+        const float                     input[QWEN35_N_EMBD],
+        uint32_t                        position,
+        uint32_t                        n_cached,
+        uint32_t                        kv_capacity,
+        ds4_qwen35_cpu_scratch         *scratch) {
+    if (!out || !model || !layer || !state || !input || !scratch ||
+        !state->key || !state->value || n_cached >= kv_capacity ||
+        n_cached >= scratch->score_cap) {
+        return false;
+    }
+
+    rms_norm_weight(scratch->norm, input,
+                    tensor_data(model, layer->attn_norm),
+                    QWEN35_N_EMBD, 1.0e-6f);
+    qwen35_cpu_matvec(scratch->projection, model, layer->attn_q,
+                      scratch->norm, scratch);
+    qwen35_cpu_matvec_pair(scratch->key, scratch->value,
+                           model, layer->attn_k, layer->attn_v,
+                           scratch->norm, scratch);
+
+    if (!ds4_qwen35_cpu_split_q_gate_f32(
+            scratch->query,
+            scratch->gate,
+            scratch->projection,
+            QWEN35_N_HEAD,
+            QWEN35_N_HEAD_DIM) ||
+        !ds4_qwen35_cpu_head_rms_norm_f32(
+            scratch->query,
+            scratch->query,
+            tensor_data(model, layer->attn_q_norm),
+            QWEN35_N_HEAD,
+            QWEN35_N_HEAD_DIM,
+            1.0e-6f) ||
+        !ds4_qwen35_cpu_head_rms_norm_f32(
+            scratch->key,
+            scratch->key,
+            tensor_data(model, layer->attn_k_norm),
+            QWEN35_N_HEAD_KV,
+            QWEN35_N_HEAD_DIM,
+            1.0e-6f) ||
+        !ds4_qwen35_cpu_text_rope_f32(
+            scratch->query,
+            position,
+            QWEN35_N_HEAD,
+            QWEN35_N_HEAD_DIM,
+            QWEN35_N_ROT,
+            10000000.0f) ||
+        !ds4_qwen35_cpu_text_rope_f32(
+            scratch->key,
+            position,
+            QWEN35_N_HEAD_KV,
+            QWEN35_N_HEAD_DIM,
+            QWEN35_N_ROT,
+            10000000.0f)) {
+        return false;
+    }
+
+    const uint64_t row_values =
+        (uint64_t)QWEN35_N_HEAD_KV * QWEN35_N_HEAD_DIM;
+    memcpy(state->key + (uint64_t)n_cached * row_values,
+           scratch->key, (size_t)row_values * sizeof(float));
+    memcpy(state->value + (uint64_t)n_cached * row_values,
+           scratch->value, (size_t)row_values * sizeof(float));
+
+    const size_t n_kv = (size_t)n_cached + 1u;
+    if (!ds4_qwen35_cpu_gqa_decode_f32(
+            scratch->heads,
+            scratch->score,
+            scratch->score_cap,
+            scratch->query,
+            state->key,
+            state->value,
+            n_kv,
+            QWEN35_N_HEAD,
+            QWEN35_N_HEAD_KV,
+            QWEN35_N_HEAD_DIM) ||
+        !ds4_qwen35_cpu_sigmoid_gate_elements_f32(
+            scratch->heads,
+            scratch->heads,
+            scratch->gate,
+            (size_t)QWEN35_N_HEAD * QWEN35_N_HEAD_DIM)) {
+        return false;
+    }
+
+    qwen35_cpu_matvec(out, model, layer->attn_output,
+                      scratch->heads, scratch);
+    return true;
+}
+
+static bool qwen35_cpu_ffn_one(
+        float                           hidden[QWEN35_N_EMBD],
+        const ds4_model                *model,
+        const ds4_qwen35_layer_weights *layer,
+        ds4_qwen35_cpu_scratch         *scratch) {
+    if (!hidden || !model || !layer || !scratch) return false;
+
+    rms_norm_weight(scratch->norm, hidden,
+                    tensor_data(model, layer->post_attention_norm),
+                    QWEN35_N_EMBD, 1.0e-6f);
+    qwen35_cpu_matvec(scratch->router_logits, model,
+                      layer->ffn_gate_inp, scratch->norm, scratch);
+    if (!ds4_qwen35_cpu_softmax_top8_f32(
+            scratch->selected,
+            scratch->selected_weight,
+            scratch->router_probability,
+            scratch->router_logits)) {
+        return false;
+    }
+
+    int selected[QWEN35_N_EXPERT_USED];
+    for (uint32_t slot = 0; slot < QWEN35_N_EXPERT_USED; slot++) {
+        selected[slot] = scratch->selected[slot];
+    }
+    block_q8_K *routed_xq = (block_q8_K *)scratch->routed_q8k;
+    block_q8_K *routed_midq = (block_q8_K *)scratch->routed_mid_q8k;
+    float unit_weight[QWEN35_N_EXPERT_USED];
+    for (uint32_t slot = 0; slot < QWEN35_N_EXPERT_USED; slot++) {
+        unit_weight[slot] = 1.0f;
+    }
+    ds4_quantize_row_q8_K(scratch->norm, routed_xq, QWEN35_N_EMBD);
+    matvec_q4_k_experts_mid_prequant(
+        scratch->routed_mid,
+        model,
+        layer->ffn_gate_exps,
+        layer->ffn_up_exps,
+        routed_xq,
+        selected,
+        unit_weight,
+        QWEN35_N_EXPERT_USED,
+        0.0f);
+    for (uint32_t slot = 0; slot < QWEN35_N_EXPERT_USED; slot++) {
+        ds4_quantize_row_q8_K(
+            scratch->routed_mid + (uint64_t)slot * QWEN35_N_FF_EXP,
+            routed_midq + (uint64_t)slot *
+                (QWEN35_N_FF_EXP / QK_K),
+            QWEN35_N_FF_EXP);
+    }
+    /* Apply router probabilities after each expert MLP.  Moving them before
+     * the Q8_K mid quantization is algebraically tempting but changes rounding
+     * and therefore is not the Qwen graph. */
+    matvec_q4_k_experts_accum_weighted_prequant(
+        scratch->moe_out,
+        model,
+        layer->ffn_down_exps,
+        routed_midq,
+        selected,
+        scratch->selected_weight,
+        QWEN35_N_EXPERT_USED);
+
+    qwen35_cpu_matvec_pair(
+        scratch->shared_gate,
+        scratch->shared_up,
+        model,
+        layer->ffn_gate_shexp,
+        layer->ffn_up_shexp,
+        scratch->norm,
+        scratch);
+    swiglu(scratch->shared_mid,
+           scratch->shared_gate,
+           scratch->shared_up,
+           QWEN35_N_FF_SHARED,
+           0.0f);
+    qwen35_cpu_matvec(scratch->shared_out, model,
+                      layer->ffn_down_shexp,
+                      scratch->shared_mid, scratch);
+    const float shared_gate_logit = qwen35_cpu_dot_f32_tensor(
+        model, layer->ffn_gate_inp_shexp, scratch->norm, QWEN35_N_EMBD);
+    if (!ds4_qwen35_cpu_sigmoid_gate_f32(
+            scratch->shared_out,
+            scratch->shared_out,
+            &shared_gate_logit,
+            1u,
+            QWEN35_N_EMBD)) {
+        return false;
+    }
+
+    for (uint32_t i = 0; i < QWEN35_N_EMBD; i++) {
+        hidden[i] += scratch->moe_out[i] + scratch->shared_out[i];
+    }
+    return true;
+}
+
+static bool qwen35_cpu_layer_one(
+        float                           out[QWEN35_N_EMBD],
+        const ds4_model                *model,
+        const ds4_qwen35_layer_weights *layer,
+        ds4_qwen35_cpu_layer_state     *state,
+        const float                     input[QWEN35_N_EMBD],
+        uint32_t                        layer_index,
+        uint32_t                        position,
+        uint32_t                        n_cached,
+        uint32_t                        kv_capacity,
+        ds4_qwen35_cpu_scratch         *scratch) {
+    if (out == input) return false;
+    const bool attention_ok = ds4_qwen35_layer_is_full_attention(layer_index) ?
+        qwen35_cpu_full_attention_one(out, model, layer, state, input,
+                                      position, n_cached, kv_capacity,
+                                      scratch) :
+        qwen35_cpu_gdn_one(out, model, layer, state, input, scratch);
+    if (!attention_ok) return false;
+
+    for (uint32_t i = 0; i < QWEN35_N_EMBD; i++) out[i] += input[i];
+    return qwen35_cpu_ffn_one(out, model, layer, scratch);
+}
+
+static DS4_MAYBE_UNUSED bool qwen35_cpu_forward_token(
+        float                         *logits,
+        const ds4_model              *model,
+        const ds4_qwen35_weights     *weights,
+        ds4_qwen35_cpu_cache         *cache,
+        int                           token,
+        uint32_t                      position,
+        ds4_qwen35_cpu_scratch       *scratch) {
+    if (!model || !weights || !cache || !scratch ||
+        position != cache->n_tokens ||
+        cache->n_tokens >= cache->ctx_capacity ||
+        cache->n_tokens >= cache->kv_capacity ||
+        scratch->ctx_capacity != cache->ctx_capacity ||
+        scratch->score_cap <= cache->n_tokens ||
+        !qwen35_cpu_embed_token(scratch->hidden[0], model,
+                                weights->token_embd, token)) {
+        return false;
+    }
+
+    float *current = scratch->hidden[0];
+    float *next = scratch->hidden[1];
+    for (uint32_t layer = 0; layer < QWEN35_N_LAYER; layer++) {
+        if (!qwen35_cpu_layer_one(
+                next,
+                model,
+                &weights->layer[layer],
+                &cache->layer[layer],
+                current,
+                layer,
+                position,
+                cache->n_tokens,
+                cache->kv_capacity,
+                scratch)) {
+            return false;
+        }
+        float *swap = current;
+        current = next;
+        next = swap;
+    }
+
+    if (logits) {
+        rms_norm_weight(scratch->norm, current,
+                        tensor_data(model, weights->output_norm),
+                        QWEN35_N_EMBD, 1.0e-6f);
+        qwen35_cpu_matvec(logits, model, weights->output,
+                          scratch->norm, scratch);
+    }
+    return ds4_qwen35_cpu_cache_advance(cache, 1u);
 }
 
 #ifndef DS4_NO_GPU
