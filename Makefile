@@ -55,6 +55,7 @@ METAL_TEST_BINS := \
 	$(METAL_BINDIR)/ds4_agent_test \
 	$(METAL_BINDIR)/test_q4k_dot \
 	$(METAL_BINDIR)/test_qwen_gdn_ref \
+	$(METAL_BINDIR)/test_qwen_attention_ref \
 	$(METAL_BINDIR)/test_ssd_residency
 
 all: metal
@@ -184,6 +185,11 @@ $(METAL_OBJDIR)/test_qwen_gdn_ref.o: tests/test_qwen_gdn_ref.c ds4_qwen_ref.h \
 	@mkdir -p "$(@D)"
 	$(CC) -O2 -Wall -Wextra -std=c99 $(DEPFLAGS) -I. -c -o $@ $<
 
+$(METAL_OBJDIR)/test_qwen_attention_ref.o: tests/test_qwen_attention_ref.c \
+		ds4_qwen_ref.h tests/qwen/qwen36_attention_golden.inc
+	@mkdir -p "$(@D)"
+	$(CC) -O2 -Wall -Wextra -std=c99 $(DEPFLAGS) -I. -c -o $@ $<
+
 $(METAL_OBJDIR)/ds4_qwen_ref.o: ds4_qwen_ref.c ds4_qwen_ref.h
 	@mkdir -p "$(@D)"
 	$(CC) -O2 -Wall -Wextra -std=c99 $(DEPFLAGS) -c -o $@ $<
@@ -215,6 +221,11 @@ $(METAL_BINDIR)/test_qwen_gdn_ref: \
 	@mkdir -p "$(@D)"
 	$(CC) -O2 -o $@ $^ -lm
 
+$(METAL_BINDIR)/test_qwen_attention_ref: \
+	$(METAL_OBJDIR)/test_qwen_attention_ref.o $(METAL_OBJDIR)/ds4_qwen_ref.o
+	@mkdir -p "$(@D)"
+	$(CC) -O2 -o $@ $^ -lm
+
 # Preserve the documented direct test-runner commands without letting a CPU
 # target publish over them.
 ds4_test: $(METAL_BINDIR)/ds4_test
@@ -231,19 +242,26 @@ q4k-dot-test: $(METAL_BINDIR)/test_q4k_dot
 qwen-metadata-test: $(METAL_BINDIR)/ds4 tests/test_qwen_metadata.py
 	python3 tests/test_qwen_metadata.py $(METAL_BINDIR)/ds4
 
-qwen-reference-test: $(METAL_BINDIR)/test_qwen_gdn_ref
+qwen-reference-test: $(METAL_BINDIR)/test_qwen_gdn_ref \
+		$(METAL_BINDIR)/test_qwen_attention_ref
 	python3 tests/qwen/collect_gdn_reference.py --check
+	python3 tests/qwen/collect_attention_reference.py --check
 	python3 tests/qwen/test_v_tiling_contract.py
-	$<
+	$(METAL_BINDIR)/test_qwen_gdn_ref
+	$(METAL_BINDIR)/test_qwen_attention_ref
 
 model-free-test: metal ds4_test ds4_agent_test $(METAL_BINDIR)/test_q4k_dot \
-		$(METAL_BINDIR)/test_qwen_gdn_ref $(METAL_BINDIR)/test_ssd_residency
+		$(METAL_BINDIR)/test_qwen_gdn_ref \
+		$(METAL_BINDIR)/test_qwen_attention_ref \
+		$(METAL_BINDIR)/test_ssd_residency
 	$(METAL_BINDIR)/ds4-eval --self-test-extractors
 	$(METAL_BINDIR)/ds4_agent_test
 	$(METAL_BINDIR)/ds4_test --server
 	$(METAL_BINDIR)/test_q4k_dot
 	$(METAL_BINDIR)/test_qwen_gdn_ref
+	$(METAL_BINDIR)/test_qwen_attention_ref
 	python3 tests/qwen/collect_gdn_reference.py --check
+	python3 tests/qwen/collect_attention_reference.py --check
 	python3 tests/qwen/test_v_tiling_contract.py
 	$(METAL_BINDIR)/test_ssd_residency
 	python3 tests/test_qwen_metadata.py $(METAL_BINDIR)/ds4
@@ -431,12 +449,15 @@ ds4_agent_test: ds4_agent_test.o ds4_help.o ds4_web.o ds4_kvstore.o linenoise.o 
 	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
 
 model-free-test: ds4 ds4_test ds4_agent_test ds4-eval q4k-dot-test \
-		tests/test_qwen_gdn_ref tests/test_ssd_residency
+		tests/test_qwen_gdn_ref tests/test_qwen_attention_ref \
+		tests/test_ssd_residency
 	./ds4-eval --self-test-extractors
 	./ds4_agent_test
 	./ds4_test --server
 	./tests/test_qwen_gdn_ref
+	./tests/test_qwen_attention_ref
 	python3 tests/qwen/collect_gdn_reference.py --check
+	python3 tests/qwen/collect_attention_reference.py --check
 	python3 tests/qwen/test_v_tiling_contract.py
 	./tests/test_ssd_residency
 	python3 tests/test_qwen_metadata.py ./ds4
@@ -456,10 +477,17 @@ tests/test_qwen_gdn_ref: tests/test_qwen_gdn_ref.c ds4_qwen_ref.c \
 	$(CC) -O2 -Wall -Wextra -std=c99 -I. -o $@ \
 		tests/test_qwen_gdn_ref.c ds4_qwen_ref.c -lm
 
-qwen-reference-test: tests/test_qwen_gdn_ref
+tests/test_qwen_attention_ref: tests/test_qwen_attention_ref.c ds4_qwen_ref.c \
+		ds4_qwen_ref.h tests/qwen/qwen36_attention_golden.inc
+	$(CC) -O2 -Wall -Wextra -std=c99 -I. -o $@ \
+		tests/test_qwen_attention_ref.c ds4_qwen_ref.c -lm
+
+qwen-reference-test: tests/test_qwen_gdn_ref tests/test_qwen_attention_ref
 	python3 tests/qwen/collect_gdn_reference.py --check
+	python3 tests/qwen/collect_attention_reference.py --check
 	python3 tests/qwen/test_v_tiling_contract.py
 	./tests/test_qwen_gdn_ref
+	./tests/test_qwen_attention_ref
 
 endif
 
@@ -467,5 +495,6 @@ clean:
 	rm -rf "$(BUILD_ROOT)"
 	rm -f ds4 ds4-server ds4-bench ds4-eval ds4-agent ds4_cpu ds4_native \
 		ds4_server_test ds4_test ds4_agent_test tests/test_q4k_dot \
-		tests/test_qwen_gdn_ref tests/test_ssd_residency tests/cuda_long_context_smoke \
+		tests/test_qwen_gdn_ref tests/test_qwen_attention_ref \
+		tests/test_ssd_residency tests/cuda_long_context_smoke \
 		tests/cuda_long_context_smoke.o *.o

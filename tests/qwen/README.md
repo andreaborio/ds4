@@ -35,6 +35,17 @@ network dependency.  Verify it with:
 python3 tests/qwen/collect_gdn_reference.py --check
 ```
 
+`qwen36_attention_golden.inc` freezes the other token-mixer path: per-head
+Q/K RMSNorm using the converter-shifted weights, the fused per-head `[Q, gate]`
+projection layout, text-only split-half partial RoPE, contiguous GQA head
+repetition, F32 causal softmax, and the elementwise sigmoid output gate.  It
+also proves that prefix and one-shot causal results agree.  Refresh or verify
+it with:
+
+```sh
+python3 tests/qwen/collect_attention_reference.py --check
+```
+
 These scalar fixtures are correctness oracles only.  Passing them does not
 enable Qwen CPU, Metal, or SSD-streaming inference; the runtime remains
 fail-closed until the complete model graph passes end-to-end logits gates.

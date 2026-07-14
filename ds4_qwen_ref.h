@@ -81,4 +81,56 @@ void ds4_qwen_ref_sigmoid_gate_f32(
         size_t       n_vector,
         size_t       dim);
 
+/* Full-attention reference helpers use the post-conversion GGUF layout.  The
+ * fused Q projection stores [query, gate] inside every query-head block. */
+bool ds4_qwen_ref_split_q_gate_f32(
+        float       *query,
+        float       *gate,
+        const float *projection,
+        size_t       n_token,
+        size_t       n_query_head,
+        size_t       head_dim);
+
+/* Qwen3.5/3.6 RMSNorm weights are already shifted by +1 by the pinned GGUF
+ * converter, so this helper multiplies by weight directly. */
+bool ds4_qwen_ref_head_rms_norm_f32(
+        float       *output,
+        const float *input,
+        const float *weight,
+        size_t       n_token,
+        size_t       n_head,
+        size_t       head_dim,
+        float        eps);
+
+/* Text-only Qwen positions have identical T/H/W coordinates.  Interleaved
+ * MRoPE therefore reduces to split-half RoPE on the first n_rot channels. */
+bool ds4_qwen_ref_text_rope_f32(
+        float          *values,
+        const uint32_t *position,
+        size_t          n_token,
+        size_t          n_head,
+        size_t          head_dim,
+        size_t          n_rot,
+        float           theta);
+
+/* Scalar causal GQA over a complete sequence.  Query heads map to contiguous
+ * repeated KV groups, matching repeat_interleave in the official fallback. */
+bool ds4_qwen_ref_causal_gqa_f32(
+        float       *output,
+        const float *query,
+        const float *key,
+        const float *value,
+        size_t       n_token,
+        size_t       n_query_head,
+        size_t       n_kv_head,
+        size_t       head_dim);
+
+/* Full-attention output gating is elementwise, unlike the shared-expert gate
+ * above, which broadcasts one scalar across a hidden vector. */
+void ds4_qwen_ref_sigmoid_gate_elements_f32(
+        float       *output,
+        const float *input,
+        const float *gate_logit,
+        size_t       n_value);
+
 #endif
