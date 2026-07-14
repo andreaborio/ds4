@@ -411,6 +411,7 @@ def generate(source: SourceData, cache_digest: str) -> bytes:
                decomposition_pool, 8, 8)
     emit_array("uint64_t", "qwen_uc_composition",
                composition_packed, 16, 4, "ULL")
+    lines.pop()  # Keep one final newline without a blank line at EOF.
     return ("\n".join(lines) + "\n").encode("ascii")
 
 
