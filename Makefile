@@ -44,8 +44,8 @@ CPU_BINDIR := $(BUILD_ROOT)/$(CPU_PROFILE)/bin
 
 METAL_LDLIBS := $(LDLIBS) -framework Foundation -framework Metal
 
-METAL_CORE_OBJS := $(addprefix $(METAL_OBJDIR)/,ds4.o ds4_build.o ds4_distributed.o ds4_ssd.o ds4_metal.o)
-CPU_CORE_OBJS := $(addprefix $(CPU_OBJDIR)/,ds4.o ds4_build.o ds4_distributed.o ds4_ssd.o)
+METAL_CORE_OBJS := $(addprefix $(METAL_OBJDIR)/,ds4.o ds4_build.o ds4_distributed.o ds4_ssd.o ds4_qwen.o ds4_metal.o)
+CPU_CORE_OBJS := $(addprefix $(CPU_OBJDIR)/,ds4.o ds4_build.o ds4_distributed.o ds4_ssd.o ds4_qwen.o)
 
 METAL_BINS := $(addprefix $(METAL_BINDIR)/,$(PROGRAMS))
 CPU_BINS := $(addprefix $(CPU_BINDIR)/,$(PROGRAMS))
@@ -56,6 +56,7 @@ METAL_TEST_BINS := \
 	$(METAL_BINDIR)/test_q4k_dot \
 	$(METAL_BINDIR)/test_qwen_gdn_ref \
 	$(METAL_BINDIR)/test_qwen_attention_ref \
+	$(METAL_BINDIR)/test_qwen_state \
 	$(METAL_BINDIR)/test_ssd_residency
 
 all: metal
@@ -190,6 +191,10 @@ $(METAL_OBJDIR)/test_qwen_attention_ref.o: tests/test_qwen_attention_ref.c \
 	@mkdir -p "$(@D)"
 	$(CC) -O2 -Wall -Wextra -std=c99 $(DEPFLAGS) -I. -c -o $@ $<
 
+$(METAL_OBJDIR)/test_qwen_state.o: tests/test_qwen_state.c ds4_qwen.h
+	@mkdir -p "$(@D)"
+	$(CC) -O2 -Wall -Wextra -std=c99 $(DEPFLAGS) -I. -c -o $@ $<
+
 $(METAL_OBJDIR)/ds4_qwen_ref.o: ds4_qwen_ref.c ds4_qwen_ref.h
 	@mkdir -p "$(@D)"
 	$(CC) -O2 -Wall -Wextra -std=c99 $(DEPFLAGS) -c -o $@ $<
@@ -226,6 +231,11 @@ $(METAL_BINDIR)/test_qwen_attention_ref: \
 	@mkdir -p "$(@D)"
 	$(CC) -O2 -o $@ $^ -lm
 
+$(METAL_BINDIR)/test_qwen_state: \
+	$(METAL_OBJDIR)/test_qwen_state.o $(METAL_OBJDIR)/ds4_qwen.o
+	@mkdir -p "$(@D)"
+	$(CC) -O2 -o $@ $^
+
 # Preserve the documented direct test-runner commands without letting a CPU
 # target publish over them.
 ds4_test: $(METAL_BINDIR)/ds4_test
@@ -253,6 +263,7 @@ qwen-reference-test: $(METAL_BINDIR)/test_qwen_gdn_ref \
 model-free-test: metal ds4_test ds4_agent_test $(METAL_BINDIR)/test_q4k_dot \
 		$(METAL_BINDIR)/test_qwen_gdn_ref \
 		$(METAL_BINDIR)/test_qwen_attention_ref \
+		$(METAL_BINDIR)/test_qwen_state \
 		$(METAL_BINDIR)/test_ssd_residency
 	$(METAL_BINDIR)/ds4-eval --self-test-extractors
 	$(METAL_BINDIR)/ds4_agent_test
@@ -260,6 +271,7 @@ model-free-test: metal ds4_test ds4_agent_test $(METAL_BINDIR)/test_q4k_dot \
 	$(METAL_BINDIR)/test_q4k_dot
 	$(METAL_BINDIR)/test_qwen_gdn_ref
 	$(METAL_BINDIR)/test_qwen_attention_ref
+	$(METAL_BINDIR)/test_qwen_state
 	python3 tests/qwen/collect_gdn_reference.py --check
 	python3 tests/qwen/collect_attention_reference.py --check
 	python3 tests/qwen/test_v_tiling_contract.py
@@ -287,8 +299,8 @@ ifneq ($(strip $(CUDA_ARCH)),)
 NVCC_ARCH_FLAGS := -arch=$(CUDA_ARCH)
 endif
 NVCCFLAGS ?= -O3 -g -lineinfo --use_fast_math $(NVCC_ARCH_FLAGS) -Xcompiler $(NATIVE_CPU_FLAG) -Xcompiler -pthread
-CORE_OBJS = ds4.o ds4_build.o ds4_distributed.o ds4_ssd.o ds4_cuda.o
-CPU_CORE_OBJS = ds4_cpu.o ds4_build_cpu.o ds4_distributed.o ds4_ssd.o
+CORE_OBJS = ds4.o ds4_build.o ds4_distributed.o ds4_ssd.o ds4_qwen.o ds4_cuda.o
+CPU_CORE_OBJS = ds4_cpu.o ds4_build_cpu.o ds4_distributed.o ds4_ssd.o ds4_qwen.o
 CUDA_LDLIBS ?= -lm -Xcompiler -pthread -L$(CUDA_HOME)/targets/sbsa-linux/lib -L$(CUDA_HOME)/lib64 -lcudart -lcublas
 HIPCC ?= $(shell command -v hipcc 2>/dev/null || echo /opt/rocm/bin/hipcc)
 ROCM_ARCH ?= gfx1151
@@ -326,7 +338,7 @@ cuda:
 
 strix-halo:
 	$(MAKE) -B ds4 ds4-server ds4-bench ds4-eval ds4-agent \
-		CORE_OBJS="ds4.o ds4_build.o ds4_distributed.o ds4_ssd.o ds4_rocm.o" \
+		CORE_OBJS="ds4.o ds4_build.o ds4_distributed.o ds4_ssd.o ds4_qwen.o ds4_rocm.o" \
 		CFLAGS="$(CFLAGS) -DDS4_ROCM_BUILD" \
 		DS4_LINK="$(HIPCC) $(ROCM_CFLAGS)" \
 		DS4_LINK_LIBS="$(ROCM_LDLIBS)"
@@ -358,7 +370,7 @@ cpu: ds4_cli_cpu.o ds4_server_cpu.o ds4_bench_cpu.o ds4_eval_cpu.o ds4_agent_cpu
 cuda-regression: tests/cuda_long_context_smoke
 	./tests/cuda_long_context_smoke
 
-ds4.o: ds4.c ds4.h ds4_ssd.h ds4_distributed.h ds4_gpu.h
+ds4.o: ds4.c ds4.h ds4_ssd.h ds4_distributed.h ds4_gpu.h ds4_qwen.h
 	$(CC) $(CFLAGS) -c -o $@ ds4.c
 
 ds4_build.o: ds4_build.c ds4.h FORCE
@@ -369,6 +381,9 @@ ds4_build_cpu.o: ds4_build.c ds4.h FORCE
 
 ds4_ssd.o: ds4_ssd.c ds4_ssd.h
 	$(CC) $(CFLAGS) -c -o $@ ds4_ssd.c
+
+ds4_qwen.o: ds4_qwen.c ds4_qwen.h
+	$(CC) $(CFLAGS) -c -o $@ ds4_qwen.c
 
 ds4_cli.o: ds4_cli.c ds4.h ds4_ssd.h ds4_distributed.h ds4_help.h linenoise.h
 	$(CC) $(CFLAGS) -c -o $@ ds4_cli.c
@@ -415,7 +430,7 @@ rax.o: rax.c rax.h rax_malloc.h
 linenoise.o: linenoise.c linenoise.h
 	$(CC) $(CFLAGS) -c -o $@ linenoise.c
 
-ds4_cpu.o: ds4.c ds4.h ds4_ssd.h ds4_distributed.h ds4_gpu.h
+ds4_cpu.o: ds4.c ds4.h ds4_ssd.h ds4_distributed.h ds4_gpu.h ds4_qwen.h
 	$(CC) $(CFLAGS) -DDS4_NO_GPU -c -o $@ ds4.c
 
 ds4_cli_cpu.o: ds4_cli.c ds4.h ds4_ssd.h ds4_distributed.h ds4_help.h linenoise.h
@@ -450,12 +465,14 @@ ds4_agent_test: ds4_agent_test.o ds4_help.o ds4_web.o ds4_kvstore.o linenoise.o 
 
 model-free-test: ds4 ds4_test ds4_agent_test ds4-eval q4k-dot-test \
 		tests/test_qwen_gdn_ref tests/test_qwen_attention_ref \
+		tests/test_qwen_state \
 		tests/test_ssd_residency
 	./ds4-eval --self-test-extractors
 	./ds4_agent_test
 	./ds4_test --server
 	./tests/test_qwen_gdn_ref
 	./tests/test_qwen_attention_ref
+	./tests/test_qwen_state
 	python3 tests/qwen/collect_gdn_reference.py --check
 	python3 tests/qwen/collect_attention_reference.py --check
 	python3 tests/qwen/test_v_tiling_contract.py
@@ -482,6 +499,10 @@ tests/test_qwen_attention_ref: tests/test_qwen_attention_ref.c ds4_qwen_ref.c \
 	$(CC) -O2 -Wall -Wextra -std=c99 -I. -o $@ \
 		tests/test_qwen_attention_ref.c ds4_qwen_ref.c -lm
 
+tests/test_qwen_state: tests/test_qwen_state.c ds4_qwen.c ds4_qwen.h
+	$(CC) -O2 -Wall -Wextra -std=c99 -I. -o $@ \
+		tests/test_qwen_state.c ds4_qwen.c
+
 qwen-reference-test: tests/test_qwen_gdn_ref tests/test_qwen_attention_ref
 	python3 tests/qwen/collect_gdn_reference.py --check
 	python3 tests/qwen/collect_attention_reference.py --check
@@ -496,5 +517,6 @@ clean:
 	rm -f ds4 ds4-server ds4-bench ds4-eval ds4-agent ds4_cpu ds4_native \
 		ds4_server_test ds4_test ds4_agent_test tests/test_q4k_dot \
 		tests/test_qwen_gdn_ref tests/test_qwen_attention_ref \
+		tests/test_qwen_state \
 		tests/test_ssd_residency tests/cuda_long_context_smoke \
 		tests/cuda_long_context_smoke.o *.o

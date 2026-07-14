@@ -38,6 +38,7 @@
 
 #include "ds4.h"
 #include "ds4_distributed.h"
+#include "ds4_qwen.h"
 
 #ifndef DS4_NO_GPU
 #include "ds4_gpu.h"
@@ -140,32 +141,6 @@ enum {
     DS4_MAX_INDEXER_TOP_K    = 1024,
     DS4_MAX_HC               = 4,
     DS4_MAX_HC_SINKHORN_ITER = 20,
-};
-
-enum {
-    QWEN35_N_LAYER                    = 40,
-    QWEN35_N_TENSOR                   = 733,
-    QWEN35_N_EMBD                     = 2048,
-    QWEN35_N_VOCAB                    = 248320,
-    QWEN35_N_MERGE                    = 247587,
-    QWEN35_N_HEAD                     = 16,
-    QWEN35_N_HEAD_KV                  = 2,
-    QWEN35_N_HEAD_DIM                 = 256,
-    QWEN35_N_ROT                      = 64,
-    QWEN35_N_EXPERT                   = 256,
-    QWEN35_N_EXPERT_USED              = 8,
-    QWEN35_N_FF_EXP                   = 512,
-    QWEN35_N_FF_SHARED                = 512,
-    QWEN35_SSM_CONV_KERNEL            = 4,
-    QWEN35_SSM_STATE                  = 128,
-    QWEN35_SSM_GROUP                  = 16,
-    QWEN35_SSM_DT_RANK                = 32,
-    QWEN35_SSM_INNER                  = 4096,
-    QWEN35_FULL_ATTENTION_INTERVAL    = 4,
-    QWEN35_CONTEXT_LENGTH             = 262144,
-    QWEN35_BOS_PAD_ID                 = 248044,
-    QWEN35_EOS_ID                     = 248046,
-    QWEN35_MODEL_ID                   = 2,
 };
 
 typedef enum {
@@ -4375,10 +4350,6 @@ static void config_validate_model(const ds4_model *m) {
     exit(1);
 }
 
-static bool qwen35_layer_is_full_attention(uint32_t il) {
-    return ((il + 1u) % QWEN35_FULL_ATTENTION_INTERVAL) == 0;
-}
-
 static void qwen35_weights_validate_layout(const ds4_qwen35_weights *w) {
     tensor_expect_f16_or_q8_0_layout(w->token_embd, 2,
                                       QWEN35_N_EMBD, QWEN35_N_VOCAB, 0);
@@ -4394,7 +4365,7 @@ static void qwen35_weights_validate_layout(const ds4_qwen35_weights *w) {
         tensor_expect_layout(l->post_attention_norm, DS4_TENSOR_F32, 1,
                              QWEN35_N_EMBD, 0, 0);
 
-        if (qwen35_layer_is_full_attention(il)) {
+        if (ds4_qwen35_layer_is_full_attention(il)) {
             /* Q contains both 16 x 256 queries and a same-width output gate. */
             tensor_expect_f16_or_q8_0_layout(l->attn_q, 2,
                                               QWEN35_N_EMBD, 8192, 0);
@@ -4467,7 +4438,7 @@ static void qwen35_weights_bind(ds4_qwen35_weights *w, const ds4_model *m) {
         l->post_attention_norm = required_tensorf(
             m, "blk.%u.post_attention_norm.weight", il);
 
-        if (qwen35_layer_is_full_attention(il)) {
+        if (ds4_qwen35_layer_is_full_attention(il)) {
             l->attn_q = required_tensorf(m, "blk.%u.attn_q.weight", il);
             l->attn_k = required_tensorf(m, "blk.%u.attn_k.weight", il);
             l->attn_v = required_tensorf(m, "blk.%u.attn_v.weight", il);
@@ -23990,6 +23961,7 @@ struct ds4_session {
 #endif
     ds4_kv_cache cpu_cache;
     ds4_cpu_decode_scratch cpu_scratch;
+    ds4_qwen35_cpu_cache qwen35_cpu_cache;
     token_vec checkpoint;
     float *logits;
     float *mtp_logits;
@@ -27520,6 +27492,7 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
 void ds4_session_free(ds4_session *s) {
     if (!s) return;
     ds4_dist_session_free(s->distributed);
+    ds4_qwen35_cpu_cache_free(&s->qwen35_cpu_cache);
     if (ds4_session_is_cpu(s)) {
         kv_cache_free(&s->cpu_cache);
         cpu_decode_scratch_free(&s->cpu_scratch);
