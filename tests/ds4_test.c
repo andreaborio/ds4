@@ -1470,6 +1470,10 @@ static void test_metal_qwen35_primitives(void) {
 
 #ifdef __APPLE__
 extern uint64_t ds4_gpu_internal_stream_expert_cache_decode_tokens(void);
+extern uint64_t ds4_gpu_internal_stream_expert_timing_selected_calls(void);
+extern int ds4_gpu_internal_moe_selected_trace_inspect(
+    const char *path, uint32_t requested_width, uint32_t *file_width,
+    uint64_t *record_count, int *legacy);
 
 typedef struct {
     uint16_t d;
@@ -1480,6 +1484,76 @@ typedef struct {
 
 _Static_assert(sizeof(test_metal_q4_k_block) == 144,
                "Q4_K test block ABI drift");
+
+typedef struct {
+    uint8_t  magic[8];
+    uint32_t version;
+    uint32_t width;
+    uint32_t id_bytes;
+    uint32_t header_bytes;
+} test_metal_selected_trace_header;
+
+_Static_assert(sizeof(test_metal_selected_trace_header) == 24,
+               "selected trace test header ABI drift");
+
+static bool test_write_all(int fd, const void *data, size_t bytes) {
+    const uint8_t *src = data;
+    size_t written = 0;
+    while (written < bytes) {
+        ssize_t n = write(fd, src + written, bytes - written);
+        if (n < 0 && errno == EINTR) continue;
+        if (n <= 0) return false;
+        written += (size_t)n;
+    }
+    return true;
+}
+
+static void test_metal_selected_trace_legacy_parser(void) {
+    char legacy_path[] = "/tmp/ds4-selected-legacy-XXXXXX";
+    int legacy_fd = mkstemp(legacy_path);
+    TEST_ASSERT(legacy_fd >= 0);
+    if (legacy_fd >= 0) {
+        /* 96 bytes is divisible by both width-6 and width-8 record sizes.
+         * Headerless input must nevertheless remain unambiguously width 6. */
+        int32_t legacy_ids[24];
+        for (uint32_t i = 0; i < 24; i++) legacy_ids[i] = (int32_t)i;
+        TEST_ASSERT(test_write_all(legacy_fd,
+                                   legacy_ids,
+                                   sizeof(legacy_ids)));
+        close(legacy_fd);
+        uint32_t width = 0;
+        uint64_t records = 0;
+        int legacy = 0;
+        TEST_ASSERT(ds4_gpu_internal_moe_selected_trace_inspect(
+            legacy_path, 6, &width, &records, &legacy));
+        TEST_ASSERT(width == 6);
+        TEST_ASSERT(records == 4);
+        TEST_ASSERT(legacy == 1);
+        TEST_ASSERT(!ds4_gpu_internal_moe_selected_trace_inspect(
+            legacy_path, 8, NULL, NULL, NULL));
+        unlink(legacy_path);
+    }
+
+    char bad_path[] = "/tmp/ds4-selected-bad-header-XXXXXX";
+    int bad_fd = mkstemp(bad_path);
+    TEST_ASSERT(bad_fd >= 0);
+    if (bad_fd >= 0) {
+        test_metal_selected_trace_header bad = {
+            .magic = {'D', 'S', '4', 'M', 'O', 'E', 'I', 'D'},
+            .version = 99,
+            .width = 8,
+            .id_bytes = sizeof(int32_t),
+            .header_bytes = sizeof(test_metal_selected_trace_header),
+        };
+        int32_t ids[8] = {0, 1, 2, 3, 4, 5, 6, 7};
+        TEST_ASSERT(test_write_all(bad_fd, &bad, sizeof(bad)));
+        TEST_ASSERT(test_write_all(bad_fd, ids, sizeof(ids)));
+        close(bad_fd);
+        TEST_ASSERT(!ds4_gpu_internal_moe_selected_trace_inspect(
+            bad_path, 8, NULL, NULL, NULL));
+        unlink(bad_path);
+    }
+}
 
 typedef struct {
     float out[2];
@@ -1499,6 +1573,18 @@ typedef struct {
     uint64_t decode_tokens;
     uint32_t current_entries;
 } test_metal_qwen_top8_result;
+
+static float test_metal_qwen_top8_expected(
+        const int32_t selected[8],
+        const float   weights[8]) {
+    const float silu_one = 1.0f / (1.0f + expf(-1.0f));
+    float weighted = 0.0f;
+    for (uint32_t i = 0; i < 8; i++) {
+        const float value = (float)(selected[i] % 15 + 1);
+        weighted += weights[i] * value * value;
+    }
+    return 256.0f * silu_one * weighted;
+}
 
 static void test_metal_q4_k_fill_constant(
         test_metal_q4_k_block *block,
@@ -1631,6 +1717,7 @@ static bool test_metal_qwen_top8_case(
         uint64_t                       down_expert_bytes,
         const int32_t                  selected_host[8],
         const float                    weight_host[8],
+        const float                   *router_logits_host,
         bool                           expect_success,
         test_metal_qwen_top8_result   *result) {
     enum {
@@ -1639,6 +1726,7 @@ static bool test_metal_qwen_top8_case(
         OUT_DIM = 2,
         TOTAL_EXPERT = 128,
         HALF_EXPERT = 4,
+        ROUTER_EXPERT = 256,
         GGML_TYPE_Q4_K = 12,
     };
     const uint64_t row_bytes = sizeof(test_metal_q4_k_block);
@@ -1671,10 +1759,13 @@ static bool test_metal_qwen_top8_case(
         weights, 0, 4u * sizeof(float)) : NULL;
     ds4_gpu_tensor *weights_half1 = weights ? ds4_gpu_tensor_view(
         weights, 4u * sizeof(float), 4u * sizeof(float)) : NULL;
+    ds4_gpu_tensor *router_logits = router_logits_host ?
+        ds4_gpu_tensor_alloc(ROUTER_EXPERT * sizeof(float)) : NULL;
     ds4_gpu_tensor *input = ds4_gpu_tensor_alloc(sizeof(input_host));
     bool ok = out && partial0 && partial1 && gate && up && mid && experts &&
               selected && weights && selected_half0 && selected_half1 &&
-              weights_half0 && weights_half1 && input && result;
+              weights_half0 && weights_half1 && input && result &&
+              (!router_logits_host || router_logits);
     TEST_ASSERT(ok);
     if (!ok) goto cleanup;
 
@@ -1684,6 +1775,9 @@ static bool test_metal_qwen_top8_case(
                               8u * sizeof(float)) != 0 &&
          ds4_gpu_tensor_write(input, 0, input_host,
                               sizeof(input_host)) != 0 &&
+         (!router_logits_host ||
+          ds4_gpu_tensor_write(router_logits, 0, router_logits_host,
+                               ROUTER_EXPERT * sizeof(float)) != 0) &&
          ds4_gpu_tensor_fill_f32(out, sentinel, OUT_DIM) != 0 &&
          ds4_gpu_tensor_fill_f32(partial0, sentinel, OUT_DIM) != 0 &&
          ds4_gpu_tensor_fill_f32(partial1, sentinel, OUT_DIM) != 0 &&
@@ -1701,20 +1795,37 @@ static bool test_metal_qwen_top8_case(
         ds4_gpu_internal_stream_expert_cache_decode_tokens();
     const uint32_t entries0 = ds4_gpu_stream_expert_cache_current_count();
 
-    const int call_ok = ds4_gpu_qwen35_routed_moe_top8_tensor(
-        out, partial0, partial1, gate, up, mid, experts,
-        model_map, model_size,
-        gate_offset, up_offset, down_offset,
-        GGML_TYPE_Q4_K, GGML_TYPE_Q4_K,
-        gate_expert_bytes, row_bytes,
-        down_expert_bytes, row_bytes,
-        IN_DIM, MID_DIM, OUT_DIM,
-        selected, weights,
-        selected_half0, selected_half1, weights_half0, weights_half1,
-        TOTAL_EXPERT,
-        0.0f, input, 0);
+    int call_ok = 0;
+    if (router_logits_host) {
+        const int begin_ok = ds4_gpu_begin_commands();
+        ok = begin_ok != 0 &&
+             ds4_gpu_qwen35_router_softmax_top8_tensor(
+                 selected, weights, router_logits) != 0;
+        TEST_ASSERT(ok);
+        if (!ok) {
+            if (begin_ok) (void)ds4_gpu_end_commands();
+            goto cleanup;
+        }
+    }
+    call_ok = ds4_gpu_qwen35_routed_moe_top8_tensor(
+            out, partial0, partial1, gate, up, mid, experts,
+            model_map, model_size,
+            gate_offset, up_offset, down_offset,
+            GGML_TYPE_Q4_K, GGML_TYPE_Q4_K,
+            gate_expert_bytes, row_bytes,
+            down_expert_bytes, row_bytes,
+            IN_DIM, MID_DIM, OUT_DIM,
+            selected, weights,
+            selected_half0, selected_half1, weights_half0, weights_half1,
+            TOTAL_EXPERT,
+            0.0f, input, 0);
+    if (router_logits_host) {
+        const int end_ok = ds4_gpu_end_commands();
+        TEST_ASSERT(end_ok);
+        if (!end_ok) ok = false;
+    }
     TEST_ASSERT((call_ok != 0) == expect_success);
-    if ((call_ok != 0) != expect_success) {
+    if (!ok || (call_ok != 0) != expect_success) {
         ok = false;
         goto cleanup;
     }
@@ -1768,6 +1879,7 @@ cleanup:
     ds4_gpu_tensor_free(selected_half1);
     ds4_gpu_tensor_free(weights_half0);
     ds4_gpu_tensor_free(weights_half1);
+    ds4_gpu_tensor_free(router_logits);
     ds4_gpu_tensor_free(selected);
     ds4_gpu_tensor_free(weights);
     ds4_gpu_tensor_free(input);
@@ -1779,6 +1891,7 @@ static void test_metal_q4_selected_slots_runtime_count(void) {
         MID_DIM = 256,
         OUT_DIM = 2,
         TOTAL_EXPERT = 128,
+        ROUTER_EXPERT = 256,
     };
     const uint64_t row_bytes = sizeof(test_metal_q4_k_block);
     const uint64_t gate_expert_bytes = MID_DIM * row_bytes;
@@ -1841,9 +1954,25 @@ static void test_metal_q4_selected_slots_runtime_count(void) {
         test_save_env("DS4_METAL_DISABLE_ROUTED_PAIR_SWIGLU_FUSION");
     char *saved_clamped =
         test_save_env("DS4_METAL_MOE_WRITE_CLAMPED_ACT");
+    char *saved_record_selected =
+        test_save_env("DS4_MOE_RECORD_SELECTED_IDS");
+    char *saved_replay_selected =
+        test_save_env("DS4_MOE_REPLAY_SELECTED_IDS");
+    char *saved_pread_threads =
+        test_save_env("DS4_METAL_STREAMING_EXPERT_PREAD_THREADS");
+    char *saved_timing_summary =
+        test_save_env("DS4_METAL_STREAMING_EXPERT_TIMING_SUMMARY");
+    char *saved_disable_timing_summary =
+        test_save_env("DS4_METAL_DISABLE_STREAMING_EXPERT_TIMING_SUMMARY");
     unsetenv("DS4_METAL_DISABLE_Q4_SELECTED_EXPERT_VIEWS");
     unsetenv("DS4_METAL_DISABLE_ROUTED_PAIR_SWIGLU_FUSION");
     unsetenv("DS4_METAL_MOE_WRITE_CLAMPED_ACT");
+    unsetenv("DS4_MOE_RECORD_SELECTED_IDS");
+    unsetenv("DS4_MOE_REPLAY_SELECTED_IDS");
+    unsetenv("DS4_METAL_STREAMING_EXPERT_PREAD_THREADS");
+    TEST_ASSERT(setenv("DS4_METAL_STREAMING_EXPERT_TIMING_SUMMARY",
+                       "1", 1) == 0);
+    unsetenv("DS4_METAL_DISABLE_STREAMING_EXPERT_TIMING_SUMMARY");
 
     ds4_gpu_set_quality(false);
     ds4_gpu_set_model_fd(fd);
@@ -1898,7 +2027,7 @@ static void test_metal_q4_selected_slots_runtime_count(void) {
         model_map, model_size,
         gate_offset, up_offset, down_offset,
         gate_expert_bytes, down_expert_bytes,
-        invalid_top8, top8_weights, false, &invalid));
+        invalid_top8, top8_weights, NULL, false, &invalid));
     TEST_ASSERT(invalid.hits == 0);
     TEST_ASSERT(invalid.misses == 0);
     TEST_ASSERT(invalid.pread_bytes == 0);
@@ -1910,7 +2039,7 @@ static void test_metal_q4_selected_slots_runtime_count(void) {
         model_map, model_size,
         gate_offset, up_offset, down_offset,
         gate_expert_bytes, down_expert_bytes,
-        unique_top8, top8_weights, true, &cold_top8));
+        unique_top8, top8_weights, NULL, true, &cold_top8));
     TEST_ASSERT(cold_top8.hits == 0);
     TEST_ASSERT(cold_top8.misses == 8);
     TEST_ASSERT(cold_top8.pread_bytes == 8u * per_expert_bytes);
@@ -1940,7 +2069,7 @@ static void test_metal_q4_selected_slots_runtime_count(void) {
         model_map, model_size,
         gate_offset, up_offset, down_offset,
         gate_expert_bytes, down_expert_bytes,
-        unique_top8, top8_weights, true, &warm_top8));
+        unique_top8, top8_weights, NULL, true, &warm_top8));
     TEST_ASSERT(warm_top8.hits == 8);
     TEST_ASSERT(warm_top8.misses == cold_top8.misses);
     TEST_ASSERT(warm_top8.pread_bytes == cold_top8.pread_bytes);
@@ -1958,7 +2087,7 @@ static void test_metal_q4_selected_slots_runtime_count(void) {
         model_map, model_size,
         gate_offset, up_offset, down_offset,
         gate_expert_bytes, down_expert_bytes,
-        duplicate_top8, top8_weights, true, &duplicate));
+        duplicate_top8, top8_weights, NULL, true, &duplicate));
     TEST_ASSERT(duplicate.hits == 0);
     TEST_ASSERT(duplicate.misses == 6);
     TEST_ASSERT(duplicate.pread_bytes == 6u * per_expert_bytes);
@@ -1975,11 +2104,169 @@ static void test_metal_q4_selected_slots_runtime_count(void) {
         TEST_ASSERT(fabsf(duplicate.out[row] - duplicate_expected) < 0.1f);
     }
 
+    /* Exercise the production ordering: the GPU router writes selected IDs
+     * and weights into an active command batch; the top-8 wrapper closes that
+     * batch for the CPU cache decision, reopens it, runs both halves, and the
+     * caller finally commits the restarted batch. */
+    float router_logits[2][ROUTER_EXPERT];
+    int32_t router_selected[2][8];
+    float router_weights[2][8];
+    float router_probability[ROUTER_EXPERT];
+    for (uint32_t route = 0; route < 2; route++) {
+        for (uint32_t expert = 0; expert < ROUTER_EXPERT; expert++) {
+            router_logits[route][expert] = -20.0f;
+        }
+        for (uint32_t i = 0; i < 8; i++) {
+            router_logits[route][route * 8u + i] =
+                12.0f - 0.25f * (float)i;
+        }
+        TEST_ASSERT(ds4_qwen35_cpu_softmax_top8_f32(
+            router_selected[route],
+            router_weights[route],
+            router_probability,
+            router_logits[route]));
+        for (uint32_t i = 0; i < 8; i++) {
+            TEST_ASSERT(router_selected[route][i] >= 0);
+            TEST_ASSERT(router_selected[route][i] < TOTAL_EXPERT);
+        }
+    }
+
+    char trace_path[] = "/tmp/ds4-selected-top8-XXXXXX";
+    int trace_fd = mkstemp(trace_path);
+    TEST_ASSERT(trace_fd >= 0);
+    test_metal_qwen_top8_result active_cold = {0};
+    test_metal_qwen_top8_result active_warm = {0};
+    test_metal_qwen_top8_result active_pressure = {0};
+    if (trace_fd >= 0) {
+        close(trace_fd);
+        TEST_ASSERT(setenv("DS4_MOE_RECORD_SELECTED_IDS",
+                           trace_path, 1) == 0);
+
+        ds4_gpu_set_streaming_expert_cache_budget(8);
+        TEST_ASSERT(test_metal_qwen_top8_case(
+            model_map, model_size,
+            gate_offset, up_offset, down_offset,
+            gate_expert_bytes, down_expert_bytes,
+            router_selected[0], router_weights[0], router_logits[0],
+            true, &active_cold));
+        TEST_ASSERT(active_cold.hits == 0);
+        TEST_ASSERT(active_cold.misses == 8);
+        TEST_ASSERT(active_cold.pread_bytes == 8u * per_expert_bytes);
+        TEST_ASSERT(active_cold.current_entries == 8);
+        TEST_ASSERT(active_cold.decode_tokens == 1);
+        const float active_expected0 = test_metal_qwen_top8_expected(
+            router_selected[0], router_weights[0]);
+        for (uint32_t row = 0; row < OUT_DIM; row++) {
+            TEST_ASSERT(isfinite(active_cold.out[row]));
+            TEST_ASSERT(fabsf(active_cold.out[row] - active_expected0) < 0.1f);
+        }
+
+        TEST_ASSERT(test_metal_qwen_top8_case(
+            model_map, model_size,
+            gate_offset, up_offset, down_offset,
+            gate_expert_bytes, down_expert_bytes,
+            router_selected[0], router_weights[0], router_logits[0],
+            true, &active_warm));
+        TEST_ASSERT(active_warm.hits == 8);
+        TEST_ASSERT(active_warm.misses == active_cold.misses);
+        TEST_ASSERT(active_warm.pread_bytes == active_cold.pread_bytes);
+        TEST_ASSERT(active_warm.current_entries == 8);
+        TEST_ASSERT(active_warm.decode_tokens == 2);
+        for (uint32_t row = 0; row < OUT_DIM; row++) {
+            TEST_ASSERT(fabsf(active_warm.out[row] -
+                              active_cold.out[row]) < 1.0e-4f);
+        }
+
+        /* The cache is full here. Replacing all eight selected experts proves
+         * that the keep-set protects the incoming route while old entries are
+         * evicted, and that the configured budget remains a hard ceiling. */
+        TEST_ASSERT(test_metal_qwen_top8_case(
+            model_map, model_size,
+            gate_offset, up_offset, down_offset,
+            gate_expert_bytes, down_expert_bytes,
+            router_selected[1], router_weights[1], router_logits[1],
+            true, &active_pressure));
+        TEST_ASSERT(active_pressure.hits == active_warm.hits);
+        TEST_ASSERT(active_pressure.misses == 16);
+        TEST_ASSERT(active_pressure.pread_bytes == 16u * per_expert_bytes);
+        TEST_ASSERT(active_pressure.current_entries == 8);
+        TEST_ASSERT(active_pressure.decode_tokens == 3);
+        TEST_ASSERT(ds4_gpu_internal_stream_expert_timing_selected_calls() == 3);
+        const float active_expected1 = test_metal_qwen_top8_expected(
+            router_selected[1], router_weights[1]);
+        for (uint32_t row = 0; row < OUT_DIM; row++) {
+            TEST_ASSERT(isfinite(active_pressure.out[row]));
+            TEST_ASSERT(fabsf(active_pressure.out[row] -
+                              active_expected1) < 0.1f);
+        }
+
+        uint32_t trace_width = 0;
+        uint64_t trace_records = 0;
+        int trace_legacy = 1;
+        TEST_ASSERT(ds4_gpu_internal_moe_selected_trace_inspect(
+            trace_path, 8, &trace_width, &trace_records, &trace_legacy));
+        TEST_ASSERT(trace_width == 8);
+        TEST_ASSERT(trace_records == 3);
+        TEST_ASSERT(trace_legacy == 0);
+        TEST_ASSERT(!ds4_gpu_internal_moe_selected_trace_inspect(
+            trace_path, 6, NULL, NULL, NULL));
+        unsetenv("DS4_MOE_RECORD_SELECTED_IDS");
+        unlink(trace_path);
+    }
+    test_metal_selected_trace_legacy_parser();
+
+    /* Budget rejection happens after the router readback but before SSD I/O,
+     * cache/token accounting, or any output writes. */
+    ds4_gpu_set_streaming_expert_cache_budget(7);
+    test_metal_qwen_top8_result undersized_budget = {0};
+    TEST_ASSERT(test_metal_qwen_top8_case(
+        model_map, model_size,
+        gate_offset, up_offset, down_offset,
+        gate_expert_bytes, down_expert_bytes,
+        router_selected[0], router_weights[0], router_logits[0],
+        false, &undersized_budget));
+    TEST_ASSERT(undersized_budget.hits == 0);
+    TEST_ASSERT(undersized_budget.misses == 0);
+    TEST_ASSERT(undersized_budget.pread_bytes == 0);
+    TEST_ASSERT(undersized_budget.current_entries == 0);
+    TEST_ASSERT(undersized_budget.decode_tokens == 0);
+
+    /* Force early-load to run synchronously. A cold install is one miss only,
+     * not a miss followed by a synthetic wrapper hit; the next route is the
+     * real warm-hit case. */
+    TEST_ASSERT(setenv("DS4_METAL_STREAMING_EXPERT_PREAD_THREADS", "1", 1) == 0);
+    ds4_gpu_set_streaming_expert_cache_budget(8);
+    test_metal_qwen_top8_result sync_cold = {0};
+    TEST_ASSERT(test_metal_qwen_top8_case(
+        model_map, model_size,
+        gate_offset, up_offset, down_offset,
+        gate_expert_bytes, down_expert_bytes,
+        unique_top8, top8_weights, NULL, true, &sync_cold));
+    TEST_ASSERT(sync_cold.hits == 0);
+    TEST_ASSERT(sync_cold.misses == 8);
+    TEST_ASSERT(sync_cold.pread_bytes == 8u * per_expert_bytes);
+    TEST_ASSERT(sync_cold.current_entries == 8);
+    TEST_ASSERT(sync_cold.decode_tokens == 1);
+
+    test_metal_qwen_top8_result sync_warm = {0};
+    TEST_ASSERT(test_metal_qwen_top8_case(
+        model_map, model_size,
+        gate_offset, up_offset, down_offset,
+        gate_expert_bytes, down_expert_bytes,
+        unique_top8, top8_weights, NULL, true, &sync_warm));
+    TEST_ASSERT(sync_warm.hits == 8);
+    TEST_ASSERT(sync_warm.misses == sync_cold.misses);
+    TEST_ASSERT(sync_warm.pread_bytes == sync_cold.pread_bytes);
+    TEST_ASSERT(sync_warm.current_entries == 8);
+    TEST_ASSERT(sync_warm.decode_tokens == 2);
+    unsetenv("DS4_METAL_STREAMING_EXPERT_PREAD_THREADS");
+
     fprintf(stderr,
             "ds4-test: Q4 selected slots n=4/n=6 output=%.6f "
             "misses=%llu/%llu pread=%llu/%llu; "
-            "Qwen top8 cold/warm/dup=%llu/%llu/%llu misses, "
-            "tokens=%llu/%llu/%llu\n",
+            "Qwen top8 cold/warm/dup=%llu/%llu/%llu misses; "
+            "active cold/warm/pressure=%llu/%llu/%llu misses; "
+            "sync cold/warm hits=%llu/%llu\n",
             top4.out[0],
             (unsigned long long)top4.misses,
             (unsigned long long)top6.misses,
@@ -1988,9 +2275,11 @@ static void test_metal_q4_selected_slots_runtime_count(void) {
             (unsigned long long)cold_top8.misses,
             (unsigned long long)warm_top8.misses,
             (unsigned long long)duplicate.misses,
-            (unsigned long long)cold_top8.decode_tokens,
-            (unsigned long long)warm_top8.decode_tokens,
-            (unsigned long long)duplicate.decode_tokens);
+            (unsigned long long)active_cold.misses,
+            (unsigned long long)active_warm.misses,
+            (unsigned long long)active_pressure.misses,
+            (unsigned long long)sync_cold.hits,
+            (unsigned long long)sync_warm.hits);
 
     ds4_gpu_set_ssd_streaming(false);
     ds4_gpu_set_streaming_expert_cache_budget(0);
@@ -2001,6 +2290,14 @@ static void test_metal_q4_selected_slots_runtime_count(void) {
                      saved_disable_pair);
     test_restore_env("DS4_METAL_DISABLE_Q4_SELECTED_EXPERT_VIEWS",
                      saved_disable_selected);
+    test_restore_env("DS4_METAL_STREAMING_EXPERT_PREAD_THREADS",
+                     saved_pread_threads);
+    test_restore_env("DS4_METAL_DISABLE_STREAMING_EXPERT_TIMING_SUMMARY",
+                     saved_disable_timing_summary);
+    test_restore_env("DS4_METAL_STREAMING_EXPERT_TIMING_SUMMARY",
+                     saved_timing_summary);
+    test_restore_env("DS4_MOE_REPLAY_SELECTED_IDS", saved_replay_selected);
+    test_restore_env("DS4_MOE_RECORD_SELECTED_IDS", saved_record_selected);
     munmap(model_map, (size_t)model_size);
     close(fd);
 }

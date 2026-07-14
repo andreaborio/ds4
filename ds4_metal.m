@@ -325,13 +325,42 @@ static int32_t g_routed_moe_selected_override[6];
 static uint32_t g_routed_moe_selected_override_n;
 static int g_moe_selected_trace_record_initialized;
 static FILE *g_moe_selected_trace_record_fp;
+static char *g_moe_selected_trace_record_path;
 static uint64_t g_moe_selected_trace_record_count;
 static uint32_t g_moe_selected_trace_record_width;
 static int g_moe_selected_trace_replay_initialized;
+static char *g_moe_selected_trace_replay_path;
 static int32_t *g_moe_selected_trace_replay_ids;
 static uint64_t g_moe_selected_trace_replay_count;
 static uint64_t g_moe_selected_trace_replay_pos;
 static uint32_t g_moe_selected_trace_replay_width;
+
+enum {
+    DS4_MOE_SELECTED_TRACE_VERSION = 1,
+};
+
+static const uint8_t g_moe_selected_trace_magic[8] = {
+    'D', 'S', '4', 'M', 'O', 'E', 'I', 'D'
+};
+
+typedef struct {
+    uint8_t  magic[8];
+    uint32_t version;
+    uint32_t width;
+    uint32_t id_bytes;
+    uint32_t header_bytes;
+} ds4_gpu_moe_selected_trace_header;
+
+_Static_assert(sizeof(ds4_gpu_moe_selected_trace_header) == 24,
+               "selected-id trace header ABI drift");
+
+typedef struct {
+    uint64_t payload_offset;
+    uint64_t payload_bytes;
+    uint64_t record_count;
+    uint32_t width;
+    int      legacy;
+} ds4_gpu_moe_selected_trace_info;
 
 static double ds4_gpu_gib(uint64_t bytes);
 
@@ -1244,16 +1273,145 @@ static int ds4_gpu_moe_selected_hotlist_record(
     return 1;
 }
 
-static void ds4_gpu_moe_selected_trace_record_close(void) {
-    if (g_moe_selected_trace_record_fp) {
-        const char *path = getenv("DS4_MOE_RECORD_SELECTED_IDS");
-        fclose(g_moe_selected_trace_record_fp);
-        g_moe_selected_trace_record_fp = NULL;
-        fprintf(stderr,
-                "ds4: recorded %" PRIu64 " routed-MoE selected-id entries to %s\n",
-                g_moe_selected_trace_record_count,
-                path && path[0] ? path : "(unknown)");
+static int ds4_gpu_moe_selected_trace_parse(
+        FILE                            *fp,
+        const char                      *path,
+        uint32_t                         requested_width,
+        ds4_gpu_moe_selected_trace_info *info) {
+    if (!fp || !info ||
+        (requested_width != 6 &&
+         requested_width != DS4_METAL_STREAM_SELECTED_MAX)) {
+        return 0;
     }
+    *info = (ds4_gpu_moe_selected_trace_info){0};
+    const char *label = path && path[0] ? path : "(unknown)";
+    if (fseeko(fp, 0, SEEK_END) != 0) {
+        fprintf(stderr, "ds4: failed to seek selected-id trace file %s\n", label);
+        return 0;
+    }
+    const off_t end = ftello(fp);
+    if (end < 0 || fseeko(fp, 0, SEEK_SET) != 0) {
+        fprintf(stderr, "ds4: failed to size selected-id trace file %s\n", label);
+        return 0;
+    }
+    const uint64_t bytes = (uint64_t)end;
+    if (bytes == 0) {
+        fprintf(stderr, "ds4: selected-id trace file %s is empty\n", label);
+        return 0;
+    }
+
+    uint8_t magic[sizeof(g_moe_selected_trace_magic)] = {0};
+    const size_t magic_read = bytes < sizeof(magic) ?
+        (size_t)bytes : sizeof(magic);
+    if (fread(magic, 1, magic_read, fp) != magic_read) {
+        fprintf(stderr, "ds4: failed to read selected-id trace file %s\n", label);
+        return 0;
+    }
+
+    const bool headered = magic_read == sizeof(magic) &&
+        memcmp(magic, g_moe_selected_trace_magic, sizeof(magic)) == 0;
+    uint64_t payload_offset = 0;
+    uint32_t width = 6;
+    int legacy = 1;
+    if (headered) {
+        ds4_gpu_moe_selected_trace_header header = {0};
+        if (bytes < sizeof(header) ||
+            fseeko(fp, 0, SEEK_SET) != 0 ||
+            fread(&header, 1, sizeof(header), fp) != sizeof(header)) {
+            fprintf(stderr,
+                    "ds4: selected-id trace file %s has a truncated header\n",
+                    label);
+            return 0;
+        }
+        if (header.version != DS4_MOE_SELECTED_TRACE_VERSION ||
+            header.header_bytes != sizeof(header) ||
+            header.id_bytes != sizeof(int32_t) ||
+            (header.width != 6 &&
+             header.width != DS4_METAL_STREAM_SELECTED_MAX)) {
+            fprintf(stderr,
+                    "ds4: selected-id trace file %s has an unsupported header "
+                    "version=%u width=%u id_bytes=%u header_bytes=%u\n",
+                    label,
+                    header.version,
+                    header.width,
+                    header.id_bytes,
+                    header.header_bytes);
+            return 0;
+        }
+        width = header.width;
+        payload_offset = header.header_bytes;
+        legacy = 0;
+    } else if (requested_width != 6) {
+        fprintf(stderr,
+                "ds4: headerless selected-id trace %s is legacy width 6; "
+                "Qwen width %u requires a versioned header\n",
+                label,
+                requested_width);
+        return 0;
+    }
+
+    if (width != requested_width) {
+        fprintf(stderr,
+                "ds4: selected-id trace %s width %u does not match requested %u\n",
+                label,
+                width,
+                requested_width);
+        return 0;
+    }
+    const uint64_t payload_bytes = bytes - payload_offset;
+    const uint64_t entry_bytes =
+        (uint64_t)width * sizeof(int32_t);
+    if (payload_bytes == 0 || (payload_bytes % entry_bytes) != 0) {
+        fprintf(stderr,
+                "ds4: selected-id trace file %s has invalid payload size %" PRIu64
+                " for width %u\n",
+                label,
+                payload_bytes,
+                width);
+        return 0;
+    }
+
+    info->payload_offset = payload_offset;
+    info->payload_bytes = payload_bytes;
+    info->record_count = payload_bytes / entry_bytes;
+    info->width = width;
+    info->legacy = legacy;
+    return 1;
+}
+
+int ds4_gpu_internal_moe_selected_trace_inspect(
+        const char *path,
+        uint32_t    requested_width,
+        uint32_t   *file_width,
+        uint64_t   *record_count,
+        int        *legacy) {
+    if (!path || !path[0]) return 0;
+    FILE *fp = fopen(path, "rb");
+    if (!fp) return 0;
+    ds4_gpu_moe_selected_trace_info info = {0};
+    const int ok = ds4_gpu_moe_selected_trace_parse(fp,
+                                                     path,
+                                                     requested_width,
+                                                     &info);
+    fclose(fp);
+    if (!ok) return 0;
+    if (file_width) *file_width = info.width;
+    if (record_count) *record_count = info.record_count;
+    if (legacy) *legacy = info.legacy;
+    return 1;
+}
+
+static void ds4_gpu_moe_selected_trace_record_close(void) {
+    if (!g_moe_selected_trace_record_fp) return;
+    fclose(g_moe_selected_trace_record_fp);
+    g_moe_selected_trace_record_fp = NULL;
+    fprintf(stderr,
+            "ds4: recorded %" PRIu64 " routed-MoE selected-id entries to %s\n",
+            g_moe_selected_trace_record_count,
+            g_moe_selected_trace_record_path ?
+                g_moe_selected_trace_record_path : "(unknown)");
+    free(g_moe_selected_trace_record_path);
+    g_moe_selected_trace_record_path = NULL;
 }
 
 static int ds4_gpu_moe_selected_trace_record(
@@ -1269,25 +1427,57 @@ static int ds4_gpu_moe_selected_trace_record(
     }
 
     if (!g_moe_selected_trace_record_initialized) {
-        g_moe_selected_trace_record_initialized = 1;
-        g_moe_selected_trace_record_fp = fopen(path, "wb");
-        if (!g_moe_selected_trace_record_fp) {
+        FILE *fp = fopen(path, "wb");
+        char *saved_path = strdup(path);
+        if (!fp || !saved_path) {
             fprintf(stderr, "ds4: failed to open selected-id record file %s\n", path);
+            if (fp) fclose(fp);
+            free(saved_path);
             return 0;
         }
-        setvbuf(g_moe_selected_trace_record_fp, NULL, _IOFBF, 1u << 20);
+        setvbuf(fp, NULL, _IOFBF, 1u << 20);
+        ds4_gpu_moe_selected_trace_header header = {
+            .version = DS4_MOE_SELECTED_TRACE_VERSION,
+            .width = n_selected,
+            .id_bytes = sizeof(int32_t),
+            .header_bytes = sizeof(ds4_gpu_moe_selected_trace_header),
+        };
+        memcpy(header.magic,
+               g_moe_selected_trace_magic,
+               sizeof(header.magic));
+        if (fwrite(&header, 1, sizeof(header), fp) != sizeof(header) ||
+            fflush(fp) != 0) {
+            fprintf(stderr,
+                    "ds4: failed to write selected-id trace header to %s\n",
+                    path);
+            fclose(fp);
+            free(saved_path);
+            return 0;
+        }
+        g_moe_selected_trace_record_initialized = 1;
+        g_moe_selected_trace_record_fp = fp;
+        g_moe_selected_trace_record_path = saved_path;
         g_moe_selected_trace_record_width = n_selected;
         atexit(ds4_gpu_moe_selected_trace_record_close);
     }
-    if (g_moe_selected_trace_record_width != n_selected) {
+    if (g_moe_selected_trace_record_width != n_selected ||
+        !g_moe_selected_trace_record_path ||
+        strcmp(g_moe_selected_trace_record_path, path) != 0) {
         fprintf(stderr,
-                "ds4: selected-id recording width changed from %u to %u\n",
+                "ds4: selected-id recording target changed from %s width %u "
+                "to %s width %u\n",
+                g_moe_selected_trace_record_path ?
+                    g_moe_selected_trace_record_path : "(unknown)",
                 g_moe_selected_trace_record_width,
+                path,
                 n_selected);
         return 0;
     }
 
-    if (fwrite(selected_ids, sizeof(selected_ids[0]), n_selected, g_moe_selected_trace_record_fp) != n_selected) {
+    if (fwrite(selected_ids,
+               sizeof(selected_ids[0]),
+               n_selected,
+               g_moe_selected_trace_record_fp) != n_selected) {
         fprintf(stderr, "ds4: failed to write selected-id record file %s\n", path);
         return 0;
     }
@@ -1312,71 +1502,57 @@ static int ds4_gpu_moe_selected_trace_replay(
     }
 
     if (!g_moe_selected_trace_replay_initialized) {
-        g_moe_selected_trace_replay_initialized = 1;
         FILE *fp = fopen(path, "rb");
         if (!fp) {
             fprintf(stderr, "ds4: failed to open selected-id replay file %s\n", path);
             return -1;
         }
-        if (fseeko(fp, 0, SEEK_END) != 0) {
-            fprintf(stderr, "ds4: failed to seek selected-id replay file %s\n", path);
+        ds4_gpu_moe_selected_trace_info info = {0};
+        if (!ds4_gpu_moe_selected_trace_parse(fp,
+                                              path,
+                                              n_selected,
+                                              &info) ||
+            info.payload_bytes > SIZE_MAX ||
+            info.payload_offset > (uint64_t)LLONG_MAX ||
+            fseeko(fp, (off_t)info.payload_offset, SEEK_SET) != 0) {
             fclose(fp);
             return -1;
         }
-        const off_t end = ftello(fp);
-        if (end < 0) {
-            fprintf(stderr, "ds4: failed to size selected-id replay file %s\n", path);
-            fclose(fp);
-            return -1;
-        }
-        if (fseeko(fp, 0, SEEK_SET) != 0) {
-            fprintf(stderr, "ds4: failed to rewind selected-id replay file %s\n", path);
-            fclose(fp);
-            return -1;
-        }
-
-        const uint64_t bytes = (uint64_t)end;
-        const uint64_t entry_bytes = (uint64_t)n_selected * sizeof(selected_ids[0]);
-        if (bytes == 0 || (bytes % entry_bytes) != 0) {
-            fprintf(stderr,
-                    "ds4: selected-id replay file %s has invalid size %" PRIu64 "\n",
-                    path,
-                    bytes);
-            fclose(fp);
-            return -1;
-        }
-        if (bytes > SIZE_MAX) {
-            fprintf(stderr, "ds4: selected-id replay file %s is too large\n", path);
-            fclose(fp);
-            return -1;
-        }
-        g_moe_selected_trace_replay_count = bytes / entry_bytes;
-        g_moe_selected_trace_replay_width = n_selected;
-        g_moe_selected_trace_replay_ids = malloc((size_t)bytes);
-        if (!g_moe_selected_trace_replay_ids) {
+        int32_t *ids = malloc((size_t)info.payload_bytes);
+        char *saved_path = strdup(path);
+        if (!ids || !saved_path) {
             fprintf(stderr, "ds4: failed to allocate selected-id replay buffer\n");
             fclose(fp);
+            free(ids);
+            free(saved_path);
             return -1;
         }
-        if (fread(g_moe_selected_trace_replay_ids, 1, (size_t)bytes, fp) != (size_t)bytes) {
+        if (fread(ids, 1, (size_t)info.payload_bytes, fp) !=
+            (size_t)info.payload_bytes) {
             fprintf(stderr, "ds4: failed to read selected-id replay file %s\n", path);
             fclose(fp);
-            free(g_moe_selected_trace_replay_ids);
-            g_moe_selected_trace_replay_ids = NULL;
+            free(ids);
+            free(saved_path);
             return -1;
         }
         fclose(fp);
+        g_moe_selected_trace_replay_initialized = 1;
+        g_moe_selected_trace_replay_ids = ids;
+        g_moe_selected_trace_replay_path = saved_path;
+        g_moe_selected_trace_replay_count = info.record_count;
+        g_moe_selected_trace_replay_width = info.width;
         fprintf(stderr,
-                "ds4: loaded %" PRIu64 " routed-MoE selected-id entries from %s\n",
+                "ds4: loaded %" PRIu64 " routed-MoE selected-id entries from %s%s\n",
                 g_moe_selected_trace_replay_count,
-                path);
+                path,
+                info.legacy ? " (legacy width 6)" : "");
     }
 
-    if (g_moe_selected_trace_replay_width != n_selected) {
+    if (g_moe_selected_trace_replay_width != n_selected ||
+        !g_moe_selected_trace_replay_path ||
+        strcmp(g_moe_selected_trace_replay_path, path) != 0) {
         fprintf(stderr,
-                "ds4: selected-id replay width changed from %u to %u\n",
-                g_moe_selected_trace_replay_width,
-                n_selected);
+                "ds4: selected-id replay target or width changed after initialization\n");
         return -1;
     }
 
@@ -1387,7 +1563,8 @@ static int ds4_gpu_moe_selected_trace_replay(
         return -1;
     }
     memcpy(selected_ids,
-           g_moe_selected_trace_replay_ids + g_moe_selected_trace_replay_pos * n_selected,
+           g_moe_selected_trace_replay_ids +
+               g_moe_selected_trace_replay_pos * n_selected,
            (size_t)n_selected * sizeof(selected_ids[0]));
     g_moe_selected_trace_replay_pos++;
     return 1;
@@ -7789,6 +7966,10 @@ uint64_t ds4_gpu_internal_stream_expert_cache_decode_tokens(void) {
     return g_stream_expert_cache_decode_tokens;
 }
 
+uint64_t ds4_gpu_internal_stream_expert_timing_selected_calls(void) {
+    return g_stream_expert_timing_selected_calls;
+}
+
 uint32_t ds4_gpu_stream_expert_cache_budget_for_expert_size(
         uint64_t gate_expert_bytes,
         uint64_t down_expert_bytes) {
@@ -8988,6 +9169,13 @@ void ds4_gpu_stream_expert_cache_reset_route_hotness(void) {
            sizeof(g_stream_expert_cache_route_hotness));
     g_stream_expert_cache_hotness_decay_token =
         g_stream_expert_cache_decode_tokens;
+}
+
+void ds4_gpu_stream_expert_cache_release_resident(void) {
+    /* --ssd-streaming-cold drops only resident expert storage. Preserve the
+     * process-wide counters so later diagnostics still describe all I/O and
+     * cache activity performed by this engine. */
+    ds4_gpu_stream_expert_cache_clear_all(0);
 }
 
 static void ds4_gpu_stream_expert_cache_maybe_decay_route_hotness(void) {
@@ -23945,6 +24133,7 @@ static int ds4_gpu_routed_moe_one_tensor_impl(
                 end && *end == '\0' && layer >= 0 && (uint32_t)layer == layer_index;
         }
         const bool selected_profile =
+            !qwen_plan &&
             use_selected_slots &&
             selected_profile_env != NULL &&
             selected_profile_layer_match;
@@ -24235,8 +24424,9 @@ static int ds4_gpu_routed_moe_one_tensor_impl(
             }
         } else if (use_selected_slots) {
             const bool selected_timing =
-                selected_profile ||
-                ds4_gpu_stream_expert_timing_summary_enabled();
+                !qwen_plan &&
+                (selected_profile ||
+                 ds4_gpu_stream_expert_timing_summary_enabled());
             double selected_t0 = selected_timing ? ds4_gpu_now_ms() : 0.0;
             double selected_read_ms = 0.0;
             double selected_wrap_ms = 0.0;
@@ -26010,6 +26200,9 @@ int ds4_gpu_qwen35_routed_moe_top8_tensor(
         return 0;
     }
 
+    const bool selected_timing =
+        ds4_gpu_stream_expert_timing_summary_enabled();
+    const double selected_t0 = selected_timing ? ds4_gpu_now_ms() : 0.0;
     int32_t selected_ids[DS4_METAL_STREAM_SELECTED_MAX] = { 0 };
     const int replayed = ds4_gpu_moe_selected_trace_replay(
             selected_ids,
@@ -26025,6 +26218,10 @@ int ds4_gpu_qwen35_routed_moe_top8_tensor(
         const int restart_ok = !had_batch || ds4_gpu_begin_commands() != 0;
         if (!read_ok || !restart_ok) return 0;
     }
+    const double selected_read_ms = selected_timing ?
+        ds4_gpu_now_ms() - selected_t0 : 0.0;
+    const double selected_bind_t0 = selected_timing ?
+        ds4_gpu_now_ms() : 0.0;
 
     uint64_t gate_abs_offsets[DS4_METAL_STREAM_SELECTED_MAX] = { 0 };
     uint64_t up_abs_offsets[DS4_METAL_STREAM_SELECTED_MAX] = { 0 };
@@ -26085,24 +26282,60 @@ int ds4_gpu_qwen35_routed_moe_top8_tensor(
     };
     ds4_gpu_stream_expert_cache_entry
         *entries[DS4_METAL_STREAM_SELECTED_MAX] = { NULL };
+    uint32_t preexisting_mask = 0;
+    for (uint32_t i = 0; i < DS4_METAL_STREAM_SELECTED_MAX; i++) {
+        ds4_gpu_stream_expert_cache_entry *entry =
+            &g_stream_expert_cache[layer_index][(uint32_t)selected_ids[i]];
+        if (ds4_gpu_stream_expert_cache_entry_matches(
+                entry,
+                model_map,
+                model_size,
+                gate_abs_offsets[i],
+                up_abs_offsets[i],
+                down_abs_offsets[i],
+                gate_expert_bytes,
+                down_expert_bytes)) {
+            preexisting_mask |= 1u << i;
+        }
+    }
     uint32_t missing_mask = 0;
     int ok = ds4_gpu_stream_expert_cache_begin_selected_load(
             &table,
             selected_ids,
             DS4_METAL_STREAM_SELECTED_MAX);
     for (uint32_t i = 0; ok && i < DS4_METAL_STREAM_SELECTED_MAX; i++) {
-        entries[i] = ds4_gpu_stream_expert_cache_peek(
-                model_map,
-                model_size,
-                layer_index,
-                (uint32_t)selected_ids[i],
-                n_total_expert,
-                DS4_METAL_STREAM_SELECTED_MAX,
-                gate_abs_offsets[i],
-                up_abs_offsets[i],
-                down_abs_offsets[i],
-                gate_expert_bytes,
-                down_expert_bytes);
+        if ((preexisting_mask & (1u << i)) != 0) {
+            entries[i] = ds4_gpu_stream_expert_cache_peek(
+                    model_map,
+                    model_size,
+                    layer_index,
+                    (uint32_t)selected_ids[i],
+                    n_total_expert,
+                    DS4_METAL_STREAM_SELECTED_MAX,
+                    gate_abs_offsets[i],
+                    up_abs_offsets[i],
+                    down_abs_offsets[i],
+                    gate_expert_bytes,
+                    down_expert_bytes);
+        } else {
+            /* A one-thread/disabled pread pool completes early-load inline.
+             * Bind that freshly installed miss without reclassifying it as a
+             * hit; the async path remains absent here and is finished below. */
+            ds4_gpu_stream_expert_cache_entry *entry =
+                &g_stream_expert_cache[layer_index]
+                                      [(uint32_t)selected_ids[i]];
+            if (ds4_gpu_stream_expert_cache_entry_matches(
+                    entry,
+                    model_map,
+                    model_size,
+                    gate_abs_offsets[i],
+                    up_abs_offsets[i],
+                    down_abs_offsets[i],
+                    gate_expert_bytes,
+                    down_expert_bytes)) {
+                entries[i] = entry;
+            }
+        }
         if (!entries[i]) missing_mask |= 1u << i;
     }
     if (ok && missing_mask != 0) {
@@ -26159,6 +26392,11 @@ int ds4_gpu_qwen35_routed_moe_top8_tensor(
                 layer_index,
                 selected_ids,
                 DS4_METAL_STREAM_SELECTED_MAX);
+    }
+    if (ok && selected_timing) {
+        ds4_gpu_stream_expert_timing_note_selected(
+                selected_read_ms,
+                ds4_gpu_now_ms() - selected_bind_t0);
     }
 
     ds4_gpu_qwen_selected_plan plans[2] = {
