@@ -117,6 +117,32 @@ static void fake_qwen_engine(ds4_engine *engine, bool raw_runtime) {
     engine->qwen35_weights.output = &output;
 }
 
+static void test_gpu_dense_layout_contract(void) {
+    ds4_tensor matrix = {
+        .ndim = 2,
+        .dim = {QWEN35_N_EMBD, QWEN35_N_EXPERT},
+        .type = DS4_TENSOR_F32,
+    };
+    ds4_tensor scalar_gate = {
+        .ndim = 1,
+        .dim = {QWEN35_N_EMBD},
+        .type = DS4_TENSOR_F32,
+    };
+
+    CHECK(qwen35_gpu_dense_weight_layout_matches(
+              &matrix, QWEN35_N_EMBD, QWEN35_N_EXPERT));
+    CHECK(qwen35_gpu_dense_weight_layout_matches(
+              &scalar_gate, QWEN35_N_EMBD, 1u));
+    CHECK(!qwen35_gpu_dense_weight_layout_matches(
+               &scalar_gate, QWEN35_N_EMBD, 2u));
+    scalar_gate.type = DS4_TENSOR_Q8_0;
+    CHECK(!qwen35_gpu_dense_weight_layout_matches(
+               &scalar_gate, QWEN35_N_EMBD, 1u));
+    matrix.dim[1]--;
+    CHECK(!qwen35_gpu_dense_weight_layout_matches(
+               &matrix, QWEN35_N_EMBD, QWEN35_N_EXPERT));
+}
+
 static void test_session_creation_boundary(void) {
     ds4_engine engine;
     ds4_session *session = NULL;
@@ -810,6 +836,7 @@ int main(void) {
     test_session_creation_boundary();
     test_model_aware_context_memory();
     test_qwen35_ssd_static_contract();
+    test_gpu_dense_layout_contract();
 
     ds4_engine engine;
     ds4_session *session = NULL;

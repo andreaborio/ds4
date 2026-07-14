@@ -11842,6 +11842,21 @@ fail:
     return false;
 }
 
+/* Qwen's scalar shared-expert gate is the sole dense projection represented
+ * as a one-dimensional tensor.  Keep that exception explicit and testable;
+ * every other projection must retain its exact two-dimensional layout. */
+static DS4_MAYBE_UNUSED bool qwen35_gpu_dense_weight_layout_matches(
+        const ds4_tensor *weight,
+        uint64_t          in_dim,
+        uint64_t          out_dim) {
+    const bool matrix_layout = weight && weight->ndim == 2 &&
+        weight->dim[0] == in_dim && weight->dim[1] == out_dim;
+    const bool scalar_f32_layout = weight &&
+        weight->type == DS4_TENSOR_F32 && weight->ndim == 1 &&
+        weight->dim[0] == in_dim && out_dim == 1u;
+    return matrix_layout || scalar_f32_layout;
+}
+
 #ifndef DS4_NO_GPU
 static int sample_argmax(const float *logits, uint32_t n_vocab);
 
@@ -12477,6 +12492,606 @@ void ds4_internal_qwen35_gpu_graph_free(
     if (!storage || storage_bytes != sizeof(ds4_qwen35_gpu_graph)) return;
     qwen35_gpu_graph_free(storage);
 }
+
+#if defined(__APPLE__)
+/* =========================================================================
+ * Qwen3.6 Metal one-token forward.
+ * =========================================================================
+ *
+ * This executor is deliberately separate from the DeepSeek graph.  Qwen owns
+ * its recurrent/attention state, scratch geometry, router contract, and
+ * physical vocabulary width.  The caller must supply the SSD-selected Q4
+ * expert runtime configured by the engine; this function only evaluates one
+ * already-bound token transaction.
+ */
+
+static bool qwen35_gpu_matmul_dense(
+        ds4_gpu_tensor       *out,
+        const ds4_model      *model,
+        const ds4_tensor     *weight,
+        uint64_t              in_dim,
+        uint64_t              out_dim,
+        const ds4_gpu_tensor *input) {
+    if (!out || !model || !model->map || !weight || !input ||
+        !qwen35_gpu_dense_weight_layout_matches(weight, in_dim, out_dim)) {
+        return false;
+    }
+
+    switch (weight->type) {
+    case DS4_TENSOR_Q8_0:
+        return ds4_gpu_matmul_q8_0_tensor(
+                   out, model->map, model->size, weight->abs_offset,
+                   in_dim, out_dim, input, 1) != 0;
+    case DS4_TENSOR_F16:
+        return ds4_gpu_matmul_f16_tensor(
+                   out, model->map, model->size, weight->abs_offset,
+                   in_dim, out_dim, input, 1) != 0;
+    case DS4_TENSOR_F32:
+        return ds4_gpu_matmul_f32_tensor(
+                   out, model->map, model->size, weight->abs_offset,
+                   in_dim, out_dim, input, 1) != 0;
+    default:
+        return false;
+    }
+}
+
+/* Reuse the paired Q8 projection whenever both supported-model tensors permit
+ * it.  A zero return is an optional-fusion miss, so the required scalar
+ * projections remain the correctness fallback, as in the DeepSeek driver. */
+static bool qwen35_gpu_matmul_dense_pair(
+        ds4_gpu_tensor       *out0,
+        ds4_gpu_tensor       *out1,
+        const ds4_model      *model,
+        const ds4_tensor     *weight0,
+        const ds4_tensor     *weight1,
+        uint64_t              in_dim,
+        uint64_t              out0_dim,
+        uint64_t              out1_dim,
+        const ds4_gpu_tensor *input) {
+    if (!out0 || !out1 || out0 == out1 || !model || !weight0 || !weight1 ||
+        !input || weight0->ndim != 2 || weight1->ndim != 2 ||
+        weight0->dim[0] != in_dim || weight1->dim[0] != in_dim ||
+        weight0->dim[1] != out0_dim || weight1->dim[1] != out1_dim) {
+        return false;
+    }
+
+    if (weight0->type == DS4_TENSOR_Q8_0 &&
+        weight1->type == DS4_TENSOR_Q8_0 &&
+        ds4_gpu_matmul_q8_0_pair_tensor(
+            out0, out1, model->map, model->size,
+            weight0->abs_offset, weight1->abs_offset,
+            in_dim, out0_dim, out1_dim, input, 1) != 0) {
+        return true;
+    }
+    if (weight0->type == DS4_TENSOR_F16 &&
+        weight1->type == DS4_TENSOR_F16 &&
+        out0_dim == out1_dim &&
+        ds4_gpu_matmul_f16_pair_tensor(
+            out0, out1, model->map, model->size,
+            weight0->abs_offset, weight1->abs_offset,
+            in_dim, out0_dim, input, 1) != 0) {
+        return true;
+    }
+    return qwen35_gpu_matmul_dense(
+               out0, model, weight0, in_dim, out0_dim, input) &&
+           qwen35_gpu_matmul_dense(
+               out1, model, weight1, in_dim, out1_dim, input);
+}
+
+static bool qwen35_gpu_encode_gdn_one(
+        ds4_qwen35_gpu_graph         *graph,
+        const ds4_model              *model,
+        const ds4_qwen35_layer_weights *layer,
+        const ds4_gpu_tensor         *input,
+        ds4_gpu_tensor               *attention_out,
+        uint32_t                      layer_index,
+        bool                         *state_mutated) {
+    if (!graph || !model || !layer || !input || !attention_out ||
+        !state_mutated || layer_index >= QWEN35_N_LAYER ||
+        ds4_qwen35_layer_is_full_attention(layer_index) ||
+        !graph->conv[layer_index] || !graph->recurrent[layer_index]) {
+        return false;
+    }
+
+    bool ok = ds4_gpu_rms_norm_weight_tensor(
+                  graph->norm, input, model->map, model->size,
+                  layer->attn_norm->abs_offset,
+                  QWEN35_N_EMBD, 1.0e-6f) != 0;
+    if (ok) {
+        ok = qwen35_gpu_matmul_dense_pair(
+            graph->projection, graph->gate,
+            model, layer->attn_qkv, layer->attn_gate,
+            QWEN35_N_EMBD, QWEN35_SSM_CONV_CHANNEL,
+            QWEN35_SSM_INNER, graph->norm);
+    }
+    if (ok) {
+        ok = qwen35_gpu_matmul_dense_pair(
+            graph->alpha_logit, graph->beta_logit,
+            model, layer->ssm_alpha, layer->ssm_beta,
+            QWEN35_N_EMBD, QWEN35_SSM_DT_RANK,
+            QWEN35_SSM_DT_RANK, graph->norm);
+    }
+
+    /* Conv and DeltaNet update persistent state in place.  From this point a
+     * late failure invalidates the whole token timeline. */
+    if (ok) {
+        *state_mutated = true;
+        ok = ds4_gpu_qwen35_causal_conv_step_tensor(
+                 graph->projection,
+                 graph->conv[layer_index],
+                 graph->projection,
+                 model->map,
+                 model->size,
+                 layer->ssm_conv1d->abs_offset,
+                 QWEN35_SSM_CONV_CHANNEL,
+                 QWEN35_SSM_CONV_KERNEL) != 0;
+    }
+    if (ok) {
+        ok = ds4_gpu_qwen35_gated_delta_controls_tensor(
+                 graph->log_decay,
+                 graph->beta,
+                 graph->alpha_logit,
+                 graph->beta_logit,
+                 model->map,
+                 model->size,
+                 layer->ssm_a->abs_offset,
+                 layer->ssm_dt->abs_offset,
+                 QWEN35_SSM_VALUE_HEAD) != 0;
+    }
+    if (ok) {
+        ok = ds4_gpu_qwen35_gated_delta_step_tensor(
+                 graph->gdn_value,
+                 graph->recurrent[layer_index],
+                 graph->gdn_query,
+                 graph->gdn_key,
+                 graph->gdn_value,
+                 graph->log_decay,
+                 graph->beta,
+                 QWEN35_SSM_GROUP,
+                 QWEN35_SSM_VALUE_HEAD,
+                 QWEN35_SSM_STATE,
+                 QWEN35_SSM_STATE) != 0;
+    }
+    if (ok) {
+        ok = ds4_gpu_qwen35_rmsnorm_gated_tensor(
+                 graph->gdn_value,
+                 graph->gdn_value,
+                 graph->gate,
+                 model->map,
+                 model->size,
+                 layer->ssm_norm->abs_offset,
+                 QWEN35_SSM_VALUE_HEAD,
+                 QWEN35_SSM_STATE,
+                 1.0e-6f) != 0;
+    }
+    if (ok) {
+        ok = qwen35_gpu_matmul_dense(
+            attention_out, model, layer->ssm_out,
+            QWEN35_SSM_INNER, QWEN35_N_EMBD,
+            graph->gdn_value);
+    }
+    return ok;
+}
+
+static bool qwen35_gpu_encode_full_attention_one(
+        ds4_qwen35_gpu_graph           *graph,
+        const ds4_model                *model,
+        const ds4_qwen35_layer_weights *layer,
+        const ds4_gpu_tensor           *input,
+        ds4_gpu_tensor                 *attention_out,
+        uint32_t                        layer_index,
+        uint32_t                        position,
+        bool                           *state_mutated) {
+    if (!graph || !model || !layer || !input || !attention_out ||
+        !state_mutated || layer_index >= QWEN35_N_LAYER ||
+        !ds4_qwen35_layer_is_full_attention(layer_index) ||
+        !graph->full_attn_key[layer_index] ||
+        !graph->full_attn_value[layer_index]) {
+        return false;
+    }
+
+    bool ok = ds4_gpu_rms_norm_weight_tensor(
+                  graph->norm, input, model->map, model->size,
+                  layer->attn_norm->abs_offset,
+                  QWEN35_N_EMBD, 1.0e-6f) != 0;
+    if (ok) {
+        ok = qwen35_gpu_matmul_dense(
+            graph->projection, model, layer->attn_q,
+            QWEN35_N_EMBD,
+            (uint64_t)2u * QWEN35_N_HEAD * QWEN35_N_HEAD_DIM,
+            graph->norm);
+    }
+    if (ok) {
+        ok = qwen35_gpu_matmul_dense_pair(
+            graph->key, graph->value,
+            model, layer->attn_k, layer->attn_v,
+            QWEN35_N_EMBD,
+            (uint64_t)QWEN35_N_HEAD_KV * QWEN35_N_HEAD_DIM,
+            (uint64_t)QWEN35_N_HEAD_KV * QWEN35_N_HEAD_DIM,
+            graph->norm);
+    }
+    if (ok) {
+        ok = ds4_gpu_qwen35_split_q_gate_tensor(
+                 graph->query,
+                 graph->gate,
+                 graph->projection,
+                 QWEN35_N_HEAD,
+                 QWEN35_N_HEAD_DIM) != 0;
+    }
+    if (ok) {
+        ok = ds4_gpu_rms_norm_weight_rows_tensor(
+                 graph->query,
+                 graph->query,
+                 model->map,
+                 model->size,
+                 layer->attn_q_norm->abs_offset,
+                 QWEN35_N_HEAD_DIM,
+                 QWEN35_N_HEAD,
+                 1.0e-6f) != 0;
+    }
+    if (ok) {
+        ok = ds4_gpu_rms_norm_weight_rows_tensor(
+                 graph->key,
+                 graph->key,
+                 model->map,
+                 model->size,
+                 layer->attn_k_norm->abs_offset,
+                 QWEN35_N_HEAD_DIM,
+                 QWEN35_N_HEAD_KV,
+                 1.0e-6f) != 0;
+    }
+    if (ok) {
+        ok = ds4_gpu_qwen35_rope_prefix_tensor(
+                 graph->query,
+                 QWEN35_N_HEAD,
+                 QWEN35_N_HEAD_DIM,
+                 QWEN35_N_ROT,
+                 position,
+                 10000000.0f) != 0;
+    }
+    if (ok) {
+        ok = ds4_gpu_qwen35_rope_prefix_tensor(
+                 graph->key,
+                 QWEN35_N_HEAD_KV,
+                 QWEN35_N_HEAD_DIM,
+                 QWEN35_N_ROT,
+                 position,
+                 10000000.0f) != 0;
+    }
+
+    const uint64_t cache_row_values =
+        (uint64_t)QWEN35_N_HEAD_KV * QWEN35_N_HEAD_DIM;
+    const uint64_t cache_row_bytes = cache_row_values * sizeof(float);
+    const uint64_t cache_row_offset = (uint64_t)position * cache_row_bytes;
+    if (ok) {
+        *state_mutated = true;
+        ok = ds4_gpu_tensor_copy(
+                 graph->full_attn_key[layer_index],
+                 cache_row_offset,
+                 graph->key,
+                 0,
+                 cache_row_bytes) != 0 &&
+             ds4_gpu_tensor_copy(
+                 graph->full_attn_value[layer_index],
+                 cache_row_offset,
+                 graph->value,
+                 0,
+                 cache_row_bytes) != 0;
+    }
+    if (ok) {
+        ok = ds4_gpu_qwen35_gqa_decode_tensor(
+                 graph->heads,
+                 graph->query,
+                 graph->full_attn_key[layer_index],
+                 graph->full_attn_value[layer_index],
+                 position + 1u,
+                 QWEN35_N_HEAD,
+                 QWEN35_N_HEAD_KV,
+                 QWEN35_N_HEAD_DIM) != 0;
+    }
+    if (ok) {
+        ok = ds4_gpu_qwen35_sigmoid_mul_tensor(
+                 graph->heads,
+                 graph->heads,
+                 graph->gate,
+                 QWEN35_N_HEAD * QWEN35_N_HEAD_DIM,
+                 false) != 0;
+    }
+    if (ok) {
+        ok = qwen35_gpu_matmul_dense(
+            attention_out, model, layer->attn_output,
+            (uint64_t)QWEN35_N_HEAD * QWEN35_N_HEAD_DIM,
+            QWEN35_N_EMBD, graph->heads);
+    }
+    return ok;
+}
+
+static bool qwen35_gpu_encode_ffn_one(
+        ds4_qwen35_gpu_graph           *graph,
+        const ds4_model                *model,
+        const ds4_qwen35_layer_weights *layer,
+        ds4_gpu_tensor                 *hidden,
+        uint32_t                        layer_index) {
+    if (!graph || !model || !layer || !hidden ||
+        layer_index >= QWEN35_N_LAYER) {
+        return false;
+    }
+
+    uint64_t gate_expert_bytes = 0;
+    uint64_t up_expert_bytes = 0;
+    uint64_t down_expert_bytes = 0;
+    if (!qwen35_routed_expert_matrix_bytes(
+            layer->ffn_gate_exps,
+            QWEN35_N_EMBD,
+            QWEN35_N_FF_EXP,
+            &gate_expert_bytes) ||
+        !qwen35_routed_expert_matrix_bytes(
+            layer->ffn_up_exps,
+            QWEN35_N_EMBD,
+            QWEN35_N_FF_EXP,
+            &up_expert_bytes) ||
+        !qwen35_routed_expert_matrix_bytes(
+            layer->ffn_down_exps,
+            QWEN35_N_FF_EXP,
+            QWEN35_N_EMBD,
+            &down_expert_bytes) ||
+        gate_expert_bytes != up_expert_bytes) {
+        return false;
+    }
+    const uint64_t gate_row_bytes =
+        gate_expert_bytes / QWEN35_N_FF_EXP;
+    const uint64_t down_row_bytes =
+        down_expert_bytes / QWEN35_N_EMBD;
+
+    bool ok = ds4_gpu_rms_norm_weight_tensor(
+                  graph->norm, hidden, model->map, model->size,
+                  layer->post_attention_norm->abs_offset,
+                  QWEN35_N_EMBD, 1.0e-6f) != 0;
+    if (ok) {
+        ok = qwen35_gpu_matmul_dense(
+            graph->router_logits, model, layer->ffn_gate_inp,
+            QWEN35_N_EMBD, QWEN35_N_EXPERT, graph->norm);
+    }
+    if (ok) {
+        ok = ds4_gpu_qwen35_router_softmax_top8_tensor(
+                 graph->router_selected,
+                 graph->router_weight,
+                 graph->router_logits) != 0;
+    }
+
+    /* The shared expert is independent of the routed SSD read and remains on
+     * the same command timeline.  Preserve the existing fused Q8 gate/up path
+     * when available; Qwen has no SwiGLU clamp, hence limit=0. */
+    bool shared_gate_up_fused = false;
+    if (ok && layer->ffn_gate_shexp->type == DS4_TENSOR_Q8_0 &&
+        layer->ffn_up_shexp->type == DS4_TENSOR_Q8_0) {
+        shared_gate_up_fused =
+            ds4_gpu_shared_gate_up_swiglu_q8_0_tensor(
+                graph->shared_gate,
+                graph->shared_up,
+                graph->shared_mid,
+                model->map,
+                model->size,
+                layer->ffn_gate_shexp->abs_offset,
+                layer->ffn_up_shexp->abs_offset,
+                QWEN35_N_EMBD,
+                QWEN35_N_FF_SHARED,
+                graph->norm,
+                0.0f) != 0;
+    }
+    if (ok && !shared_gate_up_fused) {
+        ok = qwen35_gpu_matmul_dense_pair(
+                 graph->shared_gate, graph->shared_up,
+                 model, layer->ffn_gate_shexp, layer->ffn_up_shexp,
+                 QWEN35_N_EMBD, QWEN35_N_FF_SHARED,
+                 QWEN35_N_FF_SHARED, graph->norm) &&
+             ds4_gpu_swiglu_tensor(
+                 graph->shared_mid,
+                 graph->shared_gate,
+                 graph->shared_up,
+                 QWEN35_N_FF_SHARED,
+                 0.0f,
+                 1.0f) != 0;
+    }
+    if (ok) {
+        ok = qwen35_gpu_matmul_dense(
+            graph->shared_out, model, layer->ffn_down_shexp,
+            QWEN35_N_FF_SHARED, QWEN35_N_EMBD,
+            graph->shared_mid);
+    }
+    if (ok) {
+        ok = qwen35_gpu_matmul_dense(
+            graph->shared_gate_logit, model,
+            layer->ffn_gate_inp_shexp,
+            QWEN35_N_EMBD, 1u, graph->norm);
+    }
+    if (ok) {
+        ok = ds4_gpu_qwen35_sigmoid_mul_tensor(
+                 graph->shared_out,
+                 graph->shared_out,
+                 graph->shared_gate_logit,
+                 QWEN35_N_EMBD,
+                 true) != 0;
+    }
+    if (ok) {
+        ok = ds4_gpu_qwen35_routed_moe_top8_tensor(
+                 graph->moe_out,
+                 graph->moe_partial[0],
+                 graph->moe_partial[1],
+                 graph->routed_gate,
+                 graph->routed_up,
+                 graph->routed_mid,
+                 graph->routed_down,
+                 model->map,
+                 model->size,
+                 layer->ffn_gate_exps->abs_offset,
+                 layer->ffn_up_exps->abs_offset,
+                 layer->ffn_down_exps->abs_offset,
+                 layer->ffn_gate_exps->type,
+                 layer->ffn_down_exps->type,
+                 gate_expert_bytes,
+                 gate_row_bytes,
+                 down_expert_bytes,
+                 down_row_bytes,
+                 QWEN35_N_EMBD,
+                 QWEN35_N_FF_EXP,
+                 QWEN35_N_EMBD,
+                 graph->router_selected,
+                 graph->router_weight,
+                 graph->router_selected_split[0],
+                 graph->router_selected_split[1],
+                 graph->router_weight_split[0],
+                 graph->router_weight_split[1],
+                 QWEN35_N_EXPERT,
+                 0.0f,
+                 graph->norm,
+                 layer_index) != 0;
+    }
+    if (ok) {
+        ok = ds4_gpu_add_tensor(
+                 graph->attn_out,
+                 graph->moe_out,
+                 graph->shared_out,
+                 QWEN35_N_EMBD) != 0;
+    }
+    if (ok) {
+        ok = ds4_gpu_add_tensor(
+                 hidden,
+                 hidden,
+                 graph->attn_out,
+                 QWEN35_N_EMBD) != 0;
+    }
+    return ok;
+}
+
+/* Evaluate exactly one token and commit graph->n_tokens only after the full
+ * physical-vocabulary logits vector is readable on the host.  Callers sample
+ * only QWEN35_N_VALID_TOKEN rows; the final padded rows are preserved solely
+ * for the public logits I/O contract. */
+static DS4_MAYBE_UNUSED bool qwen35_gpu_forward_token(
+        float                     *logits,
+        const ds4_model           *model,
+        const ds4_qwen35_weights  *weights,
+        ds4_qwen35_gpu_graph      *graph,
+        int                        token,
+        uint32_t                   position) {
+    if (!logits || !model || !weights || !graph ||
+        model->family != DS4_MODEL_FAMILY_QWEN35_MOE ||
+        !model->map || model->size == 0 ||
+        token < 0 || (uint32_t)token >= QWEN35_N_VALID_TOKEN ||
+        !qwen35_gpu_graph_validate_position(graph, position) ||
+        !weights->token_embd ||
+        weights->token_embd->type != DS4_TENSOR_Q8_0 ||
+        !weights->output_norm || !weights->output ||
+        weights->output->dim[1] != QWEN35_N_VOCAB) {
+        return false;
+    }
+
+    bool state_mutated = false;
+    bool ok = ds4_gpu_begin_commands() != 0;
+    const char *failed_stage = ok ? NULL : "begin";
+    if (ok) {
+        ok = ds4_gpu_qwen35_dequant_embedding_q8_0_tensor(
+                 graph->hidden[0],
+                 model->map,
+                 model->size,
+                 weights->token_embd->abs_offset,
+                 (uint32_t)token,
+                 QWEN35_N_EMBD) != 0;
+        if (!ok) failed_stage = "embedding";
+    }
+
+    ds4_gpu_tensor *current = graph->hidden[0];
+    ds4_gpu_tensor *next = graph->hidden[1];
+    for (uint32_t layer_index = 0;
+         ok && layer_index < QWEN35_N_LAYER;
+         layer_index++) {
+        const ds4_qwen35_layer_weights *layer =
+            &weights->layer[layer_index];
+        if (ds4_qwen35_layer_is_full_attention(layer_index)) {
+            ok = qwen35_gpu_encode_full_attention_one(
+                graph, model, layer, current, graph->attn_out,
+                layer_index, position, &state_mutated);
+            if (!ok) failed_stage = "full attention";
+        } else {
+            ok = qwen35_gpu_encode_gdn_one(
+                graph, model, layer, current, graph->attn_out,
+                layer_index, &state_mutated);
+            if (!ok) failed_stage = "Gated DeltaNet";
+        }
+        if (ok) {
+            ok = ds4_gpu_add_tensor(
+                     next, current, graph->attn_out,
+                     QWEN35_N_EMBD) != 0;
+            if (!ok) failed_stage = "attention residual";
+        }
+        if (ok) {
+            ok = qwen35_gpu_encode_ffn_one(
+                graph, model, layer, next, layer_index);
+            if (!ok) failed_stage = "FFN";
+        }
+        if (ok) {
+            ds4_gpu_tensor *swap = current;
+            current = next;
+            next = swap;
+        }
+    }
+
+    if (ok) {
+        ok = ds4_gpu_rms_norm_weight_tensor(
+                 graph->output_norm,
+                 current,
+                 model->map,
+                 model->size,
+                 weights->output_norm->abs_offset,
+                 QWEN35_N_EMBD,
+                 1.0e-6f) != 0;
+        if (!ok) failed_stage = "output norm";
+    }
+    if (ok) {
+        ok = qwen35_gpu_matmul_dense(
+            graph->logits, model, weights->output,
+            QWEN35_N_EMBD, QWEN35_N_VOCAB,
+            graph->output_norm);
+        if (!ok) failed_stage = "output projection";
+    }
+    if (ok) {
+        ok = ds4_gpu_end_commands() != 0;
+        if (!ok) failed_stage = "command completion";
+    }
+    if (ok) {
+        ok = ds4_gpu_tensor_read(
+                 graph->logits,
+                 0,
+                 logits,
+                 (uint64_t)QWEN35_N_VOCAB * sizeof(float)) != 0;
+        if (!ok) failed_stage = "logits readback";
+    }
+    if (ok) {
+        ok = qwen35_gpu_graph_advance(graph, position);
+        if (!ok) failed_stage = "timeline commit";
+    }
+    if (ok) return true;
+
+    /* synchronize() also closes a still-live command batch.  Reset only after
+     * that fence: conv/recurrent state and the current K/V rows may already
+     * contain a partial token.  A failed reset leaves state_valid=false. */
+    const bool synchronized = ds4_gpu_synchronize() != 0;
+    bool reset = true;
+    if (state_mutated) {
+        reset = qwen35_gpu_graph_reset(graph);
+    } else if (!synchronized) {
+        reset = qwen35_gpu_graph_mark_state_invalid(graph);
+    }
+    fprintf(stderr,
+            "ds4: Metal Qwen token %u failed at %s (sync=%d reset=%d)\n",
+            position,
+            failed_stage ? failed_stage : "unknown stage",
+            synchronized ? 1 : 0,
+            reset ? 1 : 0);
+    return false;
+}
+#endif /* __APPLE__ */
 
 /* =========================================================================
  * Metal Release Graph State.
