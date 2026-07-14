@@ -1469,6 +1469,8 @@ static void test_metal_qwen35_primitives(void) {
 }
 
 #ifdef __APPLE__
+extern uint64_t ds4_gpu_internal_stream_expert_cache_decode_tokens(void);
+
 typedef struct {
     uint16_t d;
     uint16_t dmin;
@@ -1486,6 +1488,17 @@ typedef struct {
     uint64_t pread_bytes;
     uint32_t current_entries;
 } test_metal_q4_slots_result;
+
+typedef struct {
+    float out[2];
+    float partial0[2];
+    float partial1[2];
+    uint64_t hits;
+    uint64_t misses;
+    uint64_t pread_bytes;
+    uint64_t decode_tokens;
+    uint32_t current_entries;
+} test_metal_qwen_top8_result;
 
 static void test_metal_q4_k_fill_constant(
         test_metal_q4_k_block *block,
@@ -1608,6 +1621,159 @@ cleanup:
     return ok;
 }
 
+static bool test_metal_qwen_top8_case(
+        const void                    *model_map,
+        uint64_t                       model_size,
+        uint64_t                       gate_offset,
+        uint64_t                       up_offset,
+        uint64_t                       down_offset,
+        uint64_t                       gate_expert_bytes,
+        uint64_t                       down_expert_bytes,
+        const int32_t                  selected_host[8],
+        const float                    weight_host[8],
+        bool                           expect_success,
+        test_metal_qwen_top8_result   *result) {
+    enum {
+        IN_DIM = 256,
+        MID_DIM = 256,
+        OUT_DIM = 2,
+        TOTAL_EXPERT = 128,
+        HALF_EXPERT = 4,
+        GGML_TYPE_Q4_K = 12,
+    };
+    const uint64_t row_bytes = sizeof(test_metal_q4_k_block);
+    const uint64_t mid_bytes =
+        (uint64_t)HALF_EXPERT * MID_DIM * sizeof(float);
+    const uint64_t expert_out_bytes =
+        (uint64_t)HALF_EXPERT * OUT_DIM * sizeof(float);
+    const float sentinel = -4321.25f;
+    float input_host[IN_DIM];
+    for (uint32_t i = 0; i < IN_DIM; i++) {
+        input_host[i] = 1.0f / (float)IN_DIM;
+    }
+
+    ds4_gpu_tensor *out = ds4_gpu_tensor_alloc(OUT_DIM * sizeof(float));
+    ds4_gpu_tensor *partial0 =
+        ds4_gpu_tensor_alloc(OUT_DIM * sizeof(float));
+    ds4_gpu_tensor *partial1 =
+        ds4_gpu_tensor_alloc(OUT_DIM * sizeof(float));
+    ds4_gpu_tensor *gate = ds4_gpu_tensor_alloc(mid_bytes);
+    ds4_gpu_tensor *up = ds4_gpu_tensor_alloc(mid_bytes);
+    ds4_gpu_tensor *mid = ds4_gpu_tensor_alloc(mid_bytes);
+    ds4_gpu_tensor *experts = ds4_gpu_tensor_alloc(expert_out_bytes);
+    ds4_gpu_tensor *selected = ds4_gpu_tensor_alloc(8u * sizeof(int32_t));
+    ds4_gpu_tensor *weights = ds4_gpu_tensor_alloc(8u * sizeof(float));
+    ds4_gpu_tensor *selected_half0 = selected ? ds4_gpu_tensor_view(
+        selected, 0, 4u * sizeof(int32_t)) : NULL;
+    ds4_gpu_tensor *selected_half1 = selected ? ds4_gpu_tensor_view(
+        selected, 4u * sizeof(int32_t), 4u * sizeof(int32_t)) : NULL;
+    ds4_gpu_tensor *weights_half0 = weights ? ds4_gpu_tensor_view(
+        weights, 0, 4u * sizeof(float)) : NULL;
+    ds4_gpu_tensor *weights_half1 = weights ? ds4_gpu_tensor_view(
+        weights, 4u * sizeof(float), 4u * sizeof(float)) : NULL;
+    ds4_gpu_tensor *input = ds4_gpu_tensor_alloc(sizeof(input_host));
+    bool ok = out && partial0 && partial1 && gate && up && mid && experts &&
+              selected && weights && selected_half0 && selected_half1 &&
+              weights_half0 && weights_half1 && input && result;
+    TEST_ASSERT(ok);
+    if (!ok) goto cleanup;
+
+    ok = ds4_gpu_tensor_write(selected, 0, selected_host,
+                              8u * sizeof(int32_t)) != 0 &&
+         ds4_gpu_tensor_write(weights, 0, weight_host,
+                              8u * sizeof(float)) != 0 &&
+         ds4_gpu_tensor_write(input, 0, input_host,
+                              sizeof(input_host)) != 0 &&
+         ds4_gpu_tensor_fill_f32(out, sentinel, OUT_DIM) != 0 &&
+         ds4_gpu_tensor_fill_f32(partial0, sentinel, OUT_DIM) != 0 &&
+         ds4_gpu_tensor_fill_f32(partial1, sentinel, OUT_DIM) != 0 &&
+         ds4_gpu_tensor_fill_f32(experts, sentinel,
+                                 (uint64_t)HALF_EXPERT * OUT_DIM) != 0;
+    TEST_ASSERT(ok);
+    if (!ok) goto cleanup;
+
+    uint64_t hits0 = 0;
+    uint64_t misses0 = 0;
+    uint64_t pread0 = 0;
+    ds4_gpu_stream_expert_cache_stats(&hits0, &misses0, &pread0,
+                                      NULL, NULL);
+    const uint64_t tokens0 =
+        ds4_gpu_internal_stream_expert_cache_decode_tokens();
+    const uint32_t entries0 = ds4_gpu_stream_expert_cache_current_count();
+
+    const int call_ok = ds4_gpu_qwen35_routed_moe_top8_tensor(
+        out, partial0, partial1, gate, up, mid, experts,
+        model_map, model_size,
+        gate_offset, up_offset, down_offset,
+        GGML_TYPE_Q4_K, GGML_TYPE_Q4_K,
+        gate_expert_bytes, row_bytes,
+        down_expert_bytes, row_bytes,
+        IN_DIM, MID_DIM, OUT_DIM,
+        selected, weights,
+        selected_half0, selected_half1, weights_half0, weights_half1,
+        TOTAL_EXPERT,
+        0.0f, input, 0);
+    TEST_ASSERT((call_ok != 0) == expect_success);
+    if ((call_ok != 0) != expect_success) {
+        ok = false;
+        goto cleanup;
+    }
+
+    ok = ds4_gpu_tensor_read(out, 0, result->out,
+                             sizeof(result->out)) != 0 &&
+         ds4_gpu_tensor_read(partial0, 0, result->partial0,
+                             sizeof(result->partial0)) != 0 &&
+         ds4_gpu_tensor_read(partial1, 0, result->partial1,
+                             sizeof(result->partial1)) != 0;
+    TEST_ASSERT(ok);
+    if (!ok) goto cleanup;
+    ds4_gpu_stream_expert_cache_stats(
+        &result->hits, &result->misses, &result->pread_bytes, NULL, NULL);
+    result->decode_tokens =
+        ds4_gpu_internal_stream_expert_cache_decode_tokens();
+    result->current_entries = ds4_gpu_stream_expert_cache_current_count();
+
+    if (!expect_success) {
+        bool outputs_unchanged = true;
+        for (uint32_t row = 0; row < OUT_DIM; row++) {
+            TEST_ASSERT(result->out[row] == sentinel);
+            TEST_ASSERT(result->partial0[row] == sentinel);
+            TEST_ASSERT(result->partial1[row] == sentinel);
+            outputs_unchanged = outputs_unchanged &&
+                result->out[row] == sentinel &&
+                result->partial0[row] == sentinel &&
+                result->partial1[row] == sentinel;
+        }
+        TEST_ASSERT(result->hits == hits0);
+        TEST_ASSERT(result->misses == misses0);
+        TEST_ASSERT(result->pread_bytes == pread0);
+        TEST_ASSERT(result->decode_tokens == tokens0);
+        TEST_ASSERT(result->current_entries == entries0);
+        ok = outputs_unchanged &&
+             result->hits == hits0 && result->misses == misses0 &&
+             result->pread_bytes == pread0 &&
+             result->decode_tokens == tokens0 &&
+             result->current_entries == entries0;
+    }
+
+cleanup:
+    ds4_gpu_tensor_free(out);
+    ds4_gpu_tensor_free(partial0);
+    ds4_gpu_tensor_free(partial1);
+    ds4_gpu_tensor_free(gate);
+    ds4_gpu_tensor_free(up);
+    ds4_gpu_tensor_free(mid);
+    ds4_gpu_tensor_free(experts);
+    ds4_gpu_tensor_free(selected_half0);
+    ds4_gpu_tensor_free(selected_half1);
+    ds4_gpu_tensor_free(weights_half0);
+    ds4_gpu_tensor_free(weights_half1);
+    ds4_gpu_tensor_free(selected);
+    ds4_gpu_tensor_free(weights);
+    ds4_gpu_tensor_free(input);
+    return ok;
+}
+
 static void test_metal_q4_selected_slots_runtime_count(void) {
     enum {
         MID_DIM = 256,
@@ -1716,14 +1882,115 @@ static void test_metal_q4_selected_slots_runtime_count(void) {
         TEST_ASSERT(fabsf(top6.out[row] - top4.out[row]) < 1.0e-4f);
     }
 
+    const float top8_weights[8] = {
+        0.05f, 0.10f, 0.15f, 0.20f,
+        0.15f, 0.10f, 0.10f, 0.15f,
+    };
+    const int32_t invalid_top8[8] = {0, 1, 2, 3, 4, 5, 6, TOTAL_EXPERT};
+    const int32_t unique_top8[8] = {0, 1, 2, 3, 4, 5, 6, 7};
+    const int32_t duplicate_top8[8] = {0, 1, 2, 3, 0, 1, 4, 5};
+
+    /* Invalid route rejection is pre-I/O and leaves all caller-visible state
+     * unchanged, including the two partial buffers and token accounting. */
+    ds4_gpu_set_streaming_expert_cache_budget(8);
+    test_metal_qwen_top8_result invalid = {0};
+    TEST_ASSERT(test_metal_qwen_top8_case(
+        model_map, model_size,
+        gate_offset, up_offset, down_offset,
+        gate_expert_bytes, down_expert_bytes,
+        invalid_top8, top8_weights, false, &invalid));
+    TEST_ASSERT(invalid.hits == 0);
+    TEST_ASSERT(invalid.misses == 0);
+    TEST_ASSERT(invalid.pread_bytes == 0);
+    TEST_ASSERT(invalid.current_entries == 0);
+    TEST_ASSERT(invalid.decode_tokens == 0);
+
+    test_metal_qwen_top8_result cold_top8 = {0};
+    TEST_ASSERT(test_metal_qwen_top8_case(
+        model_map, model_size,
+        gate_offset, up_offset, down_offset,
+        gate_expert_bytes, down_expert_bytes,
+        unique_top8, top8_weights, true, &cold_top8));
+    TEST_ASSERT(cold_top8.hits == 0);
+    TEST_ASSERT(cold_top8.misses == 8);
+    TEST_ASSERT(cold_top8.pread_bytes == 8u * per_expert_bytes);
+    TEST_ASSERT(cold_top8.current_entries == 8);
+    TEST_ASSERT(cold_top8.decode_tokens == 1);
+
+    float expected_half[2] = {0.0f, 0.0f};
+    for (uint32_t i = 0; i < 8; i++) {
+        const float value = (float)(unique_top8[i] % 15 + 1);
+        expected_half[i / 4u] += top8_weights[i] * value * value;
+    }
+    expected_half[0] *= 256.0f * silu_one;
+    expected_half[1] *= 256.0f * silu_one;
+    const float expected_top8 = expected_half[0] + expected_half[1];
+    for (uint32_t row = 0; row < OUT_DIM; row++) {
+        TEST_ASSERT(isfinite(cold_top8.out[row]));
+        TEST_ASSERT(fabsf(cold_top8.partial0[row] - expected_half[0]) < 0.1f);
+        TEST_ASSERT(fabsf(cold_top8.partial1[row] - expected_half[1]) < 0.1f);
+        TEST_ASSERT(fabsf(cold_top8.out[row] - expected_top8) < 0.1f);
+        TEST_ASSERT(fabsf(cold_top8.out[row] -
+                          (cold_top8.partial0[row] +
+                           cold_top8.partial1[row])) < 1.0e-4f);
+    }
+
+    test_metal_qwen_top8_result warm_top8 = {0};
+    TEST_ASSERT(test_metal_qwen_top8_case(
+        model_map, model_size,
+        gate_offset, up_offset, down_offset,
+        gate_expert_bytes, down_expert_bytes,
+        unique_top8, top8_weights, true, &warm_top8));
+    TEST_ASSERT(warm_top8.hits == 8);
+    TEST_ASSERT(warm_top8.misses == cold_top8.misses);
+    TEST_ASSERT(warm_top8.pread_bytes == cold_top8.pread_bytes);
+    TEST_ASSERT(warm_top8.current_entries == 8);
+    TEST_ASSERT(warm_top8.decode_tokens == 2);
+    for (uint32_t row = 0; row < OUT_DIM; row++) {
+        TEST_ASSERT(fabsf(warm_top8.out[row] - cold_top8.out[row]) < 1.0e-4f);
+    }
+
+    /* Duplicate route IDs share one cache entry while retaining their two
+     * independent router weights in the split computation. */
+    ds4_gpu_set_streaming_expert_cache_budget(8);
+    test_metal_qwen_top8_result duplicate = {0};
+    TEST_ASSERT(test_metal_qwen_top8_case(
+        model_map, model_size,
+        gate_offset, up_offset, down_offset,
+        gate_expert_bytes, down_expert_bytes,
+        duplicate_top8, top8_weights, true, &duplicate));
+    TEST_ASSERT(duplicate.hits == 0);
+    TEST_ASSERT(duplicate.misses == 6);
+    TEST_ASSERT(duplicate.pread_bytes == 6u * per_expert_bytes);
+    TEST_ASSERT(duplicate.current_entries == 6);
+    TEST_ASSERT(duplicate.decode_tokens == 1);
+    float duplicate_expected = 0.0f;
+    for (uint32_t i = 0; i < 8; i++) {
+        const float value = (float)(duplicate_top8[i] % 15 + 1);
+        duplicate_expected += top8_weights[i] * value * value;
+    }
+    duplicate_expected *= 256.0f * silu_one;
+    for (uint32_t row = 0; row < OUT_DIM; row++) {
+        TEST_ASSERT(isfinite(duplicate.out[row]));
+        TEST_ASSERT(fabsf(duplicate.out[row] - duplicate_expected) < 0.1f);
+    }
+
     fprintf(stderr,
             "ds4-test: Q4 selected slots n=4/n=6 output=%.6f "
-            "misses=%llu/%llu pread=%llu/%llu\n",
+            "misses=%llu/%llu pread=%llu/%llu; "
+            "Qwen top8 cold/warm/dup=%llu/%llu/%llu misses, "
+            "tokens=%llu/%llu/%llu\n",
             top4.out[0],
             (unsigned long long)top4.misses,
             (unsigned long long)top6.misses,
             (unsigned long long)top4.pread_bytes,
-            (unsigned long long)top6.pread_bytes);
+            (unsigned long long)top6.pread_bytes,
+            (unsigned long long)cold_top8.misses,
+            (unsigned long long)warm_top8.misses,
+            (unsigned long long)duplicate.misses,
+            (unsigned long long)cold_top8.decode_tokens,
+            (unsigned long long)warm_top8.decode_tokens,
+            (unsigned long long)duplicate.decode_tokens);
 
     ds4_gpu_set_ssd_streaming(false);
     ds4_gpu_set_streaming_expert_cache_budget(0);
