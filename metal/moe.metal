@@ -121,7 +121,7 @@ struct ds4_metal_dsv4_moe_swiglu_weight_args {
     float clamp_value;
 };
 
-struct ds4_metal_dsv4_moe_sum6_args {
+struct ds4_metal_dsv4_moe_sum_args {
     uint32_t width;
     uint32_t tokens;
     uint64_t src_token_stride;
@@ -206,7 +206,7 @@ kernel void kernel_dsv4_moe_swiglu_weight_f16(
 }
 
 kernel void kernel_dsv4_moe_sum6_f32(
-        constant ds4_metal_dsv4_moe_sum6_args &args,
+        constant ds4_metal_dsv4_moe_sum_args &args,
         device const char *src,
         device       char *dst,
         uint token[[threadgroup_position_in_grid]],
@@ -227,6 +227,36 @@ kernel void kernel_dsv4_moe_sum6_f32(
         v += s[4u * args.width + col];
         v += s[5u * args.width + col];
         d[col] = v;
+    }
+}
+
+/* Qwen3.6 routes every token to eight experts.  Keep the reduction in one
+ * dispatch so the resident path does not serialize seven generic add kernels
+ * after the down projection.  The accumulation order matches the historical
+ * two-top-4 path: ((0+1)+2)+3, ((4+5)+6)+7, then left + right. */
+kernel void kernel_qwen35_moe_sum8_f32(
+        constant ds4_metal_dsv4_moe_sum_args &args,
+        device const char *src,
+        device       char *dst,
+        uint token[[threadgroup_position_in_grid]],
+        uint tid[[thread_position_in_threadgroup]],
+        uint ntg[[threads_per_threadgroup]]) {
+    if (token >= args.tokens) return;
+
+    device const float *s =
+        (device const float *)(src + (uint64_t)token * args.src_token_stride);
+    device float *d =
+        (device float *)(dst + (uint64_t)token * args.dst_token_stride);
+
+    for (uint col = tid; col < args.width; col += ntg) {
+        float left = s[col] + s[args.width + col];
+        left += s[2u * args.width + col];
+        left += s[3u * args.width + col];
+        float right = s[4u * args.width + col] +
+                      s[5u * args.width + col];
+        right += s[6u * args.width + col];
+        right += s[7u * args.width + col];
+        d[col] = left + right;
     }
 }
 

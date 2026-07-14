@@ -453,15 +453,23 @@ int ds4_gpu_rope_tail_tensor(
         float             beta_fast,
         float             beta_slow);
 
-/* Qwen3.6 one-token primitives.  These keep the recurrent/full-attention
- * state resident and deliberately use the model's F32 correctness layout;
- * batched prefill and narrower cache storage can be layered on later without
- * changing the model-family scheduler.  Tensor arguments must not overlap
- * unless the function exposes a single in-place tensor, as RoPE does. */
+/* Qwen3.6 resident primitives.  Decode uses the one-token entry points while
+ * layer-major prefill uses the batch/sequence forms below.  Recurrent and
+ * full-attention state remain resident in the model's F32 correctness layout.
+ * Tensor arguments must not overlap unless the function exposes a single
+ * in-place tensor, as RoPE does. */
 int ds4_gpu_qwen35_split_q_gate_tensor(
         ds4_gpu_tensor       *query,
         ds4_gpu_tensor       *gate,
         const ds4_gpu_tensor *projection,
+        uint32_t              n_query_head,
+        uint32_t              head_dim);
+
+int ds4_gpu_qwen35_split_q_gate_batch_tensor(
+        ds4_gpu_tensor       *query,
+        ds4_gpu_tensor       *gate,
+        const ds4_gpu_tensor *projection,
+        uint32_t              n_token,
         uint32_t              n_query_head,
         uint32_t              head_dim);
 
@@ -472,6 +480,15 @@ int ds4_gpu_qwen35_sigmoid_mul_tensor(
         uint32_t              n_value,
         bool                  broadcast_gate);
 
+/* Row-wise scalar gate used by batched shared experts.  input/output are
+ * [n_row][row_width], while gate contains one scalar per row. */
+int ds4_gpu_qwen35_sigmoid_mul_rows_tensor(
+        ds4_gpu_tensor       *out,
+        const ds4_gpu_tensor *input,
+        const ds4_gpu_tensor *gate,
+        uint32_t              n_row,
+        uint32_t              row_width);
+
 int ds4_gpu_qwen35_rope_prefix_tensor(
         ds4_gpu_tensor *values,
         uint32_t        n_head,
@@ -480,6 +497,16 @@ int ds4_gpu_qwen35_rope_prefix_tensor(
         uint32_t        position,
         float           theta);
 
+/* positions is a packed uint32 tensor with one absolute position per token. */
+int ds4_gpu_qwen35_rope_prefix_batch_tensor(
+        ds4_gpu_tensor       *values,
+        const ds4_gpu_tensor *positions,
+        uint32_t              n_token,
+        uint32_t              n_head,
+        uint32_t              head_dim,
+        uint32_t              n_rot,
+        float                 theta);
+
 int ds4_gpu_qwen35_causal_conv_step_tensor(
         ds4_gpu_tensor       *out,
         ds4_gpu_tensor       *state,
@@ -487,6 +514,19 @@ int ds4_gpu_qwen35_causal_conv_step_tensor(
         const void           *model_map,
         uint64_t              model_size,
         uint64_t              weight_offset,
+        uint32_t              n_channel,
+        uint32_t              kernel_size);
+
+/* Advances a complete token chunk in order while keeping each channel's
+ * short convolution history in registers. */
+int ds4_gpu_qwen35_causal_conv_sequence_tensor(
+        ds4_gpu_tensor       *out,
+        ds4_gpu_tensor       *state,
+        const ds4_gpu_tensor *input,
+        const void           *model_map,
+        uint64_t              model_size,
+        uint64_t              weight_offset,
+        uint32_t              n_token,
         uint32_t              n_channel,
         uint32_t              kernel_size);
 
@@ -502,6 +542,19 @@ int ds4_gpu_qwen35_gated_delta_step_tensor(
         uint32_t              n_value_head,
         uint32_t              key_dim,
         uint32_t              value_dim);
+
+/* Qwen's fixed [Q,K,V]=[16x128,16x128,32x128] projection layout.  The
+ * recurrent state is advanced token-serially inside each row-parallel Metal
+ * threadgroup and committed once at the end of the chunk. */
+int ds4_gpu_qwen35_gated_delta_sequence_128_tensor(
+        ds4_gpu_tensor       *out,
+        ds4_gpu_tensor       *state,
+        const ds4_gpu_tensor *projection,
+        const ds4_gpu_tensor *log_decay,
+        const ds4_gpu_tensor *beta,
+        uint32_t              n_token,
+        uint32_t              n_key_head,
+        uint32_t              n_value_head);
 
 int ds4_gpu_qwen35_rmsnorm_gated_tensor(
         ds4_gpu_tensor       *out,
@@ -522,6 +575,16 @@ int ds4_gpu_qwen35_dequant_embedding_q8_0_tensor(
         uint32_t        row_index,
         uint32_t        n_embd);
 
+int ds4_gpu_qwen35_dequant_embedding_q8_0_batch_tensor(
+        ds4_gpu_tensor       *out,
+        const ds4_gpu_tensor *token_ids,
+        const void           *model_map,
+        uint64_t              model_size,
+        uint64_t              embedding_offset,
+        uint32_t              n_token,
+        uint32_t              n_row,
+        uint32_t              n_embd);
+
 int ds4_gpu_qwen35_gated_delta_controls_tensor(
         ds4_gpu_tensor       *log_decay,
         ds4_gpu_tensor       *beta,
@@ -531,6 +594,18 @@ int ds4_gpu_qwen35_gated_delta_controls_tensor(
         uint64_t              model_size,
         uint64_t              ssm_a_offset,
         uint64_t              dt_bias_offset,
+        uint32_t              n_value_head);
+
+int ds4_gpu_qwen35_gated_delta_controls_batch_tensor(
+        ds4_gpu_tensor       *log_decay,
+        ds4_gpu_tensor       *beta,
+        const ds4_gpu_tensor *alpha_logit,
+        const ds4_gpu_tensor *beta_logit,
+        const void           *model_map,
+        uint64_t              model_size,
+        uint64_t              ssm_a_offset,
+        uint64_t              dt_bias_offset,
+        uint32_t              n_token,
         uint32_t              n_value_head);
 
 int ds4_gpu_qwen35_gqa_decode_tensor(
@@ -543,6 +618,17 @@ int ds4_gpu_qwen35_gqa_decode_tensor(
         uint32_t              n_kv_head,
         uint32_t              head_dim);
 
+int ds4_gpu_qwen35_gqa_prefill_tensor(
+        ds4_gpu_tensor       *out,
+        const ds4_gpu_tensor *query,
+        const ds4_gpu_tensor *key_cache,
+        const ds4_gpu_tensor *value_cache,
+        uint32_t              position0,
+        uint32_t              n_token,
+        uint32_t              n_query_head,
+        uint32_t              n_kv_head,
+        uint32_t              head_dim);
+
 /* Fixed 256-expert Qwen router: stable full softmax, deterministic top-8
  * selection (lower expert ID wins ties), then top-8 renormalization.
  * Non-finite diagnostic input writes eight {-1, 0} ID/weight pairs while a
@@ -551,6 +637,12 @@ int ds4_gpu_qwen35_router_softmax_top8_tensor(
         ds4_gpu_tensor       *selected,
         ds4_gpu_tensor       *selected_weight,
         const ds4_gpu_tensor *logits);
+
+int ds4_gpu_qwen35_router_softmax_top8_batch_tensor(
+        ds4_gpu_tensor       *selected,
+        ds4_gpu_tensor       *selected_weight,
+        const ds4_gpu_tensor *logits,
+        uint32_t              n_token);
 
 /* Release decode fused KV finalizer: after the standalone RoPE kernel, this
  * performs DS4's FP8 non-RoPE KV round trip and writes the F16-rounded raw
@@ -957,11 +1049,14 @@ int ds4_gpu_routed_moe_one_tensor(
         const ds4_gpu_tensor *x,
         uint32_t                layer_index);
 
-/* Qwen3.6 routes one token to eight experts. The Metal SSD implementation
- * keeps the complete top-8 route pinned as one cache unit, executes two
- * ordered top-4 selected-slot passes, and adds their partial outputs. The
- * caller owns the persistent offset-0/16 half views, two partial tensors, and
- * the width-4 activation scratch. */
+/* Qwen3.6 routes one token to eight experts. Resident Metal consumes a trusted
+ * GPU route as one top-8 pass and reduces all expert outputs in one dispatch.
+ * SSD streaming keeps the complete route pinned as one cache unit, executes
+ * two ordered top-4 selected-slot passes, and adds their partial outputs. The
+ * caller owns the persistent offset-0/16 half views, partial outputs, and an
+ * eight-expert activation scratch shared by both modes. trusted_gpu_route may
+ * only be true when the IDs were produced by the top-8 router in the current
+ * command batch; trace/replay observability deliberately retains readback. */
 int ds4_gpu_qwen35_routed_moe_top8_tensor(
         ds4_gpu_tensor       *out,
         ds4_gpu_tensor       *partial0,
@@ -993,7 +1088,16 @@ int ds4_gpu_qwen35_routed_moe_top8_tensor(
         uint32_t                n_total_expert,
         float                   clamp,
         const ds4_gpu_tensor *x,
-        uint32_t                layer_index);
+        uint32_t                layer_index,
+        bool                    trusted_gpu_route);
+
+/* Test/profiling counters for the resident Qwen route boundary. */
+void ds4_gpu_internal_qwen35_resident_route_stats_reset(void);
+void ds4_gpu_internal_qwen35_resident_route_stats_add(uint64_t calls);
+uint64_t ds4_gpu_internal_qwen35_resident_gpu_route_calls(void);
+uint64_t ds4_gpu_internal_qwen35_resident_host_readbacks(void);
+void ds4_gpu_internal_qwen35_gdn128_stats_reset(void);
+uint64_t ds4_gpu_internal_qwen35_gdn128_parallel_calls(void);
 
 int ds4_gpu_routed_moe_batch_tensor(
         ds4_gpu_tensor       *out,

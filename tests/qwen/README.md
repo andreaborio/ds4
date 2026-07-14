@@ -263,10 +263,13 @@ does not prove that every GGUF page remained physically resident throughout a
 run.
 
 The supported path does not implement neural CPU+GPU hybrid inference.  Metal
-runs the dense, recurrent, attention, router, and routed-expert math; the CPU
-handles tokenization, sampling, selected-ID readback, cache policy, and GGUF
-I/O when SSD mode is active.  A future CPU/GPU expert split would be a separate
-performance experiment and must not be inferred from the current orchestration.
+runs the dense, recurrent, attention, router, and routed-expert math.  Resident
+mode consumes the router's top-8 IDs and weights on the active Metal command
+timeline without a host readback.  The CPU still handles tokenization and
+sampling; selected-ID readback, expert-cache policy, and GGUF `pread` I/O are
+confined to SSD mode and explicit route trace/replay tooling.  A future CPU/GPU
+expert split would be a separate performance experiment and must not be
+inferred from the current orchestration.
 
 ### Expert-cache tiers
 
@@ -296,10 +299,79 @@ slab default are deliberately unchanged and are not applied to Qwen.
 
 ### AUTO and resident validation
 
-The resident top-8 Metal kernel is covered model-free against the same Q4_K
-fixture as SSD streaming: both top-4 partials and their sum match, while the
-resident run records zero cache hits, misses, entries, tokens, and `pread`
-bytes.  Invalid resident routes leave all outputs and counters unchanged.
+The resident top-8 Metal path is covered model-free against the same Q4_K
+fixture as SSD streaming.  It consumes the GPU-produced route in one expert
+pass and reduces the eight weighted expert outputs in one dispatch.  Its output
+is checked against the compatibility path using the exact same GPU-produced
+IDs and weights.  The test also proves one GPU-only route and zero host
+readbacks; the compatibility run proves the readback counter separately.  SSD
+streaming retains its two top-4 selected-slot passes, and invalid resident
+routes leave all outputs and cache counters unchanged.
+
+The autoregressive Gated DeltaNet has a separate `key_dim=128` Metal kernel.
+One 32x4 threadgroup advances four value rows, keeps four adjacent state cells
+per SIMD lane in registers, and reads/writes each recurrent-state element once.
+The generic kernel remains the fallback for other shapes.  The model-free test
+forces the specialized path with an odd seven-row tail and compares output and
+mutated state with the scalar oracle; maximum absolute errors were 1.86e-9 and
+1.49e-8 respectively.
+
+Decode cannot reuse prompt-style token batching: token `n+1` depends on the
+sampled result and mutated recurrent/KV state from token `n`.  The structural
+decode optimization is therefore parallelism *within* one token.  Qwen's
+previous top-8 router computed exponentials in parallel but selected eight
+experts with a serial `8 x 256` scan in one Metal thread.  The resident path now
+uses two-level SIMD reductions for those eight selections, preserving the
+reference normalization and the lower-expert-ID tie break.  The old serial
+kernel remains available with `DS4_QWEN_DISABLE_PARALLEL_ROUTER=1` as a precise
+diagnostic fallback.
+
+The model-free gate compares the parallel and serial production batch ABIs on
+13 adversarial rows, including all-equal logits, exact maximum ties, and finite
+softmax-underflow extremes.  Selected IDs and weights are bit-identical between
+the two Metal kernels; the maximum weight difference from the CPU oracle is
+5.96e-8.  Undersized buffers, guard regions, and non-finite input behavior are
+checked separately.
+
+The opt-in stage profiler can isolate a layer and decode position:
+
+```sh
+DS4_QWEN_METAL_DECODE_STAGE_PROFILE=1 \
+DS4_QWEN_METAL_DECODE_STAGE_PROFILE_LAYER=17 \
+DS4_QWEN_METAL_DECODE_STAGE_PROFILE_POSITION=64 \
+  ./ds4 -m "$MODEL" --metal --resident [normal generation arguments]
+```
+
+Every reported boundary closes and waits for the active Metal command buffer.
+Its timings are diagnostic attribution, not normal pipeline throughput.  On an
+Apple M5 Pro, it measured the serial top-8 selection at 0.451-0.455 ms per
+profiled layer and the parallel selection at 0.159-0.174 ms.
+
+With the resident model warm, the deterministic n96 command below was run in
+the order serial/parallel/parallel/serial/serial/parallel.  Serial decode
+measured 36.97, 37.00, and 37.19 t/s; parallel decode measured 62.72, 63.05,
+and 62.96 t/s.  The medians are 37.00 and 62.96 t/s, a 70.2% improvement.  All
+six outputs have SHA-256
+`a650b56ceb47dc8715f87c125c7eeab506bc4a510512cedbd190e38c46df5f33`,
+and `/usr/bin/time -l` recorded zero process swaps in every run.
+
+After the rejected prototype below was removed and the tree rebuilt cleanly,
+five quiet-desktop confirmations measured 232.37/66.02, 233.33/66.18,
+220.06/64.04, 223.64/65.63, and 223.73/65.20 t/s for
+prefill/generation.  The medians are 223.73 and 65.63 t/s; the best decode run
+is 66.18 t/s.  The same binary measured a 185.35/50.20 t/s median while the
+desktop compositor and Codex renderer were actively contending for the GPU.
+The quiet run hid those application windows temporarily but did not terminate
+their processes.  This gap is reported explicitly: 65.63 t/s is an achievable
+machine-local resident result, not a promise under arbitrary interactive GPU
+load.  All ten outputs retained the hash above and every process reported zero
+swaps.
+
+A Q8_0 paired-matvec prototype was also tested and deliberately not retained.
+After clock and page-cache warmup, its balanced A/B median was 63.315 t/s
+against 63.09 t/s for the two standard matvecs (+0.36%), with fully overlapping
+ranges.  That result is below run-to-run noise and does not justify another
+kernel.  Neither experiment changes or further quantizes any model weights.
 
 Model-backed AUTO is pressure-dependent by design.  A 64 GiB Mac is not an
 unconditional resident tier: if other applications consume unified memory,
@@ -307,6 +379,79 @@ AUTO can correctly choose SSD.  A physical 16 GiB machine is expected to use
 SSD for this 19.37 GiB tensor payload, but still receives the largest cache that
 fits the same safety accounting.  This expectation is not a substitute for the
 physical 16 GiB release gate below.
+
+### Reproduce the resident coding benchmark
+
+This is the resident counterpart of the bounded coding smoke below.  It uses
+the same 43-token prompt and 96-token generation cap, but admits the complete
+19.37 GiB model mapping only while the live pressure preflight can preserve the
+configured headroom:
+
+```sh
+MODEL=/absolute/path/to/Qwen3.6-35B-A3B-ds4-Q4_K_S.gguf
+
+DS4_QWEN_EXPERIMENTAL_METAL=1 \
+DS4_METAL_MEMORY_REPORT=1 \
+  ./ds4 -m "$MODEL" --metal --resident \
+    -c 160 -n 96 -t 18 \
+    --temp 0 --top-p 1 --min-p 0 --seed 1 --nothink \
+    -p 'Scrivi solo codice Python: una funzione fibonacci(n) iterativa, con validazione per n negativo.'
+```
+
+On an Apple M5 Pro with 64 GiB unified memory, the GPU-only top-8 route before
+the Gated DeltaNet specialization measured 32.71/30.24, 32.55/30.21, and
+33.02/30.01 t/s for prefill/generation: medians of 32.71 and 30.21 t/s.  With
+the parallel GDN-128 kernel, three cool-state runs measured 40.48/37.08,
+40.12/37.38, and 41.13/37.25 t/s: medians of 40.48 and 37.25 t/s.  This is a
+23.3% generation improvement from the immediately preceding implementation
+and a 39.9% improvement from the earlier 26.62 t/s resident confirmation.
+
+Resident prefill now runs layer-major, in chunks of at most 64 tokens.  Dense
+projections use the existing batched matrix kernels, while dedicated sequence
+kernels keep causal-convolution and Gated DeltaNet state in registers across a
+chunk.  Full-attention queries scan only their causal K/V prefix; batched
+router and routed-MoE kernels keep all top-8 routes on Metal.  The fixed batch
+scratch allocation is included in the resident admission budget and the graph
+lifetime test.  `DS4_QWEN_DISABLE_RESIDENT_BATCH_PREFILL=1` selects the scalar
+fallback for differential diagnosis.
+
+With the model pages warm and memory pressure normal, three consecutive n96
+runs of the command above measured 170.29/30.40, 179.63/30.47, and
+175.77/30.32 t/s for prefill/generation: medians of 175.77 and 30.40 t/s.  An
+immediately following scalar-fallback run measured 31.93/29.31 t/s, making the
+controlled prompt-prefill improvement 5.50x without a decode regression in
+that run order.  Throughput is prompt-length, temperature, and page-cache
+dependent; this is a local implementation A/B, not a cross-runtime benchmark.
+
+For the 43-token prompt, batch/scalar next-token logits had the same top-1,
+20/20 top-20 overlap, 98/100 top-100 overlap, RMSE 0.07970, and maximum absolute
+difference 0.40870.  A 122-token prompt forced two chunks and retained the same
+top-1, 5/5 top-5, 19/20 top-20, and 97/100 top-100 overlap (RMSE 0.10999,
+maximum absolute difference 0.64091).  The drift is expected because the
+batched quantized matrix kernels use half-width activation tiles; it is not
+presented as bit-identical logits.  Model-free sequence tests independently
+compare convolution, DeltaNet state, and causal GQA with repeated scalar
+oracles, with maximum absolute errors no larger than 2.98e-8.
+
+Every complete n96 run recorded 5,520 GPU-only routed-MoE token/layer calls,
+zero route readbacks, and 4,140 specialized GDN token/layer calls.  Generated
+stdout remained byte-identical across all three runs and to the prior resident
+and SSD output at SHA-256
+`a650b56ceb47dc8715f87c125c7eeab506bc4a510512cedbd190e38c46df5f33`.
+
+The earlier bounded scalar queue remains as a diagnostic fallback when batched
+prefill is disabled.  It caps resident scalar prefill at eight command buffers
+in flight; `DS4_QWEN_DISABLE_RESIDENT_PREFILL_QUEUE=1` disables that queue as
+well.  SSD mode and route trace/replay remain synchronous because expert-cache
+selection is still token-dependent.
+
+A controlled implementation A/B on the same machine separated the two changes:
+the compatibility readback/two-top-4 path generated at 22.90 t/s; keeping the
+route on GPU while retaining two top-4 passes reached 27.00 t/s; the
+single-top-8 path reached 28.17 t/s before the GDN work.  The temporary MoE A/B
+switches were removed from the production source.  These are short,
+deterministic local measurements rather than a cross-runtime `llama-bench`
+comparison.
 
 ### Reproduce the one-token Metal/logits smoke
 
@@ -448,9 +593,10 @@ Its primary files have these hashes:
   `d873b429fc4aa373e7a3c78ca156f00244a968a71d1b166f97cb8369c9f9376b`.
 
 Both measurements are from an M5 Pro with 64 GiB unified memory.  They do not
-prove operation on a physical 16 GiB Mac.  Prefill is scalar
-(`prefill_cap=1`), prioritizing correctness over throughput.  The experimental
-runtime currently rejects or leaves unsupported:
+prove operation on a physical 16 GiB Mac.  The evidence bundle in this section
+predates resident layer-major prefill; its SSD path remains scalar
+(`prefill_cap=1`), prioritizing bounded expert-cache behavior over throughput.
+The experimental runtime currently rejects or leaves unsupported:
 
 - `--quality` and MTP;
 - session payloads/snapshots and layer slices/distributed execution;
