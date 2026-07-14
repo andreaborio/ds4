@@ -26925,11 +26925,11 @@ void ds4_engine_close(ds4_engine *e) {
     weights_free(&e->weights);
     vocab_free(&e->vocab);
     ds4_threads_shutdown();
-    if (e->mtp_ready) model_close(&e->mtp_model);
-    model_close(&e->model);
 #ifndef DS4_NO_GPU
     ds4_gpu_cleanup();
 #endif
+    if (e->mtp_ready) model_close(&e->mtp_model);
+    model_close(&e->model);
     ds4_ssd_memory_lock_release(&e->simulated_memory);
     ds4_release_instance_lock();
     free(e->directional_steering_dirs);
