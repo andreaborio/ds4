@@ -11942,6 +11942,8 @@ DS4_STATIC_ASSERT(ds4_qwen35_gpu_moe_split_4x2,
 
 typedef struct {
     uint32_t ctx_capacity;
+    uint32_t n_tokens;
+    bool state_valid;
 
     /* Reused one-token work tensors. */
     ds4_gpu_tensor *hidden[2];
@@ -11951,6 +11953,9 @@ typedef struct {
     ds4_gpu_tensor *query;
     ds4_gpu_tensor *key;
     ds4_gpu_tensor *value;
+    ds4_gpu_tensor *gdn_query;
+    ds4_gpu_tensor *gdn_key;
+    ds4_gpu_tensor *gdn_value;
     ds4_gpu_tensor *alpha_logit;
     ds4_gpu_tensor *beta_logit;
     ds4_gpu_tensor *log_decay;
@@ -11971,6 +11976,8 @@ typedef struct {
     ds4_gpu_tensor *router_probability;
     ds4_gpu_tensor *router_selected;
     ds4_gpu_tensor *router_weight;
+    ds4_gpu_tensor *router_selected_split[QWEN35_GPU_MOE_SPLIT_COUNT];
+    ds4_gpu_tensor *router_weight_split[QWEN35_GPU_MOE_SPLIT_COUNT];
     ds4_gpu_tensor *routed_gate;
     ds4_gpu_tensor *routed_up;
     ds4_gpu_tensor *routed_mid;
@@ -12042,6 +12049,10 @@ static void qwen35_gpu_graph_free(ds4_qwen35_gpu_graph *g) {
     ds4_gpu_tensor_free(g->routed_mid);
     ds4_gpu_tensor_free(g->routed_up);
     ds4_gpu_tensor_free(g->routed_gate);
+    for (uint32_t split = 0; split < QWEN35_GPU_MOE_SPLIT_COUNT; split++) {
+        ds4_gpu_tensor_free(g->router_weight_split[split]);
+        ds4_gpu_tensor_free(g->router_selected_split[split]);
+    }
     ds4_gpu_tensor_free(g->router_weight);
     ds4_gpu_tensor_free(g->router_selected);
     ds4_gpu_tensor_free(g->router_probability);
@@ -12061,6 +12072,9 @@ static void qwen35_gpu_graph_free(ds4_qwen35_gpu_graph *g) {
     ds4_gpu_tensor_free(g->log_decay);
     ds4_gpu_tensor_free(g->beta_logit);
     ds4_gpu_tensor_free(g->alpha_logit);
+    ds4_gpu_tensor_free(g->gdn_value);
+    ds4_gpu_tensor_free(g->gdn_key);
+    ds4_gpu_tensor_free(g->gdn_query);
     ds4_gpu_tensor_free(g->value);
     ds4_gpu_tensor_free(g->key);
     ds4_gpu_tensor_free(g->query);
@@ -12110,6 +12124,114 @@ static bool qwen35_gpu_graph_allocated_bytes(
     return true;
 }
 
+static bool qwen35_gpu_graph_state_allocated(
+        const ds4_qwen35_gpu_graph *g) {
+    if (!g || g->ctx_capacity == 0 ||
+        g->ctx_capacity > QWEN35_CONTEXT_LENGTH) {
+        return false;
+    }
+
+    uint32_t n_full_attention = 0;
+    uint32_t n_recurrent = 0;
+    for (uint32_t il = 0; il < QWEN35_N_LAYER; il++) {
+        if (ds4_qwen35_layer_is_full_attention(il)) {
+            if (!g->full_attn_key[il] || !g->full_attn_value[il] ||
+                g->conv[il] || g->recurrent[il]) {
+                return false;
+            }
+            n_full_attention++;
+        } else {
+            if (g->full_attn_key[il] || g->full_attn_value[il] ||
+                !g->conv[il] || !g->recurrent[il]) {
+                return false;
+            }
+            n_recurrent++;
+        }
+    }
+    return n_full_attention == QWEN35_FULL_ATTENTION_LAYER_COUNT &&
+           n_recurrent == QWEN35_RECURRENT_LAYER_COUNT;
+}
+
+static bool qwen35_gpu_graph_reset(ds4_qwen35_gpu_graph *g) {
+    if (!qwen35_gpu_graph_state_allocated(g)) {
+        if (g) {
+            g->state_valid = false;
+            g->n_tokens = 0;
+        }
+        return false;
+    }
+
+    /* Cache state may still be referenced by an in-flight command buffer.
+     * Never overwrite it until the backend confirms completion.  On a failed
+     * synchronization, invalidate the host timeline even though the buffers
+     * cannot safely be touched. */
+    g->state_valid = false;
+    g->n_tokens = 0;
+    if (ds4_gpu_synchronize() == 0) return false;
+
+    bool ok = true;
+    for (uint32_t il = 0; il < QWEN35_N_LAYER; il++) {
+        if (ds4_qwen35_layer_is_full_attention(il)) {
+            const uint64_t elements = (uint64_t)g->ctx_capacity *
+                QWEN35_N_HEAD_KV * QWEN35_N_HEAD_DIM;
+            if (ds4_gpu_tensor_fill_f32(
+                    g->full_attn_key[il], 0.0f, elements) == 0) {
+                ok = false;
+            }
+            if (ds4_gpu_tensor_fill_f32(
+                    g->full_attn_value[il], 0.0f, elements) == 0) {
+                ok = false;
+            }
+        } else {
+            const uint64_t conv_elements =
+                (uint64_t)QWEN35_SSM_CONV_CHANNEL *
+                (QWEN35_SSM_CONV_KERNEL - 1u);
+            const uint64_t recurrent_elements =
+                (uint64_t)QWEN35_SSM_VALUE_HEAD * QWEN35_SSM_STATE *
+                QWEN35_SSM_STATE;
+            if (ds4_gpu_tensor_fill_f32(
+                    g->conv[il], 0.0f, conv_elements) == 0) {
+                ok = false;
+            }
+            if (ds4_gpu_tensor_fill_f32(
+                    g->recurrent[il], 0.0f, recurrent_elements) == 0) {
+                ok = false;
+            }
+        }
+    }
+    /* Metal fills shared buffers synchronously.  CUDA and ROCm enqueue fill
+     * kernels, so wait once more before declaring the timeline usable. */
+#if !defined(__APPLE__)
+    if (ds4_gpu_synchronize() == 0) ok = false;
+#endif
+    g->state_valid = ok;
+    return ok;
+}
+
+static bool qwen35_gpu_graph_validate_position(
+        const ds4_qwen35_gpu_graph *g,
+        uint32_t                    position) {
+    return qwen35_gpu_graph_state_allocated(g) && g->state_valid &&
+           g->n_tokens <= g->ctx_capacity &&
+           position == g->n_tokens && position < g->ctx_capacity;
+}
+
+static bool qwen35_gpu_graph_advance(
+        ds4_qwen35_gpu_graph *g,
+        uint32_t              position) {
+    if (!qwen35_gpu_graph_validate_position(g, position)) return false;
+    g->n_tokens = position + 1u;
+    return true;
+}
+
+static bool qwen35_gpu_graph_mark_state_invalid(
+        ds4_qwen35_gpu_graph *g) {
+    if (!qwen35_gpu_graph_state_allocated(g)) return false;
+    g->state_valid = false;
+    g->n_tokens = 0;
+    return true;
+}
+
 static bool qwen35_gpu_graph_alloc(
         ds4_qwen35_gpu_graph *g,
         uint32_t              ctx_capacity) {
@@ -12132,6 +12254,21 @@ static bool qwen35_gpu_graph_alloc(
     QWEN35_GPU_ALLOC_F32(hidden[1], QWEN35_N_EMBD, 1, 1, 1);
     QWEN35_GPU_ALLOC_F32(norm, QWEN35_N_EMBD, 1, 1, 1);
     QWEN35_GPU_ALLOC_F32(projection, QWEN35_SSM_CONV_CHANNEL, 1, 1, 1);
+    const uint64_t gdn_query_elements =
+        (uint64_t)QWEN35_SSM_GROUP * QWEN35_SSM_STATE;
+    const uint64_t gdn_key_elements = gdn_query_elements;
+    const uint64_t gdn_value_elements =
+        (uint64_t)QWEN35_SSM_VALUE_HEAD * QWEN35_SSM_STATE;
+    next.gdn_query = ds4_gpu_tensor_view(
+        next.projection, 0, gdn_query_elements * sizeof(float));
+    next.gdn_key = ds4_gpu_tensor_view(
+        next.projection,
+        gdn_query_elements * sizeof(float),
+        gdn_key_elements * sizeof(float));
+    next.gdn_value = ds4_gpu_tensor_view(
+        next.projection,
+        (gdn_query_elements + gdn_key_elements) * sizeof(float),
+        gdn_value_elements * sizeof(float));
     QWEN35_GPU_ALLOC_F32(gate, QWEN35_SSM_INNER, 1, 1, 1);
     QWEN35_GPU_ALLOC_F32(query, QWEN35_SSM_INNER, 1, 1, 1);
     QWEN35_GPU_ALLOC_F32(key, QWEN35_SSM_GROUP, QWEN35_SSM_STATE, 1, 1);
@@ -12144,7 +12281,6 @@ static bool qwen35_gpu_graph_alloc(
     QWEN35_GPU_ALLOC_F32(attn_out, QWEN35_N_EMBD, 1, 1, 1);
     QWEN35_GPU_ALLOC_F32(attn_score, ctx_capacity, 1, 1, 1);
 
-    bool state_ok = true;
     uint32_t n_full_attention = 0;
     uint32_t n_recurrent = 0;
     for (uint32_t il = 0; il < QWEN35_N_LAYER; il++) {
@@ -12153,30 +12289,12 @@ static bool qwen35_gpu_graph_alloc(
                                  QWEN35_N_HEAD_KV, QWEN35_N_HEAD_DIM, 1);
             QWEN35_GPU_ALLOC_F32(full_attn_value[il], ctx_capacity,
                                  QWEN35_N_HEAD_KV, QWEN35_N_HEAD_DIM, 1);
-            const uint64_t cache_elements = (uint64_t)ctx_capacity *
-                QWEN35_N_HEAD_KV * QWEN35_N_HEAD_DIM;
-            state_ok = state_ok && next.full_attn_key[il] &&
-                       next.full_attn_value[il] &&
-                       ds4_gpu_tensor_fill_f32(next.full_attn_key[il], 0.0f,
-                                               cache_elements) != 0 &&
-                       ds4_gpu_tensor_fill_f32(next.full_attn_value[il], 0.0f,
-                                               cache_elements) != 0;
             n_full_attention++;
         } else {
             QWEN35_GPU_ALLOC_F32(conv[il], QWEN35_SSM_CONV_CHANNEL,
                                  QWEN35_SSM_CONV_KERNEL - 1u, 1, 1);
             QWEN35_GPU_ALLOC_F32(recurrent[il], QWEN35_SSM_VALUE_HEAD,
                                  QWEN35_SSM_STATE, QWEN35_SSM_STATE, 1);
-            const uint64_t conv_elements = (uint64_t)QWEN35_SSM_CONV_CHANNEL *
-                (QWEN35_SSM_CONV_KERNEL - 1u);
-            const uint64_t recurrent_elements =
-                (uint64_t)QWEN35_SSM_VALUE_HEAD * QWEN35_SSM_STATE *
-                QWEN35_SSM_STATE;
-            state_ok = state_ok && next.conv[il] && next.recurrent[il] &&
-                       ds4_gpu_tensor_fill_f32(next.conv[il], 0.0f,
-                                               conv_elements) != 0 &&
-                       ds4_gpu_tensor_fill_f32(next.recurrent[il], 0.0f,
-                                               recurrent_elements) != 0;
             n_recurrent++;
         }
     }
@@ -12185,6 +12303,20 @@ static bool qwen35_gpu_graph_alloc(
     QWEN35_GPU_ALLOC_F32(router_probability, QWEN35_N_EXPERT, 1, 1, 1);
     QWEN35_GPU_ALLOC_I32(router_selected, QWEN35_N_EXPERT_USED, 1, 1, 1);
     QWEN35_GPU_ALLOC_F32(router_weight, QWEN35_N_EXPERT_USED, 1, 1, 1);
+    for (uint32_t split = 0; split < QWEN35_GPU_MOE_SPLIT_COUNT; split++) {
+        const uint64_t selected_offset =
+            (uint64_t)split * QWEN35_GPU_MOE_SPLIT_WIDTH * sizeof(int32_t);
+        const uint64_t selected_bytes =
+            (uint64_t)QWEN35_GPU_MOE_SPLIT_WIDTH * sizeof(int32_t);
+        const uint64_t weight_offset =
+            (uint64_t)split * QWEN35_GPU_MOE_SPLIT_WIDTH * sizeof(float);
+        const uint64_t weight_bytes =
+            (uint64_t)QWEN35_GPU_MOE_SPLIT_WIDTH * sizeof(float);
+        next.router_selected_split[split] = ds4_gpu_tensor_view(
+            next.router_selected, selected_offset, selected_bytes);
+        next.router_weight_split[split] = ds4_gpu_tensor_view(
+            next.router_weight, weight_offset, weight_bytes);
+    }
     QWEN35_GPU_ALLOC_F32(routed_gate, QWEN35_GPU_MOE_SPLIT_WIDTH,
                          QWEN35_N_FF_EXP, 1, 1);
     QWEN35_GPU_ALLOC_F32(routed_up, QWEN35_GPU_MOE_SPLIT_WIDTH,
@@ -12208,21 +12340,25 @@ static bool qwen35_gpu_graph_alloc(
 #undef QWEN35_GPU_ALLOC_I32
 #undef QWEN35_GPU_ALLOC_F32
 
-    const bool ok = state_ok &&
-                    n_full_attention == QWEN35_FULL_ATTENTION_LAYER_COUNT &&
+    const bool ok = n_full_attention == QWEN35_FULL_ATTENTION_LAYER_COUNT &&
                     n_recurrent == QWEN35_RECURRENT_LAYER_COUNT &&
                     next.hidden[0] && next.hidden[1] && next.norm &&
                     next.projection && next.gate && next.query && next.key &&
-                    next.value && next.alpha_logit && next.beta_logit &&
+                    next.value && next.gdn_query && next.gdn_key &&
+                    next.gdn_value && next.alpha_logit && next.beta_logit &&
                     next.log_decay && next.beta && next.heads && next.attn_out &&
                     next.attn_score && next.router_logits &&
                     next.router_probability && next.router_selected &&
-                    next.router_weight && next.routed_gate && next.routed_up &&
+                    next.router_weight && next.router_selected_split[0] &&
+                    next.router_selected_split[1] &&
+                    next.router_weight_split[0] &&
+                    next.router_weight_split[1] &&
+                    next.routed_gate && next.routed_up &&
                     next.routed_mid && next.routed_down && next.moe_partial[0] &&
                     next.moe_partial[1] && next.moe_out && next.shared_gate &&
                     next.shared_up && next.shared_mid && next.shared_out &&
                     next.shared_gate_logit && next.output_norm && next.logits;
-    if (!ok) {
+    if (!ok || !qwen35_gpu_graph_reset(&next)) {
         qwen35_gpu_graph_free(&next);
         return false;
     }
@@ -12252,6 +12388,87 @@ bool ds4_internal_qwen35_gpu_graph_allocated_bytes(
         uint64_t   *bytes_out) {
     if (!storage || storage_bytes != sizeof(ds4_qwen35_gpu_graph)) return false;
     return qwen35_gpu_graph_allocated_bytes(storage, bytes_out);
+}
+
+bool ds4_internal_qwen35_gpu_graph_reset(
+        void   *storage,
+        size_t  storage_bytes) {
+    if (!storage || storage_bytes != sizeof(ds4_qwen35_gpu_graph)) return false;
+    return qwen35_gpu_graph_reset(storage);
+}
+
+bool ds4_internal_qwen35_gpu_graph_validate_position(
+        const void *storage,
+        size_t      storage_bytes,
+        uint32_t    position) {
+    if (!storage || storage_bytes != sizeof(ds4_qwen35_gpu_graph)) return false;
+    return qwen35_gpu_graph_validate_position(storage, position);
+}
+
+bool ds4_internal_qwen35_gpu_graph_advance(
+        void     *storage,
+        size_t    storage_bytes,
+        uint32_t  position) {
+    if (!storage || storage_bytes != sizeof(ds4_qwen35_gpu_graph)) return false;
+    return qwen35_gpu_graph_advance(storage, position);
+}
+
+bool ds4_internal_qwen35_gpu_graph_mark_state_invalid(
+        void   *storage,
+        size_t  storage_bytes) {
+    if (!storage || storage_bytes != sizeof(ds4_qwen35_gpu_graph)) return false;
+    return qwen35_gpu_graph_mark_state_invalid(storage);
+}
+
+/* Model-free test accessors keep tensor ownership private while allowing the
+ * lifecycle test to prove that persistent views alias the intended ranges and
+ * that every cache allocation participates in reset. */
+bool ds4_internal_qwen35_gpu_graph_views(
+        void            *storage,
+        size_t           storage_bytes,
+        ds4_gpu_tensor **parents,
+        ds4_gpu_tensor **views) {
+    if (!storage || storage_bytes != sizeof(ds4_qwen35_gpu_graph) ||
+        !parents || !views) {
+        return false;
+    }
+    ds4_qwen35_gpu_graph *g = storage;
+    if (!qwen35_gpu_graph_state_allocated(g) ||
+        !g->projection || !g->gdn_query || !g->gdn_key || !g->gdn_value ||
+        !g->router_selected || !g->router_weight ||
+        !g->router_selected_split[0] || !g->router_selected_split[1] ||
+        !g->router_weight_split[0] || !g->router_weight_split[1]) {
+        return false;
+    }
+    parents[0] = g->projection;
+    parents[1] = g->router_selected;
+    parents[2] = g->router_weight;
+    views[0] = g->gdn_query;
+    views[1] = g->gdn_key;
+    views[2] = g->gdn_value;
+    views[3] = g->router_selected_split[0];
+    views[4] = g->router_selected_split[1];
+    views[5] = g->router_weight_split[0];
+    views[6] = g->router_weight_split[1];
+    return true;
+}
+
+bool ds4_internal_qwen35_gpu_graph_layer_state(
+        void            *storage,
+        size_t           storage_bytes,
+        uint32_t         layer,
+        ds4_gpu_tensor **state) {
+    if (!storage || storage_bytes != sizeof(ds4_qwen35_gpu_graph) ||
+        layer >= QWEN35_N_LAYER || !state) {
+        return false;
+    }
+    ds4_qwen35_gpu_graph *g = storage;
+    if (!qwen35_gpu_graph_state_allocated(g)) return false;
+    state[0] = g->full_attn_key[layer];
+    state[1] = g->full_attn_value[layer];
+    state[2] = g->conv[layer];
+    state[3] = g->recurrent[layer];
+    return true;
 }
 
 void ds4_internal_qwen35_gpu_graph_free(

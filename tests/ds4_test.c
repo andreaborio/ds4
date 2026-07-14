@@ -565,8 +565,121 @@ extern bool ds4_internal_qwen35_gpu_graph_alloc(
     void *storage, size_t storage_bytes, uint32_t ctx_capacity);
 extern bool ds4_internal_qwen35_gpu_graph_allocated_bytes(
     const void *storage, size_t storage_bytes, uint64_t *bytes_out);
+extern bool ds4_internal_qwen35_gpu_graph_reset(
+    void *storage, size_t storage_bytes);
+extern bool ds4_internal_qwen35_gpu_graph_validate_position(
+    const void *storage, size_t storage_bytes, uint32_t position);
+extern bool ds4_internal_qwen35_gpu_graph_advance(
+    void *storage, size_t storage_bytes, uint32_t position);
+extern bool ds4_internal_qwen35_gpu_graph_mark_state_invalid(
+    void *storage, size_t storage_bytes);
+extern bool ds4_internal_qwen35_gpu_graph_views(
+    void *storage, size_t storage_bytes,
+    ds4_gpu_tensor **parents, ds4_gpu_tensor **views);
+extern bool ds4_internal_qwen35_gpu_graph_layer_state(
+    void *storage, size_t storage_bytes, uint32_t layer,
+    ds4_gpu_tensor **state);
 extern void ds4_internal_qwen35_gpu_graph_free(
     void *storage, size_t storage_bytes);
+
+static bool test_metal_tensor_view_partition(
+        ds4_gpu_tensor       *parent,
+        ds4_gpu_tensor *const *views,
+        const uint64_t       *offsets,
+        const uint64_t       *sizes,
+        size_t                n_views) {
+    const uint64_t parent_bytes = ds4_gpu_tensor_bytes(parent);
+    bool ok = parent && views && offsets && sizes && n_views > 0 &&
+              parent_bytes > 0 && parent_bytes <= SIZE_MAX;
+    TEST_ASSERT(ok);
+    if (!ok) return false;
+
+    for (size_t i = 0; i < n_views; i++) {
+        ok = offsets[i] <= parent_bytes &&
+             sizes[i] <= parent_bytes - offsets[i] &&
+             sizes[i] == ds4_gpu_tensor_bytes(views[i]);
+        TEST_ASSERT(ok);
+        for (size_t j = 0; ok && j < i; j++) {
+            const bool disjoint = offsets[i] + sizes[i] <= offsets[j] ||
+                                  offsets[j] + sizes[j] <= offsets[i];
+            TEST_ASSERT(disjoint);
+            ok = ok && disjoint;
+        }
+    }
+    if (!ok) return false;
+
+    uint8_t *expected = malloc((size_t)parent_bytes);
+    uint8_t *actual = malloc((size_t)parent_bytes);
+    ok = expected && actual;
+    TEST_ASSERT(ok);
+    if (!ok) {
+        free(expected);
+        free(actual);
+        return false;
+    }
+
+    for (uint64_t i = 0; i < parent_bytes; i++) {
+        expected[i] = (uint8_t)(i * 29u + 17u);
+    }
+    ok = ds4_gpu_tensor_write(parent, 0, expected, parent_bytes) != 0;
+    TEST_ASSERT(ok);
+    for (size_t i = 0; ok && i < n_views; i++) {
+        ok = ds4_gpu_tensor_read(views[i], 0, actual, sizes[i]) != 0 &&
+             memcmp(actual, expected + offsets[i], (size_t)sizes[i]) == 0;
+        TEST_ASSERT(ok);
+    }
+
+    memset(expected, 0, (size_t)parent_bytes);
+    if (ok) {
+        ok = ds4_gpu_tensor_write(parent, 0, expected, parent_bytes) != 0;
+        TEST_ASSERT(ok);
+    }
+    for (size_t i = 0; ok && i < n_views; i++) {
+        const uint8_t marker = (uint8_t)(0x31u + i * 23u);
+        memset(actual, marker, (size_t)sizes[i]);
+        ok = ds4_gpu_tensor_write(views[i], 0, actual, sizes[i]) != 0;
+        TEST_ASSERT(ok);
+        memset(expected + offsets[i], marker, (size_t)sizes[i]);
+    }
+    if (ok) {
+        ok = ds4_gpu_tensor_read(parent, 0, actual, parent_bytes) != 0 &&
+             memcmp(actual, expected, (size_t)parent_bytes) == 0;
+        TEST_ASSERT(ok);
+    }
+
+    free(expected);
+    free(actual);
+    return ok;
+}
+
+static bool test_metal_tensor_is_all_zero(
+        const ds4_gpu_tensor *tensor) {
+    const uint64_t bytes = ds4_gpu_tensor_bytes(tensor);
+    const size_t chunk_capacity = 1024u * 1024u;
+    uint8_t *chunk = malloc(chunk_capacity);
+    bool ok = tensor && bytes > 0 && chunk;
+    TEST_ASSERT(ok);
+    if (!ok) {
+        free(chunk);
+        return false;
+    }
+
+    for (uint64_t offset = 0; ok && offset < bytes;) {
+        const uint64_t remaining = bytes - offset;
+        const size_t chunk_bytes = remaining < chunk_capacity
+            ? (size_t)remaining
+            : chunk_capacity;
+        ok = ds4_gpu_tensor_read(
+                 tensor, offset, chunk, (uint64_t)chunk_bytes) != 0;
+        for (size_t i = 0; ok && i < chunk_bytes; i++) {
+            if (chunk[i] != 0) ok = false;
+        }
+        TEST_ASSERT(ok);
+        offset += chunk_bytes;
+    }
+    free(chunk);
+    return ok;
+}
 
 static void test_metal_qwen35_graph_state(void) {
     /* Three rows are enough to prove the context term without turning this
@@ -599,6 +712,48 @@ static void test_metal_qwen35_graph_state(void) {
 
     TEST_ASSERT(ds4_internal_qwen35_gpu_graph_alloc(
         graph, graph_size, ctx_capacity));
+
+    ds4_gpu_tensor *view_parents[3] = {0};
+    ds4_gpu_tensor *views[7] = {0};
+    TEST_ASSERT(ds4_internal_qwen35_gpu_graph_views(
+        graph, graph_size, view_parents, views));
+    const uint64_t gdn_query_bytes =
+        (uint64_t)QWEN35_SSM_GROUP * QWEN35_SSM_STATE * f32;
+    const uint64_t gdn_key_bytes = gdn_query_bytes;
+    const uint64_t gdn_value_bytes =
+        (uint64_t)QWEN35_SSM_VALUE_HEAD * QWEN35_SSM_STATE * f32;
+    const uint64_t gdn_offsets[] = {
+        0,
+        gdn_query_bytes,
+        gdn_query_bytes + gdn_key_bytes,
+    };
+    const uint64_t gdn_sizes[] = {
+        gdn_query_bytes,
+        gdn_key_bytes,
+        gdn_value_bytes,
+    };
+    TEST_ASSERT(ds4_gpu_tensor_bytes(view_parents[0]) ==
+                gdn_query_bytes + gdn_key_bytes + gdn_value_bytes);
+    TEST_ASSERT(test_metal_tensor_view_partition(
+        view_parents[0], views, gdn_offsets, gdn_sizes, 3));
+
+    const uint64_t top4_offsets[] = {
+        0,
+        (uint64_t)moe_split_width * sizeof(int32_t),
+    };
+    const uint64_t top4_sizes[] = {
+        (uint64_t)moe_split_width * sizeof(int32_t),
+        (uint64_t)moe_split_width * sizeof(int32_t),
+    };
+    TEST_ASSERT(top4_offsets[1] == 16);
+    TEST_ASSERT(ds4_gpu_tensor_bytes(view_parents[1]) ==
+                (uint64_t)QWEN35_N_EXPERT_USED * sizeof(int32_t));
+    TEST_ASSERT(ds4_gpu_tensor_bytes(view_parents[2]) ==
+                (uint64_t)QWEN35_N_EXPERT_USED * sizeof(float));
+    TEST_ASSERT(test_metal_tensor_view_partition(
+        view_parents[1], &views[3], top4_offsets, top4_sizes, 2));
+    TEST_ASSERT(test_metal_tensor_view_partition(
+        view_parents[2], &views[5], top4_offsets, top4_sizes, 2));
 
     uint64_t expected_f32_elements =
         3ull * QWEN35_N_EMBD +
@@ -636,6 +791,71 @@ static void test_metal_qwen35_graph_state(void) {
             moe_split_count,
             moe_split_width);
 
+    TEST_ASSERT(!ds4_internal_qwen35_gpu_graph_validate_position(
+        graph, graph_size - 1u, 0));
+    TEST_ASSERT(!ds4_internal_qwen35_gpu_graph_advance(
+        graph, graph_size - 1u, 0));
+    TEST_ASSERT(!ds4_internal_qwen35_gpu_graph_reset(
+        graph, graph_size - 1u));
+    TEST_ASSERT(ds4_internal_qwen35_gpu_graph_validate_position(
+        graph, graph_size, 0));
+    TEST_ASSERT(!ds4_internal_qwen35_gpu_graph_validate_position(
+        graph, graph_size, 1));
+    TEST_ASSERT(!ds4_internal_qwen35_gpu_graph_advance(
+        graph, graph_size, 1));
+    TEST_ASSERT(ds4_internal_qwen35_gpu_graph_advance(
+        graph, graph_size, 0));
+    TEST_ASSERT(ds4_internal_qwen35_gpu_graph_validate_position(
+        graph, graph_size, 1));
+    TEST_ASSERT(!ds4_internal_qwen35_gpu_graph_advance(
+        graph, graph_size, 2));
+    TEST_ASSERT(ds4_internal_qwen35_gpu_graph_advance(
+        graph, graph_size, 1));
+    TEST_ASSERT(ds4_internal_qwen35_gpu_graph_advance(
+        graph, graph_size, 2));
+    TEST_ASSERT(!ds4_internal_qwen35_gpu_graph_validate_position(
+        graph, graph_size, ctx_capacity));
+    TEST_ASSERT(!ds4_internal_qwen35_gpu_graph_advance(
+        graph, graph_size, ctx_capacity));
+
+    for (uint32_t il = 0; il < QWEN35_N_LAYER; il++) {
+        ds4_gpu_tensor *state[4] = {0};
+        TEST_ASSERT(ds4_internal_qwen35_gpu_graph_layer_state(
+            graph, graph_size, il, state));
+        const bool full_attention = ds4_qwen35_layer_is_full_attention(il);
+        TEST_ASSERT((state[0] != NULL) == full_attention);
+        TEST_ASSERT((state[1] != NULL) == full_attention);
+        TEST_ASSERT((state[2] != NULL) != full_attention);
+        TEST_ASSERT((state[3] != NULL) != full_attention);
+        for (uint32_t kind = 0; kind < 4; kind++) {
+            if (!state[kind]) continue;
+            const uint64_t bytes = ds4_gpu_tensor_bytes(state[kind]);
+            TEST_ASSERT(bytes > 0 && bytes % sizeof(float) == 0);
+            TEST_ASSERT(ds4_gpu_tensor_fill_f32(
+                state[kind], (float)(1u + il * 4u + kind),
+                bytes / sizeof(float)) != 0);
+        }
+    }
+    TEST_ASSERT(ds4_internal_qwen35_gpu_graph_mark_state_invalid(
+        graph, graph_size));
+    TEST_ASSERT(!ds4_internal_qwen35_gpu_graph_validate_position(
+        graph, graph_size, 0));
+    TEST_ASSERT(!ds4_internal_qwen35_gpu_graph_advance(
+        graph, graph_size, 0));
+    TEST_ASSERT(ds4_internal_qwen35_gpu_graph_reset(graph, graph_size));
+    TEST_ASSERT(ds4_internal_qwen35_gpu_graph_validate_position(
+        graph, graph_size, 0));
+    for (uint32_t il = 0; il < QWEN35_N_LAYER; il++) {
+        ds4_gpu_tensor *state[4] = {0};
+        TEST_ASSERT(ds4_internal_qwen35_gpu_graph_layer_state(
+            graph, graph_size, il, state));
+        for (uint32_t kind = 0; kind < 4; kind++) {
+            if (state[kind]) {
+                TEST_ASSERT(test_metal_tensor_is_all_zero(state[kind]));
+            }
+        }
+    }
+
     /* Reinitializing a live graph must fail without replacing or leaking it. */
     const uint64_t before_reinit = allocated;
     TEST_ASSERT(!ds4_internal_qwen35_gpu_graph_alloc(
@@ -648,6 +868,11 @@ static void test_metal_qwen35_graph_state(void) {
     TEST_ASSERT(ds4_internal_qwen35_gpu_graph_allocated_bytes(
         graph, graph_size, &allocated));
     TEST_ASSERT(allocated == 0);
+    TEST_ASSERT(!ds4_internal_qwen35_gpu_graph_validate_position(
+        graph, graph_size, 0));
+    TEST_ASSERT(!ds4_internal_qwen35_gpu_graph_advance(
+        graph, graph_size, 0));
+    TEST_ASSERT(!ds4_internal_qwen35_gpu_graph_reset(graph, graph_size));
     bool cleared = true;
     for (size_t i = 0; i < graph_size; i++) {
         if (graph[i] != 0) {
