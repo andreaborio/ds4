@@ -421,6 +421,31 @@ static void test_qwen35_ssd_static_contract(void) {
     CHECK(geometry.warning_cache_experts == 640);
     CHECK(geometry.max_cacheable_experts == 10240);
 
+    uint32_t cache_experts = 99;
+    CHECK(!qwen35_streaming_cache_budget_from_request(
+              NULL, 0, 0, 321, &cache_experts));
+    CHECK(cache_experts == 0);
+    CHECK(!qwen35_streaming_cache_budget_from_request(
+              &geometry, 321, geometry.minimum_cache_bytes, 0,
+              &cache_experts));
+    CHECK(!qwen35_streaming_cache_budget_from_request(
+              &geometry, 320, 0, 0, &cache_experts));
+    CHECK(!qwen35_streaming_cache_budget_from_request(
+              &geometry, 0, geometry.minimum_cache_bytes - 1u, 0,
+              &cache_experts));
+    CHECK(qwen35_streaming_cache_budget_from_request(
+              &geometry, 0, geometry.minimum_cache_bytes, 0,
+              &cache_experts));
+    CHECK(cache_experts == 321);
+    CHECK(qwen35_streaming_cache_budget_from_request(
+              &geometry, 640, 0, 0, &cache_experts));
+    CHECK(cache_experts == 640);
+    CHECK(qwen35_streaming_cache_budget_from_request(
+              &geometry, 0, 0, 321, &cache_experts));
+    CHECK(cache_experts == 321);
+    CHECK(!qwen35_streaming_cache_budget_from_request(
+              &geometry, 10241, 0, 0, &cache_experts));
+
     ds4_tensor *mutated = fixture->weights.layer[7].ffn_gate_exps;
     const ds4_tensor saved_mutated = *mutated;
     mutated->dim[1]--;

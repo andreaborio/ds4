@@ -24729,6 +24729,7 @@ struct ds4_engine {
     bool ssd_streaming_cold;
     ds4_distributed_options distributed;
     bool qwen_raw_runtime;
+    bool qwen_metal_runtime;
     bool metal_ready;
     bool mtp_ready;
 };
@@ -30072,6 +30073,45 @@ static bool ds4_file_size_bytes(const char *path, uint64_t *bytes_out) {
     return true;
 }
 
+/* Keep residency planning model-aware without widening the public estimator.
+ * Qwen's scalar correctness runtime owns full-context F32 K/V plus the fixed
+ * recurrent state and scratch arena.  That CPU-shaped estimate is deliberately
+ * conservative for the one-token Metal graph, and therefore safe to reuse
+ * while the Metal executor remains experimental. */
+static bool ds4_engine_context_memory_estimate_private(
+        const ds4_engine   *e,
+        int                 ctx_size,
+        uint32_t            prefill_chunk,
+        ds4_context_memory *out) {
+    if (!e || !out || ctx_size <= 0) return false;
+
+    if (e->model.family != DS4_MODEL_FAMILY_QWEN35_MOE) {
+        *out = ds4_context_memory_estimate_with_prefill(
+            e->backend, ctx_size, prefill_chunk);
+        return true;
+    }
+    if ((uint32_t)ctx_size > QWEN35_CONTEXT_LENGTH) return false;
+
+    ds4_qwen35_cpu_cache_plan cache = {0};
+    ds4_qwen35_cpu_scratch_plan scratch = {0};
+    if (!ds4_qwen35_cpu_cache_plan_make((uint32_t)ctx_size, &cache) ||
+        !ds4_qwen35_cpu_scratch_plan_make((uint32_t)ctx_size, &scratch)) {
+        return false;
+    }
+
+    ds4_context_memory m = {0};
+    m.raw_bytes = cache.max_kv_bytes;
+    m.compressed_bytes = cache.fixed_bytes;
+    m.scratch_bytes = scratch.total_bytes +
+                      (uint64_t)QWEN35_N_VOCAB * sizeof(float);
+    m.prefill_cap = 1u;
+    m.raw_cap = (uint32_t)ctx_size;
+    m.total_bytes = m.raw_bytes + m.compressed_bytes + m.scratch_bytes;
+    (void)prefill_chunk;
+    *out = m;
+    return true;
+}
+
 static bool ds4_engine_resolve_residency(ds4_engine               *e,
                                          const ds4_engine_options *opt,
                                          bool                      load_slice,
@@ -30129,10 +30169,20 @@ static bool ds4_engine_resolve_residency(ds4_engine               *e,
 
     const uint32_t context_size = opt->context_size != 0 ?
                                   opt->context_size : 32768u;
-    const ds4_context_memory context =
-        ds4_context_memory_estimate_with_prefill(e->backend,
-                                                 (int)context_size,
-                                                 opt->prefill_chunk);
+    ds4_context_memory context = {0};
+    if (!ds4_engine_context_memory_estimate_private(
+            e, (int)context_size, opt->prefill_chunk, &context)) {
+        fprintf(stderr,
+                "ds4: could not estimate context memory for residency planning\n");
+        return false;
+    }
+    if (e->model.family == DS4_MODEL_FAMILY_QWEN35_MOE) {
+        fprintf(stderr,
+                "ds4: Qwen residency runtime %.2f GiB at context %u "
+                "(conservative full-F32 KV/recurrent estimate)\n",
+                (double)context.total_bytes / 1073741824.0,
+                context_size);
+    }
     uint64_t recommended = 0;
 #ifndef DS4_NO_GPU
     if (e->backend == DS4_BACKEND_METAL &&
@@ -30395,6 +30445,273 @@ static bool ds4_engine_preflight_non_routed_pin(
 }
 #endif
 
+static bool qwen35_streaming_cache_budget_from_request(
+        const ds4_qwen35_streaming_cache_geometry *geometry,
+        uint32_t                                    requested_experts,
+        uint64_t                                    requested_bytes,
+        uint32_t                                    auto_experts,
+        uint32_t                                   *experts_out) {
+    if (experts_out) *experts_out = 0;
+    if (!geometry || !experts_out || geometry->per_expert_bytes == 0 ||
+        (requested_experts > 0 && requested_bytes > 0)) {
+        return false;
+    }
+
+    uint64_t experts = 0;
+    if (requested_experts != 0) {
+        experts = requested_experts;
+    } else if (requested_bytes != 0) {
+        experts = requested_bytes / geometry->per_expert_bytes;
+    } else {
+        experts = auto_experts;
+    }
+    if (experts < geometry->minimum_cache_experts ||
+        experts > geometry->max_cacheable_experts ||
+        experts > UINT32_MAX) {
+        return false;
+    }
+    *experts_out = (uint32_t)experts;
+    return true;
+}
+
+static bool ds4_engine_qwen35_metal_options_valid(
+        const ds4_engine         *e,
+        const ds4_engine_options *opt,
+        ds4_residency_mode        residency_requested,
+        bool                      load_slice) {
+    if (!e || !opt) return false;
+    if (e->backend != DS4_BACKEND_METAL) {
+        fprintf(stderr,
+                "ds4: experimental Qwen Metal inference requires --metal\n");
+        return false;
+    }
+    if (residency_requested != DS4_RESIDENCY_SSD) {
+        fprintf(stderr,
+                "ds4: experimental Qwen Metal inference requires explicit "
+                "SSD residency (--ssd-streaming or --ssd)\n");
+        return false;
+    }
+    if (e->quality) {
+        fprintf(stderr,
+                "ds4: experimental Qwen Metal inference does not support --quality yet\n");
+        return false;
+    }
+    if (opt->mtp_path && opt->mtp_path[0]) {
+        fprintf(stderr,
+                "ds4: experimental Qwen Metal inference does not support MTP\n");
+        return false;
+    }
+    if (load_slice || opt->distributed.role != DS4_DISTRIBUTED_NONE) {
+        fprintf(stderr,
+                "ds4: experimental Qwen Metal inference does not support "
+                "layer slices or distributed execution\n");
+        return false;
+    }
+    if (e->directional_steering_file) {
+        fprintf(stderr,
+                "ds4: experimental Qwen Metal inference does not support "
+                "directional steering\n");
+        return false;
+    }
+    const char *expert_profile = getenv("DS4_EXPERT_PROFILE");
+    const char *expert_hotlist = getenv("DS4_EXPERT_HOTLIST");
+    const char *streaming_hotlist =
+        getenv("DS4_METAL_STREAMING_EXPERT_HOTLIST");
+    const char *streaming_hotlist_profile =
+        getenv("DS4_METAL_STREAMING_EXPERT_HOTLIST_PROFILE");
+    if ((opt->expert_profile_path && opt->expert_profile_path[0]) ||
+        (expert_profile && expert_profile[0]) ||
+        (expert_hotlist && expert_hotlist[0]) ||
+        (streaming_hotlist && streaming_hotlist[0]) ||
+        (streaming_hotlist_profile && streaming_hotlist_profile[0])) {
+        fprintf(stderr,
+                "ds4: experimental Qwen Metal inference does not support "
+                "expert profiles or hotlists yet\n");
+        return false;
+    }
+    if (e->ssd_streaming_preload_experts != 0) {
+        fprintf(stderr,
+                "ds4: experimental Qwen Metal inference does not support "
+                "expert preloading yet\n");
+        return false;
+    }
+    const char *pin_non_routed =
+        getenv("DS4_METAL_STREAMING_PIN_NON_ROUTED");
+    if (pin_non_routed && pin_non_routed[0]) {
+        fprintf(stderr,
+                "ds4: experimental Qwen Metal inference does not support "
+                "DS4_METAL_STREAMING_PIN_NON_ROUTED yet\n");
+        return false;
+    }
+    if (e->power_percent != 100) {
+        fprintf(stderr,
+                "ds4: experimental Qwen Metal inference requires --power 100\n");
+        return false;
+    }
+    if (e->ssd_streaming_cache_experts != 0 &&
+        e->ssd_streaming_cache_bytes != 0) {
+        fprintf(stderr,
+                "ds4: choose either an SSD expert count or a byte budget, not both\n");
+        return false;
+    }
+    return true;
+}
+
+#if defined(__APPLE__) && !defined(DS4_NO_GPU)
+static bool ds4_engine_configure_qwen35_metal_streaming(ds4_engine *e) {
+    if (!e || e->backend != DS4_BACKEND_METAL ||
+        e->residency != DS4_RESIDENCY_SSD || !e->ssd_streaming) {
+        return false;
+    }
+
+    if (!ds4_gpu_init()) {
+        fprintf(stderr,
+                "ds4: Metal backend unavailable while initializing Qwen SSD streaming\n");
+        return false;
+    }
+    e->metal_ready = true;
+    ds4_gpu_set_quality(false);
+    ds4_gpu_set_ssd_streaming(true);
+
+    ds4_qwen35_streaming_cache_geometry geometry = {0};
+    if (!qwen35_streaming_cache_geometry_make(
+            &e->qwen35_weights, &geometry)) {
+        fprintf(stderr,
+                "ds4: Qwen SSD streaming cache geometry does not match the "
+                "supported Q4_K_S artifact\n");
+        return false;
+    }
+
+    ds4_model_map_span_vec page_spans = {0};
+    uint64_t static_payload_bytes = 0;
+    uint64_t static_page_coverage_bytes = 0;
+    if (!qwen35_weights_model_map_non_routed_page_spans(
+            &e->model,
+            &e->qwen35_weights,
+            &page_spans,
+            &static_payload_bytes,
+            &static_page_coverage_bytes)) {
+        fprintf(stderr,
+                "ds4: Qwen SSD streaming could not measure static page coverage\n");
+        return false;
+    }
+    free(page_spans.v);
+
+    uint32_t auto_experts = 0;
+    ds4_ssd_adaptive_cache_plan auto_plan = {0};
+    if (e->ssd_streaming_cache_experts == 0 &&
+        e->ssd_streaming_cache_bytes == 0) {
+        ds4_ssd_host_memory memory = {0};
+        if (!ds4_gpu_host_memory_snapshot(&memory)) {
+            fprintf(stderr,
+                    "ds4: Qwen SSD AUTO cache requires a host-memory snapshot; "
+                    "set an explicit safe cache budget instead\n");
+            return false;
+        }
+        if (!ds4_ssd_adaptive_cache_plan_make_with_static_reserve(
+                &memory,
+                e->residency_plan.runtime_bytes,
+                static_page_coverage_bytes,
+                false,
+                QWEN35_N_LAYER,
+                QWEN35_N_EXPERT_USED,
+                geometry.per_expert_bytes,
+                geometry.max_cacheable_experts,
+                &auto_plan)) {
+            fprintf(stderr,
+                    "ds4: Qwen SSD AUTO cache cannot fit the static %.2f GiB "
+                    "set, runtime, and safe %" PRIu64 "-expert floor\n",
+                    (double)static_page_coverage_bytes / 1073741824.0,
+                    geometry.minimum_cache_experts);
+            return false;
+        }
+        auto_experts = auto_plan.cache_experts;
+    }
+
+    uint32_t cache_experts = 0;
+    if (!qwen35_streaming_cache_budget_from_request(
+            &geometry,
+            e->ssd_streaming_cache_experts,
+            e->ssd_streaming_cache_bytes,
+            auto_experts,
+            &cache_experts)) {
+        fprintf(stderr,
+                "ds4: Qwen SSD cache must hold %" PRIu64 "..%" PRIu64
+                " complete experts (%.2f MiB each)\n",
+                geometry.minimum_cache_experts,
+                geometry.max_cacheable_experts,
+                (double)geometry.per_expert_bytes / 1048576.0);
+        return false;
+    }
+    if ((uint64_t)cache_experts < geometry.warning_cache_experts) {
+        fprintf(stderr,
+                "ds4: WARNING: Qwen SSD cache %u is below the %" PRIu64
+                "-expert anti-thrashing tier\n",
+                cache_experts,
+                geometry.warning_cache_experts);
+    }
+
+    e->ssd_streaming_cache_experts = cache_experts;
+    e->ssd_streaming_cache_bytes =
+        (uint64_t)cache_experts * geometry.per_expert_bytes;
+    ds4_gpu_set_streaming_expert_cache_expert_bytes(
+        geometry.per_expert_bytes);
+    ds4_gpu_set_streaming_expert_cache_budget(cache_experts);
+    if (!ds4_gpu_set_model_fd(e->model.fd)) {
+        fprintf(stderr,
+                "ds4: Qwen SSD streaming failed to install the GGUF file descriptor\n");
+        return false;
+    }
+
+    ds4_model_map_span_vec exact_spans = {0};
+    uint64_t exact_payload_bytes = 0;
+    if (!qwen35_weights_model_map_non_routed_spans(
+            &e->model,
+            &e->qwen35_weights,
+            &exact_spans,
+            &exact_payload_bytes)) {
+        fprintf(stderr,
+                "ds4: Qwen SSD streaming could not build exact static spans\n");
+        return false;
+    }
+    if (exact_payload_bytes != static_payload_bytes) {
+        fprintf(stderr,
+                "ds4: Qwen SSD static payload changed between page and exact planning\n");
+        free(exact_spans.v);
+        return false;
+    }
+    const uint32_t exact_span_count = exact_spans.len;
+    const bool mapped = metal_graph_install_model_spans(
+        &e->model, &exact_spans, "Qwen non-routed");
+    free(exact_spans.v);
+    if (!mapped) return false;
+
+    const uint32_t configured =
+        ds4_gpu_stream_expert_cache_configured_count();
+    if ((uint64_t)configured < geometry.minimum_cache_experts ||
+        (uint64_t)configured > geometry.max_cacheable_experts) {
+        fprintf(stderr,
+                "ds4: Qwen SSD configured cache %u is outside the safe "
+                "%" PRIu64 "..%" PRIu64 " range after backend limits\n",
+                configured,
+                geometry.minimum_cache_experts,
+                geometry.max_cacheable_experts);
+        return false;
+    }
+
+    fprintf(stderr,
+            "ds4: experimental Qwen Metal SSD runtime: static %.2f GiB "
+            "payload / %.2f GiB page reserve, %u exact spans, cache %u "
+            "experts (%.2f GiB)\n",
+            (double)static_payload_bytes / 1073741824.0,
+            (double)static_page_coverage_bytes / 1073741824.0,
+            exact_span_count,
+            configured,
+            (double)e->ssd_streaming_cache_bytes / 1073741824.0);
+    return true;
+}
+#endif
+
 int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
     if (!out || !opt || !opt->model_path || !opt->model_path[0]) {
         fprintf(stderr, "ds4: engine open needs a model path and output pointer\n");
@@ -30504,68 +30821,109 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
             return 0;
         }
 
-        /* Keep the public runtime fail-closed until the exact release GGUF
-         * passes the model-backed DS4/llama.cpp logits gate.  This opt-in is a
-         * temporary validation seam, not a compatibility promise. */
-        const char *experimental_cpu =
-            getenv("DS4_QWEN_EXPERIMENTAL_CPU");
-        if (!experimental_cpu || strcmp(experimental_cpu, "1") != 0) {
+        /* Both executors remain behind exact-value validation gates.  A value
+         * other than the literal string "1" is deliberately not accepted. */
+        if (e->backend == DS4_BACKEND_CPU) {
+            const char *experimental_cpu =
+                getenv("DS4_QWEN_EXPERIMENTAL_CPU");
+            if (!experimental_cpu || strcmp(experimental_cpu, "1") != 0) {
+                fprintf(stderr,
+                        "ds4: Qwen3.6-35B-A3B metadata is valid, but inference is "
+                        "disabled until the model-backed logits gate passes\n");
+                ds4_engine_close(e);
+                return 1;
+            }
+            if (residency_requested == DS4_RESIDENCY_SSD ||
+                e->ssd_streaming_cache_experts != 0 ||
+                e->ssd_streaming_cache_bytes != 0 ||
+                e->ssd_streaming_preload_experts != 0 ||
+                e->ssd_streaming_cold) {
+                fprintf(stderr,
+                        "ds4: experimental Qwen CPU inference does not support SSD options\n");
+                ds4_engine_close(e);
+                return 1;
+            }
+            if (opt->mtp_path && opt->mtp_path[0]) {
+                fprintf(stderr,
+                        "ds4: experimental Qwen CPU inference does not support MTP\n");
+                ds4_engine_close(e);
+                return 1;
+            }
+            if (load_slice || opt->distributed.role != DS4_DISTRIBUTED_NONE) {
+                fprintf(stderr,
+                        "ds4: experimental Qwen CPU inference does not support "
+                        "layer slices or distributed execution\n");
+                ds4_engine_close(e);
+                return 1;
+            }
+            const char *expert_profile_env = getenv("DS4_EXPERT_PROFILE");
+            const char *expert_hotlist_env = getenv("DS4_EXPERT_HOTLIST");
+            if (e->directional_steering_file ||
+                (opt->expert_profile_path && opt->expert_profile_path[0]) ||
+                (expert_profile_env && expert_profile_env[0]) ||
+                (expert_hotlist_env && expert_hotlist_env[0])) {
+                fprintf(stderr,
+                        "ds4: experimental Qwen CPU inference does not support "
+                        "directional steering or expert profiles\n");
+                ds4_engine_close(e);
+                return 1;
+            }
+
+            vocab_load(&e->vocab, &e->model);
+            if (opt->warm_weights) model_warm_weights(&e->model);
+            e->residency = DS4_RESIDENCY_RESIDENT;
+            e->qwen_raw_runtime = true;
             fprintf(stderr,
-                    "ds4: Qwen3.6-35B-A3B metadata is valid, but inference is "
-                    "disabled until the model-backed logits gate passes\n");
-            ds4_engine_close(e);
-            return 1;
-        }
-        if (e->backend != DS4_BACKEND_CPU) {
-            fprintf(stderr,
-                    "ds4: experimental Qwen inference currently requires --cpu\n");
-            ds4_engine_close(e);
-            return 1;
-        }
-        if (residency_requested == DS4_RESIDENCY_SSD ||
-            e->ssd_streaming_cache_experts != 0 ||
-            e->ssd_streaming_cache_bytes != 0 ||
-            e->ssd_streaming_preload_experts != 0 ||
-            e->ssd_streaming_cold) {
-            fprintf(stderr,
-                    "ds4: experimental Qwen CPU inference does not support SSD options\n");
-            ds4_engine_close(e);
-            return 1;
-        }
-        if (opt->mtp_path && opt->mtp_path[0]) {
-            fprintf(stderr,
-                    "ds4: experimental Qwen CPU inference does not support MTP\n");
-            ds4_engine_close(e);
-            return 1;
-        }
-        if (load_slice || opt->distributed.role != DS4_DISTRIBUTED_NONE) {
-            fprintf(stderr,
-                    "ds4: experimental Qwen CPU inference does not support "
-                    "layer slices or distributed execution\n");
-            ds4_engine_close(e);
-            return 1;
-        }
-        const char *expert_profile_env = getenv("DS4_EXPERT_PROFILE");
-        const char *expert_hotlist_env = getenv("DS4_EXPERT_HOTLIST");
-        if (e->directional_steering_file ||
-            (opt->expert_profile_path && opt->expert_profile_path[0]) ||
-            (expert_profile_env && expert_profile_env[0]) ||
-            (expert_hotlist_env && expert_hotlist_env[0])) {
-            fprintf(stderr,
-                    "ds4: experimental Qwen CPU inference does not support "
-                    "directional steering or expert profiles\n");
-            ds4_engine_close(e);
-            return 1;
+                    "ds4: experimental Qwen CPU runtime enabled for model-backed validation\n");
+            *out = e;
+            return 0;
         }
 
+        const char *experimental_metal =
+            getenv("DS4_QWEN_EXPERIMENTAL_METAL");
+        if (!experimental_metal || strcmp(experimental_metal, "1") != 0) {
+            fprintf(stderr,
+                    "ds4: Qwen Metal inference requires "
+                    "DS4_QWEN_EXPERIMENTAL_METAL=1\n");
+            ds4_engine_close(e);
+            return 1;
+        }
+        if (!ds4_engine_qwen35_metal_options_valid(
+                e, opt, residency_requested, load_slice)) {
+            ds4_engine_close(e);
+            return 1;
+        }
+#if defined(__APPLE__) && !defined(DS4_NO_GPU)
+        if (!ds4_engine_resolve_residency(
+                e, opt, false, 0, 0, false) ||
+            e->residency != DS4_RESIDENCY_SSD || !e->ssd_streaming) {
+            fprintf(stderr,
+                    "ds4: Qwen Metal inference requires residency to resolve to SSD\n");
+            ds4_engine_close(e);
+            return 1;
+        }
+        if (opt->warm_weights) {
+            fprintf(stderr,
+                    "ds4: --warm-weights ignored for Qwen Metal SSD streaming\n");
+        }
         vocab_load(&e->vocab, &e->model);
-        if (opt->warm_weights) model_warm_weights(&e->model);
-        e->residency = DS4_RESIDENCY_RESIDENT;
+        if (!ds4_engine_configure_qwen35_metal_streaming(e)) {
+            ds4_engine_close(e);
+            return 1;
+        }
         e->qwen_raw_runtime = true;
+        e->qwen_metal_runtime = true;
         fprintf(stderr,
-                "ds4: experimental Qwen CPU runtime enabled for model-backed validation\n");
+                "ds4: experimental Qwen Metal SSD runtime enabled\n");
         *out = e;
         return 0;
+#else
+        fprintf(stderr,
+                "ds4: experimental Qwen Metal inference is available only "
+                "in an Apple Metal build\n");
+        ds4_engine_close(e);
+        return 1;
+#endif
     }
     weights_bind(&e->weights,
                  &e->model,
@@ -31117,6 +31475,10 @@ int ds4_engine_power(ds4_engine *e) {
 
 int ds4_engine_set_power(ds4_engine *e, int power_percent) {
     if (!e || power_percent < 1 || power_percent > 100) return 1;
+    if (e->model.family == DS4_MODEL_FAMILY_QWEN35_MOE &&
+        power_percent != 100) {
+        return 1;
+    }
     e->power_percent = power_percent;
     return 0;
 }
@@ -31183,36 +31545,8 @@ bool ds4_engine_context_memory_estimate_with_prefill(
         int                    ctx_size,
         uint32_t               prefill_chunk,
         ds4_context_memory    *out) {
-    if (!e || !out || ctx_size <= 0) return false;
-
-    if (e->model.family != DS4_MODEL_FAMILY_QWEN35_MOE) {
-        *out = ds4_context_memory_estimate_with_prefill(
-            e->backend, ctx_size, prefill_chunk);
-        return true;
-    }
-
-    ds4_qwen35_cpu_cache_plan cache = {0};
-    ds4_qwen35_cpu_scratch_plan scratch = {0};
-    if (!ds4_qwen35_cpu_cache_plan_make((uint32_t)ctx_size, &cache) ||
-        !ds4_qwen35_cpu_scratch_plan_make((uint32_t)ctx_size, &scratch)) {
-        return false;
-    }
-
-    /* The correctness runtime keeps full-attention K/V and recurrent state in
-     * F32, grows K/V up to ctx_size, and owns one physical-vocabulary logits
-     * vector.  Recurrent state is reported in compressed_bytes because it is
-     * the fixed-size counterpart to the context-dependent full-attention K/V. */
-    ds4_context_memory m = {0};
-    m.raw_bytes = cache.max_kv_bytes;
-    m.compressed_bytes = cache.fixed_bytes;
-    m.scratch_bytes = scratch.total_bytes +
-                      (uint64_t)QWEN35_N_VOCAB * sizeof(float);
-    m.prefill_cap = 1u;
-    m.raw_cap = (uint32_t)ctx_size;
-    m.total_bytes = m.raw_bytes + m.compressed_bytes + m.scratch_bytes;
-    (void)prefill_chunk;
-    *out = m;
-    return true;
+    return ds4_engine_context_memory_estimate_private(
+        e, ctx_size, prefill_chunk, out);
 }
 
 void ds4_engine_close(ds4_engine *e) {
@@ -31222,6 +31556,13 @@ void ds4_engine_close(ds4_engine *e) {
     vocab_free(&e->vocab);
     ds4_threads_shutdown();
 #ifndef DS4_NO_GPU
+    /* Model-backed Metal buffers and SSD cache entries retain mmap-backed
+     * pointers.  Fence and tear them down before model_close unmaps either
+     * GGUF, including partial-startup failure paths. */
+    if (e->metal_ready && ds4_gpu_synchronize() == 0) {
+        fprintf(stderr,
+                "ds4: accelerator synchronization failed during engine shutdown\n");
+    }
     ds4_gpu_cleanup();
 #endif
     if (e->mtp_ready) model_close(&e->mtp_model);
