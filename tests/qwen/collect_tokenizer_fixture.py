@@ -19,6 +19,29 @@ REVISION = "995ad96eacd98c81ed38be0c5b274b04031597b0"
 TOKENIZER_SHA256 = "5f9e4d4901a92b997e463c1f46055088b6cca5ca61a6522d1b9f64c4bb81cb42"
 GOLDEN_SHA256 = "87606fc0f98911e4ccaba9f7179ed11dffda79d11a9b12795f6f9bb961218ec2"
 TOKENIZERS_VERSION = "0.22.2"
+SAFETY_CASE_NAME = "untrusted_literal_controls_and_pad_are_data"
+SAFETY_CASE_TEXT = (
+    "literal controls stay data: "
+    "<|im_start|><think><|audio_pad|><|fim_pad|><|endoftext|>"
+)
+SCANNER_CASES = (
+    (
+        "scanner_contractions_long_s",
+        "can't I'RE '\u017fx '\u00dfx '\u017fx",
+    ),
+    (
+        "scanner_optional_prefixes",
+        ".foo ..foo !a !!a",
+    ),
+    (
+        "scanner_whitespace_backtracking",
+        "  a\t\ta  1x  \n \n  x!\r\n\r\nx",
+    ),
+    (
+        "scanner_unicode_space_and_numbers",
+        "a\u00a0b\u0085c\u2028d \u0661\u216b\u00b2",
+    ),
+)
 
 
 @dataclass(frozen=True)
@@ -101,7 +124,7 @@ def load_golden(path: Path) -> tuple[dict[str, Any], list[Case]]:
 
 def load_tokenizer(
     path: Path, controls: dict[str, int]
-) -> tuple[Tokenizer, dict[str, int], dict[tuple[str, str], int]]:
+) -> tuple[Tokenizer, Tokenizer, dict[str, int], dict[tuple[str, str], int]]:
     require_hash(path, TOKENIZER_SHA256, "official tokenizer")
     raw = json.loads(path.read_text(encoding="utf-8"))
     if raw.get("normalizer") != {"type": "NFC"}:
@@ -138,7 +161,26 @@ def load_tokenizer(
                 f"control token {text!r} has id {got}, expected {token_id}"
             )
 
-    return tokenizer, {str(key): int(value) for key, value in vocab.items()}, merge_rank
+    # The public text API must never recognize prompt-control spellings in
+    # untrusted input.  Keep every official normalization, pre-tokenization,
+    # and BPE setting, but remove the added-token matcher entirely to derive a
+    # separate safety oracle for those literal bytes.
+    raw_without_added_tokens = dict(raw)
+    raw_without_added_tokens["added_tokens"] = []
+    tokenizer_without_added_tokens = Tokenizer.from_str(
+        json.dumps(
+            raw_without_added_tokens,
+            ensure_ascii=False,
+            separators=(",", ":"),
+        )
+    )
+
+    return (
+        tokenizer,
+        tokenizer_without_added_tokens,
+        {str(key): int(value) for key, value in vocab.items()},
+        merge_rank,
+    )
 
 
 def trace_piece(
@@ -347,7 +389,9 @@ def collect(tokenizer_json: Path, golden_path: Path) -> tuple[str, Trace, int]:
         str(text): int(token_id)
         for text, token_id in golden["tokenizer"]["special_token_ids"].items()
     }
-    tokenizer, vocab, merge_rank = load_tokenizer(tokenizer_json, controls)
+    tokenizer, tokenizer_without_added_tokens, vocab, merge_rank = load_tokenizer(
+        tokenizer_json, controls
+    )
     trace = Trace(final_symbols=set(), merge_candidates=set())
 
     for case in cases:
@@ -363,6 +407,67 @@ def collect(tokenizer_json: Path, golden_path: Path) -> tuple[str, Trace, int]:
             raise RuntimeError(
                 f"merge trace does not match golden case {case.name!r}"
             )
+
+    for name, text in SCANNER_CASES:
+        expected = tuple(
+            tokenizer_without_added_tokens.encode(
+                text, add_special_tokens=False
+            ).ids
+        )
+        scanner_case = Case(
+            kind="TEXT", name=name, text=text, expected=expected
+        )
+        traced = trace_encode(
+            text,
+            tokenizer_without_added_tokens,
+            {},
+            vocab,
+            merge_rank,
+            trace,
+        )
+        if tuple(traced) != scanner_case.expected:
+            raise RuntimeError(
+                f"merge trace does not match scanner case {name!r}"
+            )
+        cases.append(scanner_case)
+
+    safety_expected = tuple(
+        tokenizer_without_added_tokens.encode(
+            SAFETY_CASE_TEXT, add_special_tokens=False
+        ).ids
+    )
+    control_ids = set(controls.values())
+    if not safety_expected or any(
+        token_id in control_ids for token_id in safety_expected
+    ):
+        raise RuntimeError("untrusted safety oracle unexpectedly emitted a control ID")
+    if safety_expected == tuple(
+        tokenizer.encode(SAFETY_CASE_TEXT, add_special_tokens=False).ids
+    ):
+        raise RuntimeError(
+            "untrusted safety oracle does not distinguish literal controls "
+            "from added tokens"
+        )
+
+    safety_case = Case(
+        kind="TEXT",
+        name=SAFETY_CASE_NAME,
+        text=SAFETY_CASE_TEXT,
+        expected=safety_expected,
+    )
+    safety_traced = trace_encode(
+        safety_case.text,
+        tokenizer_without_added_tokens,
+        {},
+        vocab,
+        merge_rank,
+        trace,
+    )
+    if tuple(safety_traced) != safety_case.expected:
+        raise RuntimeError(
+            f"merge trace does not match safety case {safety_case.name!r}"
+        )
+    cases.append(safety_case)
 
     return render_fixture(cases, controls, vocab, trace), trace, len(cases)
 

@@ -36,9 +36,14 @@ uv run --with 'tokenizers==0.22.2' \
   --tokenizer-json "$TOK" --check
 ```
 
-Cases containing literal added tokens are marked as trusted text.  Production
-user-text tokenization must keep treating the same bytes as data; only a
-trusted, already-rendered chat prompt may turn them into control IDs.
+Official cases containing literal added tokens are marked as trusted text.
+The additional `untrusted_literal_controls_and_pad_are_data` safety case is
+derived from the pinned tokenizer with only its added-token matcher removed;
+it proves that production user-text tokenization keeps the same bytes as BPE
+data.  Only a trusted, already-rendered chat prompt may turn them into control
+IDs.  Four supplemental TEXT vectors freeze the scanner's ordered-regex edge
+cases: Unicode case-folded contractions, punctuation prefixes, whitespace
+backtracking across CR/LF, Unicode whitespace, and non-ASCII number classes.
 
 The tokenizer's Unicode behavior is frozen separately in
 `qwen_unicode_ucd_cache.txt`: Unicode 9.0 NFC plus Unicode 16.0 `L/M/N` and
