@@ -105,12 +105,16 @@ static bool cancel_after_first_forward(void *ud) {
 }
 
 static void fake_qwen_engine(ds4_engine *engine, bool raw_runtime) {
+    static ds4_tensor routed_gate = {.type = DS4_TENSOR_Q4_K};
+    static ds4_tensor output = {.type = DS4_TENSOR_Q8_0};
     memset(engine, 0, sizeof(*engine));
     engine->model.fd = -1;
     engine->mtp_model.fd = -1;
     engine->model.family = DS4_MODEL_FAMILY_QWEN35_MOE;
     engine->backend = DS4_BACKEND_CPU;
     engine->qwen_raw_runtime = raw_runtime;
+    engine->qwen35_weights.layer[0].ffn_gate_exps = &routed_gate;
+    engine->qwen35_weights.output = &output;
 }
 
 static void test_session_creation_boundary(void) {
@@ -131,6 +135,8 @@ static void test_dynamic_logits(ds4_session *session) {
     CHECK(ds4_engine_vocab_size(session->engine) == QWEN35_N_VOCAB);
     CHECK(ds4_engine_effective_vocab_size(session->engine) ==
           QWEN35_N_VALID_TOKEN);
+    CHECK(ds4_engine_routed_quant_bits(session->engine) == 4);
+    CHECK(ds4_engine_has_output_head(session->engine));
     float *input = malloc((size_t)n_vocab * sizeof(input[0]));
     float *copy = malloc(((size_t)n_vocab + 1u) * sizeof(copy[0]));
     CHECK(input != NULL && copy != NULL);

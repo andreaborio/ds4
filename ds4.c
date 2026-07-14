@@ -26734,6 +26734,11 @@ int ds4_session_load_layer_payload(ds4_session *s, FILE *fp,
 
 int ds4_engine_routed_quant_bits(ds4_engine *e) {
     if (!e) return 0;
+    if (e->model.family == DS4_MODEL_FAMILY_QWEN35_MOE) {
+        const ds4_tensor *gate =
+            e->qwen35_weights.layer[0].ffn_gate_exps;
+        return gate && gate->type == DS4_TENSOR_Q4_K ? 4 : 0;
+    }
     for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
         const ds4_tensor *gate = e->weights.layer[il].ffn_gate_exps;
         if (!gate) continue;
@@ -26743,6 +26748,9 @@ int ds4_engine_routed_quant_bits(ds4_engine *e) {
 }
 
 bool ds4_engine_has_output_head(ds4_engine *e) {
+    if (e && e->model.family == DS4_MODEL_FAMILY_QWEN35_MOE) {
+        return e->qwen35_weights.output != NULL;
+    }
     return e && weights_have_output_head(&e->weights);
 }
 
@@ -28843,11 +28851,69 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
             *out = e;
             return 0;
         }
+
+        /* Keep the public runtime fail-closed until the exact release GGUF
+         * passes the model-backed DS4/llama.cpp logits gate.  This opt-in is a
+         * temporary validation seam, not a compatibility promise. */
+        const char *experimental_cpu =
+            getenv("DS4_QWEN_EXPERIMENTAL_CPU");
+        if (!experimental_cpu || strcmp(experimental_cpu, "1") != 0) {
+            fprintf(stderr,
+                    "ds4: Qwen3.6-35B-A3B metadata is valid, but inference is "
+                    "disabled until the model-backed logits gate passes\n");
+            ds4_engine_close(e);
+            return 1;
+        }
+        if (e->backend != DS4_BACKEND_CPU) {
+            fprintf(stderr,
+                    "ds4: experimental Qwen inference currently requires --cpu\n");
+            ds4_engine_close(e);
+            return 1;
+        }
+        if (residency_requested == DS4_RESIDENCY_SSD ||
+            e->ssd_streaming_cache_experts != 0 ||
+            e->ssd_streaming_cache_bytes != 0 ||
+            e->ssd_streaming_preload_experts != 0 ||
+            e->ssd_streaming_cold) {
+            fprintf(stderr,
+                    "ds4: experimental Qwen CPU inference does not support SSD options\n");
+            ds4_engine_close(e);
+            return 1;
+        }
+        if (opt->mtp_path && opt->mtp_path[0]) {
+            fprintf(stderr,
+                    "ds4: experimental Qwen CPU inference does not support MTP\n");
+            ds4_engine_close(e);
+            return 1;
+        }
+        if (load_slice || opt->distributed.role != DS4_DISTRIBUTED_NONE) {
+            fprintf(stderr,
+                    "ds4: experimental Qwen CPU inference does not support "
+                    "layer slices or distributed execution\n");
+            ds4_engine_close(e);
+            return 1;
+        }
+        const char *expert_profile_env = getenv("DS4_EXPERT_PROFILE");
+        const char *expert_hotlist_env = getenv("DS4_EXPERT_HOTLIST");
+        if (e->directional_steering_file ||
+            (opt->expert_profile_path && opt->expert_profile_path[0]) ||
+            (expert_profile_env && expert_profile_env[0]) ||
+            (expert_hotlist_env && expert_hotlist_env[0])) {
+            fprintf(stderr,
+                    "ds4: experimental Qwen CPU inference does not support "
+                    "directional steering or expert profiles\n");
+            ds4_engine_close(e);
+            return 1;
+        }
+
+        vocab_load(&e->vocab, &e->model);
+        if (opt->warm_weights) model_warm_weights(&e->model);
+        e->residency = DS4_RESIDENCY_RESIDENT;
+        e->qwen_raw_runtime = true;
         fprintf(stderr,
-                "ds4: Qwen3.6-35B-A3B metadata is valid, but inference is "
-                "disabled until the model-backed logits gate passes\n");
-        ds4_engine_close(e);
-        return 1;
+                "ds4: experimental Qwen CPU runtime enabled for model-backed validation\n");
+        *out = e;
+        return 0;
     }
     weights_bind(&e->weights,
                  &e->model,
