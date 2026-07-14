@@ -3464,6 +3464,9 @@ kernel void kernel_mul_mv_slots6_q4_K_sum6_f32(
         ushort tiitg[[thread_index_in_threadgroup]],
         ushort tiisg[[thread_index_in_simdgroup]],
         ushort sgitg[[simdgroup_index_in_threadgroup]]) {
+    const int n_expert = args.nei0;
+    if (n_expert <= 0 || n_expert > 6) return;
+
     const short NSG = FC_mul_mv_nsg;
     const short nr0 = N_R0_Q4_K;
     const int nb = args.ne00 / QK_K;
@@ -3484,7 +3487,7 @@ kernel void kernel_mul_mv_slots6_q4_K_sum6_f32(
     uint16_t sc16[4];
     thread const uint8_t *sc8 = (thread const uint8_t *)sc16;
 
-    for (int expert_slot = 0; expert_slot < 6; expert_slot++) {
+    for (int expert_slot = 0; expert_slot < n_expert; expert_slot++) {
         device const char *src0_cur = src00;
         switch (expert_slot) {
         case 1: src0_cur = src01; break;

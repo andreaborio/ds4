@@ -21675,10 +21675,12 @@ static int ds4_gpu_encode_mul_mv_slots6_pair_swiglu(
         bool                        rows_per_group_is_nr0) {
     if (!cb || !pipeline || !args || !act || !src0_a || !src0_a_off || !src0_b || !src0_b_off ||
         !src1 || !dst_a || !dst_b || !dst_mid || !weights ||
-        args->ne00 <= 0 || args->ne01 <= 0 || args->nei0 != 6 || args->nei1 <= 0) {
+        args->ne00 <= 0 || args->ne01 <= 0 ||
+        args->nei0 <= 0 || args->nei0 > 6 || args->nei1 <= 0) {
         return 0;
     }
-    for (uint32_t i = 0; i < 6; i++) {
+    const uint32_t n_expert = (uint32_t)args->nei0;
+    for (uint32_t i = 0; i < n_expert; i++) {
         if (!src0_a[i] || !src0_b[i]) return 0;
     }
 
@@ -21691,11 +21693,16 @@ static int ds4_gpu_encode_mul_mv_slots6_pair_swiglu(
     [enc setComputePipelineState:pipeline];
     [enc setBytes:args length:sizeof(*args) atIndex:0];
     [enc setBytes:act  length:sizeof(*act)  atIndex:1];
+    /* Metal validates every declared buffer argument even though runtime
+     * dispatch never selects slots >= n_expert. Anchor those inactive
+     * arguments to slot zero instead of binding nil. */
     for (uint32_t i = 0; i < 6; i++) {
-        [enc setBuffer:src0_a[i] offset:src0_a_off[i] atIndex:2 + i];
+        const uint32_t slot = i < n_expert ? i : 0u;
+        [enc setBuffer:src0_a[slot] offset:src0_a_off[slot] atIndex:2 + i];
     }
     for (uint32_t i = 0; i < 6; i++) {
-        [enc setBuffer:src0_b[i] offset:src0_b_off[i] atIndex:8 + i];
+        const uint32_t slot = i < n_expert ? i : 0u;
+        [enc setBuffer:src0_b[slot] offset:src0_b_off[slot] atIndex:8 + i];
     }
     [enc setBuffer:src1    offset:src1_off    atIndex:14];
     [enc setBuffer:dst_a   offset:dst_a_off   atIndex:15];
@@ -21724,10 +21731,12 @@ static int ds4_gpu_encode_mul_mv_slots6_sum6(
         NSUInteger                  threadgroup_bytes,
         NSUInteger                  nsg) {
     if (!cb || !pipeline || !args || !src0 || !src0_off || !src1 || !dst ||
-        args->ne00 <= 0 || args->ne01 <= 0 || args->nei0 != 6 || args->nei1 <= 0) {
+        args->ne00 <= 0 || args->ne01 <= 0 ||
+        args->nei0 <= 0 || args->nei0 > 6 || args->nei1 <= 0) {
         return 0;
     }
-    for (uint32_t i = 0; i < 6; i++) {
+    const uint32_t n_expert = (uint32_t)args->nei0;
+    for (uint32_t i = 0; i < n_expert; i++) {
         if (!src0[i]) return 0;
     }
 
@@ -21737,8 +21746,10 @@ static int ds4_gpu_encode_mul_mv_slots6_sum6(
     id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
     [enc setComputePipelineState:pipeline];
     [enc setBytes:args length:sizeof(*args) atIndex:0];
+    /* Keep all six ABI bindings valid while the kernel reduces only nei0. */
     for (uint32_t i = 0; i < 6; i++) {
-        [enc setBuffer:src0[i] offset:src0_off[i] atIndex:1 + i];
+        const uint32_t slot = i < n_expert ? i : 0u;
+        [enc setBuffer:src0[slot] offset:src0_off[slot] atIndex:1 + i];
     }
     [enc setBuffer:src1 offset:src1_off atIndex:7];
     [enc setBuffer:dst  offset:dst_off  atIndex:8];
@@ -23815,14 +23826,12 @@ int ds4_gpu_routed_moe_one_tensor(
             !use_q4_gather_slots &&
             gate_type == DS4_METAL_TENSOR_Q4_K &&
             down_type == DS4_METAL_TENSOR_Q4_K &&
-            n_expert == 6 &&
             n_tokens == 1 &&
             n_total_expert >= 128 &&
             (g_ssd_streaming_mode ||
              (gate_tensor_bytes >= q4_selected_min_tensor_bytes &&
               down_tensor_bytes >= q4_selected_min_tensor_bytes)) &&
             fuse_pair_swiglu &&
-            direct_down_sum &&
             ds4_gpu_q4_selected_paths_allowed() &&
             g_moe_mul_mv_slots6_q4_k_pair_swiglu_pipeline != nil &&
             g_moe_mul_mv_slots6_q4_k_sum6_pipeline != nil &&
@@ -23839,6 +23848,28 @@ int ds4_gpu_routed_moe_one_tensor(
             g_moe_mul_mv_slots6_q2_k_sum6_pipeline != nil &&
             getenv("DS4_METAL_DISABLE_IQ2_SELECTED_EXPERT_VIEWS") == NULL;
         const bool use_selected_slots = use_q4_selected_slots || use_iq2_selected_slots;
+        const bool q4_selected_slots_required =
+            g_ssd_streaming_mode &&
+            gate_type == DS4_METAL_TENSOR_Q4_K &&
+            down_type == DS4_METAL_TENSOR_Q4_K &&
+            n_tokens == 1 &&
+            n_total_expert >= 128 &&
+            !use_q4_grouped_experts &&
+            !use_q4_group6_experts &&
+            !use_q4_group8_experts &&
+            !use_q4_group24_experts &&
+            !use_q4_exact_tensor_id &&
+            !use_q4_expert_address_table &&
+            !use_q4_expert_table &&
+            !use_q4_gather_slots;
+        if (q4_selected_slots_required && !use_q4_selected_slots) {
+            fprintf(stderr,
+                    "ds4: Metal SSD Q4 routed MoE requires selected expert slots; "
+                    "refusing full expert tensor fallback\n");
+            return 0;
+        }
+        const bool selected_slots_down_sum =
+            use_q4_gather_slots || use_selected_slots;
         id<MTLComputePipelineState> slots_pair_swiglu_pipeline =
             use_iq2_selected_slots ? g_moe_mul_mv_slots6_iq2_xxs_pair_swiglu_pipeline :
             g_moe_mul_mv_slots6_q4_k_pair_swiglu_pipeline;
@@ -24297,7 +24328,7 @@ int ds4_gpu_routed_moe_one_tensor(
             }
 
             if (selected_ids_available) {
-                for (uint32_t i = 0; i < 6; i++) {
+                for (uint32_t i = 0; i < n_expert; i++) {
                     if (selected_ids[i] < 0 || (uint32_t)selected_ids[i] >= n_total_expert) {
                         fprintf(stderr,
                                 "ds4: Metal routed MoE selected expert id %d is outside 0..%u\n",
@@ -24317,7 +24348,7 @@ int ds4_gpu_routed_moe_one_tensor(
                     return 0;
                 }
 
-                for (uint32_t i = 0; i < 6; i++) {
+                for (uint32_t i = 0; i < n_expert; i++) {
                     const uint64_t expert_id = (uint64_t)(uint32_t)selected_ids[i];
                     if (expert_id > UINT64_MAX / gate_expert_bytes ||
                         expert_id > UINT64_MAX / down_expert_bytes) {
@@ -24571,12 +24602,12 @@ int ds4_gpu_routed_moe_one_tensor(
                         selected_path,
                         selected_view_mode,
                         selected_id_source,
-                        selected_ids_available ? selected_ids[0] : -1,
-                        selected_ids_available ? selected_ids[1] : -1,
-                        selected_ids_available ? selected_ids[2] : -1,
-                        selected_ids_available ? selected_ids[3] : -1,
-                        selected_ids_available ? selected_ids[4] : -1,
-                        selected_ids_available ? selected_ids[5] : -1,
+                        selected_ids_available && n_expert > 0 ? selected_ids[0] : -1,
+                        selected_ids_available && n_expert > 1 ? selected_ids[1] : -1,
+                        selected_ids_available && n_expert > 2 ? selected_ids[2] : -1,
+                        selected_ids_available && n_expert > 3 ? selected_ids[3] : -1,
+                        selected_ids_available && n_expert > 4 ? selected_ids[4] : -1,
+                        selected_ids_available && n_expert > 5 ? selected_ids[5] : -1,
                         ds4_gpu_mib(gate_expert_bytes),
                         ds4_gpu_mib(down_expert_bytes),
                         selected_read_ms,
@@ -25634,7 +25665,8 @@ int ds4_gpu_routed_moe_one_tensor(
                                                  false);
         }
         DS4_METAL_PROFILE_MOE_ONE_STAGE("down");
-        if (ok && n_expert > 1 && !direct_down_sum && !stream_expert_split_completed) {
+        if (ok && n_expert > 1 && !direct_down_sum &&
+            !selected_slots_down_sum && !stream_expert_split_completed) {
             ok = ds4_gpu_encode_moe_sum_experts(cb,
                                                        down_dst,
                                                        down_dst_off,
@@ -25775,7 +25807,6 @@ int ds4_gpu_routed_moe_batch_tensor(
         gate_type == DS4_METAL_TENSOR_Q4_K &&
         down_type == DS4_METAL_TENSOR_Q4_K &&
         n_tokens == 1 &&
-        n_expert == 6 &&
         n_total_expert >= 128 &&
         (g_ssd_streaming_mode ||
          (gate_tensor_bytes >= q4_selected_min_tensor_bytes &&
@@ -25791,6 +25822,19 @@ int ds4_gpu_routed_moe_batch_tensor(
          can_single_token_q4_expert_address_table ||
          can_single_token_q4_expert_table ||
          can_single_token_q4_selected_slots);
+    const bool single_token_q4_one_tensor_required =
+        g_ssd_streaming_mode &&
+        gate_type == DS4_METAL_TENSOR_Q4_K &&
+        down_type == DS4_METAL_TENSOR_Q4_K &&
+        n_tokens == 1 &&
+        n_total_expert >= 128;
+    if (single_token_q4_one_tensor_required &&
+        !use_single_token_q4_one_tensor) {
+        fprintf(stderr,
+                "ds4: Metal SSD Q4 routed batch MoE requires the selected-slot "
+                "one-token path; refusing full expert tensor fallback\n");
+        return 0;
+    }
     if (use_single_token_q4_one_tensor) {
         if (mid_is_f16) *mid_is_f16 = false;
         return ds4_gpu_routed_moe_one_tensor(out,

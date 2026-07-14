@@ -5,6 +5,12 @@
 #include "../ds4_gpu.h"
 #include "../ds4_qwen.h"
 #include <math.h>
+#ifdef __APPLE__
+#include <fcntl.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <unistd.h>
+#endif
 
 static ds4_engine *test_engine_fast;
 static ds4_engine *test_engine_quality;
@@ -1237,12 +1243,287 @@ static void test_metal_qwen35_primitives(void) {
     free(model_raw);
 }
 
+#ifdef __APPLE__
+typedef struct {
+    uint16_t d;
+    uint16_t dmin;
+    uint8_t scales[12];
+    uint8_t qs[128];
+} test_metal_q4_k_block;
+
+_Static_assert(sizeof(test_metal_q4_k_block) == 144,
+               "Q4_K test block ABI drift");
+
+typedef struct {
+    float out[2];
+    uint64_t hits;
+    uint64_t misses;
+    uint64_t pread_bytes;
+    uint32_t current_entries;
+} test_metal_q4_slots_result;
+
+static void test_metal_q4_k_fill_constant(
+        test_metal_q4_k_block *block,
+        uint8_t                value) {
+    memset(block, 0, sizeof(*block));
+    block->d = test_float_to_f16(1.0f);
+    for (uint32_t group = 0; group < 4; group++) {
+        block->scales[group] = 1;
+    }
+    for (uint32_t group = 4; group < 8; group++) {
+        block->scales[group + 4] = 1;
+    }
+    memset(block->qs, (int)(value | (uint8_t)(value << 4)),
+           sizeof(block->qs));
+}
+
+static bool test_metal_q4_selected_slots_case(
+        const void                     *model_map,
+        uint64_t                        model_size,
+        uint64_t                        gate_offset,
+        uint64_t                        up_offset,
+        uint64_t                        down_offset,
+        uint64_t                        gate_expert_bytes,
+        uint64_t                        down_expert_bytes,
+        uint32_t                        n_expert,
+        bool                            check_undersized,
+        test_metal_q4_slots_result     *result) {
+    enum {
+        IN_DIM = 256,
+        MID_DIM = 256,
+        OUT_DIM = 2,
+        TOTAL_EXPERT = 128,
+        GGML_TYPE_Q4_K = 12,
+    };
+    const uint64_t gate_row_bytes = sizeof(test_metal_q4_k_block);
+    const uint64_t down_row_bytes = sizeof(test_metal_q4_k_block);
+    const uint64_t mid_bytes =
+        (uint64_t)n_expert * MID_DIM * sizeof(float);
+    const uint64_t expert_out_bytes =
+        (uint64_t)n_expert * OUT_DIM * sizeof(float);
+    int32_t selected_host[6] = {0, 1, 2, 3, 4, 5};
+    float weight_host[6] = {0.1f, 0.2f, 0.3f, 0.4f, 0.0f, 0.0f};
+    float input_host[IN_DIM];
+    for (uint32_t i = 0; i < IN_DIM; i++) {
+        input_host[i] = 1.0f / (float)IN_DIM;
+    }
+
+    ds4_gpu_tensor *out = ds4_gpu_tensor_alloc(OUT_DIM * sizeof(float));
+    ds4_gpu_tensor *gate = ds4_gpu_tensor_alloc(mid_bytes);
+    ds4_gpu_tensor *up = ds4_gpu_tensor_alloc(mid_bytes);
+    ds4_gpu_tensor *mid = ds4_gpu_tensor_alloc(mid_bytes);
+    ds4_gpu_tensor *experts = ds4_gpu_tensor_alloc(expert_out_bytes);
+    ds4_gpu_tensor *selected = ds4_gpu_tensor_alloc(
+        (uint64_t)n_expert * sizeof(int32_t));
+    ds4_gpu_tensor *weights = ds4_gpu_tensor_alloc(
+        (uint64_t)n_expert * sizeof(float));
+    ds4_gpu_tensor *input = ds4_gpu_tensor_alloc(sizeof(input_host));
+    bool ok = out && gate && up && mid && experts && selected && weights && input;
+    TEST_ASSERT(ok);
+    if (!ok) goto cleanup;
+
+    ok = ds4_gpu_tensor_write(selected, 0, selected_host,
+                              (uint64_t)n_expert * sizeof(int32_t)) != 0 &&
+         ds4_gpu_tensor_write(weights, 0, weight_host,
+                              (uint64_t)n_expert * sizeof(float)) != 0 &&
+         ds4_gpu_tensor_write(input, 0, input_host,
+                              sizeof(input_host)) != 0 &&
+         ds4_gpu_tensor_fill_f32(experts, -1234.0f,
+                                 (uint64_t)n_expert * OUT_DIM) != 0;
+    TEST_ASSERT(ok);
+    if (!ok) goto cleanup;
+
+    if (check_undersized) {
+        ds4_gpu_tensor *short_mid = ds4_gpu_tensor_alloc(mid_bytes - sizeof(float));
+        TEST_ASSERT(short_mid != NULL);
+        if (short_mid) {
+            TEST_ASSERT(!ds4_gpu_routed_moe_one_tensor(
+                out, gate, up, short_mid, experts,
+                model_map, model_size,
+                gate_offset, up_offset, down_offset,
+                GGML_TYPE_Q4_K, GGML_TYPE_Q4_K,
+                gate_expert_bytes, gate_row_bytes,
+                down_expert_bytes, down_row_bytes,
+                IN_DIM, MID_DIM, OUT_DIM,
+                selected, weights, TOTAL_EXPERT, n_expert,
+                0.0f, input, 0));
+            ds4_gpu_tensor_free(short_mid);
+        }
+    }
+
+    ok = ds4_gpu_routed_moe_one_tensor(
+        out, gate, up, mid, experts,
+        model_map, model_size,
+        gate_offset, up_offset, down_offset,
+        GGML_TYPE_Q4_K, GGML_TYPE_Q4_K,
+        gate_expert_bytes, gate_row_bytes,
+        down_expert_bytes, down_row_bytes,
+        IN_DIM, MID_DIM, OUT_DIM,
+        selected, weights, TOTAL_EXPERT, n_expert,
+        0.0f, input, 0) != 0;
+    TEST_ASSERT(ok);
+    if (!ok) goto cleanup;
+
+    ok = ds4_gpu_tensor_read(out, 0, result->out, sizeof(result->out)) != 0;
+    TEST_ASSERT(ok);
+    if (!ok) goto cleanup;
+    ds4_gpu_stream_expert_cache_stats(
+        &result->hits, &result->misses, &result->pread_bytes, NULL, NULL);
+    result->current_entries = ds4_gpu_stream_expert_cache_current_count();
+
+cleanup:
+    ds4_gpu_tensor_free(out);
+    ds4_gpu_tensor_free(gate);
+    ds4_gpu_tensor_free(up);
+    ds4_gpu_tensor_free(mid);
+    ds4_gpu_tensor_free(experts);
+    ds4_gpu_tensor_free(selected);
+    ds4_gpu_tensor_free(weights);
+    ds4_gpu_tensor_free(input);
+    return ok;
+}
+
+static void test_metal_q4_selected_slots_runtime_count(void) {
+    enum {
+        MID_DIM = 256,
+        OUT_DIM = 2,
+        TOTAL_EXPERT = 128,
+    };
+    const uint64_t row_bytes = sizeof(test_metal_q4_k_block);
+    const uint64_t gate_expert_bytes = MID_DIM * row_bytes;
+    const uint64_t down_expert_bytes = OUT_DIM * row_bytes;
+    const uint64_t gate_tensor_bytes = TOTAL_EXPERT * gate_expert_bytes;
+    const uint64_t down_tensor_bytes = TOTAL_EXPERT * down_expert_bytes;
+    const uint64_t gate_offset = 0;
+    const uint64_t up_offset = gate_tensor_bytes;
+    const uint64_t down_offset = gate_tensor_bytes * 2u;
+    const uint64_t model_size = down_offset + down_tensor_bytes;
+    const uint64_t per_expert_bytes =
+        gate_expert_bytes * 2u + down_expert_bytes;
+    char path[] = "/tmp/ds4-q4-slots-XXXXXX";
+    int fd = mkstemp(path);
+    TEST_ASSERT(fd >= 0);
+    if (fd < 0) return;
+    unlink(path);
+    const bool file_sized = ftruncate(fd, (off_t)model_size) == 0;
+    TEST_ASSERT(file_sized);
+    if (!file_sized) {
+        close(fd);
+        return;
+    }
+    void *model_map = mmap(NULL, (size_t)model_size,
+                           PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    TEST_ASSERT(model_map != MAP_FAILED);
+    if (model_map == MAP_FAILED) {
+        close(fd);
+        return;
+    }
+
+    uint8_t *base = model_map;
+    for (uint32_t expert = 0; expert < TOTAL_EXPERT; expert++) {
+        const uint8_t value = (uint8_t)(expert % 15u + 1u);
+        for (uint32_t row = 0; row < MID_DIM; row++) {
+            test_metal_q4_k_fill_constant(
+                (test_metal_q4_k_block *)(base + gate_offset +
+                    (uint64_t)expert * gate_expert_bytes +
+                    (uint64_t)row * row_bytes),
+                1u);
+            test_metal_q4_k_fill_constant(
+                (test_metal_q4_k_block *)(base + up_offset +
+                    (uint64_t)expert * gate_expert_bytes +
+                    (uint64_t)row * row_bytes),
+                value);
+        }
+        for (uint32_t row = 0; row < OUT_DIM; row++) {
+            test_metal_q4_k_fill_constant(
+                (test_metal_q4_k_block *)(base + down_offset +
+                    (uint64_t)expert * down_expert_bytes +
+                    (uint64_t)row * row_bytes),
+                value);
+        }
+    }
+    TEST_ASSERT(msync(model_map, (size_t)model_size, MS_SYNC) == 0);
+
+    char *saved_disable_selected =
+        test_save_env("DS4_METAL_DISABLE_Q4_SELECTED_EXPERT_VIEWS");
+    char *saved_disable_pair =
+        test_save_env("DS4_METAL_DISABLE_ROUTED_PAIR_SWIGLU_FUSION");
+    char *saved_clamped =
+        test_save_env("DS4_METAL_MOE_WRITE_CLAMPED_ACT");
+    unsetenv("DS4_METAL_DISABLE_Q4_SELECTED_EXPERT_VIEWS");
+    unsetenv("DS4_METAL_DISABLE_ROUTED_PAIR_SWIGLU_FUSION");
+    unsetenv("DS4_METAL_MOE_WRITE_CLAMPED_ACT");
+
+    ds4_gpu_set_quality(false);
+    ds4_gpu_set_model_fd(fd);
+    ds4_gpu_set_streaming_expert_cache_expert_bytes(per_expert_bytes);
+    ds4_gpu_set_streaming_expert_cache_budget(6);
+    ds4_gpu_set_ssd_streaming(true);
+
+    test_metal_q4_slots_result top4 = {0};
+    TEST_ASSERT(test_metal_q4_selected_slots_case(
+        model_map, model_size,
+        gate_offset, up_offset, down_offset,
+        gate_expert_bytes, down_expert_bytes,
+        4, true, &top4));
+    TEST_ASSERT(top4.hits == 0);
+    TEST_ASSERT(top4.misses == 4);
+    TEST_ASSERT(top4.pread_bytes == 4u * per_expert_bytes);
+    TEST_ASSERT(top4.current_entries == 4);
+
+    ds4_gpu_set_streaming_expert_cache_budget(6);
+    test_metal_q4_slots_result top6 = {0};
+    TEST_ASSERT(test_metal_q4_selected_slots_case(
+        model_map, model_size,
+        gate_offset, up_offset, down_offset,
+        gate_expert_bytes, down_expert_bytes,
+        6, false, &top6));
+    TEST_ASSERT(top6.hits == 0);
+    TEST_ASSERT(top6.misses == 6);
+    TEST_ASSERT(top6.pread_bytes == 6u * per_expert_bytes);
+    TEST_ASSERT(top6.current_entries == 6);
+
+    const float silu_one = 1.0f / (1.0f + expf(-1.0f));
+    const float expected = 256.0f * silu_one * 10.0f;
+    for (uint32_t row = 0; row < OUT_DIM; row++) {
+        TEST_ASSERT(isfinite(top4.out[row]));
+        TEST_ASSERT(fabsf(top4.out[row] - expected) < 0.1f);
+        TEST_ASSERT(fabsf(top6.out[row] - top4.out[row]) < 1.0e-4f);
+    }
+
+    fprintf(stderr,
+            "ds4-test: Q4 selected slots n=4/n=6 output=%.6f "
+            "misses=%llu/%llu pread=%llu/%llu\n",
+            top4.out[0],
+            (unsigned long long)top4.misses,
+            (unsigned long long)top6.misses,
+            (unsigned long long)top4.pread_bytes,
+            (unsigned long long)top6.pread_bytes);
+
+    ds4_gpu_set_ssd_streaming(false);
+    ds4_gpu_set_streaming_expert_cache_budget(0);
+    ds4_gpu_set_streaming_expert_cache_expert_bytes(0);
+    ds4_gpu_set_model_fd(-1);
+    test_restore_env("DS4_METAL_MOE_WRITE_CLAMPED_ACT", saved_clamped);
+    test_restore_env("DS4_METAL_DISABLE_ROUTED_PAIR_SWIGLU_FUSION",
+                     saved_disable_pair);
+    test_restore_env("DS4_METAL_DISABLE_Q4_SELECTED_EXPERT_VIEWS",
+                     saved_disable_selected);
+    munmap(model_map, (size_t)model_size);
+    close(fd);
+}
+#else
+static void test_metal_q4_selected_slots_runtime_count(void) {
+}
+#endif
+
 static void test_metal_kernel_group(void) {
     test_metal_qwen35_graph_state();
     test_metal_f16_matvec_fast_nr0_4();
     test_metal_f16_prefill_matmul();
     test_metal_q8_0_prefill_matmul();
     test_metal_qwen35_primitives();
+    test_metal_q4_selected_slots_runtime_count();
 }
 
 static void test_metal_short_prefill_ratio4(void) {
