@@ -11928,14 +11928,15 @@ static void print_vec_stats(const char *name, const float *x, uint64_t n) {
 #endif
 
 /* =========================================================================
- * Qwen3.6 Metal Graph State (not yet wired to the runtime).
+ * Qwen3.6 Metal Graph State (experimental SSD runtime).
  * =========================================================================
  *
  * Qwen does not share DeepSeek's HC, compressed-cache, or MTP graph geometry.
  * Keep its persistent state and one-token scratch in a separate private graph
  * so bringing up the executor cannot silently inherit those assumptions.  The
- * allocation below is deliberately model-free and has no engine/session call
- * site yet; tests exercise only its shape, initialization, and lifetime.
+ * The engine/session path constructs this graph only behind the exact
+ * DS4_QWEN_EXPERIMENTAL_METAL=1 validation gate; model-free tests separately
+ * exercise its shape, initialization, and lifetime.
  *
  * Routed MoE scratch is four experts wide and reused for each half of Qwen's
  * top-8 selection.  The two partial output tensors retain the split results
@@ -12383,8 +12384,8 @@ static bool qwen35_gpu_graph_alloc(
 }
 
 /* Opaque lifecycle hooks for tests/ds4_test.c.  They intentionally have no
- * declaration in ds4.h: the graph remains a private implementation detail and
- * no engine/session path can construct it through the public API. */
+ * declaration in ds4.h: the graph remains a private implementation detail,
+ * constructed by the engine/session runtime rather than exposed publicly. */
 size_t ds4_internal_qwen35_gpu_graph_size(void) {
     return sizeof(ds4_qwen35_gpu_graph);
 }
