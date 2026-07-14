@@ -148,7 +148,31 @@ the runtime needs.
 | DeepSeek V4 Flash | `main` | Primary supported path | Metal, adaptive SSD streaming, 16–64 GB measurements |
 | DeepSeek V4 PRO | `main` | Supported upstream path | High-memory and distributed inference |
 | GLM 5.2 | `codex/glm52-upstream-clean-bench` | Experimental branch | Correct streamed prefill and Metal performance on 64 GB |
-| Qwen3.6-35B-A3B (`qwen35moe`) | WIP, not on `main` | Active development | CPU oracle smoke passes; Metal and SSD streaming are not release-ready |
+| Qwen3.6-35B-A3B (`qwen35moe`) | `feat/qwen-support` | Experimental branch | Real Metal + SSD path validated on M5 Pro 64 GB; physical 16 GB gate pending |
+
+### Experimental Qwen3.6 Metal + SSD path
+
+This branch accepts one normalized text-only artifact,
+`Qwen3.6-35B-A3B-ds4-Q4_K_S.gguf`; it is not generic Qwen or arbitrary
+community-GGUF support. The runtime is double opt-in and requires explicit SSD
+residency:
+
+```sh
+DS4_QWEN_EXPERIMENTAL_METAL=1 ./ds4 \
+  -m /absolute/path/to/Qwen3.6-35B-A3B-ds4-Q4_K_S.gguf \
+  --metal --ssd-streaming \
+  --ssd-streaming-cache-experts 640 \
+  --power 100 --ctx 8192 --nothink
+```
+
+The hard cache floor is 321 complete routed experts (about 0.53 GiB); 640
+(about 1.06 GiB) is the recommended small-machine starting tier. Startup and
+the per-layer path fail closed if the effective locked cache falls below the
+floor. The runtime has completed real Metal logits and generation on an M5 Pro
+with 64 GiB, but a physical 16 GiB Mac has not yet passed the required
+cold/warm, 8K-context, zero-swap release run. See
+[`tests/qwen/README.md`](tests/qwen/README.md) for the exact artifact contract,
+reproducible evidence, and current limitations.
 
 Metal on Apple Silicon is the current proving ground for fork-specific
 optimization. The inherited CUDA/DGX Spark and ROCm/Strix Halo DeepSeek paths
@@ -228,6 +252,8 @@ and still a work in progress.
 
 - [`docs/ENGINE_REFERENCE.md`](docs/ENGINE_REFERENCE.md): complete model,
   runtime, server, agent, KV-cache, distributed, backend, and debugging guide.
+- [`tests/qwen/README.md`](tests/qwen/README.md): experimental Qwen artifact
+  contract, oracle procedure, Metal + SSD commands, measurements, and limits.
 - [`CONTRIBUTING.md`](CONTRIBUTING.md): upstream-first contribution policy and
   correctness/performance gates.
 - [`FORK_NOTES.md`](FORK_NOTES.md): fork delta and upstreamability ledger.
