@@ -56,6 +56,12 @@ offline gate is:
 make qwen-unicode-test
 ```
 
+`qwen36_chat_template.jinja` is the byte-exact canonical template from the
+same pinned model revision.  Its SHA-256 is
+`e84f32a23fdda27689f868aa4a1a5621f41133e51a48d7f3efcbea2839574259`;
+the metadata gate rejects template drift because the C renderer implements
+these fixed semantics rather than executing arbitrary Jinja from a GGUF.
+
 `qwen36_gdn_golden.inc` is a small scalar Gated DeltaNet oracle derived from
 the official Transformers fallback equations after GGUF conversion.  It
 covers causal convolution, the recurrent delta update, runtime V-head mapping,
