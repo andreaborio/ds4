@@ -1089,6 +1089,151 @@ static void test_metal_qwen35_primitives(void) {
         ds4_gpu_tensor_free(out_gpu);
     }
 
+    /* Production-library Qwen router wrapper.  Offset views exercise the
+     * graph's split-4+4 layout, while parent guards prove the fixed contiguous
+     * ABI cannot write outside the selected top-8 rows. */
+    {
+        enum {
+            ROUTER_EXPERT = QWEN35_N_EXPERT,
+            ROUTER_SELECTED = QWEN35_N_EXPERT_USED,
+            ROUTER_PAD = 4,
+        };
+        float logits_parent[ROUTER_PAD + ROUTER_EXPERT + ROUTER_PAD];
+        float logits_before[ROUTER_PAD + ROUTER_EXPERT + ROUTER_PAD];
+        int32_t selected_parent[
+            ROUTER_PAD + ROUTER_SELECTED + ROUTER_PAD];
+        float weight_parent[ROUTER_PAD + ROUTER_SELECTED + ROUTER_PAD];
+        float probability[ROUTER_EXPERT];
+        int32_t expected_selected[ROUTER_SELECTED];
+        float expected_weight[ROUTER_SELECTED];
+        int32_t actual_selected[ROUTER_SELECTED];
+        float actual_weight[ROUTER_SELECTED];
+
+        for (size_t i = 0;
+             i < sizeof(logits_parent) / sizeof(logits_parent[0]); i++) {
+            logits_parent[i] = -777.0f;
+        }
+        for (size_t i = 0; i < ROUTER_EXPERT; i++) {
+            logits_parent[ROUTER_PAD + i] =
+                1.7f * sinf((float)(i + 1u) * 0.173f) -
+                0.9f * cosf((float)(i + 3u) * 0.097f) +
+                (float)((int)(i % 11u) - 5) * 0.031f;
+        }
+        /* Exact tie at the maximum must prefer the lower expert ID. */
+        logits_parent[ROUTER_PAD + 19u] = 9.0f;
+        logits_parent[ROUTER_PAD + 73u] = 9.0f;
+        memcpy(logits_before, logits_parent, sizeof(logits_before));
+        for (size_t i = 0;
+             i < sizeof(selected_parent) / sizeof(selected_parent[0]); i++) {
+            selected_parent[i] = INT32_C(0x5a5a5a5a);
+            weight_parent[i] = -333.0f;
+        }
+
+        TEST_ASSERT(ds4_qwen35_cpu_softmax_top8_f32(
+            expected_selected, expected_weight, probability,
+            logits_parent + ROUTER_PAD));
+
+        ds4_gpu_tensor *logits_base = ds4_gpu_tensor_alloc(
+            sizeof(logits_parent));
+        ds4_gpu_tensor *selected_base = ds4_gpu_tensor_alloc(
+            sizeof(selected_parent));
+        ds4_gpu_tensor *weight_base = ds4_gpu_tensor_alloc(
+            sizeof(weight_parent));
+        ds4_gpu_tensor *logits = logits_base ? ds4_gpu_tensor_view(
+            logits_base, ROUTER_PAD * sizeof(float),
+            ROUTER_EXPERT * sizeof(float)) : NULL;
+        ds4_gpu_tensor *selected = selected_base ? ds4_gpu_tensor_view(
+            selected_base, ROUTER_PAD * sizeof(int32_t),
+            ROUTER_SELECTED * sizeof(int32_t)) : NULL;
+        ds4_gpu_tensor *weight = weight_base ? ds4_gpu_tensor_view(
+            weight_base, ROUTER_PAD * sizeof(float),
+            ROUTER_SELECTED * sizeof(float)) : NULL;
+        if (logits_base && selected_base && weight_base && logits && selected &&
+            weight) {
+            TEST_ASSERT(ds4_gpu_tensor_write(
+                logits_base, 0, logits_parent, sizeof(logits_parent)));
+            TEST_ASSERT(ds4_gpu_tensor_write(
+                selected_base, 0, selected_parent, sizeof(selected_parent)));
+            TEST_ASSERT(ds4_gpu_tensor_write(
+                weight_base, 0, weight_parent, sizeof(weight_parent)));
+            TEST_ASSERT(ds4_gpu_qwen35_router_softmax_top8_tensor(
+                selected, weight, logits));
+            TEST_ASSERT(ds4_gpu_tensor_read(
+                selected, 0, actual_selected, sizeof(actual_selected)));
+            TEST_ASSERT(ds4_gpu_tensor_read(
+                weight, 0, actual_weight, sizeof(actual_weight)));
+            for (size_t i = 0; i < ROUTER_SELECTED; i++) {
+                TEST_ASSERT(actual_selected[i] == expected_selected[i]);
+            }
+            test_metal_qwen35_close("Qwen router top-8 weight",
+                                    actual_weight, expected_weight,
+                                    ROUTER_SELECTED, 2.0e-6f, 2.0e-6f);
+
+            TEST_ASSERT(ds4_gpu_tensor_read(
+                logits_base, 0, logits_parent, sizeof(logits_parent)));
+            TEST_ASSERT(memcmp(logits_parent, logits_before,
+                               sizeof(logits_parent)) == 0);
+            TEST_ASSERT(ds4_gpu_tensor_read(
+                selected_base, 0, selected_parent,
+                sizeof(selected_parent)));
+            TEST_ASSERT(ds4_gpu_tensor_read(
+                weight_base, 0, weight_parent, sizeof(weight_parent)));
+            for (size_t i = 0; i < ROUTER_PAD; i++) {
+                TEST_ASSERT(selected_parent[i] == INT32_C(0x5a5a5a5a));
+                TEST_ASSERT(selected_parent[
+                    ROUTER_PAD + ROUTER_SELECTED + i] ==
+                    INT32_C(0x5a5a5a5a));
+                TEST_ASSERT(weight_parent[i] == -333.0f);
+                TEST_ASSERT(weight_parent[
+                    ROUTER_PAD + ROUTER_SELECTED + i] == -333.0f);
+            }
+
+            /* Defensive diagnostic contract for corrupt/non-finite logits. */
+            const uint32_t quiet_nan_bits = UINT32_C(0x7fc00000);
+            memcpy(&logits_before[ROUTER_PAD + 41u], &quiet_nan_bits,
+                   sizeof(quiet_nan_bits));
+            TEST_ASSERT(ds4_gpu_tensor_write(
+                logits, 0, logits_before + ROUTER_PAD,
+                ROUTER_EXPERT * sizeof(float)));
+            TEST_ASSERT(ds4_gpu_qwen35_router_softmax_top8_tensor(
+                selected, weight, logits));
+            TEST_ASSERT(ds4_gpu_tensor_read(
+                selected, 0, actual_selected, sizeof(actual_selected)));
+            TEST_ASSERT(ds4_gpu_tensor_read(
+                weight, 0, actual_weight, sizeof(actual_weight)));
+            for (size_t i = 0; i < ROUTER_SELECTED; i++) {
+                TEST_ASSERT(actual_selected[i] == -1);
+                TEST_ASSERT(actual_weight[i] == 0.0f);
+            }
+
+            ds4_gpu_tensor *short_logits = ds4_gpu_tensor_alloc(
+                (ROUTER_EXPERT - 1u) * sizeof(float));
+            ds4_gpu_tensor *short_selected = ds4_gpu_tensor_alloc(
+                (ROUTER_SELECTED - 1u) * sizeof(int32_t));
+            ds4_gpu_tensor *short_weight = ds4_gpu_tensor_alloc(
+                (ROUTER_SELECTED - 1u) * sizeof(float));
+            if (short_logits && short_selected && short_weight) {
+                TEST_ASSERT(!ds4_gpu_qwen35_router_softmax_top8_tensor(
+                    selected, weight, short_logits));
+                TEST_ASSERT(!ds4_gpu_qwen35_router_softmax_top8_tensor(
+                    short_selected, weight, logits));
+                TEST_ASSERT(!ds4_gpu_qwen35_router_softmax_top8_tensor(
+                    selected, short_weight, logits));
+            }
+            ds4_gpu_tensor_free(short_logits);
+            ds4_gpu_tensor_free(short_selected);
+            ds4_gpu_tensor_free(short_weight);
+        } else {
+            TEST_ASSERT(false);
+        }
+        ds4_gpu_tensor_free(logits);
+        ds4_gpu_tensor_free(selected);
+        ds4_gpu_tensor_free(weight);
+        ds4_gpu_tensor_free(logits_base);
+        ds4_gpu_tensor_free(selected_base);
+        ds4_gpu_tensor_free(weight_base);
+    }
+
     free(model_raw);
 }
 

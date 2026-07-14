@@ -538,6 +538,15 @@ int ds4_gpu_qwen35_gqa_decode_tensor(
         uint32_t              n_kv_head,
         uint32_t              head_dim);
 
+/* Fixed 256-expert Qwen router: stable full softmax, deterministic top-8
+ * selection (lower expert ID wins ties), then top-8 renormalization.
+ * Non-finite diagnostic input writes eight {-1, 0} ID/weight pairs while a
+ * successful GPU dispatch still returns nonzero. */
+int ds4_gpu_qwen35_router_softmax_top8_tensor(
+        ds4_gpu_tensor       *selected,
+        ds4_gpu_tensor       *selected_weight,
+        const ds4_gpu_tensor *logits);
+
 /* Release decode fused KV finalizer: after the standalone RoPE kernel, this
  * performs DS4's FP8 non-RoPE KV round trip and writes the F16-rounded raw
  * attention cache row in one dispatch. */

@@ -3606,6 +3606,12 @@ typedef struct {
     uint64_t output_dim_stride;
 } ds4_gpu_qwen35_gqa_decode_args;
 
+typedef struct {
+    uint64_t logits_stride;
+    uint64_t selected_stride;
+    uint64_t selected_weight_stride;
+} ds4_gpu_qwen35_router_top8_args;
+
 typedef char ds4_gpu_qwen35_split_q_gate_args_size[
     sizeof(ds4_gpu_qwen35_split_q_gate_args) == 88 ? 1 : -1];
 typedef char ds4_gpu_qwen35_sigmoid_mul_args_size[
@@ -3624,6 +3630,8 @@ typedef char ds4_gpu_qwen35_gated_delta_controls_args_size[
     sizeof(ds4_gpu_qwen35_gated_delta_controls_args) == 56 ? 1 : -1];
 typedef char ds4_gpu_qwen35_gqa_decode_args_size[
     sizeof(ds4_gpu_qwen35_gqa_decode_args) == 96 ? 1 : -1];
+typedef char ds4_gpu_qwen35_router_top8_args_size[
+    sizeof(ds4_gpu_qwen35_router_top8_args) == 24 ? 1 : -1];
 
 static ds4_gpu_bin_args ds4_gpu_make_bin_rows_args(uint32_t n, uint32_t rows, uint32_t rhs_n) {
     const uint64_t row_bytes = (uint64_t)n * sizeof(float);
@@ -20631,6 +20639,79 @@ int ds4_gpu_qwen35_gqa_decode_tensor(
              threadsPerThreadgroup:MTLSizeMake(nth, 1, 1)];
         ds4_gpu_end_compute_encoder(cb, enc);
         if (!ds4_gpu_finish_command_buffer(cb, owned, "Qwen GQA")) return 0;
+    }
+    return 1;
+}
+
+int ds4_gpu_qwen35_router_softmax_top8_tensor(
+        ds4_gpu_tensor       *selected,
+        ds4_gpu_tensor       *selected_weight,
+        const ds4_gpu_tensor *logits) {
+    enum {
+        QWEN35_ROUTER_EXPERTS = 256,
+        QWEN35_ROUTER_SELECTED = 8,
+    };
+    if (!g_initialized && !ds4_gpu_init()) return 0;
+    if (!selected || !selected_weight || !logits) return 0;
+
+    const uint64_t logits_bytes =
+        (uint64_t)QWEN35_ROUTER_EXPERTS * sizeof(float);
+    const uint64_t selected_bytes =
+        (uint64_t)QWEN35_ROUTER_SELECTED * sizeof(int32_t);
+    const uint64_t selected_weight_bytes =
+        (uint64_t)QWEN35_ROUTER_SELECTED * sizeof(float);
+
+    @autoreleasepool {
+        id<MTLComputePipelineState> pipeline =
+            ds4_gpu_get_pipeline("kernel_qwen35_router_softmax_top8_f32");
+        id<MTLBuffer> logits_buf = ds4_gpu_tensor_buffer(logits);
+        id<MTLBuffer> selected_buf = ds4_gpu_tensor_buffer(selected);
+        id<MTLBuffer> selected_weight_buf =
+            ds4_gpu_tensor_buffer(selected_weight);
+        if (!pipeline || !logits_buf || !selected_buf ||
+            !selected_weight_buf ||
+            pipeline.maxTotalThreadsPerThreadgroup < QWEN35_ROUTER_EXPERTS ||
+            ds4_gpu_tensor_bytes(logits) < logits_bytes ||
+            ds4_gpu_tensor_bytes(selected) < selected_bytes ||
+            ds4_gpu_tensor_bytes(selected_weight) < selected_weight_bytes) {
+            fprintf(stderr,
+                    "ds4: Metal Qwen top-8 router received undersized buffers "
+                    "or an unsupported threadgroup limit\n");
+            return 0;
+        }
+
+        ds4_gpu_qwen35_router_top8_args args = {
+            .logits_stride = sizeof(float),
+            .selected_stride = sizeof(int32_t),
+            .selected_weight_stride = sizeof(float),
+        };
+
+        int owned = 0;
+        id<MTLCommandBuffer> cb = ds4_gpu_command_buffer(&owned);
+        if (!cb) return 0;
+        id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
+        if (!enc) return 0;
+        [enc setComputePipelineState:pipeline];
+        [enc setBytes:&args length:sizeof(args) atIndex:0];
+        [enc setBuffer:logits_buf
+                offset:ds4_gpu_tensor_offset(logits)
+               atIndex:1];
+        [enc setBuffer:selected_buf
+                offset:ds4_gpu_tensor_offset(selected)
+               atIndex:2];
+        [enc setBuffer:selected_weight_buf
+                offset:ds4_gpu_tensor_offset(selected_weight)
+               atIndex:3];
+        [enc setThreadgroupMemoryLength:
+             ds4_gpu_qwen35_threadgroup_f32_bytes(QWEN35_ROUTER_EXPERTS)
+                                  atIndex:0];
+        [enc dispatchThreadgroups:MTLSizeMake(1, 1, 1)
+             threadsPerThreadgroup:MTLSizeMake(QWEN35_ROUTER_EXPERTS, 1, 1)];
+        ds4_gpu_end_compute_encoder(cb, enc);
+        if (!ds4_gpu_finish_command_buffer(cb, owned,
+                                           "Qwen top-8 router")) {
+            return 0;
+        }
     }
     return 1;
 }
