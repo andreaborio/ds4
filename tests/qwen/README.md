@@ -40,6 +40,17 @@ Cases containing literal added tokens are marked as trusted text.  Production
 user-text tokenization must keep treating the same bytes as data; only a
 trusted, already-rendered chat prompt may turn them into control IDs.
 
+The tokenizer's Unicode behavior is frozen separately in
+`qwen_unicode_ucd_cache.txt`: Unicode 9.0 NFC plus Unicode 16.0 `L/M/N` and
+`White_Space` properties, matching the two libraries used by the pinned
+`tokenizers` build.  See `UNICODE_DATA_PROVENANCE.md` for the source hashes,
+license, refresh command, and the observable version split.  Its normal
+offline gate is:
+
+```sh
+make qwen-unicode-test
+```
+
 `qwen36_gdn_golden.inc` is a small scalar Gated DeltaNet oracle derived from
 the official Transformers fallback equations after GGUF conversion.  It
 covers causal convolution, the recurrent delta update, runtime V-head mapping,
