@@ -201,6 +201,29 @@ static void test_model_aware_context_memory(void) {
     CHECK(memcmp(&memory, &legacy, sizeof(memory)) == 0);
 }
 
+static void test_qwen_metal_session_context_budget(void) {
+    ds4_engine engine;
+    ds4_context_memory planned = {0};
+    ds4_context_memory requested = {0};
+    fake_qwen_engine(&engine, true);
+    engine.backend = DS4_BACKEND_METAL;
+    engine.qwen_metal_runtime = true;
+
+    CHECK(ds4_engine_context_memory_estimate_with_prefill(
+              &engine, 8, 0, &planned));
+    engine.residency_plan.runtime_bytes = planned.total_bytes;
+
+    CHECK(ds4_qwen35_metal_session_context_fits_runtime_plan(
+              &engine, 8, &requested));
+    CHECK(requested.total_bytes == planned.total_bytes);
+    CHECK(ds4_qwen35_metal_session_context_fits_runtime_plan(
+              &engine, 4, &requested));
+    CHECK(requested.total_bytes < planned.total_bytes);
+    CHECK(!ds4_qwen35_metal_session_context_fits_runtime_plan(
+               &engine, 9, &requested));
+    CHECK(requested.total_bytes > planned.total_bytes);
+}
+
 typedef struct {
     ds4_model model;
     ds4_qwen35_weights weights;
@@ -875,6 +898,7 @@ static void test_fail_closed_surfaces(ds4_session *session) {
 int main(void) {
     test_session_creation_boundary();
     test_model_aware_context_memory();
+    test_qwen_metal_session_context_budget();
     test_qwen35_ssd_static_contract();
     test_gpu_dense_layout_contract();
 

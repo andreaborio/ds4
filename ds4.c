@@ -30283,6 +30283,22 @@ static bool ds4_engine_context_memory_estimate_private(
     return true;
 }
 
+/* A Qwen Metal engine's SSD cache and host headroom are sized once, during
+ * engine open.  Sessions must not silently allocate a larger context runtime
+ * than that residency plan reserved. */
+static bool ds4_qwen35_metal_session_context_fits_runtime_plan(
+        const ds4_engine   *e,
+        int                 ctx_size,
+        ds4_context_memory *requested) {
+    if (requested) memset(requested, 0, sizeof(*requested));
+    if (!e || !requested ||
+        !ds4_engine_context_memory_estimate_private(
+            e, ctx_size, e->prefill_chunk, requested)) {
+        return false;
+    }
+    return requested->total_bytes <= e->residency_plan.runtime_bytes;
+}
+
 static bool ds4_engine_resolve_residency(ds4_engine               *e,
                                          const ds4_engine_options *opt,
                                          bool                      load_slice,
@@ -31773,6 +31789,28 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
                 "ds4: Qwen context %d exceeds the supported maximum %u\n",
                 ctx_size, QWEN35_CONTEXT_LENGTH);
         return 1;
+    }
+    if (qwen35 && e->backend == DS4_BACKEND_METAL &&
+        e->qwen_metal_runtime) {
+        ds4_context_memory requested = {0};
+        if (!ds4_qwen35_metal_session_context_fits_runtime_plan(
+                e, ctx_size, &requested)) {
+            if (requested.total_bytes == 0) {
+                fprintf(stderr,
+                        "ds4: could not estimate Qwen Metal session context %d; "
+                        "reopen engine with larger context\n",
+                        ctx_size);
+            } else {
+                fprintf(stderr,
+                        "ds4: Qwen Metal session context %d needs %.2f GiB "
+                        "runtime, but the engine planned %.2f GiB; reopen "
+                        "engine with larger context\n",
+                        ctx_size,
+                        (double)requested.total_bytes / 1073741824.0,
+                        (double)e->residency_plan.runtime_bytes / 1073741824.0);
+            }
+            return 1;
+        }
     }
     if (e->backend == DS4_BACKEND_CPU) {
         if (e->distributed.role == DS4_DISTRIBUTED_COORDINATOR) {
