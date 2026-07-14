@@ -29526,6 +29526,43 @@ int ds4_engine_model_id(ds4_engine *e) {
     return (int)DS4_MODEL_VARIANT;
 }
 
+bool ds4_engine_context_memory_estimate_with_prefill(
+        const ds4_engine      *e,
+        int                    ctx_size,
+        uint32_t               prefill_chunk,
+        ds4_context_memory    *out) {
+    if (!e || !out || ctx_size <= 0) return false;
+
+    if (e->model.family != DS4_MODEL_FAMILY_QWEN35_MOE) {
+        *out = ds4_context_memory_estimate_with_prefill(
+            e->backend, ctx_size, prefill_chunk);
+        return true;
+    }
+
+    ds4_qwen35_cpu_cache_plan cache = {0};
+    ds4_qwen35_cpu_scratch_plan scratch = {0};
+    if (!ds4_qwen35_cpu_cache_plan_make((uint32_t)ctx_size, &cache) ||
+        !ds4_qwen35_cpu_scratch_plan_make((uint32_t)ctx_size, &scratch)) {
+        return false;
+    }
+
+    /* The correctness runtime keeps full-attention K/V and recurrent state in
+     * F32, grows K/V up to ctx_size, and owns one physical-vocabulary logits
+     * vector.  Recurrent state is reported in compressed_bytes because it is
+     * the fixed-size counterpart to the context-dependent full-attention K/V. */
+    ds4_context_memory m = {0};
+    m.raw_bytes = cache.max_kv_bytes;
+    m.compressed_bytes = cache.fixed_bytes;
+    m.scratch_bytes = scratch.total_bytes +
+                      (uint64_t)QWEN35_N_VOCAB * sizeof(float);
+    m.prefill_cap = 1u;
+    m.raw_cap = (uint32_t)ctx_size;
+    m.total_bytes = m.raw_bytes + m.compressed_bytes + m.scratch_bytes;
+    (void)prefill_chunk;
+    *out = m;
+    return true;
+}
+
 void ds4_engine_close(ds4_engine *e) {
     if (!e) return;
     ds4_expert_profile_close();

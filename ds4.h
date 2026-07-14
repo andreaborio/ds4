@@ -255,13 +255,21 @@ const char *ds4_think_mode_name(ds4_think_mode mode);
 const char *ds4_think_max_prefix(void);
 uint32_t ds4_think_max_min_context(void);
 ds4_think_mode ds4_think_mode_for_context(ds4_think_mode mode, int ctx_size);
-/* Uses the active model shape selected by ds4_engine_open(); call after opening
- * the GGUF so Flash/Pro dimensions are known. */
+/* Uses the active DeepSeek shape selected by ds4_engine_open(); call after
+ * opening the GGUF so Flash/Pro dimensions are known.  Model-aware callers
+ * should prefer ds4_engine_context_memory_estimate_with_prefill(). */
 ds4_context_memory ds4_context_memory_estimate(ds4_backend backend, int ctx_size);
 ds4_context_memory ds4_context_memory_estimate_with_prefill(
         ds4_backend backend,
         int ctx_size,
         uint32_t prefill_chunk);
+/* Estimate the buffers owned by a session for the engine's actual model
+ * family.  Returns false for an invalid context or output pointer. */
+bool ds4_engine_context_memory_estimate_with_prefill(
+        const ds4_engine *engine,
+        int ctx_size,
+        uint32_t prefill_chunk,
+        ds4_context_memory *out);
 bool ds4_log_is_tty(FILE *fp);
 void ds4_log(FILE *fp, ds4_log_type type, const char *fmt, ...);
 int ds4_engine_generate_argmax(ds4_engine *e, const ds4_tokens *prompt,

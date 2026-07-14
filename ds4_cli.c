@@ -189,13 +189,18 @@ static ds4_backend default_backend(void) {
 #endif
 }
 
-static void log_context_memory(ds4_backend backend,
+static void log_context_memory(const ds4_engine *engine,
+                               ds4_backend backend,
                                int         ctx_size,
                                uint32_t    prefill_chunk) {
-    ds4_context_memory m =
-        ds4_context_memory_estimate_with_prefill(backend,
-                                                 ctx_size,
-                                                 prefill_chunk);
+    ds4_context_memory m = {0};
+    if (!ds4_engine_context_memory_estimate_with_prefill(
+            engine, ctx_size, prefill_chunk, &m)) {
+        fprintf(stderr,
+                "ds4: context buffer estimate unavailable for ctx=%d, backend=%s\n",
+                ctx_size, ds4_backend_name(backend));
+        return;
+    }
     fprintf(stderr,
             "ds4: context buffers %.2f MiB (ctx=%d, backend=%s, prefill_chunk=%u, raw_kv_rows=%u, compressed_kv_rows=%u)\n",
             (double)m.total_bytes / (1024.0 * 1024.0),
@@ -1316,7 +1321,8 @@ static int run_repl(ds4_engine *engine, cli_config *cfg) {
                 fprintf(stderr, "ds4: /ctx needs a positive integer\n");
             } else {
                 cfg->gen.ctx_size = parse_int(arg, "/ctx");
-                log_context_memory(cfg->engine.backend,
+                log_context_memory(engine,
+                                   cfg->engine.backend,
                                    cfg->gen.ctx_size,
                                    cfg->engine.prefill_chunk);
                 rc = repl_chat_set_ctx(engine, &chat, cfg->gen.ctx_size);
@@ -1708,7 +1714,8 @@ int main(int argc, char **argv) {
         return rc;
     }
     if (!cfg.inspect) {
-        log_context_memory(cfg.engine.backend,
+        log_context_memory(engine,
+                           cfg.engine.backend,
                            cfg.gen.ctx_size,
                            cfg.engine.prefill_chunk);
         cli_warn_think_max_downgraded(&cfg.gen, "--think-max");

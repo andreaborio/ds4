@@ -11947,13 +11947,18 @@ static const char *need_arg(int *i, int argc, char **argv, const char *opt) {
     return argv[++(*i)];
 }
 
-static void log_context_memory(ds4_backend backend,
+static void log_context_memory(const ds4_engine *engine,
+                               ds4_backend backend,
                                int         ctx_size,
                                uint32_t    prefill_chunk) {
-    ds4_context_memory m =
-        ds4_context_memory_estimate_with_prefill(backend,
-                                                 ctx_size,
-                                                 prefill_chunk);
+    ds4_context_memory m = {0};
+    if (!ds4_engine_context_memory_estimate_with_prefill(
+            engine, ctx_size, prefill_chunk, &m)) {
+        server_log(DS4_LOG_DEFAULT,
+                   "ds4-server: context buffer estimate unavailable for ctx=%d, backend=%s",
+                   ctx_size, ds4_backend_name(backend));
+        return;
+    }
     server_log(DS4_LOG_DEFAULT,
                "ds4-server: context buffers %.2f MiB (ctx=%d, backend=%s, prefill_chunk=%u, raw_kv_rows=%u, compressed_kv_rows=%u)",
                (double)m.total_bytes / (1024.0 * 1024.0),
@@ -12233,7 +12238,8 @@ int main(int argc, char **argv) {
     ds4_engine *engine = NULL;
     if (ds4_engine_open(&engine, &cfg.engine) != 0) return 1;
 
-    log_context_memory(cfg.engine.backend,
+    log_context_memory(engine,
+                       cfg.engine.backend,
                        cfg.ctx_size,
                        cfg.engine.prefill_chunk);
     if (cfg.engine.distributed.role == DS4_DISTRIBUTED_WORKER) {

@@ -130,6 +130,51 @@ static void test_session_creation_boundary(void) {
     CHECK(session == NULL);
 }
 
+static void test_model_aware_context_memory(void) {
+    ds4_engine engine;
+    ds4_context_memory memory = {0};
+    fake_qwen_engine(&engine, true);
+
+    CHECK(!ds4_engine_context_memory_estimate_with_prefill(
+              NULL, 1, 0, &memory));
+    CHECK(!ds4_engine_context_memory_estimate_with_prefill(
+              &engine, 0, 0, &memory));
+    CHECK(!ds4_engine_context_memory_estimate_with_prefill(
+              &engine, (int)QWEN35_CONTEXT_LENGTH + 1, 0, &memory));
+    CHECK(!ds4_engine_context_memory_estimate_with_prefill(
+              &engine, 1, 0, NULL));
+
+    CHECK(ds4_engine_context_memory_estimate_with_prefill(
+              &engine, 1, 4096, &memory));
+    CHECK(memory.raw_bytes == UINT64_C(40960));
+    CHECK(memory.compressed_bytes == UINT64_C(65863680));
+    CHECK(memory.scratch_bytes == UINT64_C(1185636));
+    CHECK(memory.total_bytes == UINT64_C(67090276));
+    CHECK(memory.prefill_cap == 1u);
+    CHECK(memory.raw_cap == 1u);
+    CHECK(memory.comp_cap == 0u);
+
+    CHECK(ds4_engine_context_memory_estimate_with_prefill(
+              &engine, 32768, 0, &memory));
+    CHECK(memory.raw_bytes == UINT64_C(1342177280));
+    CHECK(memory.compressed_bytes == UINT64_C(65863680));
+    CHECK(memory.scratch_bytes == UINT64_C(1316704));
+    CHECK(memory.total_bytes == UINT64_C(1409357664));
+    CHECK(memory.prefill_cap == 1u);
+    CHECK(memory.raw_cap == 32768u);
+    CHECK(memory.comp_cap == 0u);
+
+    memset(&engine, 0, sizeof(engine));
+    engine.backend = DS4_BACKEND_CPU;
+    engine.model.family = DS4_MODEL_FAMILY_DEEPSEEK4;
+    const ds4_context_memory legacy =
+        ds4_context_memory_estimate_with_prefill(
+            engine.backend, 32768, 256);
+    CHECK(ds4_engine_context_memory_estimate_with_prefill(
+              &engine, 32768, 256, &memory));
+    CHECK(memcmp(&memory, &legacy, sizeof(memory)) == 0);
+}
+
 static void test_dynamic_logits(ds4_session *session) {
     const uint32_t n_vocab = QWEN35_N_VOCAB;
     CHECK(ds4_engine_vocab_size(session->engine) == QWEN35_N_VOCAB);
@@ -408,6 +453,7 @@ static void test_fail_closed_surfaces(ds4_session *session) {
 
 int main(void) {
     test_session_creation_boundary();
+    test_model_aware_context_memory();
 
     ds4_engine engine;
     ds4_session *session = NULL;
