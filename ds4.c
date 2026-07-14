@@ -3349,6 +3349,179 @@ static DS4_MAYBE_UNUSED uint64_t routed_expert_row_bytes(const ds4_tensor *t) {
     return (t->dim[0] / QK_K) * routed_expert_block_bytes(t->type);
 }
 
+/* Qwen's SSD path is intentionally tied to the single supported
+ * Qwen3.6-35B-A3B Q4_K_S artifact.  Keep this contract separate from the
+ * DeepSeek shape profile: the layer count, top-k, and expert byte class all
+ * differ, and silently inheriting either model's cache geometry would make a
+ * too-small cache look valid. */
+#define QWEN35_ROUTED_EXPERT_TENSOR_COUNT (3u * QWEN35_N_LAYER)
+#define QWEN35_NON_ROUTED_TENSOR_COUNT \
+    (QWEN35_N_TENSOR - QWEN35_ROUTED_EXPERT_TENSOR_COUNT)
+#define QWEN35_NON_ROUTED_PAYLOAD_BYTES UINT64_C(2678180352)
+#define QWEN35_Q4_EXPERT_MATRIX_BYTES   UINT64_C(589824)
+#define QWEN35_Q4_EXPERT_COMBINED_BYTES UINT64_C(1769472)
+
+typedef struct {
+    uint64_t gate_expert_bytes;
+    uint64_t up_expert_bytes;
+    uint64_t down_expert_bytes;
+    uint64_t per_expert_bytes;
+    uint64_t cacheable_layers;
+    uint64_t experts_per_layer;
+    uint64_t selected_per_layer;
+    uint64_t working_set_experts;
+    uint64_t minimum_cache_experts;
+    uint64_t minimum_cache_bytes;
+    uint64_t warning_cache_experts;
+    uint64_t max_cacheable_experts;
+} ds4_qwen35_streaming_cache_geometry;
+
+static bool qwen35_tensor_layout_matches(
+        const ds4_tensor *t,
+        uint32_t          type,
+        bool              allow_f16_or_q8,
+        uint32_t          ndim,
+        uint64_t          d0,
+        uint64_t          d1,
+        uint64_t          d2) {
+    if (!t || ndim == 0 || ndim > 3 || t->ndim != ndim) return false;
+    if (allow_f16_or_q8) {
+        if (!tensor_type_is_f16_or_q8_0(t->type)) return false;
+    } else if (t->type != type) {
+        return false;
+    }
+
+    const uint64_t dim[3] = {d0, d1, d2};
+    uint64_t elements = 1;
+    for (uint32_t i = 0; i < ndim; i++) {
+        if (dim[i] == 0 || t->dim[i] != dim[i] ||
+            elements > UINT64_MAX / dim[i]) {
+            return false;
+        }
+        elements *= dim[i];
+    }
+    if (t->elements != elements) return false;
+
+    uint64_t bytes = 0;
+    return tensor_nbytes(t->type, elements, &bytes) &&
+           bytes != 0 && t->bytes == bytes;
+}
+
+static bool qwen35_routed_expert_matrix_bytes(
+        const ds4_tensor *t,
+        uint64_t          input_dim,
+        uint64_t          output_dim,
+        uint64_t         *expert_bytes_out) {
+    if (expert_bytes_out) *expert_bytes_out = 0;
+    if (!expert_bytes_out ||
+        !qwen35_tensor_layout_matches(t, DS4_TENSOR_Q4_K, false, 3,
+                                      input_dim, output_dim,
+                                      QWEN35_N_EXPERT) ||
+        input_dim % QK_K != 0) {
+        return false;
+    }
+
+    const uint64_t blocks_per_row = input_dim / QK_K;
+    const uint64_t block_bytes = gguf_types[DS4_TENSOR_Q4_K].block_bytes;
+    if (blocks_per_row == 0 || block_bytes == 0 ||
+        blocks_per_row > UINT64_MAX / block_bytes) {
+        return false;
+    }
+    const uint64_t row_bytes = blocks_per_row * block_bytes;
+    if (output_dim > UINT64_MAX / row_bytes) return false;
+    const uint64_t expert_bytes = output_dim * row_bytes;
+    if (expert_bytes == 0 ||
+        QWEN35_N_EXPERT > UINT64_MAX / expert_bytes ||
+        t->bytes != expert_bytes * QWEN35_N_EXPERT) {
+        return false;
+    }
+    *expert_bytes_out = expert_bytes;
+    return true;
+}
+
+static DS4_MAYBE_UNUSED bool qwen35_streaming_cache_geometry_make(
+        const ds4_qwen35_weights             *weights,
+        ds4_qwen35_streaming_cache_geometry  *out) {
+    if (!out) return false;
+    memset(out, 0, sizeof(*out));
+    if (!weights) return false;
+
+    uint64_t gate_bytes = 0;
+    uint64_t up_bytes = 0;
+    uint64_t down_bytes = 0;
+    for (uint32_t il = 0; il < QWEN35_N_LAYER; il++) {
+        uint64_t layer_gate = 0;
+        uint64_t layer_up = 0;
+        uint64_t layer_down = 0;
+        const ds4_qwen35_layer_weights *layer = &weights->layer[il];
+        if (!qwen35_routed_expert_matrix_bytes(
+                layer->ffn_gate_exps, QWEN35_N_EMBD, QWEN35_N_FF_EXP,
+                &layer_gate) ||
+            !qwen35_routed_expert_matrix_bytes(
+                layer->ffn_up_exps, QWEN35_N_EMBD, QWEN35_N_FF_EXP,
+                &layer_up) ||
+            !qwen35_routed_expert_matrix_bytes(
+                layer->ffn_down_exps, QWEN35_N_FF_EXP, QWEN35_N_EMBD,
+                &layer_down)) {
+            return false;
+        }
+        if (il == 0) {
+            gate_bytes = layer_gate;
+            up_bytes = layer_up;
+            down_bytes = layer_down;
+        } else if (layer_gate != gate_bytes ||
+                   layer_up != up_bytes ||
+                   layer_down != down_bytes) {
+            return false;
+        }
+    }
+
+    if (gate_bytes != QWEN35_Q4_EXPERT_MATRIX_BYTES ||
+        up_bytes != QWEN35_Q4_EXPERT_MATRIX_BYTES ||
+        down_bytes != QWEN35_Q4_EXPERT_MATRIX_BYTES ||
+        gate_bytes > UINT64_MAX - up_bytes ||
+        gate_bytes + up_bytes > UINT64_MAX - down_bytes) {
+        return false;
+    }
+    const uint64_t per_expert_bytes = gate_bytes + up_bytes + down_bytes;
+    if (per_expert_bytes != QWEN35_Q4_EXPERT_COMBINED_BYTES ||
+        QWEN35_N_LAYER > UINT64_MAX / QWEN35_N_EXPERT) {
+        return false;
+    }
+
+    ds4_ssd_expert_cache_floor floor;
+    if (!ds4_ssd_expert_cache_floor_make(
+            QWEN35_N_LAYER, QWEN35_N_EXPERT_USED,
+            per_expert_bytes, &floor)) {
+        return false;
+    }
+    const uint64_t max_cacheable =
+        (uint64_t)QWEN35_N_LAYER * QWEN35_N_EXPERT;
+    if (floor.working_set_experts != UINT64_C(320) ||
+        floor.minimum_cache_experts != UINT64_C(321) ||
+        floor.minimum_cache_bytes != UINT64_C(568000512) ||
+        floor.warning_cache_experts != UINT64_C(640) ||
+        max_cacheable != UINT64_C(10240)) {
+        return false;
+    }
+
+    *out = (ds4_qwen35_streaming_cache_geometry){
+        .gate_expert_bytes = gate_bytes,
+        .up_expert_bytes = up_bytes,
+        .down_expert_bytes = down_bytes,
+        .per_expert_bytes = per_expert_bytes,
+        .cacheable_layers = QWEN35_N_LAYER,
+        .experts_per_layer = QWEN35_N_EXPERT,
+        .selected_per_layer = QWEN35_N_EXPERT_USED,
+        .working_set_experts = floor.working_set_experts,
+        .minimum_cache_experts = floor.minimum_cache_experts,
+        .minimum_cache_bytes = floor.minimum_cache_bytes,
+        .warning_cache_experts = floor.warning_cache_experts,
+        .max_cacheable_experts = max_cacheable,
+    };
+    return true;
+}
+
 static bool streaming_layer_routed_expert_bytes(
         const ds4_layer_weights *layer,
         uint64_t               *per_expert_bytes_out) {
@@ -4901,6 +5074,304 @@ static DS4_MAYBE_UNUSED uint64_t model_map_span_vec_total_bytes(
         total += bytes;
     }
     return total;
+}
+
+typedef struct {
+    const ds4_model       *model;
+    ds4_model_map_span_vec *spans;
+    bool                   seen[QWEN35_N_TENSOR];
+    uint32_t               seen_count;
+    uint32_t               included_count;
+    uint64_t               payload_bytes;
+} qwen35_non_routed_span_builder;
+
+static bool qwen35_model_tensor_index(
+        const ds4_model  *model,
+        const ds4_tensor *tensor,
+        uint32_t         *index_out) {
+    if (index_out) *index_out = 0;
+    if (!model || !model->tensors || !tensor || !index_out ||
+        model->n_tensors != QWEN35_N_TENSOR) {
+        return false;
+    }
+    for (uint32_t i = 0; i < QWEN35_N_TENSOR; i++) {
+        if (&model->tensors[i] == tensor) {
+            *index_out = i;
+            return true;
+        }
+    }
+    return false;
+}
+
+static bool qwen35_model_tensor_runtime_range_valid(
+        const ds4_model  *model,
+        const ds4_tensor *tensor) {
+    if (!model || !tensor || model->alignment == 0 ||
+        tensor->bytes == 0 ||
+        tensor->rel_offset % model->alignment != 0 ||
+        tensor->rel_offset > UINT64_MAX - model->tensor_data_pos ||
+        tensor->abs_offset != model->tensor_data_pos + tensor->rel_offset ||
+        tensor->abs_offset > model->size ||
+        tensor->bytes > model->size - tensor->abs_offset) {
+        return false;
+    }
+    return true;
+}
+
+static bool qwen35_non_routed_span_builder_add(
+        qwen35_non_routed_span_builder *builder,
+        const ds4_tensor               *tensor,
+        uint32_t                        type,
+        bool                            allow_f16_or_q8,
+        uint32_t                        ndim,
+        uint64_t                        d0,
+        uint64_t                        d1,
+        uint64_t                        d2,
+        bool                            include) {
+    if (!builder || !builder->model || !builder->spans ||
+        !qwen35_tensor_layout_matches(tensor, type, allow_f16_or_q8,
+                                      ndim, d0, d1, d2) ||
+        !qwen35_model_tensor_runtime_range_valid(builder->model, tensor)) {
+        return false;
+    }
+
+    uint32_t index = 0;
+    if (!qwen35_model_tensor_index(builder->model, tensor, &index) ||
+        builder->seen[index]) {
+        return false;
+    }
+    builder->seen[index] = true;
+    builder->seen_count++;
+    if (!include) return true;
+
+    if (builder->payload_bytes > UINT64_MAX - tensor->bytes ||
+        tensor->abs_offset > UINT64_MAX - tensor->bytes) {
+        return false;
+    }
+    builder->payload_bytes += tensor->bytes;
+    builder->included_count++;
+    if (tensor->bytes > builder->spans->max_tensor_bytes) {
+        builder->spans->max_tensor_bytes = tensor->bytes;
+    }
+    model_map_span_vec_append(builder->spans, tensor->abs_offset,
+                              tensor->abs_offset + tensor->bytes, false);
+    return true;
+}
+
+static bool qwen35_model_tensor_ranges_disjoint(const ds4_model *model) {
+    if (!model || !model->tensors ||
+        model->n_tensors != QWEN35_N_TENSOR) {
+        return false;
+    }
+    ds4_model_map_span ranges[QWEN35_N_TENSOR];
+    for (uint32_t i = 0; i < QWEN35_N_TENSOR; i++) {
+        const ds4_tensor *tensor = &model->tensors[i];
+        if (!qwen35_model_tensor_runtime_range_valid(model, tensor) ||
+            tensor->abs_offset > UINT64_MAX - tensor->bytes) {
+            return false;
+        }
+        ranges[i] = (ds4_model_map_span){
+            tensor->abs_offset,
+            tensor->abs_offset + tensor->bytes,
+            false,
+        };
+    }
+    qsort(ranges, QWEN35_N_TENSOR, sizeof(ranges[0]), model_map_span_cmp);
+    for (uint32_t i = 1; i < QWEN35_N_TENSOR; i++) {
+        if (ranges[i].off < ranges[i - 1u].end) return false;
+    }
+    return true;
+}
+
+/* Build the exact always-used Qwen payload from semantic weight bindings.
+ * Every one of the 733 model tensors must appear exactly once.  The only
+ * tensors omitted from the model-map spans are the three routed Q4 matrices
+ * in each layer; router and shared-expert weights remain static. */
+static DS4_MAYBE_UNUSED bool qwen35_weights_model_map_non_routed_spans(
+        const ds4_model          *model,
+        const ds4_qwen35_weights *weights,
+        ds4_model_map_span_vec   *spans,
+        uint64_t                 *payload_bytes_out) {
+    if (payload_bytes_out) *payload_bytes_out = 0;
+    if (!model || !weights || !spans || !payload_bytes_out) return false;
+    memset(spans, 0, sizeof(*spans));
+    if (model->family != DS4_MODEL_FAMILY_QWEN35_MOE ||
+        !model->tensors || model->n_tensors != QWEN35_N_TENSOR ||
+        model->alignment == 0 || model->size == 0 ||
+        model->tensor_data_pos > model->size) {
+        return false;
+    }
+
+    qwen35_non_routed_span_builder builder = {
+        .model = model,
+        .spans = spans,
+    };
+#define QWEN35_ADD_EXACT(t_, type_, ndim_, d0_, d1_, d2_, include_) do {  \
+    if (!qwen35_non_routed_span_builder_add(                         \
+            &builder, (t_), (type_), false, (ndim_),                \
+            (d0_), (d1_), (d2_), (include_))) goto fail;            \
+} while (0)
+#define QWEN35_ADD_DENSE(t_, ndim_, d0_, d1_, include_) do {         \
+    if (!qwen35_non_routed_span_builder_add(                         \
+            &builder, (t_), 0, true, (ndim_),                       \
+            (d0_), (d1_), 0, (include_))) goto fail;                \
+} while (0)
+
+    QWEN35_ADD_DENSE(weights->token_embd, 2,
+                     QWEN35_N_EMBD, QWEN35_N_VOCAB, true);
+    for (uint32_t il = 0; il < QWEN35_N_LAYER; il++) {
+        const ds4_qwen35_layer_weights *layer = &weights->layer[il];
+        QWEN35_ADD_EXACT(layer->attn_norm, DS4_TENSOR_F32, 1,
+                         QWEN35_N_EMBD, 0, 0, true);
+        QWEN35_ADD_EXACT(layer->post_attention_norm, DS4_TENSOR_F32, 1,
+                         QWEN35_N_EMBD, 0, 0, true);
+        if (ds4_qwen35_layer_is_full_attention(il)) {
+            QWEN35_ADD_DENSE(layer->attn_q, 2,
+                             QWEN35_N_EMBD, 8192, true);
+            QWEN35_ADD_DENSE(layer->attn_k, 2,
+                             QWEN35_N_EMBD, 512, true);
+            QWEN35_ADD_DENSE(layer->attn_v, 2,
+                             QWEN35_N_EMBD, 512, true);
+            QWEN35_ADD_DENSE(layer->attn_output, 2,
+                             4096, QWEN35_N_EMBD, true);
+            QWEN35_ADD_EXACT(layer->attn_q_norm, DS4_TENSOR_F32, 1,
+                             QWEN35_N_HEAD_DIM, 0, 0, true);
+            QWEN35_ADD_EXACT(layer->attn_k_norm, DS4_TENSOR_F32, 1,
+                             QWEN35_N_HEAD_DIM, 0, 0, true);
+        } else {
+            QWEN35_ADD_DENSE(layer->attn_gate, 2,
+                             QWEN35_N_EMBD, 4096, true);
+            QWEN35_ADD_DENSE(layer->attn_qkv, 2,
+                             QWEN35_N_EMBD, 8192, true);
+            QWEN35_ADD_EXACT(layer->ssm_a, DS4_TENSOR_F32, 1,
+                             QWEN35_SSM_VALUE_HEAD, 0, 0, true);
+            QWEN35_ADD_EXACT(layer->ssm_alpha, DS4_TENSOR_F32, 2,
+                             QWEN35_N_EMBD, QWEN35_SSM_DT_RANK, 0, true);
+            QWEN35_ADD_EXACT(layer->ssm_beta, DS4_TENSOR_F32, 2,
+                             QWEN35_N_EMBD, QWEN35_SSM_DT_RANK, 0, true);
+            QWEN35_ADD_EXACT(layer->ssm_conv1d, DS4_TENSOR_F32, 2,
+                             QWEN35_SSM_CONV_KERNEL,
+                             QWEN35_SSM_CONV_CHANNEL, 0, true);
+            QWEN35_ADD_EXACT(layer->ssm_dt, DS4_TENSOR_F32, 1,
+                             QWEN35_SSM_DT_RANK, 0, 0, true);
+            QWEN35_ADD_EXACT(layer->ssm_norm, DS4_TENSOR_F32, 1,
+                             QWEN35_SSM_STATE, 0, 0, true);
+            QWEN35_ADD_DENSE(layer->ssm_out, 2,
+                             QWEN35_SSM_INNER, QWEN35_N_EMBD, true);
+        }
+
+        QWEN35_ADD_EXACT(layer->ffn_gate_inp, DS4_TENSOR_F32, 2,
+                         QWEN35_N_EMBD, QWEN35_N_EXPERT, 0, true);
+        QWEN35_ADD_EXACT(layer->ffn_gate_exps, DS4_TENSOR_Q4_K, 3,
+                         QWEN35_N_EMBD, QWEN35_N_FF_EXP,
+                         QWEN35_N_EXPERT, false);
+        QWEN35_ADD_EXACT(layer->ffn_up_exps, DS4_TENSOR_Q4_K, 3,
+                         QWEN35_N_EMBD, QWEN35_N_FF_EXP,
+                         QWEN35_N_EXPERT, false);
+        QWEN35_ADD_EXACT(layer->ffn_down_exps, DS4_TENSOR_Q4_K, 3,
+                         QWEN35_N_FF_EXP, QWEN35_N_EMBD,
+                         QWEN35_N_EXPERT, false);
+        QWEN35_ADD_EXACT(layer->ffn_gate_inp_shexp, DS4_TENSOR_F32, 1,
+                         QWEN35_N_EMBD, 0, 0, true);
+        QWEN35_ADD_DENSE(layer->ffn_gate_shexp, 2,
+                         QWEN35_N_EMBD, QWEN35_N_FF_SHARED, true);
+        QWEN35_ADD_DENSE(layer->ffn_up_shexp, 2,
+                         QWEN35_N_EMBD, QWEN35_N_FF_SHARED, true);
+        QWEN35_ADD_DENSE(layer->ffn_down_shexp, 2,
+                         QWEN35_N_FF_SHARED, QWEN35_N_EMBD, true);
+    }
+    QWEN35_ADD_EXACT(weights->output_norm, DS4_TENSOR_F32, 1,
+                     QWEN35_N_EMBD, 0, 0, true);
+    QWEN35_ADD_DENSE(weights->output, 2,
+                     QWEN35_N_EMBD, QWEN35_N_VOCAB, true);
+
+#undef QWEN35_ADD_DENSE
+#undef QWEN35_ADD_EXACT
+
+    if (builder.seen_count != QWEN35_N_TENSOR ||
+        builder.included_count != QWEN35_NON_ROUTED_TENSOR_COUNT ||
+        builder.payload_bytes != QWEN35_NON_ROUTED_PAYLOAD_BYTES) {
+        goto fail;
+    }
+    for (uint32_t i = 0; i < QWEN35_N_TENSOR; i++) {
+        if (!builder.seen[i]) goto fail;
+    }
+    if (!qwen35_model_tensor_ranges_disjoint(model) ||
+        !model_map_span_vec_finish(spans) ||
+        model_map_span_vec_total_bytes(spans) != builder.payload_bytes) {
+        goto fail;
+    }
+
+    *payload_bytes_out = builder.payload_bytes;
+    return true;
+
+fail:
+#undef QWEN35_ADD_DENSE
+#undef QWEN35_ADD_EXACT
+    free(spans->v);
+    memset(spans, 0, sizeof(*spans));
+    return false;
+}
+
+static DS4_MAYBE_UNUSED bool qwen35_weights_model_map_non_routed_page_spans(
+        const ds4_model          *model,
+        const ds4_qwen35_weights *weights,
+        ds4_model_map_span_vec   *spans,
+        uint64_t                 *payload_bytes_out,
+        uint64_t                 *page_coverage_bytes_out) {
+    if (payload_bytes_out) *payload_bytes_out = 0;
+    if (page_coverage_bytes_out) *page_coverage_bytes_out = 0;
+    if (!model || !model->map || !weights || !spans ||
+        !payload_bytes_out || !page_coverage_bytes_out) {
+        return false;
+    }
+    if (!qwen35_weights_model_map_non_routed_spans(
+            model, weights, spans, payload_bytes_out)) {
+        return false;
+    }
+
+    const long page_long = sysconf(_SC_PAGESIZE);
+    if (page_long <= 0) goto fail;
+    const uint64_t page = (uint64_t)page_long;
+    if ((page & (page - 1u)) != 0 ||
+        model->size > UINT64_MAX - (page - 1u)) {
+        goto fail;
+    }
+    const uint64_t mapped_page_end =
+        (model->size + page - 1u) & ~(page - 1u);
+
+    uint32_t aligned_count = 0;
+    for (uint32_t i = 0; i < spans->len; i++) {
+        const uint64_t lo = spans->v[i].off & ~(page - 1u);
+        uint64_t hi = spans->v[i].end;
+        if (hi > UINT64_MAX - (page - 1u)) goto fail;
+        hi = (hi + page - 1u) & ~(page - 1u);
+        if (hi > mapped_page_end) hi = mapped_page_end;
+        if (hi <= lo) goto fail;
+        if (aligned_count != 0 &&
+            lo <= spans->v[aligned_count - 1u].end) {
+            if (hi > spans->v[aligned_count - 1u].end) {
+                spans->v[aligned_count - 1u].end = hi;
+            }
+        } else {
+            spans->v[aligned_count++] =
+                (ds4_model_map_span){lo, hi, false};
+        }
+    }
+    spans->len = aligned_count;
+    const uint64_t page_coverage = model_map_span_vec_total_bytes(spans);
+    if (page_coverage == 0 || page_coverage == UINT64_MAX ||
+        page_coverage < *payload_bytes_out) {
+        goto fail;
+    }
+    *page_coverage_bytes_out = page_coverage;
+    return true;
+
+fail:
+    free(spans->v);
+    memset(spans, 0, sizeof(*spans));
+    *payload_bytes_out = 0;
+    return false;
 }
 
 static DS4_MAYBE_UNUSED bool weights_streaming_non_routed_bytes(

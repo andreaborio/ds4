@@ -175,6 +175,361 @@ static void test_model_aware_context_memory(void) {
     CHECK(memcmp(&memory, &legacy, sizeof(memory)) == 0);
 }
 
+typedef struct {
+    ds4_model model;
+    ds4_qwen35_weights weights;
+    ds4_tensor tensors[QWEN35_N_TENSOR];
+    uint32_t next_tensor;
+    uint64_t next_offset;
+    uint64_t page;
+} qwen35_ssd_fixture;
+
+static ds4_tensor *qwen35_ssd_fixture_add(
+        qwen35_ssd_fixture *fixture,
+        uint32_t            type,
+        uint32_t            ndim,
+        uint64_t            d0,
+        uint64_t            d1,
+        uint64_t            d2) {
+    if (!fixture || fixture->next_tensor >= QWEN35_N_TENSOR ||
+        ndim == 0 || ndim > 3) {
+        return NULL;
+    }
+    const uint64_t dim[3] = {d0, d1, d2};
+    uint64_t elements = 1;
+    for (uint32_t i = 0; i < ndim; i++) {
+        if (dim[i] == 0 || elements > UINT64_MAX / dim[i]) return NULL;
+        elements *= dim[i];
+    }
+    uint64_t bytes = 0;
+    if (!tensor_nbytes(type, elements, &bytes) || bytes == 0) return NULL;
+
+    const uint64_t offset = align_up(fixture->next_offset, fixture->page);
+    if (offset < fixture->next_offset || offset > UINT64_MAX - bytes ||
+        offset < fixture->model.tensor_data_pos) {
+        return NULL;
+    }
+    ds4_tensor *tensor = &fixture->tensors[fixture->next_tensor++];
+    *tensor = (ds4_tensor){
+        .ndim = ndim,
+        .dim = {d0, d1, d2, 0},
+        .type = type,
+        .rel_offset = offset - fixture->model.tensor_data_pos,
+        .abs_offset = offset,
+        .elements = elements,
+        .bytes = bytes,
+    };
+    fixture->next_offset = offset + bytes;
+    return tensor;
+}
+
+static bool qwen35_ssd_fixture_make(qwen35_ssd_fixture *fixture) {
+    if (!fixture) return false;
+    memset(fixture, 0, sizeof(*fixture));
+    const long page_long = sysconf(_SC_PAGESIZE);
+    if (page_long <= 0) return false;
+    fixture->page = (uint64_t)page_long;
+    if ((fixture->page & (fixture->page - 1u)) != 0) return false;
+    fixture->model = (ds4_model){
+        .fd = -1,
+        .map = (const uint8_t *)(uintptr_t)1,
+        .alignment = 32,
+        .tensor_data_pos = 3u * fixture->page,
+        .family = DS4_MODEL_FAMILY_QWEN35_MOE,
+        .tensors = fixture->tensors,
+    };
+    fixture->next_offset = 5u * fixture->page;
+
+#define FIXTURE_ADD(dst_, type_, ndim_, d0_, d1_, d2_) do {          \
+    (dst_) = qwen35_ssd_fixture_add(                                 \
+        fixture, (type_), (ndim_), (d0_), (d1_), (d2_));            \
+    if (!(dst_)) return false;                                       \
+} while (0)
+
+    FIXTURE_ADD(fixture->weights.token_embd, DS4_TENSOR_Q8_0, 2,
+                QWEN35_N_EMBD, QWEN35_N_VOCAB, 0);
+    for (uint32_t il = 0; il < QWEN35_N_LAYER; il++) {
+        ds4_qwen35_layer_weights *layer = &fixture->weights.layer[il];
+        FIXTURE_ADD(layer->attn_norm, DS4_TENSOR_F32, 1,
+                    QWEN35_N_EMBD, 0, 0);
+        FIXTURE_ADD(layer->post_attention_norm, DS4_TENSOR_F32, 1,
+                    QWEN35_N_EMBD, 0, 0);
+        if (ds4_qwen35_layer_is_full_attention(il)) {
+            FIXTURE_ADD(layer->attn_q, DS4_TENSOR_Q8_0, 2,
+                        QWEN35_N_EMBD, 8192, 0);
+            FIXTURE_ADD(layer->attn_k, DS4_TENSOR_Q8_0, 2,
+                        QWEN35_N_EMBD, 512, 0);
+            FIXTURE_ADD(layer->attn_v, DS4_TENSOR_Q8_0, 2,
+                        QWEN35_N_EMBD, 512, 0);
+            FIXTURE_ADD(layer->attn_output, DS4_TENSOR_Q8_0, 2,
+                        4096, QWEN35_N_EMBD, 0);
+            FIXTURE_ADD(layer->attn_q_norm, DS4_TENSOR_F32, 1,
+                        QWEN35_N_HEAD_DIM, 0, 0);
+            FIXTURE_ADD(layer->attn_k_norm, DS4_TENSOR_F32, 1,
+                        QWEN35_N_HEAD_DIM, 0, 0);
+        } else {
+            FIXTURE_ADD(layer->attn_gate, DS4_TENSOR_Q8_0, 2,
+                        QWEN35_N_EMBD, 4096, 0);
+            FIXTURE_ADD(layer->attn_qkv, DS4_TENSOR_Q8_0, 2,
+                        QWEN35_N_EMBD, 8192, 0);
+            FIXTURE_ADD(layer->ssm_a, DS4_TENSOR_F32, 1,
+                        QWEN35_SSM_VALUE_HEAD, 0, 0);
+            FIXTURE_ADD(layer->ssm_alpha, DS4_TENSOR_F32, 2,
+                        QWEN35_N_EMBD, QWEN35_SSM_DT_RANK, 0);
+            FIXTURE_ADD(layer->ssm_beta, DS4_TENSOR_F32, 2,
+                        QWEN35_N_EMBD, QWEN35_SSM_DT_RANK, 0);
+            FIXTURE_ADD(layer->ssm_conv1d, DS4_TENSOR_F32, 2,
+                        QWEN35_SSM_CONV_KERNEL,
+                        QWEN35_SSM_CONV_CHANNEL, 0);
+            FIXTURE_ADD(layer->ssm_dt, DS4_TENSOR_F32, 1,
+                        QWEN35_SSM_DT_RANK, 0, 0);
+            FIXTURE_ADD(layer->ssm_norm, DS4_TENSOR_F32, 1,
+                        QWEN35_SSM_STATE, 0, 0);
+            FIXTURE_ADD(layer->ssm_out, DS4_TENSOR_Q8_0, 2,
+                        QWEN35_SSM_INNER, QWEN35_N_EMBD, 0);
+        }
+        FIXTURE_ADD(layer->ffn_gate_inp, DS4_TENSOR_F32, 2,
+                    QWEN35_N_EMBD, QWEN35_N_EXPERT, 0);
+        FIXTURE_ADD(layer->ffn_gate_exps, DS4_TENSOR_Q4_K, 3,
+                    QWEN35_N_EMBD, QWEN35_N_FF_EXP,
+                    QWEN35_N_EXPERT);
+        FIXTURE_ADD(layer->ffn_up_exps, DS4_TENSOR_Q4_K, 3,
+                    QWEN35_N_EMBD, QWEN35_N_FF_EXP,
+                    QWEN35_N_EXPERT);
+        FIXTURE_ADD(layer->ffn_down_exps, DS4_TENSOR_Q4_K, 3,
+                    QWEN35_N_FF_EXP, QWEN35_N_EMBD,
+                    QWEN35_N_EXPERT);
+        FIXTURE_ADD(layer->ffn_gate_inp_shexp, DS4_TENSOR_F32, 1,
+                    QWEN35_N_EMBD, 0, 0);
+        FIXTURE_ADD(layer->ffn_gate_shexp, DS4_TENSOR_Q8_0, 2,
+                    QWEN35_N_EMBD, QWEN35_N_FF_SHARED, 0);
+        FIXTURE_ADD(layer->ffn_up_shexp, DS4_TENSOR_Q8_0, 2,
+                    QWEN35_N_EMBD, QWEN35_N_FF_SHARED, 0);
+        FIXTURE_ADD(layer->ffn_down_shexp, DS4_TENSOR_Q8_0, 2,
+                    QWEN35_N_FF_SHARED, QWEN35_N_EMBD, 0);
+    }
+    FIXTURE_ADD(fixture->weights.output_norm, DS4_TENSOR_F32, 1,
+                QWEN35_N_EMBD, 0, 0);
+    FIXTURE_ADD(fixture->weights.output, DS4_TENSOR_Q8_0, 2,
+                QWEN35_N_EMBD, QWEN35_N_VOCAB, 0);
+#undef FIXTURE_ADD
+
+    if (fixture->next_tensor != QWEN35_N_TENSOR) return false;
+    fixture->model.n_tensors = fixture->next_tensor;
+    fixture->model.size = align_up(fixture->next_offset, fixture->page);
+    return fixture->model.size >= fixture->next_offset;
+}
+
+static bool qwen35_ssd_fixture_is_routed(
+        const qwen35_ssd_fixture *fixture,
+        const ds4_tensor         *tensor) {
+    for (uint32_t il = 0; il < QWEN35_N_LAYER; il++) {
+        const ds4_qwen35_layer_weights *layer = &fixture->weights.layer[il];
+        if (tensor == layer->ffn_gate_exps ||
+            tensor == layer->ffn_up_exps ||
+            tensor == layer->ffn_down_exps) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static bool qwen35_span_covers_tensor(
+        const ds4_model_map_span_vec *spans,
+        const ds4_tensor             *tensor) {
+    if (!spans || !tensor || tensor->abs_offset > UINT64_MAX - tensor->bytes) {
+        return false;
+    }
+    const uint64_t end = tensor->abs_offset + tensor->bytes;
+    for (uint32_t i = 0; i < spans->len; i++) {
+        if (spans->v[i].off <= tensor->abs_offset &&
+            spans->v[i].end >= end) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static bool qwen35_span_overlaps_tensor(
+        const ds4_model_map_span_vec *spans,
+        const ds4_tensor             *tensor) {
+    if (!spans || !tensor || tensor->abs_offset > UINT64_MAX - tensor->bytes) {
+        return true;
+    }
+    const uint64_t end = tensor->abs_offset + tensor->bytes;
+    for (uint32_t i = 0; i < spans->len; i++) {
+        if (spans->v[i].off < end && tensor->abs_offset < spans->v[i].end) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static void test_qwen35_ssd_static_contract(void) {
+    qwen35_ssd_fixture *fixture = calloc(1, sizeof(*fixture));
+    CHECK(fixture != NULL);
+    if (!fixture) return;
+    CHECK(qwen35_ssd_fixture_make(fixture));
+    if (fixture->next_tensor != QWEN35_N_TENSOR) {
+        free(fixture);
+        return;
+    }
+
+    ds4_qwen35_streaming_cache_geometry geometry;
+    memset(&geometry, 0xa5, sizeof(geometry));
+    CHECK(!qwen35_streaming_cache_geometry_make(NULL, &geometry));
+    CHECK(geometry.per_expert_bytes == 0);
+    CHECK(!qwen35_streaming_cache_geometry_make(&fixture->weights, NULL));
+    CHECK(qwen35_streaming_cache_geometry_make(
+              &fixture->weights, &geometry));
+    CHECK(geometry.gate_expert_bytes == UINT64_C(589824));
+    CHECK(geometry.up_expert_bytes == UINT64_C(589824));
+    CHECK(geometry.down_expert_bytes == UINT64_C(589824));
+    CHECK(geometry.per_expert_bytes == UINT64_C(1769472));
+    CHECK(geometry.cacheable_layers == 40);
+    CHECK(geometry.experts_per_layer == 256);
+    CHECK(geometry.selected_per_layer == 8);
+    CHECK(geometry.working_set_experts == 320);
+    CHECK(geometry.minimum_cache_experts == 321);
+    CHECK(geometry.minimum_cache_bytes == UINT64_C(568000512));
+    CHECK(geometry.warning_cache_experts == 640);
+    CHECK(geometry.max_cacheable_experts == 10240);
+
+    ds4_tensor *mutated = fixture->weights.layer[7].ffn_gate_exps;
+    const ds4_tensor saved_mutated = *mutated;
+    mutated->dim[1]--;
+    CHECK(!qwen35_streaming_cache_geometry_make(
+              &fixture->weights, &geometry));
+    *mutated = saved_mutated;
+    mutated->type = DS4_TENSOR_F16;
+    CHECK(!qwen35_streaming_cache_geometry_make(
+              &fixture->weights, &geometry));
+    *mutated = saved_mutated;
+    mutated->bytes--;
+    CHECK(!qwen35_streaming_cache_geometry_make(
+              &fixture->weights, &geometry));
+    *mutated = saved_mutated;
+
+    ds4_model_map_span_vec spans = {0};
+    uint64_t payload = 0;
+    CHECK(qwen35_weights_model_map_non_routed_spans(
+              &fixture->model, &fixture->weights, &spans, &payload));
+    CHECK(payload == QWEN35_NON_ROUTED_PAYLOAD_BYTES);
+    CHECK(payload == UINT64_C(2678180352));
+    CHECK(model_map_span_vec_total_bytes(&spans) == payload);
+    CHECK(spans.len != 0);
+    CHECK(spans.v[0].off == fixture->weights.token_embd->abs_offset);
+
+    uint32_t routed_count = 0;
+    uint32_t static_count = 0;
+    uint64_t independent_payload = 0;
+    for (uint32_t i = 0; i < QWEN35_N_TENSOR; i++) {
+        const ds4_tensor *tensor = &fixture->tensors[i];
+        if (qwen35_ssd_fixture_is_routed(fixture, tensor)) {
+            routed_count++;
+            CHECK(!qwen35_span_overlaps_tensor(&spans, tensor));
+        } else {
+            static_count++;
+            CHECK(qwen35_span_covers_tensor(&spans, tensor));
+            CHECK(independent_payload <= UINT64_MAX - tensor->bytes);
+            independent_payload += tensor->bytes;
+        }
+    }
+    CHECK(routed_count == QWEN35_ROUTED_EXPERT_TENSOR_COUNT);
+    CHECK(static_count == QWEN35_NON_ROUTED_TENSOR_COUNT);
+    CHECK(independent_payload == payload);
+    free(spans.v);
+
+    uint64_t page_payload = 0;
+    uint64_t page_coverage = 0;
+    memset(&spans, 0, sizeof(spans));
+    CHECK(qwen35_weights_model_map_non_routed_page_spans(
+              &fixture->model, &fixture->weights, &spans,
+              &page_payload, &page_coverage));
+    CHECK(page_payload == payload);
+    CHECK(page_coverage == model_map_span_vec_total_bytes(&spans));
+    CHECK(page_coverage >= page_payload);
+    for (uint32_t i = 0; i < spans.len; i++) {
+        CHECK(spans.v[i].off % fixture->page == 0);
+        CHECK(spans.v[i].end % fixture->page == 0);
+        CHECK(spans.v[i].end > spans.v[i].off);
+        if (i != 0) CHECK(spans.v[i].off > spans.v[i - 1u].end);
+    }
+    for (uint32_t i = 0; i < QWEN35_N_TENSOR; i++) {
+        const ds4_tensor *tensor = &fixture->tensors[i];
+        if (qwen35_ssd_fixture_is_routed(fixture, tensor)) {
+            CHECK(!qwen35_span_overlaps_tensor(&spans, tensor));
+        } else {
+            CHECK(qwen35_span_covers_tensor(&spans, tensor));
+        }
+    }
+    fprintf(stderr,
+            "Qwen SSD contract: static=%" PRIu64 " bytes, "
+            "page coverage=%" PRIu64 " bytes across %u spans\n",
+            page_payload, page_coverage, spans.len);
+    free(spans.v);
+
+    memset(&spans, 0, sizeof(spans));
+    ds4_tensor *saved_output = fixture->weights.output;
+    fixture->weights.output = fixture->weights.token_embd;
+    CHECK(!qwen35_weights_model_map_non_routed_spans(
+              &fixture->model, &fixture->weights, &spans, &payload));
+    CHECK(spans.v == NULL && payload == 0);
+    fixture->weights.output = saved_output;
+
+    const uint64_t saved_size = fixture->model.size;
+    const uint64_t saved_output_abs = saved_output->abs_offset;
+    const uint64_t saved_output_rel = saved_output->rel_offset;
+    saved_output->abs_offset = UINT64_MAX - 7u;
+    saved_output->rel_offset = saved_output->abs_offset -
+                               fixture->model.tensor_data_pos;
+    CHECK(!qwen35_weights_model_map_non_routed_spans(
+              &fixture->model, &fixture->weights, &spans, &payload));
+    CHECK(spans.v == NULL && payload == 0);
+    saved_output->abs_offset = saved_output_abs;
+    saved_output->rel_offset = saved_output_rel;
+
+    fixture->model.n_tensors--;
+    CHECK(!qwen35_weights_model_map_non_routed_spans(
+              &fixture->model, &fixture->weights, &spans, &payload));
+    fixture->model.n_tensors++;
+
+    const uint32_t saved_output_type = saved_output->type;
+    const uint64_t saved_output_bytes = saved_output->bytes;
+    saved_output->type = DS4_TENSOR_F16;
+    CHECK(tensor_nbytes(saved_output->type, saved_output->elements,
+                        &saved_output->bytes));
+    fixture->model.size = align_up(saved_output->abs_offset +
+                                   saved_output->bytes, fixture->page);
+    CHECK(!qwen35_weights_model_map_non_routed_spans(
+              &fixture->model, &fixture->weights, &spans, &payload));
+    CHECK(spans.v == NULL && payload == 0);
+    saved_output->type = saved_output_type;
+    saved_output->bytes = saved_output_bytes;
+    fixture->model.size = saved_size;
+
+    ds4_tensor *output_norm = fixture->weights.output_norm;
+    saved_output->abs_offset = output_norm->abs_offset;
+    saved_output->rel_offset = output_norm->rel_offset;
+    CHECK(!qwen35_weights_model_map_non_routed_spans(
+              &fixture->model, &fixture->weights, &spans, &payload));
+    CHECK(spans.v == NULL && payload == 0);
+    saved_output->abs_offset = saved_output_abs;
+    saved_output->rel_offset = saved_output_rel;
+
+    const uint8_t *saved_map = fixture->model.map;
+    fixture->model.map = NULL;
+    page_payload = 123;
+    page_coverage = 456;
+    CHECK(!qwen35_weights_model_map_non_routed_page_spans(
+              &fixture->model, &fixture->weights, &spans,
+              &page_payload, &page_coverage));
+    CHECK(spans.v == NULL && page_payload == 0 && page_coverage == 0);
+    fixture->model.map = saved_map;
+
+    free(fixture);
+}
+
 static void test_dynamic_logits(ds4_session *session) {
     const uint32_t n_vocab = QWEN35_N_VOCAB;
     CHECK(ds4_engine_vocab_size(session->engine) == QWEN35_N_VOCAB);
@@ -454,6 +809,7 @@ static void test_fail_closed_surfaces(ds4_session *session) {
 int main(void) {
     test_session_creation_boundary();
     test_model_aware_context_memory();
+    test_qwen35_ssd_static_contract();
 
     ds4_engine engine;
     ds4_session *session = NULL;
