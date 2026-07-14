@@ -1472,6 +1472,8 @@ static void test_metal_qwen35_primitives(void) {
 extern uint64_t ds4_gpu_internal_stream_expert_cache_decode_tokens(void);
 extern uint64_t ds4_gpu_internal_stream_expert_timing_selected_calls(void);
 extern uint32_t ds4_gpu_internal_stream_expert_cache_required_floor(void);
+extern void ds4_gpu_internal_stream_expert_cache_fail_mlock_after(
+    int64_t calls);
 extern int ds4_gpu_internal_moe_selected_trace_inspect(
     const char *path, uint32_t requested_width, uint32_t *file_width,
     uint64_t *record_count, int *legacy);
@@ -2290,6 +2292,35 @@ static void test_metal_q4_selected_slots_runtime_count(void) {
     TEST_ASSERT(floor_reject.decode_tokens == 0);
     TEST_ASSERT(ds4_gpu_internal_stream_expert_timing_selected_calls() == 0);
 
+    /* The actual first lazy allocation must fail closed before readahead,
+     * pread, cache installation, miss accounting, or token accounting. The
+     * fault hook exercises the production mlock wrapper, not a synthetic
+     * budget override, and proves that an active zero cap is not the unset
+     * sentinel. */
+    ds4_gpu_set_streaming_expert_cache_budget(321);
+    TEST_ASSERT(ds4_gpu_stream_expert_cache_configured_count() == 321);
+    ds4_gpu_internal_stream_expert_cache_fail_mlock_after(0);
+    test_metal_qwen_top8_result first_mlock_reject = {0};
+    const bool first_mlock_case_ok = test_metal_qwen_top8_case(
+        model_map, model_size,
+        gate_offset, up_offset, down_offset,
+        gate_expert_bytes, down_expert_bytes,
+        router_selected[0], router_weights[0], router_logits[0],
+        false, &first_mlock_reject);
+    ds4_gpu_internal_stream_expert_cache_fail_mlock_after(-1);
+    TEST_ASSERT(first_mlock_case_ok);
+    TEST_ASSERT(ds4_gpu_stream_expert_cache_configured_count() == 0);
+    TEST_ASSERT(first_mlock_reject.hits == 0);
+    TEST_ASSERT(first_mlock_reject.misses == 0);
+    TEST_ASSERT(first_mlock_reject.pread_bytes == 0);
+    TEST_ASSERT(first_mlock_reject.current_entries == 0);
+    TEST_ASSERT(first_mlock_reject.decode_tokens == 0);
+    TEST_ASSERT(ds4_gpu_internal_stream_expert_timing_selected_calls() == 0);
+    ds4_gpu_set_streaming_expert_cache_required_floor(0);
+    TEST_ASSERT(ds4_gpu_stream_expert_cache_configured_count() == 321);
+    ds4_gpu_set_streaming_expert_cache_required_floor(321);
+    TEST_ASSERT(ds4_gpu_stream_expert_cache_configured_count() == 0);
+
     ds4_gpu_set_streaming_expert_cache_budget(321);
     TEST_ASSERT(ds4_gpu_stream_expert_cache_configured_count() == 321);
     TEST_ASSERT(
@@ -2319,7 +2350,7 @@ static void test_metal_q4_selected_slots_runtime_count(void) {
             "misses=%llu/%llu pread=%llu/%llu; "
             "Qwen top8 cold/warm/dup=%llu/%llu/%llu misses; "
             "active cold/warm/pressure=%llu/%llu/%llu misses; "
-            "sync cold/warm hits=%llu/%llu; floor 320/321=%llu/%llu misses\n",
+            "sync cold/warm hits=%llu/%llu; floor 320/mlock/321=%llu/%llu/%llu misses\n",
             top4.out[0],
             (unsigned long long)top4.misses,
             (unsigned long long)top6.misses,
@@ -2334,6 +2365,7 @@ static void test_metal_q4_selected_slots_runtime_count(void) {
             (unsigned long long)sync_cold.hits,
             (unsigned long long)sync_warm.hits,
             (unsigned long long)floor_reject.misses,
+            (unsigned long long)first_mlock_reject.misses,
             (unsigned long long)floor_accept.misses);
 
     ds4_gpu_set_ssd_streaming(false);
@@ -2341,6 +2373,7 @@ static void test_metal_q4_selected_slots_runtime_count(void) {
     ds4_gpu_set_streaming_expert_cache_budget(0);
     ds4_gpu_set_streaming_expert_cache_expert_bytes(0);
     ds4_gpu_set_model_fd(-1);
+    ds4_gpu_internal_stream_expert_cache_fail_mlock_after(-1);
     test_restore_env("DS4_METAL_MOE_WRITE_CLAMPED_ACT", saved_clamped);
     test_restore_env("DS4_METAL_DISABLE_ROUTED_PAIR_SWIGLU_FUSION",
                      saved_disable_pair);
