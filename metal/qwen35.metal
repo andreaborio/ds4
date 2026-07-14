@@ -92,6 +92,47 @@ struct ds4_metal_args_qwen35_rmsnorm_gated {
     uint64_t output_dim_stride;
 };
 
+struct ds4_metal_args_qwen35_embedding_q8_0 {
+    uint32_t row_index;
+    uint32_t n_embd;
+    uint32_t block_size;
+    uint32_t reserved;
+    uint64_t source_row_stride;
+    uint64_t source_block_stride;
+    uint64_t source_scale_offset;
+    uint64_t source_quant_offset;
+    uint64_t source_quant_stride;
+    uint64_t output_dim_stride;
+};
+
+struct ds4_metal_args_qwen35_gated_delta_controls {
+    uint32_t n_value_head;
+    uint32_t reserved;
+    uint64_t alpha_logit_head_stride;
+    uint64_t beta_logit_head_stride;
+    uint64_t ssm_a_head_stride;
+    uint64_t dt_bias_head_stride;
+    uint64_t log_decay_head_stride;
+    uint64_t beta_head_stride;
+};
+
+struct ds4_metal_args_qwen35_gqa_decode {
+    uint32_t n_kv;
+    uint32_t n_query_head;
+    uint32_t n_kv_head;
+    uint32_t head_dim;
+    uint64_t query_head_stride;
+    uint64_t query_dim_stride;
+    uint64_t key_token_stride;
+    uint64_t key_head_stride;
+    uint64_t key_dim_stride;
+    uint64_t value_token_stride;
+    uint64_t value_head_stride;
+    uint64_t value_dim_stride;
+    uint64_t output_head_stride;
+    uint64_t output_dim_stride;
+};
+
 static inline float qwen35_metal_sigmoid(float x) {
     if (x >= 0.0f) {
         return 1.0f / (1.0f + exp(-x));
@@ -102,6 +143,20 @@ static inline float qwen35_metal_sigmoid(float x) {
 
 static inline float qwen35_metal_silu(float x) {
     return x * qwen35_metal_sigmoid(x);
+}
+
+static inline float qwen35_metal_softplus(float x) {
+    if (x > 20.0f) return x;
+    if (x < -20.0f) return exp(x);
+    // Metal does not expose log1p.  Keep both tails stable instead of losing
+    // exp(x) when it is added to 1 in ordinary float arithmetic.
+    if (x < -10.0f) {
+        const float exponential = exp(x);
+        return exponential - 0.5f * exponential * exponential +
+               (exponential * exponential * exponential) / 3.0f;
+    }
+    if (x > 10.0f) return x + log(1.0f + exp(-x));
+    return log(1.0f + exp(x));
 }
 
 static inline float qwen35_metal_load_f32(
@@ -115,6 +170,58 @@ static inline void qwen35_metal_store_f32(
         uint64_t     offset,
         float        value) {
     *((device float *)(base + offset)) = value;
+}
+
+// Dequantizes one token-embedding row from GGUF Q8_0 blocks.  The standard
+// encoding has block_size=32, a two-byte F16 scale, then 32 signed bytes.  All
+// physical offsets and strides are explicit so padded rows remain valid.
+kernel void kernel_qwen35_dequant_embedding_q8_0_f32(
+        constant ds4_metal_args_qwen35_embedding_q8_0 &args [[buffer(0)]],
+        device const char *embedding [[buffer(1)]],
+        device       char *output    [[buffer(2)]],
+        uint dim [[thread_position_in_grid]]) {
+    if (dim >= args.n_embd || args.block_size != 32u) return;
+    const uint block = dim / args.block_size;
+    const uint within_block = dim - block * args.block_size;
+    const uint64_t block_offset =
+        (uint64_t)args.row_index * args.source_row_stride +
+        (uint64_t)block * args.source_block_stride;
+    const half scale = *((device const half *)(
+        embedding + block_offset + args.source_scale_offset));
+    const int8_t quant = *((device const int8_t *)(
+        embedding + block_offset + args.source_quant_offset +
+        (uint64_t)within_block * args.source_quant_stride));
+    qwen35_metal_store_f32(
+        output, (uint64_t)dim * args.output_dim_stride,
+        (float)scale * (float)quant);
+}
+
+// One-token Gated DeltaNet control transform.  GGUF stores ssm_a as
+// -exp(A_log), so it is multiplied directly by the positive softplus timestep.
+kernel void kernel_qwen35_gated_delta_controls_f32(
+        constant ds4_metal_args_qwen35_gated_delta_controls &args
+            [[buffer(0)]],
+        device const char *alpha_logit [[buffer(1)]],
+        device const char *beta_logit  [[buffer(2)]],
+        device const char *ssm_a       [[buffer(3)]],
+        device const char *dt_bias     [[buffer(4)]],
+        device       char *log_decay   [[buffer(5)]],
+        device       char *beta        [[buffer(6)]],
+        uint head [[thread_position_in_grid]]) {
+    if (head >= args.n_value_head) return;
+    const float alpha = qwen35_metal_load_f32(
+        alpha_logit, (uint64_t)head * args.alpha_logit_head_stride);
+    const float beta_value = qwen35_metal_sigmoid(qwen35_metal_load_f32(
+        beta_logit, (uint64_t)head * args.beta_logit_head_stride));
+    const float a = qwen35_metal_load_f32(
+        ssm_a, (uint64_t)head * args.ssm_a_head_stride);
+    const float bias = qwen35_metal_load_f32(
+        dt_bias, (uint64_t)head * args.dt_bias_head_stride);
+    qwen35_metal_store_f32(
+        log_decay, (uint64_t)head * args.log_decay_head_stride,
+        a * qwen35_metal_softplus(alpha + bias));
+    qwen35_metal_store_f32(
+        beta, (uint64_t)head * args.beta_head_stride, beta_value);
 }
 
 // Projection layout is [token][head][Q then gate].  One grid thread copies one
@@ -413,6 +520,117 @@ kernel void kernel_qwen35_gated_delta_step_f32(
             output_base +
                 (uint64_t)value_dim * args.output_dim_stride,
             result);
+    }
+}
+
+// One-token causal grouped-query attention over separate F32 K/V caches with
+// layout [token][kv_head][head_dim].  One threadgroup owns one query head.  A
+// stable online softmax avoids an O(context) score buffer while preserving the
+// ordinary GQA mapping: contiguous query-head groups share each KV head.
+//
+// Dispatch requirements:
+//   grid = n_query_head threadgroups
+//   threads_per_threadgroup >= head_dim
+//   scratch = n_simdgroup + 4 floats
+kernel void kernel_qwen35_gqa_decode_f32(
+        constant ds4_metal_args_qwen35_gqa_decode &args [[buffer(0)]],
+        device const char *query       [[buffer(1)]],
+        device const char *key_cache   [[buffer(2)]],
+        device const char *value_cache [[buffer(3)]],
+        device       char *output      [[buffer(4)]],
+        threadgroup float *scratch     [[threadgroup(0)]],
+        uint3 group [[threadgroup_position_in_grid]],
+        ushort3 thread_pos [[thread_position_in_threadgroup]],
+        ushort lane [[thread_index_in_simdgroup]],
+        ushort simdgroup [[simdgroup_index_in_threadgroup]],
+        ushort simd_width [[threads_per_simdgroup]],
+        ushort3 threads [[threads_per_threadgroup]]) {
+    const uint query_head = group.x;
+    const uint tid = thread_pos.x;
+    if (query_head >= args.n_query_head || args.n_kv == 0u ||
+        args.n_kv_head == 0u || args.head_dim == 0u ||
+        args.n_query_head % args.n_kv_head != 0u ||
+        threads.x < args.head_dim) {
+        return;
+    }
+
+    const uint n_simdgroup =
+        (threads.x + simd_width - 1u) / simd_width;
+    if (n_simdgroup > simd_width) return;
+    const uint control = n_simdgroup;
+    const uint query_per_kv = args.n_query_head / args.n_kv_head;
+    const uint kv_head = query_head / query_per_kv;
+    const uint64_t query_base =
+        (uint64_t)query_head * args.query_head_stride;
+    const uint64_t output_base =
+        (uint64_t)query_head * args.output_head_stride;
+    const float scale = 1.0f / sqrt((float)args.head_dim);
+    float accumulator = 0.0f;
+
+    if (tid == 0u) {
+        scratch[control + 0u] = -INFINITY;
+        scratch[control + 1u] = 0.0f;
+        scratch[control + 2u] = 0.0f;
+        scratch[control + 3u] = 0.0f;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint token = 0; token < args.n_kv; token++) {
+        const uint64_t key_base =
+            (uint64_t)token * args.key_token_stride +
+            (uint64_t)kv_head * args.key_head_stride;
+        float dot_product = 0.0f;
+        for (uint dim = tid; dim < args.head_dim; dim += threads.x) {
+            const float q = qwen35_metal_load_f32(
+                query, query_base + (uint64_t)dim * args.query_dim_stride);
+            const float k = qwen35_metal_load_f32(
+                key_cache,
+                key_base + (uint64_t)dim * args.key_dim_stride);
+            dot_product += q * k;
+        }
+        dot_product = simd_sum(dot_product);
+        if (lane == 0u) scratch[simdgroup] = dot_product;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        if (simdgroup == 0u) {
+            float dot = lane < n_simdgroup ? scratch[lane] : 0.0f;
+            dot = simd_sum(dot);
+            if (lane == 0u) {
+                const float score = dot * scale;
+                const float previous_max = scratch[control + 0u];
+                const float next_max = max(previous_max, score);
+                const float previous_factor =
+                    exp(previous_max - next_max);
+                const float current_factor = exp(score - next_max);
+                scratch[control + 0u] = next_max;
+                scratch[control + 1u] =
+                    scratch[control + 1u] * previous_factor +
+                    current_factor;
+                scratch[control + 2u] = previous_factor;
+                scratch[control + 3u] = current_factor;
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        if (tid < args.head_dim) {
+            const uint64_t value_offset =
+                (uint64_t)token * args.value_token_stride +
+                (uint64_t)kv_head * args.value_head_stride +
+                (uint64_t)tid * args.value_dim_stride;
+            accumulator =
+                accumulator * scratch[control + 2u] +
+                qwen35_metal_load_f32(value_cache, value_offset) *
+                    scratch[control + 3u];
+        }
+        // The next token reuses the partial-sum slots and online-softmax
+        // factors, so every lane must finish consuming them first.
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    if (tid < args.head_dim) {
+        qwen35_metal_store_f32(
+            output, output_base + (uint64_t)tid * args.output_dim_stride,
+            accumulator / scratch[control + 1u]);
     }
 }
 
