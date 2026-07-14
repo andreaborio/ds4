@@ -448,6 +448,96 @@ int ds4_gpu_rope_tail_tensor(
         float             beta_fast,
         float             beta_slow);
 
+/* Qwen3.6 one-token primitives.  These keep the recurrent/full-attention
+ * state resident and deliberately use the model's F32 correctness layout;
+ * batched prefill and narrower cache storage can be layered on later without
+ * changing the model-family scheduler.  Tensor arguments must not overlap
+ * unless the function exposes a single in-place tensor, as RoPE does. */
+int ds4_gpu_qwen35_split_q_gate_tensor(
+        ds4_gpu_tensor       *query,
+        ds4_gpu_tensor       *gate,
+        const ds4_gpu_tensor *projection,
+        uint32_t              n_query_head,
+        uint32_t              head_dim);
+
+int ds4_gpu_qwen35_sigmoid_mul_tensor(
+        ds4_gpu_tensor       *out,
+        const ds4_gpu_tensor *input,
+        const ds4_gpu_tensor *gate,
+        uint32_t              n_value,
+        bool                  broadcast_gate);
+
+int ds4_gpu_qwen35_rope_prefix_tensor(
+        ds4_gpu_tensor *values,
+        uint32_t        n_head,
+        uint32_t        head_dim,
+        uint32_t        n_rot,
+        uint32_t        position,
+        float           theta);
+
+int ds4_gpu_qwen35_causal_conv_step_tensor(
+        ds4_gpu_tensor       *out,
+        ds4_gpu_tensor       *state,
+        const ds4_gpu_tensor *input,
+        const void           *model_map,
+        uint64_t              model_size,
+        uint64_t              weight_offset,
+        uint32_t              n_channel,
+        uint32_t              kernel_size);
+
+int ds4_gpu_qwen35_gated_delta_step_tensor(
+        ds4_gpu_tensor       *out,
+        ds4_gpu_tensor       *state,
+        const ds4_gpu_tensor *query,
+        const ds4_gpu_tensor *key,
+        const ds4_gpu_tensor *value,
+        const ds4_gpu_tensor *log_decay,
+        const ds4_gpu_tensor *beta,
+        uint32_t              n_key_head,
+        uint32_t              n_value_head,
+        uint32_t              key_dim,
+        uint32_t              value_dim);
+
+int ds4_gpu_qwen35_rmsnorm_gated_tensor(
+        ds4_gpu_tensor       *out,
+        const ds4_gpu_tensor *input,
+        const ds4_gpu_tensor *gate,
+        const void           *model_map,
+        uint64_t              model_size,
+        uint64_t              weight_offset,
+        uint32_t              n_vector,
+        uint32_t              dim,
+        float                 epsilon);
+
+int ds4_gpu_qwen35_dequant_embedding_q8_0_tensor(
+        ds4_gpu_tensor *out,
+        const void     *model_map,
+        uint64_t        model_size,
+        uint64_t        embedding_offset,
+        uint32_t        row_index,
+        uint32_t        n_embd);
+
+int ds4_gpu_qwen35_gated_delta_controls_tensor(
+        ds4_gpu_tensor       *log_decay,
+        ds4_gpu_tensor       *beta,
+        const ds4_gpu_tensor *alpha_logit,
+        const ds4_gpu_tensor *beta_logit,
+        const void           *model_map,
+        uint64_t              model_size,
+        uint64_t              ssm_a_offset,
+        uint64_t              dt_bias_offset,
+        uint32_t              n_value_head);
+
+int ds4_gpu_qwen35_gqa_decode_tensor(
+        ds4_gpu_tensor       *out,
+        const ds4_gpu_tensor *query,
+        const ds4_gpu_tensor *key_cache,
+        const ds4_gpu_tensor *value_cache,
+        uint32_t              n_kv,
+        uint32_t              n_query_head,
+        uint32_t              n_kv_head,
+        uint32_t              head_dim);
+
 /* Release decode fused KV finalizer: after the standalone RoPE kernel, this
  * performs DS4's FP8 non-RoPE KV round trip and writes the F16-rounded raw
  * attention cache row in one dispatch. */

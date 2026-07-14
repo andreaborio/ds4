@@ -3,6 +3,7 @@
 #include "../ds4_server.c"
 #ifndef DS4_NO_GPU
 #include "../ds4_gpu.h"
+#include "../ds4_qwen.h"
 #include <math.h>
 
 static ds4_engine *test_engine_fast;
@@ -491,10 +492,509 @@ static void test_metal_q8_0_prefill_matmul(void) {
     free(weights_raw);
 }
 
+static ds4_gpu_tensor *test_metal_tensor_from_f32(
+        const float *values,
+        size_t       count) {
+    const uint64_t bytes = (uint64_t)count * sizeof(float);
+    ds4_gpu_tensor *tensor = ds4_gpu_tensor_alloc(bytes);
+    TEST_ASSERT(tensor != NULL);
+    if (!tensor) return NULL;
+    if (!ds4_gpu_tensor_write(tensor, 0, values, bytes)) {
+        TEST_ASSERT(false);
+        ds4_gpu_tensor_free(tensor);
+        return NULL;
+    }
+    return tensor;
+}
+
+static bool test_metal_read_f32(
+        const ds4_gpu_tensor *tensor,
+        float                *values,
+        size_t                count) {
+    const bool ok = tensor && values &&
+        ds4_gpu_tensor_read(tensor, 0, values,
+                            (uint64_t)count * sizeof(float)) != 0;
+    TEST_ASSERT(ok);
+    return ok;
+}
+
+static bool test_metal_qwen35_close(
+        const char  *label,
+        const float *actual,
+        const float *expected,
+        size_t       count,
+        float        absolute_tolerance,
+        float        relative_tolerance) {
+    bool ok = actual && expected;
+    float max_abs = 0.0f;
+    size_t worst = 0;
+    if (ok) {
+        for (size_t i = 0; i < count; i++) {
+            const float error = fabsf(actual[i] - expected[i]);
+            const float tolerance = absolute_tolerance +
+                relative_tolerance * fabsf(expected[i]);
+            if (error > max_abs) {
+                max_abs = error;
+                worst = i;
+            }
+            if (!(error <= tolerance)) ok = false;
+        }
+    }
+    if (!ok) {
+        fprintf(stderr,
+                "ds4-test: %s mismatch at %zu: got=%.9g expected=%.9g max_abs=%.9g\n",
+                label, worst, actual ? actual[worst] : 0.0f,
+                expected ? expected[worst] : 0.0f, max_abs);
+    } else {
+        fprintf(stderr, "ds4-test: %s max_abs=%.3g\n", label, max_abs);
+    }
+    TEST_ASSERT(ok);
+    return ok;
+}
+
+static void test_metal_qwen35_primitives(void) {
+    enum {
+        EMB_N = 64,
+        EMB_ROWS = 3,
+        EMB_ROW_BYTES = (EMB_N / 32) * 34,
+        EMB_OFFSET = 0,
+        CONV_CHANNEL = 5,
+        CONV_KERNEL = 4,
+        CONV_OFFSET = 256,
+        RMS_VECTOR = 4,
+        RMS_DIM = 7,
+        RMS_OFFSET = 384,
+        CONTROL_HEAD = 4,
+        SSM_A_OFFSET = 448,
+        DT_BIAS_OFFSET = 480,
+    };
+
+    const uint64_t model_size = test_round_up_u64(512, (uint64_t)getpagesize());
+    void *model_raw = NULL;
+    TEST_ASSERT(posix_memalign(&model_raw, (size_t)getpagesize(),
+                              (size_t)model_size) == 0);
+    if (!model_raw) return;
+    uint8_t *model = model_raw;
+    memset(model, 0, (size_t)model_size);
+
+    test_fill_q8_0_weights(model + EMB_OFFSET, EMB_N, EMB_ROWS);
+    float *conv_weight = (float *)(model + CONV_OFFSET);
+    for (size_t i = 0; i < CONV_CHANNEL * CONV_KERNEL; i++) {
+        conv_weight[i] = (float)((int)((i * 13u + 5u) % 29u) - 14) / 37.0f;
+    }
+    float *rms_weight = (float *)(model + RMS_OFFSET);
+    for (size_t i = 0; i < RMS_DIM; i++) {
+        rms_weight[i] = 0.75f + (float)i * 0.071f;
+    }
+    float *ssm_a = (float *)(model + SSM_A_OFFSET);
+    float *dt_bias = (float *)(model + DT_BIAS_OFFSET);
+    for (size_t i = 0; i < CONTROL_HEAD; i++) {
+        ssm_a[i] = -0.35f - 0.11f * (float)i;
+        dt_bias[i] = -0.4f + 0.27f * (float)i;
+    }
+
+    TEST_ASSERT(ds4_gpu_set_model_map(model_raw, model_size) != 0);
+
+    /* Q8_0 token embedding row dequantization from the page-aligned map. */
+    {
+        const uint32_t row_index = 1;
+        float expected[EMB_N];
+        float actual[EMB_N];
+        const uint8_t *row = model + EMB_OFFSET + row_index * EMB_ROW_BYTES;
+        for (size_t block = 0; block < EMB_N / 32; block++) {
+            uint16_t scale_bits = 0;
+            memcpy(&scale_bits, row + block * 34u, sizeof(scale_bits));
+            const float scale = test_f16_to_f32(scale_bits);
+            const int8_t *quant =
+                (const int8_t *)(row + block * 34u + 2u);
+            for (size_t i = 0; i < 32; i++) {
+                expected[block * 32u + i] = scale * (float)quant[i];
+            }
+        }
+        ds4_gpu_tensor *out = ds4_gpu_tensor_alloc(sizeof(actual));
+        TEST_ASSERT(out != NULL);
+        if (out) {
+            TEST_ASSERT(ds4_gpu_qwen35_dequant_embedding_q8_0_tensor(
+                out, model_raw, model_size, EMB_OFFSET, row_index, EMB_N));
+            if (test_metal_read_f32(out, actual, EMB_N)) {
+                test_metal_qwen35_close("Qwen Q8_0 embedding", actual,
+                                        expected, EMB_N, 1.0e-7f, 1.0e-7f);
+            }
+        }
+        ds4_gpu_tensor_free(out);
+    }
+
+    /* DeltaNet control transform, including both F32 model-map vectors. */
+    {
+        float alpha_logit[CONTROL_HEAD];
+        float beta_logit[CONTROL_HEAD];
+        float expected_decay[CONTROL_HEAD];
+        float expected_beta[CONTROL_HEAD];
+        float actual_decay[CONTROL_HEAD];
+        float actual_beta[CONTROL_HEAD];
+        float zero[CONTROL_HEAD];
+        for (size_t i = 0; i < CONTROL_HEAD; i++) {
+            alpha_logit[i] = -1.1f + 0.73f * (float)i;
+            beta_logit[i] = 0.9f - 0.61f * (float)i;
+            zero[i] = 0.0f;
+        }
+        TEST_ASSERT(ds4_qwen35_cpu_gated_delta_controls_f32(
+            expected_decay, expected_beta, alpha_logit, beta_logit,
+            ssm_a, dt_bias, CONTROL_HEAD));
+
+        ds4_gpu_tensor *alpha =
+            test_metal_tensor_from_f32(alpha_logit, CONTROL_HEAD);
+        ds4_gpu_tensor *beta_in =
+            test_metal_tensor_from_f32(beta_logit, CONTROL_HEAD);
+        ds4_gpu_tensor *decay = test_metal_tensor_from_f32(zero, CONTROL_HEAD);
+        ds4_gpu_tensor *beta = test_metal_tensor_from_f32(zero, CONTROL_HEAD);
+        if (alpha && beta_in && decay && beta) {
+            TEST_ASSERT(ds4_gpu_qwen35_gated_delta_controls_tensor(
+                decay, beta, alpha, beta_in, model_raw, model_size,
+                SSM_A_OFFSET, DT_BIAS_OFFSET, CONTROL_HEAD));
+            if (test_metal_read_f32(decay, actual_decay, CONTROL_HEAD) &&
+                test_metal_read_f32(beta, actual_beta, CONTROL_HEAD)) {
+                test_metal_qwen35_close("Qwen DeltaNet log decay",
+                                        actual_decay, expected_decay,
+                                        CONTROL_HEAD, 4.0e-6f, 4.0e-6f);
+                test_metal_qwen35_close("Qwen DeltaNet beta", actual_beta,
+                                        expected_beta, CONTROL_HEAD,
+                                        2.0e-6f, 2.0e-6f);
+            }
+        }
+        ds4_gpu_tensor_free(alpha);
+        ds4_gpu_tensor_free(beta_in);
+        ds4_gpu_tensor_free(decay);
+        ds4_gpu_tensor_free(beta);
+    }
+
+    /* Interleaved [Q, gate] head projection split. */
+    {
+        enum { N_HEAD = 3, HEAD_DIM = 5, OUT_N = N_HEAD * HEAD_DIM };
+        float projection[OUT_N * 2];
+        float expected_query[OUT_N];
+        float expected_gate[OUT_N];
+        float actual_query[OUT_N];
+        float actual_gate[OUT_N];
+        float zero[OUT_N];
+        for (size_t i = 0; i < OUT_N * 2; i++) {
+            projection[i] = (float)((int)((i * 19u + 7u) % 41u) - 20) /
+                            23.0f;
+        }
+        memset(zero, 0, sizeof(zero));
+        TEST_ASSERT(ds4_qwen35_cpu_split_q_gate_f32(
+            expected_query, expected_gate, projection, N_HEAD, HEAD_DIM));
+        ds4_gpu_tensor *projection_gpu =
+            test_metal_tensor_from_f32(projection, OUT_N * 2);
+        ds4_gpu_tensor *query_gpu = test_metal_tensor_from_f32(zero, OUT_N);
+        ds4_gpu_tensor *gate_gpu = test_metal_tensor_from_f32(zero, OUT_N);
+        if (projection_gpu && query_gpu && gate_gpu) {
+            TEST_ASSERT(ds4_gpu_qwen35_split_q_gate_tensor(
+                query_gpu, gate_gpu, projection_gpu, N_HEAD, HEAD_DIM));
+            if (test_metal_read_f32(query_gpu, actual_query, OUT_N) &&
+                test_metal_read_f32(gate_gpu, actual_gate, OUT_N)) {
+                test_metal_qwen35_close("Qwen split query", actual_query,
+                                        expected_query, OUT_N, 0.0f, 0.0f);
+                test_metal_qwen35_close("Qwen split gate", actual_gate,
+                                        expected_gate, OUT_N, 0.0f, 0.0f);
+            }
+        }
+        ds4_gpu_tensor_free(projection_gpu);
+        ds4_gpu_tensor_free(query_gpu);
+        ds4_gpu_tensor_free(gate_gpu);
+    }
+
+    /* Elementwise attention gating and scalar shared-expert broadcast. */
+    {
+        enum { N_VALUE = 17 };
+        float input[N_VALUE];
+        float gate[N_VALUE];
+        float expected[N_VALUE];
+        float actual[N_VALUE];
+        float zero[N_VALUE];
+        const float scalar_gate[1] = {-0.37f};
+        for (size_t i = 0; i < N_VALUE; i++) {
+            input[i] = (float)((int)(i * 7u % 23u) - 11) / 9.0f;
+            gate[i] = -2.0f + 0.29f * (float)i;
+            zero[i] = 0.0f;
+        }
+        ds4_gpu_tensor *input_gpu = test_metal_tensor_from_f32(input, N_VALUE);
+        ds4_gpu_tensor *gate_gpu = test_metal_tensor_from_f32(gate, N_VALUE);
+        ds4_gpu_tensor *scalar_gpu =
+            test_metal_tensor_from_f32(scalar_gate, 1);
+        ds4_gpu_tensor *out_gpu = test_metal_tensor_from_f32(zero, N_VALUE);
+        if (input_gpu && gate_gpu && scalar_gpu && out_gpu) {
+            TEST_ASSERT(ds4_qwen35_cpu_sigmoid_gate_elements_f32(
+                expected, input, gate, N_VALUE));
+            TEST_ASSERT(ds4_gpu_qwen35_sigmoid_mul_tensor(
+                out_gpu, input_gpu, gate_gpu, N_VALUE, false));
+            if (test_metal_read_f32(out_gpu, actual, N_VALUE)) {
+                test_metal_qwen35_close("Qwen elementwise sigmoid gate",
+                                        actual, expected, N_VALUE,
+                                        2.0e-6f, 2.0e-6f);
+            }
+
+            TEST_ASSERT(ds4_qwen35_cpu_sigmoid_gate_f32(
+                expected, input, scalar_gate, 1, N_VALUE));
+            TEST_ASSERT(ds4_gpu_qwen35_sigmoid_mul_tensor(
+                out_gpu, input_gpu, scalar_gpu, N_VALUE, true));
+            if (test_metal_read_f32(out_gpu, actual, N_VALUE)) {
+                test_metal_qwen35_close("Qwen broadcast sigmoid gate",
+                                        actual, expected, N_VALUE,
+                                        2.0e-6f, 2.0e-6f);
+            }
+        }
+        ds4_gpu_tensor_free(input_gpu);
+        ds4_gpu_tensor_free(gate_gpu);
+        ds4_gpu_tensor_free(scalar_gpu);
+        ds4_gpu_tensor_free(out_gpu);
+    }
+
+    /* Split-half NeoX RoPE over only the configured prefix. */
+    {
+        enum { N_HEAD = 3, HEAD_DIM = 8, N_ROT = 6, N_VALUE = N_HEAD * HEAD_DIM };
+        const uint32_t position = 17;
+        const float theta = 10000.0f;
+        float input[N_VALUE];
+        float expected[N_VALUE];
+        float actual[N_VALUE];
+        for (size_t i = 0; i < N_VALUE; i++) {
+            input[i] = 0.43f * sinf((float)(i + 1u) * 0.37f) -
+                       0.17f * cosf((float)(i + 3u) * 0.23f);
+        }
+        memcpy(expected, input, sizeof(expected));
+        TEST_ASSERT(ds4_qwen35_cpu_text_rope_f32(
+            expected, position, N_HEAD, HEAD_DIM, N_ROT, theta));
+        ds4_gpu_tensor *values = test_metal_tensor_from_f32(input, N_VALUE);
+        if (values) {
+            TEST_ASSERT(ds4_gpu_qwen35_rope_prefix_tensor(
+                values, N_HEAD, HEAD_DIM, N_ROT, position, theta));
+            if (test_metal_read_f32(values, actual, N_VALUE)) {
+                test_metal_qwen35_close("Qwen text RoPE", actual, expected,
+                                        N_VALUE, 1.0e-5f, 1.0e-5f);
+            }
+        }
+        ds4_gpu_tensor_free(values);
+    }
+
+    /* Stateful one-token causal convolution. */
+    {
+        enum { STATE_N = CONV_CHANNEL * (CONV_KERNEL - 1) };
+        float input[CONV_CHANNEL];
+        float initial_state[STATE_N];
+        float expected_state[STATE_N];
+        float expected_out[CONV_CHANNEL];
+        float actual_state[STATE_N];
+        float actual_out[CONV_CHANNEL];
+        float zero[CONV_CHANNEL];
+        for (size_t i = 0; i < CONV_CHANNEL; i++) {
+            input[i] = -0.55f + 0.31f * (float)i;
+            zero[i] = 0.0f;
+        }
+        for (size_t i = 0; i < STATE_N; i++) {
+            initial_state[i] = (float)((int)(i * 11u % 31u) - 15) / 29.0f;
+        }
+        memcpy(expected_state, initial_state, sizeof(expected_state));
+        TEST_ASSERT(ds4_qwen35_cpu_causal_conv_step_f32(
+            expected_out, expected_state, input, conv_weight,
+            CONV_CHANNEL, CONV_KERNEL));
+        ds4_gpu_tensor *input_gpu =
+            test_metal_tensor_from_f32(input, CONV_CHANNEL);
+        ds4_gpu_tensor *state_gpu =
+            test_metal_tensor_from_f32(initial_state, STATE_N);
+        ds4_gpu_tensor *out_gpu =
+            test_metal_tensor_from_f32(zero, CONV_CHANNEL);
+        if (input_gpu && state_gpu && out_gpu) {
+            TEST_ASSERT(ds4_gpu_qwen35_causal_conv_step_tensor(
+                out_gpu, state_gpu, input_gpu, model_raw, model_size,
+                CONV_OFFSET, CONV_CHANNEL, CONV_KERNEL));
+            if (test_metal_read_f32(out_gpu, actual_out, CONV_CHANNEL) &&
+                test_metal_read_f32(state_gpu, actual_state, STATE_N)) {
+                test_metal_qwen35_close("Qwen causal conv output", actual_out,
+                                        expected_out, CONV_CHANNEL,
+                                        3.0e-6f, 3.0e-6f);
+                test_metal_qwen35_close("Qwen causal conv state", actual_state,
+                                        expected_state, STATE_N,
+                                        0.0f, 0.0f);
+            }
+        }
+        ds4_gpu_tensor_free(input_gpu);
+        ds4_gpu_tensor_free(state_gpu);
+        ds4_gpu_tensor_free(out_gpu);
+    }
+
+    /* Recurrent Gated DeltaNet update and persistent state. */
+    {
+        enum {
+            N_KEY_HEAD = 2,
+            N_VALUE_HEAD = 4,
+            KEY_DIM = 16,
+            VALUE_DIM = 7,
+            QK_N = N_KEY_HEAD * KEY_DIM,
+            VALUE_N = N_VALUE_HEAD * VALUE_DIM,
+            STATE_N = N_VALUE_HEAD * VALUE_DIM * KEY_DIM,
+        };
+        float query[QK_N];
+        float key[QK_N];
+        float value[VALUE_N];
+        float log_decay[N_VALUE_HEAD];
+        float beta[N_VALUE_HEAD];
+        float initial_state[STATE_N];
+        float expected_state[STATE_N];
+        float expected_out[VALUE_N];
+        float actual_state[STATE_N];
+        float actual_out[VALUE_N];
+        float zero[VALUE_N];
+        for (size_t i = 0; i < QK_N; i++) {
+            query[i] = 0.37f * sinf((float)(i + 1u) * 0.19f) - 0.08f;
+            key[i] = 0.41f * cosf((float)(i + 2u) * 0.17f) + 0.05f;
+        }
+        for (size_t i = 0; i < VALUE_N; i++) {
+            value[i] = (float)((int)(i * 17u % 43u) - 21) / 31.0f;
+            zero[i] = 0.0f;
+        }
+        for (size_t i = 0; i < N_VALUE_HEAD; i++) {
+            log_decay[i] = -0.07f - 0.045f * (float)i;
+            beta[i] = 0.22f + 0.13f * (float)i;
+        }
+        for (size_t i = 0; i < STATE_N; i++) {
+            initial_state[i] =
+                (float)((int)(i * 29u % 97u) - 48) / 503.0f;
+        }
+        memcpy(expected_state, initial_state, sizeof(expected_state));
+        TEST_ASSERT(ds4_qwen35_cpu_gated_delta_step_f32(
+            expected_out, expected_state, query, key, value, log_decay, beta,
+            N_KEY_HEAD, N_VALUE_HEAD, KEY_DIM, VALUE_DIM));
+
+        ds4_gpu_tensor *query_gpu = test_metal_tensor_from_f32(query, QK_N);
+        ds4_gpu_tensor *key_gpu = test_metal_tensor_from_f32(key, QK_N);
+        ds4_gpu_tensor *value_gpu = test_metal_tensor_from_f32(value, VALUE_N);
+        ds4_gpu_tensor *decay_gpu =
+            test_metal_tensor_from_f32(log_decay, N_VALUE_HEAD);
+        ds4_gpu_tensor *beta_gpu =
+            test_metal_tensor_from_f32(beta, N_VALUE_HEAD);
+        ds4_gpu_tensor *state_gpu =
+            test_metal_tensor_from_f32(initial_state, STATE_N);
+        ds4_gpu_tensor *out_gpu = test_metal_tensor_from_f32(zero, VALUE_N);
+        if (query_gpu && key_gpu && value_gpu && decay_gpu && beta_gpu &&
+            state_gpu && out_gpu) {
+            TEST_ASSERT(ds4_gpu_qwen35_gated_delta_step_tensor(
+                out_gpu, state_gpu, query_gpu, key_gpu, value_gpu,
+                decay_gpu, beta_gpu, N_KEY_HEAD, N_VALUE_HEAD,
+                KEY_DIM, VALUE_DIM));
+            if (test_metal_read_f32(out_gpu, actual_out, VALUE_N) &&
+                test_metal_read_f32(state_gpu, actual_state, STATE_N)) {
+                test_metal_qwen35_close("Qwen Gated DeltaNet output",
+                                        actual_out, expected_out, VALUE_N,
+                                        8.0e-5f, 8.0e-5f);
+                test_metal_qwen35_close("Qwen Gated DeltaNet state",
+                                        actual_state, expected_state, STATE_N,
+                                        8.0e-5f, 8.0e-5f);
+            }
+        }
+        ds4_gpu_tensor_free(query_gpu);
+        ds4_gpu_tensor_free(key_gpu);
+        ds4_gpu_tensor_free(value_gpu);
+        ds4_gpu_tensor_free(decay_gpu);
+        ds4_gpu_tensor_free(beta_gpu);
+        ds4_gpu_tensor_free(state_gpu);
+        ds4_gpu_tensor_free(out_gpu);
+    }
+
+    /* Per-value-head gated RMS normalization with F32 model weight. */
+    {
+        enum { N_VALUE = RMS_VECTOR * RMS_DIM };
+        const float epsilon = 1.0e-6f;
+        float input[N_VALUE];
+        float gate[N_VALUE];
+        float expected[N_VALUE];
+        float actual[N_VALUE];
+        float zero[N_VALUE];
+        for (size_t i = 0; i < N_VALUE; i++) {
+            input[i] = (float)((int)(i * 23u % 53u) - 26) / 19.0f;
+            gate[i] = -1.7f + 0.14f * (float)i;
+            zero[i] = 0.0f;
+        }
+        TEST_ASSERT(ds4_qwen35_cpu_rmsnorm_gated_f32(
+            expected, input, gate, rms_weight, RMS_VECTOR, RMS_DIM, epsilon));
+        ds4_gpu_tensor *input_gpu = test_metal_tensor_from_f32(input, N_VALUE);
+        ds4_gpu_tensor *gate_gpu = test_metal_tensor_from_f32(gate, N_VALUE);
+        ds4_gpu_tensor *out_gpu = test_metal_tensor_from_f32(zero, N_VALUE);
+        if (input_gpu && gate_gpu && out_gpu) {
+            TEST_ASSERT(ds4_gpu_qwen35_rmsnorm_gated_tensor(
+                out_gpu, input_gpu, gate_gpu, model_raw, model_size,
+                RMS_OFFSET, RMS_VECTOR, RMS_DIM, epsilon));
+            if (test_metal_read_f32(out_gpu, actual, N_VALUE)) {
+                test_metal_qwen35_close("Qwen gated RMSNorm", actual,
+                                        expected, N_VALUE,
+                                        5.0e-5f, 5.0e-5f);
+            }
+        }
+        ds4_gpu_tensor_free(input_gpu);
+        ds4_gpu_tensor_free(gate_gpu);
+        ds4_gpu_tensor_free(out_gpu);
+    }
+
+    /* One-token grouped-query attention over separate F32 K/V caches. */
+    {
+        enum {
+            N_KV = 5,
+            N_QUERY_HEAD = 4,
+            N_KV_HEAD = 2,
+            HEAD_DIM = 32,
+            QUERY_N = N_QUERY_HEAD * HEAD_DIM,
+            CACHE_N = N_KV * N_KV_HEAD * HEAD_DIM,
+        };
+        float query[QUERY_N];
+        float key[CACHE_N];
+        float value[CACHE_N];
+        float expected[QUERY_N];
+        float actual[QUERY_N];
+        float zero[QUERY_N];
+        float score[N_KV];
+        for (size_t i = 0; i < QUERY_N; i++) {
+            query[i] = 0.29f * sinf((float)(i + 1u) * 0.071f) -
+                       0.13f * cosf((float)(i + 4u) * 0.053f);
+            zero[i] = 0.0f;
+        }
+        for (size_t i = 0; i < CACHE_N; i++) {
+            key[i] = 0.33f * cosf((float)(i + 2u) * 0.037f) +
+                     0.07f * sinf((float)(i + 5u) * 0.019f);
+            value[i] = 0.61f * sinf((float)(i + 3u) * 0.043f) -
+                       0.09f * cosf((float)(i + 7u) * 0.031f);
+        }
+        TEST_ASSERT(ds4_qwen35_cpu_gqa_decode_f32(
+            expected, score, N_KV, query, key, value, N_KV,
+            N_QUERY_HEAD, N_KV_HEAD, HEAD_DIM));
+        ds4_gpu_tensor *query_gpu =
+            test_metal_tensor_from_f32(query, QUERY_N);
+        ds4_gpu_tensor *key_gpu = test_metal_tensor_from_f32(key, CACHE_N);
+        ds4_gpu_tensor *value_gpu =
+            test_metal_tensor_from_f32(value, CACHE_N);
+        ds4_gpu_tensor *out_gpu = test_metal_tensor_from_f32(zero, QUERY_N);
+        if (query_gpu && key_gpu && value_gpu && out_gpu) {
+            TEST_ASSERT(ds4_gpu_qwen35_gqa_decode_tensor(
+                out_gpu, query_gpu, key_gpu, value_gpu, N_KV,
+                N_QUERY_HEAD, N_KV_HEAD, HEAD_DIM));
+            if (test_metal_read_f32(out_gpu, actual, QUERY_N)) {
+                test_metal_qwen35_close("Qwen GQA decode", actual, expected,
+                                        QUERY_N, 2.0e-4f, 2.0e-4f);
+            }
+        }
+        ds4_gpu_tensor_free(query_gpu);
+        ds4_gpu_tensor_free(key_gpu);
+        ds4_gpu_tensor_free(value_gpu);
+        ds4_gpu_tensor_free(out_gpu);
+    }
+
+    free(model_raw);
+}
+
 static void test_metal_kernel_group(void) {
     test_metal_f16_matvec_fast_nr0_4();
     test_metal_f16_prefill_matmul();
     test_metal_q8_0_prefill_matmul();
+    test_metal_qwen35_primitives();
 }
 
 static void test_metal_short_prefill_ratio4(void) {
