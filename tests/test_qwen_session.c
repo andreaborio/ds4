@@ -588,6 +588,11 @@ static void test_dynamic_logits(ds4_session *session) {
           QWEN35_N_VALID_TOKEN);
     CHECK(ds4_engine_routed_quant_bits(session->engine) == 4);
     CHECK(ds4_engine_has_output_head(session->engine));
+    CHECK(ds4_engine_set_power(session->engine, 99) != 0);
+    CHECK(ds4_engine_set_power(session->engine, 100) == 0);
+    CHECK(ds4_session_set_power(session, 99) != 0);
+    CHECK(ds4_session_set_power(session, 100) == 0);
+    CHECK(ds4_session_power(session) == 100);
     float *input = malloc((size_t)n_vocab * sizeof(input[0]));
     float *copy = malloc(((size_t)n_vocab + 1u) * sizeof(copy[0]));
     CHECK(input != NULL && copy != NULL);
@@ -807,6 +812,8 @@ static void test_fail_closed_surfaces(ds4_session *session) {
     CHECK(ds4_session_eval_qwen35_with_forward(
               session, 42, err, sizeof(err), stub_forward) == 0);
     CHECK(ds4_session_payload_bytes(session) == 0);
+    CHECK(ds4_session_layer_payload_bytes(session, 0, 0) == 0);
+    CHECK(ds4_session_imatrix_enable(session) == 2);
 
     FILE *fp = tmpfile();
     CHECK(fp != NULL);
@@ -814,6 +821,14 @@ static void test_fail_closed_surfaces(ds4_session *session) {
         CHECK(ds4_session_save_payload(session, fp, err, sizeof(err)) != 0);
         rewind(fp);
         CHECK(ds4_session_load_payload(session, fp, 0, err, sizeof(err)) != 0);
+        rewind(fp);
+        CHECK(ds4_session_save_layer_payload(
+                  session, fp, 0, 0, err, sizeof(err)) != 0);
+        rewind(fp);
+        const int token = 42;
+        CHECK(ds4_session_load_layer_payload(
+                  session, fp, 0, &token, 1, 0, 0,
+                  err, sizeof(err)) != 0);
         fclose(fp);
     }
     ds4_session_payload_file staged = {0};
