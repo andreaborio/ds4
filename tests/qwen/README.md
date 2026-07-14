@@ -8,13 +8,19 @@ their assigned IDs.  Transformers' `Qwen2Tokenizer` is otherwise used only to
 render the canonical Jinja chat template before the JSON tokenizer encodes it.
 It covers byte-BPE splitting, Unicode, whitespace, code, special tokens,
 thinking controls, the canonical chat template, and a tool-call round trip.
+The chat vectors also freeze Qwen's reasoning-retention boundary, embedded
+`<think>` fallback, every JSON argument type, multi-call and grouped-response
+formatting, content before a tool call, `preserve_thinking`, and Unicode/tool
+schema serialization order.
 
 Refresh it intentionally with:
 
 ```sh
 uv run \
   --with 'transformers==5.13.1' \
-  --with 'jinja2>=3.1' \
+  --with 'tokenizers==0.22.2' \
+  --with 'jinja2==3.1.6' \
+  --with 'huggingface-hub==1.23.0' \
   python tests/qwen/collect_reference.py
 ```
 
@@ -44,6 +50,23 @@ data.  Only a trusted, already-rendered chat prompt may turn them into control
 IDs.  Four supplemental TEXT vectors freeze the scanner's ordered-regex edge
 cases: Unicode case-folded contractions, punctuation prefixes, whitespace
 backtracking across CR/LF, Unicode whitespace, and non-ASCII number classes.
+
+`literal_controls_in_user_content_reference` is intentionally different: the
+JSON records the canonical Jinja rendered text and its official whole-string
+token IDs, but the compact trusted-rendered C fixture skips it.  Those literal
+spellings originate in user data, so a structured security renderer must encode
+them as ordinary BPE data instead of granting them control-token meaning.  The
+case is marked `reference_only_untrusted_content` to make that distinction
+machine-checked by the fixture collector.
+
+`literal_controls_as_data` freezes that ordinary-BPE counterpart for the exact
+same user payload.  It is collected with the pinned tokenizer's
+`Tokenizer.encode_special_tokens=True` mode, checked to contain no control-token
+IDs, and included in the compact C closure as a normal `TEXT` case.  Some
+canonical prompt atoms are declared as non-special added tokens in the source
+JSON, so the collector first promotes all known controls to special in a private
+clone while verifying that every official ID remains unchanged; the trusted
+official tokenizer itself is not modified.
 
 The tokenizer's Unicode behavior is frozen separately in
 `qwen_unicode_ucd_cache.txt`: Unicode 9.0 NFC plus Unicode 16.0 `L/M/N` and

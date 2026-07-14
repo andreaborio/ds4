@@ -17,7 +17,7 @@ from tokenizers import AddedToken, Tokenizer
 MODEL = "Qwen/Qwen3.6-35B-A3B"
 REVISION = "995ad96eacd98c81ed38be0c5b274b04031597b0"
 TOKENIZER_SHA256 = "5f9e4d4901a92b997e463c1f46055088b6cca5ca61a6522d1b9f64c4bb81cb42"
-GOLDEN_SHA256 = "87606fc0f98911e4ccaba9f7179ed11dffda79d11a9b12795f6f9bb961218ec2"
+GOLDEN_SHA256 = "d71b6e5d2e936c1e204b0cc1baf0945bed063a0aa4637be5e89a2c944281e2f6"
 TOKENIZERS_VERSION = "0.22.2"
 SAFETY_CASE_NAME = "untrusted_literal_controls_and_pad_are_data"
 SAFETY_CASE_TEXT = (
@@ -94,14 +94,30 @@ def load_golden(path: Path) -> tuple[dict[str, Any], list[Case]]:
     cases: list[Case] = []
     controls = set(data["tokenizer"]["special_token_ids"])
     for item in data["text_vectors"]:
-        # The public text API treats user content as data.  Golden vectors that
-        # intentionally contain added tokens exercise only the trusted rendered
-        # prompt path, where those atoms must remain special and unnormalized.
-        kind = (
-            "TRUSTED_TEXT"
-            if any(token in item["text"] for token in controls)
-            else "TEXT"
-        )
+        fixture_mode = item.get("fixture_mode")
+        if fixture_mode == "untrusted_data":
+            if (
+                item.get("encoding_mode")
+                != "Tokenizer.encode_special_tokens=True"
+            ):
+                raise RuntimeError(
+                    f"unexpected data encoding mode for {item.get('name')!r}"
+                )
+            kind = "TEXT"
+        elif fixture_mode is not None:
+            raise RuntimeError(
+                f"unexpected text fixture mode {fixture_mode!r} for "
+                f"{item.get('name')!r}"
+            )
+        else:
+            # Golden vectors that intentionally contain added tokens exercise
+            # only the trusted rendered path, where those atoms must remain
+            # special and unnormalized.
+            kind = (
+                "TRUSTED_TEXT"
+                if any(token in item["text"] for token in controls)
+                else "TEXT"
+            )
         cases.append(
             Case(
                 kind=kind,
@@ -111,6 +127,18 @@ def load_golden(path: Path) -> tuple[dict[str, Any], list[Case]]:
             )
         )
     for item in data["chat_vectors"]:
+        fixture_mode = item.get("fixture_mode", "trusted_rendered_chat")
+        if fixture_mode == "reference_only_untrusted_content":
+            # The JSON still freezes the canonical Jinja output and official
+            # whole-string token IDs.  A secure structured renderer must not
+            # feed literal controls from user content through that trusted
+            # whole-string path, so it deliberately has no compact C oracle.
+            continue
+        if fixture_mode != "trusted_rendered_chat":
+            raise RuntimeError(
+                f"unexpected chat fixture mode {fixture_mode!r} for "
+                f"{item.get('name')!r}"
+            )
         cases.append(
             Case(
                 kind="RENDERED_CHAT",
@@ -124,7 +152,13 @@ def load_golden(path: Path) -> tuple[dict[str, Any], list[Case]]:
 
 def load_tokenizer(
     path: Path, controls: dict[str, int]
-) -> tuple[Tokenizer, Tokenizer, dict[str, int], dict[tuple[str, str], int]]:
+) -> tuple[
+    Tokenizer,
+    Tokenizer,
+    Tokenizer,
+    dict[str, int],
+    dict[tuple[str, str], int],
+]:
     require_hash(path, TOKENIZER_SHA256, "official tokenizer")
     raw = json.loads(path.read_text(encoding="utf-8"))
     if raw.get("normalizer") != {"type": "NFC"}:
@@ -175,8 +209,20 @@ def load_tokenizer(
         )
     )
 
+    tokenizer_as_data = Tokenizer.from_str(tokenizer.to_str())
+    for text, token_id in controls.items():
+        tokenizer_as_data.add_special_tokens(
+            [AddedToken(text, special=True, normalized=False)]
+        )
+        if tokenizer_as_data.token_to_id(text) != token_id:
+            raise RuntimeError(
+                f"data tokenizer changed official ID for {text!r}"
+            )
+    tokenizer_as_data.encode_special_tokens = True
+
     return (
         tokenizer,
+        tokenizer_as_data,
         tokenizer_without_added_tokens,
         {str(key): int(value) for key, value in vocab.items()},
         merge_rank,
@@ -389,19 +435,33 @@ def collect(tokenizer_json: Path, golden_path: Path) -> tuple[str, Trace, int]:
         str(text): int(token_id)
         for text, token_id in golden["tokenizer"]["special_token_ids"].items()
     }
-    tokenizer, tokenizer_without_added_tokens, vocab, merge_rank = load_tokenizer(
-        tokenizer_json, controls
-    )
+    (
+        tokenizer,
+        tokenizer_as_data,
+        tokenizer_without_added_tokens,
+        vocab,
+        merge_rank,
+    ) = load_tokenizer(tokenizer_json, controls)
     trace = Trace(final_symbols=set(), merge_candidates=set())
 
     for case in cases:
-        official = tokenizer.encode(case.text, add_special_tokens=False).ids
+        is_data = case.kind == "TEXT"
+        case_tokenizer = tokenizer_as_data if is_data else tokenizer
+        case_controls = {} if is_data else controls
+        official = case_tokenizer.encode(
+            case.text, add_special_tokens=False
+        ).ids
         if tuple(official) != case.expected:
             raise RuntimeError(
                 f"official tokenizer no longer matches golden case {case.name!r}"
             )
         traced = trace_encode(
-            case.text, tokenizer, controls, vocab, merge_rank, trace
+            case.text,
+            case_tokenizer,
+            case_controls,
+            vocab,
+            merge_rank,
+            trace,
         )
         if tuple(traced) != case.expected:
             raise RuntimeError(

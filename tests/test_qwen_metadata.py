@@ -6,6 +6,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import struct
 import subprocess
 import sys
@@ -33,6 +34,9 @@ QWEN_CHAT_TEMPLATE_PATH = (
     Path(__file__).with_name("qwen") / "qwen36_chat_template.jinja"
 )
 QWEN_CHAT_TEMPLATE = QWEN_CHAT_TEMPLATE_PATH.read_text(encoding="utf-8")
+QWEN_TOKENIZER_FIXTURE_PATH = (
+    Path(__file__).with_name("qwen") / "qwen36_tokenizer_fixture.inc"
+)
 
 
 class RepeatedArray:
@@ -284,13 +288,30 @@ def check_frozen_reference() -> None:
     )
     path = Path(__file__).with_name("qwen") / "qwen36_tokenizer_chat_golden.json"
     raw = path.read_bytes()
-    assert hashlib.sha256(raw).hexdigest() == (
-        "87606fc0f98911e4ccaba9f7179ed11dffda79d11a9b12795f6f9bb961218ec2"
+    golden_sha = hashlib.sha256(raw).hexdigest()
+    assert golden_sha == (
+        "d71b6e5d2e936c1e204b0cc1baf0945bed063a0aa4637be5e89a2c944281e2f6"
     )
+    fixture = QWEN_TOKENIZER_FIXTURE_PATH.read_text(encoding="utf-8")
+    fixture_golden_sha = re.search(
+        r'^#define QWEN36_TOKENIZER_FIXTURE_GOLDEN_SHA256 "([0-9a-f]{64})"$',
+        fixture,
+        re.MULTILINE,
+    )
+    assert fixture_golden_sha is not None
+    assert fixture_golden_sha.group(1) == golden_sha
     data = json.loads(raw)
     assert data["source"] == {
         "model": "Qwen/Qwen3.6-35B-A3B",
         "revision": "995ad96eacd98c81ed38be0c5b274b04031597b0",
+    }
+    assert data["collector"] == {
+        "package_versions": {
+            "transformers": "5.13.1",
+            "tokenizers": "0.22.2",
+            "Jinja2": "3.1.6",
+            "huggingface-hub": "1.23.0",
+        }
     }
     tokenizer = data["tokenizer"]
     assert tokenizer["chat_template_class"] == "Qwen2Tokenizer"
@@ -354,6 +375,7 @@ def check_frozen_reference() -> None:
         "tool_specials",
         "audio_control_tokens",
         "all_control_tokens",
+        "literal_controls_as_data",
     }
     chat = {case["name"]: case for case in data["chat_vectors"]}
     assert set(chat) == {
@@ -362,6 +384,17 @@ def check_frozen_reference() -> None:
         "system_and_user",
         "tools_prompt",
         "tool_roundtrip",
+        "reasoning_before_last_query_stripped",
+        "reasoning_after_last_query_preserved",
+        "embedded_think_fallback",
+        "typed_tool_arguments",
+        "assistant_content_before_tool_call",
+        "multiple_tool_calls",
+        "grouped_tool_responses",
+        "post_tool_new_user_strips_reasoning",
+        "preserve_thinking",
+        "tool_schema_unicode_and_order",
+        "literal_controls_in_user_content_reference",
     }
     assert chat["plain_thinking"]["rendered"].endswith("<think>\n")
     assert "<think>\n\n</think>\n\n" in chat["plain_no_thinking"]["rendered"]
