@@ -11285,7 +11285,7 @@ static bool qwen35_cpu_layer_one(
     return qwen35_cpu_ffn_one(out, model, layer, scratch);
 }
 
-static DS4_MAYBE_UNUSED bool qwen35_cpu_forward_token(
+static bool qwen35_cpu_forward_token(
         float                         *logits,
         const ds4_model              *model,
         const ds4_qwen35_weights     *weights,
@@ -11318,7 +11318,7 @@ static DS4_MAYBE_UNUSED bool qwen35_cpu_forward_token(
                 cache->n_tokens,
                 cache->kv_capacity,
                 scratch)) {
-            return false;
+            goto fail;
         }
         float *swap = current;
         current = next;
@@ -11332,7 +11332,15 @@ static DS4_MAYBE_UNUSED bool qwen35_cpu_forward_token(
         qwen35_cpu_matvec(logits, model, weights->output,
                           scratch->norm, scratch);
     }
-    return ds4_qwen35_cpu_cache_advance(cache, 1u);
+    if (ds4_qwen35_cpu_cache_advance(cache, 1u)) return true;
+
+fail:
+    /* Conv/recurrent state and the current K/V row are written in place.  A
+     * late numerical failure therefore invalidates the whole timeline; reset
+     * it here so no caller can accidentally retry against a half-written
+     * token.  The session layer clears its matching token checkpoint. */
+    ds4_qwen35_cpu_cache_reset(cache);
+    return false;
 }
 
 #ifndef DS4_NO_GPU
@@ -23004,6 +23012,7 @@ struct ds4_engine {
     bool ssd_streaming;
     bool ssd_streaming_cold;
     ds4_distributed_options distributed;
+    bool qwen_raw_runtime;
     bool metal_ready;
     bool mtp_ready;
 };
@@ -23482,6 +23491,7 @@ static void encode_chat_prompt(
 }
 
 void ds4_tokenize_text(ds4_engine *e, const char *text, ds4_tokens *out) {
+    if (!e || !out || e->vocab.n_vocab == 0) return;
     bpe_tokenize_text(&e->vocab, text ? text : "", out);
 }
 
@@ -23541,10 +23551,12 @@ static void tokenize_rendered_chat_vocab(const ds4_vocab *vocab, const char *tex
 }
 
 void ds4_tokenize_rendered_chat(ds4_engine *e, const char *text, ds4_tokens *out) {
+    if (!e || !out || e->vocab.n_vocab == 0) return;
     tokenize_rendered_chat_vocab(&e->vocab, text, out);
 }
 
 void ds4_chat_begin(ds4_engine *e, ds4_tokens *tokens) {
+    if (!e || !tokens || e->vocab.n_vocab == 0) return;
     token_vec_push(tokens, e->vocab.bos_id);
 }
 
@@ -23554,10 +23566,12 @@ void ds4_encode_chat_prompt(
         const char *prompt,
         ds4_think_mode think_mode,
         ds4_tokens *out) {
+    if (!e || !out || e->vocab.n_vocab == 0) return;
     encode_chat_prompt(&e->vocab, system, prompt ? prompt : "", think_mode, out);
 }
 
 void ds4_chat_append_max_effort_prefix(ds4_engine *e, ds4_tokens *tokens) {
+    if (!e || !tokens || e->vocab.n_vocab == 0) return;
     bpe_tokenize_text(&e->vocab, DS4_REASONING_EFFORT_MAX_PREFIX, tokens);
 }
 
@@ -23584,6 +23598,7 @@ static void bpe_tokenize_tool_result_text(ds4_vocab *vocab, const char *content,
 }
 
 void ds4_chat_append_message(ds4_engine *e, ds4_tokens *tokens, const char *role, const char *content) {
+    if (!e || !tokens || e->vocab.n_vocab == 0) return;
     ds4_vocab *vocab = &e->vocab;
     if (!role) role = "user";
     if (!content) content = "";
@@ -23608,6 +23623,7 @@ void ds4_chat_append_message(ds4_engine *e, ds4_tokens *tokens, const char *role
 }
 
 void ds4_chat_append_assistant_prefix(ds4_engine *e, ds4_tokens *tokens, ds4_think_mode think_mode) {
+    if (!e || !tokens || e->vocab.n_vocab == 0) return;
     token_vec_push(tokens, e->vocab.assistant_id);
     token_vec_push(tokens, ds4_think_mode_enabled(think_mode) ?
                    e->vocab.think_start_id : e->vocab.think_end_id);
@@ -23689,7 +23705,13 @@ static bool vocab_token_is_literal_special(ds4_str s) {
 }
 
 char *ds4_token_text(ds4_engine *e, int token, size_t *len) {
-    ds4_vocab *vocab = &e->vocab;
+    ds4_vocab *vocab = e ? &e->vocab : NULL;
+    if (!vocab) {
+        if (len) *len = 0;
+        char *out = xmalloc(1);
+        out[0] = '\0';
+        return out;
+    }
     if (token < 0 || token >= vocab->n_vocab) {
         if (len) *len = 0;
         char *out = xmalloc(1);
@@ -23719,15 +23741,15 @@ char *ds4_token_text(ds4_engine *e, int token, size_t *len) {
 }
 
 int ds4_token_eos(ds4_engine *e) {
-    return e->vocab.eos_id;
+    return e && e->vocab.n_vocab != 0 ? e->vocab.eos_id : -1;
 }
 
 int ds4_token_user(ds4_engine *e) {
-    return e->vocab.user_id;
+    return e && e->vocab.n_vocab != 0 ? e->vocab.user_id : -1;
 }
 
 int ds4_token_assistant(ds4_engine *e) {
-    return e->vocab.assistant_id;
+    return e && e->vocab.n_vocab != 0 ? e->vocab.assistant_id : -1;
 }
 
 static int sample_argmax(const float *logits, uint32_t n_vocab) {
@@ -24441,6 +24463,7 @@ struct ds4_session {
     ds4_kv_cache cpu_cache;
     ds4_cpu_decode_scratch cpu_scratch;
     ds4_qwen35_cpu_cache qwen35_cpu_cache;
+    ds4_qwen35_cpu_scratch qwen35_cpu_scratch;
     token_vec checkpoint;
     float *logits;
     float *mtp_logits;
@@ -24757,6 +24780,35 @@ static bool ds4_session_is_cpu(const ds4_session *s) {
     return s && s->engine && s->engine->backend == DS4_BACKEND_CPU;
 }
 
+static bool ds4_session_is_qwen35(const ds4_session *s) {
+    return s && s->engine &&
+           s->engine->model.family == DS4_MODEL_FAMILY_QWEN35_MOE;
+}
+
+static bool ds4_session_is_qwen35_cpu(const ds4_session *s) {
+    return ds4_session_is_cpu(s) && ds4_session_is_qwen35(s);
+}
+
+static uint32_t ds4_session_vocab_size(const ds4_session *s) {
+    return ds4_session_is_qwen35(s) ? QWEN35_N_VOCAB : DS4_N_VOCAB;
+}
+
+static bool ds4_session_qwen35_timeline_valid(const ds4_session *s) {
+    if (!ds4_session_is_qwen35_cpu(s) || s->checkpoint.len < 0) return false;
+    const uint32_t checkpoint_len = s->checkpoint_valid ?
+        (uint32_t)s->checkpoint.len : 0u;
+    return (!s->checkpoint_valid ? s->checkpoint.len == 0 : true) &&
+           s->qwen35_cpu_cache.n_tokens == checkpoint_len;
+}
+
+static void ds4_session_qwen35_reset_timeline(ds4_session *s) {
+    if (!ds4_session_is_qwen35_cpu(s)) return;
+    ds4_qwen35_cpu_cache_reset(&s->qwen35_cpu_cache);
+    s->checkpoint.len = 0;
+    s->checkpoint_valid = false;
+    s->mtp_draft_valid = false;
+}
+
 static uint32_t session_cpu_raw_live_rows(const ds4_session *s) {
     if (!s || !s->checkpoint_valid) return 0;
     uint32_t rows = ds4_default_raw_cap((uint32_t)s->ctx_size);
@@ -24798,6 +24850,10 @@ static uint64_t session_cpu_payload_live_tensor_bytes(const ds4_session *s) {
 }
 
 static void session_cpu_reset_cache(ds4_session *s) {
+    if (ds4_session_is_qwen35_cpu(s)) {
+        ds4_qwen35_cpu_cache_reset(&s->qwen35_cpu_cache);
+        return;
+    }
     kv_cache_free(&s->cpu_cache);
     kv_cache_init(&s->cpu_cache, (uint32_t)s->ctx_size, 0);
 }
@@ -25345,6 +25401,7 @@ static bool spec_frontier_commit_prefix1(ds4_session *s) {
 uint64_t ds4_session_payload_bytes(ds4_session *s) {
     if (!s || !s->checkpoint_valid) return 0;
     if (s->distributed) return 0;
+    if (ds4_session_is_qwen35(s)) return 0;
     if (ds4_session_is_cpu(s)) {
         uint64_t bytes = (uint64_t)DS4_SESSION_PAYLOAD_U32_FIELDS * sizeof(uint32_t);
         bytes += (uint64_t)s->checkpoint.len * sizeof(uint32_t);
@@ -25407,6 +25464,11 @@ int ds4_session_stage_payload(ds4_session *s, ds4_session_payload_file *out,
         payload_set_err(err, errlen, "session has no valid checkpoint to stage");
         return 1;
     }
+    if (ds4_session_is_qwen35(s)) {
+        payload_set_err(err, errlen,
+                        "Qwen session payloads are not supported yet");
+        return 1;
+    }
 
     char tmpl[] = "/tmp/ds4-session-payload.XXXXXX";
     int fd = mkstemp(tmpl);
@@ -25457,6 +25519,11 @@ int ds4_session_save_payload(ds4_session *s, FILE *fp, char *err, size_t errlen)
     }
     if (s->distributed) {
         return ds4_dist_session_save_payload(s->distributed, s, fp, err, errlen);
+    }
+    if (ds4_session_is_qwen35(s)) {
+        payload_set_err(err, errlen,
+                        "Qwen session payloads are not supported yet");
+        return 1;
     }
     if (ds4_session_is_cpu(s)) {
         const uint32_t raw_live = session_cpu_raw_live_rows(s);
@@ -25666,6 +25733,11 @@ int ds4_session_load_payload(ds4_session *s, FILE *fp, uint64_t payload_bytes, c
     }
     if (s->distributed) {
         return ds4_dist_session_load_payload(s->distributed, s, fp, payload_bytes, err, errlen);
+    }
+    if (ds4_session_is_qwen35(s)) {
+        payload_set_err(err, errlen,
+                        "Qwen session payloads are not supported yet");
+        return 1;
     }
     uint64_t remaining = payload_bytes;
     uint32_t h[DS4_SESSION_PAYLOAD_U32_FIELDS];
@@ -26330,6 +26402,14 @@ int ds4_engine_generate_argmax(
         void              *emit_ud,
         ds4_session_progress_fn progress,
         void              *progress_ud) {
+    if (!e) return 1;
+    if (e->model.family == DS4_MODEL_FAMILY_QWEN35_MOE) {
+        fprintf(stderr,
+                "ds4: Qwen text generation is disabled until its tokenizer "
+                "and chat template are wired; raw-token session opening is "
+                "not exposed yet\n");
+        return 1;
+    }
     const ds4_model *model = &e->model;
     const ds4_vocab *vocab = &e->vocab;
     const ds4_weights *weights = &e->weights;
@@ -27887,19 +27967,54 @@ void ds4_engine_close(ds4_engine *e) {
 
 int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
     if (!out || !e || ctx_size <= 0) return 1;
+    const bool qwen35 =
+        e->model.family == DS4_MODEL_FAMILY_QWEN35_MOE;
+    if (qwen35 && !e->qwen_raw_runtime) {
+        fprintf(stderr,
+                "ds4: Qwen session creation requires the explicit raw-token runtime\n");
+        return 1;
+    }
+    if (qwen35 && e->backend != DS4_BACKEND_CPU) {
+        fprintf(stderr,
+                "ds4: the Qwen raw-token runtime currently requires the CPU backend\n");
+        return 1;
+    }
     if (e->backend == DS4_BACKEND_CPU) {
         if (e->distributed.role == DS4_DISTRIBUTED_COORDINATOR) {
             fprintf(stderr, "ds4: distributed coordinator sessions require the graph backend\n");
             return 1;
         }
+        if (qwen35 && (uint32_t)ctx_size > QWEN35_CONTEXT_LENGTH) {
+            fprintf(stderr,
+                    "ds4: Qwen context %d exceeds the supported maximum %u\n",
+                    ctx_size, QWEN35_CONTEXT_LENGTH);
+            return 1;
+        }
         ds4_session *s = xcalloc(1, sizeof(*s));
         s->engine = e;
         s->ctx_size = ctx_size;
-        s->prefill_cap = ds4_prefill_cap_for_prompt(ctx_size,
-                                                     e->prefill_chunk);
-        kv_cache_init(&s->cpu_cache, (uint32_t)ctx_size, 0);
-        cpu_decode_scratch_init(&s->cpu_scratch, (uint32_t)ctx_size);
-        s->logits = xmalloc((size_t)DS4_N_VOCAB * sizeof(s->logits[0]));
+        if (qwen35) {
+            /* Qwen prefill is intentionally scalar until the correctness path
+             * has a model-backed logits oracle.  K/V capacity grows through
+             * reserve() before a token enters the allocation-free forward. */
+            s->prefill_cap = 1u;
+            if (!ds4_qwen35_cpu_cache_init(&s->qwen35_cpu_cache,
+                                           (uint32_t)ctx_size) ||
+                !ds4_qwen35_cpu_scratch_init(&s->qwen35_cpu_scratch,
+                                             (uint32_t)ctx_size)) {
+                ds4_qwen35_cpu_cache_free(&s->qwen35_cpu_cache);
+                ds4_qwen35_cpu_scratch_free(&s->qwen35_cpu_scratch);
+                free(s);
+                return 1;
+            }
+        } else {
+            s->prefill_cap = ds4_prefill_cap_for_prompt(ctx_size,
+                                                        e->prefill_chunk);
+            kv_cache_init(&s->cpu_cache, (uint32_t)ctx_size, 0);
+            cpu_decode_scratch_init(&s->cpu_scratch, (uint32_t)ctx_size);
+        }
+        const uint32_t n_vocab = qwen35 ? QWEN35_N_VOCAB : DS4_N_VOCAB;
+        s->logits = xmalloc((size_t)n_vocab * sizeof(s->logits[0]));
         *out = s;
         return 0;
     }
@@ -27971,8 +28086,10 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
 void ds4_session_free(ds4_session *s) {
     if (!s) return;
     ds4_dist_session_free(s->distributed);
-    ds4_qwen35_cpu_cache_free(&s->qwen35_cpu_cache);
-    if (ds4_session_is_cpu(s)) {
+    if (ds4_session_is_qwen35_cpu(s)) {
+        ds4_qwen35_cpu_cache_free(&s->qwen35_cpu_cache);
+        ds4_qwen35_cpu_scratch_free(&s->qwen35_cpu_scratch);
+    } else if (ds4_session_is_cpu(s)) {
         kv_cache_free(&s->cpu_cache);
         cpu_decode_scratch_free(&s->cpu_scratch);
     }
@@ -28093,6 +28210,10 @@ int ds4_session_layer_slice_reset(ds4_session *s, char *err, size_t errlen) {
         if (errlen) snprintf(err, errlen, "missing layer-slice session");
         return 1;
     }
+    if (ds4_session_is_qwen35(s)) {
+        if (errlen) snprintf(err, errlen, "Qwen layer slices are not supported yet");
+        return 1;
+    }
     ds4_session_invalidate(s);
     if (ds4_session_is_cpu(s)) {
         session_cpu_reset_cache(s);
@@ -28120,6 +28241,11 @@ int ds4_session_eval_output_head_from_hc(ds4_session *s,
                                          size_t errlen) {
     if (!s || !s->engine || !hidden_hc || n_tokens == 0 || !logits) {
         if (errlen) snprintf(err, errlen, "invalid output-head hidden-state input");
+        return 1;
+    }
+    if (ds4_session_is_qwen35(s)) {
+        if (errlen) snprintf(err, errlen,
+                             "Qwen hidden-state output-head evaluation is not supported yet");
         return 1;
     }
 
@@ -28219,6 +28345,10 @@ int ds4_session_eval_layer_slice(ds4_session *s,
                                  size_t errlen) {
     if (!s || !s->engine) {
         if (errlen) snprintf(err, errlen, "missing layer-slice session");
+        return 1;
+    }
+    if (ds4_session_is_qwen35(s)) {
+        if (errlen) snprintf(err, errlen, "Qwen layer slices are not supported yet");
         return 1;
     }
     if (layer_start > layer_end || layer_end >= (uint32_t)DS4_N_LAYER) {
@@ -28574,6 +28704,113 @@ static void ds4_session_note_prefill_progress(void *ud, const char *event, int c
 }
 #endif
 
+typedef bool (*ds4_qwen35_forward_fn)(
+        float                         *logits,
+        const ds4_model              *model,
+        const ds4_qwen35_weights     *weights,
+        ds4_qwen35_cpu_cache         *cache,
+        int                           token,
+        uint32_t                      position,
+        ds4_qwen35_cpu_scratch       *scratch);
+
+/* Commit the token checkpoint only after the model cache advanced exactly one
+ * position.  The function pointer is a narrow test seam: production always
+ * supplies qwen35_cpu_forward_token, while model-free tests can exercise the
+ * transaction without allocating a 35B tensor fixture. */
+static bool ds4_session_qwen35_forward_commit(
+        ds4_session            *s,
+        int                     token,
+        float                  *logits,
+        ds4_qwen35_forward_fn   forward) {
+    if (!s || !forward || !ds4_session_qwen35_timeline_valid(s)) return false;
+
+    const uint32_t position = (uint32_t)s->checkpoint.len;
+    if (!forward(logits,
+                 &s->engine->model,
+                 &s->engine->qwen35_weights,
+                 &s->qwen35_cpu_cache,
+                 token,
+                 position,
+                 &s->qwen35_cpu_scratch) ||
+        s->qwen35_cpu_cache.n_tokens != position + 1u) {
+        return false;
+    }
+
+    token_vec_push(&s->checkpoint, token);
+    s->checkpoint_valid = true;
+    s->mtp_draft_valid = false;
+    return true;
+}
+
+static int ds4_session_sync_qwen35_with_forward(
+        ds4_session            *s,
+        const ds4_tokens       *prompt,
+        char                   *err,
+        size_t                  errlen,
+        ds4_qwen35_forward_fn   forward) {
+    if (!ds4_session_is_qwen35_cpu(s) || !prompt || !forward ||
+        prompt->len <= 0 || prompt->len >= s->ctx_size) {
+        if (errlen) snprintf(err, errlen, "invalid Qwen raw-token sync");
+        return 1;
+    }
+
+    if (!ds4_session_qwen35_timeline_valid(s)) {
+        ds4_session_qwen35_reset_timeline(s);
+        if (errlen) snprintf(err, errlen, "Qwen cache/checkpoint timeline mismatch");
+        return 1;
+    }
+    for (int i = 0; i < prompt->len; i++) {
+        if (prompt->v[i] < 0 || (uint32_t)prompt->v[i] >= QWEN35_N_VOCAB) {
+            if (errlen) {
+                snprintf(err, errlen,
+                         "Qwen token id %d at position %d is outside vocabulary",
+                         prompt->v[i], i);
+            }
+            return 1;
+        }
+    }
+
+    const bool extend =
+        s->checkpoint_valid &&
+        prompt->len >= s->checkpoint.len &&
+        ds4_tokens_starts_with(prompt, &s->checkpoint);
+    if (!extend) ds4_session_qwen35_reset_timeline(s);
+
+    if (!ds4_qwen35_cpu_cache_reserve(&s->qwen35_cpu_cache,
+                                      (uint32_t)prompt->len)) {
+        if (errlen) snprintf(err, errlen, "failed to reserve Qwen K/V cache");
+        return 1;
+    }
+
+    const int start = s->checkpoint.len;
+    for (int i = start; i < prompt->len; i++) {
+        if (ds4_session_cancelled(s)) {
+            if (errlen) snprintf(err, errlen, "interrupted");
+            /* Intermediate prefill tokens intentionally skip the expensive
+             * output head.  Their cache is therefore usable for neither
+             * sampling nor an exact-prefix no-op sync.  Keep the public
+             * checkpoint/logits contract atomic by discarding the partial
+             * recurrent timeline on cancellation. */
+            ds4_session_qwen35_reset_timeline(s);
+            return DS4_SESSION_SYNC_INTERRUPTED;
+        }
+        float *token_logits = i + 1 == prompt->len ? s->logits : NULL;
+        if (!ds4_session_qwen35_forward_commit(
+                s, prompt->v[i], token_logits, forward)) {
+            ds4_session_qwen35_reset_timeline(s);
+            if (errlen) {
+                snprintf(err, errlen,
+                         "Qwen CPU forward failed at position %d", i);
+            }
+            return 1;
+        }
+        if (s->progress) {
+            s->progress(s->progress_ud, "prefill_chunk", i + 1, prompt->len);
+        }
+    }
+    return 0;
+}
+
 /* Bring the live backend state to exactly the supplied token prefix.
  *
  * ds4-server and the REPL are stateless at the text/API layer but stateful here:
@@ -28609,6 +28846,10 @@ int ds4_session_sync(ds4_session *s, const ds4_tokens *prompt, char *err, size_t
                                      errlen);
     }
     if (ds4_session_is_cpu(s)) {
+        if (ds4_session_is_qwen35_cpu(s)) {
+            return ds4_session_sync_qwen35_with_forward(
+                s, prompt, err, errlen, qwen35_cpu_forward_token);
+        }
         ds4_engine *e = s->engine;
         if (s->checkpoint_valid &&
             prompt->len >= s->checkpoint.len &&
@@ -28868,14 +29109,16 @@ int ds4_session_common_prefix(ds4_session *s, const ds4_tokens *prompt) {
 }
 
 int ds4_session_argmax(ds4_session *s) {
-    return sample_argmax(s->logits, DS4_N_VOCAB);
+    if (!s || !s->logits) return -1;
+    return sample_argmax(s->logits, ds4_session_vocab_size(s));
 }
 
 int ds4_session_argmax_excluding(ds4_session *s, int excluded_id) {
     if (!s || !s->logits) return -1;
+    const uint32_t n_vocab = ds4_session_vocab_size(s);
     int best = -1;
     float best_logit = DS4_NEG_INF;
-    for (uint32_t i = 0; i < DS4_N_VOCAB; i++) {
+    for (uint32_t i = 0; i < n_vocab; i++) {
         if ((int)i == excluded_id) continue;
         const float v = s->logits[i];
         if (best < 0 || v > best_logit) {
@@ -28893,12 +29136,15 @@ int ds4_sample_logits(const float *logits, int n_vocab, float temperature,
 }
 
 int ds4_session_sample(ds4_session *s, float temperature, int top_k, float top_p, float min_p, uint64_t *rng) {
-    return sample_top_p_min_p(s->logits, DS4_N_VOCAB, temperature, top_k, top_p, min_p, rng);
+    if (!s || !s->logits) return -1;
+    return sample_top_p_min_p(s->logits, ds4_session_vocab_size(s),
+                              temperature, top_k, top_p, min_p, rng);
 }
 
 int ds4_session_top_logprobs(ds4_session *s, ds4_token_score *out, int k) {
     if (!s || !out || k <= 0) return 0;
-    if (k > (int)DS4_N_VOCAB) k = (int)DS4_N_VOCAB;
+    const uint32_t n_vocab = ds4_session_vocab_size(s);
+    if (k > (int)n_vocab) k = (int)n_vocab;
     for (int i = 0; i < k; i++) {
         out[i].id = -1;
         out[i].logit = DS4_NEG_INF;
@@ -28906,7 +29152,7 @@ int ds4_session_top_logprobs(ds4_session *s, ds4_token_score *out, int k) {
     }
 
     float max_logit = DS4_NEG_INF;
-    for (uint32_t i = 0; i < DS4_N_VOCAB; i++) {
+    for (uint32_t i = 0; i < n_vocab; i++) {
         const float v = s->logits[i];
         if (!isfinite(v)) continue;
         if (v > max_logit) max_logit = v;
@@ -28922,7 +29168,7 @@ int ds4_session_top_logprobs(ds4_session *s, ds4_token_score *out, int k) {
     if (!isfinite(max_logit)) return 0;
 
     double sum = 0.0;
-    for (uint32_t i = 0; i < DS4_N_VOCAB; i++) {
+    for (uint32_t i = 0; i < n_vocab; i++) {
         const float v = s->logits[i];
         if (isfinite(v)) sum += exp((double)v - (double)max_logit);
     }
@@ -28934,17 +29180,19 @@ int ds4_session_top_logprobs(ds4_session *s, ds4_token_score *out, int k) {
 }
 
 int ds4_session_token_logprob(ds4_session *s, int token, ds4_token_score *out) {
-    if (!s || !out || token < 0 || token >= (int)DS4_N_VOCAB) return 0;
+    if (!s || !out) return 0;
+    const uint32_t n_vocab = ds4_session_vocab_size(s);
+    if (token < 0 || token >= (int)n_vocab) return 0;
 
     float max_logit = DS4_NEG_INF;
-    for (uint32_t i = 0; i < DS4_N_VOCAB; i++) {
+    for (uint32_t i = 0; i < n_vocab; i++) {
         const float v = s->logits[i];
         if (isfinite(v) && v > max_logit) max_logit = v;
     }
     if (!isfinite(max_logit)) return 0;
 
     double sum = 0.0;
-    for (uint32_t i = 0; i < DS4_N_VOCAB; i++) {
+    for (uint32_t i = 0; i < n_vocab; i++) {
         const float v = s->logits[i];
         if (isfinite(v)) sum += exp((double)v - (double)max_logit);
     }
@@ -28956,14 +29204,58 @@ int ds4_session_token_logprob(ds4_session *s, int token, ds4_token_score *out) {
 }
 
 int ds4_session_copy_logits(ds4_session *s, float *out, int cap) {
-    if (!s || !out || cap < (int)DS4_N_VOCAB) return 0;
-    memcpy(out, s->logits, (size_t)DS4_N_VOCAB * sizeof(out[0]));
-    return (int)DS4_N_VOCAB;
+    if (!s || !out) return 0;
+    const uint32_t n_vocab = ds4_session_vocab_size(s);
+    if (cap < (int)n_vocab) return 0;
+    memcpy(out, s->logits, (size_t)n_vocab * sizeof(out[0]));
+    return (int)n_vocab;
 }
 
 int ds4_session_set_logits(ds4_session *s, const float *logits, int n) {
-    if (!s || !logits || n != (int)DS4_N_VOCAB) return 1;
-    memcpy(s->logits, logits, (size_t)DS4_N_VOCAB * sizeof(s->logits[0]));
+    if (!s || !logits) return 1;
+    const uint32_t n_vocab = ds4_session_vocab_size(s);
+    if (n != (int)n_vocab) return 1;
+    memcpy(s->logits, logits, (size_t)n_vocab * sizeof(s->logits[0]));
+    return 0;
+}
+
+static int ds4_session_eval_qwen35_with_forward(
+        ds4_session            *s,
+        int                     token,
+        char                   *err,
+        size_t                  errlen,
+        ds4_qwen35_forward_fn   forward) {
+    if (!ds4_session_is_qwen35_cpu(s) || !forward) {
+        if (errlen) snprintf(err, errlen, "invalid Qwen raw-token evaluation");
+        return 1;
+    }
+    if (token < 0 || (uint32_t)token >= QWEN35_N_VOCAB) {
+        if (errlen) snprintf(err, errlen, "Qwen token id %d is outside vocabulary", token);
+        return 1;
+    }
+    if (!ds4_session_qwen35_timeline_valid(s)) {
+        ds4_session_qwen35_reset_timeline(s);
+        if (errlen) snprintf(err, errlen, "Qwen cache/checkpoint timeline mismatch");
+        return 1;
+    }
+    if ((uint32_t)s->checkpoint.len >= (uint32_t)s->ctx_size) {
+        if (errlen) snprintf(err, errlen, "Qwen session context is full");
+        return 1;
+    }
+
+    const uint32_t required = (uint32_t)s->checkpoint.len + 1u;
+    if (!ds4_qwen35_cpu_cache_reserve(&s->qwen35_cpu_cache, required)) {
+        if (errlen) snprintf(err, errlen, "failed to reserve Qwen K/V cache");
+        return 1;
+    }
+    if (!ds4_session_qwen35_forward_commit(s, token, s->logits, forward)) {
+        ds4_session_qwen35_reset_timeline(s);
+        if (errlen) {
+            snprintf(err, errlen,
+                     "Qwen CPU forward failed at position %u", required - 1u);
+        }
+        return 1;
+    }
     return 0;
 }
 
@@ -28985,6 +29277,11 @@ static int ds4_session_eval_internal(ds4_session *s, int token, bool probe_mtp,
                                      errlen);
     }
     if (ds4_session_is_cpu(s)) {
+        if (ds4_session_is_qwen35_cpu(s)) {
+            (void)probe_mtp;
+            return ds4_session_eval_qwen35_with_forward(
+                s, token, err, errlen, qwen35_cpu_forward_token);
+        }
         ds4_engine *e = s->engine;
         forward_token_raw_swa_cpu_decode_scratch(s->logits,
                                                  &e->model,
@@ -29671,14 +29968,30 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
 }
 
 void ds4_session_invalidate(ds4_session *s) {
+    if (!s) return;
+    if (ds4_session_is_qwen35_cpu(s)) {
+        ds4_session_qwen35_reset_timeline(s);
+        return;
+    }
     s->checkpoint_valid = false;
     s->checkpoint.len = 0;
     s->mtp_draft_valid = false;
 }
 
 void ds4_session_rewind(ds4_session *s, int pos) {
+    if (!s) return;
     if (pos < 0) pos = 0;
     if (pos > s->checkpoint.len) pos = s->checkpoint.len;
+    if (ds4_session_is_qwen35_cpu(s)) {
+        /* Gated DeltaNet state is recurrent, so truncating only the token
+         * vector would leave the cache at a future position.  A real rewind
+         * must replay from zero until Qwen snapshots are implemented. */
+        if (pos != s->checkpoint.len ||
+            !ds4_session_qwen35_timeline_valid(s)) {
+            ds4_session_qwen35_reset_timeline(s);
+        }
+        return;
+    }
     s->checkpoint.len = pos;
     s->mtp_draft_valid = false;
 }
