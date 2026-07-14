@@ -24284,6 +24284,597 @@ void ds4_tokenize_rendered_chat(ds4_engine *e, const char *text, ds4_tokens *out
     }
 }
 
+typedef struct {
+    char *ptr;
+    size_t len;
+    size_t cap;
+} qwen_chat_bytes;
+
+typedef struct {
+    const ds4_vocab *vocab;
+    token_vec tokens;
+    qwen_chat_bytes rendered;
+    qwen_chat_bytes plain;
+} qwen_chat_sink;
+
+static void qwen_chat_bytes_append(
+        qwen_chat_bytes *b, const char *text, size_t len) {
+    if (!len) return;
+    if (len > SIZE_MAX - b->len - 1u) {
+        ds4_die("Qwen chat rendering is too large");
+    }
+    const size_t need = b->len + len + 1u;
+    if (need > b->cap) {
+        size_t cap = b->cap ? b->cap : 256u;
+        while (cap < need) {
+            if (cap > SIZE_MAX / 2u) {
+                cap = need;
+                break;
+            }
+            cap *= 2u;
+        }
+        b->ptr = xrealloc(b->ptr, cap);
+        b->cap = cap;
+    }
+    memcpy(b->ptr + b->len, text, len);
+    b->len += len;
+    b->ptr[b->len] = '\0';
+}
+
+static void qwen_chat_bytes_puts(qwen_chat_bytes *b, const char *text) {
+    if (text) qwen_chat_bytes_append(b, text, strlen(text));
+}
+
+static char *qwen_chat_bytes_take(qwen_chat_bytes *b) {
+    if (!b->ptr) {
+        b->ptr = xmalloc(1);
+        b->ptr[0] = '\0';
+    }
+    char *ptr = b->ptr;
+    memset(b, 0, sizeof(*b));
+    return ptr;
+}
+
+static void qwen_chat_sink_free(qwen_chat_sink *sink) {
+    token_vec_free(&sink->tokens);
+    free(sink->rendered.ptr);
+    free(sink->plain.ptr);
+    memset(sink, 0, sizeof(*sink));
+}
+
+static bool qwen_chat_sink_flush(qwen_chat_sink *sink) {
+    if (!sink->plain.len) return true;
+    const bool ok = bpe_tokenize_text(
+        sink->vocab, sink->plain.ptr, &sink->tokens);
+    sink->plain.len = 0;
+    if (sink->plain.ptr) sink->plain.ptr[0] = '\0';
+    return ok;
+}
+
+static bool qwen_chat_sink_data_n(
+        qwen_chat_sink *sink, const char *text, size_t len) {
+    if (!len) return true;
+    qwen_chat_bytes_append(&sink->rendered, text, len);
+    qwen_chat_bytes_append(&sink->plain, text, len);
+    return true;
+}
+
+static bool qwen_chat_sink_data(qwen_chat_sink *sink, const char *text) {
+    return qwen_chat_sink_data_n(sink, text ? text : "",
+                                 text ? strlen(text) : 0u);
+}
+
+static bool qwen_chat_control_id(
+        const ds4_vocab *vocab, const char *literal, int *id) {
+    const size_t len = strlen(literal);
+    for (size_t i = 0; i < vocab->n_special; i++) {
+        const ds4_vocab_special *special = &vocab->special[i];
+        if (special->text.len == len &&
+            memcmp(special->text.ptr, literal, len) == 0) {
+            *id = special->id;
+            return true;
+        }
+    }
+    return false;
+}
+
+/* Only template-authored controls use this path.  Client content always goes
+ * through qwen_chat_sink_data(), so a literal <|im_end|>, <tool_call>, or
+ * <think> in user/tool data remains ordinary BPE text. */
+static bool qwen_chat_sink_control(
+        qwen_chat_sink *sink, const char *literal) {
+    int id = -1;
+    if (!qwen_chat_control_id(sink->vocab, literal, &id) ||
+        !qwen_chat_sink_flush(sink)) {
+        return false;
+    }
+    qwen_chat_bytes_puts(&sink->rendered, literal);
+    token_vec_push(&sink->tokens, id);
+    return true;
+}
+
+static bool qwen_chat_trim_copy(const char *text, char **out) {
+    ds4_str trimmed = {0};
+    if (!qwen35_trimmed_text(text ? text : "", &trimmed)) return false;
+    char *copy = xmalloc((size_t)trimmed.len + 1u);
+    memcpy(copy, trimmed.ptr, (size_t)trimmed.len);
+    copy[trimmed.len] = '\0';
+    *out = copy;
+    return true;
+}
+
+static bool qwen_chat_trim_span(
+        const char *text, size_t len, char **out) {
+    char *copy = xmalloc(len + 1u);
+    memcpy(copy, text, len);
+    copy[len] = '\0';
+    char *trimmed = NULL;
+    const bool ok = qwen_chat_trim_copy(copy, &trimmed);
+    free(copy);
+    if (!ok) return false;
+    *out = trimmed;
+    return true;
+}
+
+static bool qwen_chat_span_is_tool_response(ds4_str content) {
+    static const char open[] = "<tool_response>";
+    static const char close[] = "</tool_response>";
+    const size_t open_len = sizeof(open) - 1u;
+    const size_t close_len = sizeof(close) - 1u;
+    return content.len >= open_len + close_len &&
+           memcmp(content.ptr, open, open_len) == 0 &&
+           memcmp(content.ptr + content.len - close_len,
+                  close, close_len) == 0;
+}
+
+static const char *qwen_chat_find_last_before(
+        const char *text, const char *needle, const char *end) {
+    const size_t needle_len = strlen(needle);
+    const size_t text_len = (size_t)(end - text);
+    const char *last = NULL;
+    if (!needle_len) return text;
+    if (needle_len > text_len) return NULL;
+    for (size_t i = 0; i + needle_len <= text_len; i++) {
+        if (memcmp(text + i, needle, needle_len) == 0) last = text + i;
+    }
+    return last;
+}
+
+static bool qwen_chat_assistant_parts(
+        const ds4_chat_message *message,
+        char **content_out,
+        char **reasoning_out) {
+    char *content = NULL;
+    if (!qwen_chat_trim_copy(message->content, &content)) return false;
+
+    char *reasoning = NULL;
+    if (message->reasoning) {
+        if (!qwen_chat_trim_copy(message->reasoning, &reasoning)) {
+            free(content);
+            return false;
+        }
+    } else {
+        static const char think_open[] = "<think>";
+        static const char think_close[] = "</think>";
+        char *first_close = strstr(content, think_close);
+        if (first_close) {
+            const char *reason_start = content;
+            const char *last_open = qwen_chat_find_last_before(
+                content, think_open, first_close);
+            if (last_open) reason_start = last_open + sizeof(think_open) - 1u;
+            if (!qwen_chat_trim_span(
+                    reason_start, (size_t)(first_close - reason_start),
+                    &reasoning)) {
+                free(content);
+                return false;
+            }
+
+            const char *last_close = qwen_chat_find_last_before(
+                content, think_close, content + strlen(content));
+            const char *visible = last_close + sizeof(think_close) - 1u;
+            while (*visible == '\n') visible++;
+            char *new_content = ds4_strdup(visible);
+            free(content);
+            content = new_content;
+        } else {
+            reasoning = ds4_strdup("");
+        }
+    }
+
+    *content_out = content;
+    *reasoning_out = reasoning;
+    return true;
+}
+
+static bool qwen_chat_render_tools_system(
+        qwen_chat_sink *sink,
+        const ds4_chat_request *request,
+        const char *system_content) {
+    if (!qwen_chat_sink_control(sink, "<|im_start|>") ||
+        !qwen_chat_sink_data(sink,
+            "system\n# Tools\n\n"
+            "You have access to the following functions:\n\n<tools>")) {
+        return false;
+    }
+    for (size_t i = 0; i < request->n_tools; i++) {
+        if (!request->tools_json || !request->tools_json[i] ||
+            !qwen_chat_sink_data(sink, "\n") ||
+            !qwen_chat_sink_data(sink, request->tools_json[i])) {
+            return false;
+        }
+    }
+    if (!qwen_chat_sink_data(sink,
+            "\n</tools>"
+            "\n\nIf you choose to call a function ONLY reply in the following format with NO suffix:"
+            "\n\n") ||
+        !qwen_chat_sink_control(sink, "<tool_call>") ||
+        !qwen_chat_sink_data(sink,
+            "\n<function=example_function_name>"
+            "\n<parameter=example_parameter_1>"
+            "\nvalue_1"
+            "\n</parameter>"
+            "\n<parameter=example_parameter_2>"
+            "\nThis is the value for the second parameter"
+            "\nthat can span"
+            "\nmultiple lines"
+            "\n</parameter>"
+            "\n</function>"
+            "\n") ||
+        !qwen_chat_sink_control(sink, "</tool_call>") ||
+        !qwen_chat_sink_data(sink,
+            "\n\n<IMPORTANT>"
+            "\nReminder:"
+            "\n- Function calls MUST follow the specified format: an inner <function=...></function> block must be nested within ") ||
+        !qwen_chat_sink_control(sink, "<tool_call>") ||
+        !qwen_chat_sink_control(sink, "</tool_call>") ||
+        !qwen_chat_sink_data(sink,
+            " XML tags"
+            "\n- Required parameters MUST be specified"
+            "\n- You may provide optional reasoning for your function call in natural language BEFORE the function call, but NOT after"
+            "\n- If there is no function call available, answer the question like normal with your current knowledge and do not tell the user about function calls"
+            "\n</IMPORTANT>")) {
+        return false;
+    }
+    if (system_content && system_content[0] &&
+        (!qwen_chat_sink_data(sink, "\n\n") ||
+         !qwen_chat_sink_data(sink, system_content))) {
+        return false;
+    }
+    return qwen_chat_sink_control(sink, "<|im_end|>") &&
+           qwen_chat_sink_data(sink, "\n");
+}
+
+static bool qwen_chat_render_tool_call(
+        qwen_chat_sink *sink,
+        const ds4_chat_tool_call *call,
+        bool content_before,
+        bool first) {
+    if (!call || !call->name || !call->name[0] ||
+        (call->n_args && !call->args)) {
+        return false;
+    }
+    if ((!first || content_before) && !qwen_chat_sink_data(sink, first ? "\n\n" : "\n"))
+        return false;
+    if (!qwen_chat_sink_control(sink, "<tool_call>") ||
+        !qwen_chat_sink_data(sink, "\n<function=") ||
+        !qwen_chat_sink_data(sink, call->name) ||
+        !qwen_chat_sink_data(sink, ">\n")) {
+        return false;
+    }
+    for (size_t i = 0; i < call->n_args; i++) {
+        const ds4_chat_tool_arg *arg = &call->args[i];
+        if (!arg->name || !arg->name[0] || !arg->value ||
+            !qwen_chat_sink_data(sink, "<parameter=") ||
+            !qwen_chat_sink_data(sink, arg->name) ||
+            !qwen_chat_sink_data(sink, ">\n") ||
+            !qwen_chat_sink_data(sink, arg->value) ||
+            !qwen_chat_sink_data(sink, "\n</parameter>\n")) {
+            return false;
+        }
+    }
+    return qwen_chat_sink_data(sink, "</function>\n") &&
+           qwen_chat_sink_control(sink, "</tool_call>");
+}
+
+static bool qwen_chat_render_request(
+        const ds4_vocab *vocab,
+        const ds4_chat_request *request,
+        qwen_chat_sink *sink,
+        char *err,
+        size_t errlen) {
+    if (!request || !request->messages || request->n_messages == 0) {
+        if (errlen) snprintf(err, errlen, "no messages provided");
+        return false;
+    }
+    if (request->n_tools && !request->tools_json) {
+        if (errlen) snprintf(err, errlen, "missing tool schemas");
+        return false;
+    }
+    sink->vocab = vocab;
+
+    size_t last_query = SIZE_MAX;
+    for (size_t i = 0; i < request->n_messages; i++) {
+        const ds4_chat_message *message = &request->messages[i];
+        if (message->role < DS4_CHAT_ROLE_SYSTEM ||
+            message->role > DS4_CHAT_ROLE_TOOL) {
+            if (errlen) snprintf(err, errlen, "unexpected message role");
+            return false;
+        }
+        if (message->role == DS4_CHAT_ROLE_SYSTEM && i != 0) {
+            if (errlen) snprintf(err, errlen,
+                                 "system message must be at the beginning");
+            return false;
+        }
+        if (message->n_tool_calls &&
+            (message->role != DS4_CHAT_ROLE_ASSISTANT ||
+             !message->tool_calls)) {
+            if (errlen) snprintf(err, errlen,
+                                 "tool calls require an assistant message");
+            return false;
+        }
+        if (message->role == DS4_CHAT_ROLE_TOOL &&
+            (i == 0 ||
+             (request->messages[i - 1u].role != DS4_CHAT_ROLE_ASSISTANT &&
+              request->messages[i - 1u].role != DS4_CHAT_ROLE_TOOL))) {
+            if (errlen) snprintf(err, errlen,
+                                 "tool response requires a preceding assistant message");
+            return false;
+        }
+        if (message->role == DS4_CHAT_ROLE_USER) {
+            ds4_str content = {0};
+            if (!qwen35_trimmed_text(
+                    message->content ? message->content : "", &content)) {
+                if (errlen) snprintf(err, errlen, "invalid UTF-8 in user message");
+                return false;
+            }
+            if (!qwen_chat_span_is_tool_response(content)) last_query = i;
+        }
+    }
+    if (last_query == SIZE_MAX) {
+        if (errlen) snprintf(err, errlen, "no user query found in messages");
+        return false;
+    }
+
+    char *first_system = NULL;
+    if (request->messages[0].role == DS4_CHAT_ROLE_SYSTEM &&
+        !qwen_chat_trim_copy(request->messages[0].content, &first_system)) {
+        if (errlen) snprintf(err, errlen, "invalid UTF-8 in system message");
+        return false;
+    }
+
+    bool ok = true;
+    if (request->n_tools) {
+        ok = qwen_chat_render_tools_system(
+            sink, request, first_system ? first_system : "");
+    } else if (first_system) {
+        ok = qwen_chat_sink_control(sink, "<|im_start|>") &&
+             qwen_chat_sink_data(sink, "system\n") &&
+             qwen_chat_sink_data(sink, first_system) &&
+             qwen_chat_sink_control(sink, "<|im_end|>") &&
+             qwen_chat_sink_data(sink, "\n");
+    }
+    free(first_system);
+    if (!ok) goto render_failed;
+
+    for (size_t i = 0; i < request->n_messages; i++) {
+        const ds4_chat_message *message = &request->messages[i];
+        if (message->role == DS4_CHAT_ROLE_SYSTEM) continue;
+
+        char *content = NULL;
+        if (!qwen_chat_trim_copy(message->content, &content)) {
+            if (errlen) snprintf(err, errlen, "invalid UTF-8 in message content");
+            return false;
+        }
+        if (message->role == DS4_CHAT_ROLE_USER) {
+            ok = qwen_chat_sink_control(sink, "<|im_start|>") &&
+                 qwen_chat_sink_data(sink, "user\n") &&
+                 qwen_chat_sink_data(sink, content) &&
+                 qwen_chat_sink_control(sink, "<|im_end|>") &&
+                 qwen_chat_sink_data(sink, "\n");
+        } else if (message->role == DS4_CHAT_ROLE_ASSISTANT) {
+            free(content);
+            content = NULL;
+            char *reasoning = NULL;
+            if (!qwen_chat_assistant_parts(message, &content, &reasoning)) {
+                if (errlen) snprintf(err, errlen,
+                                     "invalid UTF-8 in assistant message");
+                return false;
+            }
+            ok = qwen_chat_sink_control(sink, "<|im_start|>") &&
+                 qwen_chat_sink_data(sink, "assistant\n");
+            if (ok && (request->preserve_thinking || i > last_query)) {
+                ok = qwen_chat_sink_control(sink, "<think>") &&
+                     qwen_chat_sink_data(sink, "\n") &&
+                     qwen_chat_sink_data(sink, reasoning) &&
+                     qwen_chat_sink_data(sink, "\n") &&
+                     qwen_chat_sink_control(sink, "</think>") &&
+                     qwen_chat_sink_data(sink, "\n\n") &&
+                     qwen_chat_sink_data(sink, content);
+            } else if (ok) {
+                ok = qwen_chat_sink_data(sink, content);
+            }
+            for (size_t j = 0; ok && j < message->n_tool_calls; j++) {
+                ok = qwen_chat_render_tool_call(
+                    sink, &message->tool_calls[j], content[0] != '\0', j == 0);
+            }
+            if (ok) {
+                ok = qwen_chat_sink_control(sink, "<|im_end|>") &&
+                     qwen_chat_sink_data(sink, "\n");
+            }
+            free(reasoning);
+        } else {
+            const bool starts_group = i == 0 ||
+                request->messages[i - 1].role != DS4_CHAT_ROLE_TOOL;
+            const bool ends_group = i + 1u == request->n_messages ||
+                request->messages[i + 1u].role != DS4_CHAT_ROLE_TOOL;
+            if (starts_group) {
+                ok = qwen_chat_sink_control(sink, "<|im_start|>") &&
+                     qwen_chat_sink_data(sink, "user");
+            }
+            if (ok) {
+                ok = qwen_chat_sink_data(sink, "\n") &&
+                     qwen_chat_sink_control(sink, "<tool_response>") &&
+                     qwen_chat_sink_data(sink, "\n") &&
+                     qwen_chat_sink_data(sink, content) &&
+                     qwen_chat_sink_data(sink, "\n") &&
+                     qwen_chat_sink_control(sink, "</tool_response>");
+            }
+            if (ok && ends_group) {
+                ok = qwen_chat_sink_control(sink, "<|im_end|>") &&
+                     qwen_chat_sink_data(sink, "\n");
+            }
+        }
+        free(content);
+        if (!ok) goto render_failed;
+    }
+
+    if (request->add_generation_prompt) {
+        ok = qwen_chat_sink_control(sink, "<|im_start|>") &&
+             qwen_chat_sink_data(sink, "assistant\n") &&
+             qwen_chat_sink_control(sink, "<think>");
+        if (ok && ds4_think_mode_enabled(request->think_mode)) {
+            ok = qwen_chat_sink_data(sink, "\n");
+        } else if (ok) {
+            ok = qwen_chat_sink_data(sink, "\n\n") &&
+                 qwen_chat_sink_control(sink, "</think>") &&
+                 qwen_chat_sink_data(sink, "\n\n");
+        }
+    }
+    if (ok) ok = qwen_chat_sink_flush(sink);
+    if (ok) return true;
+
+render_failed:
+    if (errlen) snprintf(err, errlen,
+                         "Qwen chat rendering or tokenization failed");
+    return false;
+}
+
+bool ds4_render_qwen36_chat_checked(
+        ds4_engine *e,
+        const ds4_chat_request *request,
+        ds4_tokens *out,
+        char **rendered_out,
+        char *err,
+        size_t errlen) {
+    if (!err) errlen = 0;
+    if (err && errlen) err[0] = '\0';
+    if (!e || !out || !rendered_out || e->vocab.n_vocab == 0 ||
+        e->vocab.family != DS4_MODEL_FAMILY_QWEN35_MOE) {
+        if (err && errlen) snprintf(err, errlen,
+                                    "Qwen3.6 renderer requires a Qwen engine");
+        return false;
+    }
+
+    qwen_chat_sink sink = {0};
+    if (!qwen_chat_render_request(
+            &e->vocab, request, &sink, err, errlen)) {
+        qwen_chat_sink_free(&sink);
+        return false;
+    }
+
+    char *rendered = qwen_chat_bytes_take(&sink.rendered);
+    token_vec_commit_suffix(out, &sink.tokens, 0);
+    free(*rendered_out);
+    *rendered_out = rendered;
+    qwen_chat_sink_free(&sink);
+    return true;
+}
+
+bool ds4_qwen36_visible_checkpoint_checked(
+        ds4_engine *e,
+        const char *generation_prompt,
+        const ds4_tokens *generation_tokens,
+        ds4_think_mode think_mode,
+        const char *assistant_content,
+        ds4_tokens *tokens_out,
+        char **out) {
+    if (!e || e->vocab.family != DS4_MODEL_FAMILY_QWEN35_MOE ||
+        !generation_prompt || !generation_tokens || !tokens_out || !out) {
+        return false;
+    }
+
+    const char *generation_suffix = ds4_think_mode_enabled(think_mode)
+        ? "<think>\n"
+        : "<think>\n\n</think>\n\n";
+    const size_t prompt_len = strlen(generation_prompt);
+    const size_t suffix_len = strlen(generation_suffix);
+    if (prompt_len < suffix_len ||
+        memcmp(generation_prompt + prompt_len - suffix_len,
+               generation_suffix, suffix_len) != 0) {
+        return false;
+    }
+
+    int im_start_id = -1;
+    if (!qwen_chat_control_id(&e->vocab, "<|im_start|>", &im_start_id)) {
+        return false;
+    }
+    int assistant_start = -1;
+    for (int i = 0; i < generation_tokens->len; i++) {
+        if (generation_tokens->v[i] == im_start_id) assistant_start = i;
+    }
+    if (assistant_start < 0) return false;
+
+    qwen_chat_bytes prefix = {0};
+    for (int i = 0; i < assistant_start; i++) {
+        size_t piece_len = 0;
+        char *piece = ds4_token_text(e, generation_tokens->v[i], &piece_len);
+        if (!piece) {
+            free(prefix.ptr);
+            return false;
+        }
+        qwen_chat_bytes_append(&prefix, piece, piece_len);
+        free(piece);
+    }
+    static const char assistant_header[] = "<|im_start|>assistant\n";
+    const size_t expected_tail_len =
+        sizeof(assistant_header) - 1u + suffix_len;
+    if (prefix.len > prompt_len ||
+        prompt_len - prefix.len != expected_tail_len ||
+        memcmp(generation_prompt, prefix.ptr ? prefix.ptr : "", prefix.len) != 0 ||
+        memcmp(generation_prompt + prefix.len,
+               assistant_header, sizeof(assistant_header) - 1u) != 0 ||
+        memcmp(generation_prompt + prefix.len + sizeof(assistant_header) - 1u,
+               generation_suffix, suffix_len) != 0) {
+        free(prefix.ptr);
+        return false;
+    }
+
+    char *content = NULL;
+    if (!qwen_chat_trim_copy(assistant_content, &content)) {
+        free(prefix.ptr);
+        return false;
+    }
+    qwen_chat_sink sink = {.vocab = &e->vocab};
+    qwen_chat_bytes_append(&sink.rendered,
+                           prefix.ptr ? prefix.ptr : "", prefix.len);
+    free(prefix.ptr);
+    for (int i = 0; i < assistant_start; i++) {
+        token_vec_push(&sink.tokens, generation_tokens->v[i]);
+    }
+    const bool ok = qwen_chat_sink_control(&sink, "<|im_start|>") &&
+        qwen_chat_sink_data(&sink, "assistant\n") &&
+        qwen_chat_sink_data(&sink, content) &&
+        qwen_chat_sink_control(&sink, "<|im_end|>") &&
+        qwen_chat_sink_data(&sink, "\n") &&
+        qwen_chat_sink_flush(&sink);
+    free(content);
+    if (!ok) {
+        qwen_chat_sink_free(&sink);
+        return false;
+    }
+
+    char *visible = qwen_chat_bytes_take(&sink.rendered);
+    ds4_tokens visible_tokens = sink.tokens;
+    memset(&sink.tokens, 0, sizeof(sink.tokens));
+    ds4_tokens old_tokens = *tokens_out;
+    *tokens_out = visible_tokens;
+    ds4_tokens_free(&old_tokens);
+    free(*out);
+    *out = visible;
+    qwen_chat_sink_free(&sink);
+    return true;
+}
+
 void ds4_chat_begin(ds4_engine *e, ds4_tokens *tokens) {
     if (!e || !tokens || e->vocab.n_vocab == 0) return;
     if (e->vocab.add_bos) token_vec_push(tokens, e->vocab.bos_id);

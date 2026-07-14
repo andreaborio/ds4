@@ -34,6 +34,50 @@ typedef enum {
 } ds4_chat_format;
 
 typedef enum {
+    DS4_CHAT_ROLE_SYSTEM,
+    DS4_CHAT_ROLE_USER,
+    DS4_CHAT_ROLE_ASSISTANT,
+    DS4_CHAT_ROLE_TOOL,
+} ds4_chat_role;
+
+typedef struct {
+    const char *name;
+    /* Decoded text for strings; canonical JSON for every other type. */
+    const char *value;
+    bool is_string;
+} ds4_chat_tool_arg;
+
+typedef struct {
+    const char *name;
+    const ds4_chat_tool_arg *args;
+    size_t n_args;
+} ds4_chat_tool_call;
+
+typedef struct {
+    ds4_chat_role role;
+    /* Borrowed, NUL-terminated text. Multimodal content is outside this
+     * renderer's deliberately text-only Qwen3.6 subset. */
+    const char *content;
+    /* NULL means the field was absent and enables the template's fallback
+     * extraction from an embedded <think>...</think> block. */
+    const char *reasoning;
+    const ds4_chat_tool_call *tool_calls;
+    size_t n_tool_calls;
+} ds4_chat_message;
+
+typedef struct {
+    const ds4_chat_message *messages;
+    size_t n_messages;
+    /* Borrowed canonical JSON C strings in API order, including the function
+     * wrapper. Tool names and argument names/values are borrowed as well. */
+    const char *const *tools_json;
+    size_t n_tools;
+    ds4_think_mode think_mode;
+    bool add_generation_prompt;
+    bool preserve_thinking;
+} ds4_chat_request;
+
+typedef enum {
     DS4_LOG_DEFAULT,
     DS4_LOG_PREFILL,
     DS4_LOG_GENERATION,
@@ -169,6 +213,30 @@ const char *ds4_engine_model_name(ds4_engine *e);
 ds4_chat_format ds4_engine_chat_format(const ds4_engine *e);
 bool ds4_engine_prompt_is_rendered_chat(
         const ds4_engine *e, const char *prompt);
+/* Render the text-only subset of the pinned Qwen3.6 template while keeping
+ * client data separate from trusted control tokens. On failure, out and
+ * *rendered_out are unchanged. On success, the old malloc-owned *rendered_out
+ * is freed and replaced. */
+bool ds4_render_qwen36_chat_checked(
+        ds4_engine *e,
+        const ds4_chat_request *request,
+        ds4_tokens *out,
+        char **rendered_out,
+        char *err,
+        size_t errlen);
+/* Build the canonical visible prefix used to key a later turn against a live
+ * Qwen checkpoint that may contain hidden reasoning. The text and tokens must
+ * be the exact generation prompt returned by the renderer. Failure leaves both
+ * outputs unchanged; success replaces tokens_out and frees/replaces the
+ * previous malloc-owned *out value. */
+bool ds4_qwen36_visible_checkpoint_checked(
+        ds4_engine *e,
+        const char *generation_prompt,
+        const ds4_tokens *generation_tokens,
+        ds4_think_mode think_mode,
+        const char *assistant_content,
+        ds4_tokens *tokens_out,
+        char **out);
 int ds4_engine_layer_count(ds4_engine *e);
 uint32_t ds4_engine_layer_compress_ratio(ds4_engine *e, uint32_t layer);
 uint64_t ds4_engine_hidden_f32_values(ds4_engine *e);

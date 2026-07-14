@@ -131,6 +131,15 @@ bool ds4_kvstore_build_prompt_from_exact_prefix_and_text_suffix(
         const ds4_tokens *exact_prefix,
         const char *suffix_text,
         ds4_tokens *out);
+/* Keep an exact live checkpoint and append a suffix from an already-tokenized
+ * canonical prompt. text_prefix_bytes must land exactly on a token boundary. */
+bool ds4_kvstore_build_prompt_from_exact_prefix_and_canonical_suffix(
+        ds4_engine *engine,
+        const ds4_tokens *exact_prefix,
+        const ds4_tokens *canonical_prompt,
+        const char *canonical_text,
+        size_t text_prefix_bytes,
+        ds4_tokens *out);
 
 int ds4_kvstore_store_len(const ds4_kvstore *kc, int tokens);
 int ds4_kvstore_chat_anchor_pos(const ds4_kvstore *kc,

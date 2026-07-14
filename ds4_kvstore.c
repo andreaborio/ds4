@@ -748,6 +748,15 @@ bool ds4_kvstore_build_prompt_from_exact_prefix_and_text_suffix(
         ds4_tokens *out) {
     if (!engine || !exact_prefix || !out) return false;
 
+    /* Qwen's structured renderer deliberately distinguishes template-authored
+     * control tokens from identical bytes supplied by a client.  A plain text
+     * suffix has lost that provenance, so retokenizing it as rendered chat can
+     * promote client text such as <|im_end|> into a control token.  Exact token
+     * prefix reuse is handled before this byte-prefix fallback in the server;
+     * reject every Qwen text reconstruction until cache entries carry trusted
+     * renderer segments (or the full canonical token stream) explicitly. */
+    if (ds4_engine_chat_format(engine) == DS4_CHAT_FORMAT_QWEN36) return false;
+
     /* Build off to the side: callers often pass a reusable effective-prompt
      * buffer, and a failed suffix tokenization must not leave it containing a
      * valid-looking exact prefix followed by a partial/stale suffix. */
@@ -765,6 +774,48 @@ bool ds4_kvstore_build_prompt_from_exact_prefix_and_text_suffix(
             ds4_tokens_free(&built);
             return false;
         }
+    }
+
+    ds4_tokens old = *out;
+    *out = built;
+    ds4_tokens_free(&old);
+    return true;
+}
+
+bool ds4_kvstore_build_prompt_from_exact_prefix_and_canonical_suffix(
+        ds4_engine *engine,
+        const ds4_tokens *exact_prefix,
+        const ds4_tokens *canonical_prompt,
+        const char *canonical_text,
+        size_t text_prefix_bytes,
+        ds4_tokens *out) {
+    if (!engine || !exact_prefix || !canonical_prompt || !canonical_text ||
+        !out || text_prefix_bytes > strlen(canonical_text)) {
+        return false;
+    }
+
+    size_t decoded = 0;
+    int token_boundary = text_prefix_bytes == 0 ? 0 : -1;
+    for (int i = 0;
+         i < canonical_prompt->len && decoded < text_prefix_bytes;
+         i++) {
+        size_t piece_len = 0;
+        char *piece = ds4_token_text(engine, canonical_prompt->v[i], &piece_len);
+        const size_t remaining = text_prefix_bytes - decoded;
+        const bool matches = piece && piece_len <= remaining &&
+            (piece_len == 0 ||
+             memcmp(piece, canonical_text + decoded, piece_len) == 0);
+        free(piece);
+        if (!matches) return false;
+        decoded += piece_len;
+        if (decoded == text_prefix_bytes) token_boundary = i + 1;
+    }
+    if (token_boundary < 0) return false;
+
+    ds4_tokens built = {0};
+    ds4_tokens_copy(&built, exact_prefix);
+    for (int i = token_boundary; i < canonical_prompt->len; i++) {
+        ds4_tokens_push(&built, canonical_prompt->v[i]);
     }
 
     ds4_tokens old = *out;
@@ -1009,6 +1060,12 @@ bool ds4_kvstore_store_live_prefix_text(ds4_kvstore *kc,
                                         char *err,
                                         size_t err_len) {
     if (!kc->enabled) return false;
+    /* Qwen controls carry provenance that a byte-only cache key cannot
+     * represent: client text may spell the same bytes as template-authored
+     * <|im_start|>/<|im_end|> tokens.  Loads are disabled for the same reason
+     * below; do not create unusable entries (or spend SSD writes) until the
+     * on-disk format records the exact canonical token prefix. */
+    if (ds4_engine_chat_format(engine) == DS4_CHAT_FORMAT_QWEN36) return false;
     if (!tokens || store_len < kc->opt.min_tokens) return false;
     const int original_len = tokens->len;
 
@@ -1299,6 +1356,11 @@ int ds4_kvstore_try_load_text(ds4_kvstore *kc,
     if (result) memset(result, 0, sizeof(*result));
     if (effective_prompt) effective_prompt->len = 0;
     if (!kc->enabled || !prompt_text) return 0;
+    /* A Qwen byte key is not a token/provenance key: client data can spell the
+     * same control bytes as a different trusted template history. Qwen disk
+     * snapshots stay disabled until their index stores and compares the exact
+     * canonical token prefix. */
+    if (ds4_engine_chat_format(engine) == DS4_CHAT_FORMAT_QWEN36) return 0;
     const int quant_bits = ds4_engine_routed_quant_bits(engine);
     if (quant_bits != 2 && quant_bits != 4) return 0;
     const int model_id = ds4_engine_model_id(engine);

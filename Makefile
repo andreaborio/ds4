@@ -217,7 +217,7 @@ $(METAL_OBJDIR)/test_qwen_session.o: tests/test_qwen_session.c ds4.c ds4.h \
 		-Wno-unused-function -Wno-unused-parameter -I. -c -o $@ $<
 
 $(METAL_OBJDIR)/test_qwen_tokenizer.o: tests/test_qwen_tokenizer.c ds4.c \
-		ds4.h ds4_ssd.h ds4_distributed.h ds4_gpu.h ds4_qwen.h \
+		ds4.h ds4_kvstore.h ds4_ssd.h ds4_distributed.h ds4_gpu.h ds4_qwen.h \
 		ds4_qwen_unicode.h tests/qwen/qwen36_tokenizer_fixture.inc
 	@mkdir -p "$(@D)"
 	$(CC) $(CFLAGS) $(QWEN_CFLAGS) $(DEPFLAGS) -DDS4_NO_GPU \
@@ -282,7 +282,8 @@ $(METAL_BINDIR)/test_qwen_session: \
 	$(CC) $(CFLAGS) -o $@ $^ $(LDLIBS)
 
 $(METAL_BINDIR)/test_qwen_tokenizer: \
-		$(METAL_OBJDIR)/test_qwen_tokenizer.o $(METAL_OBJDIR)/ds4_build.o \
+		$(METAL_OBJDIR)/test_qwen_tokenizer.o $(METAL_OBJDIR)/ds4_kvstore.o \
+		$(METAL_OBJDIR)/ds4_build.o \
 		$(METAL_OBJDIR)/ds4_distributed.o $(METAL_OBJDIR)/ds4_ssd.o \
 		$(METAL_OBJDIR)/ds4_qwen.o $(METAL_OBJDIR)/ds4_qwen_unicode.o
 	@mkdir -p "$(@D)"
@@ -619,13 +620,13 @@ tests/test_qwen_session: tests/test_qwen_session.c ds4.c ds4.h ds4_ssd.h \
 		ds4_qwen.c ds4_qwen_unicode.c $(LDLIBS)
 
 tests/test_qwen_tokenizer: tests/test_qwen_tokenizer.c ds4.c ds4.h \
-		ds4_ssd.h ds4_distributed.h ds4_gpu.h ds4_qwen.h \
+		ds4_kvstore.c ds4_kvstore.h ds4_ssd.h ds4_distributed.h ds4_gpu.h ds4_qwen.h \
 		ds4_qwen_unicode.h ds4_build.c ds4_distributed.c ds4_ssd.c \
 		ds4_qwen.c ds4_qwen_unicode.c ds4_qwen_unicode_data.inc \
 		ds4_streaming_hotlist.inc tests/qwen/qwen36_tokenizer_fixture.inc
 	$(CC) $(CFLAGS) $(QWEN_CFLAGS) -DDS4_NO_GPU \
 		-Wno-unused-function -Wno-unused-parameter -I. -o $@ \
-		tests/test_qwen_tokenizer.c ds4_build.c ds4_distributed.c ds4_ssd.c \
+		tests/test_qwen_tokenizer.c ds4_kvstore.c ds4_build.c ds4_distributed.c ds4_ssd.c \
 		ds4_qwen.c ds4_qwen_unicode.c $(LDLIBS)
 
 qwen-metadata-test: ds4 tests/test_qwen_metadata.py
