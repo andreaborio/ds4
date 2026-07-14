@@ -48,6 +48,14 @@ typedef struct {
 } ds4_qwen35_cpu_cache_plan;
 
 typedef struct {
+    uint64_t float_bytes;
+    uint64_t quant_bytes;
+    uint64_t fixed_bytes;
+    uint64_t score_bytes;
+    uint64_t total_bytes;
+} ds4_qwen35_cpu_scratch_plan;
+
+typedef struct {
     /* Full-attention layers only: [context][kv_head][head_dim]. */
     float *key;
     float *value;
@@ -65,6 +73,49 @@ typedef struct {
     uint32_t kv_capacity;
     uint32_t n_tokens;
 } ds4_qwen35_cpu_cache;
+
+/* One allocation owns every temporary used by the scalar CPU token forward.
+ * Capacities follow the fixed Qwen shape: projection=8192, gate/query/value/
+ * heads=4096, key=2048, routed_mid=8x512, and score=ctx_capacity.  The raw
+ * Q8_K regions use ds4's private 292-byte block layout and are cast only in
+ * ds4.c, keeping quant implementation details out of the operator API. */
+typedef struct {
+    void *arena;
+    uint64_t arena_bytes;
+    uint32_t ctx_capacity;
+    uint32_t score_cap;
+
+    float *hidden[2];
+    float *norm;
+    float *projection;
+    float *gate;
+    float *query;
+    float *key;
+    float *value;
+    float *alpha_logit;
+    float *beta_logit;
+    float *log_decay;
+    float *beta;
+    float *heads;
+    float *attn_out;
+    float *score;
+
+    float *router_logits;
+    float *router_probability;
+    int32_t selected[QWEN35_N_EXPERT_USED];
+    float selected_weight[QWEN35_N_EXPERT_USED];
+    float *routed_mid;
+    float *moe_out;
+    float *shared_gate;
+    float *shared_up;
+    float *shared_mid;
+    float *shared_out;
+
+    int8_t *dense_q8;
+    float *dense_q8_scale;
+    uint8_t *routed_q8k;
+    uint8_t *routed_mid_q8k;
+} ds4_qwen35_cpu_scratch;
 
 bool ds4_qwen35_layer_is_full_attention(uint32_t layer);
 
@@ -97,6 +148,22 @@ bool ds4_qwen35_cpu_cache_advance(
 
 uint64_t ds4_qwen35_cpu_cache_allocated_bytes(
         const ds4_qwen35_cpu_cache *cache);
+
+bool ds4_qwen35_cpu_scratch_plan_make(
+        uint32_t                       ctx_size,
+        ds4_qwen35_cpu_scratch_plan   *plan);
+
+/* Scratch is fully allocated up front so the token loop never grows it.  As
+ * with the cache, initialize only a zero/uninitialized object and free it
+ * before reinitializing. */
+bool ds4_qwen35_cpu_scratch_init(
+        ds4_qwen35_cpu_scratch *scratch,
+        uint32_t                ctx_capacity);
+
+void ds4_qwen35_cpu_scratch_free(ds4_qwen35_cpu_scratch *scratch);
+
+uint64_t ds4_qwen35_cpu_scratch_allocated_bytes(
+        const ds4_qwen35_cpu_scratch *scratch);
 
 /* Allocation-free post-projection CPU operators.  Dimensions are explicit so
  * the model-free tests can compare the production path with small independent

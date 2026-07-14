@@ -256,6 +256,165 @@ uint64_t ds4_qwen35_cpu_cache_allocated_bytes(
     return total_bytes;
 }
 
+enum {
+    QWEN35_CPU_Q8_0_CAP = QWEN35_SSM_INNER,
+    QWEN35_CPU_Q8_0_BLOCK = 32,
+    QWEN35_CPU_QK_K = 256,
+    QWEN35_CPU_Q8_K_BLOCK_BYTES = 292,
+};
+
+bool ds4_qwen35_cpu_scratch_plan_make(
+        uint32_t                     ctx_size,
+        ds4_qwen35_cpu_scratch_plan *plan) {
+    if (!plan || ctx_size == 0 || ctx_size > QWEN35_CONTEXT_LENGTH) {
+        return false;
+    }
+
+    uint64_t float_values = 0;
+    uint64_t float_bytes = 0;
+    uint64_t quant_bytes = 0;
+    uint64_t fixed_bytes = 0;
+    uint64_t score_bytes = 0;
+    uint64_t total_bytes = 0;
+
+    const uint64_t fixed_float_values =
+        2u * QWEN35_N_EMBD +                 /* hidden ping-pong */
+        QWEN35_N_EMBD +                      /* norm */
+        QWEN35_SSM_CONV_CHANNEL +            /* largest projection */
+        QWEN35_SSM_INNER +                   /* gate */
+        QWEN35_N_HEAD * QWEN35_N_HEAD_DIM +  /* query */
+        QWEN35_SSM_GROUP * QWEN35_SSM_STATE +/* key */
+        QWEN35_SSM_VALUE_HEAD * QWEN35_SSM_STATE + /* value */
+        4u * QWEN35_SSM_DT_RANK +            /* alpha/beta controls */
+        QWEN35_N_HEAD * QWEN35_N_HEAD_DIM +  /* attention heads */
+        QWEN35_N_EMBD +                      /* attention output */
+        2u * QWEN35_N_EXPERT +               /* router logits/prob */
+        QWEN35_N_EXPERT_USED * QWEN35_N_FF_EXP + /* routed mid */
+        QWEN35_N_EMBD +                      /* routed output */
+        3u * QWEN35_N_FF_SHARED +            /* shared gate/up/mid */
+        QWEN35_N_EMBD;                       /* shared output */
+    const uint64_t dense_scale_values =
+        (QWEN35_CPU_Q8_0_CAP + QWEN35_CPU_Q8_0_BLOCK - 1u) /
+        QWEN35_CPU_Q8_0_BLOCK;
+    const uint64_t routed_input_blocks =
+        QWEN35_N_EMBD / QWEN35_CPU_QK_K;
+    const uint64_t routed_mid_blocks =
+        QWEN35_N_EXPERT_USED * QWEN35_N_FF_EXP / QWEN35_CPU_QK_K;
+
+    if (!qwen35_u64_add(float_values, fixed_float_values, &float_values) ||
+        !qwen35_u64_mul(float_values, sizeof(float), &float_bytes) ||
+        !qwen35_u64_mul(dense_scale_values, sizeof(float), &quant_bytes) ||
+        !qwen35_u64_add(quant_bytes, QWEN35_CPU_Q8_0_CAP,
+                        &quant_bytes)) {
+        return false;
+    }
+    uint64_t routed_quant_bytes = 0;
+    if (!qwen35_u64_add(routed_input_blocks, routed_mid_blocks,
+                        &routed_quant_bytes) ||
+        !qwen35_u64_mul(routed_quant_bytes,
+                        QWEN35_CPU_Q8_K_BLOCK_BYTES,
+                        &routed_quant_bytes) ||
+        !qwen35_u64_add(quant_bytes, routed_quant_bytes, &quant_bytes) ||
+        !qwen35_u64_add(float_bytes, quant_bytes, &fixed_bytes) ||
+        !qwen35_u64_mul(ctx_size, sizeof(float), &score_bytes) ||
+        !qwen35_u64_add(fixed_bytes, score_bytes, &total_bytes)) {
+        return false;
+    }
+
+    *plan = (ds4_qwen35_cpu_scratch_plan){
+        .float_bytes = float_bytes,
+        .quant_bytes = quant_bytes,
+        .fixed_bytes = fixed_bytes,
+        .score_bytes = score_bytes,
+        .total_bytes = total_bytes,
+    };
+    return true;
+}
+
+void ds4_qwen35_cpu_scratch_free(ds4_qwen35_cpu_scratch *scratch) {
+    if (!scratch) return;
+    free(scratch->arena);
+    memset(scratch, 0, sizeof(*scratch));
+}
+
+bool ds4_qwen35_cpu_scratch_init(
+        ds4_qwen35_cpu_scratch *scratch,
+        uint32_t                ctx_capacity) {
+    if (!scratch) return false;
+    memset(scratch, 0, sizeof(*scratch));
+
+    ds4_qwen35_cpu_scratch_plan plan;
+    if (!ds4_qwen35_cpu_scratch_plan_make(ctx_capacity, &plan) ||
+        plan.total_bytes > SIZE_MAX) {
+        return false;
+    }
+
+    uint8_t *arena = malloc((size_t)plan.total_bytes);
+    if (!arena) return false;
+    memset(arena, 0, (size_t)plan.total_bytes);
+
+    uint8_t *cursor = arena;
+#define QWEN35_TAKE_FLOAT(field_, count_) do {                               \
+        scratch->field_ = (float *)cursor;                                  \
+        cursor += (size_t)(count_) * sizeof(float);                         \
+    } while (0)
+    QWEN35_TAKE_FLOAT(hidden[0], QWEN35_N_EMBD);
+    QWEN35_TAKE_FLOAT(hidden[1], QWEN35_N_EMBD);
+    QWEN35_TAKE_FLOAT(norm, QWEN35_N_EMBD);
+    QWEN35_TAKE_FLOAT(projection, QWEN35_SSM_CONV_CHANNEL);
+    QWEN35_TAKE_FLOAT(gate, QWEN35_SSM_INNER);
+    QWEN35_TAKE_FLOAT(query, QWEN35_N_HEAD * QWEN35_N_HEAD_DIM);
+    QWEN35_TAKE_FLOAT(key, QWEN35_SSM_GROUP * QWEN35_SSM_STATE);
+    QWEN35_TAKE_FLOAT(value,
+                      QWEN35_SSM_VALUE_HEAD * QWEN35_SSM_STATE);
+    QWEN35_TAKE_FLOAT(alpha_logit, QWEN35_SSM_DT_RANK);
+    QWEN35_TAKE_FLOAT(beta_logit, QWEN35_SSM_DT_RANK);
+    QWEN35_TAKE_FLOAT(log_decay, QWEN35_SSM_DT_RANK);
+    QWEN35_TAKE_FLOAT(beta, QWEN35_SSM_DT_RANK);
+    QWEN35_TAKE_FLOAT(heads, QWEN35_N_HEAD * QWEN35_N_HEAD_DIM);
+    QWEN35_TAKE_FLOAT(attn_out, QWEN35_N_EMBD);
+    QWEN35_TAKE_FLOAT(router_logits, QWEN35_N_EXPERT);
+    QWEN35_TAKE_FLOAT(router_probability, QWEN35_N_EXPERT);
+    QWEN35_TAKE_FLOAT(routed_mid,
+                      QWEN35_N_EXPERT_USED * QWEN35_N_FF_EXP);
+    QWEN35_TAKE_FLOAT(moe_out, QWEN35_N_EMBD);
+    QWEN35_TAKE_FLOAT(shared_gate, QWEN35_N_FF_SHARED);
+    QWEN35_TAKE_FLOAT(shared_up, QWEN35_N_FF_SHARED);
+    QWEN35_TAKE_FLOAT(shared_mid, QWEN35_N_FF_SHARED);
+    QWEN35_TAKE_FLOAT(shared_out, QWEN35_N_EMBD);
+#undef QWEN35_TAKE_FLOAT
+
+    scratch->dense_q8 = (int8_t *)cursor;
+    cursor += QWEN35_CPU_Q8_0_CAP;
+    scratch->dense_q8_scale = (float *)cursor;
+    cursor += (QWEN35_CPU_Q8_0_CAP / QWEN35_CPU_Q8_0_BLOCK) *
+              sizeof(float);
+    scratch->routed_q8k = cursor;
+    cursor += (QWEN35_N_EMBD / QWEN35_CPU_QK_K) *
+              QWEN35_CPU_Q8_K_BLOCK_BYTES;
+    scratch->routed_mid_q8k = cursor;
+    cursor += (QWEN35_N_EXPERT_USED * QWEN35_N_FF_EXP /
+               QWEN35_CPU_QK_K) * QWEN35_CPU_Q8_K_BLOCK_BYTES;
+    scratch->score = (float *)cursor;
+    cursor += (size_t)ctx_capacity * sizeof(float);
+
+    if ((uint64_t)(cursor - arena) != plan.total_bytes) {
+        free(arena);
+        memset(scratch, 0, sizeof(*scratch));
+        return false;
+    }
+    scratch->arena = arena;
+    scratch->arena_bytes = plan.total_bytes;
+    scratch->ctx_capacity = ctx_capacity;
+    scratch->score_cap = ctx_capacity;
+    return true;
+}
+
+uint64_t ds4_qwen35_cpu_scratch_allocated_bytes(
+        const ds4_qwen35_cpu_scratch *scratch) {
+    return scratch ? scratch->arena_bytes : 0;
+}
+
 static float qwen35_sigmoid(float x) {
     if (x >= 0.0f) return 1.0f / (1.0f + expf(-x));
     const float e = expf(x);

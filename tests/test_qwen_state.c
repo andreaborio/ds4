@@ -51,6 +51,86 @@ static void test_memory_plan(void) {
     CHECK(plan.max_total_bytes == UINT64_C(1408040960));
 }
 
+static void test_scratch_plan(void) {
+    ds4_qwen35_cpu_scratch_plan plan = {0};
+    CHECK(!ds4_qwen35_cpu_scratch_plan_make(0, &plan));
+    CHECK(!ds4_qwen35_cpu_scratch_plan_make(
+        QWEN35_CONTEXT_LENGTH + 1u, &plan));
+    CHECK(!ds4_qwen35_cpu_scratch_plan_make(UINT32_MAX, &plan));
+    CHECK(!ds4_qwen35_cpu_scratch_plan_make(1, NULL));
+    CHECK(ds4_qwen35_cpu_scratch_plan_make(1, &plan));
+    CHECK(plan.float_bytes == UINT64_C(180736));
+    CHECK(plan.quant_bytes == UINT64_C(11616));
+    CHECK(plan.fixed_bytes == UINT64_C(192352));
+    CHECK(plan.score_bytes == UINT64_C(4));
+    CHECK(plan.total_bytes == UINT64_C(192356));
+
+    CHECK(ds4_qwen35_cpu_scratch_plan_make(32768, &plan));
+    CHECK(plan.fixed_bytes == UINT64_C(192352));
+    CHECK(plan.score_bytes == UINT64_C(131072));
+    CHECK(plan.total_bytes == UINT64_C(323424));
+}
+
+static void test_scratch_lifecycle(void) {
+    ds4_qwen35_cpu_scratch scratch;
+    memset(&scratch, 0xa5, sizeof(scratch));
+    CHECK(!ds4_qwen35_cpu_scratch_init(&scratch, 0));
+
+    memset(&scratch, 0, sizeof(scratch));
+    CHECK(ds4_qwen35_cpu_scratch_init(&scratch, 130));
+    CHECK(scratch.arena != NULL);
+    CHECK(scratch.ctx_capacity == 130);
+    CHECK(scratch.score_cap == 130);
+    CHECK(ds4_qwen35_cpu_scratch_allocated_bytes(&scratch) ==
+          UINT64_C(192872));
+    CHECK(scratch.hidden[0] != NULL);
+    CHECK(scratch.hidden[1] != NULL);
+    CHECK(scratch.norm != NULL);
+    CHECK(scratch.projection != NULL);
+    CHECK(scratch.gate != NULL);
+    CHECK(scratch.query != NULL);
+    CHECK(scratch.key != NULL);
+    CHECK(scratch.value != NULL);
+    CHECK(scratch.alpha_logit != NULL);
+    CHECK(scratch.beta_logit != NULL);
+    CHECK(scratch.log_decay != NULL);
+    CHECK(scratch.beta != NULL);
+    CHECK(scratch.heads != NULL);
+    CHECK(scratch.attn_out != NULL);
+    CHECK(scratch.score != NULL);
+    CHECK(scratch.router_logits != NULL);
+    CHECK(scratch.router_probability != NULL);
+    CHECK(scratch.routed_mid != NULL);
+    CHECK(scratch.moe_out != NULL);
+    CHECK(scratch.shared_gate != NULL);
+    CHECK(scratch.shared_up != NULL);
+    CHECK(scratch.shared_mid != NULL);
+    CHECK(scratch.shared_out != NULL);
+    CHECK(scratch.dense_q8 != NULL);
+    CHECK(scratch.dense_q8_scale != NULL);
+    CHECK(scratch.routed_q8k != NULL);
+    CHECK(scratch.routed_mid_q8k != NULL);
+
+    scratch.hidden[0][0] = 1.0f;
+    scratch.hidden[1][QWEN35_N_EMBD - 1u] = 2.0f;
+    scratch.projection[QWEN35_SSM_CONV_CHANNEL - 1u] = 3.0f;
+    scratch.routed_mid[
+        QWEN35_N_EXPERT_USED * QWEN35_N_FF_EXP - 1u] = 4.0f;
+    scratch.score[129] = 5.0f;
+    CHECK(scratch.hidden[0][0] == 1.0f);
+    CHECK(scratch.hidden[1][QWEN35_N_EMBD - 1u] == 2.0f);
+    CHECK(scratch.projection[QWEN35_SSM_CONV_CHANNEL - 1u] == 3.0f);
+    CHECK(scratch.routed_mid[
+        QWEN35_N_EXPERT_USED * QWEN35_N_FF_EXP - 1u] == 4.0f);
+    CHECK(scratch.score[129] == 5.0f);
+
+    ds4_qwen35_cpu_scratch_free(&scratch);
+    ds4_qwen35_cpu_scratch empty = {0};
+    CHECK(memcmp(&scratch, &empty, sizeof(scratch)) == 0);
+    ds4_qwen35_cpu_scratch_free(&scratch);
+    CHECK(ds4_qwen35_cpu_scratch_allocated_bytes(&scratch) == 0);
+}
+
 static void test_cache_lifecycle(void) {
     ds4_qwen35_cpu_cache cache;
     memset(&cache, 0xa5, sizeof(cache));
@@ -181,7 +261,9 @@ static void test_cache_lifecycle(void) {
 int main(void) {
     test_layer_pattern();
     test_memory_plan();
+    test_scratch_plan();
     test_cache_lifecycle();
+    test_scratch_lifecycle();
     if (failures) {
         fprintf(stderr, "qwen CPU state tests: %d failure(s)\n", failures);
         return 1;
