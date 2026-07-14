@@ -13,6 +13,7 @@ enum {
     QWEN35_N_TENSOR                   = 733,
     QWEN35_N_EMBD                     = 2048,
     QWEN35_N_VOCAB                    = 248320,
+    QWEN35_N_VALID_TOKEN              = 248077,
     QWEN35_N_MERGE                    = 247587,
     QWEN35_N_HEAD                     = 16,
     QWEN35_N_HEAD_KV                  = 2,

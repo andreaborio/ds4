@@ -153,7 +153,11 @@ typedef struct {
 int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt);
 void ds4_engine_close(ds4_engine *e);
 void ds4_engine_summary(ds4_engine *e);
+/* Physical output width, including any model-defined padding rows. */
 int ds4_engine_vocab_size(ds4_engine *e);
+/* Token ids in [0, effective_vocab_size) are valid inputs and sampling
+ * candidates.  Raw-logits callers must use this bound with ds4_sample_logits. */
+int ds4_engine_effective_vocab_size(ds4_engine *e);
 int ds4_engine_power(ds4_engine *e);
 int ds4_engine_set_power(ds4_engine *e, int power_percent);
 const char *ds4_engine_model_name(ds4_engine *e);

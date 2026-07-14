@@ -128,6 +128,9 @@ static void test_session_creation_boundary(void) {
 
 static void test_dynamic_logits(ds4_session *session) {
     const uint32_t n_vocab = QWEN35_N_VOCAB;
+    CHECK(ds4_engine_vocab_size(session->engine) == QWEN35_N_VOCAB);
+    CHECK(ds4_engine_effective_vocab_size(session->engine) ==
+          QWEN35_N_VALID_TOKEN);
     float *input = malloc((size_t)n_vocab * sizeof(input[0]));
     float *copy = malloc(((size_t)n_vocab + 1u) * sizeof(copy[0]));
     CHECK(input != NULL && copy != NULL);
@@ -139,25 +142,32 @@ static void test_dynamic_logits(ds4_session *session) {
 
     for (uint32_t i = 0; i < n_vocab; i++) input[i] = -INFINITY;
     input[200000] = 3.0f;
+    input[QWEN35_N_VALID_TOKEN - 1u] = 4.0f;
     input[n_vocab - 1u] = 5.0f;
     CHECK(ds4_session_set_logits(session, input, (int)n_vocab) == 0);
     CHECK(ds4_session_set_logits(session, input, (int)DS4_N_VOCAB) != 0);
     CHECK(ds4_session_set_logits(session, input, (int)n_vocab - 1) != 0);
-    CHECK(ds4_session_argmax(session) == (int)n_vocab - 1);
-    CHECK(ds4_session_argmax_excluding(session, (int)n_vocab - 1) == 200000);
+    CHECK(ds4_session_argmax(session) ==
+          (int)QWEN35_N_VALID_TOKEN - 1);
+    CHECK(ds4_session_argmax_excluding(
+              session, (int)QWEN35_N_VALID_TOKEN - 1) == 200000);
 
     uint64_t rng = UINT64_C(0x123456789abcdef0);
     CHECK(ds4_session_sample(session, 0.0f, 0, 1.0f, 0.0f, &rng) ==
-          (int)n_vocab - 1);
+          (int)QWEN35_N_VALID_TOKEN - 1);
 
     ds4_token_score top[2];
     CHECK(ds4_session_top_logprobs(session, top, 2) == 2);
-    CHECK(top[0].id == (int)n_vocab - 1);
+    CHECK(top[0].id == (int)QWEN35_N_VALID_TOKEN - 1);
     CHECK(top[1].id == 200000);
     CHECK(top[0].logprob > top[1].logprob);
+    CHECK(top[0].logprob > -1.0f); /* UNUSED logit is not normalized. */
     ds4_token_score one;
-    CHECK(ds4_session_token_logprob(session, (int)n_vocab - 1, &one) == 1);
-    CHECK(one.id == (int)n_vocab - 1 && isfinite(one.logprob));
+    CHECK(ds4_session_token_logprob(
+              session, (int)QWEN35_N_VALID_TOKEN - 1, &one) == 1);
+    CHECK(one.id == (int)QWEN35_N_VALID_TOKEN - 1 && isfinite(one.logprob));
+    CHECK(ds4_session_token_logprob(
+              session, (int)QWEN35_N_VALID_TOKEN, &one) == 0);
     CHECK(ds4_session_token_logprob(session, (int)n_vocab, &one) == 0);
 
     copy[0] = 91.0f;
@@ -189,10 +199,13 @@ static void test_eval_transaction(ds4_session *session) {
     CHECK(ds4_session_eval_qwen35_with_forward(
               session, -1, err, sizeof(err), stub_forward) != 0);
     CHECK(ds4_session_eval_qwen35_with_forward(
-              session, QWEN35_N_VOCAB, err, sizeof(err), stub_forward) != 0);
+              session, QWEN35_N_VALID_TOKEN,
+              err, sizeof(err), stub_forward) != 0);
     memset(err, 0, sizeof(err));
-    CHECK(ds4_session_eval(session, QWEN35_N_VOCAB,
+    session->distributed = (ds4_dist_session *)(uintptr_t)1;
+    CHECK(ds4_session_eval(session, QWEN35_N_VALID_TOKEN,
                            err, sizeof(err)) != 0);
+    session->distributed = NULL;
     CHECK(strstr(err, "Qwen token id") != NULL);
     CHECK(stub_calls == 1);
     CHECK(session->checkpoint.len == 1 &&
@@ -287,12 +300,14 @@ static void test_sync_transaction(ds4_session *session) {
     CHECK(session->logits[QWEN35_N_VOCAB - 1u] == 13.0f);
     CHECK(stub_position[2] == 2 && stub_token[2] == 13);
 
-    int invalid_values[] = {11, QWEN35_N_VOCAB};
+    int invalid_values[] = {11, QWEN35_N_VALID_TOKEN};
     ds4_tokens invalid = {.v = invalid_values, .len = 2, .cap = 2};
     CHECK(ds4_session_sync_qwen35_with_forward(
               session, &invalid, err, sizeof(err), stub_forward) != 0);
     memset(err, 0, sizeof(err));
+    session->distributed = (ds4_dist_session *)(uintptr_t)1;
     CHECK(ds4_session_sync(session, &invalid, err, sizeof(err)) != 0);
+    session->distributed = NULL;
     CHECK(strstr(err, "Qwen token id") != NULL);
     CHECK(stub_calls == 3);
     CHECK(session->checkpoint.len == 3 &&

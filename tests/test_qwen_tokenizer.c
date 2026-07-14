@@ -7,6 +7,7 @@
  * without downloading model weights or a multi-hundred-megabyte tokenizer.
  */
 
+#define DS4_BPE_TEST_HOOKS 1
 #include "../ds4.c"
 #include "qwen/qwen36_tokenizer_fixture.inc"
 
@@ -67,6 +68,9 @@ static void fixture_engine_init(ds4_engine *engine, int omitted_token_id) {
         CHECK(merge->len == strlen(merge->text));
         table_put(&vocab->merge_rank,
                   (ds4_str){merge->text, merge->len}, merge->rank);
+        if (merge->len > vocab->max_merge_len) {
+            vocab->max_merge_len = merge->len;
+        }
     }
 
     vocab_configure_qwen35(vocab);
@@ -313,8 +317,163 @@ static void test_decode(ds4_engine *engine) {
     expect_decoded(engine, 248068, "<think>");
 }
 
+static void bpe_test_vocab_init(
+        ds4_vocab *vocab,
+        uint64_t   token_count,
+        uint64_t   merge_count) {
+    memset(vocab, 0, sizeof(*vocab));
+    table_init(&vocab->token_to_id, token_count);
+    table_init(&vocab->merge_rank, merge_count);
+}
+
+static void bpe_test_vocab_free(ds4_vocab *vocab) {
+    table_free(&vocab->token_to_id);
+    table_free(&vocab->merge_rank);
+}
+
+static void bpe_test_put_token(
+        ds4_vocab *vocab,
+        const char *text,
+        int id) {
+    table_put(&vocab->token_to_id,
+              (ds4_str){text, (uint64_t)strlen(text)}, id);
+}
+
+static void bpe_test_put_merge(
+        ds4_vocab *vocab,
+        const char *text,
+        int rank) {
+    const uint64_t len = (uint64_t)strlen(text);
+    table_put(&vocab->merge_rank,
+              (ds4_str){text, len}, rank);
+    if (len > vocab->max_merge_len) vocab->max_merge_len = len;
+}
+
+static void test_bpe_leftmost_overlap(void) {
+    ds4_vocab vocab;
+    bpe_test_vocab_init(&vocab, 2, 1);
+    bpe_test_put_token(&vocab, "a", 10);
+    bpe_test_put_token(&vocab, "aa", 11);
+    bpe_test_put_merge(&vocab, "a a", 0);
+
+    token_vec out = {0};
+    static const int expected[] = {11, 10};
+    CHECK(bpe_emit_piece(
+        &vocab, (ds4_str){"aaa", 3}, &out, true));
+    expect_tokens(&out, expected, TEST_ARRAY_LEN(expected), false);
+
+    token_vec_free(&out);
+    bpe_test_vocab_free(&vocab);
+}
+
+static void test_bpe_stale_candidate(void) {
+    ds4_vocab vocab;
+    bpe_test_vocab_init(&vocab, 2, 2);
+    bpe_test_put_token(&vocab, "a", 20);
+    bpe_test_put_token(&vocab, "bc", 21);
+    bpe_test_put_merge(&vocab, "b c", 0);
+    bpe_test_put_merge(&vocab, "a b", 1);
+
+    token_vec out = {0};
+    static const int expected[] = {20, 21};
+    CHECK(bpe_emit_piece(
+        &vocab, (ds4_str){"abc", 3}, &out, true));
+    expect_tokens(&out, expected, TEST_ARRAY_LEN(expected), false);
+
+    token_vec_free(&out);
+    bpe_test_vocab_free(&vocab);
+}
+
+static void test_bpe_long_actual_chain(void) {
+    enum { RAW_LEN = 65536 };
+    ds4_vocab vocab;
+    bpe_test_vocab_init(&vocab, 1, 3);
+    bpe_test_put_token(&vocab, "aaaaaaaa", 30);
+    bpe_test_put_merge(&vocab, "a a", 0);
+    bpe_test_put_merge(&vocab, "aa aa", 1);
+    bpe_test_put_merge(&vocab, "aaaa aaaa", 2);
+
+    char *raw = xmalloc(RAW_LEN + 1u);
+    memset(raw, 'a', RAW_LEN);
+    raw[RAW_LEN] = '\0';
+
+    token_vec out = {0};
+    g_bpe_test_rank_lookups = 0;
+    CHECK(bpe_emit_piece(
+        &vocab, (ds4_str){raw, RAW_LEN}, &out, true));
+    CHECK(out.len == RAW_LEN / 8);
+    for (int i = 0; i < out.len; i++) CHECK(out.v[i] == 30);
+    CHECK(g_bpe_test_rank_lookups <= 3u * RAW_LEN);
+
+    token_vec_free(&out);
+    free(raw);
+    bpe_test_vocab_free(&vocab);
+}
+
+static void test_bpe_heap_allocated_rank_key(void) {
+    enum { FINAL_LEN = 512, N_MERGES = 9 };
+    ds4_vocab vocab;
+    bpe_test_vocab_init(&vocab, 1, N_MERGES);
+
+    char *final_token = xmalloc(FINAL_LEN + 1u);
+    memset(final_token, 'a', FINAL_LEN);
+    final_token[FINAL_LEN] = '\0';
+    bpe_test_put_token(&vocab, final_token, 40);
+
+    char *merge_keys[N_MERGES] = {0};
+    size_t symbol_len = 1;
+    for (int rank = 0; rank < N_MERGES; rank++) {
+        const size_t key_len = symbol_len * 2u + 1u;
+        merge_keys[rank] = xmalloc(key_len + 1u);
+        memset(merge_keys[rank], 'a', symbol_len);
+        merge_keys[rank][symbol_len] = ' ';
+        memset(merge_keys[rank] + symbol_len + 1u, 'a', symbol_len);
+        merge_keys[rank][key_len] = '\0';
+        bpe_test_put_merge(&vocab, merge_keys[rank], rank);
+        symbol_len *= 2u;
+    }
+    CHECK(strlen(merge_keys[N_MERGES - 1]) > 512u);
+
+    token_vec out = {0};
+    static const int expected[] = {40};
+    CHECK(bpe_emit_piece(
+        &vocab, (ds4_str){final_token, FINAL_LEN}, &out, true));
+    expect_tokens(&out, expected, TEST_ARRAY_LEN(expected), false);
+
+    token_vec_free(&out);
+    bpe_test_vocab_free(&vocab);
+    for (int i = 0; i < N_MERGES; i++) free(merge_keys[i]);
+    free(final_token);
+}
+
+static void test_bpe_deepseek_nonstrict_fallback(void) {
+    ds4_vocab vocab;
+    bpe_test_vocab_init(&vocab, 2, 1);
+    bpe_test_put_token(&vocab, "a", 50);
+    bpe_test_put_token(&vocab, "b", 51);
+    bpe_test_put_merge(&vocab, "a b", 0);
+
+    token_vec out = {0};
+    static const int expected[] = {50, 51};
+    CHECK(bpe_emit_piece(
+        &vocab, (ds4_str){"ab", 2}, &out, false));
+    expect_tokens(&out, expected, TEST_ARRAY_LEN(expected), false);
+
+    token_vec_free(&out);
+    bpe_test_vocab_free(&vocab);
+}
+
+static void test_heap_bpe(void) {
+    test_bpe_leftmost_overlap();
+    test_bpe_stale_candidate();
+    test_bpe_long_actual_chain();
+    test_bpe_heap_allocated_rank_key();
+    test_bpe_deepseek_nonstrict_fallback();
+}
+
 int main(void) {
     test_fixture_contract();
+    test_heap_bpe();
 
     ds4_engine engine;
     fixture_engine_init(&engine, -1);

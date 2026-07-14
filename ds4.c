@@ -23022,6 +23022,7 @@ struct ds4_vocab {
     size_t n_special;
     str_i32_table token_to_id;
     str_i32_table merge_rank;
+    uint64_t max_merge_len;
 };
 
 struct ds4_engine {
@@ -23150,6 +23151,10 @@ static uint32_t gpt2_byte_to_codepoint(uint8_t b) {
 /* GPT-2 byte-level BPE first maps raw bytes to printable Unicode codepoints
  * so merges can operate on UTF-8 strings without losing byte identity. */
 static char *byte_encode(ds4_str in, uint64_t *out_len) {
+    if (in.len > ((uint64_t)SIZE_MAX - 1u) / 4u) {
+        *out_len = 0;
+        return NULL;
+    }
     char *out = xmalloc((size_t)in.len * 4 + 1);
     char *p = out;
 
@@ -23170,21 +23175,25 @@ static int utf8_len_from_first_byte(uint8_t c) {
 }
 
 typedef struct {
-    char *ptr;
+    const char *ptr;
     uint64_t len;
-} owned_str;
+} bpe_span;
 
-static owned_str owned_copy(const char *ptr, uint64_t len) {
-    owned_str s;
-    s.ptr = xmalloc((size_t)len);
-    memcpy(s.ptr, ptr, (size_t)len);
-    s.len = len;
-    return s;
-}
+#ifdef DS4_BPE_TEST_HOOKS
+static uint64_t g_bpe_test_rank_lookups;
+#endif
 
 /* Look up the merge rank for two adjacent BPE symbols. */
-static int bpe_rank(const ds4_vocab *vocab, const owned_str *a, const owned_str *b) {
+static int bpe_rank(const ds4_vocab *vocab, const bpe_span *a, const bpe_span *b) {
+#ifdef DS4_BPE_TEST_HOOKS
+    g_bpe_test_rank_lookups++;
+#endif
+    if (a->len == UINT64_MAX ||
+        b->len > UINT64_MAX - a->len - 1u) return -1;
     uint64_t len = a->len + 1 + b->len;
+    /* No stored merge can match a longer key.  Besides avoiding pointless
+     * allocations, this bounds byte hashing by the tokenizer's own data. */
+    if (len > vocab->max_merge_len || len > SIZE_MAX) return -1;
     char stack[512];
     char *buf = len <= sizeof(stack) ? stack : xmalloc((size_t)len);
 
@@ -23199,6 +23208,121 @@ static int bpe_rank(const ds4_vocab *vocab, const owned_str *a, const owned_str 
     return rank;
 }
 
+typedef struct {
+    uint64_t off;
+    uint64_t len;
+    int prev;
+    int next;
+    uint32_t generation;
+    bool alive;
+} bpe_symbol;
+
+typedef struct {
+    int rank;
+    int left;
+    int right;
+    uint32_t left_generation;
+    uint32_t right_generation;
+    uint64_t left_offset;
+} bpe_candidate;
+
+typedef struct {
+    bpe_candidate *item;
+    size_t len;
+    size_t cap;
+} bpe_candidate_heap;
+
+static bool bpe_candidate_less(
+        const bpe_candidate *a,
+        const bpe_candidate *b) {
+    if (a->rank != b->rank) return a->rank < b->rank;
+    if (a->left_offset != b->left_offset) {
+        return a->left_offset < b->left_offset;
+    }
+    if (a->left_generation != b->left_generation) {
+        return a->left_generation < b->left_generation;
+    }
+    return a->right_generation < b->right_generation;
+}
+
+static void bpe_heap_push(
+        bpe_candidate_heap *heap,
+        bpe_candidate       candidate) {
+    if (heap->len == heap->cap) {
+        size_t cap = heap->cap ? heap->cap * 2u : 64u;
+        if (cap < heap->cap || cap > SIZE_MAX / sizeof(heap->item[0])) {
+            ds4_die("BPE candidate heap is too large");
+        }
+        heap->item = xrealloc(heap->item, cap * sizeof(heap->item[0]));
+        heap->cap = cap;
+    }
+
+    size_t i = heap->len++;
+    while (i != 0) {
+        const size_t parent = (i - 1u) / 2u;
+        if (!bpe_candidate_less(&candidate, &heap->item[parent])) break;
+        heap->item[i] = heap->item[parent];
+        i = parent;
+    }
+    heap->item[i] = candidate;
+}
+
+static bool bpe_heap_pop(
+        bpe_candidate_heap *heap,
+        bpe_candidate      *candidate) {
+    if (heap->len == 0) return false;
+    *candidate = heap->item[0];
+    const bpe_candidate last = heap->item[--heap->len];
+    if (heap->len == 0) return true;
+
+    size_t i = 0;
+    while (true) {
+        const size_t left = i * 2u + 1u;
+        if (left >= heap->len) break;
+        const size_t right = left + 1u;
+        size_t child = left;
+        if (right < heap->len &&
+            bpe_candidate_less(&heap->item[right], &heap->item[left])) {
+            child = right;
+        }
+        if (!bpe_candidate_less(&heap->item[child], &last)) break;
+        heap->item[i] = heap->item[child];
+        i = child;
+    }
+    heap->item[i] = last;
+    return true;
+}
+
+static void bpe_enqueue_pair(
+        const ds4_vocab  *vocab,
+        const char       *encoded,
+        const bpe_symbol *symbol,
+        int               left,
+        bpe_candidate_heap *heap) {
+    if (left < 0 || !symbol[left].alive) return;
+    const int right = symbol[left].next;
+    if (right < 0 || !symbol[right].alive) return;
+
+    const bpe_span a = {
+        encoded + symbol[left].off,
+        symbol[left].len,
+    };
+    const bpe_span b = {
+        encoded + symbol[right].off,
+        symbol[right].len,
+    };
+    const int rank = bpe_rank(vocab, &a, &b);
+    if (rank < 0) return;
+    bpe_heap_push(heap, (bpe_candidate){
+        .rank = rank,
+        .left = left,
+        .right = right,
+        .left_generation = symbol[left].generation,
+        .right_generation = symbol[right].generation,
+        .left_offset = symbol[left].off,
+    });
+}
+
 /* Apply byte-level BPE to one pre-tokenized piece.  Qwen uses strict mode:
  * every final symbol must exist in the fixed vocab, so a corrupt tokenizer
  * cannot silently drop input bytes.  DeepSeek keeps its legacy byte fallback. */
@@ -23207,72 +23331,93 @@ static bool bpe_emit_piece(
         ds4_str          raw_piece,
         token_vec       *out,
         bool             strict) {
+    if (raw_piece.len == 0) return true;
+    if (raw_piece.len > INT32_MAX ||
+        raw_piece.len > SIZE_MAX / sizeof(bpe_symbol)) {
+        return false;
+    }
+
     uint64_t encoded_len = 0;
     char *encoded = byte_encode(raw_piece, &encoded_len);
+    if (!encoded) return false;
 
     int n_sym = 0;
-    int cap_sym = 32;
-    owned_str *sym = xcalloc((size_t)cap_sym, sizeof(sym[0]));
+    bpe_symbol *symbol = xcalloc(
+        (size_t)raw_piece.len, sizeof(symbol[0]));
 
     for (uint64_t off = 0; off < encoded_len;) {
         int n = utf8_len_from_first_byte((uint8_t)encoded[off]);
         if (off + (uint64_t)n > encoded_len) n = 1;
-        if (n_sym == cap_sym) {
-            cap_sym *= 2;
-            sym = xrealloc(sym, (size_t)cap_sym * sizeof(sym[0]));
-        }
-        sym[n_sym++] = owned_copy(encoded + off, (uint64_t)n);
+        symbol[n_sym] = (bpe_symbol){
+            .off = off,
+            .len = (uint64_t)n,
+            .prev = n_sym - 1,
+            .next = -1,
+            .generation = 0,
+            .alive = true,
+        };
+        if (n_sym != 0) symbol[n_sym - 1].next = n_sym;
+        n_sym++;
         off += (uint64_t)n;
     }
+    if ((uint64_t)n_sym != raw_piece.len) {
+        free(symbol);
+        free(encoded);
+        return false;
+    }
 
-    for (;;) {
-        int best_i = -1;
-        int best_rank = INT32_MAX;
+    bpe_candidate_heap heap = {0};
+    for (int i = 0; i + 1 < n_sym; i++) {
+        bpe_enqueue_pair(vocab, encoded, symbol, i, &heap);
+    }
 
-        for (int i = 0; i + 1 < n_sym; i++) {
-            int rank = bpe_rank(vocab, &sym[i], &sym[i + 1]);
-            if (rank >= 0 && rank < best_rank) {
-                best_rank = rank;
-                best_i = i;
-            }
+    bpe_candidate candidate;
+    while (bpe_heap_pop(&heap, &candidate)) {
+        bpe_symbol *left = &symbol[candidate.left];
+        bpe_symbol *right = &symbol[candidate.right];
+        if (!left->alive || !right->alive ||
+            left->generation != candidate.left_generation ||
+            right->generation != candidate.right_generation ||
+            left->next != candidate.right ||
+            right->prev != candidate.left) {
+            continue;
         }
 
-        if (best_i < 0) break;
+        const int prev = left->prev;
+        const int next = right->next;
+        left->len += right->len;
+        left->next = next;
+        left->generation++;
+        right->alive = false;
+        right->prev = -1;
+        right->next = -1;
+        right->generation++;
+        if (next >= 0) symbol[next].prev = candidate.left;
 
-        owned_str merged;
-        merged.len = sym[best_i].len + sym[best_i + 1].len;
-        merged.ptr = xmalloc((size_t)merged.len);
-        memcpy(merged.ptr, sym[best_i].ptr, (size_t)sym[best_i].len);
-        memcpy(merged.ptr + sym[best_i].len, sym[best_i + 1].ptr, (size_t)sym[best_i + 1].len);
-
-        free(sym[best_i].ptr);
-        free(sym[best_i + 1].ptr);
-        sym[best_i] = merged;
-
-        for (int j = best_i + 1; j + 1 < n_sym; j++) {
-            sym[j] = sym[j + 1];
-        }
-        n_sym--;
+        bpe_enqueue_pair(vocab, encoded, symbol, prev, &heap);
+        bpe_enqueue_pair(vocab, encoded, symbol, candidate.left, &heap);
     }
 
     bool ok = true;
-    for (int i = 0; i < n_sym; i++) {
+    for (int i = 0; i >= 0; i = symbol[i].next) {
+        const char *ptr = encoded + symbol[i].off;
+        const uint64_t len = symbol[i].len;
         int token = -1;
-        if (table_get(&vocab->token_to_id, sym[i].ptr, sym[i].len, &token)) {
+        if (table_get(&vocab->token_to_id, ptr, len, &token)) {
             if (ok) token_vec_push(out, token);
         } else if (strict) {
             ok = false;
         } else if (ok) {
-            for (uint64_t j = 0; j < sym[i].len; j++) {
-                if (table_get(&vocab->token_to_id, sym[i].ptr + j, 1, &token)) {
+            for (uint64_t j = 0; j < len; j++) {
+                if (table_get(&vocab->token_to_id, ptr + j, 1, &token)) {
                     token_vec_push(out, token);
                 }
             }
         }
-        free(sym[i].ptr);
     }
 
-    free(sym);
+    free(heap.item);
+    free(symbol);
     free(encoded);
     return ok;
 }
@@ -23829,11 +23974,15 @@ static void vocab_load(ds4_vocab *vocab, const ds4_model *model) {
         ds4_die("GGUF tokenizer token table is missing or invalid");
     }
     if (!model_get_array(model, "tokenizer.ggml.merges", &merges) ||
-        merges.type != GGUF_VALUE_STRING) {
+        merges.type != GGUF_VALUE_STRING ||
+        merges.len > INT32_MAX) {
         ds4_die("GGUF tokenizer merge table is missing or invalid");
     }
     if (model->family == DS4_MODEL_FAMILY_QWEN35_MOE) {
         qwen35_validate_tokenizer_metadata(model);
+    } else if (model->family == DS4_MODEL_FAMILY_DEEPSEEK4 &&
+               tokens.len != DS4_N_VOCAB) {
+        ds4_die("DeepSeek tokenizer size does not match the model vocabulary");
     }
 
     vocab->n_vocab = (int)tokens.len;
@@ -23852,6 +24001,9 @@ static void vocab_load(ds4_vocab *vocab, const ds4_model *model) {
         ds4_str merge;
         if (!cursor_string(&c, &merge)) ds4_die(c.error);
         table_put(&vocab->merge_rank, merge, (int)i);
+        if (merge.len > vocab->max_merge_len) {
+            vocab->max_merge_len = merge.len;
+        }
     }
 
     if (vocab->family == DS4_MODEL_FAMILY_QWEN35_MOE) {
@@ -25354,6 +25506,40 @@ static bool ds4_session_is_qwen35_cpu(const ds4_session *s) {
 
 static uint32_t ds4_session_vocab_size(const ds4_session *s) {
     return ds4_session_is_qwen35(s) ? QWEN35_N_VOCAB : DS4_N_VOCAB;
+}
+
+/* Qwen's output matrix is padded to 248320 rows, but the final 243 rows are
+ * tokenizer type UNUSED.  Keep the full width for logits I/O while excluding
+ * those rows from sampling and probability normalization. */
+static uint32_t ds4_session_selectable_vocab_size(const ds4_session *s) {
+    const int n = s ? ds4_engine_effective_vocab_size(s->engine) : 0;
+    return n > 0 ? (uint32_t)n : 0u;
+}
+
+static bool ds4_session_token_id_valid(const ds4_session *s, int token) {
+    return token >= 0 &&
+           (uint32_t)token < ds4_session_selectable_vocab_size(s);
+}
+
+static int ds4_session_reject_invalid_token(
+        const ds4_session *s,
+        int                token,
+        int                position,
+        char              *err,
+        size_t             errlen) {
+    if (ds4_session_token_id_valid(s, token)) return 0;
+    if (err && errlen) {
+        const char *family = ds4_session_is_qwen35(s) ? "Qwen " : "";
+        if (position >= 0) {
+            snprintf(err, errlen,
+                     "%stoken id %d at position %d is outside vocabulary",
+                     family, token, position);
+        } else {
+            snprintf(err, errlen,
+                     "%stoken id %d is outside vocabulary", family, token);
+        }
+    }
+    return 1;
 }
 
 static bool ds4_session_qwen35_timeline_valid(const ds4_session *s) {
@@ -28470,6 +28656,13 @@ int ds4_engine_vocab_size(ds4_engine *e) {
     return e ? e->vocab.n_vocab : 0;
 }
 
+int ds4_engine_effective_vocab_size(ds4_engine *e) {
+    if (e && e->model.family == DS4_MODEL_FAMILY_QWEN35_MOE) {
+        return QWEN35_N_VALID_TOKEN;
+    }
+    return e ? e->vocab.n_vocab : 0;
+}
+
 int ds4_engine_power(ds4_engine *e) {
     return e ? e->power_percent : 100;
 }
@@ -29330,7 +29523,8 @@ static int ds4_session_sync_qwen35_with_forward(
         return 1;
     }
     for (int i = 0; i < prompt->len; i++) {
-        if (prompt->v[i] < 0 || (uint32_t)prompt->v[i] >= QWEN35_N_VOCAB) {
+        if (prompt->v[i] < 0 ||
+            (uint32_t)prompt->v[i] >= QWEN35_N_VALID_TOKEN) {
             if (errlen) {
                 snprintf(err, errlen,
                          "Qwen token id %d at position %d is outside vocabulary",
@@ -29400,6 +29594,12 @@ int ds4_session_sync(ds4_session *s, const ds4_tokens *prompt, char *err, size_t
     if (!s || !prompt || prompt->len <= 0 || prompt->len >= s->ctx_size) {
         snprintf(err, errlen, "prompt exceeds context");
         return 1;
+    }
+    for (int i = 0; i < prompt->len; i++) {
+        if (ds4_session_reject_invalid_token(
+                s, prompt->v[i], i, err, errlen) != 0) {
+            return 1;
+        }
     }
     if (ds4_session_cancelled(s)) {
         snprintf(err, errlen, "interrupted");
@@ -29680,12 +29880,12 @@ int ds4_session_common_prefix(ds4_session *s, const ds4_tokens *prompt) {
 
 int ds4_session_argmax(ds4_session *s) {
     if (!s || !s->logits) return -1;
-    return sample_argmax(s->logits, ds4_session_vocab_size(s));
+    return sample_argmax(s->logits, ds4_session_selectable_vocab_size(s));
 }
 
 int ds4_session_argmax_excluding(ds4_session *s, int excluded_id) {
     if (!s || !s->logits) return -1;
-    const uint32_t n_vocab = ds4_session_vocab_size(s);
+    const uint32_t n_vocab = ds4_session_selectable_vocab_size(s);
     int best = -1;
     float best_logit = DS4_NEG_INF;
     for (uint32_t i = 0; i < n_vocab; i++) {
@@ -29707,13 +29907,14 @@ int ds4_sample_logits(const float *logits, int n_vocab, float temperature,
 
 int ds4_session_sample(ds4_session *s, float temperature, int top_k, float top_p, float min_p, uint64_t *rng) {
     if (!s || !s->logits) return -1;
-    return sample_top_p_min_p(s->logits, ds4_session_vocab_size(s),
+    return sample_top_p_min_p(s->logits,
+                              ds4_session_selectable_vocab_size(s),
                               temperature, top_k, top_p, min_p, rng);
 }
 
 int ds4_session_top_logprobs(ds4_session *s, ds4_token_score *out, int k) {
     if (!s || !out || k <= 0) return 0;
-    const uint32_t n_vocab = ds4_session_vocab_size(s);
+    const uint32_t n_vocab = ds4_session_selectable_vocab_size(s);
     if (k > (int)n_vocab) k = (int)n_vocab;
     for (int i = 0; i < k; i++) {
         out[i].id = -1;
@@ -29751,7 +29952,7 @@ int ds4_session_top_logprobs(ds4_session *s, ds4_token_score *out, int k) {
 
 int ds4_session_token_logprob(ds4_session *s, int token, ds4_token_score *out) {
     if (!s || !out) return 0;
-    const uint32_t n_vocab = ds4_session_vocab_size(s);
+    const uint32_t n_vocab = ds4_session_selectable_vocab_size(s);
     if (token < 0 || token >= (int)n_vocab) return 0;
 
     float max_logit = DS4_NEG_INF;
@@ -29799,7 +30000,7 @@ static int ds4_session_eval_qwen35_with_forward(
         if (errlen) snprintf(err, errlen, "invalid Qwen raw-token evaluation");
         return 1;
     }
-    if (token < 0 || (uint32_t)token >= QWEN35_N_VOCAB) {
+    if (token < 0 || (uint32_t)token >= QWEN35_N_VALID_TOKEN) {
         if (errlen) snprintf(err, errlen, "Qwen token id %d is outside vocabulary", token);
         return 1;
     }
@@ -29832,6 +30033,10 @@ static int ds4_session_eval_qwen35_with_forward(
 static int ds4_session_eval_internal(ds4_session *s, int token, bool probe_mtp,
                                      char *err, size_t errlen) {
     if (!s) return 1;
+    if (ds4_session_reject_invalid_token(
+            s, token, -1, err, errlen) != 0) {
+        return 1;
+    }
     if (s->distributed) {
         if (!s->checkpoint_valid) {
             if (errlen) snprintf(err, errlen, "distributed decode requires a valid checkpoint");

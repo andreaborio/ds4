@@ -2876,7 +2876,8 @@ static int dist_write_logits_dump(
     }
 
     const int vocab = ds4_engine_vocab_size(state->engine);
-    const int argmax = dist_logits_argmax(logits, vocab);
+    const int argmax = dist_logits_argmax(
+        logits, ds4_engine_effective_vocab_size(state->engine));
     fprintf(fp,
             "{\n"
             "  \"source\":\"ds4-distributed\",\n"
@@ -3035,8 +3036,11 @@ static int dist_write_logprobs_dump(
     int rc = 0;
     const int eos = ds4_token_eos(state->engine);
     for (int generated = 0; generated < max_tokens; generated++) {
-        const int n = dist_logits_top_logprobs(logits, ds4_engine_vocab_size(state->engine), scores, k);
-        const int token = dist_logits_argmax(logits, ds4_engine_vocab_size(state->engine));
+        const int effective_vocab =
+            ds4_engine_effective_vocab_size(state->engine);
+        const int n = dist_logits_top_logprobs(
+            logits, effective_vocab, scores, k);
+        const int token = dist_logits_argmax(logits, effective_vocab);
         if (generated) fputs(",\n", fp);
         fprintf(fp, "    {\"step\":%d,\"selected\":", generated);
         dist_json_write_token(fp, state->engine, token);
@@ -4032,7 +4036,8 @@ static int dist_run_coordinator_generation(
     ds4_tokens_copy(&transcript, &prompt);
     while (generated < max_tokens) {
         int token = ds4_sample_logits(logits,
-                                      ds4_engine_vocab_size(state->engine),
+                                      ds4_engine_effective_vocab_size(
+                                          state->engine),
                                       gen->temperature,
                                       0,
                                       gen->top_p,
@@ -5279,7 +5284,8 @@ int ds4_dist_session_load_payload(
             return 1;
         }
         if (tok > (uint32_t)INT_MAX ||
-            tok >= (uint32_t)ds4_engine_vocab_size(d->state.engine)) {
+            tok >= (uint32_t)ds4_engine_effective_vocab_size(
+                d->state.engine)) {
             free(tokens);
             free(logits);
             free(n_comp);
@@ -7017,7 +7023,8 @@ static int dist_worker_handle_snapshot_load(
         }
         uint32_t token = ntohl(wire_token);
         if (token > (uint32_t)INT_MAX ||
-            token >= (uint32_t)ds4_engine_vocab_size(state->engine)) {
+            token >= (uint32_t)ds4_engine_effective_vocab_size(
+                state->engine)) {
             snprintf(err, sizeof(err), "snapshot token id is outside the model vocabulary");
             tokens[i] = 0;
         } else {
@@ -7249,7 +7256,9 @@ static int dist_worker_process_work_payload(
             return -1;
         }
         uint32_t token = ntohl(wire_token);
-        if (token > (uint32_t)INT_MAX || token >= (uint32_t)ds4_engine_vocab_size(state->engine)) {
+        if (token > (uint32_t)INT_MAX ||
+            token >= (uint32_t)ds4_engine_effective_vocab_size(
+                state->engine)) {
             free(tokens);
             return dist_worker_upstream_send_work_error(upstream, request_id, "WORK token id is outside the model vocabulary");
         }
