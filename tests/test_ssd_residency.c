@@ -1,4 +1,5 @@
 #include "ds4_ssd.h"
+#include "ds4_qwen.h"
 
 #include <assert.h>
 #include <stdint.h>
@@ -164,6 +165,40 @@ int main(void) {
     assert(ds4_ssd_expert_cache_floor_make(55, 6, 1, &floor));
     assert(floor.working_set_experts == 330);
     assert(floor.minimum_cache_experts == 331);
+
+    /* Qwen's supported Q4_K artifact has three equally sized expert slabs.
+     * Each block stores 256 values in 144 bytes: gate/up are 2048x512 and
+     * down is 512x2048, so every selected expert occupies 3 x 589824 bytes.
+     * One complete token route spans 40 layers x top-8; the extra cache slot
+     * prevents the first load of the next token from evicting a still-live
+     * expert in the current route. */
+    const uint64_t qwen_q4_k_block_bytes = 144u;
+    const uint64_t qwen_gate_row_bytes =
+        (QWEN35_N_EMBD / 256u) * qwen_q4_k_block_bytes;
+    const uint64_t qwen_down_row_bytes =
+        (QWEN35_N_FF_EXP / 256u) * qwen_q4_k_block_bytes;
+    const uint64_t qwen_gate_expert_bytes =
+        qwen_gate_row_bytes * QWEN35_N_FF_EXP;
+    const uint64_t qwen_down_expert_bytes =
+        qwen_down_row_bytes * QWEN35_N_EMBD;
+    const uint64_t qwen_expert_bytes =
+        2u * qwen_gate_expert_bytes + qwen_down_expert_bytes;
+    const uint64_t qwen_max_cacheable =
+        (uint64_t)QWEN35_N_LAYER * QWEN35_N_EXPERT;
+    assert(qwen_gate_row_bytes == UINT64_C(1152));
+    assert(qwen_down_row_bytes == UINT64_C(288));
+    assert(qwen_gate_expert_bytes == UINT64_C(589824));
+    assert(qwen_down_expert_bytes == UINT64_C(589824));
+    assert(qwen_expert_bytes == UINT64_C(1769472));
+    assert(qwen_max_cacheable == UINT64_C(10240));
+    assert(ds4_ssd_expert_cache_floor_make(QWEN35_N_LAYER,
+                                            QWEN35_N_EXPERT_USED,
+                                            qwen_expert_bytes,
+                                            &floor));
+    assert(floor.working_set_experts == 320);
+    assert(floor.minimum_cache_experts == 321);
+    assert(floor.minimum_cache_bytes == UINT64_C(568000512));
+    assert(floor.warning_cache_experts == 640);
 
     assert(!ds4_ssd_expert_cache_floor_make(0, 6, 1, &floor));
     assert(!ds4_ssd_expert_cache_floor_make(1, 0, 1, &floor));

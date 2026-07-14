@@ -223,7 +223,8 @@ $(METAL_OBJDIR)/test_qwen_tokenizer.o: tests/test_qwen_tokenizer.c ds4.c \
 	$(CC) $(CFLAGS) $(QWEN_CFLAGS) $(DEPFLAGS) -DDS4_NO_GPU \
 		-Wno-unused-function -Wno-unused-parameter -I. -c -o $@ $<
 
-$(METAL_OBJDIR)/test_ssd_residency.o: tests/test_ssd_residency.c
+$(METAL_OBJDIR)/test_ssd_residency.o: tests/test_ssd_residency.c \
+		ds4_ssd.h ds4_qwen.h
 	@mkdir -p "$(@D)"
 	$(CC) $(CFLAGS) $(DEPFLAGS) -I. -c -o $@ $<
 
