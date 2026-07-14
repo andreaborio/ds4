@@ -552,6 +552,108 @@ static bool test_metal_qwen35_close(
     return ok;
 }
 
+/* Private ds4.c hooks: intentionally absent from ds4.h so this allocation
+ * scaffold cannot become an engine/session API before the executor exists. */
+extern size_t ds4_internal_qwen35_gpu_graph_size(void);
+extern bool ds4_internal_qwen35_gpu_graph_alloc(
+    void *storage, size_t storage_bytes, uint32_t ctx_capacity);
+extern bool ds4_internal_qwen35_gpu_graph_allocated_bytes(
+    const void *storage, size_t storage_bytes, uint64_t *bytes_out);
+extern void ds4_internal_qwen35_gpu_graph_free(
+    void *storage, size_t storage_bytes);
+
+static void test_metal_qwen35_graph_state(void) {
+    /* Three rows are enough to prove the context term without turning this
+     * model-free lifetime test into a real long-context allocation. */
+    const uint32_t ctx_capacity = 3;
+    const uint64_t f32 = sizeof(float);
+    const uint32_t moe_split_count = 2;
+    const uint32_t moe_split_width =
+        QWEN35_N_EXPERT_USED / moe_split_count;
+    TEST_ASSERT(QWEN35_N_EXPERT_USED == 8);
+    TEST_ASSERT(moe_split_width == 4);
+    const size_t graph_size = ds4_internal_qwen35_gpu_graph_size();
+    TEST_ASSERT(graph_size > 0);
+    if (graph_size == 0) return;
+
+    uint8_t *graph = calloc(1, graph_size);
+    TEST_ASSERT(graph != NULL);
+    if (!graph) return;
+
+    uint64_t allocated = UINT64_MAX;
+    TEST_ASSERT(!ds4_internal_qwen35_gpu_graph_alloc(
+        graph, graph_size, 0));
+    TEST_ASSERT(!ds4_internal_qwen35_gpu_graph_alloc(
+        graph, graph_size, QWEN35_CONTEXT_LENGTH + 1u));
+    TEST_ASSERT(!ds4_internal_qwen35_gpu_graph_alloc(
+        graph, graph_size - 1u, ctx_capacity));
+    TEST_ASSERT(ds4_internal_qwen35_gpu_graph_allocated_bytes(
+        graph, graph_size, &allocated));
+    TEST_ASSERT(allocated == 0);
+
+    TEST_ASSERT(ds4_internal_qwen35_gpu_graph_alloc(
+        graph, graph_size, ctx_capacity));
+
+    uint64_t expected_f32_elements =
+        3ull * QWEN35_N_EMBD +
+        QWEN35_SSM_CONV_CHANNEL +
+        3ull * QWEN35_SSM_INNER +
+        (uint64_t)QWEN35_SSM_GROUP * QWEN35_SSM_STATE +
+        4ull * QWEN35_SSM_VALUE_HEAD +
+        (uint64_t)QWEN35_N_HEAD * QWEN35_N_HEAD_DIM +
+        QWEN35_N_EMBD + ctx_capacity +
+        2ull * QWEN35_N_EXPERT + QWEN35_N_EXPERT_USED +
+        3ull * moe_split_width * QWEN35_N_FF_EXP +
+        (uint64_t)moe_split_width * QWEN35_N_EMBD +
+        (uint64_t)moe_split_count * QWEN35_N_EMBD +
+        QWEN35_N_EMBD + 3ull * QWEN35_N_FF_SHARED +
+        QWEN35_N_EMBD + 1ull + QWEN35_N_EMBD + QWEN35_N_VOCAB;
+    expected_f32_elements +=
+        2ull * QWEN35_FULL_ATTENTION_LAYER_COUNT * ctx_capacity *
+            QWEN35_N_HEAD_KV * QWEN35_N_HEAD_DIM +
+        (uint64_t)QWEN35_RECURRENT_LAYER_COUNT *
+            QWEN35_SSM_CONV_CHANNEL * (QWEN35_SSM_CONV_KERNEL - 1u) +
+        (uint64_t)QWEN35_RECURRENT_LAYER_COUNT *
+            QWEN35_SSM_VALUE_HEAD * QWEN35_SSM_STATE * QWEN35_SSM_STATE;
+    const uint64_t expected_bytes = expected_f32_elements * f32 +
+        (uint64_t)QWEN35_N_EXPERT_USED * sizeof(int32_t);
+
+    TEST_ASSERT(ds4_internal_qwen35_gpu_graph_allocated_bytes(
+        graph, graph_size, &allocated));
+    TEST_ASSERT(allocated == expected_bytes);
+    fprintf(stderr,
+            "ds4-test: Qwen graph ctx=%u allocated=%.2f MiB "
+            "(full=%u recurrent=%u, MoE=%ux%u)\n",
+            ctx_capacity, (double)allocated / (1024.0 * 1024.0),
+            QWEN35_FULL_ATTENTION_LAYER_COUNT,
+            QWEN35_RECURRENT_LAYER_COUNT,
+            moe_split_count,
+            moe_split_width);
+
+    /* Reinitializing a live graph must fail without replacing or leaking it. */
+    const uint64_t before_reinit = allocated;
+    TEST_ASSERT(!ds4_internal_qwen35_gpu_graph_alloc(
+        graph, graph_size, ctx_capacity));
+    TEST_ASSERT(ds4_internal_qwen35_gpu_graph_allocated_bytes(
+        graph, graph_size, &allocated));
+    TEST_ASSERT(allocated == before_reinit);
+
+    ds4_internal_qwen35_gpu_graph_free(graph, graph_size);
+    TEST_ASSERT(ds4_internal_qwen35_gpu_graph_allocated_bytes(
+        graph, graph_size, &allocated));
+    TEST_ASSERT(allocated == 0);
+    bool cleared = true;
+    for (size_t i = 0; i < graph_size; i++) {
+        if (graph[i] != 0) {
+            cleared = false;
+            break;
+        }
+    }
+    TEST_ASSERT(cleared);
+    ds4_internal_qwen35_gpu_graph_free(graph, graph_size);
+    free(graph);
+}
+
 static void test_metal_qwen35_primitives(void) {
     enum {
         EMB_N = 64,
@@ -991,6 +1093,7 @@ static void test_metal_qwen35_primitives(void) {
 }
 
 static void test_metal_kernel_group(void) {
+    test_metal_qwen35_graph_state();
     test_metal_f16_matvec_fast_nr0_4();
     test_metal_f16_prefill_matmul();
     test_metal_q8_0_prefill_matmul();

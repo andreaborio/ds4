@@ -11442,6 +11442,355 @@ static void print_vec_stats(const char *name, const float *x, uint64_t n) {
 #endif
 
 /* =========================================================================
+ * Qwen3.6 Metal Graph State (not yet wired to the runtime).
+ * =========================================================================
+ *
+ * Qwen does not share DeepSeek's HC, compressed-cache, or MTP graph geometry.
+ * Keep its persistent state and one-token scratch in a separate private graph
+ * so bringing up the executor cannot silently inherit those assumptions.  The
+ * allocation below is deliberately model-free and has no engine/session call
+ * site yet; tests exercise only its shape, initialization, and lifetime.
+ *
+ * Routed MoE scratch is four experts wide and reused for each half of Qwen's
+ * top-8 selection.  The two partial output tensors retain the split results
+ * until they can be added without growing the existing DeepSeek top-6 kernel
+ * contract.
+ */
+
+enum {
+    QWEN35_GPU_MOE_SPLIT_COUNT = 2,
+    QWEN35_GPU_MOE_SPLIT_WIDTH = QWEN35_N_EXPERT_USED / 2,
+};
+
+DS4_STATIC_ASSERT(ds4_qwen35_gpu_moe_top8,
+                  QWEN35_N_EXPERT_USED == 8);
+DS4_STATIC_ASSERT(ds4_qwen35_gpu_moe_split_4x2,
+                  QWEN35_GPU_MOE_SPLIT_WIDTH == 4 &&
+                  QWEN35_GPU_MOE_SPLIT_COUNT * QWEN35_GPU_MOE_SPLIT_WIDTH ==
+                      QWEN35_N_EXPERT_USED);
+
+typedef struct {
+    uint32_t ctx_capacity;
+
+    /* Reused one-token work tensors. */
+    ds4_gpu_tensor *hidden[2];
+    ds4_gpu_tensor *norm;
+    ds4_gpu_tensor *projection;
+    ds4_gpu_tensor *gate;
+    ds4_gpu_tensor *query;
+    ds4_gpu_tensor *key;
+    ds4_gpu_tensor *value;
+    ds4_gpu_tensor *alpha_logit;
+    ds4_gpu_tensor *beta_logit;
+    ds4_gpu_tensor *log_decay;
+    ds4_gpu_tensor *beta;
+    ds4_gpu_tensor *heads;
+    ds4_gpu_tensor *attn_out;
+    ds4_gpu_tensor *attn_score;
+
+    /* Exactly one state kind is live for each model layer.  Full-attention
+     * rows are [context][kv_head][head_dim].  Recurrent state is
+     * [value_head][value_dim][key_dim], with value_dim == key_dim == 128. */
+    ds4_gpu_tensor *full_attn_key[QWEN35_N_LAYER];
+    ds4_gpu_tensor *full_attn_value[QWEN35_N_LAYER];
+    ds4_gpu_tensor *conv[QWEN35_N_LAYER];
+    ds4_gpu_tensor *recurrent[QWEN35_N_LAYER];
+
+    ds4_gpu_tensor *router_logits;
+    ds4_gpu_tensor *router_probability;
+    ds4_gpu_tensor *router_selected;
+    ds4_gpu_tensor *router_weight;
+    ds4_gpu_tensor *routed_gate;
+    ds4_gpu_tensor *routed_up;
+    ds4_gpu_tensor *routed_mid;
+    ds4_gpu_tensor *routed_down;
+    ds4_gpu_tensor *moe_partial[QWEN35_GPU_MOE_SPLIT_COUNT];
+    ds4_gpu_tensor *moe_out;
+    ds4_gpu_tensor *shared_gate;
+    ds4_gpu_tensor *shared_up;
+    ds4_gpu_tensor *shared_mid;
+    ds4_gpu_tensor *shared_out;
+    ds4_gpu_tensor *shared_gate_logit;
+
+    ds4_gpu_tensor *output_norm;
+    /* Physical vocabulary, including reserved padding rows. */
+    ds4_gpu_tensor *logits;
+} ds4_qwen35_gpu_graph;
+
+static bool qwen35_gpu_checked_mul_u64(
+        uint64_t  a,
+        uint64_t  b,
+        uint64_t *out) {
+    if (!out || (a != 0 && b > UINT64_MAX / a)) return false;
+    *out = a * b;
+    return true;
+}
+
+static bool qwen35_gpu_checked_add_u64(
+        uint64_t  a,
+        uint64_t  b,
+        uint64_t *out) {
+    if (!out || b > UINT64_MAX - a) return false;
+    *out = a + b;
+    return true;
+}
+
+static ds4_gpu_tensor *qwen35_gpu_tensor_alloc_shape(
+        uint64_t element_bytes,
+        uint64_t d0,
+        uint64_t d1,
+        uint64_t d2,
+        uint64_t d3) {
+    uint64_t elements = 0;
+    uint64_t bytes = 0;
+    if (element_bytes == 0 || d0 == 0 || d1 == 0 || d2 == 0 || d3 == 0 ||
+        !qwen35_gpu_checked_mul_u64(d0, d1, &elements) ||
+        !qwen35_gpu_checked_mul_u64(elements, d2, &elements) ||
+        !qwen35_gpu_checked_mul_u64(elements, d3, &elements) ||
+        !qwen35_gpu_checked_mul_u64(elements, element_bytes, &bytes)) {
+        return NULL;
+    }
+    return ds4_gpu_tensor_alloc(bytes);
+}
+
+static void qwen35_gpu_graph_free(ds4_qwen35_gpu_graph *g) {
+    if (!g) return;
+
+    ds4_gpu_tensor_free(g->logits);
+    ds4_gpu_tensor_free(g->output_norm);
+    ds4_gpu_tensor_free(g->shared_gate_logit);
+    ds4_gpu_tensor_free(g->shared_out);
+    ds4_gpu_tensor_free(g->shared_mid);
+    ds4_gpu_tensor_free(g->shared_up);
+    ds4_gpu_tensor_free(g->shared_gate);
+    ds4_gpu_tensor_free(g->moe_out);
+    for (uint32_t split = 0; split < QWEN35_GPU_MOE_SPLIT_COUNT; split++) {
+        ds4_gpu_tensor_free(g->moe_partial[split]);
+    }
+    ds4_gpu_tensor_free(g->routed_down);
+    ds4_gpu_tensor_free(g->routed_mid);
+    ds4_gpu_tensor_free(g->routed_up);
+    ds4_gpu_tensor_free(g->routed_gate);
+    ds4_gpu_tensor_free(g->router_weight);
+    ds4_gpu_tensor_free(g->router_selected);
+    ds4_gpu_tensor_free(g->router_probability);
+    ds4_gpu_tensor_free(g->router_logits);
+
+    for (uint32_t il = 0; il < QWEN35_N_LAYER; il++) {
+        ds4_gpu_tensor_free(g->recurrent[il]);
+        ds4_gpu_tensor_free(g->conv[il]);
+        ds4_gpu_tensor_free(g->full_attn_value[il]);
+        ds4_gpu_tensor_free(g->full_attn_key[il]);
+    }
+
+    ds4_gpu_tensor_free(g->attn_score);
+    ds4_gpu_tensor_free(g->attn_out);
+    ds4_gpu_tensor_free(g->heads);
+    ds4_gpu_tensor_free(g->beta);
+    ds4_gpu_tensor_free(g->log_decay);
+    ds4_gpu_tensor_free(g->beta_logit);
+    ds4_gpu_tensor_free(g->alpha_logit);
+    ds4_gpu_tensor_free(g->value);
+    ds4_gpu_tensor_free(g->key);
+    ds4_gpu_tensor_free(g->query);
+    ds4_gpu_tensor_free(g->gate);
+    ds4_gpu_tensor_free(g->projection);
+    ds4_gpu_tensor_free(g->norm);
+    ds4_gpu_tensor_free(g->hidden[1]);
+    ds4_gpu_tensor_free(g->hidden[0]);
+    memset(g, 0, sizeof(*g));
+}
+
+static bool qwen35_gpu_graph_add_tensor_bytes(
+        uint64_t             *total,
+        const ds4_gpu_tensor *tensor) {
+    if (!total || !tensor) return total != NULL;
+    return qwen35_gpu_checked_add_u64(
+        *total, ds4_gpu_tensor_bytes(tensor), total);
+}
+
+static bool qwen35_gpu_graph_allocated_bytes(
+        const ds4_qwen35_gpu_graph *g,
+        uint64_t                    *bytes_out) {
+    if (!g || !bytes_out) return false;
+    uint64_t total = 0;
+    const ds4_gpu_tensor *fixed[] = {
+        g->hidden[0], g->hidden[1], g->norm, g->projection, g->gate,
+        g->query, g->key, g->value, g->alpha_logit, g->beta_logit,
+        g->log_decay, g->beta, g->heads, g->attn_out, g->attn_score,
+        g->router_logits, g->router_probability, g->router_selected,
+        g->router_weight, g->routed_gate, g->routed_up, g->routed_mid,
+        g->routed_down, g->moe_partial[0], g->moe_partial[1], g->moe_out,
+        g->shared_gate, g->shared_up, g->shared_mid, g->shared_out,
+        g->shared_gate_logit, g->output_norm, g->logits,
+    };
+    for (size_t i = 0; i < sizeof(fixed) / sizeof(fixed[0]); i++) {
+        if (!qwen35_gpu_graph_add_tensor_bytes(&total, fixed[i])) return false;
+    }
+    for (uint32_t il = 0; il < QWEN35_N_LAYER; il++) {
+        if (!qwen35_gpu_graph_add_tensor_bytes(&total, g->full_attn_key[il]) ||
+            !qwen35_gpu_graph_add_tensor_bytes(&total, g->full_attn_value[il]) ||
+            !qwen35_gpu_graph_add_tensor_bytes(&total, g->conv[il]) ||
+            !qwen35_gpu_graph_add_tensor_bytes(&total, g->recurrent[il])) {
+            return false;
+        }
+    }
+    *bytes_out = total;
+    return true;
+}
+
+static bool qwen35_gpu_graph_alloc(
+        ds4_qwen35_gpu_graph *g,
+        uint32_t              ctx_capacity) {
+    if (!g || g->ctx_capacity != 0 || ctx_capacity == 0 ||
+        ctx_capacity > QWEN35_CONTEXT_LENGTH) {
+        return false;
+    }
+
+    ds4_qwen35_gpu_graph next = {0};
+    next.ctx_capacity = ctx_capacity;
+
+#define QWEN35_GPU_ALLOC_F32(field, d0, d1, d2, d3) \
+    next.field = qwen35_gpu_tensor_alloc_shape(       \
+        sizeof(float), (d0), (d1), (d2), (d3))
+#define QWEN35_GPU_ALLOC_I32(field, d0, d1, d2, d3) \
+    next.field = qwen35_gpu_tensor_alloc_shape(       \
+        sizeof(int32_t), (d0), (d1), (d2), (d3))
+
+    QWEN35_GPU_ALLOC_F32(hidden[0], QWEN35_N_EMBD, 1, 1, 1);
+    QWEN35_GPU_ALLOC_F32(hidden[1], QWEN35_N_EMBD, 1, 1, 1);
+    QWEN35_GPU_ALLOC_F32(norm, QWEN35_N_EMBD, 1, 1, 1);
+    QWEN35_GPU_ALLOC_F32(projection, QWEN35_SSM_CONV_CHANNEL, 1, 1, 1);
+    QWEN35_GPU_ALLOC_F32(gate, QWEN35_SSM_INNER, 1, 1, 1);
+    QWEN35_GPU_ALLOC_F32(query, QWEN35_SSM_INNER, 1, 1, 1);
+    QWEN35_GPU_ALLOC_F32(key, QWEN35_SSM_GROUP, QWEN35_SSM_STATE, 1, 1);
+    QWEN35_GPU_ALLOC_F32(value, QWEN35_SSM_INNER, 1, 1, 1);
+    QWEN35_GPU_ALLOC_F32(alpha_logit, QWEN35_SSM_VALUE_HEAD, 1, 1, 1);
+    QWEN35_GPU_ALLOC_F32(beta_logit, QWEN35_SSM_VALUE_HEAD, 1, 1, 1);
+    QWEN35_GPU_ALLOC_F32(log_decay, QWEN35_SSM_VALUE_HEAD, 1, 1, 1);
+    QWEN35_GPU_ALLOC_F32(beta, QWEN35_SSM_VALUE_HEAD, 1, 1, 1);
+    QWEN35_GPU_ALLOC_F32(heads, QWEN35_N_HEAD, QWEN35_N_HEAD_DIM, 1, 1);
+    QWEN35_GPU_ALLOC_F32(attn_out, QWEN35_N_EMBD, 1, 1, 1);
+    QWEN35_GPU_ALLOC_F32(attn_score, ctx_capacity, 1, 1, 1);
+
+    bool state_ok = true;
+    uint32_t n_full_attention = 0;
+    uint32_t n_recurrent = 0;
+    for (uint32_t il = 0; il < QWEN35_N_LAYER; il++) {
+        if (ds4_qwen35_layer_is_full_attention(il)) {
+            QWEN35_GPU_ALLOC_F32(full_attn_key[il], ctx_capacity,
+                                 QWEN35_N_HEAD_KV, QWEN35_N_HEAD_DIM, 1);
+            QWEN35_GPU_ALLOC_F32(full_attn_value[il], ctx_capacity,
+                                 QWEN35_N_HEAD_KV, QWEN35_N_HEAD_DIM, 1);
+            const uint64_t cache_elements = (uint64_t)ctx_capacity *
+                QWEN35_N_HEAD_KV * QWEN35_N_HEAD_DIM;
+            state_ok = state_ok && next.full_attn_key[il] &&
+                       next.full_attn_value[il] &&
+                       ds4_gpu_tensor_fill_f32(next.full_attn_key[il], 0.0f,
+                                               cache_elements) != 0 &&
+                       ds4_gpu_tensor_fill_f32(next.full_attn_value[il], 0.0f,
+                                               cache_elements) != 0;
+            n_full_attention++;
+        } else {
+            QWEN35_GPU_ALLOC_F32(conv[il], QWEN35_SSM_CONV_CHANNEL,
+                                 QWEN35_SSM_CONV_KERNEL - 1u, 1, 1);
+            QWEN35_GPU_ALLOC_F32(recurrent[il], QWEN35_SSM_VALUE_HEAD,
+                                 QWEN35_SSM_STATE, QWEN35_SSM_STATE, 1);
+            const uint64_t conv_elements = (uint64_t)QWEN35_SSM_CONV_CHANNEL *
+                (QWEN35_SSM_CONV_KERNEL - 1u);
+            const uint64_t recurrent_elements =
+                (uint64_t)QWEN35_SSM_VALUE_HEAD * QWEN35_SSM_STATE *
+                QWEN35_SSM_STATE;
+            state_ok = state_ok && next.conv[il] && next.recurrent[il] &&
+                       ds4_gpu_tensor_fill_f32(next.conv[il], 0.0f,
+                                               conv_elements) != 0 &&
+                       ds4_gpu_tensor_fill_f32(next.recurrent[il], 0.0f,
+                                               recurrent_elements) != 0;
+            n_recurrent++;
+        }
+    }
+
+    QWEN35_GPU_ALLOC_F32(router_logits, QWEN35_N_EXPERT, 1, 1, 1);
+    QWEN35_GPU_ALLOC_F32(router_probability, QWEN35_N_EXPERT, 1, 1, 1);
+    QWEN35_GPU_ALLOC_I32(router_selected, QWEN35_N_EXPERT_USED, 1, 1, 1);
+    QWEN35_GPU_ALLOC_F32(router_weight, QWEN35_N_EXPERT_USED, 1, 1, 1);
+    QWEN35_GPU_ALLOC_F32(routed_gate, QWEN35_GPU_MOE_SPLIT_WIDTH,
+                         QWEN35_N_FF_EXP, 1, 1);
+    QWEN35_GPU_ALLOC_F32(routed_up, QWEN35_GPU_MOE_SPLIT_WIDTH,
+                         QWEN35_N_FF_EXP, 1, 1);
+    QWEN35_GPU_ALLOC_F32(routed_mid, QWEN35_GPU_MOE_SPLIT_WIDTH,
+                         QWEN35_N_FF_EXP, 1, 1);
+    QWEN35_GPU_ALLOC_F32(routed_down, QWEN35_GPU_MOE_SPLIT_WIDTH,
+                         QWEN35_N_EMBD, 1, 1);
+    for (uint32_t split = 0; split < QWEN35_GPU_MOE_SPLIT_COUNT; split++) {
+        QWEN35_GPU_ALLOC_F32(moe_partial[split], QWEN35_N_EMBD, 1, 1, 1);
+    }
+    QWEN35_GPU_ALLOC_F32(moe_out, QWEN35_N_EMBD, 1, 1, 1);
+    QWEN35_GPU_ALLOC_F32(shared_gate, QWEN35_N_FF_SHARED, 1, 1, 1);
+    QWEN35_GPU_ALLOC_F32(shared_up, QWEN35_N_FF_SHARED, 1, 1, 1);
+    QWEN35_GPU_ALLOC_F32(shared_mid, QWEN35_N_FF_SHARED, 1, 1, 1);
+    QWEN35_GPU_ALLOC_F32(shared_out, QWEN35_N_EMBD, 1, 1, 1);
+    QWEN35_GPU_ALLOC_F32(shared_gate_logit, 1, 1, 1, 1);
+    QWEN35_GPU_ALLOC_F32(output_norm, QWEN35_N_EMBD, 1, 1, 1);
+    QWEN35_GPU_ALLOC_F32(logits, QWEN35_N_VOCAB, 1, 1, 1);
+
+#undef QWEN35_GPU_ALLOC_I32
+#undef QWEN35_GPU_ALLOC_F32
+
+    const bool ok = state_ok &&
+                    n_full_attention == QWEN35_FULL_ATTENTION_LAYER_COUNT &&
+                    n_recurrent == QWEN35_RECURRENT_LAYER_COUNT &&
+                    next.hidden[0] && next.hidden[1] && next.norm &&
+                    next.projection && next.gate && next.query && next.key &&
+                    next.value && next.alpha_logit && next.beta_logit &&
+                    next.log_decay && next.beta && next.heads && next.attn_out &&
+                    next.attn_score && next.router_logits &&
+                    next.router_probability && next.router_selected &&
+                    next.router_weight && next.routed_gate && next.routed_up &&
+                    next.routed_mid && next.routed_down && next.moe_partial[0] &&
+                    next.moe_partial[1] && next.moe_out && next.shared_gate &&
+                    next.shared_up && next.shared_mid && next.shared_out &&
+                    next.shared_gate_logit && next.output_norm && next.logits;
+    if (!ok) {
+        qwen35_gpu_graph_free(&next);
+        return false;
+    }
+
+    *g = next;
+    return true;
+}
+
+/* Opaque lifecycle hooks for tests/ds4_test.c.  They intentionally have no
+ * declaration in ds4.h: the graph remains a private implementation detail and
+ * no engine/session path can construct it through the public API. */
+size_t ds4_internal_qwen35_gpu_graph_size(void) {
+    return sizeof(ds4_qwen35_gpu_graph);
+}
+
+bool ds4_internal_qwen35_gpu_graph_alloc(
+        void     *storage,
+        size_t    storage_bytes,
+        uint32_t  ctx_capacity) {
+    if (!storage || storage_bytes != sizeof(ds4_qwen35_gpu_graph)) return false;
+    return qwen35_gpu_graph_alloc(storage, ctx_capacity);
+}
+
+bool ds4_internal_qwen35_gpu_graph_allocated_bytes(
+        const void *storage,
+        size_t      storage_bytes,
+        uint64_t   *bytes_out) {
+    if (!storage || storage_bytes != sizeof(ds4_qwen35_gpu_graph)) return false;
+    return qwen35_gpu_graph_allocated_bytes(storage, bytes_out);
+}
+
+void ds4_internal_qwen35_gpu_graph_free(
+        void   *storage,
+        size_t  storage_bytes) {
+    if (!storage || storage_bytes != sizeof(ds4_qwen35_gpu_graph)) return;
+    qwen35_gpu_graph_free(storage);
+}
+
+/* =========================================================================
  * Metal Release Graph State.
  * =========================================================================
  *
