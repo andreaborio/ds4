@@ -39,6 +39,7 @@
 #include "ds4.h"
 #include "ds4_distributed.h"
 #include "ds4_qwen.h"
+#include "ds4_qwen_unicode.h"
 
 #ifndef DS4_NO_GPU
 #include "ds4_gpu.h"
@@ -663,16 +664,6 @@ static void ds4_die_errno(const char *what, const char *path) {
 static bool ds4_streq(ds4_str s, const char *z) {
     size_t n = strlen(z);
     return s.len == n && memcmp(s.ptr, z, n) == 0;
-}
-
-static bool ds4_str_contains(ds4_str s, const char *needle) {
-    const size_t n = strlen(needle);
-    if (n == 0) return true;
-    if (s.len < n) return false;
-    for (uint64_t i = 0; i <= s.len - n; i++) {
-        if (memcmp(s.ptr + i, needle, n) == 0) return true;
-    }
-    return false;
 }
 
 static bool ds4_str_eq(ds4_str a, ds4_str b) {
@@ -4106,6 +4097,70 @@ static void qwen35_validate_recurrent_layers(const ds4_model *m) {
     }
 }
 
+static int32_t qwen35_expected_token_type(uint32_t token) {
+    if (token <= 248043u) return 1;  /* NORMAL */
+    if (token <= 248057u) return 3;  /* CONTROL */
+    if (token <= 248059u) return 4;  /* USER_DEFINED */
+    if (token <= 248065u) return 3;
+    if (token <= 248069u) return 4;
+    if (token <= 248076u) return 3;
+    return 5;                       /* UNUSED model-output padding */
+}
+
+static void qwen35_validate_token_types(const ds4_model *m) {
+    ds4_array_ref arr = qwen35_expect_array(
+        m, "tokenizer.ggml.token_type", GGUF_VALUE_INT32,
+        QWEN35_N_VOCAB);
+    ds4_cursor c = cursor_at(m, arr.data_pos);
+    for (uint32_t token = 0; token < QWEN35_N_VOCAB; token++) {
+        int32_t got = 0;
+        if (!cursor_read(&c, &got, sizeof(got))) ds4_die(c.error);
+        const int32_t expected = qwen35_expected_token_type(token);
+        if (got == expected) continue;
+        fprintf(stderr,
+                "ds4: expected tokenizer.ggml.token_type[%u]=%d for "
+                "Qwen3.6-35B-A3B, got %d\n",
+                token, expected, got);
+        exit(1);
+    }
+}
+
+static void qwen35_validate_tokenizer_metadata(const ds4_model *m) {
+    qwen35_expect_string(m, "tokenizer.ggml.model", "gpt2");
+    qwen35_expect_string(m, "tokenizer.ggml.pre", "qwen35");
+    qwen35_expect_array(m, "tokenizer.ggml.tokens", GGUF_VALUE_STRING,
+                        QWEN35_N_VOCAB);
+    qwen35_validate_token_types(m);
+    qwen35_expect_array(m, "tokenizer.ggml.merges", GGUF_VALUE_STRING,
+                        QWEN35_N_MERGE);
+    qwen35_expect_u32("tokenizer.ggml.bos_token_id",
+                      required_u32(m, "tokenizer.ggml.bos_token_id"),
+                      QWEN35_BOS_PAD_ID);
+    qwen35_expect_u32("tokenizer.ggml.padding_token_id",
+                      required_u32(m, "tokenizer.ggml.padding_token_id"),
+                      QWEN35_BOS_PAD_ID);
+    qwen35_expect_u32("tokenizer.ggml.eos_token_id",
+                      required_u32(m, "tokenizer.ggml.eos_token_id"),
+                      QWEN35_EOS_ID);
+    if (required_bool(m, "tokenizer.ggml.add_bos_token")) {
+        ds4_die("expected tokenizer.ggml.add_bos_token=false for Qwen3.6-35B-A3B");
+    }
+
+    ds4_str chat_template = {0};
+    if (!model_get_string(m, "tokenizer.chat_template", &chat_template)) {
+        ds4_die("Qwen tokenizer.chat_template is missing");
+    }
+    /* Exact bytes from Qwen/Qwen3.6-35B-A3B revision
+     * 995ad96eacd98c81ed38be0c5b274b04031597b0.  The source SHA256 is
+     * e84f32a23fdda27689f868aa4a1a5621f41133e51a48d7f3efcbea2839574259;
+     * FNV-1a is used here only as a compact drift guard, not for security. */
+    if (chat_template.len != 7764u ||
+        hash_bytes(chat_template.ptr, chat_template.len) !=
+            UINT64_C(0xf01bddd66fa4bdd6)) {
+        ds4_die("Qwen tokenizer.chat_template does not match the pinned canonical template");
+    }
+}
+
 /* This is the one Qwen shape selected for the small-Mac release.  It is
  * deliberately stricter than a generic qwen35moe loader: SSD cache geometry,
  * recurrent state, and the Metal graph all depend on these exact values. */
@@ -4186,34 +4241,7 @@ static void config_validate_qwen35moe_model(const ds4_model *m) {
                       QWEN35_FULL_ATTENTION_INTERVAL);
     qwen35_validate_recurrent_layers(m);
 
-    qwen35_expect_string(m, "tokenizer.ggml.model", "gpt2");
-    qwen35_expect_string(m, "tokenizer.ggml.pre", "qwen35");
-    qwen35_expect_array(m, "tokenizer.ggml.tokens", GGUF_VALUE_STRING,
-                        QWEN35_N_VOCAB);
-    qwen35_expect_array(m, "tokenizer.ggml.token_type", GGUF_VALUE_INT32,
-                        QWEN35_N_VOCAB);
-    qwen35_expect_array(m, "tokenizer.ggml.merges", GGUF_VALUE_STRING,
-                        QWEN35_N_MERGE);
-    qwen35_expect_u32("tokenizer.ggml.bos_token_id",
-                      required_u32(m, "tokenizer.ggml.bos_token_id"),
-                      QWEN35_BOS_PAD_ID);
-    qwen35_expect_u32("tokenizer.ggml.padding_token_id",
-                      required_u32(m, "tokenizer.ggml.padding_token_id"),
-                      QWEN35_BOS_PAD_ID);
-    qwen35_expect_u32("tokenizer.ggml.eos_token_id",
-                      required_u32(m, "tokenizer.ggml.eos_token_id"),
-                      QWEN35_EOS_ID);
-    if (required_bool(m, "tokenizer.ggml.add_bos_token")) {
-        ds4_die("expected tokenizer.ggml.add_bos_token=false for Qwen3.6-35B-A3B");
-    }
-
-    ds4_str chat_template = {0};
-    if (!model_get_string(m, "tokenizer.chat_template", &chat_template) ||
-        !ds4_str_contains(chat_template, "<|im_start|>") ||
-        !ds4_str_contains(chat_template, "<|im_end|>") ||
-        !ds4_str_contains(chat_template, "<think>")) {
-        ds4_die("Qwen tokenizer.chat_template is missing the canonical chat markers");
-    }
+    qwen35_validate_tokenizer_metadata(m);
 }
 
 /* Validate metadata values that affect semantics: attention shape, HC count,
@@ -22970,16 +22998,28 @@ bool ds4_tokens_starts_with(const ds4_tokens *tokens, const ds4_tokens *prefix) 
     return true;
 }
 
+typedef struct {
+    ds4_str text;
+    int id;
+} ds4_vocab_special;
+
 struct ds4_vocab {
+    ds4_model_family family;
     ds4_str *token;
     int n_vocab;
     int bos_id;
     int eos_id;
+    int pad_id;
     int user_id;
     int assistant_id;
+    int im_start_id;
+    int im_end_id;
     int think_start_id;
     int think_end_id;
     int dsml_id;
+    bool add_bos;
+    ds4_vocab_special special[33];
+    size_t n_special;
     str_i32_table token_to_id;
     str_i32_table merge_rank;
 };
@@ -23159,8 +23199,14 @@ static int bpe_rank(const ds4_vocab *vocab, const owned_str *a, const owned_str 
     return rank;
 }
 
-/* Apply byte-level BPE to one regex-like pre-tokenized piece and emit token ids. */
-static void bpe_emit_piece(const ds4_vocab *vocab, ds4_str raw_piece, token_vec *out) {
+/* Apply byte-level BPE to one pre-tokenized piece.  Qwen uses strict mode:
+ * every final symbol must exist in the fixed vocab, so a corrupt tokenizer
+ * cannot silently drop input bytes.  DeepSeek keeps its legacy byte fallback. */
+static bool bpe_emit_piece(
+        const ds4_vocab *vocab,
+        ds4_str          raw_piece,
+        token_vec       *out,
+        bool             strict) {
     uint64_t encoded_len = 0;
     char *encoded = byte_encode(raw_piece, &encoded_len);
 
@@ -23209,11 +23255,14 @@ static void bpe_emit_piece(const ds4_vocab *vocab, ds4_str raw_piece, token_vec 
         n_sym--;
     }
 
+    bool ok = true;
     for (int i = 0; i < n_sym; i++) {
         int token = -1;
         if (table_get(&vocab->token_to_id, sym[i].ptr, sym[i].len, &token)) {
-            token_vec_push(out, token);
-        } else {
+            if (ok) token_vec_push(out, token);
+        } else if (strict) {
+            ok = false;
+        } else if (ok) {
             for (uint64_t j = 0; j < sym[i].len; j++) {
                 if (table_get(&vocab->token_to_id, sym[i].ptr + j, 1, &token)) {
                     token_vec_push(out, token);
@@ -23225,6 +23274,7 @@ static void bpe_emit_piece(const ds4_vocab *vocab, ds4_str raw_piece, token_vec 
 
     free(sym);
     free(encoded);
+    return ok;
 }
 
 static uint64_t next_utf8_char(const char *s, uint64_t len, uint64_t pos) {
@@ -23335,7 +23385,10 @@ static bool joyai_cjk_at(const char *s, uint64_t len, uint64_t pos) {
  */
 /* JoyAI/DeepSeek pre-tokenization.  The split shape matters: different pieces
  * lead to different BPE merges even when the final text bytes are identical. */
-static void bpe_tokenize_text(const ds4_vocab *vocab, const char *text, token_vec *out) {
+static void joyai_bpe_tokenize_text(
+        const ds4_vocab *vocab,
+        const char      *text,
+        token_vec       *out) {
     const uint64_t len = strlen(text);
     uint64_t pos = 0;
 
@@ -23401,8 +23454,214 @@ static void bpe_tokenize_text(const ds4_vocab *vocab, const char *text, token_ve
         }
 
         if (pos == start) pos = next_utf8_char(text, len, pos);
-        bpe_emit_piece(vocab, (ds4_str){ text + start, pos - start }, out);
+        (void)bpe_emit_piece(
+            vocab, (ds4_str){ text + start, pos - start }, out, false);
     }
+}
+
+typedef struct {
+    uint32_t codepoint;
+    size_t byte_offset;
+} qwen35_char;
+
+static bool qwen35_is_letter_or_mark(enum ds4_qwen_unicode_class cls) {
+    return cls == DS4_QWEN_UNICODE_LETTER ||
+           cls == DS4_QWEN_UNICODE_MARK;
+}
+
+static bool qwen35_is_other(uint32_t cp) {
+    return !ds4_qwen_unicode_is_space(cp) &&
+           ds4_qwen_unicode_classify(cp) == DS4_QWEN_UNICODE_OTHER;
+}
+
+/* Oniguruma's scoped Unicode case-fold adds only LONG S among code points
+ * that can match the ASCII contraction suffixes in Qwen's expression. */
+static uint32_t qwen35_contraction_fold(uint32_t cp) {
+    if (cp >= 'A' && cp <= 'Z') return cp + ('a' - 'A');
+    if (cp == 0x017fu) return 's';
+    return cp;
+}
+
+static bool qwen35_emit_chars(
+        const ds4_vocab *vocab,
+        const char      *normalized,
+        const qwen35_char *chars,
+        size_t           start,
+        size_t           end,
+        token_vec       *out) {
+    const size_t first = chars[start].byte_offset;
+    const size_t last = chars[end].byte_offset;
+    return bpe_emit_piece(
+        vocab, (ds4_str){normalized + first, last - first}, out, true);
+}
+
+/* Exact deterministic form of tokenizer.ggml.pre=qwen35.  The official
+ * tokenizer normalizes with Unicode-9 NFC, then applies Unicode-16 L/M/N and
+ * White_Space properties.  Keeping the scanner direct avoids a regex runtime
+ * and makes the whitespace/backtracking behavior explicit. */
+static bool qwen35_bpe_tokenize_text(
+        const ds4_vocab *vocab,
+        const char      *text,
+        token_vec       *out) {
+    const size_t original_len = out->len;
+    char *normalized = NULL;
+    size_t normalized_len = 0;
+    if (!ds4_qwen_nfc_normalize(
+            text, strlen(text), &normalized, &normalized_len)) {
+        return false;
+    }
+    if (normalized_len > SIZE_MAX / sizeof(qwen35_char) - 1u) {
+        free(normalized);
+        return false;
+    }
+
+    qwen35_char *chars = malloc(
+        (normalized_len + 1u) * sizeof(chars[0]));
+    if (!chars) {
+        free(normalized);
+        return false;
+    }
+
+    size_t n_chars = 0;
+    size_t offset = 0;
+    while (offset < normalized_len) {
+        const size_t byte_offset = offset;
+        uint32_t cp = 0;
+        if (ds4_qwen_utf8_next(
+                normalized, normalized_len, &offset, &cp) != 1) {
+            goto fail;
+        }
+        chars[n_chars++] = (qwen35_char){cp, byte_offset};
+    }
+    chars[n_chars] = (qwen35_char){0, normalized_len};
+
+    for (size_t pos = 0; pos < n_chars;) {
+        size_t end = pos;
+        const uint32_t cp = chars[pos].codepoint;
+        const enum ds4_qwen_unicode_class cls =
+            ds4_qwen_unicode_classify(cp);
+
+        /* (?i:'s|'t|'re|'ve|'m|'ll|'d) */
+        if (cp == '\'' && pos + 1u < n_chars) {
+            const uint32_t one = qwen35_contraction_fold(
+                chars[pos + 1u].codepoint);
+            if (one == 's' || one == 't' || one == 'm' || one == 'd') {
+                end = pos + 2u;
+            } else if (pos + 2u < n_chars) {
+                const uint32_t two = qwen35_contraction_fold(
+                    chars[pos + 2u].codepoint);
+                if ((one == 'r' && two == 'e') ||
+                    (one == 'v' && two == 'e') ||
+                    (one == 'l' && two == 'l')) {
+                    end = pos + 3u;
+                }
+            }
+        }
+
+        /* [^\r\n\p{L}\p{N}]?[\p{L}\p{M}]+ */
+        if (end == pos) {
+            size_t run = pos;
+            if (!qwen35_is_letter_or_mark(cls)) {
+                if (cp != '\r' && cp != '\n' &&
+                    cls != DS4_QWEN_UNICODE_LETTER &&
+                    cls != DS4_QWEN_UNICODE_NUMBER &&
+                    pos + 1u < n_chars &&
+                    qwen35_is_letter_or_mark(ds4_qwen_unicode_classify(
+                        chars[pos + 1u].codepoint))) {
+                    run++;
+                } else {
+                    run = n_chars;
+                }
+            }
+            if (run < n_chars && qwen35_is_letter_or_mark(
+                    ds4_qwen_unicode_classify(chars[run].codepoint))) {
+                end = run + 1u;
+                while (end < n_chars && qwen35_is_letter_or_mark(
+                        ds4_qwen_unicode_classify(chars[end].codepoint))) {
+                    end++;
+                }
+            }
+        }
+
+        /* \p{N} -- one scalar, not one decimal digit or a digit run. */
+        if (end == pos && cls == DS4_QWEN_UNICODE_NUMBER) {
+            end = pos + 1u;
+        }
+
+        /* Literal-space optional prefix, then OTHER and trailing CR/LF. */
+        if (end == pos) {
+            size_t run = pos;
+            if (cp == ' ' && pos + 1u < n_chars &&
+                qwen35_is_other(chars[pos + 1u].codepoint)) {
+                run++;
+            }
+            if (run < n_chars && qwen35_is_other(chars[run].codepoint)) {
+                end = run + 1u;
+                while (end < n_chars &&
+                       qwen35_is_other(chars[end].codepoint)) {
+                    end++;
+                }
+                while (end < n_chars &&
+                       (chars[end].codepoint == '\r' ||
+                        chars[end].codepoint == '\n')) {
+                    end++;
+                }
+            }
+        }
+
+        if (end == pos && ds4_qwen_unicode_is_space(cp)) {
+            size_t whitespace_end = pos;
+            size_t last_newline_end = pos;
+            while (whitespace_end < n_chars &&
+                   ds4_qwen_unicode_is_space(
+                       chars[whitespace_end].codepoint)) {
+                const uint32_t current = chars[whitespace_end].codepoint;
+                whitespace_end++;
+                if (current == '\r' || current == '\n') {
+                    last_newline_end = whitespace_end;
+                }
+            }
+            if (last_newline_end != pos) {
+                end = last_newline_end;
+            } else if (whitespace_end - pos > 1u &&
+                       whitespace_end < n_chars) {
+                end = whitespace_end - 1u;
+            } else {
+                end = whitespace_end;
+            }
+        }
+
+        if (end == pos) end = pos + 1u;
+        if (!qwen35_emit_chars(
+                vocab, normalized, chars, pos, end, out)) {
+            goto fail;
+        }
+        pos = end;
+    }
+
+    free(chars);
+    free(normalized);
+    return true;
+
+fail:
+    out->len = (int)original_len;
+    free(chars);
+    free(normalized);
+    return false;
+}
+
+static bool bpe_tokenize_text(
+        const ds4_vocab *vocab,
+        const char      *text,
+        token_vec       *out) {
+    if (vocab->family == DS4_MODEL_FAMILY_QWEN35_MOE) {
+        return qwen35_bpe_tokenize_text(vocab, text, out);
+    }
+    if (vocab->family == DS4_MODEL_FAMILY_DEEPSEEK4) {
+        joyai_bpe_tokenize_text(vocab, text, out);
+        return true;
+    }
+    return false;
 }
 
 static int vocab_lookup(const ds4_vocab *vocab, const char *text) {
@@ -23414,9 +23673,153 @@ static int vocab_lookup(const ds4_vocab *vocab, const char *text) {
     return token;
 }
 
+static int vocab_expect_token_id(
+        const ds4_vocab *vocab,
+        const char      *text,
+        int              expected) {
+    const int token = vocab_lookup(vocab, text);
+    if (token == expected) return token;
+    fprintf(stderr,
+            "ds4: expected tokenizer token %s at id %d, got %d\n",
+            text, expected, token);
+    exit(1);
+}
+
+static void vocab_add_special(
+        ds4_vocab *vocab,
+        const char *text,
+        int token) {
+    if (vocab->n_special >=
+        sizeof(vocab->special) / sizeof(vocab->special[0])) {
+        ds4_die("too many tokenizer special tokens");
+    }
+    vocab->special[vocab->n_special++] = (ds4_vocab_special){
+        .text = {text, strlen(text)},
+        .id = token,
+    };
+}
+
+static void vocab_configure_deepseek(ds4_vocab *vocab) {
+    static const char *const special[] = {
+        "<｜begin▁of▁sentence｜>",
+        "<｜end▁of▁sentence｜>",
+        "<｜User｜>",
+        "<｜Assistant｜>",
+        "<think>",
+        "</think>",
+        "｜DSML｜",
+    };
+
+    vocab->bos_id = vocab_lookup(vocab, special[0]);
+    vocab->eos_id = vocab_lookup(vocab, special[1]);
+    vocab->pad_id = vocab->eos_id;
+    vocab->user_id = vocab_lookup(vocab, special[2]);
+    vocab->assistant_id = vocab_lookup(vocab, special[3]);
+    vocab->think_start_id = vocab_lookup(vocab, special[4]);
+    vocab->think_end_id = vocab_lookup(vocab, special[5]);
+    vocab->dsml_id = vocab_lookup(vocab, special[6]);
+    vocab->add_bos = true;
+
+    const int ids[] = {
+        vocab->bos_id,
+        vocab->eos_id,
+        vocab->user_id,
+        vocab->assistant_id,
+        vocab->think_start_id,
+        vocab->think_end_id,
+        vocab->dsml_id,
+    };
+    for (size_t i = 0; i < sizeof(special) / sizeof(special[0]); i++) {
+        vocab_add_special(vocab, special[i], ids[i]);
+    }
+}
+
+typedef struct {
+    const char *text;
+    int id;
+} qwen35_special_contract;
+
+static const qwen35_special_contract qwen35_special_tokens[] = {
+    {"<|endoftext|>", 248044},
+    {"<|im_start|>", 248045},
+    {"<|im_end|>", 248046},
+    {"<|object_ref_start|>", 248047},
+    {"<|object_ref_end|>", 248048},
+    {"<|box_start|>", 248049},
+    {"<|box_end|>", 248050},
+    {"<|quad_start|>", 248051},
+    {"<|quad_end|>", 248052},
+    {"<|vision_start|>", 248053},
+    {"<|vision_end|>", 248054},
+    {"<|vision_pad|>", 248055},
+    {"<|image_pad|>", 248056},
+    {"<|video_pad|>", 248057},
+    {"<tool_call>", 248058},
+    {"</tool_call>", 248059},
+    {"<|fim_prefix|>", 248060},
+    {"<|fim_middle|>", 248061},
+    {"<|fim_suffix|>", 248062},
+    {"<|fim_pad|>", 248063},
+    {"<|repo_name|>", 248064},
+    {"<|file_sep|>", 248065},
+    {"<tool_response>", 248066},
+    {"</tool_response>", 248067},
+    {"<think>", 248068},
+    {"</think>", 248069},
+    {"<|audio_start|>", 248070},
+    {"<|audio_end|>", 248071},
+    {"<tts_pad>", 248072},
+    {"<tts_text_bos>", 248073},
+    {"<tts_text_eod>", 248074},
+    {"<tts_text_bos_single>", 248075},
+    {"<|audio_pad|>", 248076},
+};
+
+static void vocab_configure_qwen35(ds4_vocab *vocab) {
+    if (vocab->n_vocab != QWEN35_N_VOCAB) {
+        fprintf(stderr,
+                "ds4: expected Qwen tokenizer vocab size %u, got %d\n",
+                QWEN35_N_VOCAB, vocab->n_vocab);
+        exit(1);
+    }
+    if (sizeof(qwen35_special_tokens) /
+            sizeof(qwen35_special_tokens[0]) != 33u) {
+        ds4_die("internal Qwen special-token contract is incomplete");
+    }
+
+    for (size_t i = 0;
+         i < sizeof(qwen35_special_tokens) /
+             sizeof(qwen35_special_tokens[0]);
+         i++) {
+        const qwen35_special_contract *special = &qwen35_special_tokens[i];
+        vocab_expect_token_id(vocab, special->text, special->id);
+        vocab_add_special(vocab, special->text, special->id);
+    }
+
+    vocab->bos_id = QWEN35_BOS_PAD_ID;
+    vocab->eos_id = QWEN35_EOS_ID;
+    vocab->pad_id = QWEN35_BOS_PAD_ID;
+    vocab->im_start_id = 248045;
+    vocab->im_end_id = QWEN35_EOS_ID;
+    vocab->think_start_id = 248068;
+    vocab->think_end_id = 248069;
+    vocab->add_bos = false;
+}
+
 /* Load token strings, special token ids, and merge ranks from GGUF metadata. */
 static void vocab_load(ds4_vocab *vocab, const ds4_model *model) {
     memset(vocab, 0, sizeof(*vocab));
+    vocab->family = model->family;
+    vocab->bos_id = -1;
+    vocab->eos_id = -1;
+    vocab->pad_id = -1;
+    vocab->user_id = -1;
+    vocab->assistant_id = -1;
+    vocab->im_start_id = -1;
+    vocab->im_end_id = -1;
+    vocab->think_start_id = -1;
+    vocab->think_end_id = -1;
+    vocab->dsml_id = -1;
 
     ds4_array_ref tokens;
     ds4_array_ref merges;
@@ -23428,6 +23831,9 @@ static void vocab_load(ds4_vocab *vocab, const ds4_model *model) {
     if (!model_get_array(model, "tokenizer.ggml.merges", &merges) ||
         merges.type != GGUF_VALUE_STRING) {
         ds4_die("GGUF tokenizer merge table is missing or invalid");
+    }
+    if (model->family == DS4_MODEL_FAMILY_QWEN35_MOE) {
+        qwen35_validate_tokenizer_metadata(model);
     }
 
     vocab->n_vocab = (int)tokens.len;
@@ -23448,13 +23854,13 @@ static void vocab_load(ds4_vocab *vocab, const ds4_model *model) {
         table_put(&vocab->merge_rank, merge, (int)i);
     }
 
-    vocab->bos_id       = vocab_lookup(vocab, "<｜begin▁of▁sentence｜>");
-    vocab->eos_id       = vocab_lookup(vocab, "<｜end▁of▁sentence｜>");
-    vocab->user_id      = vocab_lookup(vocab, "<｜User｜>");
-    vocab->assistant_id = vocab_lookup(vocab, "<｜Assistant｜>");
-    vocab->think_start_id = vocab_lookup(vocab, "<think>");
-    vocab->think_end_id = vocab_lookup(vocab, "</think>");
-    vocab->dsml_id = vocab_lookup(vocab, "｜DSML｜");
+    if (vocab->family == DS4_MODEL_FAMILY_QWEN35_MOE) {
+        vocab_configure_qwen35(vocab);
+    } else if (vocab->family == DS4_MODEL_FAMILY_DEEPSEEK4) {
+        vocab_configure_deepseek(vocab);
+    } else {
+        ds4_die("unsupported tokenizer model family");
+    }
 }
 
 static void vocab_free(ds4_vocab *vocab) {
@@ -23464,15 +23870,130 @@ static void vocab_free(ds4_vocab *vocab) {
     memset(vocab, 0, sizeof(*vocab));
 }
 
+static bool tokenize_span(
+        const ds4_vocab *vocab,
+        const char      *p,
+        size_t           n,
+        token_vec       *out) {
+    if (!n) return true;
+    char *tmp = xmalloc(n + 1);
+    memcpy(tmp, p, n);
+    tmp[n] = '\0';
+    const bool ok = bpe_tokenize_text(vocab, tmp, out);
+    free(tmp);
+    return ok;
+}
+
+static bool qwen35_trimmed_text(const char *text, ds4_str *trimmed) {
+    const size_t len = strlen(text);
+    size_t offset = 0;
+    size_t first = len;
+    size_t last = 0;
+    while (offset < len) {
+        const size_t start = offset;
+        uint32_t cp = 0;
+        if (ds4_qwen_utf8_next(text, len, &offset, &cp) != 1) return false;
+        /* Jinja's |trim delegates to Python str.strip().  CPython includes
+         * the four ASCII information separators in addition to Unicode
+         * White_Space, so chat trimming is intentionally a little broader
+         * than the qwen35 pre-tokenizer's \s class. */
+        const bool trim_space = ds4_qwen_unicode_is_space(cp) ||
+                                (cp >= 0x001cu && cp <= 0x001fu);
+        if (!trim_space) {
+            if (first == len) first = start;
+            last = offset;
+        }
+    }
+    if (first == len) {
+        *trimmed = (ds4_str){text + len, 0};
+    } else {
+        *trimmed = (ds4_str){text + first, last - first};
+    }
+    return true;
+}
+
+static bool qwen35_append_boundary(
+        const ds4_vocab *vocab,
+        token_vec       *out) {
+    if (out->len == 0 || out->v[out->len - 1] != vocab->im_end_id) {
+        return true;
+    }
+    return bpe_tokenize_text(vocab, "\n", out);
+}
+
+static bool qwen35_append_chat_block(
+        const ds4_vocab *vocab,
+        const char      *role,
+        const char      *content,
+        token_vec       *out) {
+    const int original_len = out->len;
+    ds4_str trimmed = {0};
+    if (!qwen35_trimmed_text(content, &trimmed) ||
+        !qwen35_append_boundary(vocab, out)) {
+        goto fail;
+    }
+
+    token_vec_push(out, vocab->im_start_id);
+    if (!bpe_tokenize_text(vocab, role, out) ||
+        !bpe_tokenize_text(vocab, "\n", out) ||
+        !tokenize_span(vocab, trimmed.ptr, (size_t)trimmed.len, out)) {
+        goto fail;
+    }
+    token_vec_push(out, vocab->im_end_id);
+    if (!bpe_tokenize_text(vocab, "\n", out)) goto fail;
+    return true;
+
+fail:
+    out->len = original_len;
+    return false;
+}
+
+static bool qwen35_append_assistant_prefix(
+        const ds4_vocab *vocab,
+        ds4_think_mode   think_mode,
+        token_vec       *out) {
+    const int original_len = out->len;
+    if (!qwen35_append_boundary(vocab, out)) goto fail;
+
+    token_vec_push(out, vocab->im_start_id);
+    if (!bpe_tokenize_text(vocab, "assistant\n", out)) goto fail;
+    token_vec_push(out, vocab->think_start_id);
+    if (ds4_think_mode_enabled(think_mode)) {
+        if (!bpe_tokenize_text(vocab, "\n", out)) goto fail;
+    } else {
+        if (!bpe_tokenize_text(vocab, "\n\n", out)) goto fail;
+        token_vec_push(out, vocab->think_end_id);
+        if (!bpe_tokenize_text(vocab, "\n\n", out)) goto fail;
+    }
+    return true;
+
+fail:
+    out->len = original_len;
+    return false;
+}
+
 /* Build the DS4 chat prompt: BOS, optional system text, user prompt, assistant
  * marker, and either <think> or </think> depending on the requested mode.  Max
  * thinking is only a prompt prefix: the model still enters through <think>. */
-static void encode_chat_prompt(
+static bool encode_chat_prompt(
         const ds4_vocab *vocab,
         const char      *system,
         const char      *prompt,
         ds4_think_mode   think_mode,
         token_vec       *out) {
+    const int original_len = out->len;
+    if (vocab->family == DS4_MODEL_FAMILY_QWEN35_MOE) {
+        if (system && system[0] &&
+            !qwen35_append_chat_block(vocab, "system", system, out)) {
+            goto fail;
+        }
+        if (!qwen35_append_chat_block(vocab, "user", prompt, out) ||
+            !qwen35_append_assistant_prefix(vocab, think_mode, out)) {
+            goto fail;
+        }
+        return true;
+    }
+
     token_vec_push(out, vocab->bos_id);
     if (think_mode == DS4_THINK_MAX) {
         bpe_tokenize_text(vocab, DS4_REASONING_EFFORT_MAX_PREFIX, out);
@@ -23488,31 +24009,32 @@ static void encode_chat_prompt(
     } else {
         token_vec_push(out, vocab->think_end_id);
     }
+    return true;
+
+fail:
+    out->len = original_len;
+    return false;
 }
 
 void ds4_tokenize_text(ds4_engine *e, const char *text, ds4_tokens *out) {
     if (!e || !out || e->vocab.n_vocab == 0) return;
-    bpe_tokenize_text(&e->vocab, text ? text : "", out);
+    if (!bpe_tokenize_text(&e->vocab, text ? text : "", out)) {
+        fprintf(stderr,
+                "ds4: text tokenization failed; output was left unchanged\n");
+    }
 }
 
-static bool special_token_at(const ds4_vocab *vocab, const char *p, int *token, size_t *len) {
-    struct special {
-        const char *text;
-        int token;
-    } specials[] = {
-        {"<｜begin▁of▁sentence｜>", vocab->bos_id},
-        {"<｜end▁of▁sentence｜>",   vocab->eos_id},
-        {"<｜User｜>",              vocab->user_id},
-        {"<｜Assistant｜>",         vocab->assistant_id},
-        {"<think>",                vocab->think_start_id},
-        {"</think>",               vocab->think_end_id},
-        {"｜DSML｜",                vocab->dsml_id},
-    };
-
-    for (size_t i = 0; i < sizeof(specials) / sizeof(specials[0]); i++) {
-        size_t n = strlen(specials[i].text);
-        if (!strncmp(p, specials[i].text, n)) {
-            *token = specials[i].token;
+static bool special_token_at(
+        const ds4_vocab *vocab,
+        const char      *p,
+        size_t           remaining,
+        int             *token,
+        size_t          *len) {
+    for (size_t i = 0; i < vocab->n_special; i++) {
+        const ds4_vocab_special *special = &vocab->special[i];
+        const size_t n = (size_t)special->text.len;
+        if (n <= remaining && memcmp(p, special->text.ptr, n) == 0) {
+            *token = special->id;
             *len = n;
             return true;
         }
@@ -23520,26 +24042,25 @@ static bool special_token_at(const ds4_vocab *vocab, const char *p, int *token, 
     return false;
 }
 
-static void tokenize_span(const ds4_vocab *vocab, const char *p, size_t n, token_vec *out) {
-    if (!n) return;
-    char *tmp = xmalloc(n + 1);
-    memcpy(tmp, p, n);
-    tmp[n] = '\0';
-    bpe_tokenize_text(vocab, tmp, out);
-    free(tmp);
-}
-
-static void tokenize_rendered_chat_vocab(const ds4_vocab *vocab, const char *text,
-                                         token_vec *out) {
+static bool tokenize_rendered_chat_vocab(
+        const ds4_vocab *vocab,
+        const char      *text,
+        token_vec       *out) {
     if (!text) text = "";
 
+    const int original_len = out->len;
+    const size_t text_len = strlen(text);
     const char *span = text;
     const char *p = text;
-    while (*p) {
+    const char *end = text + text_len;
+    while (p < end) {
         int token = -1;
         size_t len = 0;
-        if (special_token_at(vocab, p, &token, &len)) {
-            tokenize_span(vocab, span, (size_t)(p - span), out);
+        if (special_token_at(
+                vocab, p, (size_t)(end - p), &token, &len)) {
+            if (!tokenize_span(vocab, span, (size_t)(p - span), out)) {
+                goto fail;
+            }
             token_vec_push(out, token);
             p += len;
             span = p;
@@ -23547,17 +24068,25 @@ static void tokenize_rendered_chat_vocab(const ds4_vocab *vocab, const char *tex
         }
         p++;
     }
-    tokenize_span(vocab, span, (size_t)(p - span), out);
+    if (!tokenize_span(vocab, span, (size_t)(p - span), out)) goto fail;
+    return true;
+
+fail:
+    out->len = original_len;
+    return false;
 }
 
 void ds4_tokenize_rendered_chat(ds4_engine *e, const char *text, ds4_tokens *out) {
     if (!e || !out || e->vocab.n_vocab == 0) return;
-    tokenize_rendered_chat_vocab(&e->vocab, text, out);
+    if (!tokenize_rendered_chat_vocab(&e->vocab, text, out)) {
+        fprintf(stderr,
+                "ds4: rendered-chat tokenization failed; output was left unchanged\n");
+    }
 }
 
 void ds4_chat_begin(ds4_engine *e, ds4_tokens *tokens) {
     if (!e || !tokens || e->vocab.n_vocab == 0) return;
-    token_vec_push(tokens, e->vocab.bos_id);
+    if (e->vocab.add_bos) token_vec_push(tokens, e->vocab.bos_id);
 }
 
 void ds4_encode_chat_prompt(
@@ -23567,12 +24096,19 @@ void ds4_encode_chat_prompt(
         ds4_think_mode think_mode,
         ds4_tokens *out) {
     if (!e || !out || e->vocab.n_vocab == 0) return;
-    encode_chat_prompt(&e->vocab, system, prompt ? prompt : "", think_mode, out);
+    if (!encode_chat_prompt(
+            &e->vocab, system, prompt ? prompt : "", think_mode, out)) {
+        fprintf(stderr,
+                "ds4: chat prompt tokenization failed; output was left unchanged\n");
+    }
 }
 
 void ds4_chat_append_max_effort_prefix(ds4_engine *e, ds4_tokens *tokens) {
     if (!e || !tokens || e->vocab.n_vocab == 0) return;
-    bpe_tokenize_text(&e->vocab, DS4_REASONING_EFFORT_MAX_PREFIX, tokens);
+    if (e->vocab.family != DS4_MODEL_FAMILY_QWEN35_MOE) {
+        bpe_tokenize_text(
+            &e->vocab, DS4_REASONING_EFFORT_MAX_PREFIX, tokens);
+    }
 }
 
 static void bpe_tokenize_tool_result_text(ds4_vocab *vocab, const char *content, token_vec *out) {
@@ -23603,6 +24139,25 @@ void ds4_chat_append_message(ds4_engine *e, ds4_tokens *tokens, const char *role
     if (!role) role = "user";
     if (!content) content = "";
 
+    if (vocab->family == DS4_MODEL_FAMILY_QWEN35_MOE) {
+        const char *qwen_role = role;
+        if (!strcmp(role, "developer")) qwen_role = "system";
+        if (strcmp(qwen_role, "system") != 0 &&
+            strcmp(qwen_role, "user") != 0 &&
+            strcmp(qwen_role, "assistant") != 0) {
+            fprintf(stderr,
+                    "ds4: Qwen chat role %s is not enabled in the core renderer yet\n",
+                    role);
+            return;
+        }
+        if (!qwen35_append_chat_block(vocab, qwen_role, content, tokens)) {
+            fprintf(stderr,
+                    "ds4: Qwen chat message tokenization failed; "
+                    "output was left unchanged\n");
+        }
+        return;
+    }
+
     if (!strcmp(role, "system") || !strcmp(role, "developer")) {
         bpe_tokenize_text(vocab, content, tokens);
     } else if (!strcmp(role, "assistant")) {
@@ -23624,6 +24179,14 @@ void ds4_chat_append_message(ds4_engine *e, ds4_tokens *tokens, const char *role
 
 void ds4_chat_append_assistant_prefix(ds4_engine *e, ds4_tokens *tokens, ds4_think_mode think_mode) {
     if (!e || !tokens || e->vocab.n_vocab == 0) return;
+    if (e->vocab.family == DS4_MODEL_FAMILY_QWEN35_MOE) {
+        if (!qwen35_append_assistant_prefix(&e->vocab, think_mode, tokens)) {
+            fprintf(stderr,
+                    "ds4: Qwen assistant-prefix tokenization failed; "
+                    "output was left unchanged\n");
+        }
+        return;
+    }
     token_vec_push(tokens, e->vocab.assistant_id);
     token_vec_push(tokens, ds4_think_mode_enabled(think_mode) ?
                    e->vocab.think_start_id : e->vocab.think_end_id);
@@ -26186,7 +26749,15 @@ int ds4_dump_text_tokenization(const char *model_path, const char *text, FILE *f
     if (!fp) fp = stdout;
     model_open(&model, model_path, false, false);
     vocab_load(&vocab, &model);
-    tokenize_rendered_chat_vocab(&vocab, text ? text : "", &tokens);
+    if (!tokenize_rendered_chat_vocab(
+            &vocab, text ? text : "", &tokens)) {
+        fprintf(stderr,
+                "ds4: failed to tokenize rendered chat text\n");
+        token_vec_free(&tokens);
+        vocab_free(&vocab);
+        model_close(&model);
+        return 1;
+    }
 
     dump_tokens_fp(fp, &vocab, &tokens);
     token_vec_free(&tokens);
@@ -26405,9 +26976,8 @@ int ds4_engine_generate_argmax(
     if (!e) return 1;
     if (e->model.family == DS4_MODEL_FAMILY_QWEN35_MOE) {
         fprintf(stderr,
-                "ds4: Qwen text generation is disabled until its tokenizer "
-                "and chat template are wired; raw-token session opening is "
-                "not exposed yet\n");
+                "ds4: Qwen text generation remains disabled until the "
+                "model-backed CPU and Metal logits gates pass\n");
         return 1;
     }
     const ds4_model *model = &e->model;
@@ -27359,7 +27929,7 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
         }
         fprintf(stderr,
                 "ds4: Qwen3.6-35B-A3B metadata is valid, but inference is "
-                "disabled until the Qwen Gated DeltaNet and top-8 runtime is available\n");
+                "disabled until the model-backed logits gate passes\n");
         ds4_engine_close(e);
         return 1;
     }

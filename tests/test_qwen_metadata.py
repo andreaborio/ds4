@@ -29,12 +29,25 @@ TENSOR_Q8_0 = 8
 TENSOR_Q4_K = 12
 TENSOR_Q5_K = 13
 
+QWEN_CHAT_TEMPLATE_PATH = (
+    Path(__file__).with_name("qwen") / "qwen36_chat_template.jinja"
+)
+QWEN_CHAT_TEMPLATE = QWEN_CHAT_TEMPLATE_PATH.read_text(encoding="utf-8")
+
 
 class RepeatedArray:
     def __init__(self, item_type: int, count: int, value: object) -> None:
         self.item_type = item_type
         self.count = count
         self.value = value
+
+
+class SegmentedArray:
+    def __init__(
+        self, item_type: int, segments: tuple[tuple[int, object], ...]
+    ) -> None:
+        self.item_type = item_type
+        self.segments = segments
 
 
 @dataclass(frozen=True)
@@ -72,6 +85,16 @@ def pack_value(value_type: int, value: object) -> bytes:
         return (
             struct.pack("<IQ", value.item_type, value.count)
             + item * value.count
+        )
+
+    if isinstance(value, SegmentedArray):
+        count = sum(segment_count for segment_count, _ in value.segments)
+        return (
+            struct.pack("<IQ", value.item_type, count)
+            + b"".join(
+                pack_scalar(value.item_type, item) * segment_count
+                for segment_count, item in value.segments
+            )
         )
 
     item_type, items = value
@@ -113,7 +136,24 @@ def qwen_metadata() -> OrderedDict[str, tuple[int, object]]:
             ("tokenizer.ggml.model", (STRING, "gpt2")),
             ("tokenizer.ggml.pre", (STRING, "qwen35")),
             ("tokenizer.ggml.tokens", (ARRAY, RepeatedArray(STRING, 248320, ""))),
-            ("tokenizer.ggml.token_type", (ARRAY, RepeatedArray(INT32, 248320, 0))),
+            (
+                "tokenizer.ggml.token_type",
+                (
+                    ARRAY,
+                    SegmentedArray(
+                        INT32,
+                        (
+                            (248044, 1),
+                            (14, 3),
+                            (2, 4),
+                            (6, 3),
+                            (4, 4),
+                            (7, 3),
+                            (243, 5),
+                        ),
+                    ),
+                ),
+            ),
             ("tokenizer.ggml.merges", (ARRAY, RepeatedArray(STRING, 247587, ""))),
             ("tokenizer.ggml.bos_token_id", (UINT32, 248044)),
             ("tokenizer.ggml.padding_token_id", (UINT32, 248044)),
@@ -121,7 +161,7 @@ def qwen_metadata() -> OrderedDict[str, tuple[int, object]]:
             ("tokenizer.ggml.add_bos_token", (BOOL, False)),
             (
                 "tokenizer.chat_template",
-                (STRING, "<|im_start|>user\\n{{ content }}<|im_end|>\\n<think>\\n"),
+                (STRING, QWEN_CHAT_TEMPLATE),
             ),
         ]
     )
@@ -237,6 +277,11 @@ def require(condition: bool, message: str, result: subprocess.CompletedProcess[s
 
 
 def check_frozen_reference() -> None:
+    template = QWEN_CHAT_TEMPLATE_PATH.read_bytes()
+    assert len(template) == 7764
+    assert hashlib.sha256(template).hexdigest() == (
+        "e84f32a23fdda27689f868aa4a1a5621f41133e51a48d7f3efcbea2839574259"
+    )
     path = Path(__file__).with_name("qwen") / "qwen36_tokenizer_chat_golden.json"
     raw = path.read_bytes()
     assert hashlib.sha256(raw).hexdigest() == (
@@ -400,6 +445,38 @@ def main() -> int:
             "expected qwen35moe.full_attention_interval=4",
         )
 
+        def corrupt_first_control_type(
+            metadata: OrderedDict[str, tuple[int, object]],
+        ) -> None:
+            metadata["tokenizer.ggml.token_type"] = (
+                ARRAY,
+                SegmentedArray(
+                    INT32,
+                    (
+                        (248045, 1),
+                        (13, 3),
+                        (2, 4),
+                        (6, 3),
+                        (4, 4),
+                        (7, 3),
+                        (243, 5),
+                    ),
+                ),
+            )
+
+        check(
+            "wrong-first-control-token-type",
+            corrupt_first_control_type,
+            "expected tokenizer.ggml.token_type[248044]=3",
+        )
+        check(
+            "wrong-chat-template",
+            lambda m: m.__setitem__(
+                "tokenizer.chat_template", (STRING, QWEN_CHAT_TEMPLATE + "\n")
+            ),
+            "chat_template does not match the pinned canonical template",
+        )
+
         def add_recurrent_mask(
             metadata: OrderedDict[str, tuple[int, object]], *, valid: bool
         ) -> None:
@@ -473,7 +550,7 @@ def main() -> int:
         check(
             "runtime-closed",
             None,
-            "inference is disabled until the Qwen Gated DeltaNet and top-8 runtime is available",
+            "inference is disabled until the model-backed logits gate passes",
             inspect=False,
         )
 
