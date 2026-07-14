@@ -1,0 +1,19 @@
+The lighthouse keeper had grown accustomed to solitude, but the signal that arrived on the third night of the storm was unlike anything in her twenty years of service. It pulsed at regular intervals, seven seconds apart, on a frequency that should have been silent. She logged it carefully, noting the barometric pressure and the state of the sea, because a keeper's discipline survives even her astonishment.
+
+Rayleigh scattering explains why the sky appears blue: shorter wavelengths of visible light scatter more strongly off gas molecules than longer ones, roughly in proportion to the inverse fourth power of wavelength. At sunset the light path through the atmosphere lengthens, the blue is scattered away before reaching the observer, and the transmitted light shifts toward red and orange.
+
+def column_statistics(rows):
+    """Compute count, mean and variance per numeric column."""
+    stats = {}
+    for row in rows:
+        for key, value in row.items():
+            try:
+                x = float(value)
+            except (TypeError, ValueError):
+                continue
+            entry = stats.setdefault(key, [0, 0.0, 0.0])
+            entry[0] += 1
+            delta = x - entry[1]
+            entry[1] += delta / entry[0]
+            entry[2] += delta * (x - entry[1])
+    return

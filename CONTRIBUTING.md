@@ -5,8 +5,45 @@ affect. The project has two regression tracks: correctness and speed. Please
 include the commands you ran, the machine/backend, the model quant, and any
 notable failures in the PR or commit notes.
 
+## Co-development with `antirez/ds4`
+
+This repository is a transparent research fork of
+[`antirez/ds4`](https://github.com/antirez/ds4), not a replacement for it. The
+goal is to co-develop DwarfStar: use the fork to investigate complementary
+hardware and model paths without blocking on review latency, then contribute
+general improvements back upstream.
+
+Every change applicable to an upstream-supported path **must be opened as an
+upstream PR** once it is scoped and validated. This includes model- or
+hardware-specific work when the same path exists upstream. Continuing research
+in the fork while that PR is reviewed is expected.
+
+Every contribution must be classified before it is promoted:
+
+| Classification | Required action |
+| --- | --- |
+| General, reproducible, and safe for the affected backends | Open an upstream PR once correctness and performance evidence is complete |
+| Potentially general, but not yet proven across the affected paths | Keep it isolated and clearly experimental while collecting the missing evidence |
+| Model-, quant-, or hardware-specific research | Keep it labelled while incomplete; if it applies to an upstream-supported path, open an upstream PR after validation |
+| Equivalent change already exists upstream | Adopt the upstream implementation and remove the redundant fork delta |
+| Measured regression without a necessary correctness fix | Do not promote it |
+
+Before opening a fork PR:
+
+- check current upstream commits, PRs, and issues so the work is not duplicated;
+- state the upstreamability classification in the PR description;
+- include the exact test commands, hardware/backend, model and quantization,
+  before/after numbers, and correctness evidence;
+- link the upstream PR or issue when one exists, or explain concretely why the
+  change remains fork-only;
+- update [`FORK_NOTES.md`](FORK_NOTES.md) if the fork/upstream boundary changes.
+
+An upstream review may continue while follow-up research proceeds here. If
+upstream later lands an equivalent or better implementation, this fork should
+converge on it rather than preserve a competing version.
+
 Do not send PRs affecting one or more inference backends without checking if the
-resulting code is still correct and fast. The only acceptable regression speed
+resulting code is still correct and fast. The only acceptable speed regression
 is when an important correctness bug is fixed and it requires some speed penalty.
 
 ## Correctness Regression Tests
