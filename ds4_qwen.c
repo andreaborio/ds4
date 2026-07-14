@@ -1,5 +1,7 @@
 #include "ds4_qwen.h"
 
+#include <float.h>
+#include <math.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -252,4 +254,401 @@ uint64_t ds4_qwen35_cpu_cache_allocated_bytes(
         return 0;
     }
     return total_bytes;
+}
+
+static float qwen35_sigmoid(float x) {
+    if (x >= 0.0f) return 1.0f / (1.0f + expf(-x));
+    const float e = expf(x);
+    return e / (1.0f + e);
+}
+
+/* ds4 builds with -ffast-math, which lets the compiler assume that ordinary
+ * isfinite() calls are always true.  Model weights are binary32 on every
+ * supported backend, so inspect the exponent bits for fail-closed guards. */
+static bool qwen35_f32_is_finite(float value) {
+    typedef char qwen35_requires_binary32[
+        sizeof(float) == sizeof(uint32_t) ? 1 : -1];
+    (void)sizeof(qwen35_requires_binary32);
+    uint32_t bits = 0;
+    memcpy(&bits, &value, sizeof(bits));
+    return (bits & UINT32_C(0x7f800000)) != UINT32_C(0x7f800000);
+}
+
+static float qwen35_softplus(float x) {
+    if (x > 20.0f) return x;
+    if (x < -20.0f) return expf(x);
+    return log1pf(expf(x));
+}
+
+bool ds4_qwen35_cpu_causal_conv_step_f32(
+        float       *output,
+        float       *state,
+        const float *input,
+        const float *weight,
+        size_t       n_channel,
+        size_t       kernel) {
+    if (!output || !state || !input || !weight || n_channel == 0 ||
+        kernel < 2 || n_channel > SIZE_MAX / (kernel - 1u) ||
+        n_channel > SIZE_MAX / kernel) {
+        return false;
+    }
+
+    const size_t history_len = kernel - 1u;
+    for (size_t channel = 0; channel < n_channel; channel++) {
+        float *history = state + channel * history_len;
+        const float *filter = weight + channel * kernel;
+        const float current = input[channel];
+        float sum = current * filter[kernel - 1u];
+        for (size_t k = 0; k < history_len; k++) {
+            sum += history[k] * filter[k];
+        }
+        output[channel] = sum * qwen35_sigmoid(sum);
+
+        if (history_len > 1u) {
+            memmove(history, history + 1,
+                    (history_len - 1u) * sizeof(history[0]));
+        }
+        history[history_len - 1u] = current;
+    }
+    return true;
+}
+
+bool ds4_qwen35_cpu_gated_delta_controls_f32(
+        float       *log_decay,
+        float       *beta,
+        const float *alpha_logit,
+        const float *beta_logit,
+        const float *ssm_a,
+        const float *dt_bias,
+        size_t       n_value_head) {
+    if (!log_decay || !beta || !alpha_logit || !beta_logit || !ssm_a ||
+        !dt_bias || n_value_head == 0) {
+        return false;
+    }
+    for (size_t head = 0; head < n_value_head; head++) {
+        beta[head] = qwen35_sigmoid(beta_logit[head]);
+        /* GGUF already stores -exp(A_log); it must not be exponentiated a
+         * second time before scaling the positive timestep. */
+        log_decay[head] = ssm_a[head] *
+            qwen35_softplus(alpha_logit[head] + dt_bias[head]);
+    }
+    return true;
+}
+
+bool ds4_qwen35_cpu_gated_delta_step_f32(
+        float       *output,
+        float       *state,
+        const float *query,
+        const float *key,
+        const float *value,
+        const float *log_decay,
+        const float *beta,
+        size_t       n_key_head,
+        size_t       n_value_head,
+        size_t       key_dim,
+        size_t       value_dim) {
+    if (!output || !state || !query || !key || !value || !log_decay ||
+        !beta || n_key_head == 0 || n_value_head == 0 || key_dim == 0 ||
+        value_dim == 0 || n_value_head % n_key_head != 0 ||
+        key_dim > SIZE_MAX / value_dim ||
+        n_value_head > SIZE_MAX / (key_dim * value_dim)) {
+        return false;
+    }
+
+    const float query_scale = 1.0f / sqrtf((float)key_dim);
+    const size_t state_stride = key_dim * value_dim;
+    for (size_t value_head = 0; value_head < n_value_head; value_head++) {
+        /* The pinned converter tiles V-side quantities.  Modulo is therefore
+         * intentional and differs from the full-attention contiguous GQA map. */
+        const size_t key_head = value_head % n_key_head;
+        const float *q = query + key_head * key_dim;
+        const float *k = key + key_head * key_dim;
+        const float *v = value + value_head * value_dim;
+        float *head_state = state + value_head * state_stride;
+        float *head_output = output + value_head * value_dim;
+
+        float q_square = 0.0f;
+        float k_square = 0.0f;
+        for (size_t i = 0; i < key_dim; i++) {
+            q_square += q[i] * q[i];
+            k_square += k[i] * k[i];
+        }
+        const float q_inv = query_scale / sqrtf(q_square + 1.0e-6f);
+        const float k_inv = 1.0f / sqrtf(k_square + 1.0e-6f);
+        const float decay = expf(log_decay[value_head]);
+        const float step = beta[value_head];
+
+        for (size_t i = 0; i < state_stride; i++) head_state[i] *= decay;
+        for (size_t j = 0; j < value_dim; j++) {
+            float memory = 0.0f;
+            for (size_t i = 0; i < key_dim; i++) {
+                memory += head_state[j * key_dim + i] * (k[i] * k_inv);
+            }
+            const float delta = (v[j] - memory) * step;
+            for (size_t i = 0; i < key_dim; i++) {
+                head_state[j * key_dim + i] += (k[i] * k_inv) * delta;
+            }
+        }
+        for (size_t j = 0; j < value_dim; j++) {
+            float sum = 0.0f;
+            for (size_t i = 0; i < key_dim; i++) {
+                sum += head_state[j * key_dim + i] * (q[i] * q_inv);
+            }
+            head_output[j] = sum;
+        }
+    }
+    return true;
+}
+
+bool ds4_qwen35_cpu_rmsnorm_gated_f32(
+        float       *output,
+        const float *input,
+        const float *gate,
+        const float *weight,
+        size_t       n_vector,
+        size_t       dim,
+        float        epsilon) {
+    if (!output || !input || !gate || !weight || n_vector == 0 || dim == 0 ||
+        !(epsilon > 0.0f) || !qwen35_f32_is_finite(epsilon) ||
+        n_vector > SIZE_MAX / dim) {
+        return false;
+    }
+    for (size_t vector = 0; vector < n_vector; vector++) {
+        const size_t base = vector * dim;
+        float square = 0.0f;
+        for (size_t i = 0; i < dim; i++) {
+            square += input[base + i] * input[base + i];
+        }
+        const float inv_rms = 1.0f / sqrtf(square / (float)dim + epsilon);
+        for (size_t i = 0; i < dim; i++) {
+            output[base + i] = input[base + i] * inv_rms * weight[i] *
+                               (gate[base + i] * qwen35_sigmoid(gate[base + i]));
+        }
+    }
+    return true;
+}
+
+bool ds4_qwen35_cpu_sigmoid_gate_f32(
+        float       *output,
+        const float *input,
+        const float *gate_logit,
+        size_t       n_vector,
+        size_t       dim) {
+    if (!output || !input || !gate_logit || n_vector == 0 || dim == 0 ||
+        n_vector > SIZE_MAX / dim) {
+        return false;
+    }
+    for (size_t vector = 0; vector < n_vector; vector++) {
+        const float gate = qwen35_sigmoid(gate_logit[vector]);
+        for (size_t i = 0; i < dim; i++) {
+            output[vector * dim + i] = input[vector * dim + i] * gate;
+        }
+    }
+    return true;
+}
+
+bool ds4_qwen35_cpu_softmax_top8_f32(
+        int32_t     selected[QWEN35_N_EXPERT_USED],
+        float       selected_weight[QWEN35_N_EXPERT_USED],
+        float       probability[QWEN35_N_EXPERT],
+        const float logits[QWEN35_N_EXPERT]) {
+    if (!selected || !selected_weight || !probability || !logits) return false;
+
+    float maximum = logits[0];
+    if (!qwen35_f32_is_finite(maximum)) return false;
+    for (size_t expert = 1; expert < QWEN35_N_EXPERT; expert++) {
+        if (!qwen35_f32_is_finite(logits[expert])) return false;
+        if (logits[expert] > maximum) maximum = logits[expert];
+    }
+
+    float total = 0.0f;
+    for (size_t expert = 0; expert < QWEN35_N_EXPERT; expert++) {
+        probability[expert] = expf(logits[expert] - maximum);
+        total += probability[expert];
+    }
+    if (!(total > 0.0f) || !qwen35_f32_is_finite(total)) return false;
+    for (size_t expert = 0; expert < QWEN35_N_EXPERT; expert++) {
+        probability[expert] /= total;
+    }
+
+    for (size_t slot = 0; slot < QWEN35_N_EXPERT_USED; slot++) {
+        size_t best = QWEN35_N_EXPERT;
+        for (size_t expert = 0; expert < QWEN35_N_EXPERT; expert++) {
+            bool used = false;
+            for (size_t prior = 0; prior < slot; prior++) {
+                if (selected[prior] == (int32_t)expert) {
+                    used = true;
+                    break;
+                }
+            }
+            if (used) continue;
+            if (best == QWEN35_N_EXPERT ||
+                probability[expert] > probability[best] ||
+                (probability[expert] == probability[best] && expert < best)) {
+                best = expert;
+            }
+        }
+        selected[slot] = (int32_t)best;
+        selected_weight[slot] = probability[best];
+    }
+
+    float selected_total = 0.0f;
+    for (size_t slot = 0; slot < QWEN35_N_EXPERT_USED; slot++) {
+        selected_total += selected_weight[slot];
+    }
+    if (!(selected_total > 0.0f) ||
+        !qwen35_f32_is_finite(selected_total)) return false;
+    for (size_t slot = 0; slot < QWEN35_N_EXPERT_USED; slot++) {
+        selected_weight[slot] /= selected_total;
+    }
+    return true;
+}
+
+bool ds4_qwen35_cpu_split_q_gate_f32(
+        float       *query,
+        float       *gate,
+        const float *projection,
+        size_t       n_query_head,
+        size_t       head_dim) {
+    if (!query || !gate || !projection || n_query_head == 0 || head_dim == 0 ||
+        n_query_head > SIZE_MAX / head_dim ||
+        n_query_head * head_dim > SIZE_MAX / 2u) {
+        return false;
+    }
+    for (size_t head = 0; head < n_query_head; head++) {
+        const size_t projection_base = head * 2u * head_dim;
+        const size_t output_base = head * head_dim;
+        memcpy(query + output_base, projection + projection_base,
+               head_dim * sizeof(query[0]));
+        memcpy(gate + output_base, projection + projection_base + head_dim,
+               head_dim * sizeof(gate[0]));
+    }
+    return true;
+}
+
+bool ds4_qwen35_cpu_head_rms_norm_f32(
+        float       *output,
+        const float *input,
+        const float *weight,
+        size_t       n_head,
+        size_t       head_dim,
+        float        epsilon) {
+    if (!output || !input || !weight || n_head == 0 || head_dim == 0 ||
+        !(epsilon > 0.0f) || !qwen35_f32_is_finite(epsilon) ||
+        n_head > SIZE_MAX / head_dim) {
+        return false;
+    }
+    for (size_t head = 0; head < n_head; head++) {
+        const size_t base = head * head_dim;
+        float square = 0.0f;
+        for (size_t i = 0; i < head_dim; i++) {
+            square += input[base + i] * input[base + i];
+        }
+        const float inv_rms =
+            1.0f / sqrtf(square / (float)head_dim + epsilon);
+        for (size_t i = 0; i < head_dim; i++) {
+            /* The converter already applied the zero-centred norm's +1. */
+            output[base + i] = input[base + i] * inv_rms * weight[i];
+        }
+    }
+    return true;
+}
+
+bool ds4_qwen35_cpu_text_rope_f32(
+        float    *values,
+        uint32_t  position,
+        size_t    n_head,
+        size_t    head_dim,
+        size_t    n_rot,
+        float     theta) {
+    if (!values || n_head == 0 || head_dim == 0 || n_rot == 0 ||
+        n_rot > head_dim || (n_rot & 1u) || !(theta > 0.0f) ||
+        !qwen35_f32_is_finite(theta) || n_head > SIZE_MAX / head_dim) {
+        return false;
+    }
+
+    const size_t half = n_rot / 2u;
+    for (size_t i = 0; i < half; i++) {
+        const float exponent = (2.0f * (float)i) / (float)n_rot;
+        const float angle = (float)position / powf(theta, exponent);
+        const float cosine = cosf(angle);
+        const float sine = sinf(angle);
+        for (size_t head = 0; head < n_head; head++) {
+            float *x = values + head * head_dim;
+            const float a = x[i];
+            const float b = x[i + half];
+            x[i] = a * cosine - b * sine;
+            x[i + half] = b * cosine + a * sine;
+        }
+    }
+    return true;
+}
+
+bool ds4_qwen35_cpu_gqa_decode_f32(
+        float       *output,
+        float       *score,
+        size_t       score_cap,
+        const float *query,
+        const float *key,
+        const float *value,
+        size_t       n_kv,
+        size_t       n_query_head,
+        size_t       n_kv_head,
+        size_t       head_dim) {
+    if (!output || !score || !query || !key || !value || n_kv == 0 ||
+        n_kv > score_cap ||
+        n_query_head == 0 || n_kv_head == 0 || head_dim == 0 ||
+        n_query_head % n_kv_head != 0 ||
+        n_query_head > SIZE_MAX / head_dim ||
+        n_kv_head > SIZE_MAX / head_dim ||
+        n_kv > SIZE_MAX / (n_kv_head * head_dim)) {
+        return false;
+    }
+
+    const size_t query_per_kv = n_query_head / n_kv_head;
+    const size_t kv_stride = n_kv_head * head_dim;
+    const float scale = 1.0f / sqrtf((float)head_dim);
+    for (size_t query_head = 0; query_head < n_query_head; query_head++) {
+        const size_t kv_head = query_head / query_per_kv;
+        const float *q = query + query_head * head_dim;
+        float maximum = -FLT_MAX;
+        for (size_t token = 0; token < n_kv; token++) {
+            const float *k = key + token * kv_stride + kv_head * head_dim;
+            float dot = 0.0f;
+            for (size_t i = 0; i < head_dim; i++) dot += q[i] * k[i];
+            score[token] = dot * scale;
+            if (score[token] > maximum) maximum = score[token];
+        }
+
+        float denominator = 0.0f;
+        for (size_t token = 0; token < n_kv; token++) {
+            score[token] = expf(score[token] - maximum);
+            denominator += score[token];
+        }
+        if (!(denominator > 0.0f) ||
+            !qwen35_f32_is_finite(denominator)) return false;
+
+        float *out = output + query_head * head_dim;
+        memset(out, 0, head_dim * sizeof(out[0]));
+        for (size_t token = 0; token < n_kv; token++) {
+            const float probability = score[token] / denominator;
+            const float *v = value + token * kv_stride + kv_head * head_dim;
+            for (size_t i = 0; i < head_dim; i++) {
+                out[i] += probability * v[i];
+            }
+        }
+    }
+    return true;
+}
+
+bool ds4_qwen35_cpu_sigmoid_gate_elements_f32(
+        float       *output,
+        const float *input,
+        const float *gate_logit,
+        size_t       n_value) {
+    if (!output || !input || !gate_logit || n_value == 0) return false;
+    for (size_t i = 0; i < n_value; i++) {
+        output[i] = input[i] * qwen35_sigmoid(gate_logit[i]);
+    }
+    return true;
 }

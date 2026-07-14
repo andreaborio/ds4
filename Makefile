@@ -11,6 +11,9 @@ endif
 DEBUG_FLAGS ?= -g
 CFLAGS ?= -O3 -ffast-math $(DEBUG_FLAGS) $(NATIVE_CPU_FLAG) -Wall -Wextra -std=c99
 OBJCFLAGS ?= -O3 -ffast-math $(DEBUG_FLAGS) $(NATIVE_CPU_FLAG) -Wall -Wextra -fobjc-arc
+# Qwen's stable softmax rejects non-finite logits; retain that branch while
+# keeping the remaining fast-math optimizations used by the scalar CPU path.
+QWEN_CFLAGS ?= -fno-finite-math-only
 DEPFLAGS ?= -MMD -MP
 
 BUILD_GIT_SHA ?= $(shell git rev-parse --short=12 HEAD 2>/dev/null || echo unknown)
@@ -161,6 +164,14 @@ $(CPU_OBJDIR)/ds4_build.o: ds4_build.c ds4.h FORCE
 	@mkdir -p "$(@D)"
 	$(CC) $(CFLAGS) -DDS4_NO_GPU $(DEPFLAGS) -c -o $@ $<
 
+$(METAL_OBJDIR)/ds4_qwen.o: ds4_qwen.c ds4_qwen.h
+	@mkdir -p "$(@D)"
+	$(CC) $(CFLAGS) $(QWEN_CFLAGS) $(DEPFLAGS) -c -o $@ $<
+
+$(CPU_OBJDIR)/ds4_qwen.o: ds4_qwen.c ds4_qwen.h
+	@mkdir -p "$(@D)"
+	$(CC) $(CFLAGS) $(QWEN_CFLAGS) -DDS4_NO_GPU $(DEPFLAGS) -c -o $@ $<
+
 $(METAL_OBJDIR)/ds4_metal.o: ds4_metal.m ds4_gpu.h $(METAL_SRCS)
 	@mkdir -p "$(@D)"
 	$(CC) $(OBJCFLAGS) $(DEPFLAGS) -c -o $@ ds4_metal.m
@@ -182,12 +193,12 @@ $(METAL_OBJDIR)/test_ssd_residency.o: tests/test_ssd_residency.c
 	$(CC) $(CFLAGS) $(DEPFLAGS) -I. -c -o $@ $<
 
 $(METAL_OBJDIR)/test_qwen_gdn_ref.o: tests/test_qwen_gdn_ref.c ds4_qwen_ref.h \
-		tests/qwen/qwen36_gdn_golden.inc
+		ds4_qwen.h tests/qwen/qwen36_gdn_golden.inc
 	@mkdir -p "$(@D)"
 	$(CC) -O2 -Wall -Wextra -std=c99 $(DEPFLAGS) -I. -c -o $@ $<
 
 $(METAL_OBJDIR)/test_qwen_attention_ref.o: tests/test_qwen_attention_ref.c \
-		ds4_qwen_ref.h tests/qwen/qwen36_attention_golden.inc
+		ds4_qwen_ref.h ds4_qwen.h tests/qwen/qwen36_attention_golden.inc
 	@mkdir -p "$(@D)"
 	$(CC) -O2 -Wall -Wextra -std=c99 $(DEPFLAGS) -I. -c -o $@ $<
 
@@ -222,19 +233,21 @@ $(METAL_BINDIR)/test_ssd_residency: \
 	$(CC) $(CFLAGS) -o $@ $^ $(LDLIBS)
 
 $(METAL_BINDIR)/test_qwen_gdn_ref: \
-	$(METAL_OBJDIR)/test_qwen_gdn_ref.o $(METAL_OBJDIR)/ds4_qwen_ref.o
+		$(METAL_OBJDIR)/test_qwen_gdn_ref.o $(METAL_OBJDIR)/ds4_qwen_ref.o \
+		$(METAL_OBJDIR)/ds4_qwen.o
 	@mkdir -p "$(@D)"
 	$(CC) -O2 -o $@ $^ -lm
 
 $(METAL_BINDIR)/test_qwen_attention_ref: \
-	$(METAL_OBJDIR)/test_qwen_attention_ref.o $(METAL_OBJDIR)/ds4_qwen_ref.o
+		$(METAL_OBJDIR)/test_qwen_attention_ref.o $(METAL_OBJDIR)/ds4_qwen_ref.o \
+		$(METAL_OBJDIR)/ds4_qwen.o
 	@mkdir -p "$(@D)"
 	$(CC) -O2 -o $@ $^ -lm
 
 $(METAL_BINDIR)/test_qwen_state: \
 	$(METAL_OBJDIR)/test_qwen_state.o $(METAL_OBJDIR)/ds4_qwen.o
 	@mkdir -p "$(@D)"
-	$(CC) -O2 -o $@ $^
+	$(CC) -O2 -o $@ $^ -lm
 
 # Preserve the documented direct test-runner commands without letting a CPU
 # target publish over them.
@@ -383,7 +396,7 @@ ds4_ssd.o: ds4_ssd.c ds4_ssd.h
 	$(CC) $(CFLAGS) -c -o $@ ds4_ssd.c
 
 ds4_qwen.o: ds4_qwen.c ds4_qwen.h
-	$(CC) $(CFLAGS) -c -o $@ ds4_qwen.c
+	$(CC) $(CFLAGS) $(QWEN_CFLAGS) -c -o $@ ds4_qwen.c
 
 ds4_cli.o: ds4_cli.c ds4.h ds4_ssd.h ds4_distributed.h ds4_help.h linenoise.h
 	$(CC) $(CFLAGS) -c -o $@ ds4_cli.c
@@ -489,19 +502,20 @@ q4k-dot-test: tests/test_q4k_dot.c
 qwen-metadata-test: ds4 tests/test_qwen_metadata.py
 	python3 tests/test_qwen_metadata.py ./ds4
 
-tests/test_qwen_gdn_ref: tests/test_qwen_gdn_ref.c ds4_qwen_ref.c \
-		ds4_qwen_ref.h tests/qwen/qwen36_gdn_golden.inc
+tests/test_qwen_gdn_ref: tests/test_qwen_gdn_ref.c ds4_qwen_ref.c ds4_qwen.c \
+		ds4_qwen_ref.h ds4_qwen.h tests/qwen/qwen36_gdn_golden.inc
 	$(CC) -O2 -Wall -Wextra -std=c99 -I. -o $@ \
-		tests/test_qwen_gdn_ref.c ds4_qwen_ref.c -lm
+		tests/test_qwen_gdn_ref.c ds4_qwen_ref.c ds4_qwen.c -lm
 
 tests/test_qwen_attention_ref: tests/test_qwen_attention_ref.c ds4_qwen_ref.c \
-		ds4_qwen_ref.h tests/qwen/qwen36_attention_golden.inc
+		ds4_qwen.c ds4_qwen_ref.h ds4_qwen.h \
+		tests/qwen/qwen36_attention_golden.inc
 	$(CC) -O2 -Wall -Wextra -std=c99 -I. -o $@ \
-		tests/test_qwen_attention_ref.c ds4_qwen_ref.c -lm
+		tests/test_qwen_attention_ref.c ds4_qwen_ref.c ds4_qwen.c -lm
 
 tests/test_qwen_state: tests/test_qwen_state.c ds4_qwen.c ds4_qwen.h
 	$(CC) -O2 -Wall -Wextra -std=c99 -I. -o $@ \
-		tests/test_qwen_state.c ds4_qwen.c
+		tests/test_qwen_state.c ds4_qwen.c -lm
 
 qwen-reference-test: tests/test_qwen_gdn_ref tests/test_qwen_attention_ref
 	python3 tests/qwen/collect_gdn_reference.py --check

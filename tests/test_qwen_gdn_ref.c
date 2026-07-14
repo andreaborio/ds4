@@ -1,4 +1,5 @@
 #include "ds4_qwen_ref.h"
+#include "ds4_qwen.h"
 
 #include <math.h>
 #include <stdio.h>
@@ -37,6 +38,41 @@ static int test_causal_conv(void) {
                     N_OUT, 2.0e-6f) ||
         check_close("conv state", state, qwen_ref_conv_state,
                     N_STATE, 2.0e-6f)) {
+        return 1;
+    }
+
+    float production_output[N_OUT] = {0};
+    float production_state[N_STATE] = {0};
+    for (size_t token = 0; token < QWEN_REF_N_TOKEN; token++) {
+        if (!ds4_qwen35_cpu_causal_conv_step_f32(
+                production_output + token * QWEN_REF_N_CHANNEL,
+                production_state,
+                qwen_ref_conv_input + token * QWEN_REF_N_CHANNEL,
+                qwen_ref_conv_weight,
+                QWEN_REF_N_CHANNEL,
+                QWEN_REF_KERNEL)) {
+            return 1;
+        }
+    }
+    if (check_close("production conv output", production_output,
+                    qwen_ref_conv_output, N_OUT, 2.0e-6f) ||
+        check_close("production conv state", production_state,
+                    qwen_ref_conv_state, N_STATE, 2.0e-6f)) {
+        return 1;
+    }
+    float inplace_output[N_OUT];
+    float inplace_state[N_STATE] = {0};
+    memcpy(inplace_output, qwen_ref_conv_input, sizeof(inplace_output));
+    for (size_t token = 0; token < QWEN_REF_N_TOKEN; token++) {
+        float *row = inplace_output + token * QWEN_REF_N_CHANNEL;
+        if (!ds4_qwen35_cpu_causal_conv_step_f32(
+                row, inplace_state, row, qwen_ref_conv_weight,
+                QWEN_REF_N_CHANNEL, QWEN_REF_KERNEL)) {
+            return 1;
+        }
+    }
+    if (check_close("in-place production conv", inplace_output,
+                    qwen_ref_conv_output, N_OUT, 2.0e-6f)) {
         return 1;
     }
 
@@ -94,6 +130,62 @@ static int test_gated_delta(void) {
         return 1;
     }
 
+    float production_output[N_OUT] = {0};
+    float production_state[N_STATE];
+    memcpy(production_state, qwen_ref_initial_state,
+           sizeof(production_state));
+    for (size_t token = 0; token < QWEN_REF_N_TOKEN; token++) {
+        if (!ds4_qwen35_cpu_gated_delta_step_f32(
+                production_output +
+                    token * QWEN_REF_N_VALUE_HEAD * QWEN_REF_VALUE_DIM,
+                production_state,
+                qwen_ref_query +
+                    token * QWEN_REF_N_KEY_HEAD * QWEN_REF_KEY_DIM,
+                qwen_ref_key +
+                    token * QWEN_REF_N_KEY_HEAD * QWEN_REF_KEY_DIM,
+                qwen_ref_value +
+                    token * QWEN_REF_N_VALUE_HEAD * QWEN_REF_VALUE_DIM,
+                qwen_ref_log_decay + token * QWEN_REF_N_VALUE_HEAD,
+                qwen_ref_beta + token * QWEN_REF_N_VALUE_HEAD,
+                QWEN_REF_N_KEY_HEAD,
+                QWEN_REF_N_VALUE_HEAD,
+                QWEN_REF_KEY_DIM,
+                QWEN_REF_VALUE_DIM)) {
+            return 1;
+        }
+    }
+    if (check_close("production delta output", production_output,
+                    qwen_ref_delta_output, N_OUT, 3.0e-6f) ||
+        check_close("production delta state", production_state,
+                    qwen_ref_delta_state, N_STATE, 3.0e-6f)) {
+        return 1;
+    }
+    float inplace_value[N_OUT];
+    float inplace_state[N_STATE];
+    memcpy(inplace_value, qwen_ref_value, sizeof(inplace_value));
+    memcpy(inplace_state, qwen_ref_initial_state, sizeof(inplace_state));
+    for (size_t token = 0; token < QWEN_REF_N_TOKEN; token++) {
+        float *row = inplace_value +
+            token * QWEN_REF_N_VALUE_HEAD * QWEN_REF_VALUE_DIM;
+        if (!ds4_qwen35_cpu_gated_delta_step_f32(
+                row, inplace_state,
+                qwen_ref_query +
+                    token * QWEN_REF_N_KEY_HEAD * QWEN_REF_KEY_DIM,
+                qwen_ref_key +
+                    token * QWEN_REF_N_KEY_HEAD * QWEN_REF_KEY_DIM,
+                row,
+                qwen_ref_log_decay + token * QWEN_REF_N_VALUE_HEAD,
+                qwen_ref_beta + token * QWEN_REF_N_VALUE_HEAD,
+                QWEN_REF_N_KEY_HEAD, QWEN_REF_N_VALUE_HEAD,
+                QWEN_REF_KEY_DIM, QWEN_REF_VALUE_DIM)) {
+            return 1;
+        }
+    }
+    if (check_close("in-place production delta", inplace_value,
+                    qwen_ref_delta_output, N_OUT, 3.0e-6f)) {
+        return 1;
+    }
+
     /* Decode and arbitrary prefill chunks must preserve the same recurrent
      * boundary.  This is the invariant used by prefix reuse and checkpoints. */
     for (size_t first = 1; first < QWEN_REF_N_TOKEN; first++) {
@@ -119,8 +211,29 @@ static int test_gated_delta_controls(void) {
         log_decay, beta, qwen_ref_alpha_logit, qwen_ref_beta_logit,
         qwen_ref_ssm_a, qwen_ref_dt_bias,
         QWEN_REF_N_TOKEN, QWEN_REF_N_VALUE_HEAD);
-    return check_close("log decay", log_decay, qwen_ref_log_decay, N, 2.0e-6f) ||
-           check_close("beta", beta, qwen_ref_beta, N, 2.0e-6f);
+    if (check_close("log decay", log_decay, qwen_ref_log_decay, N, 2.0e-6f) ||
+        check_close("beta", beta, qwen_ref_beta, N, 2.0e-6f)) {
+        return 1;
+    }
+
+    float production_decay[N];
+    float production_beta[N];
+    for (size_t token = 0; token < QWEN_REF_N_TOKEN; token++) {
+        if (!ds4_qwen35_cpu_gated_delta_controls_f32(
+                production_decay + token * QWEN_REF_N_VALUE_HEAD,
+                production_beta + token * QWEN_REF_N_VALUE_HEAD,
+                qwen_ref_alpha_logit + token * QWEN_REF_N_VALUE_HEAD,
+                qwen_ref_beta_logit + token * QWEN_REF_N_VALUE_HEAD,
+                qwen_ref_ssm_a,
+                qwen_ref_dt_bias,
+                QWEN_REF_N_VALUE_HEAD)) {
+            return 1;
+        }
+    }
+    return check_close("production log decay", production_decay,
+                       qwen_ref_log_decay, N, 2.0e-6f) ||
+           check_close("production beta", production_beta,
+                       qwen_ref_beta, N, 2.0e-6f);
 }
 
 static int test_rmsnorm_gate(void) {
@@ -133,7 +246,31 @@ static int test_rmsnorm_gate(void) {
         QWEN_REF_N_TOKEN * QWEN_REF_N_VALUE_HEAD,
         QWEN_REF_VALUE_DIM,
         1.0e-6f);
-    return check_close("gated RMSNorm", output, qwen_ref_gated_output,
+    if (check_close("gated RMSNorm", output, qwen_ref_gated_output,
+                    sizeof(output) / sizeof(output[0]), 3.0e-6f)) {
+        return 1;
+    }
+    if (!ds4_qwen35_cpu_rmsnorm_gated_f32(
+            output, qwen_ref_delta_output, qwen_ref_gate,
+            qwen_ref_norm_weight,
+            QWEN_REF_N_TOKEN * QWEN_REF_N_VALUE_HEAD,
+            QWEN_REF_VALUE_DIM, 1.0e-6f)) {
+        return 1;
+    }
+    if (check_close("production gated RMSNorm", output,
+                    qwen_ref_gated_output,
+                    sizeof(output) / sizeof(output[0]), 3.0e-6f)) {
+        return 1;
+    }
+    memcpy(output, qwen_ref_delta_output, sizeof(output));
+    if (!ds4_qwen35_cpu_rmsnorm_gated_f32(
+            output, output, qwen_ref_gate, qwen_ref_norm_weight,
+            QWEN_REF_N_TOKEN * QWEN_REF_N_VALUE_HEAD,
+            QWEN_REF_VALUE_DIM, 1.0e-6f)) {
+        return 1;
+    }
+    return check_close("in-place production gated RMSNorm", output,
+                       qwen_ref_gated_output,
                        sizeof(output) / sizeof(output[0]), 3.0e-6f);
 }
 
@@ -141,9 +278,14 @@ static int test_invalid_geometry(void) {
     float output[1] = {0};
     float state[1] = {0};
     float input[1] = {0};
-    return ds4_qwen_ref_gated_delta_rule_f32(
+    if (ds4_qwen_ref_gated_delta_rule_f32(
         output, state, input, input, input, input, input,
-        1, 2, 3, 1, 1) ? 1 : 0;
+        1, 2, 3, 1, 1)) {
+        return 1;
+    }
+    return ds4_qwen35_cpu_gated_delta_step_f32(
+        output, state, input, input, input, input, input,
+        2, 3, 1, 1) ? 1 : 0;
 }
 
 static void fill_router_logits(float logits[256]) {
@@ -163,6 +305,7 @@ static int test_router(void) {
     float logits[256];
     int32_t selected[8];
     float weight[8];
+    float probability[QWEN35_N_EXPERT];
     fill_router_logits(logits);
     if (!ds4_qwen_ref_softmax_topk_f32(selected, weight, logits, 256, 8)) return 1;
     for (size_t i = 0; i < 8; i++) {
@@ -175,15 +318,39 @@ static int test_router(void) {
     if (check_close("router weight", weight, qwen_ref_router_weight, 8, 2.0e-6f)) {
         return 1;
     }
+    if (!ds4_qwen35_cpu_softmax_top8_f32(
+            selected, weight, probability, logits)) {
+        fprintf(stderr, "qwen production router rejected golden logits\n");
+        return 1;
+    }
+    for (size_t i = 0; i < QWEN35_N_EXPERT_USED; i++) {
+        if (selected[i] != qwen_ref_router_id[i]) return 1;
+    }
+    if (check_close("production router weight", weight,
+                    qwen_ref_router_weight,
+                    QWEN35_N_EXPERT_USED, 2.0e-6f)) {
+        return 1;
+    }
     for (int i = 0; i < 256; i++) logits[i] = -100.0f;
     for (int i = 0; i < 8; i++) logits[i] = 100.0f - (float)i;
     if (!ds4_qwen_ref_softmax_topk_f32(selected, weight, logits, 256, 8)) return 1;
+    if (!ds4_qwen35_cpu_softmax_top8_f32(
+            selected, weight, probability, logits)) {
+        fprintf(stderr, "qwen production router rejected extreme finite logits\n");
+        return 1;
+    }
     float total = 0.0f;
     for (int i = 0; i < 8; i++) {
-        if (selected[i] != i || !isfinite(weight[i])) return 1;
+        if (selected[i] != i || !isfinite(weight[i])) {
+            fprintf(stderr, "qwen production router extreme result is invalid\n");
+            return 1;
+        }
         total += weight[i];
     }
-    if (fabsf(total - 1.0f) > 1.0e-6f) return 1;
+    if (fabsf(total - 1.0f) > 1.0e-6f) {
+        fprintf(stderr, "qwen production router weights do not sum to one\n");
+        return 1;
+    }
     if (ds4_qwen_ref_softmax_topk_f32(
             selected, weight, logits, 7, 8)) {
         return 1;
@@ -199,6 +366,30 @@ static int test_router(void) {
         fprintf(stderr, "qwen-ref: router tie policy is not deterministic\n");
         return 1;
     }
+    if (!ds4_qwen35_cpu_softmax_top8_f32(
+            selected, weight, probability, logits) ||
+        selected[6] != 17 || selected[7] != 19) {
+        fprintf(stderr, "qwen production router tie policy is not deterministic\n");
+        return 1;
+    }
+    logits[0] = NAN;
+    if (ds4_qwen35_cpu_softmax_top8_f32(
+            selected, weight, probability, logits)) {
+        fprintf(stderr, "qwen production router accepted NaN\n");
+        return 1;
+    }
+    logits[0] = INFINITY;
+    if (ds4_qwen35_cpu_softmax_top8_f32(
+            selected, weight, probability, logits)) {
+        fprintf(stderr, "qwen production router accepted +Inf\n");
+        return 1;
+    }
+    logits[0] = -INFINITY;
+    if (ds4_qwen35_cpu_softmax_top8_f32(
+            selected, weight, probability, logits)) {
+        fprintf(stderr, "qwen production router accepted -Inf\n");
+        return 1;
+    }
     return 0;
 }
 
@@ -208,23 +399,47 @@ static int test_shared_expert_gate(void) {
     ds4_qwen_ref_sigmoid_gate_f32(
         output, qwen_ref_shared_input, qwen_ref_shared_gate_logit,
         N_VECTOR, DIM);
-    return check_close("shared expert gate", output, qwen_ref_shared_output,
-                       N_VECTOR * DIM, 2.0e-6f);
+    if (check_close("shared expert gate", output, qwen_ref_shared_output,
+                    N_VECTOR * DIM, 2.0e-6f)) {
+        return 1;
+    }
+    if (!ds4_qwen35_cpu_sigmoid_gate_f32(
+            output, qwen_ref_shared_input, qwen_ref_shared_gate_logit,
+            N_VECTOR, DIM)) {
+        return 1;
+    }
+    if (check_close("production shared expert gate", output,
+                    qwen_ref_shared_output, N_VECTOR * DIM, 2.0e-6f)) {
+        return 1;
+    }
+    memcpy(output, qwen_ref_shared_input, sizeof(output));
+    if (!ds4_qwen35_cpu_sigmoid_gate_f32(
+            output, output, qwen_ref_shared_gate_logit, N_VECTOR, DIM)) {
+        return 1;
+    }
+    return check_close("in-place production shared expert gate", output,
+                       qwen_ref_shared_output, N_VECTOR * DIM, 2.0e-6f);
 }
 
 int main(void) {
     int failed = 0;
-    failed += test_causal_conv();
-    failed += test_gated_delta();
-    failed += test_gated_delta_controls();
-    failed += test_rmsnorm_gate();
-    failed += test_invalid_geometry();
-    failed += test_router();
-    failed += test_shared_expert_gate();
+#define RUN_TEST(test) do {                                                  \
+    const int rc = test();                                                   \
+    if (rc != 0) fprintf(stderr, "qwen test failed: %s\n", #test);          \
+    failed += rc;                                                            \
+} while (0)
+    RUN_TEST(test_causal_conv);
+    RUN_TEST(test_gated_delta);
+    RUN_TEST(test_gated_delta_controls);
+    RUN_TEST(test_rmsnorm_gate);
+    RUN_TEST(test_invalid_geometry);
+    RUN_TEST(test_router);
+    RUN_TEST(test_shared_expert_gate);
+#undef RUN_TEST
     if (failed != 0) {
-        fprintf(stderr, "qwen reference tests: FAIL (%d)\n", failed);
+        fprintf(stderr, "qwen reference/production tests: FAIL (%d)\n", failed);
         return 1;
     }
-    printf("qwen reference tests: OK\n");
+    printf("qwen reference/production tests: OK\n");
     return 0;
 }

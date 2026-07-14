@@ -131,7 +131,8 @@ enum {
     DS4_MAX_LORA_Q           = 1536,
     DS4_MAX_LORA_O           = 1024,
     DS4_MAX_EXPERT           = 384,
-    DS4_MAX_EXPERT_USED      = 6,
+    /* Host-side expert kernels also serve Qwen top-8; DeepSeek stays top-6. */
+    DS4_MAX_EXPERT_USED      = 8,
     DS4_MAX_EXPERT_SHARED    = 1,
     DS4_MAX_FF_EXP           = 3072,
     DS4_MAX_HASH_LAYER       = 3,
@@ -6279,7 +6280,7 @@ static void matvec_iq2_xxs_experts_mid_prequant(
         int               n_expert,
         float             clamp) {
     if (gate_w->type != 16 || up_w->type != 16) ds4_die("expected IQ2_XXS expert tensors");
-    if (n_expert < 1 || (uint32_t)n_expert > DS4_N_EXPERT_USED) ds4_die("unexpected routed expert count");
+    if (n_expert < 1 || (uint32_t)n_expert > DS4_MAX_EXPERT_USED) ds4_die("unexpected routed expert count");
 
     uint64_t in_dim0 = 0;
     uint64_t out_dim0 = 0;
@@ -6393,7 +6394,7 @@ static void matvec_q2_k_experts_accum_prequant(
         const int        *selected,
         int               n_expert) {
     if (w->type != 10) ds4_die("expected a Q2_K expert tensor");
-    if (n_expert < 1 || (uint32_t)n_expert > DS4_N_EXPERT_USED) ds4_die("unexpected routed expert count");
+    if (n_expert < 1 || (uint32_t)n_expert > DS4_MAX_EXPERT_USED) ds4_die("unexpected routed expert count");
 
     uint64_t in_dim0 = 0;
     uint64_t out_dim0 = 0;
@@ -6630,7 +6631,7 @@ static void matvec_q4_k_experts_mid_prequant(
         float             clamp) {
     if (gate_w->type != DS4_TENSOR_Q4_K || up_w->type != DS4_TENSOR_Q4_K)
         ds4_die("expected Q4_K expert tensors");
-    if (n_expert < 1 || (uint32_t)n_expert > DS4_N_EXPERT_USED) ds4_die("unexpected routed expert count");
+    if (n_expert < 1 || (uint32_t)n_expert > DS4_MAX_EXPERT_USED) ds4_die("unexpected routed expert count");
 
     uint64_t in_dim0 = 0;
     uint64_t out_dim0 = 0;
@@ -6698,7 +6699,7 @@ static void matvec_q4_k_experts_accum_prequant(
         const int        *selected,
         int               n_expert) {
     if (w->type != DS4_TENSOR_Q4_K) ds4_die("expected a Q4_K expert tensor");
-    if (n_expert < 1 || (uint32_t)n_expert > DS4_N_EXPERT_USED) ds4_die("unexpected routed expert count");
+    if (n_expert < 1 || (uint32_t)n_expert > DS4_MAX_EXPERT_USED) ds4_die("unexpected routed expert count");
 
     uint64_t in_dim0 = 0;
     uint64_t out_dim0 = 0;

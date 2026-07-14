@@ -98,4 +98,104 @@ bool ds4_qwen35_cpu_cache_advance(
 uint64_t ds4_qwen35_cpu_cache_allocated_bytes(
         const ds4_qwen35_cpu_cache *cache);
 
+/* Allocation-free post-projection CPU operators.  Dimensions are explicit so
+ * the model-free tests can compare the production path with small independent
+ * fixtures; the runtime calls them with the fixed Qwen3.6 geometry above.
+ * Conv output may alias input, delta output may alias value, and both gated
+ * operators may alias input. */
+bool ds4_qwen35_cpu_causal_conv_step_f32(
+        float       *output,
+        float       *state,
+        const float *input,
+        const float *weight,
+        size_t       n_channel,
+        size_t       kernel);
+
+bool ds4_qwen35_cpu_gated_delta_controls_f32(
+        float       *log_decay,
+        float       *beta,
+        const float *alpha_logit,
+        const float *beta_logit,
+        const float *ssm_a,
+        const float *dt_bias,
+        size_t       n_value_head);
+
+bool ds4_qwen35_cpu_gated_delta_step_f32(
+        float       *output,
+        float       *state,
+        const float *query,
+        const float *key,
+        const float *value,
+        const float *log_decay,
+        const float *beta,
+        size_t       n_key_head,
+        size_t       n_value_head,
+        size_t       key_dim,
+        size_t       value_dim);
+
+bool ds4_qwen35_cpu_rmsnorm_gated_f32(
+        float       *output,
+        const float *input,
+        const float *gate,
+        const float *weight,
+        size_t       n_vector,
+        size_t       dim,
+        float        epsilon);
+
+bool ds4_qwen35_cpu_sigmoid_gate_f32(
+        float       *output,
+        const float *input,
+        const float *gate_logit,
+        size_t       n_vector,
+        size_t       dim);
+
+bool ds4_qwen35_cpu_softmax_top8_f32(
+        int32_t     selected[QWEN35_N_EXPERT_USED],
+        float       selected_weight[QWEN35_N_EXPERT_USED],
+        float       probability[QWEN35_N_EXPERT],
+        const float logits[QWEN35_N_EXPERT]);
+
+bool ds4_qwen35_cpu_split_q_gate_f32(
+        float       *query,
+        float       *gate,
+        const float *projection,
+        size_t       n_query_head,
+        size_t       head_dim);
+
+bool ds4_qwen35_cpu_head_rms_norm_f32(
+        float       *output,
+        const float *input,
+        const float *weight,
+        size_t       n_head,
+        size_t       head_dim,
+        float        epsilon);
+
+bool ds4_qwen35_cpu_text_rope_f32(
+        float    *values,
+        uint32_t  position,
+        size_t    n_head,
+        size_t    head_dim,
+        size_t    n_rot,
+        float     theta);
+
+/* Decode one query row against cache rows [0, n_kv).  score may be reused for
+ * every query head.  Projection/input/output buffers must not overlap. */
+bool ds4_qwen35_cpu_gqa_decode_f32(
+        float       *output,
+        float       *score,
+        size_t       score_cap,
+        const float *query,
+        const float *key,
+        const float *value,
+        size_t       n_kv,
+        size_t       n_query_head,
+        size_t       n_kv_head,
+        size_t       head_dim);
+
+bool ds4_qwen35_cpu_sigmoid_gate_elements_f32(
+        float       *output,
+        const float *input,
+        const float *gate_logit,
+        size_t       n_value);
+
 #endif
