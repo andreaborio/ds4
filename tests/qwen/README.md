@@ -20,8 +20,25 @@ uv run \
 
 Verify a checked-in fixture against the pinned source with the same command and
 `--check`.  This networked collector is not part of `make model-free-test`;
-the eventual C tokenizer tests consume the frozen JSON without contacting the
-Hub.
+the C tokenizer tests consume the frozen data without contacting the Hub.
+
+`qwen36_tokenizer_fixture.inc` is the compact C closure of those golden cases:
+the required final symbols, every ranked merge candidate encountered on the
+official path, and all expected token IDs.  Keeping every candidate is
+intentional; a fixture containing only winning merges would not catch a BPE
+implementation that ignores rank.  Regenerate or verify it against the pinned
+`tokenizer.json` with:
+
+```sh
+TOK=/path/to/Qwen3.6-35B-A3B/tokenizer.json
+uv run --with 'tokenizers==0.22.2' \
+  python tests/qwen/collect_tokenizer_fixture.py \
+  --tokenizer-json "$TOK" --check
+```
+
+Cases containing literal added tokens are marked as trusted text.  Production
+user-text tokenization must keep treating the same bytes as data; only a
+trusted, already-rendered chat prompt may turn them into control IDs.
 
 `qwen36_gdn_golden.inc` is a small scalar Gated DeltaNet oracle derived from
 the official Transformers fallback equations after GGUF conversion.  It
