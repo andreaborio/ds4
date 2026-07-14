@@ -295,18 +295,18 @@ DS4_MOE_RECORD_SELECTED_IDS="$OUT/selected-ids.bin" \
     > "$OUT/stdout.log" 2> "$OUT/stderr.log"
 ```
 
-At runtime build `8ea5e6dc8252` on an Apple M5 Pro with 64 GiB unified memory,
+At runtime build `04fb4cc2a3e8` on an Apple M5 Pro with 64 GiB unified memory,
 this command completed a real Metal graph and
 SSD-selected-expert forward.  The backend recorded 40 routed-MoE selections,
 320 cold misses, 0.53 GiB of logical expert `pread` demand, no non-finite
 logits, and argmax token 846 (`user`) at 25.9613953.  The confirmatory rerun
-completed in 0.26 s and `/usr/bin/time -l` reported 704,069,632 bytes maximum
+completed in 0.29 s and `/usr/bin/time -l` reported 704,495,616 bytes maximum
 RSS and zero swap.  The OS page cache was not flushed after preceding model
 runs, so this timing is correctness/footprint evidence, not a cold-start
 benchmark.
 
 The Metal vector was compared offline over all 248,077 non-padding IDs with a
-CPU vector captured from the same `8ea5e6dc8252` runtime build and the pinned
+CPU vector captured from the same `04fb4cc2a3e8` runtime build and the pinned
 llama.cpp oracle described above.  llama.cpp was pinned to
 `bf2c86ddc0685f580595954056c2e77ebabfab4f`.
 
@@ -342,7 +342,7 @@ DS4_MOE_RECORD_SELECTED_IDS="$OUT/selected-ids.bin" \
     > "$OUT/stdout.log" 2> "$OUT/stderr.log"
 ```
 
-At runtime build `8ea5e6dc8252` on the same M5 Pro 64 GiB machine, the prompt
+At runtime build `04fb4cc2a3e8` on the same M5 Pro 64 GiB machine, the prompt
 contained 43 tokens and the 96-token cap produced a complete iterative
 `fibonacci(n)` implementation through `return curr`.  The closing Markdown
 fence was not emitted before the cap; this is recorded as truncation, not
@@ -364,8 +364,8 @@ DS4_QWEN_EXPERIMENTAL_CPU=1 \
 
 | Backend | Prefill | Generation | Wall | Maximum RSS |
 | --- | ---: | ---: | ---: | ---: |
-| Metal + SSD, cache 640 | 19.63 t/s | 19.75 t/s | 7.14 s | 1,276,821,504 B |
-| DS4 CPU reference | 27.45 t/s | 26.83 t/s | 5.33 s | 13,585,793,024 B |
+| Metal + SSD, cache 640 | 19.43 t/s | 19.94 t/s | 7.14 s | 1,276,952,576 B |
+| DS4 CPU reference | 27.20 t/s | 27.09 t/s | 5.32 s | 13,585,743,872 B |
 
 These post-rebase confirmations followed earlier model runs without flushing
 the macOS page cache; `--ssd-streaming-cold` clears DS4's expert cache, not the
@@ -393,22 +393,22 @@ The normalized GGUF used by both model-backed runs has SHA-256
 `c33efb67bde86c9ba1f9e79c2dc42627170963bef0e915ab9b91a55cfb6d0fcd`.
 The post-rebase runtime-build evidence bundle used to prepare this record was
 kept outside the worktree at
-`../qwen36-ds4-artifact/logs/metal-ssd-final-8ea5e6d/`.
+`../qwen36-ds4-artifact/logs/metal-ssd-final-04fb4cc/`.
 It is intentionally not committed because it contains model-run artifacts.
 Its primary files have these hashes:
 
 - `metal-logits.json`:
   `decc87665fc08665946d296d0936a5c89913511cb88098f805fd6587b61d450c`;
 - `stderr.log`:
-  `bf438bf8b60754de42a664e87ccee1f893a7095f70a9b0da9de198f9d0396a35`;
+  `98267a0ec5e62c46b294fbb0961ebcaf425b64e7f0ac2ff4e371ca475773e204`;
 - `coding-640-n96.stdout.log`:
   `a650b56ceb47dc8715f87c125c7eeab506bc4a510512cedbd190e38c46df5f33`;
 - `coding-640-n96.stderr.log`:
-  `1d5188d890b807ecf279adf76ec72d62044536b58f3bd8b2ff9f3620f3bb3b37`;
+  `420dcf20d2c0139417c443419e2f550dbe6b26edcbbf30e3ab3d7186972f70af`;
 - `coding-cpu-n96.stdout.log`:
   `a650b56ceb47dc8715f87c125c7eeab506bc4a510512cedbd190e38c46df5f33`;
 - `coding-cpu-n96.stderr.log`:
-  `d11b8356c8eefce276574e39297126bb1f39b23f988ed7c402068638df5b98ca`.
+  `d873b429fc4aa373e7a3c78ca156f00244a968a71d1b166f97cb8369c9f9376b`.
 
 Both measurements are from an M5 Pro with 64 GiB unified memory.  They do not
 prove operation on a physical 16 GiB Mac.  Prefill is scalar
