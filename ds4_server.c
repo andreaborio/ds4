@@ -219,6 +219,8 @@ static bool json_u16(const char **p, uint32_t *out) {
 }
 
 static bool json_string(const char **p, char **out) {
+    if (!out) return false;
+    *out = NULL;
     json_ws(p);
     if (**p != '"') return false;
     (*p)++;
@@ -252,6 +254,10 @@ static bool json_string(const char **p, char **out) {
                     cp = 0xfffd;
                 }
             }
+            /* The server stores decoded JSON strings as NUL-terminated C
+             * strings throughout.  Accepting U+0000 here would silently hide
+             * the remainder from every downstream strlen-based consumer. */
+            if (cp == 0) goto fail;
             utf8_put(&b, cp);
             break;
         }
@@ -378,6 +384,8 @@ static bool json_skip_value(const char **p) {
 }
 
 static bool json_raw_value(const char **p, char **out) {
+    if (!out) return false;
+    *out = NULL;
     json_ws(p);
     const char *start = *p;
     if (!json_skip_value(p)) return false;
@@ -416,7 +424,10 @@ static char *json_minify_raw_value(const char *json) {
     return buf_take(&b);
 }
 
-static bool json_content(const char **p, char **out) {
+static bool json_content_ex(const char **p, char **out, bool *has_nontext) {
+    if (!out) return false;
+    *out = NULL;
+    if (has_nontext) *has_nontext = false;
     json_ws(p);
     if (**p == '"') return json_string(p, out);
     if (json_lit(p, "null")) {
@@ -426,11 +437,13 @@ static bool json_content(const char **p, char **out) {
     if (**p != '[') {
         if (!json_skip_value(p)) return false;
         *out = xstrdup("");
+        if (has_nontext) *has_nontext = true;
         return true;
     }
 
     (*p)++;
     buf b = {0};
+    char *object_type = NULL;
     json_ws(p);
     while (**p && **p != ']') {
         if (**p == '"') {
@@ -438,7 +451,12 @@ static bool json_content(const char **p, char **out) {
             if (!json_string(p, &s)) goto fail;
             buf_puts(&b, s);
             free(s);
+            if (has_nontext) *has_nontext = true;
         } else if (**p == '{') {
+            bool object_has_text = false;
+            bool object_has_media = false;
+            free(object_type);
+            object_type = NULL;
             (*p)++;
             json_ws(p);
             while (**p && **p != '}') {
@@ -457,7 +475,35 @@ static bool json_content(const char **p, char **out) {
                         goto fail;
                     }
                     buf_puts(&b, s);
+                    object_has_text = true;
                     free(s);
+                } else if (!strcmp(key, "type")) {
+                    free(object_type);
+                    object_type = NULL;
+                    json_ws(p);
+                    if (**p == '"') {
+                        if (!json_string(p, &object_type)) {
+                            free(key);
+                            goto fail;
+                        }
+                    } else {
+                        if (has_nontext) *has_nontext = true;
+                        if (!json_skip_value(p)) {
+                            free(key);
+                            goto fail;
+                        }
+                    }
+                } else if (!strcmp(key, "image") ||
+                           !strcmp(key, "image_url") ||
+                           !strcmp(key, "video") ||
+                           !strcmp(key, "audio") ||
+                           !strcmp(key, "input_audio") ||
+                           !strcmp(key, "file")) {
+                    object_has_media = true;
+                    if (!json_skip_value(p)) {
+                        free(key);
+                        goto fail;
+                    }
                 } else if (!json_skip_value(p)) {
                     free(key);
                     goto fail;
@@ -469,8 +515,22 @@ static bool json_content(const char **p, char **out) {
             }
             if (**p != '}') goto fail;
             (*p)++;
+            const bool type_is_media = object_type &&
+                (!strcmp(object_type, "image") ||
+                 !strcmp(object_type, "image_url") ||
+                 !strcmp(object_type, "video") ||
+                 !strcmp(object_type, "audio") ||
+                 !strcmp(object_type, "input_audio") ||
+                 !strcmp(object_type, "file"));
+            if (!object_has_text || object_has_media || type_is_media) {
+                if (has_nontext) *has_nontext = true;
+            }
+            free(object_type);
+            object_type = NULL;
         } else if (!json_skip_value(p)) {
             goto fail;
+        } else if (has_nontext) {
+            *has_nontext = true;
         }
         json_ws(p);
         if (**p == ',') (*p)++;
@@ -478,11 +538,17 @@ static bool json_content(const char **p, char **out) {
     }
     if (**p != ']') goto fail;
     (*p)++;
+    free(object_type);
     *out = buf_take(&b);
     return true;
 fail:
+    free(object_type);
     buf_free(&b);
     return false;
+}
+
+static bool json_content(const char **p, char **out) {
+    return json_content_ex(p, out, NULL);
 }
 
 typedef enum {
@@ -567,6 +633,16 @@ typedef struct {
     int tool_call_ids_len;
     int tool_call_ids_cap;
     tool_calls calls;
+    /* Presence matters for Qwen's fail-closed tool gate: an empty tool_calls
+     * array still opts into a wire protocol whose output parser is not wired
+     * up yet.  DeepSeek keeps using calls.len exactly as before. */
+    bool has_tool_fields;
+    bool has_role_field;
+    bool content_has_nontext;
+    /* The Qwen template distinguishes a JSON string from null/arrays/objects
+     * for reasoning_content.  Keep the legacy flattened value for DeepSeek,
+     * but expose only actual strings to the typed Qwen renderer. */
+    bool reasoning_is_string;
 } chat_msg;
 
 typedef struct {
@@ -670,6 +746,7 @@ static void tool_calls_push(tool_calls *calls, tool_call tc) {
 
 static void chat_msg_add_tool_call_id(chat_msg *m, const char *id) {
     if (!m || !id || !id[0]) return;
+    m->has_tool_fields = true;
     if (!m->tool_call_id) m->tool_call_id = xstrdup(id);
     for (int i = 0; i < m->tool_call_ids_len; i++) {
         if (m->tool_call_ids[i] && !strcmp(m->tool_call_ids[i], id)) return;
@@ -906,15 +983,30 @@ static bool model_alias_enables_thinking(const char *model) {
     return model && !strcmp(model, "deepseek-reasoner");
 }
 
-static const char *server_model_id_from_engine(ds4_engine *engine) {
-    return ds4_engine_model_id(engine) == 1 ?
-           "deepseek-v4-pro" : "deepseek-v4-flash";
+static const char *server_model_id_for_format(ds4_chat_format format,
+                                               int model_id) {
+    if (format == DS4_CHAT_FORMAT_QWEN36) return "qwen3.6-35b-a3b";
+    return model_id == 1 ? "deepseek-v4-pro" : "deepseek-v4-flash";
 }
 
-static bool server_model_alias_known(const char *id) {
-    return id &&
-           (!strcmp(id, "deepseek-v4-flash") ||
-            !strcmp(id, "deepseek-v4-pro"));
+static const char *server_model_id_from_engine(ds4_engine *engine) {
+    return server_model_id_for_format(ds4_engine_chat_format(engine),
+                                      ds4_engine_model_id(engine));
+}
+
+static bool server_model_alias_known_for_format(ds4_chat_format format,
+                                                const char *id) {
+    if (!id) return false;
+    if (format == DS4_CHAT_FORMAT_QWEN36) {
+        return !strcmp(id, "qwen3.6-35b-a3b");
+    }
+    return !strcmp(id, "deepseek-v4-flash") ||
+           !strcmp(id, "deepseek-v4-pro");
+}
+
+static bool server_model_alias_known(ds4_engine *engine, const char *id) {
+    return server_model_alias_known_for_format(
+        ds4_engine_chat_format(engine), id);
 }
 
 static void stop_list_clear(stop_list *stops) {
@@ -1629,6 +1721,7 @@ static bool parse_messages(const char **p, chat_msgs *msgs) {
             }
             (*p)++;
             if (!strcmp(key, "role")) {
+                msg.has_role_field = true;
                 free(msg.role);
                 if (!json_string(p, &msg.role)) {
                     free(key);
@@ -1636,17 +1729,21 @@ static bool parse_messages(const char **p, chat_msgs *msgs) {
                 }
             } else if (!strcmp(key, "content")) {
                 free(msg.content);
-                if (!json_content(p, &msg.content)) {
+                if (!json_content_ex(
+                        p, &msg.content, &msg.content_has_nontext)) {
                     free(key);
                     goto fail;
                 }
             } else if (!strcmp(key, "reasoning_content")) {
                 free(msg.reasoning);
+                json_ws(p);
+                msg.reasoning_is_string = **p == '"';
                 if (!json_content(p, &msg.reasoning)) {
                     free(key);
                     goto fail;
                 }
             } else if (!strcmp(key, "tool_call_id")) {
+                msg.has_tool_fields = true;
                 char *id = NULL;
                 if (!json_string(p, &id)) {
                     free(key);
@@ -1655,8 +1752,18 @@ static bool parse_messages(const char **p, chat_msgs *msgs) {
                 chat_msg_add_tool_call_id(&msg, id);
                 free(id);
             } else if (!strcmp(key, "tool_calls")) {
+                msg.has_tool_fields = true;
                 tool_calls_free(&msg.calls);
                 if (!parse_tool_calls_value(p, &msg.calls)) {
+                    free(key);
+                    goto fail;
+                }
+            } else if (!strcmp(key, "function_call")) {
+                /* Legacy OpenAI tool-call field.  DeepSeek historically
+                 * ignored it; remember only its presence so Qwen can reject
+                 * the unsupported protocol rather than silently dropping it. */
+                msg.has_tool_fields = true;
+                if (!json_skip_value(p)) {
                     free(key);
                     goto fail;
                 }
@@ -2628,6 +2735,158 @@ static void anthropic_prepare_live_continuation(request *r,
         render_live_tool_tail(msgs, tail_start, r->think_mode);
 }
 
+static bool qwen_endpoint_is_supported(ds4_chat_format format,
+                                       api_style api,
+                                       req_kind kind,
+                                       char *err,
+                                       size_t errlen) {
+    if (format != DS4_CHAT_FORMAT_QWEN36) return true;
+    if (api == API_OPENAI && kind == REQ_CHAT) return true;
+
+    const char *endpoint = kind == REQ_COMPLETION ? "/v1/completions" :
+                           api == API_ANTHROPIC ? "/v1/messages" :
+                           api == API_RESPONSES ? "/v1/responses" :
+                           "this endpoint";
+    if (err && errlen) {
+        snprintf(err, errlen,
+                 "Qwen3.6 currently supports only tool-free "
+                 "/v1/chat/completions; %s is not supported",
+                 endpoint);
+    }
+    return false;
+}
+
+/* Build the public chat IR as a shallow, borrowed view.  The renderer consumes
+ * it before chat_msgs is freed.  No prompt string is inspected for structure:
+ * roles and tool metadata are validated while they are still typed fields, and
+ * message content remains untrusted data all the way into the Qwen renderer. */
+static bool qwen_chat_messages_borrow(const chat_msgs *msgs,
+                                      bool has_active_tools,
+                                      ds4_chat_message **messages_out,
+                                      size_t *n_messages_out,
+                                      char *err,
+                                      size_t errlen) {
+    if (!messages_out || !n_messages_out) return false;
+    *messages_out = NULL;
+    *n_messages_out = 0;
+    if (has_active_tools) {
+        if (err && errlen) {
+            snprintf(err, errlen,
+                     "Qwen3.6 tools are disabled until Qwen tool-call output "
+                     "parsing is implemented");
+        }
+        return false;
+    }
+    if (!msgs || msgs->len <= 0) {
+        if (err && errlen) {
+            snprintf(err, errlen,
+                     "Qwen3.6 chat requires at least one message");
+        }
+        return false;
+    }
+
+    ds4_chat_message *messages =
+        xmalloc((size_t)msgs->len * sizeof(messages[0]));
+    memset(messages, 0, (size_t)msgs->len * sizeof(messages[0]));
+    bool has_user = false;
+
+    for (int i = 0; i < msgs->len; i++) {
+        const chat_msg *src = &msgs->v[i];
+        const char *role = src->role ? src->role : "";
+        ds4_chat_role mapped;
+
+        if (!src->has_role_field) {
+            if (err && errlen) {
+                snprintf(err, errlen,
+                         "Qwen3.6 message role is required");
+            }
+            free(messages);
+            return false;
+        } else if (!strcmp(role, "system")) {
+            if (i != 0) {
+                if (err && errlen) {
+                    snprintf(err, errlen,
+                             "Qwen3.6 system message must be first");
+                }
+                free(messages);
+                return false;
+            }
+            mapped = DS4_CHAT_ROLE_SYSTEM;
+        } else if (!strcmp(role, "user")) {
+            mapped = DS4_CHAT_ROLE_USER;
+            has_user = true;
+        } else if (!strcmp(role, "assistant")) {
+            mapped = DS4_CHAT_ROLE_ASSISTANT;
+        } else if (!strcmp(role, "developer")) {
+            if (err && errlen) {
+                snprintf(err, errlen,
+                         "Qwen3.6 does not support role 'developer'; use one "
+                         "leading 'system' message");
+            }
+            free(messages);
+            return false;
+        } else if (!strcmp(role, "tool") || !strcmp(role, "function")) {
+            if (err && errlen) {
+                snprintf(err, errlen,
+                         "Qwen3.6 tools and tool messages are disabled until "
+                         "Qwen tool-call output parsing is implemented");
+            }
+            free(messages);
+            return false;
+        } else {
+            if (err && errlen) {
+                snprintf(err, errlen,
+                         "Qwen3.6 does not support message role '%s'", role);
+            }
+            free(messages);
+            return false;
+        }
+
+        if (src->has_tool_fields || src->calls.len > 0 ||
+            src->tool_call_id || src->tool_call_ids_len > 0) {
+            if (err && errlen) {
+                snprintf(err, errlen,
+                         "Qwen3.6 tools and tool_calls are disabled until "
+                         "Qwen tool-call output parsing is implemented");
+            }
+            free(messages);
+            return false;
+        }
+        if (src->content_has_nontext) {
+            if (err && errlen) {
+                snprintf(err, errlen,
+                         "Qwen3.6 server support is text-only; image, video, "
+                         "audio, file, and other non-text content are not supported");
+            }
+            free(messages);
+            return false;
+        }
+
+        messages[i].role = mapped;
+        messages[i].content = src->content ? src->content : "";
+        messages[i].reasoning = src->reasoning_is_string
+            ? src->reasoning : NULL;
+    }
+
+    if (!has_user) {
+        if (err && errlen) {
+            snprintf(err, errlen,
+                     "Qwen3.6 chat requires at least one user message");
+        }
+        free(messages);
+        return false;
+    }
+
+    *messages_out = messages;
+    *n_messages_out = (size_t)msgs->len;
+    return true;
+}
+
+static bool tool_schemas_are_active(const char *tool_schemas,
+                                    bool tool_choice_none) {
+    return tool_schemas && tool_schemas[0] && !tool_choice_none;
+}
+
 /* The API parsers are intentionally selective JSON parsers: they keep only
  * fields that affect model semantics, rendering, streaming, or cache keys, and
  * skip extension fields.  The output is always a rendered DS4 chat/completion
@@ -2779,7 +3038,47 @@ static bool parse_chat_request(ds4_engine *e, server *s, const char *body, int d
         request_free(r);
         return false;
     }
-    r->has_tools = tool_schemas && tool_schemas[0] && !tool_choice_none;
+    if (ds4_engine_chat_format(e) == DS4_CHAT_FORMAT_QWEN36) {
+        if (!got_thinking && model_alias_disables_thinking(r->model)) thinking_enabled = false;
+        if (!got_thinking && model_alias_enables_thinking(r->model)) thinking_enabled = true;
+        r->think_mode = ds4_think_mode_for_context(
+            think_mode_from_enabled(thinking_enabled, reasoning_effort), ctx_size);
+
+        ds4_chat_message *messages = NULL;
+        size_t n_messages = 0;
+        const bool has_active_tools =
+            tool_schemas_are_active(tool_schemas, tool_choice_none);
+        if (!qwen_chat_messages_borrow(&msgs, has_active_tools,
+                                       &messages, &n_messages,
+                                       err, errlen)) {
+            chat_msgs_free(&msgs);
+            free(tool_schemas);
+            request_free(r);
+            return false;
+        }
+        const ds4_chat_request chat = {
+            .messages = messages,
+            .n_messages = n_messages,
+            .think_mode = r->think_mode,
+            .add_generation_prompt = true,
+            .preserve_thinking = false,
+        };
+        const bool rendered = ds4_render_qwen36_chat_checked(
+            e, &chat, &r->prompt, &r->prompt_text, err, errlen);
+        free(messages);
+        if (!rendered) {
+            chat_msgs_free(&msgs);
+            free(tool_schemas);
+            request_free(r);
+            return false;
+        }
+        r->has_tools = false;
+        r->prompt_preserves_reasoning = false;
+        chat_msgs_free(&msgs);
+        free(tool_schemas);
+        return true;
+    }
+    r->has_tools = tool_schemas_are_active(tool_schemas, tool_choice_none);
     if (!got_thinking && model_alias_disables_thinking(r->model)) thinking_enabled = false;
     if (!got_thinking && model_alias_enables_thinking(r->model)) thinking_enabled = true;
     r->think_mode = ds4_think_mode_for_context(
@@ -2813,6 +3112,11 @@ static bool parse_anthropic_request(ds4_engine *e, server *s, const char *body, 
                                     int ctx_size, request *r, char *err, size_t errlen) {
     request_init(r, REQ_CHAT, def_tokens);
     r->api = API_ANTHROPIC;
+    if (!qwen_endpoint_is_supported(ds4_engine_chat_format(e), r->api,
+                                    r->kind, err, errlen)) {
+        request_free(r);
+        return false;
+    }
     const char *p = body;
     bool got_messages = false;
     bool tool_choice_none = false;
@@ -3710,6 +4014,11 @@ static bool parse_responses_request(ds4_engine *e, server *s, const char *body, 
                                     int ctx_size, request *r, char *err, size_t errlen) {
     request_init(r, REQ_CHAT, def_tokens);
     r->api = API_RESPONSES;
+    if (!qwen_endpoint_is_supported(ds4_engine_chat_format(e), r->api,
+                                    r->kind, err, errlen)) {
+        request_free(r);
+        return false;
+    }
     const char *p = body;
     bool got_input = false;
     bool tool_choice_none = false;
@@ -4013,6 +4322,11 @@ static bool parse_prompt(const char **p, char **out) {
 static bool parse_completion_request(ds4_engine *e, const char *body, int def_tokens,
                                      int ctx_size, request *r, char *err, size_t errlen) {
     request_init(r, REQ_COMPLETION, def_tokens);
+    if (!qwen_endpoint_is_supported(ds4_engine_chat_format(e), r->api,
+                                    r->kind, err, errlen)) {
+        request_free(r);
+        return false;
+    }
     const char *p = body;
     char *prompt = NULL;
     bool got_thinking = false;
@@ -7732,6 +8046,9 @@ typedef struct {
     int live_tokens;
     char *visible_text;
     size_t visible_len;
+    /* Canonical visible token prefix. Required for Qwen because equal bytes
+     * can carry different trusted-control provenance. */
+    ds4_tokens visible_tokens;
 } visible_live_state;
 
 static bool id_list_contains(const stop_list *ids, const char *id);
@@ -7995,6 +8312,7 @@ static void visible_live_clear_locked(visible_live_state *st) {
     free(st->visible_text);
     st->visible_text = NULL;
     st->visible_len = 0;
+    ds4_tokens_free(&st->visible_tokens);
     st->live_tokens = 0;
     st->valid = false;
 }
@@ -8012,12 +8330,16 @@ static void thinking_live_clear(server *s) {
     pthread_mutex_unlock(&s->tool_mu);
 }
 
-static void thinking_live_remember(server *s, const char *visible_text) {
+static void thinking_live_remember(server *s, const char *visible_text,
+                                   const ds4_tokens *visible_tokens) {
     if (!s || !visible_text || !visible_text[0]) return;
     pthread_mutex_lock(&s->tool_mu);
     visible_live_clear_locked(&s->thinking_live);
     s->thinking_live.visible_text = xstrdup(visible_text);
     s->thinking_live.visible_len = strlen(visible_text);
+    if (visible_tokens) {
+        ds4_tokens_copy(&s->thinking_live.visible_tokens, visible_tokens);
+    }
     s->thinking_live.live_tokens = ds4_session_pos(s->session);
     s->thinking_live.valid = true;
     pthread_mutex_unlock(&s->tool_mu);
@@ -8877,6 +9199,9 @@ static int kv_cache_try_load(server *s, const request *req,
 static int live_text_prefix_prompt(server *s, const request *req,
                                    ds4_tokens *effective_prompt) {
     if (!s || !req || !req->prompt_text || !effective_prompt) return 0;
+    /* Equal Qwen bytes may encode client data or trusted controls. Exact token
+     * reuse and the provenance-keyed thinking continuation handle Qwen safely. */
+    if (ds4_engine_chat_format(s->engine) == DS4_CHAT_FORMAT_QWEN36) return 0;
     const ds4_tokens *live_tokens = ds4_session_tokens(s->session);
     if (!live_tokens || live_tokens->len <= 0) return 0;
 
@@ -8978,6 +9303,10 @@ static int responses_live_visible_prefix_prompt(server *s, const request *req,
                                                 ds4_tokens *effective_prompt) {
     if (!s || !req || !req->prompt_text || !effective_prompt) return 0;
     if (req->api != API_RESPONSES) return 0;
+    /* Qwen currently rejects the Responses protocol at request validation.
+     * Keep this fallback DeepSeek-only: its byte-visible checkpoint key cannot
+     * preserve Qwen's distinction between client data and template controls. */
+    if (ds4_engine_chat_format(s->engine) == DS4_CHAT_FORMAT_QWEN36) return 0;
 
     const size_t prompt_len = strlen(req->prompt_text);
     size_t visible_len = 0;
@@ -9025,6 +9354,8 @@ static int thinking_live_visible_prefix_prompt(server *s, const request *req,
 
     const size_t prompt_len = strlen(req->prompt_text);
     size_t visible_len = 0;
+    const bool qwen = ds4_engine_chat_format(s->engine) ==
+        DS4_CHAT_FORMAT_QWEN36;
     pthread_mutex_lock(&s->tool_mu);
     bool ok = s->thinking_live.valid &&
               s->thinking_live.live_tokens == live_pos &&
@@ -9032,7 +9363,11 @@ static int thinking_live_visible_prefix_prompt(server *s, const request *req,
               s->thinking_live.visible_len < prompt_len &&
               byte_prefix_match(req->prompt_text, prompt_len,
                                 s->thinking_live.visible_text,
-                                s->thinking_live.visible_len);
+                                s->thinking_live.visible_len) &&
+              (!qwen ||
+               (s->thinking_live.visible_tokens.len > 0 &&
+                ds4_tokens_starts_with(
+                    &req->prompt, &s->thinking_live.visible_tokens)));
     if (ok) visible_len = s->thinking_live.visible_len;
     pthread_mutex_unlock(&s->tool_mu);
     if (!ok) return 0;
@@ -9040,11 +9375,25 @@ static int thinking_live_visible_prefix_prompt(server *s, const request *req,
     const ds4_tokens *live_tokens = ds4_session_tokens(s->session);
     if (!live_tokens || live_tokens->len != live_pos) return 0;
 
-    if (!build_prompt_from_exact_prefix_and_text_suffix(
-            s->engine, live_tokens, req->prompt_text + visible_len,
-            effective_prompt)) {
-        return 0;
+    size_t canonical_suffix_at = visible_len;
+    static const char qwen_turn_end[] = "<|im_end|>\n";
+    if (qwen) {
+        const size_t end_len = sizeof(qwen_turn_end) - 1u;
+        if (visible_len < end_len ||
+            memcmp(req->prompt_text + visible_len - end_len,
+                   qwen_turn_end, end_len) != 0) {
+            return 0;
+        }
+        canonical_suffix_at -= end_len;
     }
+    const bool built = qwen
+        ? ds4_kvstore_build_prompt_from_exact_prefix_and_canonical_suffix(
+            s->engine, live_tokens, &req->prompt, req->prompt_text,
+            canonical_suffix_at, effective_prompt)
+        : build_prompt_from_exact_prefix_and_text_suffix(
+            s->engine, live_tokens, req->prompt_text + visible_len,
+            effective_prompt);
+    if (!built) return 0;
     return live_tokens->len;
 }
 
@@ -9652,10 +10001,14 @@ static bool continue_after_invalid_dsml(server *s, const request *r,
 
 static bool should_remember_thinking_checkpoint(const request *r,
                                                 const thinking_state *thinking,
-                                                const char *finish) {
+                                                const char *finish,
+                                                ds4_chat_format format) {
     if (!r || r->kind != REQ_CHAT || r->has_tools) return false;
     if (r->prompt_preserves_reasoning) return false;
-    if (!ds4_think_mode_enabled(r->think_mode)) return false;
+    /* Qwen's no-thinking generation prefix still contains a trusted
+     * <think>...</think> wrapper that the next canonical history omits. */
+    if (format != DS4_CHAT_FORMAT_QWEN36 &&
+        !ds4_think_mode_enabled(r->think_mode)) return false;
     if (finish && (!strcmp(finish, "error") || !strcmp(finish, "length"))) return false;
     if (thinking && thinking->inside) return false;
     return true;
@@ -9842,9 +10195,19 @@ static char *build_responses_visible_assistant_suffix(const request *r,
  * Instead, remember the visible bytes as a key for the current sampled frontier.
  * The next request can then continue from live KV while tokenizing only the new
  * visible suffix. */
-static char *build_toolless_thinking_visible_text(const request *r,
-                                                  const char *content) {
+static char *build_toolless_thinking_visible_text(ds4_engine *engine,
+                                                  const request *r,
+                                                  const char *content,
+                                                  ds4_tokens *visible_tokens) {
     if (!r || !r->prompt_text) return NULL;
+    if (ds4_engine_chat_format(engine) == DS4_CHAT_FORMAT_QWEN36) {
+        char *visible = NULL;
+        if (!visible_tokens) return NULL;
+        return ds4_qwen36_visible_checkpoint_checked(
+            engine, r->prompt_text, &r->prompt, r->think_mode, content,
+            visible_tokens, &visible)
+            ? visible : NULL;
+    }
     if (!ds4_think_mode_enabled(r->think_mode)) return NULL;
 
     size_t pt_len = strlen(r->prompt_text);
@@ -9865,16 +10228,23 @@ static char *build_toolless_thinking_visible_text(const request *r,
 
 static void remember_thinking_checkpoint(server *s, const job *j, const char *ctx,
                                          uint64_t trace_id, const char *content) {
-    char *visible = build_toolless_thinking_visible_text(&j->req, content);
-    if (!visible) return;
+    ds4_tokens visible_tokens = {0};
+    char *visible = build_toolless_thinking_visible_text(
+        s ? s->engine : NULL, &j->req, content, &visible_tokens);
+    if (!visible) {
+        ds4_tokens_free(&visible_tokens);
+        return;
+    }
 
-    thinking_live_remember(s, visible);
+    thinking_live_remember(s, visible,
+                           visible_tokens.len ? &visible_tokens : NULL);
     server_log(DS4_LOG_KVCACHE,
                "ds4-server: thinking live checkpoint remembered ctx=%s live=%d visible=%zu",
                ctx, ds4_session_pos(s->session), strlen(visible));
     trace_event(s, trace_id,
                 "thinking live checkpoint remembered: live=%d visible=%zu",
                 ds4_session_pos(s->session), strlen(visible));
+    ds4_tokens_free(&visible_tokens);
     free(visible);
 }
 
@@ -10972,7 +11342,9 @@ decode_again:
     } else if (parsed_calls.len) {
         thinking_live_clear(s);
     } else if (!parsed_calls.len &&
-               should_remember_thinking_checkpoint(&j->req, &thinking, final_finish)) {
+               should_remember_thinking_checkpoint(
+                   &j->req, &thinking, final_finish,
+                   ds4_engine_chat_format(s->engine))) {
         remember_thinking_checkpoint(s, j, ctx_span, trace_id,
                                      parsed_content ? parsed_content : "");
     } else if (!parsed_calls.len) {
@@ -11258,7 +11630,8 @@ typedef struct {
 } client_arg;
 
 static void append_model_json_values(buf *b, const char *id, const char *name,
-                                     int ctx, int default_tokens) {
+                                     int ctx, int default_tokens,
+                                     bool supports_tools) {
     const int max_completion = default_tokens < ctx ? default_tokens : ctx;
     buf_printf(b,
         "{\"id\":");
@@ -11276,9 +11649,14 @@ static void append_model_json_values(buf *b, const char *id, const char *name,
             "\"context_length\":%d,"
             "\"max_completion_tokens\":%d,"
             "\"is_moderated\":false},"
-        "\"supported_parameters\":["
-            "\"tools\","
-            "\"tool_choice\","
+        "\"supported_parameters\":[",
+        ctx,
+        ctx,
+        max_completion);
+    if (supports_tools) {
+        buf_puts(b, "\"tools\",\"tool_choice\",");
+    }
+    buf_puts(b,
             "\"max_tokens\","
             "\"temperature\","
             "\"top_p\","
@@ -11287,10 +11665,7 @@ static void append_model_json_values(buf *b, const char *id, const char *name,
             "\"stop\","
             "\"seed\","
             "\"stream\","
-            "\"reasoning_effort\"]}",
-        ctx,
-        ctx,
-        max_completion);
+            "\"reasoning_effort\"]}");
 }
 
 static void append_model_json(buf *b, const server *s, const char *id) {
@@ -11298,7 +11673,9 @@ static void append_model_json(buf *b, const server *s, const char *id) {
                              id,
                              ds4_engine_model_name(s->engine),
                              ds4_session_ctx(s->session),
-                             s->default_tokens);
+                             s->default_tokens,
+                             ds4_engine_chat_format(s->engine) !=
+                                 DS4_CHAT_FORMAT_QWEN36);
 }
 
 static bool send_model(server *s, int fd, const char *id) {
@@ -11310,13 +11687,30 @@ static bool send_model(server *s, int fd, const char *id) {
     return ok;
 }
 
+static void append_models_json_values(buf *b,
+                                      ds4_chat_format format,
+                                      const char *name,
+                                      int ctx,
+                                      int default_tokens) {
+    buf_puts(b, "{\"object\":\"list\",\"data\":[");
+    if (format == DS4_CHAT_FORMAT_QWEN36) {
+        append_model_json_values(b, "qwen3.6-35b-a3b", name, ctx,
+                                 default_tokens, false);
+    } else {
+        append_model_json_values(b, "deepseek-v4-flash", name, ctx,
+                                 default_tokens, true);
+        buf_putc(b, ',');
+        append_model_json_values(b, "deepseek-v4-pro", name, ctx,
+                                 default_tokens, true);
+    }
+    buf_puts(b, "]}\n");
+}
+
 static bool send_models(server *s, int fd) {
     buf b = {0};
-    buf_puts(&b, "{\"object\":\"list\",\"data\":[");
-    append_model_json(&b, s, "deepseek-v4-flash");
-    buf_putc(&b, ',');
-    append_model_json(&b, s, "deepseek-v4-pro");
-    buf_puts(&b, "]}\n");
+    append_models_json_values(&b, ds4_engine_chat_format(s->engine),
+                              ds4_engine_model_name(s->engine),
+                              ds4_session_ctx(s->session), s->default_tokens);
     bool ok = http_response(fd, s->enable_cors, 200, "application/json", b.ptr);
     buf_free(&b);
     return ok;
@@ -11358,7 +11752,8 @@ static void *client_main(void *arg) {
     const size_t model_path_prefix_len = strlen(model_path_prefix);
     if (!strcmp(hr.method, "GET") &&
         !strncmp(hr.path, model_path_prefix, model_path_prefix_len) &&
-        server_model_alias_known(hr.path + model_path_prefix_len))
+        server_model_alias_known(s->engine,
+                                 hr.path + model_path_prefix_len))
     {
         send_model(s, fd, hr.path + model_path_prefix_len);
         http_request_free(&hr);
@@ -11390,6 +11785,16 @@ static void *client_main(void *arg) {
     http_request_free(&hr);
     if (!ok) {
         http_error(fd, s->enable_cors, 400, err);
+        goto done;
+    }
+    if (ds4_engine_chat_format(s->engine) == DS4_CHAT_FORMAT_QWEN36 &&
+        req.model_from_request &&
+        !server_model_alias_known(s->engine, req.model)) {
+        snprintf(err, sizeof(err),
+                 "model '%s' is not loaded; this server provides only %s",
+                 req.model ? req.model : "", server_model_id_from_engine(s->engine));
+        http_error(fd, s->enable_cors, 400, err);
+        request_free(&req);
         goto done;
     }
     if (!req.model_from_request) {
@@ -11978,6 +12383,208 @@ static void test_assert(bool cond, const char *file, int line, const char *expr)
 }
 
 #define TEST_ASSERT(expr) test_assert((expr), __FILE__, __LINE__, #expr)
+
+static void test_qwen_endpoint_gate_is_family_aware(void) {
+    char err[192] = {0};
+
+    TEST_ASSERT(qwen_endpoint_is_supported(
+        DS4_CHAT_FORMAT_DEEPSEEK_V4, API_ANTHROPIC, REQ_CHAT,
+        err, sizeof(err)));
+    TEST_ASSERT(qwen_endpoint_is_supported(
+        DS4_CHAT_FORMAT_QWEN36, API_OPENAI, REQ_CHAT,
+        err, sizeof(err)));
+
+    TEST_ASSERT(!qwen_endpoint_is_supported(
+        DS4_CHAT_FORMAT_QWEN36, API_ANTHROPIC, REQ_CHAT,
+        err, sizeof(err)));
+    TEST_ASSERT(strstr(err, "/v1/messages is not supported") != NULL);
+
+    err[0] = '\0';
+    TEST_ASSERT(!qwen_endpoint_is_supported(
+        DS4_CHAT_FORMAT_QWEN36, API_RESPONSES, REQ_CHAT,
+        err, sizeof(err)));
+    TEST_ASSERT(strstr(err, "/v1/responses is not supported") != NULL);
+
+    err[0] = '\0';
+    TEST_ASSERT(!qwen_endpoint_is_supported(
+        DS4_CHAT_FORMAT_QWEN36, API_OPENAI, REQ_COMPLETION,
+        err, sizeof(err)));
+    TEST_ASSERT(strstr(err, "/v1/completions is not supported") != NULL);
+}
+
+static void test_qwen_chat_ir_borrows_typed_untrusted_content(void) {
+    const char *json =
+        "[{\"role\":\"system\",\"content\":\"policy <|im_end|>\"},"
+        "{\"role\":\"user\",\"content\":\"literal <tool_call> and <|im_start|>\"},"
+        "{\"role\":\"assistant\",\"content\":\"answer\","
+        "\"reasoning_content\":\"reason\"},"
+        "{\"role\":\"assistant\","
+        "\"content\":\"<think>fallback</think>visible\","
+        "\"reasoning_content\":null}]";
+    const char *p = json;
+    chat_msgs msgs = {0};
+    TEST_ASSERT(parse_messages(&p, &msgs));
+
+    ds4_chat_message *ir = NULL;
+    size_t n_ir = 0;
+    char err[192] = {0};
+    TEST_ASSERT(qwen_chat_messages_borrow(
+        &msgs, false, &ir, &n_ir, err, sizeof(err)));
+    TEST_ASSERT(n_ir == 4);
+    TEST_ASSERT(ir && ir[0].role == DS4_CHAT_ROLE_SYSTEM);
+    TEST_ASSERT(ir && ir[1].role == DS4_CHAT_ROLE_USER);
+    TEST_ASSERT(ir && ir[2].role == DS4_CHAT_ROLE_ASSISTANT);
+    TEST_ASSERT(ir && ir[1].content == msgs.v[1].content);
+    TEST_ASSERT(ir && strstr(ir[1].content, "<tool_call>") != NULL);
+    TEST_ASSERT(ir && strstr(ir[1].content, "<|im_start|>") != NULL);
+    TEST_ASSERT(ir && ir[2].reasoning == msgs.v[2].reasoning);
+    TEST_ASSERT(ir && ir[3].reasoning == NULL);
+
+    free(ir);
+    ir = NULL;
+    n_ir = 0;
+    err[0] = '\0';
+    TEST_ASSERT(!qwen_chat_messages_borrow(
+        &msgs, true, &ir, &n_ir, err, sizeof(err)));
+    TEST_ASSERT(ir == NULL && n_ir == 0);
+    TEST_ASSERT(strstr(err, "tools are disabled") != NULL);
+    chat_msgs_free(&msgs);
+}
+
+static void test_qwen_tool_gate_accepts_semantically_tool_free_requests(void) {
+    TEST_ASSERT(!tool_schemas_are_active(NULL, false));
+    TEST_ASSERT(!tool_schemas_are_active("", false));
+
+    const char *p = "null";
+    char *schemas = NULL;
+    tool_schema_orders orders = {0};
+    TEST_ASSERT(parse_tools_value(&p, &schemas, &orders));
+    TEST_ASSERT(schemas && schemas[0] == '\0');
+    TEST_ASSERT(!tool_schemas_are_active(schemas, false));
+    free(schemas);
+    tool_schema_orders_free(&orders);
+
+    p = "[]";
+    schemas = NULL;
+    memset(&orders, 0, sizeof(orders));
+    TEST_ASSERT(parse_tools_value(&p, &schemas, &orders));
+    TEST_ASSERT(!schemas || schemas[0] == '\0');
+    TEST_ASSERT(!tool_schemas_are_active(schemas, false));
+    free(schemas);
+    tool_schema_orders_free(&orders);
+
+    p = "[{\"type\":\"function\",\"function\":{\"name\":\"f\","
+        "\"parameters\":{\"type\":\"object\"}}}]";
+    schemas = NULL;
+    memset(&orders, 0, sizeof(orders));
+    TEST_ASSERT(parse_tools_value(&p, &schemas, &orders));
+    TEST_ASSERT(tool_schemas_are_active(schemas, false));
+    /* OpenAI clients commonly serialize schemas together with the explicit
+     * no-tool choice.  That request is semantically tool-free. */
+    TEST_ASSERT(!tool_schemas_are_active(schemas, true));
+    free(schemas);
+    tool_schema_orders_free(&orders);
+}
+
+static void assert_qwen_chat_ir_rejects(const char *json,
+                                        const char *error_fragment) {
+    const char *p = json;
+    chat_msgs msgs = {0};
+    if (!parse_messages(&p, &msgs)) {
+        TEST_ASSERT(false);
+        return;
+    }
+
+    ds4_chat_message *ir = NULL;
+    size_t n_ir = 0;
+    char err[192] = {0};
+    TEST_ASSERT(!qwen_chat_messages_borrow(
+        &msgs, false, &ir, &n_ir, err, sizeof(err)));
+    TEST_ASSERT(ir == NULL);
+    TEST_ASSERT(n_ir == 0);
+    TEST_ASSERT(strstr(err, error_fragment) != NULL);
+
+    free(ir);
+    chat_msgs_free(&msgs);
+}
+
+static void test_qwen_chat_ir_rejects_unsupported_protocol_shapes(void) {
+    assert_qwen_chat_ir_rejects(
+        "[{\"role\":\"developer\",\"content\":\"policy\"},"
+        "{\"role\":\"user\",\"content\":\"hi\"}]",
+        "role 'developer'");
+    assert_qwen_chat_ir_rejects(
+        "[{\"role\":\"function\",\"content\":\"result\"},"
+        "{\"role\":\"user\",\"content\":\"hi\"}]",
+        "tools and tool messages are disabled");
+    assert_qwen_chat_ir_rejects(
+        "[{\"role\":\"tool\",\"content\":\"result\"},"
+        "{\"role\":\"user\",\"content\":\"hi\"}]",
+        "tools and tool messages are disabled");
+    assert_qwen_chat_ir_rejects(
+        "[{\"role\":\"critic\",\"content\":\"nope\"},"
+        "{\"role\":\"user\",\"content\":\"hi\"}]",
+        "role 'critic'");
+    assert_qwen_chat_ir_rejects(
+        "[{\"content\":\"missing role\"}]",
+        "message role is required");
+    assert_qwen_chat_ir_rejects(
+        "[{\"role\":\"user\",\"content\":\"hi\"},"
+        "{\"role\":\"system\",\"content\":\"late\"}]",
+        "system message must be first");
+    assert_qwen_chat_ir_rejects(
+        "[{\"role\":\"user\",\"content\":\"hi\"},"
+        "{\"role\":\"assistant\",\"content\":\"\",\"tool_calls\":[]}]",
+        "tools and tool_calls are disabled");
+    assert_qwen_chat_ir_rejects(
+        "[{\"role\":\"user\",\"content\":\"hi\"},"
+        "{\"role\":\"assistant\",\"content\":\"\","
+        "\"function_call\":{\"name\":\"f\",\"arguments\":\"{}\"}}]",
+        "tools and tool_calls are disabled");
+    assert_qwen_chat_ir_rejects(
+        "[{\"role\":\"user\",\"content\":["
+        "{\"type\":\"text\",\"text\":\"describe this\"},"
+        "{\"type\":\"image_url\",\"image_url\":{\"url\":\"x\"}}]}]",
+        "server support is text-only");
+    assert_qwen_chat_ir_rejects(
+        "[{\"role\":\"user\",\"content\":["
+        "{\"type\":\"text\",\"text\":\"mixed\","
+        "\"image_url\":{\"url\":\"x\"}}]}]",
+        "server support is text-only");
+    assert_qwen_chat_ir_rejects(
+        "[{\"role\":\"user\",\"content\":[\"array string\"]}]",
+        "server support is text-only");
+    assert_qwen_chat_ir_rejects(
+        "[{\"role\":\"assistant\",\"content\":\"orphan\"}]",
+        "at least one user message");
+}
+
+static void test_message_content_flags_preserve_legacy_flattening(void) {
+    const char *p =
+        "[{\"role\":\"user\",\"content\":["
+        "{\"type\":null,\"text\":\"kept for DeepSeek\"}]}]";
+    chat_msgs msgs = {0};
+    TEST_ASSERT(parse_messages(&p, &msgs));
+    TEST_ASSERT(msgs.len == 1);
+    TEST_ASSERT(msgs.v[0].content &&
+                !strcmp(msgs.v[0].content, "kept for DeepSeek"));
+    TEST_ASSERT(msgs.v[0].content_has_nontext);
+    chat_msgs_free(&msgs);
+
+    p = "[{\"role\":\"user\",\"content\":\"ok\","
+        "\"content\":\"bad\\u0000tail\"}]";
+    memset(&msgs, 0, sizeof(msgs));
+    TEST_ASSERT(!parse_messages(&p, &msgs));
+    chat_msgs_free(&msgs);
+
+    p = "[{\"role\":\"assistant\",\"tool_calls\":[{"
+        "\"type\":\"function\",\"function\":{\"name\":\"f\","
+        "\"arguments\":{\"ok\":1},"
+        "\"arguments\":{\"bad\":\"\\u0000\"}}}]}]";
+    memset(&msgs, 0, sizeof(msgs));
+    TEST_ASSERT(!parse_messages(&p, &msgs));
+    chat_msgs_free(&msgs);
+}
 
 static void test_tool_schema_order_from_anthropic_schema(void) {
     tool_schema_orders orders = {0};
@@ -14734,12 +15341,17 @@ static void test_json_string_handles_surrogates(void) {
     TEST_ASSERT(strstr(s, "badlow \xef\xbf\xbd" "A") != NULL);
     TEST_ASSERT(*p == '\0');
     free(s);
+
+    p = "\"prefix\\u0000hidden\"";
+    s = NULL;
+    TEST_ASSERT(!json_string(&p, &s));
+    TEST_ASSERT(s == NULL);
 }
 
 static void test_model_metadata_clamps_completion_to_context(void) {
     buf b = {0};
     append_model_json_values(&b, "deepseek-v4-flash", "DeepSeek V4 Flash",
-                             32768, 393216);
+                             32768, 393216, true);
     TEST_ASSERT(strstr(b.ptr, "\"id\":\"deepseek-v4-flash\"") != NULL);
     TEST_ASSERT(strstr(b.ptr, "\"name\":\"DeepSeek V4 Flash\"") != NULL);
     TEST_ASSERT(strstr(b.ptr, "\"context_length\":32768") != NULL);
@@ -14747,11 +15359,41 @@ static void test_model_metadata_clamps_completion_to_context(void) {
     buf_free(&b);
 
     append_model_json_values(&b, "deepseek-v4-pro", "DeepSeek V4 Pro",
-                             100000, 4096);
+                             100000, 4096, true);
     TEST_ASSERT(strstr(b.ptr, "\"id\":\"deepseek-v4-pro\"") != NULL);
     TEST_ASSERT(strstr(b.ptr, "\"name\":\"DeepSeek V4 Pro\"") != NULL);
     TEST_ASSERT(strstr(b.ptr, "\"context_length\":100000") != NULL);
     TEST_ASSERT(strstr(b.ptr, "\"max_completion_tokens\":4096") != NULL);
+    buf_free(&b);
+
+    append_model_json_values(&b, "qwen3.6-35b-a3b",
+                             "Qwen3.6 35B A3B", 8192, 2048, false);
+    TEST_ASSERT(strstr(b.ptr, "\"id\":\"qwen3.6-35b-a3b\"") != NULL);
+    TEST_ASSERT(strstr(b.ptr, "\"name\":\"Qwen3.6 35B A3B\"") != NULL);
+    TEST_ASSERT(strstr(b.ptr, "\"tools\"") == NULL);
+    TEST_ASSERT(strstr(b.ptr, "\"tool_choice\"") == NULL);
+    TEST_ASSERT(strstr(b.ptr, "\"reasoning_effort\"") != NULL);
+    buf_free(&b);
+
+    TEST_ASSERT(!strcmp(server_model_id_for_format(
+        DS4_CHAT_FORMAT_QWEN36, 0), "qwen3.6-35b-a3b"));
+    TEST_ASSERT(!strcmp(server_model_id_for_format(
+        DS4_CHAT_FORMAT_DEEPSEEK_V4, 0), "deepseek-v4-flash"));
+    TEST_ASSERT(!strcmp(server_model_id_for_format(
+        DS4_CHAT_FORMAT_DEEPSEEK_V4, 1), "deepseek-v4-pro"));
+    TEST_ASSERT(server_model_alias_known_for_format(
+        DS4_CHAT_FORMAT_QWEN36, "qwen3.6-35b-a3b"));
+    TEST_ASSERT(!server_model_alias_known_for_format(
+        DS4_CHAT_FORMAT_QWEN36, "deepseek-v4-flash"));
+    TEST_ASSERT(!server_model_alias_known_for_format(
+        DS4_CHAT_FORMAT_QWEN36, "garbage"));
+
+    append_models_json_values(&b, DS4_CHAT_FORMAT_QWEN36,
+                              "Qwen3.6 35B A3B", 8192, 2048);
+    TEST_ASSERT(strstr(b.ptr, "\"object\":\"list\"") != NULL);
+    TEST_ASSERT(strstr(b.ptr, "\"id\":\"qwen3.6-35b-a3b\"") != NULL);
+    TEST_ASSERT(strstr(b.ptr, "deepseek-v4") == NULL);
+    TEST_ASSERT(strstr(b.ptr, "\"tools\"") == NULL);
     buf_free(&b);
 }
 
@@ -14847,21 +15489,30 @@ static void test_thinking_checkpoint_remember_gate(void) {
     r.think_mode = DS4_THINK_HIGH;
     thinking_state st = {.inside = true};
 
-    TEST_ASSERT(!should_remember_thinking_checkpoint(&r, &st, "length"));
-    TEST_ASSERT(!should_remember_thinking_checkpoint(&r, &st, "stop"));
+    TEST_ASSERT(!should_remember_thinking_checkpoint(
+        &r, &st, "length", DS4_CHAT_FORMAT_DEEPSEEK_V4));
+    TEST_ASSERT(!should_remember_thinking_checkpoint(
+        &r, &st, "stop", DS4_CHAT_FORMAT_DEEPSEEK_V4));
 
     st.inside = false;
-    TEST_ASSERT(!should_remember_thinking_checkpoint(&r, &st, "length"));
-    TEST_ASSERT(should_remember_thinking_checkpoint(&r, &st, "stop"));
+    TEST_ASSERT(!should_remember_thinking_checkpoint(
+        &r, &st, "length", DS4_CHAT_FORMAT_DEEPSEEK_V4));
+    TEST_ASSERT(should_remember_thinking_checkpoint(
+        &r, &st, "stop", DS4_CHAT_FORMAT_DEEPSEEK_V4));
 
     r.prompt_preserves_reasoning = true;
-    TEST_ASSERT(!should_remember_thinking_checkpoint(&r, &st, "stop"));
+    TEST_ASSERT(!should_remember_thinking_checkpoint(
+        &r, &st, "stop", DS4_CHAT_FORMAT_DEEPSEEK_V4));
     r.prompt_preserves_reasoning = false;
     r.has_tools = true;
-    TEST_ASSERT(!should_remember_thinking_checkpoint(&r, &st, "stop"));
+    TEST_ASSERT(!should_remember_thinking_checkpoint(
+        &r, &st, "stop", DS4_CHAT_FORMAT_DEEPSEEK_V4));
     r.has_tools = false;
     r.think_mode = DS4_THINK_NONE;
-    TEST_ASSERT(!should_remember_thinking_checkpoint(&r, &st, "stop"));
+    TEST_ASSERT(!should_remember_thinking_checkpoint(
+        &r, &st, "stop", DS4_CHAT_FORMAT_DEEPSEEK_V4));
+    TEST_ASSERT(should_remember_thinking_checkpoint(
+        &r, &st, "stop", DS4_CHAT_FORMAT_QWEN36));
 
     request_free(&r);
 }
@@ -15705,7 +16356,8 @@ static void test_thinking_checkpoint_canonical_matches_future_prompt(void) {
     request_init(&r, REQ_CHAT, 128);
     r.think_mode = DS4_THINK_HIGH;
     r.prompt_text = xstrdup(prompt_text);
-    char *visible = build_toolless_thinking_visible_text(&r, content);
+    char *visible = build_toolless_thinking_visible_text(
+        NULL, &r, content, NULL);
     TEST_ASSERT(visible != NULL);
     TEST_ASSERT(!strcmp(visible, canonical.ptr));
     free(visible);
@@ -15933,6 +16585,11 @@ static void test_thinking_canonical_non_thinking_mode_noop(void) {
 }
 
 static void ds4_server_unit_tests_run(void) {
+    test_qwen_endpoint_gate_is_family_aware();
+    test_qwen_chat_ir_borrows_typed_untrusted_content();
+    test_qwen_tool_gate_accepts_semantically_tool_free_requests();
+    test_qwen_chat_ir_rejects_unsupported_protocol_shapes();
+    test_message_content_flags_preserve_legacy_flattening();
     test_request_defaults_use_min_p_filtering();
     test_reasoning_effort_mapping();
     test_api_thinking_controls_parse();
