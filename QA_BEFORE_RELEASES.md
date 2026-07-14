@@ -109,6 +109,39 @@ SSD streaming is a capacity path, so test both correctness and user experience.
 - If streaming cache internals changed, test the same prompt twice and compare
   first-token/logprob sanity between runs.
 
+### Experimental Qwen3.6 Metal lane
+
+This lane is branch-only and does not relax the DeepSeek gates above. Use only
+the normalized Qwen3.6-35B-A3B Q4_K_S artifact and record its SHA-256; a raw
+community GGUF is not an equivalent input.
+
+- Run `make model-free-test` and `./ds4_test --metal-kernels`. The latter must
+  retain resident/SSD top-8 output equivalence, zero resident cache/`pread`
+  accounting, malformed-route fail-closed behavior, and slab-growth checks.
+- Run AUTO with `DS4_QWEN_EXPERIMENTAL_METAL=1`; record both admission plans,
+  their point-in-time inputs, resolved mode, cache tier, configured 321-expert
+  slab target, cache `buffer_allocs`, task physical footprint, and system swap
+  before/during/after. Exact slab count/capacity is asserted by the Metal
+  kernel test; it is not a public runtime counter.
+- Never bypass a failed resident admission to obtain a benchmark. On a host
+  where both checks pass, compare the same deterministic prompt and logits in
+  model-backed resident and forced-SSD modes.
+- In SSD mode, verify the first route allocates one 321-expert slab (about
+  0.529 GiB), later growth remains within the admitted cache budget, and no new
+  swap appears. Separate warm page-cache evidence from cold device-I/O evidence.
+- A physical 16 GiB Mac must pass cold and repeated runs at 8,192 context with
+  no new swap before any 16 GiB support claim. Do not run the large scalar CPU
+  reference on that machine.
+- Resident mode proves complete model mapping and full-tensor Metal execution,
+  not that every mapped GGUF page remained physically resident. Measure the
+  stronger claim separately if it is used in release language.
+- Apply the correctness and performance thresholds in
+  [`PREREG_QWEN36_35B_A3B_20260714.md`](PREREG_QWEN36_35B_A3B_20260714.md):
+  physical 16 GiB at context 8,192 with at least 128 prompt + 64 output tokens,
+  warm generation at least 3 t/s, warm first token at most 5 s, resident at
+  least 85% of pinned llama.cpp, context 32,768 on at least 32 GiB, and no
+  significant DeepSeek regression.
+
 ## 6. CUDA / DGX Spark
 
 Before a release, ask the user for CUDA access if it is not already configured.

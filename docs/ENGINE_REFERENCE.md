@@ -183,8 +183,25 @@ Start with AUTO residency and the automatic cache budget:
 ./ds4 -m ./ds4flash.gguf
 ```
 
-Use `--ssd-streaming` to force streaming, or `--resident` to force full
-residency.  Startup logs report the resolved mode and the memory-plan reason.
+Use `--ssd-streaming` to force streaming, or `--resident` to request the
+full-model mapped mode. Startup logs report the resolved mode and the
+memory-plan reason.
+
+The experimental `qwen35moe` branch narrows this contract to one normalized
+Qwen3.6-35B-A3B Q4_K_S layout.  `DS4_QWEN_EXPERIMENTAL_METAL=1` enables a Metal
+AUTO mode that first attempts a complete mapped-tensor path.  It requires both
+the normal working-set calculation and a live unified-memory pressure snapshot;
+if either cannot admit that mode, AUTO uses bounded SSD streaming.  Qwen's cache
+planner charges its complete non-routed page set separately and grows cache
+storage in 321-expert (about 0.529 GiB) slabs.  The generic DeepSeek planner and
+4 GiB slab default are unchanged.  Exact artifact and validation details live
+in [`tests/qwen/README.md`](../tests/qwen/README.md).
+
+Qwen numerical inference is currently Metal-only.  The CPU performs tokenizer,
+sampling, selected-route readback, cache bookkeeping, and GGUF I/O in streamed
+mode; there is no CPU/GPU split of neural layers or routed experts.  Resident
+mode disables DS4's expert-cache `pread`, but Metal's residency request remains
+a budget hint rather than proof that every mapped page stayed physically in RAM.
 
 If startup reports that the expert cache is too large, or if you want to reserve
 more memory for context, set the routed expert cache explicitly:

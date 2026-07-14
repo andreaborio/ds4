@@ -208,7 +208,7 @@ Python standard library.  Their offline gate is:
 python3 tests/qwen/test_compare_logits.py -v
 ```
 
-## Experimental Qwen Metal + SSD runtime
+## Experimental Qwen Metal AUTO runtime
 
 The current experimental runtime qualifies one text model and one normalized
 layout: `Qwen3.6-35B-A3B-ds4-Q4_K_S.gguf`, GGUF architecture `qwen35moe`, with
@@ -238,20 +238,35 @@ artifact has SHA-256
 This exact hash is the artifact qualified by the evidence below; the raw
 Unsloth GGUF is not a drop-in substitute for this experimental DS4 path.
 
-The two true explicit opt-ins are the literal environment guard and explicit
-SSD residency.  The Metal backend is mandatory but already defaults on Apple
-builds; `--metal` is shown for clarity.  Effective power must be 100;
-`--power 100` is shown for reproducibility but is also the default:
+The literal environment guard is the experimental opt-in.  The Metal backend,
+AUTO residency, and power 100 already default on Apple builds; the backend and
+power are shown for clarity and reproducibility:
 
 ```sh
 export DS4_QWEN_EXPERIMENTAL_METAL=1
 ./ds4 -m /absolute/path/to/Qwen3.6-35B-A3B-ds4-Q4_K_S.gguf \
-  --metal --ssd-streaming --power 100 ...
+  --metal --power 100 ...
 ```
 
-Omitting the environment guard or explicit `--ssd-streaming` fails closed, as
-does selecting a non-Metal backend or an effective power setting below 100.
-Resident Qwen Metal inference is not enabled by this experiment.
+Omitting the environment guard fails closed, as does selecting a non-Metal
+backend or an effective power setting below 100.  AUTO resolves to resident
+only when both the fixed Metal working-set budget and a live host-pressure
+preflight prove it safe; otherwise it selects bounded SSD streaming.
+`--resident` is a strict request and fails unless both admission checks pass;
+the point-in-time pressure snapshot cannot guarantee future memory availability.
+`--ssd-streaming` remains the explicit forced-streaming mode.  Cache, cold, and
+other SSD-only options continue to imply SSD and conflict with `--resident`.
+Resident mode maps the complete tensor payload, disables DS4's explicit expert
+cache/`pread` path, and uses full-tensor Metal kernels.  Metal residency requests
+are budgeting hints rather than whole-file pre-faults, so this mode name alone
+does not prove that every GGUF page remained physically resident throughout a
+run.
+
+The supported path does not implement neural CPU+GPU hybrid inference.  Metal
+runs the dense, recurrent, attention, router, and routed-expert math; the CPU
+handles tokenization, sampling, selected-ID readback, cache policy, and GGUF
+I/O when SSD mode is active.  A future CPU/GPU expert split would be a separate
+performance experiment and must not be inferred from the current orchestration.
 
 ### Expert-cache tiers
 
@@ -264,12 +279,34 @@ against the effective locked budget, not only the requested count: the Metal
 kernel test forces the first lazy `mlock` to fail and verifies rejection before
 readahead, `pread`, cache installation, miss accounting, or token accounting.
 
-The recommended starting tier is 640 experts (1.055 GiB), covering two complete
-routes.  A smaller accepted cache emits an anti-thrashing warning.  This is a
-starting policy, not a guarantee that 640 experts fit every machine under
-current memory pressure: the startup planner may reject an explicit request
-that exceeds its safe host-memory budget.  If no count or byte budget is
-supplied, AUTO selects a safe value at or above the 321-expert floor.
+The controlled comparison tier is 640 experts (1.055 GiB), covering two
+complete routes.  A smaller accepted cache emits an anti-thrashing warning.
+This is a benchmark tier, not the automatic production choice or a guarantee
+that 640 experts fit every machine under current memory pressure.  When AUTO
+selects SSD and no count or byte budget is supplied, the Qwen-specific strict
+planner independently charges the 2.50 GiB static page set, context/runtime,
+current-pressure margin, and Metal headroom, then chooses the largest complete
+320-expert cycle admitted by the conservative snapshot and planner.  Expert
+slots are populated and locked lazily, but Metal cache storage is allocated in
+321-expert slabs (about 0.529 GiB), so the first route allocates one complete
+working set plus its safety slot and later routes grow storage incrementally.
+The planner charges the complete cache budget rather than only the currently
+populated slots.  The generic DeepSeek low-RAM floor-only tuning and its 4 GiB
+slab default are deliberately unchanged and are not applied to Qwen.
+
+### AUTO and resident validation
+
+The resident top-8 Metal kernel is covered model-free against the same Q4_K
+fixture as SSD streaming: both top-4 partials and their sum match, while the
+resident run records zero cache hits, misses, entries, tokens, and `pread`
+bytes.  Invalid resident routes leave all outputs and counters unchanged.
+
+Model-backed AUTO is pressure-dependent by design.  A 64 GiB Mac is not an
+unconditional resident tier: if other applications consume unified memory,
+AUTO can correctly choose SSD.  A physical 16 GiB machine is expected to use
+SSD for this 19.37 GiB tensor payload, but still receives the largest cache that
+fits the same safety accounting.  This expectation is not a substitute for the
+physical 16 GiB release gate below.
 
 ### Reproduce the one-token Metal/logits smoke
 
@@ -422,9 +459,9 @@ runtime currently rejects or leaves unsupported:
 - non-routed pin profiles and power settings below 100.
 
 The preregistered normalized-vs-original-Unsloth multi-position NLL/top-1 gate,
-a complete multi-position oracle, longer continuations, resident/SSD
-equivalence, disk snapshot restore, server tool-call sessions, 8K/32K context,
-and physical 16 GiB pressure/swap tests remain release gates.  The one-token
-oracle is a smoke-tolerance result; together with the bounded coding run it
-proves an alive, numerically close Metal+SSD path, not the general Qwen release
-path.
+a complete multi-position oracle, longer continuations, model-backed
+resident/SSD equivalence on a host where resident admission is safe, disk
+snapshot restore, server tool-call sessions, 8K/32K context, and physical
+16 GiB pressure/swap tests remain release gates.  The one-token oracle is a
+smoke-tolerance result; together with the bounded coding run it proves an alive,
+numerically close Metal+SSD path, not the general Qwen release path.

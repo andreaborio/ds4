@@ -1,9 +1,9 @@
 # Gold Metal + SSD contract
 
 This fork treats Apple Metal as the production default on macOS.  The default
-runtime policy is `AUTO` residency: use the faster fully-resident path when the
-model and requested context fit a conservative Metal budget, otherwise select
-SSD streaming automatically.
+runtime policy is `AUTO` residency: use the faster full-model mapped path when
+the model and requested context fit a conservative Metal budget, otherwise
+select SSD streaming automatically.
 
 ## User-facing contract
 
@@ -68,6 +68,28 @@ equivalent backend-specific capacity planner is validated.
 
 If Metal cannot report a working-set recommendation, AUTO fails safely unless
 the user supplies an explicit SSD cache budget.  SSD + MTP remains unsupported.
+
+### Experimental Qwen3.6 policy
+
+The `feat/qwen-support` branch has a stricter family-specific contract for the
+single normalized Qwen3.6-35B-A3B Q4_K_S artifact.  With
+`DS4_QWEN_EXPERIMENTAL_METAL=1`, AUTO admits the complete mapped-tensor Metal
+path only when both the fixed working-set plan and a point-in-time live-memory
+pressure check pass.  Otherwise it selects SSD streaming.  Explicit
+`--resident` fails unless both checks pass; the snapshot is conservative
+admission, not a guarantee against later memory-pressure changes.
+
+Qwen's SSD planner charges static page coverage, session/runtime memory,
+ordinary host headroom, pressure margin, and Metal headroom independently.  It
+then chooses a complete `1 + 320*k` expert tier and grows Metal storage in
+321-expert slabs (about 0.529 GiB) instead of the generic 4 GiB slab.  DeepSeek
+AUTO tuning and slab defaults are unchanged.
+
+For this path, `resident` means complete tensor mapping, full-tensor Metal
+kernels, and no DS4 expert-cache `pread`.  Metal residency requests are budget
+hints; they do not prove that all file pages remained physically resident.  See
+[`tests/qwen/README.md`](tests/qwen/README.md) for the exact hash, commands, and
+still-open physical 16 GiB and model-backed resident gates.
 
 ## Reference lanes
 

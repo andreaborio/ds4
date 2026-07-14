@@ -15,9 +15,10 @@ equivalent implementation, this fork converges on it and removes the duplicate.
 > only acceptable speed regression is when an important correctness bug is fixed and it
 > requires some speed penalty."* Read every entry below against that rule.
 
-Ledger snapshot: fork `main` `1523b26`, upstream `main` `80ebbc3`, audited
-2026-07-14. Commit links and live branch differences remain authoritative if
-this dated snapshot drifts.
+Ledger snapshot: fork `origin/main` `e633c77` (including the earlier `1523b26`
+Metal lifecycle milestone), upstream `main` `80ebbc3`, audited 2026-07-14.
+Commit links and live branch differences remain authoritative if this dated
+snapshot drifts.
 
 ## Upstream status of fork changes
 
@@ -45,7 +46,7 @@ this dated snapshot drifts.
 |---|---|---|
 | Resident-map overcommit guard | Published branch `fix/refuse-oversized-resident-maps` at `06fd005`; tested, not yet on fork `main` | Open upstream as a standalone PR; do not claim mainline protection until it lands here or upstream. |
 | GLM 5.2 | Published experimental branch; streamed prefill fixes and optimization measured on M5 Pro 64 GB | Keep whole-line claims separate from DeepSeek `main`; #520 and #528 are already open upstream. |
-| Qwen3.6-35B-A3B (`qwen35moe`) | Experimental branch `feat/qwen-support`; the normalized Q4_K_S artifact passes a one-token CPU/llama.cpp logits smoke gate and real Metal + SSD logits/generation on M5 Pro 64 GB | Keep isolated and opt-in. No 16 GB support claim until a physical 8K cold/warm zero-swap run passes; the normalized-vs-Unsloth multi-position quality gate, server tools, exact rewind/snapshots, long context, and cross-backend production parity remain release gates. Review reusable primitives for focused upstream PRs only after those measurements. |
+| Qwen3.6-35B-A3B (`qwen35moe`) | Experimental branch `feat/qwen-support`; the exact normalized Q4_K_S artifact has real Metal + SSD logits/generation evidence, AUTO full-model-map admission with an independent live-pressure gate, a strict Qwen cache planner, incremental 321-expert slabs, and model-free resident/SSD top-8 equivalence. Live check on 2026-07-14 found upstream issue [#462](https://github.com/antirez/ds4/issues/462) but no open Qwen implementation PR. | Keep isolated and opt-in. No 16 GB support claim until a physical 8K cold/warm no-new-swapout run passes. Model-backed resident/SSD equivalence is still open, as are the normalized-vs-Unsloth multi-position quality gate, server tools, exact rewind/snapshots, long context, cold device-I/O, and cross-backend production parity. The live-pressure guard, strict planner, and slab override are potentially reusable primitives but are not upstream-ready until DeepSeek and cross-backend validation is complete. |
 
 ## DO NOT UPSTREAM (without clearing the bar below): per-expert / mixed-precision expert quantization
 

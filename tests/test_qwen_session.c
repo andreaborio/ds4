@@ -224,6 +224,38 @@ static void test_qwen_metal_session_context_budget(void) {
     CHECK(requested.total_bytes > planned.total_bytes);
 }
 
+static void test_qwen_residency_request_normalization(void) {
+    ds4_engine_options opt = {0};
+    ds4_residency_mode mode = DS4_RESIDENCY_SSD;
+
+    opt.residency = DS4_RESIDENCY_AUTO;
+    CHECK(ds4_engine_normalize_residency_request(&opt, &mode));
+    CHECK(mode == DS4_RESIDENCY_AUTO);
+
+    opt.residency = DS4_RESIDENCY_RESIDENT;
+    CHECK(ds4_engine_normalize_residency_request(&opt, &mode));
+    CHECK(mode == DS4_RESIDENCY_RESIDENT);
+
+    opt.residency = DS4_RESIDENCY_SSD;
+    CHECK(ds4_engine_normalize_residency_request(&opt, &mode));
+    CHECK(mode == DS4_RESIDENCY_SSD);
+
+    opt = (ds4_engine_options){0};
+    opt.residency = DS4_RESIDENCY_AUTO;
+    opt.ssd_streaming_cache_experts = 321;
+    CHECK(ds4_engine_normalize_residency_request(&opt, &mode));
+    CHECK(mode == DS4_RESIDENCY_SSD);
+
+    opt.residency = DS4_RESIDENCY_RESIDENT;
+    CHECK(!ds4_engine_normalize_residency_request(&opt, &mode));
+
+    opt = (ds4_engine_options){0};
+    opt.residency = DS4_RESIDENCY_AUTO;
+    opt.ssd_streaming = true;
+    CHECK(ds4_engine_normalize_residency_request(&opt, &mode));
+    CHECK(mode == DS4_RESIDENCY_SSD);
+}
+
 typedef struct {
     ds4_model model;
     ds4_qwen35_weights weights;
@@ -899,6 +931,7 @@ int main(void) {
     test_session_creation_boundary();
     test_model_aware_context_memory();
     test_qwen_metal_session_context_budget();
+    test_qwen_residency_request_normalization();
     test_qwen35_ssd_static_contract();
     test_gpu_dense_layout_contract();
 

@@ -19,6 +19,7 @@ typedef enum {
     DS4_RESIDENCY_REASON_NON_METAL_AUTO,
     DS4_RESIDENCY_REASON_METAL_FITS,
     DS4_RESIDENCY_REASON_METAL_EXCEEDS,
+    DS4_RESIDENCY_REASON_METAL_CURRENT_PRESSURE,
     DS4_RESIDENCY_REASON_METAL_BUDGET_UNAVAILABLE,
     DS4_RESIDENCY_REASON_INSPECT_ONLY,
 } ds4_residency_reason;
@@ -47,6 +48,18 @@ typedef struct {
     uint64_t effective_cache_bytes;
     uint32_t cache_experts;
 } ds4_ssd_cache_plan;
+
+/* Point-in-time guard for AUTO full-model mapped mode. Metal's fixed
+ * recommended working-set limit does not shrink when another process consumes
+ * unified memory, so the live reclaimable budget must pass independently. */
+typedef struct {
+    uint64_t physical_bytes;
+    uint64_t reclaimable_bytes;
+    uint64_t current_headroom_bytes;
+    uint64_t pressure_margin_bytes;
+    uint64_t required_bytes;
+    bool fits;
+} ds4_ssd_resident_pressure_plan;
 
 typedef struct {
     uint64_t working_set_experts;
@@ -135,6 +148,21 @@ bool ds4_ssd_adaptive_cache_plan_make_with_static_reserve(
         uint64_t                    per_expert_bytes,
         uint64_t                    max_cacheable_experts,
         ds4_ssd_adaptive_cache_plan *out);
+bool ds4_ssd_adaptive_cache_plan_make_strict_with_static_reserve(
+        const ds4_ssd_host_memory  *memory,
+        uint64_t                    runtime_bytes,
+        uint64_t                    static_working_set_bytes,
+        bool                        static_already_pinned,
+        uint64_t                    cacheable_routed_layers,
+        uint64_t                    experts_per_token,
+        uint64_t                    per_expert_bytes,
+        uint64_t                    max_cacheable_experts,
+        ds4_ssd_adaptive_cache_plan *out);
+bool ds4_ssd_resident_pressure_plan_make(
+        const ds4_ssd_host_memory      *memory,
+        uint64_t                        model_bytes,
+        uint64_t                        runtime_bytes,
+        ds4_ssd_resident_pressure_plan *out);
 bool ds4_ssd_low_ram_cache_policy(uint64_t physical_bytes);
 bool ds4_ssd_static_pin_host_supported(uint64_t physical_bytes);
 bool ds4_ssd_working_set_after_reserve(uint64_t  recommended_bytes,

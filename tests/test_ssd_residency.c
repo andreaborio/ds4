@@ -103,6 +103,44 @@ int main(void) {
                                     (ds4_residency_mode)99,
                                     0, 0, 0, 0, &p));
 
+    ds4_ssd_resident_pressure_plan pressure = {0};
+    ds4_ssd_host_memory pressure_memory = {
+        .physical_bytes = 64 * GIB,
+        .free_bytes = 30 * GIB,
+        .purgeable_bytes = 2 * GIB,
+        .inactive_bytes = 8 * GIB,
+        .file_backed_bytes = 10 * GIB,
+    };
+    assert(ds4_ssd_resident_pressure_plan_make(
+        &pressure_memory, 20 * GIB, 1 * GIB, &pressure));
+    assert(pressure.reclaimable_bytes == 36 * GIB);
+    assert(pressure.current_headroom_bytes == 4 * GIB);
+    assert(pressure.pressure_margin_bytes == 1 * GIB);
+    assert(pressure.required_bytes == 26 * GIB);
+    assert(pressure.fits);
+
+    /* Live pressure is an independent residency gate: equality is safe, but
+     * one byte less reclaimable memory fails closed even on a 64 GiB host. */
+    pressure_memory = (ds4_ssd_host_memory){
+        .physical_bytes = 64 * GIB,
+        .free_bytes = 26 * GIB,
+    };
+    assert(ds4_ssd_resident_pressure_plan_make(
+        &pressure_memory, 20 * GIB, 1 * GIB, &pressure));
+    assert(pressure.fits);
+    pressure_memory.free_bytes--;
+    assert(ds4_ssd_resident_pressure_plan_make(
+        &pressure_memory, 20 * GIB, 1 * GIB, &pressure));
+    assert(!pressure.fits);
+    assert(!ds4_ssd_resident_pressure_plan_make(
+        NULL, 1, 0, &pressure));
+    assert(!ds4_ssd_resident_pressure_plan_make(
+        &pressure_memory, 0, 0, &pressure));
+    assert(!ds4_ssd_resident_pressure_plan_make(
+        &pressure_memory, UINT64_MAX, 1, &pressure));
+    assert(!ds4_ssd_resident_pressure_plan_make(
+        &pressure_memory, 1, 0, NULL));
+
     uint64_t available = 0;
     uint64_t reserved = 0;
     assert(ds4_ssd_working_set_after_reserve(10 * GIB,
@@ -199,6 +237,60 @@ int main(void) {
     assert(floor.minimum_cache_experts == 321);
     assert(floor.minimum_cache_bytes == UINT64_C(568000512));
     assert(floor.warning_cache_experts == 640);
+
+    /* Qwen's bounded SSD policy is deliberately distinct from the measured
+     * DeepSeek low-RAM tuning below.  It charges the complete static mapping
+     * in addition to ordinary headroom, then uses every remaining safe byte
+     * in complete 320-expert routing cycles. */
+    ds4_ssd_host_memory qwen_memory = {
+        .physical_bytes = 16 * GIB,
+        .recommended_bytes = 12 * GIB,
+        .free_bytes = 15 * GIB,
+    };
+    ds4_ssd_adaptive_cache_plan qwen_adaptive = {0};
+    assert(ds4_ssd_adaptive_cache_plan_make_strict_with_static_reserve(
+        &qwen_memory,
+        512 * MIB,
+        5 * GIB / 2u,
+        false,
+        QWEN35_N_LAYER,
+        QWEN35_N_EXPERT_USED,
+        qwen_expert_bytes,
+        qwen_max_cacheable,
+        &qwen_adaptive));
+    assert(!qwen_adaptive.low_ram_floor_ceiling_active);
+    assert(qwen_adaptive.pageable_static_reserve_bytes == 5 * GIB / 2u);
+    assert(qwen_adaptive.platform_static_reserve_bytes == 5 * GIB / 2u);
+    assert(qwen_adaptive.current_headroom_bytes == 2 * GIB);
+    assert(qwen_adaptive.platform_headroom_bytes == 2 * GIB);
+    assert(qwen_adaptive.platform_wire_budget_bytes == 7 * GIB);
+    assert(qwen_adaptive.cache_envelope_bytes ==
+           qwen_adaptive.safety_wire_budget_bytes);
+    assert(qwen_adaptive.cache_experts > floor.minimum_cache_experts);
+    assert(qwen_adaptive.cache_experts < qwen_max_cacheable);
+    assert((qwen_adaptive.cache_experts - 1u) /
+           floor.working_set_experts > 0);
+    assert((qwen_adaptive.cache_experts - 1u) %
+           floor.working_set_experts == 0);
+    assert(qwen_adaptive.cache_bytes <=
+           qwen_adaptive.safety_wire_budget_bytes);
+
+    qwen_memory = (ds4_ssd_host_memory){
+        .physical_bytes = 64 * GIB,
+        .recommended_bytes = 52 * GIB,
+        .free_bytes = 60 * GIB,
+    };
+    assert(ds4_ssd_adaptive_cache_plan_make_strict_with_static_reserve(
+        &qwen_memory,
+        512 * MIB,
+        5 * GIB / 2u,
+        false,
+        QWEN35_N_LAYER,
+        QWEN35_N_EXPERT_USED,
+        qwen_expert_bytes,
+        qwen_max_cacheable,
+        &qwen_adaptive));
+    assert(qwen_adaptive.cache_experts == qwen_max_cacheable);
 
     assert(!ds4_ssd_expert_cache_floor_make(0, 6, 1, &floor));
     assert(!ds4_ssd_expert_cache_floor_make(1, 0, 1, &floor));

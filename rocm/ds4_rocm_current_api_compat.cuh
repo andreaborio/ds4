@@ -183,6 +183,11 @@ extern "C" void ds4_gpu_set_streaming_expert_cache_expert_bytes(uint64_t bytes) 
     (void)bytes;
 }
 
+extern "C" void ds4_gpu_set_streaming_expert_cache_slab_target_bytes(
+        uint64_t bytes) {
+    (void)bytes;
+}
+
 extern "C" uint64_t ds4_gpu_recommended_working_set_size(void) {
     size_t free_b = 0;
     size_t total_b = 0;

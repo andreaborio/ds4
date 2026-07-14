@@ -40,6 +40,8 @@ const char *ds4_residency_reason_name(ds4_residency_reason reason) {
         return "estimated Metal residency plan fits the conservative budget";
     case DS4_RESIDENCY_REASON_METAL_EXCEEDS:
         return "estimated Metal residency plan exceeds the conservative budget";
+    case DS4_RESIDENCY_REASON_METAL_CURRENT_PRESSURE:
+        return "live-pressure budget cannot admit full-model mapped mode";
     case DS4_RESIDENCY_REASON_METAL_BUDGET_UNAVAILABLE:
         return "Metal recommended working-set budget is unavailable";
     case DS4_RESIDENCY_REASON_INSPECT_ONLY:
@@ -251,6 +253,50 @@ bool ds4_ssd_low_ram_cache_policy(uint64_t physical_bytes) {
     return physical_bytes != 0 && physical_bytes <= 16u * DS4_GIB;
 }
 
+bool ds4_ssd_resident_pressure_plan_make(
+        const ds4_ssd_host_memory      *memory,
+        uint64_t                        model_bytes,
+        uint64_t                        runtime_bytes,
+        ds4_ssd_resident_pressure_plan *out) {
+    if (!out) return false;
+    memset(out, 0, sizeof(*out));
+    if (!memory || memory->physical_bytes == 0 || model_bytes == 0) {
+        return false;
+    }
+
+    out->physical_bytes = memory->physical_bytes;
+    const uint64_t file_inactive_bytes =
+        memory->inactive_bytes < memory->file_backed_bytes ?
+            memory->inactive_bytes : memory->file_backed_bytes;
+    uint64_t reclaimable = saturating_add_u64(memory->free_bytes,
+                                               memory->purgeable_bytes);
+    reclaimable = saturating_add_u64(reclaimable,
+                                      file_inactive_bytes / 2u);
+    if (reclaimable > memory->physical_bytes) {
+        reclaimable = memory->physical_bytes;
+    }
+    out->reclaimable_bytes = reclaimable;
+
+    out->current_headroom_bytes = memory->physical_bytes / 16u;
+    if (out->current_headroom_bytes < 2u * DS4_GIB) {
+        out->current_headroom_bytes = 2u * DS4_GIB;
+    }
+    out->pressure_margin_bytes = memory->physical_bytes / 64u;
+    if (out->pressure_margin_bytes < DS4_GIB / 4u) {
+        out->pressure_margin_bytes = DS4_GIB / 4u;
+    }
+
+    if (model_bytes > UINT64_MAX - runtime_bytes) return false;
+    uint64_t required = model_bytes + runtime_bytes;
+    if (required > UINT64_MAX - out->current_headroom_bytes) return false;
+    required += out->current_headroom_bytes;
+    if (required > UINT64_MAX - out->pressure_margin_bytes) return false;
+    required += out->pressure_margin_bytes;
+    out->required_bytes = required;
+    out->fits = required <= reclaimable;
+    return true;
+}
+
 bool ds4_ssd_static_pin_host_supported(uint64_t physical_bytes) {
     /* The static pin is an experimental performance arm, not a correctness
      * requirement.  It has only been validated on a 64 GiB unified-memory
@@ -258,11 +304,12 @@ bool ds4_ssd_static_pin_host_supported(uint64_t physical_bytes) {
     return physical_bytes >= 64u * DS4_GIB;
 }
 
-bool ds4_ssd_adaptive_cache_plan_make_with_static_reserve(
+static bool ds4_ssd_adaptive_cache_plan_make_policy(
         const ds4_ssd_host_memory   *memory,
         uint64_t                     runtime_bytes,
         uint64_t                     static_working_set_bytes,
         bool                         static_already_pinned,
+        bool                         apply_deepseek_tuning,
         uint64_t                     cacheable_routed_layers,
         uint64_t                     experts_per_token,
         uint64_t                     per_expert_bytes,
@@ -281,6 +328,7 @@ bool ds4_ssd_adaptive_cache_plan_make_with_static_reserve(
         return false;
     }
     out->low_ram_floor_ceiling_active =
+        apply_deepseek_tuning &&
         ds4_ssd_low_ram_cache_policy(memory->physical_bytes);
     /* A 16 GiB host cannot retain Flash's complete static working set and a
      * useful expert cache simultaneously.  The measured winner there is the
@@ -308,14 +356,15 @@ bool ds4_ssd_adaptive_cache_plan_make_with_static_reserve(
     if (out->current_headroom_bytes < two_gib) {
         out->current_headroom_bytes = two_gib;
     }
-    if (static_already_pinned) {
+    if (apply_deepseek_tuning && static_already_pinned) {
         /* The live snapshot has already fallen by the pinned bytes.  Preserve
          * the same pre-pin max(base, static) policy by charging only the
          * residual base slack not covered by that drop. */
         out->current_headroom_bytes =
             out->current_headroom_bytes > static_reserve_bytes ?
                 out->current_headroom_bytes - static_reserve_bytes : 0;
-    } else if (out->current_headroom_bytes <
+    } else if (apply_deepseek_tuning &&
+               out->current_headroom_bytes <
                out->pageable_static_reserve_bytes) {
         out->current_headroom_bytes = out->pageable_static_reserve_bytes;
     }
@@ -327,14 +376,15 @@ bool ds4_ssd_adaptive_cache_plan_make_with_static_reserve(
     if (out->platform_headroom_bytes < two_gib) {
         out->platform_headroom_bytes = two_gib;
     }
-    if (static_already_pinned) {
+    if (apply_deepseek_tuning && static_already_pinned) {
         /* Pinned pages are irreversible pressure and therefore additive to
          * the ordinary platform slack.  Pageable static pages can instead
          * occupy that slack and remain reclaimable, so max() is sufficient. */
         out->platform_headroom_bytes = saturating_add_u64(
             out->platform_headroom_bytes,
             out->platform_static_reserve_bytes);
-    } else if (out->platform_headroom_bytes <
+    } else if (apply_deepseek_tuning &&
+               out->platform_headroom_bytes <
                out->platform_static_reserve_bytes) {
         out->platform_headroom_bytes = out->platform_static_reserve_bytes;
     }
@@ -342,6 +392,14 @@ bool ds4_ssd_adaptive_cache_plan_make_with_static_reserve(
     uint64_t current_reserve =
         saturating_add_u64(out->current_headroom_bytes,
                            out->pressure_margin_bytes);
+    if (!apply_deepseek_tuning) {
+        /* Qwen's strict bounded mode treats the mapped static page set as an
+         * independent charge.  It is not allowed to consume the ordinary
+         * host-pressure headroom that protects the rest of the system. */
+        current_reserve = saturating_add_u64(
+            current_reserve,
+            out->pageable_static_reserve_bytes);
+    }
     /* The host snapshot is taken while the engine is opened, before a session
      * allocates its modeled KV/cache/scratch footprint.  Reserve that future
      * allocation in both independent safety constraints: subtracting it only
@@ -352,8 +410,13 @@ bool ds4_ssd_adaptive_cache_plan_make_with_static_reserve(
         out->current_wire_budget_bytes = reclaimable - current_reserve;
     }
 
-    const uint64_t platform_reserve =
+    uint64_t platform_reserve =
         saturating_add_u64(runtime_bytes, out->platform_headroom_bytes);
+    if (!apply_deepseek_tuning) {
+        platform_reserve = saturating_add_u64(
+            platform_reserve,
+            out->platform_static_reserve_bytes);
+    }
     if (memory->recommended_bytes > platform_reserve) {
         out->platform_wire_budget_bytes =
             memory->recommended_bytes - platform_reserve;
@@ -368,9 +431,10 @@ bool ds4_ssd_adaptive_cache_plan_make_with_static_reserve(
      * Metal recommended set), but below the larger tier which consumed 3.57
      * GiB more wired memory without improving decode.  Current pressure can
      * still shrink below this hardware-scaled ceiling. */
-    out->cache_envelope_bytes =
+    out->cache_envelope_bytes = apply_deepseek_tuning ?
         (memory->recommended_bytes / 16u) * 9u +
-        ((memory->recommended_bytes % 16u) * 9u) / 16u;
+            ((memory->recommended_bytes % 16u) * 9u) / 16u :
+        out->safety_wire_budget_bytes;
     out->wire_budget_bytes =
         out->safety_wire_budget_bytes < out->cache_envelope_bytes ?
             out->safety_wire_budget_bytes : out->cache_envelope_bytes;
@@ -410,6 +474,52 @@ bool ds4_ssd_adaptive_cache_plan_make_with_static_reserve(
     out->cache_experts = (uint32_t)cache_experts;
     out->cache_bytes = cache_experts * per_expert_bytes;
     return true;
+}
+
+bool ds4_ssd_adaptive_cache_plan_make_with_static_reserve(
+        const ds4_ssd_host_memory   *memory,
+        uint64_t                     runtime_bytes,
+        uint64_t                     static_working_set_bytes,
+        bool                         static_already_pinned,
+        uint64_t                     cacheable_routed_layers,
+        uint64_t                     experts_per_token,
+        uint64_t                     per_expert_bytes,
+        uint64_t                     max_cacheable_experts,
+        ds4_ssd_adaptive_cache_plan *out) {
+    return ds4_ssd_adaptive_cache_plan_make_policy(
+        memory,
+        runtime_bytes,
+        static_working_set_bytes,
+        static_already_pinned,
+        true,
+        cacheable_routed_layers,
+        experts_per_token,
+        per_expert_bytes,
+        max_cacheable_experts,
+        out);
+}
+
+bool ds4_ssd_adaptive_cache_plan_make_strict_with_static_reserve(
+        const ds4_ssd_host_memory   *memory,
+        uint64_t                     runtime_bytes,
+        uint64_t                     static_working_set_bytes,
+        bool                         static_already_pinned,
+        uint64_t                     cacheable_routed_layers,
+        uint64_t                     experts_per_token,
+        uint64_t                     per_expert_bytes,
+        uint64_t                     max_cacheable_experts,
+        ds4_ssd_adaptive_cache_plan *out) {
+    return ds4_ssd_adaptive_cache_plan_make_policy(
+        memory,
+        runtime_bytes,
+        static_working_set_bytes,
+        static_already_pinned,
+        false,
+        cacheable_routed_layers,
+        experts_per_token,
+        per_expert_bytes,
+        max_cacheable_experts,
+        out);
 }
 
 bool ds4_ssd_adaptive_cache_plan_make(

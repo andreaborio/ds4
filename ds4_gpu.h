@@ -78,6 +78,9 @@ void ds4_gpu_set_streaming_expert_cache_budget(uint32_t experts);
 /* Optional model-lifetime fail-closed floor; zero disables the contract. */
 void ds4_gpu_set_streaming_expert_cache_required_floor(uint32_t experts);
 void ds4_gpu_set_streaming_expert_cache_expert_bytes(uint64_t bytes);
+/* Optional model-specific slab-growth target; zero restores the backend
+ * default. An explicit DS4_METAL_STREAMING_EXPERT_SLAB_MB still wins. */
+void ds4_gpu_set_streaming_expert_cache_slab_target_bytes(uint64_t bytes);
 uint64_t ds4_gpu_recommended_working_set_size(void);
 int ds4_gpu_host_memory_snapshot(ds4_ssd_host_memory *out);
 uint32_t ds4_gpu_stream_expert_cache_configured_count(void);

@@ -30374,7 +30374,8 @@ static bool ds4_engine_resolve_residency(ds4_engine               *e,
     uint64_t recommended = 0;
 #ifndef DS4_NO_GPU
     if (e->backend == DS4_BACKEND_METAL &&
-        e->residency_requested != DS4_RESIDENCY_RESIDENT) {
+        (e->residency_requested != DS4_RESIDENCY_RESIDENT ||
+         e->model.family == DS4_MODEL_FAMILY_QWEN35_MOE)) {
         recommended = ds4_gpu_recommended_working_set_size();
     }
 #endif
@@ -30389,6 +30390,53 @@ static bool ds4_engine_resolve_residency(ds4_engine               *e,
         fprintf(stderr, "ds4: could not resolve residency plan\n");
         return false;
     }
+
+#ifndef DS4_NO_GPU
+    if (e->backend == DS4_BACKEND_METAL &&
+        e->model.family == DS4_MODEL_FAMILY_QWEN35_MOE &&
+        e->residency_requested != DS4_RESIDENCY_SSD) {
+        const bool fixed_budget_fits =
+            e->residency_plan.recommended_bytes != 0 &&
+            e->residency_plan.required_bytes <=
+                e->residency_plan.budget_bytes;
+        ds4_ssd_host_memory memory = {0};
+        ds4_ssd_resident_pressure_plan pressure = {0};
+        const bool pressure_available =
+            ds4_gpu_host_memory_snapshot(&memory) &&
+            ds4_ssd_resident_pressure_plan_make(
+                &memory,
+                e->residency_plan.model_bytes,
+                e->residency_plan.runtime_bytes,
+                &pressure);
+        const bool pressure_fits = pressure_available && pressure.fits;
+
+        if (pressure_available) {
+            fprintf(stderr,
+                    "ds4: Qwen resident pressure preflight: model/runtime + "
+                    "headroom/margin %.2f GiB required; %.2f GiB currently "
+                    "reclaimable on %.2f GiB RAM\n",
+                    (double)pressure.required_bytes / 1073741824.0,
+                    (double)pressure.reclaimable_bytes / 1073741824.0,
+                    (double)pressure.physical_bytes / 1073741824.0);
+        }
+
+        if (e->residency_requested == DS4_RESIDENCY_RESIDENT &&
+            (!fixed_budget_fits || !pressure_fits)) {
+            fprintf(stderr,
+                    "ds4: refusing explicit Qwen resident mode: full Metal "
+                    "mapped mode was not admitted by both the fixed working-"
+                    "set and live-pressure budgets\n");
+            return false;
+        }
+        if (e->residency_requested == DS4_RESIDENCY_AUTO &&
+            e->residency_plan.resolved == DS4_RESIDENCY_RESIDENT &&
+            !pressure_fits) {
+            e->residency_plan.resolved = DS4_RESIDENCY_SSD;
+            e->residency_plan.reason =
+                DS4_RESIDENCY_REASON_METAL_CURRENT_PRESSURE;
+        }
+    }
+#endif
     e->residency = e->residency_plan.resolved;
     e->ssd_streaming = e->residency == DS4_RESIDENCY_SSD;
 
@@ -30665,18 +30713,11 @@ static DS4_MAYBE_UNUSED bool qwen35_streaming_cache_budget_from_request(
 static bool ds4_engine_qwen35_metal_options_valid(
         const ds4_engine         *e,
         const ds4_engine_options *opt,
-        ds4_residency_mode        residency_requested,
         bool                      load_slice) {
     if (!e || !opt) return false;
     if (e->backend != DS4_BACKEND_METAL) {
         fprintf(stderr,
                 "ds4: experimental Qwen Metal inference requires --metal\n");
-        return false;
-    }
-    if (residency_requested != DS4_RESIDENCY_SSD) {
-        fprintf(stderr,
-                "ds4: experimental Qwen Metal inference requires explicit "
-                "SSD residency (--ssd-streaming or --ssd)\n");
         return false;
     }
     if (e->quality) {
@@ -30800,7 +30841,7 @@ static bool ds4_engine_configure_qwen35_metal_streaming(ds4_engine *e) {
                 "ds4: Qwen SSD cache planning requires a host-memory snapshot\n");
         return false;
     }
-    if (!ds4_ssd_adaptive_cache_plan_make_with_static_reserve(
+    if (!ds4_ssd_adaptive_cache_plan_make_strict_with_static_reserve(
             &memory,
             e->residency_plan.runtime_bytes,
             static_page_coverage_bytes,
@@ -30859,6 +30900,11 @@ static bool ds4_engine_configure_qwen35_metal_streaming(ds4_engine *e) {
         (uint64_t)cache_experts * geometry.per_expert_bytes;
     ds4_gpu_set_streaming_expert_cache_expert_bytes(
         geometry.per_expert_bytes);
+    /* Grow the Qwen cache one complete route plus its in-flight safety slot
+     * at a time. This avoids a 4 GiB first slab on small unified-memory Macs
+     * while preserving the generic DeepSeek slab default. */
+    ds4_gpu_set_streaming_expert_cache_slab_target_bytes(
+        geometry.minimum_cache_bytes);
     ds4_gpu_set_streaming_expert_cache_budget(cache_experts);
     if (!ds4_gpu_set_model_fd(e->model.fd)) {
         fprintf(stderr,
@@ -30894,7 +30940,7 @@ static bool ds4_engine_configure_qwen35_metal_streaming(ds4_engine *e) {
     if ((uint64_t)configured < geometry.minimum_cache_experts ||
         (uint64_t)configured > geometry.max_cacheable_experts) {
         fprintf(stderr,
-                "ds4: Qwen SSD configured cache %u is outside the safe "
+                "ds4: Qwen SSD configured cache %u is outside the supported "
                 "%" PRIu64 "..%" PRIu64 " range after backend limits\n",
                 configured,
                 geometry.minimum_cache_experts,
@@ -30905,12 +30951,59 @@ static bool ds4_engine_configure_qwen35_metal_streaming(ds4_engine *e) {
     fprintf(stderr,
             "ds4: experimental Qwen Metal SSD runtime: static %.2f GiB "
             "payload / %.2f GiB page reserve, %u exact spans, cache %u "
-            "experts (%.2f GiB)\n",
+            "experts (%.2f GiB; current conservative AUTO cap %u), model "
+            "slab target %" PRIu64 " experts (%.2f GiB; "
+            "DS4_METAL_STREAMING_EXPERT_SLAB_MB overrides when set)\n",
             (double)static_payload_bytes / 1073741824.0,
             (double)static_page_coverage_bytes / 1073741824.0,
             exact_span_count,
             configured,
-            (double)e->ssd_streaming_cache_bytes / 1073741824.0);
+            (double)e->ssd_streaming_cache_bytes / 1073741824.0,
+            auto_plan.cache_experts,
+            geometry.minimum_cache_experts,
+            (double)geometry.minimum_cache_bytes / 1073741824.0);
+    return true;
+}
+
+static bool ds4_engine_configure_qwen35_metal_resident(ds4_engine *e) {
+    if (!e || e->backend != DS4_BACKEND_METAL ||
+        e->residency != DS4_RESIDENCY_RESIDENT || e->ssd_streaming ||
+        !e->model.map || e->model.tensor_data_pos >= e->model.size) {
+        return false;
+    }
+
+    if (!ds4_gpu_init()) {
+        fprintf(stderr,
+                "ds4: Metal backend unavailable while initializing Qwen resident mode\n");
+        return false;
+    }
+    e->metal_ready = true;
+    e->ssd_streaming_cache_experts = 0;
+    e->ssd_streaming_cache_bytes = 0;
+    ds4_gpu_set_quality(false);
+    ds4_gpu_set_ssd_streaming(false);
+    ds4_gpu_set_streaming_expert_cache_budget(0);
+    ds4_gpu_set_streaming_expert_cache_required_floor(0);
+    ds4_gpu_set_streaming_expert_cache_expert_bytes(0);
+    ds4_gpu_set_streaming_expert_cache_slab_target_bytes(0);
+    (void)ds4_gpu_set_model_fd(-1);
+
+    if (!ds4_gpu_set_model_map_range(
+            e->model.map,
+            e->model.size,
+            e->model.tensor_data_pos,
+            e->model.size - e->model.tensor_data_pos,
+            e->model.max_tensor_bytes)) {
+        fprintf(stderr,
+                "ds4: Qwen resident mode could not install the complete Metal model map\n");
+        return false;
+    }
+
+    fprintf(stderr,
+            "ds4: experimental Qwen Metal resident runtime: mapped %.2f GiB "
+            "of tensor data; SSD expert cache disabled\n",
+            (double)(e->model.size - e->model.tensor_data_pos) /
+                1073741824.0);
     return true;
 }
 #endif
@@ -31092,32 +31185,43 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
             return 1;
         }
         if (!ds4_engine_qwen35_metal_options_valid(
-                e, opt, residency_requested, load_slice)) {
+                e, opt, load_slice)) {
             ds4_engine_close(e);
             return 1;
         }
 #if defined(__APPLE__) && !defined(DS4_NO_GPU)
         if (!ds4_engine_resolve_residency(
-                e, opt, false, 0, 0, false) ||
-            e->residency != DS4_RESIDENCY_SSD || !e->ssd_streaming) {
-            fprintf(stderr,
-                    "ds4: Qwen Metal inference requires residency to resolve to SSD\n");
+                e, opt, false, 0, 0, false)) {
             ds4_engine_close(e);
             return 1;
         }
-        if (opt->warm_weights) {
-            fprintf(stderr,
-                    "ds4: --warm-weights ignored for Qwen Metal SSD streaming\n");
-        }
         vocab_load(&e->vocab, &e->model);
-        if (!ds4_engine_configure_qwen35_metal_streaming(e)) {
+        bool configured = false;
+        if (e->residency == DS4_RESIDENCY_SSD && e->ssd_streaming) {
+            if (opt->warm_weights) {
+                fprintf(stderr,
+                        "ds4: --warm-weights ignored for Qwen Metal SSD streaming\n");
+            }
+            configured =
+                ds4_engine_configure_qwen35_metal_streaming(e);
+        } else if (e->residency == DS4_RESIDENCY_RESIDENT &&
+                   !e->ssd_streaming) {
+            if (opt->warm_weights) model_warm_weights(&e->model);
+            configured =
+                ds4_engine_configure_qwen35_metal_resident(e);
+        }
+        if (!configured) {
+            fprintf(stderr,
+                    "ds4: Qwen Metal residency configuration failed for %s mode\n",
+                    ds4_residency_mode_name(e->residency));
             ds4_engine_close(e);
             return 1;
         }
         e->qwen_raw_runtime = true;
         e->qwen_metal_runtime = true;
         fprintf(stderr,
-                "ds4: experimental Qwen Metal SSD runtime enabled\n");
+                "ds4: experimental Qwen Metal %s runtime enabled\n",
+                ds4_residency_mode_name(e->residency));
         *out = e;
         return 0;
 #else

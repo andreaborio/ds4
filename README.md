@@ -148,30 +148,49 @@ the runtime needs.
 | DeepSeek V4 Flash | `main` | Primary supported path | Metal, adaptive SSD streaming, 16–64 GB measurements |
 | DeepSeek V4 PRO | `main` | Supported upstream path | High-memory and distributed inference |
 | GLM 5.2 | `codex/glm52-upstream-clean-bench` | Experimental branch | Correct streamed prefill and Metal performance on 64 GB |
-| Qwen3.6-35B-A3B (`qwen35moe`) | `feat/qwen-support` | Experimental branch | One-token logits and bounded Metal + SSD generation verified on M5 Pro 64 GB; physical 16 GB gate pending |
+| Qwen3.6-35B-A3B (`qwen35moe`) | `feat/qwen-support` | Experimental branch | Metal AUTO mapping, live-pressure fallback, strict SSD cache, and resident/SSD kernels implemented and model-free validated; clean post-slab model run and physical 16 GB gate pending |
 
-### Experimental Qwen3.6 Metal + SSD path
+### Experimental Qwen3.6 Metal AUTO path
 
 This branch is qualified and measured with one normalized text-only artifact,
 `Qwen3.6-35B-A3B-ds4-Q4_K_S.gguf`; it is not generic Qwen or arbitrary
-community-GGUF support. The two true opt-ins are the literal environment guard
-and explicit SSD residency; `--metal` and `--power 100` below pin the effective
-Apple defaults for reproducibility:
+community-GGUF support. The literal environment guard is the experimental
+opt-in; Metal, power 100, and AUTO residency are the Apple defaults, but are
+shown below for reproducibility:
 
 ```sh
 DS4_QWEN_EXPERIMENTAL_METAL=1 ./ds4 \
   -m /absolute/path/to/Qwen3.6-35B-A3B-ds4-Q4_K_S.gguf \
-  --metal --ssd-streaming \
-  --ssd-streaming-cache-experts 640 \
-  --power 100 --ctx 8192 --nothink
+  --metal --power 100 --ctx 8192 --nothink
 ```
 
-The hard cache floor is 321 complete routed experts (about 0.53 GiB); 640
-(about 1.06 GiB) is the recommended small-machine starting tier. Startup and
-the per-layer path fail closed if the effective locked cache falls below the
-floor. The runtime has completed a one-token oracle and bounded generation on
-an M5 Pro with 64 GiB, but a physical 16 GiB Mac has not yet passed the required
-cold/warm, 8K-context, zero-swap release run. See
+Qwen AUTO selects the full-model mapped Metal mode only when both the fixed Metal
+working-set budget and a point-in-time host-memory pressure check pass. Under
+pressure it falls back to SSD and lazily grows the routed-expert cache to the
+largest complete routing tier admitted by the current conservative snapshot,
+after independently reserving the 2.50 GiB
+static page set, context/runtime memory, and system headroom. `--resident`
+fails unless both admission checks pass; because pressure can change after the
+snapshot, this is a conservative admission policy rather than a future-memory
+guarantee. `--ssd-streaming` remains the reproducible forced-streaming override.
+In SSD mode Qwen grows its Metal expert cache in 321-expert slabs (about
+0.529 GiB) instead of taking the generic 4 GiB first slab.
+
+Here `resident` means that DS4 maps the complete tensor payload, disables its
+explicit SSD expert cache, and executes full-tensor Metal kernels. Metal's
+residency request is a budgeting hint: it neither pre-faults every GGUF page nor
+proves that every page remains physically resident as later pressure changes.
+That stronger physical-residency claim requires separate runtime measurement.
+All neural math in the supported Qwen path is on Metal. The CPU still performs
+tokenization, sampling, route readback, cache bookkeeping, and streamed GGUF
+I/O; a CPU+GPU split of layers or experts is not implemented in this branch.
+
+The hard SSD cache floor is 321 complete routed experts (about 0.53 GiB); 640
+(about 1.06 GiB) is a useful controlled small-cache tier. Startup and the
+per-layer path fail closed if the effective locked cache falls below the floor.
+The runtime has completed a one-token oracle and bounded generation on an M5
+Pro with 64 GiB, but a physical 16 GiB Mac has not yet passed the required
+cold/warm, 8K-context, no-new-swapout release run. See
 [`tests/qwen/README.md`](tests/qwen/README.md) for the exact artifact contract,
 reproducible evidence, and current limitations.
 
