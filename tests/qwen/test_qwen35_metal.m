@@ -5,8 +5,10 @@
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
+#include "../../ds4_qwen.h"
 #include "qwen36_attention_golden.inc"
 #include "qwen36_gdn_golden.inc"
 
@@ -18,7 +20,8 @@
  * Build and run from the repository root:
  *
  *   clang -fobjc-arc -framework Foundation -framework Metal \
- *     tests/qwen/test_qwen35_metal.m -o /tmp/test-qwen35-metal
+ *     tests/qwen/test_qwen35_metal.m ds4_qwen.c \
+ *     -o /tmp/test-qwen35-metal
  *   /tmp/test-qwen35-metal
  */
 
@@ -147,6 +150,12 @@ typedef struct {
     uint64_t output_dim_stride;
 } qwen35_gqa_args;
 
+typedef struct {
+    uint64_t logits_stride;
+    uint64_t selected_stride;
+    uint64_t selected_weight_stride;
+} qwen35_router_top8_args;
+
 _Static_assert(sizeof(qwen35_split_args) == 88, "split ABI drift");
 _Static_assert(sizeof(qwen35_sigmoid_mul_args) == 32, "sigmoid ABI drift");
 _Static_assert(sizeof(qwen35_rope_args) == 80, "RoPE ABI drift");
@@ -156,6 +165,7 @@ _Static_assert(sizeof(qwen35_norm_args) == 72, "RMSNorm ABI drift");
 _Static_assert(sizeof(qwen35_embedding_args) == 64, "embedding ABI drift");
 _Static_assert(sizeof(qwen35_controls_args) == 56, "controls ABI drift");
 _Static_assert(sizeof(qwen35_gqa_args) == 96, "GQA ABI drift");
+_Static_assert(sizeof(qwen35_router_top8_args) == 24, "router top-8 ABI drift");
 
 static id<MTLBuffer> buffer_with_bytes(
         id<MTLDevice> device,
@@ -301,6 +311,279 @@ static float host_load_f32(const uint8_t *base, size_t offset) {
     float value = 0.0f;
     memcpy(&value, base + offset, sizeof(value));
     return value;
+}
+
+static int32_t host_load_i32(const uint8_t *base, size_t offset) {
+    int32_t value = 0;
+    memcpy(&value, base + offset, sizeof(value));
+    return value;
+}
+
+static bool check_strided_guard(
+        const char    *name,
+        const uint8_t *bytes,
+        size_t         byte_count,
+        size_t         prefix,
+        size_t         stride,
+        size_t         value_size,
+        size_t         count,
+        uint8_t        guard) {
+    for (size_t offset = 0; offset < byte_count; offset++) {
+        bool writable = false;
+        for (size_t slot = 0; slot < count; slot++) {
+            const size_t begin = prefix + slot * stride;
+            if (offset >= begin && offset < begin + value_size) {
+                writable = true;
+                break;
+            }
+        }
+        if (!writable && bytes[offset] != guard) {
+            fprintf(stderr, "%s guard overwritten at byte %zu\n", name, offset);
+            return false;
+        }
+    }
+    return true;
+}
+
+static uint32_t router_rng_state = 0x91e0f5d1u;
+
+static uint32_t router_random_u32(void) {
+    uint32_t value = router_rng_state;
+    value ^= value << 13;
+    value ^= value >> 17;
+    value ^= value << 5;
+    router_rng_state = value;
+    return value;
+}
+
+static float router_random_logit(void) {
+    const int32_t centered = (int32_t)(router_random_u32() % 2000001u) - 1000000;
+    return (float)centered * (64.0f / 1000000.0f);
+}
+
+static bool run_router_top8_case(
+        id<MTLDevice>       device,
+        id<MTLCommandQueue> queue,
+        id<MTLLibrary>      library,
+        const char         *name,
+        const float         logits[QWEN35_N_EXPERT],
+        float              *maximum_weight_error) {
+    enum {
+        PREFIX = 32,
+        SUFFIX = 32,
+        LOGITS_STRIDE = 8,
+        SELECTED_STRIDE = 12,
+        WEIGHT_STRIDE = 16,
+        GUARD_LOGITS = 0xc3,
+        GUARD_SELECTED = 0xa5,
+        GUARD_WEIGHT = 0x5a,
+    };
+    const size_t logits_bytes =
+        PREFIX + (QWEN35_N_EXPERT - 1u) * LOGITS_STRIDE + sizeof(float) + SUFFIX;
+    const size_t selected_bytes =
+        PREFIX + (QWEN35_N_EXPERT_USED - 1u) * SELECTED_STRIDE +
+        sizeof(int32_t) + SUFFIX;
+    const size_t weight_bytes =
+        PREFIX + (QWEN35_N_EXPERT_USED - 1u) * WEIGHT_STRIDE +
+        sizeof(float) + SUFFIX;
+    uint8_t *logits_host = malloc(logits_bytes);
+    uint8_t *logits_snapshot = malloc(logits_bytes);
+    if (!logits_host || !logits_snapshot) {
+        free(logits_host);
+        free(logits_snapshot);
+        return false;
+    }
+    memset(logits_host, GUARD_LOGITS, logits_bytes);
+    for (size_t expert = 0; expert < QWEN35_N_EXPERT; expert++) {
+        host_store_f32(
+            logits_host,
+            PREFIX + expert * LOGITS_STRIDE,
+            logits[expert]);
+    }
+    memcpy(logits_snapshot, logits_host, logits_bytes);
+
+    id<MTLBuffer> logits_buffer = buffer_with_bytes(
+        device, logits_host, logits_bytes);
+    id<MTLBuffer> selected_buffer = [device newBufferWithLength:selected_bytes
+                                                        options:MTLResourceStorageModeShared];
+    id<MTLBuffer> weight_buffer = [device newBufferWithLength:weight_bytes
+                                                      options:MTLResourceStorageModeShared];
+    if (!logits_buffer || !selected_buffer || !weight_buffer) {
+        free(logits_host);
+        free(logits_snapshot);
+        return false;
+    }
+    memset(selected_buffer.contents, GUARD_SELECTED, selected_bytes);
+    memset(weight_buffer.contents, GUARD_WEIGHT, weight_bytes);
+
+    qwen35_router_top8_args args = {
+        .logits_stride = LOGITS_STRIDE,
+        .selected_stride = SELECTED_STRIDE,
+        .selected_weight_stride = WEIGHT_STRIDE,
+    };
+    bool ok = dispatch_kernel(
+        device, queue, library,
+        @"kernel_qwen35_router_softmax_top8_f32",
+        &args, sizeof(args),
+        @[logits_buffer, selected_buffer, weight_buffer],
+        @[@(PREFIX), @(PREFIX), @(PREFIX)],
+        1, QWEN35_N_EXPERT, true, 0, QWEN35_N_EXPERT);
+
+    int32_t expected_selected[QWEN35_N_EXPERT_USED];
+    float expected_weight[QWEN35_N_EXPERT_USED];
+    float probability[QWEN35_N_EXPERT];
+    if (ok && !ds4_qwen35_cpu_softmax_top8_f32(
+            expected_selected, expected_weight, probability, logits)) {
+        fprintf(stderr, "%s: production CPU oracle rejected finite logits\n", name);
+        ok = false;
+    }
+
+    float weight_sum = 0.0f;
+    float case_maximum_error = 0.0f;
+    const uint8_t *selected_bytes_ptr = selected_buffer.contents;
+    const uint8_t *weight_bytes_ptr = weight_buffer.contents;
+    if (ok) {
+        for (size_t slot = 0; slot < QWEN35_N_EXPERT_USED; slot++) {
+            const int32_t actual_selected = host_load_i32(
+                selected_bytes_ptr, PREFIX + slot * SELECTED_STRIDE);
+            const float actual_weight = host_load_f32(
+                weight_bytes_ptr, PREFIX + slot * WEIGHT_STRIDE);
+            const float error = fabsf(actual_weight - expected_weight[slot]);
+            if (actual_selected != expected_selected[slot]) {
+                fprintf(stderr,
+                        "%s selected[%zu]: Metal %d CPU %d\n",
+                        name, slot, actual_selected, expected_selected[slot]);
+                ok = false;
+                break;
+            }
+            if (!isfinite(actual_weight) || error > 3.0e-6f) {
+                fprintf(stderr,
+                        "%s weight[%zu]: Metal %.9g CPU %.9g error %.9g\n",
+                        name, slot, actual_weight, expected_weight[slot], error);
+                ok = false;
+                break;
+            }
+            if (error > case_maximum_error) case_maximum_error = error;
+            weight_sum += actual_weight;
+        }
+    }
+    if (ok && fabsf(weight_sum - 1.0f) > 2.0e-6f) {
+        fprintf(stderr, "%s: selected weights sum to %.9g\n", name, weight_sum);
+        ok = false;
+    }
+    if (ok && memcmp(logits_buffer.contents, logits_snapshot, logits_bytes) != 0) {
+        fprintf(stderr, "%s: router mutated logits or input padding\n", name);
+        ok = false;
+    }
+    if (ok && !check_strided_guard(
+            "router selected", selected_bytes_ptr, selected_bytes,
+            PREFIX, SELECTED_STRIDE, sizeof(int32_t),
+            QWEN35_N_EXPERT_USED, GUARD_SELECTED)) {
+        ok = false;
+    }
+    if (ok && !check_strided_guard(
+            "router weight", weight_bytes_ptr, weight_bytes,
+            PREFIX, WEIGHT_STRIDE, sizeof(float),
+            QWEN35_N_EXPERT_USED, GUARD_WEIGHT)) {
+        ok = false;
+    }
+    if (ok && case_maximum_error > *maximum_weight_error) {
+        *maximum_weight_error = case_maximum_error;
+    }
+
+    free(logits_host);
+    free(logits_snapshot);
+    return ok;
+}
+
+static bool test_router_softmax_top8(
+        id<MTLDevice>       device,
+        id<MTLCommandQueue> queue,
+        id<MTLLibrary>      library) {
+    enum { RANDOM_CASE_COUNT = 24 };
+    float logits[QWEN35_N_EXPERT];
+    float maximum_weight_error = 0.0f;
+    int32_t boundary_selected[QWEN35_N_EXPERT_USED];
+    float boundary_weight[QWEN35_N_EXPERT_USED];
+    float boundary_probability[QWEN35_N_EXPERT];
+
+    for (size_t run = 0; run < RANDOM_CASE_COUNT; run++) {
+        for (size_t expert = 0; expert < QWEN35_N_EXPERT; expert++) {
+            logits[expert] = router_random_logit();
+        }
+        char label[48];
+        snprintf(label, sizeof(label), "router random %zu", run);
+        if (!run_router_top8_case(
+                device, queue, library, label, logits,
+                &maximum_weight_error)) {
+            return false;
+        }
+    }
+
+    for (size_t expert = 0; expert < QWEN35_N_EXPERT; expert++) {
+        logits[expert] = -100000.0f;
+    }
+    for (size_t slot = 0; slot < QWEN35_N_EXPERT_USED; slot++) {
+        logits[31u * slot + 7u] = 100000.0f - 1000.0f * (float)slot;
+    }
+    if (!run_router_top8_case(
+            device, queue, library, "router extreme finite", logits,
+            &maximum_weight_error)) {
+        return false;
+    }
+
+    for (size_t expert = 0; expert < QWEN35_N_EXPERT; expert++) {
+        logits[expert] = -100.0f;
+    }
+    for (size_t slot = 0; slot < 6u; slot++) {
+        logits[100u + slot] = 10.0f - (float)slot;
+    }
+    logits[17] = logits[19] = logits[23] = 0.0f;
+    if (!ds4_qwen35_cpu_softmax_top8_f32(
+            boundary_selected, boundary_weight, boundary_probability, logits) ||
+        boundary_selected[6] != 17 || boundary_selected[7] != 19) {
+        fprintf(stderr, "CPU oracle tie policy drifted at the 8th boundary\n");
+        return false;
+    }
+    if (!run_router_top8_case(
+            device, queue, library, "router tied 8th boundary", logits,
+            &maximum_weight_error)) {
+        return false;
+    }
+
+    for (size_t expert = 0; expert < QWEN35_N_EXPERT; expert++) {
+        logits[expert] = 3.25f;
+    }
+    if (!run_router_top8_case(
+            device, queue, library, "router all tied", logits,
+            &maximum_weight_error)) {
+        return false;
+    }
+
+    for (size_t expert = 0; expert < QWEN35_N_EXPERT; expert++) {
+        logits[expert] = -20.0f;
+    }
+    for (size_t slot = 0; slot < 7u; slot++) {
+        logits[240u + slot] = 20.0f - (float)slot;
+    }
+    logits[201] = 0.001f;
+    logits[3] = 0.0f;
+    if (!ds4_qwen35_cpu_softmax_top8_f32(
+            boundary_selected, boundary_weight, boundary_probability, logits) ||
+        boundary_selected[7] != 201) {
+        fprintf(stderr, "CPU oracle did not distinguish the 8th/9th boundary\n");
+        return false;
+    }
+    if (!run_router_top8_case(
+            device, queue, library, "router distinct 8th/9th", logits,
+            &maximum_weight_error)) {
+        return false;
+    }
+
+    printf("ok %-28s cases=%u ids=exact max_abs_error=%.3g\n",
+           "router softmax top-8", RANDOM_CASE_COUNT + 4u,
+           maximum_weight_error);
+    return true;
 }
 
 static bool test_embedding_q8_0(
@@ -1044,6 +1327,7 @@ int main(int argc, const char *argv[]) {
 
         printf("Qwen Metal fixture on %s\n", device.name.UTF8String);
         const bool ok =
+            test_router_softmax_top8(device, queue, library) &&
             test_embedding_q8_0(device, queue, library) &&
             test_gated_delta_controls(device, queue, library) &&
             test_split_q_gate(device, queue, library) &&

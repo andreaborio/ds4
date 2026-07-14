@@ -133,6 +133,12 @@ struct ds4_metal_args_qwen35_gqa_decode {
     uint64_t output_dim_stride;
 };
 
+struct ds4_metal_args_qwen35_router_top8 {
+    uint64_t logits_stride;
+    uint64_t selected_stride;
+    uint64_t selected_weight_stride;
+};
+
 static inline float qwen35_metal_sigmoid(float x) {
     if (x >= 0.0f) {
         return 1.0f / (1.0f + exp(-x));
@@ -170,6 +176,119 @@ static inline void qwen35_metal_store_f32(
         uint64_t     offset,
         float        value) {
     *((device float *)(base + offset)) = value;
+}
+
+// Stable softmax and deterministic top-8 routing for the fixed Qwen3.5/3.6
+// expert geometry.  The arithmetic order intentionally mirrors
+// ds4_qwen35_cpu_softmax_top8_f32: normalize all 256 probabilities first,
+// select in descending probability order (lower expert ID wins ties), then
+// renormalize the eight selected probabilities.
+//
+// Dispatch requirements:
+//   grid = 1 threadgroup
+//   threads_per_threadgroup >= 256
+//   threadgroup(0) scratch = 256 floats (1024 bytes)
+//
+// Model-produced logits are finite.  For defensive diagnostics, a non-finite
+// input emits selected=-1 and weight=0 for every slot.
+kernel void kernel_qwen35_router_softmax_top8_f32(
+        constant ds4_metal_args_qwen35_router_top8 &args [[buffer(0)]],
+        device const char *logits          [[buffer(1)]],
+        device       char *selected        [[buffer(2)]],
+        device       char *selected_weight [[buffer(3)]],
+        threadgroup float *probability [[threadgroup(0)]],
+        uint3 group [[threadgroup_position_in_grid]],
+        ushort3 thread_pos [[thread_position_in_threadgroup]],
+        ushort3 threads [[threads_per_threadgroup]]) {
+    constexpr uint n_expert = 256u;
+    constexpr uint n_selected = 8u;
+    const uint tid = thread_pos.x;
+    if (group.x != 0u || threads.x < n_expert ||
+        args.logits_stride < sizeof(float) ||
+        args.selected_stride < sizeof(int32_t) ||
+        args.selected_weight_stride < sizeof(float)) {
+        return;
+    }
+
+    if (tid == 0u) {
+        float maximum = qwen35_metal_load_f32(logits, 0u);
+        bool finite = isfinite(maximum);
+        for (uint expert = 1u; expert < n_expert; expert++) {
+            const float value = qwen35_metal_load_f32(
+                logits, (uint64_t)expert * args.logits_stride);
+            finite = finite && isfinite(value);
+            if (value > maximum) maximum = value;
+        }
+        probability[0] = maximum;
+        probability[1] = finite ? 1.0f : 0.0f;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    const float maximum = probability[0];
+    const bool finite = probability[1] != 0.0f;
+    if (!finite) {
+        if (tid < n_selected) {
+            *((device int32_t *)(selected +
+                (uint64_t)tid * args.selected_stride)) = -1;
+            qwen35_metal_store_f32(
+                selected_weight,
+                (uint64_t)tid * args.selected_weight_stride,
+                0.0f);
+        }
+        return;
+    }
+
+    if (tid < n_expert) {
+        probability[tid] = exp(qwen35_metal_load_f32(
+            logits, (uint64_t)tid * args.logits_stride) - maximum);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (tid != 0u) return;
+
+    float total = 0.0f;
+    for (uint expert = 0u; expert < n_expert; expert++) {
+        total += probability[expert];
+    }
+    for (uint expert = 0u; expert < n_expert; expert++) {
+        probability[expert] /= total;
+    }
+
+    int32_t chosen[n_selected];
+    float chosen_weight[n_selected];
+    for (uint slot = 0u; slot < n_selected; slot++) {
+        uint best = n_expert;
+        for (uint expert = 0u; expert < n_expert; expert++) {
+            bool used = false;
+            for (uint prior = 0u; prior < slot; prior++) {
+                if (chosen[prior] == (int32_t)expert) {
+                    used = true;
+                    break;
+                }
+            }
+            if (used) continue;
+            if (best == n_expert ||
+                probability[expert] > probability[best] ||
+                (probability[expert] == probability[best] && expert < best)) {
+                best = expert;
+            }
+        }
+        chosen[slot] = (int32_t)best;
+        chosen_weight[slot] = probability[best];
+    }
+
+    float selected_total = 0.0f;
+    for (uint slot = 0u; slot < n_selected; slot++) {
+        selected_total += chosen_weight[slot];
+    }
+    for (uint slot = 0u; slot < n_selected; slot++) {
+        *((device int32_t *)(selected +
+            (uint64_t)slot * args.selected_stride)) = chosen[slot];
+        qwen35_metal_store_f32(
+            selected_weight,
+            (uint64_t)slot * args.selected_weight_stride,
+            chosen_weight[slot] / selected_total);
+    }
 }
 
 // Dequantizes one token-embedding row from GGUF Q8_0 blocks.  The standard
