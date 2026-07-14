@@ -226,6 +226,11 @@ kernel void kernel_qwen35_router_softmax_top8_f32(
 
     const float maximum = probability[0];
     const bool finite = probability[1] != 0.0f;
+    // Every lane must capture the two control values before lanes 0 and 1
+    // reuse those scratch slots for exponentials.  Without this rendezvous,
+    // a later SIMD group can observe overwritten controls and diverge around
+    // the following threadgroup barrier.
+    threadgroup_barrier(mem_flags::mem_threadgroup);
     if (!finite) {
         if (tid < n_selected) {
             *((device int32_t *)(selected +
