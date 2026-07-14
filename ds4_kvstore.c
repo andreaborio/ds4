@@ -677,24 +677,100 @@ void ds4_kvstore_tokens_copy_prefix(ds4_tokens *dst, const ds4_tokens *src, int 
     for (int i = 0; i < n; i++) ds4_tokens_push(dst, src->v[i]);
 }
 
-static void tokens_append(ds4_tokens *dst, const ds4_tokens *src) {
-    if (!dst || !src) return;
-    for (int i = 0; i < src->len; i++) ds4_tokens_push(dst, src->v[i]);
+static bool kv_token_prefix_equal(const ds4_tokens *tokens,
+                                  const ds4_tokens *prefix) {
+    if (!tokens || !prefix || tokens->len < prefix->len) return false;
+    for (int i = 0; i < prefix->len; i++) {
+        if (tokens->v[i] != prefix->v[i]) return false;
+    }
+    return true;
 }
 
-void ds4_kvstore_build_prompt_from_exact_prefix_and_text_suffix(
+static bool kv_suffix_starts_with_utf8_continuation(const char *suffix) {
+    if (!suffix || !suffix[0]) return false;
+    return ((uint8_t)suffix[0] & 0xc0u) == 0x80u;
+}
+
+/* A token checkpoint can end between the bytes of one UTF-8 scalar.  Qwen's
+ * strict tokenizer quite correctly rejects the resulting continuation-byte
+ * suffix in isolation.  In that one case, reconstruct enough tokenizer
+ * context to complete the scalar: the complete rendered exact prefix is the
+ * conservative bound and keeps this rare recovery path simple.
+ *
+ * Retokenizing the combined text is safe only when it reproduces every loaded
+ * token id before the checkpoint.  Generated histories can have a
+ * non-canonical spelling of the same bytes, so byte equality alone is not
+ * sufficient; reject those histories and leave the caller with a normal cache
+ * miss rather than silently replacing their exact token semantics. */
+static bool kv_append_utf8_split_suffix(
+        ds4_engine       *engine,
+        const ds4_tokens *exact_prefix,
+        const char       *suffix_text,
+        ds4_tokens       *built) {
+    if (!kv_suffix_starts_with_utf8_continuation(suffix_text)) return false;
+
+    size_t prefix_text_len = 0;
+    char *prefix_text = ds4_kvstore_render_tokens_text(
+        engine, exact_prefix, &prefix_text_len);
+    /* Public tokenizer entry points take C strings.  A raw NUL in a sampled
+     * token history cannot be reconstructed through that API without losing
+     * bytes, so fail closed. */
+    if (memchr(prefix_text, '\0', prefix_text_len)) {
+        free(prefix_text);
+        return false;
+    }
+
+    kv_buf combined = {0};
+    kv_buf_append(&combined, prefix_text, prefix_text_len);
+    kv_buf_puts(&combined, suffix_text);
+    free(prefix_text);
+
+    ds4_tokens retokenized = {0};
+    const bool tokenized = ds4_tokenize_rendered_chat_checked(
+        engine, combined.ptr ? combined.ptr : "", &retokenized);
+    free(combined.ptr);
+    if (!tokenized || !kv_token_prefix_equal(&retokenized, exact_prefix)) {
+        ds4_tokens_free(&retokenized);
+        return false;
+    }
+
+    for (int i = exact_prefix->len; i < retokenized.len; i++) {
+        ds4_tokens_push(built, retokenized.v[i]);
+    }
+    ds4_tokens_free(&retokenized);
+    return true;
+}
+
+bool ds4_kvstore_build_prompt_from_exact_prefix_and_text_suffix(
         ds4_engine *engine,
         const ds4_tokens *exact_prefix,
         const char *suffix_text,
         ds4_tokens *out) {
-    ds4_tokens_copy(out, exact_prefix);
+    if (!engine || !exact_prefix || !out) return false;
 
-    ds4_tokens suffix = {0};
+    /* Build off to the side: callers often pass a reusable effective-prompt
+     * buffer, and a failed suffix tokenization must not leave it containing a
+     * valid-looking exact prefix followed by a partial/stale suffix. */
+    ds4_tokens built = {0};
+    ds4_tokens_copy(&built, exact_prefix);
     /* The suffix may start with DS4 chat markers such as <｜User｜> or
      * </think>, so use the rendered-chat tokenizer, not plain text BPE. */
-    ds4_tokenize_rendered_chat(engine, suffix_text ? suffix_text : "", &suffix);
-    tokens_append(out, &suffix);
-    ds4_tokens_free(&suffix);
+    if (!ds4_tokenize_rendered_chat_checked(
+            engine, suffix_text ? suffix_text : "", &built)) {
+        /* Qwen rejects a suffix that starts midway through a UTF-8 scalar.
+         * Recover with full preceding context, but only if that reconstruction
+         * retains the exact loaded token prefix. */
+        if (!kv_append_utf8_split_suffix(
+                engine, exact_prefix, suffix_text ? suffix_text : "", &built)) {
+            ds4_tokens_free(&built);
+            return false;
+        }
+    }
+
+    ds4_tokens old = *out;
+    *out = built;
+    ds4_tokens_free(&old);
+    return true;
 }
 
 int ds4_kvstore_store_len(const ds4_kvstore *kc, int tokens) {
@@ -1278,18 +1354,35 @@ int ds4_kvstore_try_load_text(ds4_kvstore *kc,
     {
         const ds4_tokens *loaded_tokens = ds4_session_tokens(session);
         if (loaded_tokens && loaded_tokens->len == (int)hdr.tokens) {
-            loaded = (int)hdr.tokens;
+            bool prompt_ok = true;
             if (effective_prompt) {
                 /* The cache lookup was by bytes, but the graph state is still
                  * the exact token history stored in the payload.  Build the
                  * prompt from that exact history and tokenize only the text
                  * suffix after the byte prefix. */
-                ds4_kvstore_build_prompt_from_exact_prefix_and_text_suffix(
-                    engine, loaded_tokens, prompt_text + text_bytes,
-                    effective_prompt);
+                prompt_ok =
+                    ds4_kvstore_build_prompt_from_exact_prefix_and_text_suffix(
+                        engine, loaded_tokens, prompt_text + text_bytes,
+                        effective_prompt);
             }
-            if (hooks && hooks->load && (hdr.ext_flags & hooks->ext_flag)) {
-                hooks->load(hooks->ud, fp, hooks->load_wanted);
+            if (prompt_ok) {
+                loaded = (int)hdr.tokens;
+                if (hooks && hooks->load && (hdr.ext_flags & hooks->ext_flag)) {
+                    hooks->load(hooks->ud, fp, hooks->load_wanted);
+                }
+            } else {
+                /* The payload itself may be intact, but it cannot be used for
+                 * this request if the text suffix failed strict tokenization.
+                 * Leave the file for a future valid request, discard the
+                 * loaded graph, and report a normal cache miss to the caller. */
+                ds4_session_invalidate(session);
+                kc->continued_last_store_tokens = 0;
+                kv_logf(kc, DS4_KVSTORE_LOG_WARNING,
+                        "%s: kv cache text suffix tokenization failed%s%s %s; treating as miss",
+                        kv_log_name(kc),
+                        responses_protocol ? " " : "",
+                        responses_protocol ? "RESPPROTO" : "",
+                        path);
             }
         } else {
             ds4_session_invalidate(session);

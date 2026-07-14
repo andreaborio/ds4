@@ -547,12 +547,16 @@ int main(int argc, char **argv) {
 
     char *text = read_file(cfg.prompt_path ? cfg.prompt_path : cfg.chat_prompt_path);
     ds4_tokens prompt = {0};
-    if (cfg.chat_prompt_path) {
-        ds4_encode_chat_prompt(engine, cfg.system, text, DS4_THINK_NONE, &prompt);
-    } else {
-        ds4_tokenize_text(engine, text, &prompt);
-    }
+    const bool tokenized = cfg.chat_prompt_path ?
+        ds4_encode_chat_prompt_checked(engine, cfg.system, text, DS4_THINK_NONE, &prompt) :
+        ds4_tokenize_text_checked(engine, text, &prompt);
     free(text);
+    if (!tokenized) {
+        fprintf(stderr, "ds4-bench: failed to tokenize prompt\n");
+        ds4_tokens_free(&prompt);
+        ds4_engine_close(engine);
+        return 1;
+    }
 
     if (prompt.len < cfg.ctx_max) {
         fprintf(stderr,

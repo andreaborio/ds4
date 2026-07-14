@@ -2787,11 +2787,6 @@ static int dist_coordinator_eval_span(
  * One-Shot Coordinator Generation Utilities
  * ========================================================================= */
 
-static bool dist_prompt_is_rendered_chat(const char *prompt) {
-    const char *bos = "<｜begin▁of▁sentence｜>";
-    return prompt && strncmp(prompt, bos, strlen(bos)) == 0;
-}
-
 static bool dist_json_utf8_valid(const char *s, size_t n) {
     for (size_t i = 0; i < n;) {
         unsigned char c = (unsigned char)s[i];
@@ -3884,13 +3879,23 @@ static int dist_run_coordinator_generation(
     }
 
     ds4_tokens prompt = {0};
-    if (dist_prompt_is_rendered_chat(gen->prompt)) {
-        ds4_tokenize_rendered_chat(state->engine, gen->prompt, &prompt);
+    bool tokenized = false;
+    if (ds4_engine_prompt_is_rendered_chat(state->engine, gen->prompt)) {
+        tokenized = ds4_tokenize_rendered_chat_checked(state->engine, gen->prompt, &prompt);
     } else {
-        ds4_encode_chat_prompt(state->engine, gen->system, gen->prompt, gen->think_mode, &prompt);
+        tokenized = ds4_encode_chat_prompt_checked(state->engine, gen->system, gen->prompt,
+                                                   gen->think_mode, &prompt);
+    }
+    if (!tokenized) {
+        fprintf(stderr, "ds4: distributed coordinator: failed to tokenize prompt\n");
+        ds4_tokens_free(&prompt);
+        ds4_session_free(session);
+        dist_route_plan_free(&plan);
+        return 1;
     }
     if (prompt.len <= 0) {
         fprintf(stderr, "ds4: distributed coordinator: empty prompt\n");
+        ds4_tokens_free(&prompt);
         ds4_session_free(session);
         dist_route_plan_free(&plan);
         return 1;

@@ -2421,7 +2421,15 @@ static int eval_max_prompt_tokens(ds4_engine *engine,
             exit(1);
         }
         ds4_tokens prompt = {0};
-        ds4_encode_chat_prompt(engine, eval_system_prompt(), question, think_mode, &prompt);
+        if (!ds4_encode_chat_prompt_checked(engine, eval_system_prompt(), question,
+                                            think_mode, &prompt)) {
+            fprintf(stderr, "ds4-eval: failed to tokenize prompt for case %s\n",
+                    cases[i].id);
+            ds4_tokens_free(&prompt);
+            free(question);
+            if (max_case_out) *max_case_out = -1;
+            return -1;
+        }
         if (prompt.len > max_prompt) {
             max_prompt = prompt.len;
             max_case = i;
@@ -2451,6 +2459,11 @@ static int eval_auto_context_size(ds4_engine *engine,
      * thinking mode that the actual run will use. */
     for (int iter = 0; iter < 3; iter++) {
         max_prompt = eval_max_prompt_tokens(engine, cfg, cases, ncases, ctx, &max_case);
+        if (max_prompt < 0) {
+            if (max_prompt_out) *max_prompt_out = -1;
+            if (max_case_out) *max_case_out = -1;
+            return -1;
+        }
         long long required = (long long)max_prompt + (long long)cfg->max_tokens;
         if (required < min_ctx) required = min_ctx;
         if (required > EVAL_MAX_CONTEXT) {
@@ -3637,7 +3650,12 @@ static eval_run_result run_one_case(ds4_engine *engine, ds4_session *session,
     }
 
     ds4_tokens prompt = {0};
-    ds4_encode_chat_prompt(engine, system, question, think_mode, &prompt);
+    if (!ds4_encode_chat_prompt_checked(engine, system, question, think_mode, &prompt)) {
+        fprintf(stderr, "ds4-eval: failed to tokenize prompt for case %s\n", tc->id);
+        ds4_tokens_free(&prompt);
+        free(question);
+        return EVAL_RUN_ERROR;
+    }
     ui->prompt_tokens[idx] = prompt.len;
     ui->generated_tokens[idx] = 0;
 
@@ -3755,7 +3773,19 @@ static eval_run_result run_one_case(ds4_engine *engine, ds4_session *session,
     bool generation_in_think = ds4_think_mode_enabled(think_mode);
     eval_think_close_info think_close = {0};
     ds4_tokens think_close_tokens = {0};
-    if (generation_in_think) ds4_tokenize_text(engine, "</think>", &think_close_tokens);
+    if (generation_in_think &&
+        !ds4_tokenize_rendered_chat_checked(engine, "</think>", &think_close_tokens)) {
+        const char *reason = "failed to tokenize trusted </think> delimiter";
+        fprintf(stderr, "ds4-eval: %s for case %s\n", reason, tc->id);
+        trace_write_case(trace, cfg, tc, idx, ui->ncases, "ERROR", reason,
+                         system, question, "", think_mode, prompt_tokens, 0,
+                         0.0, "?", &think_close);
+        tui_run_clock_stop(ui);
+        ds4_tokens_free(&think_close_tokens);
+        buf_free(&raw);
+        free(question);
+        return EVAL_RUN_ERROR;
+    }
     if (!tty && plain_in_think) plain_set_thinking_color(use_plain_color);
     tui_refresh(ui, "thinking");
 
@@ -4199,6 +4229,12 @@ int main(int argc, char **argv) {
     if (auto_ctx) {
         cfg.ctx_size = eval_auto_context_size(engine, &cfg, eval_cases, ncases,
                                               &max_prompt_tokens, &max_prompt_case);
+        if (cfg.ctx_size < 0) {
+            if (trace) fclose(trace);
+            ds4_engine_close(engine);
+            free(case_sequence);
+            return 1;
+        }
         fprintf(stderr,
                 "ds4-eval: context auto-sized to %d tokens "
                 "(largest prompt=%d tokens, case=%d, generation budget=%d)\n",
@@ -4206,6 +4242,12 @@ int main(int argc, char **argv) {
     } else {
         max_prompt_tokens = eval_max_prompt_tokens(engine, &cfg, eval_cases, ncases,
                                                    cfg.ctx_size, &max_prompt_case);
+        if (max_prompt_tokens < 0) {
+            if (trace) fclose(trace);
+            ds4_engine_close(engine);
+            free(case_sequence);
+            return 1;
+        }
         fprintf(stderr,
                 "ds4-eval: context set to %d tokens "
                 "(largest prompt=%d tokens, case=%d, generation budget=%d)\n",

@@ -137,9 +137,11 @@ static void test_all_golden_cases(ds4_engine *engine) {
         tokens.len = 0;
         ds4_tokens_push(&tokens, TEST_SENTINEL);
         if (golden->kind == QWEN36_FIXTURE_TEXT) {
-            ds4_tokenize_text(engine, golden->text, &tokens);
+            CHECK(ds4_tokenize_text_checked(
+                engine, golden->text, &tokens));
         } else {
-            ds4_tokenize_rendered_chat(engine, golden->text, &tokens);
+            CHECK(ds4_tokenize_rendered_chat_checked(
+                engine, golden->text, &tokens));
         }
         expect_tokens(&tokens, golden->expected, golden->expected_len, true);
     }
@@ -150,14 +152,23 @@ static void expect_public_failure_preserves(
         ds4_engine *engine,
         const char *text,
         bool        rendered) {
-    ds4_tokens tokens = {0};
-    ds4_tokens_push(&tokens, TEST_SENTINEL);
+    ds4_tokens tokens = {
+        .v = xmalloc(sizeof(tokens.v[0])),
+        .len = 1,
+        .cap = 1,
+    };
+    tokens.v[0] = TEST_SENTINEL;
+    int *const original_v = tokens.v;
+    const int original_cap = tokens.cap;
     if (rendered) {
-        ds4_tokenize_rendered_chat(engine, text, &tokens);
+        CHECK(!ds4_tokenize_rendered_chat_checked(
+            engine, text, &tokens));
     } else {
-        ds4_tokenize_text(engine, text, &tokens);
+        CHECK(!ds4_tokenize_text_checked(engine, text, &tokens));
     }
     CHECK(tokens.len == 1);
+    CHECK(tokens.v == original_v);
+    CHECK(tokens.cap == original_cap);
     CHECK(tokens.v[0] == TEST_SENTINEL);
     ds4_tokens_free(&tokens);
 }
@@ -200,7 +211,25 @@ static void test_fail_closed_paths(void) {
     unknown.model.family = DS4_MODEL_FAMILY_UNKNOWN;
     unknown.vocab.family = DS4_MODEL_FAMILY_UNKNOWN;
     expect_public_failure_preserves(&unknown, "Hello", false);
+    ds4_tokens tokens = {0};
+    ds4_tokens_push(&tokens, TEST_SENTINEL);
+    int *const original_v = tokens.v;
+    const int original_cap = tokens.cap;
+    CHECK(!ds4_chat_append_assistant_prefix_checked(
+        &unknown, &tokens, DS4_THINK_HIGH));
+    CHECK(tokens.len == 1 && tokens.v[0] == TEST_SENTINEL);
+    CHECK(tokens.v == original_v && tokens.cap == original_cap);
+    ds4_tokens_free(&tokens);
     fixture_engine_free(&unknown);
+}
+
+static void test_rendered_prompt_detection(ds4_engine *engine) {
+    CHECK(ds4_engine_prompt_is_rendered_chat(
+        engine, "<|im_start|>user\nhello<|im_end|>\n"));
+    CHECK(!ds4_engine_prompt_is_rendered_chat(
+        engine, "<｜begin▁of▁sentence｜>hello"));
+    CHECK(!ds4_engine_prompt_is_rendered_chat(engine, "<|im_start"));
+    CHECK(!ds4_engine_prompt_is_rendered_chat(NULL, "<|im_start|>"));
 }
 
 static void expect_encoded_prompt(
@@ -214,7 +243,8 @@ static void expect_encoded_prompt(
 
     ds4_tokens tokens = {0};
     ds4_tokens_push(&tokens, TEST_SENTINEL);
-    ds4_encode_chat_prompt(engine, system, prompt, think_mode, &tokens);
+    CHECK(ds4_encode_chat_prompt_checked(
+        engine, system, prompt, think_mode, &tokens));
     expect_tokens(&tokens, golden->expected, golden->expected_len, true);
     ds4_tokens_free(&tokens);
 }
@@ -244,11 +274,12 @@ static void test_public_incremental_chat(ds4_engine *engine) {
     ds4_tokens tokens = {0};
     ds4_chat_begin(engine, &tokens);
     CHECK(tokens.len == 0); /* Qwen declares BOS metadata but adds no BOS. */
-    ds4_chat_append_message(
-        engine, &tokens, "system", "Sei un assistente conciso.");
-    ds4_chat_append_message(
-        engine, &tokens, "user", "Saluta in italiano.");
-    ds4_chat_append_assistant_prefix(engine, &tokens, DS4_THINK_HIGH);
+    CHECK(ds4_chat_append_message_checked(
+        engine, &tokens, "system", "Sei un assistente conciso."));
+    CHECK(ds4_chat_append_message_checked(
+        engine, &tokens, "user", "Saluta in italiano."));
+    CHECK(ds4_chat_append_assistant_prefix_checked(
+        engine, &tokens, DS4_THINK_HIGH));
     if (golden) {
         expect_tokens(&tokens, golden->expected, golden->expected_len, false);
     }
@@ -256,8 +287,10 @@ static void test_public_incremental_chat(ds4_engine *engine) {
 
     ds4_tokens high = {0};
     ds4_tokens maximum = {0};
-    ds4_chat_append_assistant_prefix(engine, &high, DS4_THINK_HIGH);
-    ds4_chat_append_assistant_prefix(engine, &maximum, DS4_THINK_MAX);
+    CHECK(ds4_chat_append_assistant_prefix_checked(
+        engine, &high, DS4_THINK_HIGH));
+    CHECK(ds4_chat_append_assistant_prefix_checked(
+        engine, &maximum, DS4_THINK_MAX));
     CHECK(tokens_equal(&high, &maximum));
     ds4_tokens_free(&high);
     ds4_tokens_free(&maximum);
@@ -275,7 +308,8 @@ static void test_public_incremental_chat(ds4_engine *engine) {
     };
     ds4_tokens boundary = {0};
     ds4_tokens_push(&boundary, 248046);
-    ds4_chat_append_message(engine, &boundary, "user", "x");
+    CHECK(ds4_chat_append_message_checked(
+        engine, &boundary, "user", "x"));
     expect_tokens(&boundary, boundary_expected,
                   TEST_ARRAY_LEN(boundary_expected), false);
     ds4_tokens_free(&boundary);
@@ -285,8 +319,10 @@ static void test_public_incremental_chat(ds4_engine *engine) {
         " \302\240\034\035x\036\037\302\240 ";
     ds4_tokens plain = {0};
     ds4_tokens trimmed = {0};
-    ds4_chat_append_message(engine, &plain, "user", "x");
-    ds4_chat_append_message(engine, &trimmed, "user", padded);
+    CHECK(ds4_chat_append_message_checked(
+        engine, &plain, "user", "x"));
+    CHECK(ds4_chat_append_message_checked(
+        engine, &trimmed, "user", padded));
     CHECK(tokens_equal(&plain, &trimmed));
     ds4_tokens_free(&plain);
     ds4_tokens_free(&trimmed);
@@ -294,6 +330,54 @@ static void test_public_incremental_chat(ds4_engine *engine) {
     CHECK(ds4_token_eos(engine) == 248046);
     CHECK(ds4_token_user(engine) == -1);
     CHECK(ds4_token_assistant(engine) == -1);
+}
+
+static void test_checked_chat_failures(void) {
+    static const char malformed[] = {(char)0xc0, (char)0x80, '\0'};
+
+    ds4_engine engine;
+    fixture_engine_init(&engine, -1);
+    ds4_tokens tokens = {
+        .v = xmalloc(sizeof(tokens.v[0])),
+        .len = 1,
+        .cap = 1,
+    };
+    tokens.v[0] = TEST_SENTINEL;
+    int *const original_v = tokens.v;
+    const int original_cap = tokens.cap;
+    CHECK(!ds4_chat_append_message_checked(
+        &engine, &tokens, "user", malformed));
+    CHECK(tokens.len == 1 && tokens.v[0] == TEST_SENTINEL);
+    CHECK(tokens.v == original_v && tokens.cap == original_cap);
+    CHECK(!ds4_chat_append_message_checked(
+        &engine, &tokens, "tool", "result"));
+    CHECK(tokens.len == 1 && tokens.v[0] == TEST_SENTINEL);
+    CHECK(tokens.v == original_v && tokens.cap == original_cap);
+    CHECK(!ds4_encode_chat_prompt_checked(
+        NULL, NULL, "x", DS4_THINK_HIGH, &tokens));
+    CHECK(tokens.len == 1 && tokens.v[0] == TEST_SENTINEL);
+    CHECK(tokens.v == original_v && tokens.cap == original_cap);
+    fixture_engine_free(&engine);
+
+    ds4_engine missing;
+    fixture_engine_init(&missing, 198); /* newline used by every chat block */
+    CHECK(!ds4_encode_chat_prompt_checked(
+        &missing, NULL, "x", DS4_THINK_HIGH, &tokens));
+    CHECK(tokens.len == 1 && tokens.v[0] == TEST_SENTINEL);
+    CHECK(tokens.v == original_v && tokens.cap == original_cap);
+    CHECK(!ds4_chat_append_assistant_prefix_checked(
+        &missing, &tokens, DS4_THINK_HIGH));
+    CHECK(tokens.len == 1 && tokens.v[0] == TEST_SENTINEL);
+    CHECK(tokens.v == original_v && tokens.cap == original_cap);
+    fixture_engine_free(&missing);
+
+    /* Compatibility wrappers remain fail-closed even though they cannot
+     * return the checked status to old callers. */
+    fixture_engine_init(&missing, 9419);
+    ds4_tokenize_text(&missing, "Hello", &tokens);
+    CHECK(tokens.len == 1 && tokens.v[0] == TEST_SENTINEL);
+    fixture_engine_free(&missing);
+    ds4_tokens_free(&tokens);
 }
 
 static void expect_decoded(
@@ -485,10 +569,12 @@ int main(void) {
     test_malformed_utf8(&engine);
     test_chat_goldens(&engine);
     test_public_incremental_chat(&engine);
+    test_rendered_prompt_detection(&engine);
     test_decode(&engine);
     fixture_engine_free(&engine);
 
     test_fail_closed_paths();
+    test_checked_chat_failures();
     ds4_threads_shutdown();
 
     if (failures) {

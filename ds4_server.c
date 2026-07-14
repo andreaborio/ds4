@@ -2791,7 +2791,13 @@ static bool parse_chat_request(ds4_engine *e, server *s, const char *body, int d
         chat_history_uses_tool_context(&msgs, active_tool_schemas);
     r->prompt_text = render_chat_prompt_text(&msgs, active_tool_schemas,
                                              &r->tool_orders, r->think_mode);
-    ds4_tokenize_rendered_chat(e, r->prompt_text, &r->prompt);
+    if (!ds4_tokenize_rendered_chat_checked(e, r->prompt_text, &r->prompt)) {
+        chat_msgs_free(&msgs);
+        free(tool_schemas);
+        snprintf(err, errlen, "prompt tokenization failed");
+        request_free(r);
+        return false;
+    }
     chat_msgs_free(&msgs);
     free(tool_schemas);
     return true;
@@ -3001,7 +3007,14 @@ static bool parse_anthropic_request(ds4_engine *e, server *s, const char *body, 
         chat_history_uses_tool_context(&msgs, active_tool_schemas);
     r->prompt_text = render_chat_prompt_text(&msgs, active_tool_schemas,
                                              &r->tool_orders, r->think_mode);
-    ds4_tokenize_rendered_chat(e, r->prompt_text, &r->prompt);
+    if (!ds4_tokenize_rendered_chat_checked(e, r->prompt_text, &r->prompt)) {
+        chat_msgs_free(&msgs);
+        free(system);
+        free(tool_schemas);
+        snprintf(err, errlen, "prompt tokenization failed");
+        request_free(r);
+        return false;
+    }
     chat_msgs_free(&msgs);
     free(system);
     free(tool_schemas);
@@ -3941,7 +3954,16 @@ static bool parse_responses_request(ds4_engine *e, server *s, const char *body, 
     responses_prepare_live_continuation(r, &msgs);
     r->prompt_text = render_chat_prompt_text(&msgs, active_tool_schemas,
                                              &r->tool_orders, r->think_mode);
-    ds4_tokenize_rendered_chat(e, r->prompt_text, &r->prompt);
+    if (!ds4_tokenize_rendered_chat_checked(e, r->prompt_text, &r->prompt)) {
+        chat_msgs_free(&msgs);
+        buf_free(&combined_tool_schemas);
+        buf_free(&loaded_tool_schemas);
+        free(instructions);
+        free(tool_schemas);
+        snprintf(err, errlen, "prompt tokenization failed");
+        request_free(r);
+        return false;
+    }
     chat_msgs_free(&msgs);
     buf_free(&combined_tool_schemas);
     buf_free(&loaded_tool_schemas);
@@ -4120,7 +4142,12 @@ static bool parse_completion_request(ds4_engine *e, const char *body, int def_to
     buf_puts(&rendered, "<｜Assistant｜>");
     buf_puts(&rendered, ds4_think_mode_enabled(r->think_mode) ? "<think>" : "</think>");
     r->prompt_text = buf_take(&rendered);
-    ds4_tokenize_rendered_chat(e, r->prompt_text, &r->prompt);
+    if (!ds4_tokenize_rendered_chat_checked(e, r->prompt_text, &r->prompt)) {
+        free(prompt);
+        snprintf(err, errlen, "prompt tokenization failed");
+        request_free(r);
+        return false;
+    }
     free(prompt);
     return true;
 bad:
@@ -8633,13 +8660,13 @@ static void tokens_copy_prefix(ds4_tokens *dst, const ds4_tokens *src, int n) {
 }
 
 
-static void build_prompt_from_exact_prefix_and_text_suffix(
+static bool build_prompt_from_exact_prefix_and_text_suffix(
         ds4_engine *engine,
         const ds4_tokens *exact_prefix,
         const char *suffix_text,
         ds4_tokens *out)
 {
-    ds4_kvstore_build_prompt_from_exact_prefix_and_text_suffix(
+    return ds4_kvstore_build_prompt_from_exact_prefix_and_text_suffix(
         engine, exact_prefix, suffix_text, out);
 }
 
@@ -8867,9 +8894,12 @@ static int live_text_prefix_prompt(server *s, const request *req,
      * keep its sampled tokenization and tokenize only the request bytes that
      * come after it.  Reusing req->prompt's token suffix would be wrong: full
      * prompt BPE may have merged across this byte boundary. */
-    build_prompt_from_exact_prefix_and_text_suffix(
-        s->engine, live_tokens, req->prompt_text + live_text_len,
-        effective_prompt);
+    if (!build_prompt_from_exact_prefix_and_text_suffix(
+            s->engine, live_tokens, req->prompt_text + live_text_len,
+            effective_prompt)) {
+        free(live_text);
+        return 0;
+    }
     free(live_text);
     return live_tokens->len;
 }
@@ -8893,9 +8923,11 @@ static int responses_live_continuation_prompt(server *s, const request *req,
     const ds4_tokens *live_tokens = ds4_session_tokens(s->session);
     if (!live_tokens || live_tokens->len != live_pos) return 0;
 
-    build_prompt_from_exact_prefix_and_text_suffix(
-        s->engine, live_tokens, req->responses_live_suffix_text,
-        effective_prompt);
+    if (!build_prompt_from_exact_prefix_and_text_suffix(
+            s->engine, live_tokens, req->responses_live_suffix_text,
+            effective_prompt)) {
+        return 0;
+    }
     if (matched_ids) *matched_ids = req->responses_live_call_ids.len;
     return live_tokens->len;
 }
@@ -8919,9 +8951,11 @@ static int anthropic_live_continuation_prompt(server *s, const request *req,
     const ds4_tokens *live_tokens = ds4_session_tokens(s->session);
     if (!live_tokens || live_tokens->len != live_pos) return 0;
 
-    build_prompt_from_exact_prefix_and_text_suffix(
-        s->engine, live_tokens, req->anthropic_live_suffix_text,
-        effective_prompt);
+    if (!build_prompt_from_exact_prefix_and_text_suffix(
+            s->engine, live_tokens, req->anthropic_live_suffix_text,
+            effective_prompt)) {
+        return 0;
+    }
     if (matched_ids) *matched_ids = req->anthropic_live_call_ids.len;
     return live_tokens->len;
 }
@@ -8962,9 +8996,11 @@ static int responses_live_visible_prefix_prompt(server *s, const request *req,
     const ds4_tokens *live_tokens = ds4_session_tokens(s->session);
     if (!live_tokens || live_tokens->len != live_pos) return 0;
 
-    build_prompt_from_exact_prefix_and_text_suffix(
-        s->engine, live_tokens, req->prompt_text + visible_len,
-        effective_prompt);
+    if (!build_prompt_from_exact_prefix_and_text_suffix(
+            s->engine, live_tokens, req->prompt_text + visible_len,
+            effective_prompt)) {
+        return 0;
+    }
     return live_tokens->len;
 }
 
@@ -9004,9 +9040,11 @@ static int thinking_live_visible_prefix_prompt(server *s, const request *req,
     const ds4_tokens *live_tokens = ds4_session_tokens(s->session);
     if (!live_tokens || live_tokens->len != live_pos) return 0;
 
-    build_prompt_from_exact_prefix_and_text_suffix(
-        s->engine, live_tokens, req->prompt_text + visible_len,
-        effective_prompt);
+    if (!build_prompt_from_exact_prefix_and_text_suffix(
+            s->engine, live_tokens, req->prompt_text + visible_len,
+            effective_prompt)) {
+        return 0;
+    }
     return live_tokens->len;
 }
 
@@ -9450,7 +9488,8 @@ static thinking_state thinking_state_from_prompt(const request *r) {
  * tokenizer so </think> maps to its special token.
  *
  * Returns 1 when an injection was performed (text extended, thinking closed),
- * 0 when there is nothing to do or no budget, -1 on eval failure. */
+ * 0 when there is nothing to do or no budget, -1 on tokenization or eval
+ * failure. */
 static int chat_think_tool_recovery(server *s,
                                     buf *text,
                                     thinking_state *thinking,
@@ -9470,7 +9509,14 @@ static int chat_think_tool_recovery(server *s,
     const char *inject = "</think>\n\n";
     const size_t inject_len = strlen(inject);
     ds4_tokens toks = {0};
-    ds4_tokenize_rendered_chat(s->engine, inject, &toks);
+    if (!ds4_tokenize_rendered_chat_checked(s->engine, inject, &toks)) {
+        if (err && errlen) {
+            snprintf(err, errlen,
+                     "think tool recovery tokenization failed");
+        }
+        ds4_tokens_free(&toks);
+        return -1;
+    }
 
     const int room = ds4_session_ctx(s->session) - ds4_session_pos(s->session);
     if (toks.len <= 0 ||
@@ -9486,6 +9532,14 @@ static int chat_think_tool_recovery(server *s,
 
     for (int i = 0; i < toks.len; i++) {
         if (ds4_session_eval(s->session, toks.v[i], err, errlen) != 0) {
+            /* Earlier injected close tokens may already have advanced the
+             * graph even though they were deliberately not appended to the
+             * visible transcript until the entire injection succeeded.  A
+             * failed tail would otherwise leave those two histories out of
+             * sync, so discard the partial live state atomically from the
+             * caller's point of view. */
+            ds4_session_invalidate(s->session);
+            s->kv.continued_last_store_tokens = 0;
             ds4_tokens_free(&toks);
             return -1;
         }
@@ -9565,7 +9619,14 @@ static bool append_rendered_suffix_to_live_session(server *s, const char *suffix
     }
 
     ds4_tokens target = {0};
-    build_prompt_from_exact_prefix_and_text_suffix(s->engine, live, suffix, &target);
+    if (!build_prompt_from_exact_prefix_and_text_suffix(
+            s->engine, live, suffix, &target)) {
+        if (err && errlen) {
+            snprintf(err, errlen,
+                     "recovery suffix tokenization failed");
+        }
+        return false;
+    }
     const int before = ds4_session_pos(s->session);
     bool ok = ds4_session_sync(s->session, &target, err, errlen) == 0;
     if (ok && tokens_appended) {
@@ -9834,7 +9895,15 @@ static void canonicalize_tool_checkpoint(server *s, const job *j, const char *ct
     buf_puts(&rendered, suffix_text);
 
     ds4_tokens canonical = {0};
-    ds4_tokenize_rendered_chat(s->engine, rendered.ptr ? rendered.ptr : "", &canonical);
+    if (!ds4_tokenize_rendered_chat_checked(
+            s->engine, rendered.ptr ? rendered.ptr : "", &canonical)) {
+        server_log(DS4_LOG_WARNING,
+                   "ds4-server: tool checkpoint canonicalization skipped ctx=%s: prompt tokenization failed",
+                   ctx);
+        trace_event(s, trace_id,
+                    "tool checkpoint canonicalization skipped: prompt tokenization failed");
+        goto done;
+    }
     const int live_len = ds4_session_pos(s->session);
     const int common = ds4_session_common_prefix(s->session, &canonical);
     if (common == live_len && canonical.len == live_len) goto done;
@@ -14725,6 +14794,53 @@ static void test_thinking_state_tracks_prompt_and_generated_tags(void) {
     request_free(&r);
 }
 
+static void test_prompt_tokenization_failure_is_request_error(void) {
+    const char *body = "{\"prompt\":\"hello\"}";
+    request r;
+    char err[160] = {0};
+
+    TEST_ASSERT(!parse_completion_request(
+        NULL, body, 32, 4096, &r, err, sizeof(err)));
+    TEST_ASSERT(!strcmp(err, "prompt tokenization failed"));
+}
+
+static void test_exact_prefix_suffix_failure_is_transactional(void) {
+    ds4_tokens prefix = {0};
+    ds4_tokens out = {0};
+    ds4_tokens_push(&prefix, 10);
+    ds4_tokens_push(&prefix, 11);
+    ds4_tokens_push(&out, 90);
+    ds4_tokens_push(&out, 91);
+
+    TEST_ASSERT(!build_prompt_from_exact_prefix_and_text_suffix(
+        NULL, &prefix, "suffix", &out));
+    TEST_ASSERT(out.len == 2);
+    TEST_ASSERT(out.v[0] == 90 && out.v[1] == 91);
+
+    ds4_tokens_free(&prefix);
+    ds4_tokens_free(&out);
+}
+
+static void test_think_recovery_tokenization_failure_is_error(void) {
+    server s = {0};
+    buf text = {0};
+    buf_puts(&text, DS4_TOOL_CALLS_START);
+    thinking_state thinking = {.inside = true};
+    size_t scan_from = 0;
+    int completion = 0;
+    char err[160] = {0};
+
+    TEST_ASSERT(chat_think_tool_recovery(
+        &s, &text, &thinking, &scan_from, &completion, 32,
+        err, sizeof(err)) == -1);
+    TEST_ASSERT(!strcmp(err, "think tool recovery tokenization failed"));
+    TEST_ASSERT(completion == 0);
+    TEST_ASSERT(thinking.inside);
+    TEST_ASSERT(!strcmp(text.ptr, DS4_TOOL_CALLS_START));
+
+    buf_free(&text);
+}
+
 static void test_thinking_checkpoint_remember_gate(void) {
     request r;
     request_init(&r, REQ_CHAT, 128);
@@ -15895,6 +16011,9 @@ static void ds4_server_unit_tests_run(void) {
     test_model_metadata_clamps_completion_to_context();
     test_client_socket_nonblocking_flag();
     test_thinking_state_tracks_prompt_and_generated_tags();
+    test_prompt_tokenization_failure_is_request_error();
+    test_exact_prefix_suffix_failure_is_transactional();
+    test_think_recovery_tokenization_failure_is_error();
     test_thinking_checkpoint_remember_gate();
     test_tool_marker_state_ignores_orphan_end();
     test_canonical_rewrite_rebuilds_when_live_tail_changes();

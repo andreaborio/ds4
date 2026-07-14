@@ -29,6 +29,11 @@ typedef enum {
 } ds4_think_mode;
 
 typedef enum {
+    DS4_CHAT_FORMAT_DEEPSEEK_V4,
+    DS4_CHAT_FORMAT_QWEN36,
+} ds4_chat_format;
+
+typedef enum {
     DS4_LOG_DEFAULT,
     DS4_LOG_PREFILL,
     DS4_LOG_GENERATION,
@@ -161,6 +166,9 @@ int ds4_engine_effective_vocab_size(ds4_engine *e);
 int ds4_engine_power(ds4_engine *e);
 int ds4_engine_set_power(ds4_engine *e, int power_percent);
 const char *ds4_engine_model_name(ds4_engine *e);
+ds4_chat_format ds4_engine_chat_format(const ds4_engine *e);
+bool ds4_engine_prompt_is_rendered_chat(
+        const ds4_engine *e, const char *prompt);
 int ds4_engine_layer_count(ds4_engine *e);
 uint32_t ds4_engine_layer_compress_ratio(ds4_engine *e, uint32_t layer);
 uint64_t ds4_engine_hidden_f32_values(ds4_engine *e);
@@ -214,9 +222,22 @@ void ds4_tokens_free(ds4_tokens *tv);
 void ds4_tokens_copy(ds4_tokens *dst, const ds4_tokens *src);
 bool ds4_tokens_starts_with(const ds4_tokens *tokens, const ds4_tokens *prefix);
 
+/* Checked tokenization APIs are transactional: false leaves the destination
+ * token vector exactly unchanged.  The void forms remain compatibility
+ * wrappers and report failures to stderr. */
+bool ds4_tokenize_text_checked(
+        ds4_engine *e, const char *text, ds4_tokens *out);
 void ds4_tokenize_text(ds4_engine *e, const char *text, ds4_tokens *out);
+bool ds4_tokenize_rendered_chat_checked(
+        ds4_engine *e, const char *text, ds4_tokens *out);
 void ds4_tokenize_rendered_chat(ds4_engine *e, const char *text, ds4_tokens *out);
 void ds4_chat_begin(ds4_engine *e, ds4_tokens *tokens);
+bool ds4_encode_chat_prompt_checked(
+        ds4_engine *e,
+        const char *system,
+        const char *prompt,
+        ds4_think_mode think_mode,
+        ds4_tokens *out);
 void ds4_encode_chat_prompt(
         ds4_engine *e,
         const char *system,
@@ -224,7 +245,16 @@ void ds4_encode_chat_prompt(
         ds4_think_mode think_mode,
         ds4_tokens *out);
 void ds4_chat_append_max_effort_prefix(ds4_engine *e, ds4_tokens *tokens);
+bool ds4_chat_append_message_checked(
+        ds4_engine *e,
+        ds4_tokens *tokens,
+        const char *role,
+        const char *content);
 void ds4_chat_append_message(ds4_engine *e, ds4_tokens *tokens, const char *role, const char *content);
+bool ds4_chat_append_assistant_prefix_checked(
+        ds4_engine *e,
+        ds4_tokens *tokens,
+        ds4_think_mode think_mode);
 void ds4_chat_append_assistant_prefix(ds4_engine *e, ds4_tokens *tokens, ds4_think_mode think_mode);
 
 char *ds4_token_text(ds4_engine *e, int token, size_t *len);

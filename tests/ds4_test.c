@@ -700,7 +700,8 @@ static void test_long_story_fact_recall(void) {
     }
 
     ds4_tokens prompt = {0};
-    ds4_tokenize_rendered_chat(engine, prompt_text, &prompt);
+    TEST_ASSERT(ds4_tokenize_rendered_chat_checked(
+        engine, prompt_text, &prompt));
     TEST_ASSERT(prompt.len > 30000);
 
     ds4_session *session = NULL;
@@ -854,7 +855,8 @@ static void test_logprob_vector_case(ds4_engine *engine, const test_vec_case *vc
     if (!prompt_text) return;
 
     ds4_tokens prompt = {0};
-    ds4_encode_chat_prompt(engine, "", prompt_text, DS4_THINK_NONE, &prompt);
+    TEST_ASSERT(ds4_encode_chat_prompt_checked(
+        engine, "", prompt_text, DS4_THINK_NONE, &prompt));
     free(prompt_text);
 
     ds4_session *session = NULL;
@@ -1126,16 +1128,25 @@ static void test_local_golden_case_run(ds4_engine *engine,
     if (!prompt_text) return;
 
     ds4_tokens prompt = {0};
+    bool tokenized = false;
     if (!strcmp(tc->mode, "text")) {
-        ds4_tokenize_text(engine, prompt_text, &prompt);
+        tokenized = ds4_tokenize_text_checked(
+            engine, prompt_text, &prompt);
     } else if (!strcmp(tc->mode, "rendered")) {
-        ds4_tokenize_rendered_chat(engine, prompt_text, &prompt);
+        tokenized = ds4_tokenize_rendered_chat_checked(
+            engine, prompt_text, &prompt);
     } else if (!strcmp(tc->mode, "chat")) {
-        ds4_encode_chat_prompt(engine, "", prompt_text, DS4_THINK_NONE, &prompt);
+        tokenized = ds4_encode_chat_prompt_checked(
+            engine, "", prompt_text, DS4_THINK_NONE, &prompt);
     } else {
         TEST_ASSERT(!"unknown local golden prompt mode");
     }
     free(prompt_text);
+    TEST_ASSERT(tokenized);
+    if (!tokenized) {
+        ds4_tokens_free(&prompt);
+        return;
+    }
     TEST_ASSERT(prompt.len >= tc->frontier);
     if (prompt.len < tc->frontier) {
         ds4_tokens_free(&prompt);
@@ -1536,8 +1547,15 @@ static int test_load_mpp_cases(ds4_engine *engine, test_mpp_eq_case *cases, int 
         tc->ctx = vc.ctx;
         tc->vocab_size = ds4_engine_vocab_size(engine);
         tc->gen_steps = vc.nsteps < TEST_VEC_MAX_STEPS ? vc.nsteps : TEST_VEC_MAX_STEPS;
-        ds4_encode_chat_prompt(engine, "", prompt_text, DS4_THINK_NONE, &tc->prompt);
+        const bool tokenized = ds4_encode_chat_prompt_checked(
+            engine, "", prompt_text, DS4_THINK_NONE, &tc->prompt);
         free(prompt_text);
+        TEST_ASSERT(tokenized);
+        if (!tokenized) {
+            ds4_tokens_free(&tc->prompt);
+            ncase--;
+            continue;
+        }
         TEST_ASSERT(tc->prompt.len > 0);
     }
     fclose(fp);
@@ -1885,10 +1903,11 @@ static void test_think_tool_recovery(void) {
      * token by token, running the recovery scan after each piece.  The stanza
      * opening spans several tokens, so this also checks that detection does
      * not depend on how the marker happens to be tokenized: recovery must
-     * stay quiet on every partial prefix and trigger exactly when the
-     * opening completes. */
+    * stay quiet on every partial prefix and trigger exactly when the
+    * opening completes. */
     ds4_tokens toks = {0};
-    ds4_tokenize_rendered_chat(engine, forced.ptr, &toks);
+    TEST_ASSERT(ds4_tokenize_rendered_chat_checked(
+        engine, forced.ptr, &toks));
     TEST_ASSERT(toks.len > 1);
     size_t scan_from = 0;
     int completion = 0;
@@ -2152,8 +2171,10 @@ static void test_mtp_verify_depth(void) {
 
     ds4_tokens prompt = {0};
     ds4_chat_begin(engine, &prompt);
-    ds4_chat_append_message(engine, &prompt, "user", test_mtp_copy_prompt());
-    ds4_chat_append_assistant_prefix(engine, &prompt, DS4_THINK_NONE);
+    TEST_ASSERT(ds4_chat_append_message_checked(
+        engine, &prompt, "user", test_mtp_copy_prompt()));
+    TEST_ASSERT(ds4_chat_append_assistant_prefix_checked(
+        engine, &prompt, DS4_THINK_NONE));
     TEST_ASSERT(prompt.len > 0);
 
     int *spec = malloc((size_t)TEST_MTP_MAXGEN * sizeof(*spec));

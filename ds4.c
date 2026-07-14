@@ -22977,6 +22977,29 @@ static void token_vec_free(token_vec *tv) {
     memset(tv, 0, sizeof(*tv));
 }
 
+/* Checked tokenization APIs only append.  Build their candidate suffix in an
+ * independent vector and expose it after every fallible tokenizer step has
+ * succeeded.  Seeding the staging vector with the destination tail preserves
+ * Qwen's inter-message boundary rule without copying a potentially long chat
+ * transcript. */
+static int token_vec_stage_tail(
+        const token_vec *dst,
+        token_vec       *staged) {
+    if (dst->len <= 0) return 0;
+    token_vec_push(staged, dst->v[dst->len - 1]);
+    return 1;
+}
+
+static void token_vec_commit_suffix(
+        token_vec *dst,
+        token_vec *staged,
+        int        staged_prefix) {
+    for (int i = staged_prefix; i < staged->len; i++) {
+        token_vec_push(dst, staged->v[i]);
+    }
+    token_vec_free(staged);
+}
+
 void ds4_tokens_push(ds4_tokens *tv, int token) {
     token_vec_push(tv, token);
 }
@@ -24148,13 +24171,14 @@ static bool encode_chat_prompt(
 
     token_vec_push(out, vocab->bos_id);
     if (think_mode == DS4_THINK_MAX) {
-        bpe_tokenize_text(vocab, DS4_REASONING_EFFORT_MAX_PREFIX, out);
+        if (!bpe_tokenize_text(
+                vocab, DS4_REASONING_EFFORT_MAX_PREFIX, out)) goto fail;
     }
     if (system && system[0]) {
-        bpe_tokenize_text(vocab, system, out);
+        if (!bpe_tokenize_text(vocab, system, out)) goto fail;
     }
     token_vec_push(out, vocab->user_id);
-    bpe_tokenize_text(vocab, prompt, out);
+    if (!bpe_tokenize_text(vocab, prompt, out)) goto fail;
     token_vec_push(out, vocab->assistant_id);
     if (ds4_think_mode_enabled(think_mode)) {
         token_vec_push(out, vocab->think_start_id);
@@ -24168,9 +24192,21 @@ fail:
     return false;
 }
 
+bool ds4_tokenize_text_checked(
+        ds4_engine *e, const char *text, ds4_tokens *out) {
+    if (!e || !out || e->vocab.n_vocab == 0) return false;
+    token_vec staged = {0};
+    const int staged_prefix = token_vec_stage_tail(out, &staged);
+    if (!bpe_tokenize_text(&e->vocab, text ? text : "", &staged)) {
+        token_vec_free(&staged);
+        return false;
+    }
+    token_vec_commit_suffix(out, &staged, staged_prefix);
+    return true;
+}
+
 void ds4_tokenize_text(ds4_engine *e, const char *text, ds4_tokens *out) {
-    if (!e || !out || e->vocab.n_vocab == 0) return;
-    if (!bpe_tokenize_text(&e->vocab, text ? text : "", out)) {
+    if (!ds4_tokenize_text_checked(e, text, out)) {
         fprintf(stderr,
                 "ds4: text tokenization failed; output was left unchanged\n");
     }
@@ -24228,9 +24264,21 @@ fail:
     return false;
 }
 
+bool ds4_tokenize_rendered_chat_checked(
+        ds4_engine *e, const char *text, ds4_tokens *out) {
+    if (!e || !out || e->vocab.n_vocab == 0) return false;
+    token_vec staged = {0};
+    const int staged_prefix = token_vec_stage_tail(out, &staged);
+    if (!tokenize_rendered_chat_vocab(&e->vocab, text, &staged)) {
+        token_vec_free(&staged);
+        return false;
+    }
+    token_vec_commit_suffix(out, &staged, staged_prefix);
+    return true;
+}
+
 void ds4_tokenize_rendered_chat(ds4_engine *e, const char *text, ds4_tokens *out) {
-    if (!e || !out || e->vocab.n_vocab == 0) return;
-    if (!tokenize_rendered_chat_vocab(&e->vocab, text, out)) {
+    if (!ds4_tokenize_rendered_chat_checked(e, text, out)) {
         fprintf(stderr,
                 "ds4: rendered-chat tokenization failed; output was left unchanged\n");
     }
@@ -24241,15 +24289,32 @@ void ds4_chat_begin(ds4_engine *e, ds4_tokens *tokens) {
     if (e->vocab.add_bos) token_vec_push(tokens, e->vocab.bos_id);
 }
 
+bool ds4_encode_chat_prompt_checked(
+        ds4_engine *e,
+        const char *system,
+        const char *prompt,
+        ds4_think_mode think_mode,
+        ds4_tokens *out) {
+    if (!e || !out || e->vocab.n_vocab == 0) return false;
+    token_vec staged = {0};
+    const int staged_prefix = token_vec_stage_tail(out, &staged);
+    if (!encode_chat_prompt(
+            &e->vocab, system, prompt ? prompt : "", think_mode, &staged)) {
+        token_vec_free(&staged);
+        return false;
+    }
+    token_vec_commit_suffix(out, &staged, staged_prefix);
+    return true;
+}
+
 void ds4_encode_chat_prompt(
         ds4_engine *e,
         const char *system,
         const char *prompt,
         ds4_think_mode think_mode,
         ds4_tokens *out) {
-    if (!e || !out || e->vocab.n_vocab == 0) return;
-    if (!encode_chat_prompt(
-            &e->vocab, system, prompt ? prompt : "", think_mode, out)) {
+    if (!ds4_encode_chat_prompt_checked(
+            e, system, prompt, think_mode, out)) {
         fprintf(stderr,
                 "ds4: chat prompt tokenization failed; output was left unchanged\n");
     }
@@ -24263,7 +24328,8 @@ void ds4_chat_append_max_effort_prefix(ds4_engine *e, ds4_tokens *tokens) {
     }
 }
 
-static void bpe_tokenize_tool_result_text(ds4_vocab *vocab, const char *content, token_vec *out) {
+static bool bpe_tokenize_tool_result_text(
+        ds4_vocab *vocab, const char *content, token_vec *out) {
     /* Tool output is plain data inside <tool_result>...</tool_result>.
      * Preserve literal '<', '>' and '&' so shell output and file snippets stay
      * intact, but escape the exact closing sentinel so a malicious or accidental
@@ -24272,22 +24338,34 @@ static void bpe_tokenize_tool_result_text(ds4_vocab *vocab, const char *content,
     const size_t endlen = strlen(end);
     const char *span = content ? content : "";
     const char *p = span;
+    const int original_len = out->len;
     while (*p) {
         if (!strncmp(p, end, endlen)) {
-            tokenize_span(vocab, span, (size_t)(p - span), out);
-            bpe_tokenize_text(vocab, "&lt;", out);
+            if (!tokenize_span(vocab, span, (size_t)(p - span), out) ||
+                !bpe_tokenize_text(vocab, "&lt;", out)) goto fail;
             p++;
             span = p;
         } else {
             p++;
         }
     }
-    tokenize_span(vocab, span, (size_t)(p - span), out);
+    if (!tokenize_span(vocab, span, (size_t)(p - span), out)) goto fail;
+    return true;
+
+fail:
+    out->len = original_len;
+    return false;
 }
 
-void ds4_chat_append_message(ds4_engine *e, ds4_tokens *tokens, const char *role, const char *content) {
-    if (!e || !tokens || e->vocab.n_vocab == 0) return;
+bool ds4_chat_append_message_checked(
+        ds4_engine *e,
+        ds4_tokens *tokens,
+        const char *role,
+        const char *content) {
+    if (!e || !tokens || e->vocab.n_vocab == 0) return false;
     ds4_vocab *vocab = &e->vocab;
+    token_vec staged = {0};
+    const int staged_prefix = token_vec_stage_tail(tokens, &staged);
     if (!role) role = "user";
     if (!content) content = "";
 
@@ -24297,51 +24375,103 @@ void ds4_chat_append_message(ds4_engine *e, ds4_tokens *tokens, const char *role
         if (strcmp(qwen_role, "system") != 0 &&
             strcmp(qwen_role, "user") != 0 &&
             strcmp(qwen_role, "assistant") != 0) {
+            token_vec_free(&staged);
+            return false;
+        }
+        if (!qwen35_append_chat_block(vocab, qwen_role, content, &staged)) {
+            token_vec_free(&staged);
+            return false;
+        }
+        token_vec_commit_suffix(tokens, &staged, staged_prefix);
+        return true;
+    }
+
+    if (vocab->family != DS4_MODEL_FAMILY_DEEPSEEK4) goto fail;
+
+    if (!strcmp(role, "system") || !strcmp(role, "developer")) {
+        if (!bpe_tokenize_text(vocab, content, &staged)) goto fail;
+    } else if (!strcmp(role, "assistant")) {
+        token_vec_push(&staged, vocab->assistant_id);
+        if (strncmp(content, "<think>", 7) != 0 && strncmp(content, "</think>", 8) != 0) {
+            token_vec_push(&staged, vocab->think_end_id);
+        }
+        if (!bpe_tokenize_text(vocab, content, &staged)) goto fail;
+    } else if (!strcmp(role, "tool") || !strcmp(role, "function")) {
+        token_vec_push(&staged, vocab->user_id);
+        if (!bpe_tokenize_text(vocab, "<tool_result>", &staged) ||
+            !bpe_tokenize_tool_result_text(vocab, content, &staged) ||
+            !bpe_tokenize_text(vocab, "</tool_result>", &staged)) goto fail;
+    } else {
+        token_vec_push(&staged, vocab->user_id);
+        if (!bpe_tokenize_text(vocab, content, &staged)) goto fail;
+    }
+    token_vec_commit_suffix(tokens, &staged, staged_prefix);
+    return true;
+
+fail:
+    token_vec_free(&staged);
+    return false;
+}
+
+void ds4_chat_append_message(
+        ds4_engine *e,
+        ds4_tokens *tokens,
+        const char *role,
+        const char *content) {
+    if (!ds4_chat_append_message_checked(e, tokens, role, content)) {
+        if (e && e->vocab.family == DS4_MODEL_FAMILY_QWEN35_MOE &&
+            role && strcmp(role, "system") != 0 &&
+            strcmp(role, "developer") != 0 &&
+            strcmp(role, "user") != 0 &&
+            strcmp(role, "assistant") != 0) {
             fprintf(stderr,
                     "ds4: Qwen chat role %s is not enabled in the core renderer yet\n",
                     role);
-            return;
-        }
-        if (!qwen35_append_chat_block(vocab, qwen_role, content, tokens)) {
+        } else {
             fprintf(stderr,
-                    "ds4: Qwen chat message tokenization failed; "
+                    "ds4: chat message tokenization failed; "
                     "output was left unchanged\n");
         }
-        return;
-    }
-
-    if (!strcmp(role, "system") || !strcmp(role, "developer")) {
-        bpe_tokenize_text(vocab, content, tokens);
-    } else if (!strcmp(role, "assistant")) {
-        token_vec_push(tokens, vocab->assistant_id);
-        if (strncmp(content, "<think>", 7) != 0 && strncmp(content, "</think>", 8) != 0) {
-            token_vec_push(tokens, vocab->think_end_id);
-        }
-        bpe_tokenize_text(vocab, content, tokens);
-    } else if (!strcmp(role, "tool") || !strcmp(role, "function")) {
-        token_vec_push(tokens, vocab->user_id);
-        bpe_tokenize_text(vocab, "<tool_result>", tokens);
-        bpe_tokenize_tool_result_text(vocab, content, tokens);
-        bpe_tokenize_text(vocab, "</tool_result>", tokens);
-    } else {
-        token_vec_push(tokens, vocab->user_id);
-        bpe_tokenize_text(vocab, content, tokens);
     }
 }
 
-void ds4_chat_append_assistant_prefix(ds4_engine *e, ds4_tokens *tokens, ds4_think_mode think_mode) {
-    if (!e || !tokens || e->vocab.n_vocab == 0) return;
+bool ds4_chat_append_assistant_prefix_checked(
+        ds4_engine *e,
+        ds4_tokens *tokens,
+        ds4_think_mode think_mode) {
+    if (!e || !tokens || e->vocab.n_vocab == 0) return false;
+    token_vec staged = {0};
+    const int staged_prefix = token_vec_stage_tail(tokens, &staged);
     if (e->vocab.family == DS4_MODEL_FAMILY_QWEN35_MOE) {
-        if (!qwen35_append_assistant_prefix(&e->vocab, think_mode, tokens)) {
-            fprintf(stderr,
-                    "ds4: Qwen assistant-prefix tokenization failed; "
-                    "output was left unchanged\n");
+        if (!qwen35_append_assistant_prefix(
+                &e->vocab, think_mode, &staged)) {
+            token_vec_free(&staged);
+            return false;
         }
-        return;
+        token_vec_commit_suffix(tokens, &staged, staged_prefix);
+        return true;
     }
-    token_vec_push(tokens, e->vocab.assistant_id);
-    token_vec_push(tokens, ds4_think_mode_enabled(think_mode) ?
+    if (e->vocab.family != DS4_MODEL_FAMILY_DEEPSEEK4) {
+        token_vec_free(&staged);
+        return false;
+    }
+    token_vec_push(&staged, e->vocab.assistant_id);
+    token_vec_push(&staged, ds4_think_mode_enabled(think_mode) ?
                    e->vocab.think_start_id : e->vocab.think_end_id);
+    token_vec_commit_suffix(tokens, &staged, staged_prefix);
+    return true;
+}
+
+void ds4_chat_append_assistant_prefix(
+        ds4_engine *e,
+        ds4_tokens *tokens,
+        ds4_think_mode think_mode) {
+    if (!ds4_chat_append_assistant_prefix_checked(
+            e, tokens, think_mode)) {
+        fprintf(stderr,
+                "ds4: assistant-prefix tokenization failed; "
+                "output was left unchanged\n");
+    }
 }
 
 static void dump_tokens_fp(FILE *fp, const ds4_vocab *vocab, const token_vec *tokens) {
@@ -27077,7 +27207,16 @@ int ds4_engine_collect_imatrix(ds4_engine *e,
         char *prompt_text = imatrix_trim_block(start, end);
         if (prompt_text[0] != '\0') {
             token_vec prompt = {0};
-            ds4_tokenize_rendered_chat(e, prompt_text, &prompt);
+            if (!ds4_tokenize_rendered_chat_checked(
+                    e, prompt_text, &prompt)) {
+                fprintf(stderr,
+                        "ds4: imatrix tokenization failed at prompt %d\n",
+                        prompts_done + 1);
+                token_vec_free(&prompt);
+                *end = saved;
+                ok = false;
+                break;
+            }
             if (prompt.len > ctx_size) prompt.len = ctx_size;
             if (max_tokens > 0 && prompt.len > max_tokens - tokens_done) {
                 prompt.len = max_tokens - tokens_done;
@@ -28678,6 +28817,26 @@ const char *ds4_engine_model_name(ds4_engine *e) {
         return "Qwen3.6 35B A3B";
     }
     return DS4_MODEL_SHAPE_NAME;
+}
+
+ds4_chat_format ds4_engine_chat_format(const ds4_engine *e) {
+    return e && e->model.family == DS4_MODEL_FAMILY_QWEN35_MOE
+        ? DS4_CHAT_FORMAT_QWEN36
+        : DS4_CHAT_FORMAT_DEEPSEEK_V4;
+}
+
+bool ds4_engine_prompt_is_rendered_chat(
+        const ds4_engine *e, const char *prompt) {
+    if (!e || !prompt) return false;
+    const char *prefix = NULL;
+    if (e->model.family == DS4_MODEL_FAMILY_QWEN35_MOE) {
+        prefix = "<|im_start|>";
+    } else if (e->model.family == DS4_MODEL_FAMILY_DEEPSEEK4) {
+        prefix = "<｜begin▁of▁sentence｜>";
+    } else {
+        return false;
+    }
+    return strncmp(prompt, prefix, strlen(prefix)) == 0;
 }
 
 int ds4_engine_layer_count(ds4_engine *e) {

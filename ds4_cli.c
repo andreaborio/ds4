@@ -280,11 +280,6 @@ static void cli_prefill_progress_cb(void *ud, const char *event, int current, in
     fflush(stderr);
 }
 
-static bool is_rendered_chat_prompt(const char *prompt) {
-    const char *bos = "<｜begin▁of▁sentence｜>";
-    return prompt && strncmp(prompt, bos, strlen(bos)) == 0;
-}
-
 typedef struct {
     ds4_engine *engine;
     FILE *fp;
@@ -409,13 +404,12 @@ static void print_generated_token(void *ud, int token) {
     free(text);
 }
 
-static void build_prompt(ds4_engine *engine, const cli_generation_options *gen, ds4_tokens *out) {
-    if (is_rendered_chat_prompt(gen->prompt)) {
-        ds4_tokenize_rendered_chat(engine, gen->prompt, out);
-    } else {
-        ds4_encode_chat_prompt(engine, gen->system, gen->prompt,
-                               cli_effective_think_mode(gen), out);
+static bool build_prompt(ds4_engine *engine, const cli_generation_options *gen, ds4_tokens *out) {
+    if (ds4_engine_prompt_is_rendered_chat(engine, gen->prompt)) {
+        return ds4_tokenize_rendered_chat_checked(engine, gen->prompt, out);
     }
+    return ds4_encode_chat_prompt_checked(engine, gen->system, gen->prompt,
+                                          cli_effective_think_mode(gen), out);
 }
 
 static int run_sampled_generation(ds4_engine *engine, const cli_config *cfg, const ds4_tokens *prompt) {
@@ -790,8 +784,13 @@ static int run_logprob_dump(ds4_engine *engine, const cli_config *cfg, const ds4
 static int run_perplexity_file(ds4_engine *engine, const cli_config *cfg) {
     char *text = read_prompt_file(cfg->gen.perplexity_file_path, true);
     ds4_tokens tokens = {0};
-    ds4_tokenize_text(engine, text, &tokens);
+    const bool tokenized = ds4_tokenize_text_checked(engine, text, &tokens);
     free(text);
+    if (!tokenized) {
+        fprintf(stderr, "ds4: failed to tokenize --perplexity-file input\n");
+        ds4_tokens_free(&tokens);
+        return 1;
+    }
 
     /* Seed the graph with enough real context to stay on the normal Metal
      * prefill path; scoring starts immediately after this fixed prefix. */
@@ -872,7 +871,11 @@ static int run_perplexity_file(ds4_engine *engine, const cli_config *cfg) {
 
 static int run_generation(ds4_engine *engine, const cli_config *cfg) {
     ds4_tokens prompt = {0};
-    build_prompt(engine, &cfg->gen, &prompt);
+    if (!build_prompt(engine, &cfg->gen, &prompt)) {
+        fprintf(stderr, "ds4: failed to tokenize prompt\n");
+        ds4_tokens_free(&prompt);
+        return 1;
+    }
 
     int rc = 0;
     if (cfg->gen.metal_graph_test) {
@@ -1056,9 +1059,20 @@ static int repl_chat_init(ds4_engine *engine, repl_chat *chat, const cli_config 
     repl_chat_apply_max_prefix(engine, chat,
                                cli_effective_think_mode(&cfg->gen) == DS4_THINK_MAX);
     if (cfg->gen.system && cfg->gen.system[0]) {
-        ds4_chat_append_message(engine, &chat->transcript, "system", cfg->gen.system);
+        if (!ds4_chat_append_message_checked(engine, &chat->transcript,
+                                             "system", cfg->gen.system)) {
+            fprintf(stderr, "ds4: failed to tokenize interactive system prompt\n");
+            ds4_tokens_free(&chat->transcript);
+            memset(chat, 0, sizeof(*chat));
+            return 1;
+        }
     }
-    return repl_chat_create_session(engine, chat, cfg->gen.ctx_size);
+    if (repl_chat_create_session(engine, chat, cfg->gen.ctx_size) != 0) {
+        ds4_tokens_free(&chat->transcript);
+        memset(chat, 0, sizeof(*chat));
+        return 1;
+    }
+    return 0;
 }
 
 static void repl_chat_free(repl_chat *chat) {
@@ -1089,8 +1103,16 @@ static int run_chat_turn(ds4_engine *engine, cli_config *cfg, repl_chat *chat, c
                                                            chat->ctx_size);
     repl_chat_apply_max_prefix(engine, chat, think_mode == DS4_THINK_MAX);
     const int rollback_len = chat->transcript.len;
-    ds4_chat_append_message(engine, &chat->transcript, "user", user_text);
-    ds4_chat_append_assistant_prefix(engine, &chat->transcript, think_mode);
+    if (!ds4_chat_append_message_checked(engine, &chat->transcript, "user", user_text)) {
+        chat->transcript.len = rollback_len;
+        fprintf(stderr, "ds4: failed to tokenize interactive user prompt\n");
+        return 1;
+    }
+    if (!ds4_chat_append_assistant_prefix_checked(engine, &chat->transcript, think_mode)) {
+        chat->transcript.len = rollback_len;
+        fprintf(stderr, "ds4: failed to tokenize interactive assistant prefix\n");
+        return 1;
+    }
 
     const int old_pos = ds4_session_pos(chat->session);
     const int common = ds4_session_common_prefix(chat->session, &chat->transcript);

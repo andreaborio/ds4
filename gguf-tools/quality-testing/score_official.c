@@ -105,8 +105,31 @@ int main(int argc, char **argv) {
 
         ds4_tokens prompt = {0};
         ds4_tokens target = {0};
-        ds4_encode_chat_prompt(engine, NULL, prompt_text, DS4_THINK_NONE, &prompt);
-        ds4_tokenize_text(engine, cont_text, &target);
+        if (!ds4_encode_chat_prompt_checked(engine, NULL, prompt_text,
+                                            DS4_THINK_NONE, &prompt)) {
+            fprintf(stderr, "%s prompt tokenization failed\n", id);
+            ds4_tokens_free(&prompt);
+            ds4_tokens_free(&target);
+            free(prompt_text);
+            free(cont_text);
+            fclose(out);
+            fclose(mf);
+            ds4_session_free(session);
+            ds4_engine_close(engine);
+            return 1;
+        }
+        if (!ds4_tokenize_text_checked(engine, cont_text, &target)) {
+            fprintf(stderr, "%s continuation tokenization failed\n", id);
+            ds4_tokens_free(&prompt);
+            ds4_tokens_free(&target);
+            free(prompt_text);
+            free(cont_text);
+            fclose(out);
+            fclose(mf);
+            ds4_session_free(session);
+            ds4_engine_close(engine);
+            return 1;
+        }
 
         if (prompt.len + target.len + 1 >= ctx_size) {
             fprintf(stderr, "%s exceeds ctx=%d\n", id, ctx_size);

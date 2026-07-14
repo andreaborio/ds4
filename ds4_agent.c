@@ -138,6 +138,7 @@ typedef struct {
     bool queued_user_drain_pending;
     bool queued_user_drain_answered;
     char *queued_user_drain_text;
+    char *returned_user_text;
     bool datetime_context_injected;
     char more_path[PATH_MAX];
     int more_next_line;
@@ -999,33 +1000,50 @@ static char *agent_build_system_prompt_reminder(void) {
     return out;
 }
 
-static void agent_append_system_prompt(ds4_engine *engine, ds4_tokens *tokens,
+static void agent_tokens_take(ds4_tokens *dst, ds4_tokens *src) {
+    ds4_tokens_free(dst);
+    *dst = *src;
+    memset(src, 0, sizeof(*src));
+}
+
+static bool agent_append_system_prompt(ds4_engine *engine, ds4_tokens *tokens,
                                        const char *extra) {
     /* The built-in tool prompt is trusted DS4 control text.  Tokenize it like a
      * rendered chat prompt so the literal ｜DSML｜ markers in the examples become
      * the model's dedicated DSML token.  Do not apply that tokenizer to user
      * supplied -sys text: arbitrary user text containing <｜User｜>, <think>, or
      * ｜DSML｜ must remain plain content, not control tokens. */
+    ds4_tokens staged = {0};
+    ds4_tokens_copy(&staged, tokens);
     char *tools_prompt = agent_build_tools_prompt();
-    ds4_tokenize_rendered_chat(engine, tools_prompt, tokens);
+    bool ok = ds4_tokenize_rendered_chat_checked(engine, tools_prompt, &staged);
     free(tools_prompt);
 
-    if (!extra || !extra[0]) return;
-    size_t n = strlen(extra);
-    char *plain = xmalloc(n + 3);
-    memcpy(plain, "\n\n", 2);
-    memcpy(plain + 2, extra, n + 1);
-    ds4_chat_append_message(engine, tokens, "system", plain);
-    free(plain);
+    if (ok && extra && extra[0]) {
+        size_t n = strlen(extra);
+        char *plain = xmalloc(n + 3);
+        memcpy(plain, "\n\n", 2);
+        memcpy(plain + 2, extra, n + 1);
+        ok = ds4_chat_append_message_checked(engine, &staged, "system", plain);
+        free(plain);
+    }
+    if (ok) agent_tokens_take(tokens, &staged);
+    ds4_tokens_free(&staged);
+    return ok;
 }
 
 static void agent_worker_note_system_prompt_seen(agent_worker *w) {
     w->last_system_prompt_reminder_at = w->transcript.len;
 }
 
-static void agent_worker_maybe_append_datetime_context(agent_worker *w) {
-    if (w->datetime_context_injected) return;
+typedef struct {
+    bool note_system_prompt_seen;
+    bool appended_reminder;
+    int reminder_at;
+} agent_assistant_prefix_effects;
 
+static bool agent_append_datetime_context(agent_worker *w, ds4_tokens *tokens,
+                                          char *message, size_t message_len) {
     time_t now = time(NULL);
     struct tm tm;
     localtime_r(&now, &tm);
@@ -1034,47 +1052,75 @@ static void agent_worker_maybe_append_datetime_context(agent_worker *w) {
     if (strftime(when, sizeof(when), "%Y-%m-%d %H:%M:%S %Z", &tm) == 0)
         snprintf(when, sizeof(when), "%lld", (long long)now);
 
-    char msg[256];
-    snprintf(msg, sizeof(msg),
+    snprintf(message, message_len,
              "Current local date and time at session start: %s. "
              "Use this only when date or time matters.", when);
-    ds4_chat_append_message(w->engine, &w->transcript, "system", msg);
-    agent_trace_text(w, "datetime-context", msg, strlen(msg));
-    w->datetime_context_injected = true;
+    return ds4_chat_append_message_checked(w->engine, tokens, "system", message);
 }
 
 /* The full tool/system reminder is separate from DSML syntax errors: it is a
  * pressure-controlled refresh of the same trusted prompt shape used at startup.
  * The built-in prompt is tokenized as rendered chat so DSML markers stay native
  * control tokens; arbitrary -sys text remains ordinary text. */
-static void agent_worker_maybe_append_system_prompt_reminder(agent_worker *w) {
+static bool agent_stage_assistant_round_prefix(
+        agent_worker *w, ds4_tokens *tokens, ds4_think_mode think_mode,
+        agent_assistant_prefix_effects *effects) {
+    memset(effects, 0, sizeof(*effects));
     if (w->last_system_prompt_reminder_at <= 0) {
+        effects->note_system_prompt_seen = true;
+    } else if (tokens->len - w->last_system_prompt_reminder_at >=
+               AGENT_SYSTEM_PROMPT_REMINDER_TOKENS) {
+        effects->note_system_prompt_seen = true;
+        effects->appended_reminder = true;
+        effects->reminder_at = tokens->len;
+    }
+
+    bool ok = true;
+    if (effects->appended_reminder) {
+        char *reminder = agent_build_system_prompt_reminder();
+        ok = ds4_tokenize_rendered_chat_checked(w->engine, reminder, tokens);
+        free(reminder);
+
+        const char *extra = w->cfg->gen.system;
+        if (ok && extra && extra[0]) {
+            ok = ds4_tokenize_text_checked(w->engine,
+                "\nAdditional system instructions reminder:\n", tokens) &&
+                ds4_tokenize_text_checked(w->engine, extra, tokens) &&
+                ds4_tokenize_text_checked(w->engine,
+                    "\n[End additional system instructions reminder.]\n\n",
+                    tokens);
+        }
+    }
+    if (ok)
+        ok = ds4_chat_append_assistant_prefix_checked(w->engine, tokens,
+                                                       think_mode);
+    return ok;
+}
+
+static void agent_apply_assistant_prefix_effects(
+        agent_worker *w, const agent_assistant_prefix_effects *effects) {
+    if (effects->appended_reminder) {
+        agent_publish_system_status(w, "Re-injecting system prompt reminder...");
+        agent_trace(w, "system prompt reminder injected at transcript=%d",
+                    effects->reminder_at);
+    }
+    if (effects->note_system_prompt_seen)
         agent_worker_note_system_prompt_seen(w);
-        return;
-    }
-    if (w->transcript.len - w->last_system_prompt_reminder_at <
-        AGENT_SYSTEM_PROMPT_REMINDER_TOKENS)
-    {
-        return;
-    }
+}
 
-    char *reminder = agent_build_system_prompt_reminder();
-    agent_publish_system_status(w, "Re-injecting system prompt reminder...");
-    agent_trace(w, "system prompt reminder injected at transcript=%d",
-                w->transcript.len);
-    ds4_tokenize_rendered_chat(w->engine, reminder, &w->transcript);
-    free(reminder);
-
-    const char *extra = w->cfg->gen.system;
-    if (extra && extra[0]) {
-        ds4_tokenize_text(w->engine,
-            "\nAdditional system instructions reminder:\n", &w->transcript);
-        ds4_tokenize_text(w->engine, extra, &w->transcript);
-        ds4_tokenize_text(w->engine,
-            "\n[End additional system instructions reminder.]\n\n",
-            &w->transcript);
+static bool agent_worker_append_assistant_round_prefix(agent_worker *w,
+                                                       ds4_think_mode think_mode) {
+    ds4_tokens staged = {0};
+    ds4_tokens_copy(&staged, &w->transcript);
+    agent_assistant_prefix_effects effects;
+    if (!agent_stage_assistant_round_prefix(w, &staged, think_mode, &effects)) {
+        ds4_tokens_free(&staged);
+        return false;
     }
-    agent_worker_note_system_prompt_seen(w);
+    agent_tokens_take(&w->transcript, &staged);
+    ds4_tokens_free(&staged);
+    agent_apply_assistant_prefix_effects(w, &effects);
+    return true;
 }
 
 /* Wake the UI thread after changing worker-visible state.  The byte in
@@ -3843,9 +3889,13 @@ static bool agent_kv_load_path(agent_worker *w, const char *path,
     char load_err[160] = {0};
     if (ok && hdr.payload_bytes == 0) {
         ds4_tokens rebuilt = {0};
-        ds4_tokenize_rendered_chat(w->engine, text, &rebuilt);
-        expected_tokens = (uint32_t)rebuilt.len;
-        if (agent_worker_sync_tokens(w, &rebuilt, true, err, err_len) != 0) {
+        if (!ds4_tokenize_rendered_chat_checked(w->engine, text, &rebuilt)) {
+            snprintf(err, err_len, "failed to tokenize stripped KV transcript");
+            ok = false;
+        } else {
+            expected_tokens = (uint32_t)rebuilt.len;
+        }
+        if (ok && agent_worker_sync_tokens(w, &rebuilt, true, err, err_len) != 0) {
             ds4_session_invalidate(w->session);
             ok = false;
         }
@@ -4006,12 +4056,19 @@ static bool agent_kv_save_path(agent_worker *w, const char *path,
     return ok;
 }
 
-static void agent_worker_build_system_tokens(agent_worker *w, ds4_tokens *out) {
-    ds4_chat_begin(w->engine, out);
+static bool agent_worker_build_system_tokens(agent_worker *w, ds4_tokens *out) {
+    ds4_tokens staged = {0};
+    ds4_chat_begin(w->engine, &staged);
     if (w->cfg->gen.think_mode == DS4_THINK_MAX &&
         effective_think_mode(w->cfg) == DS4_THINK_MAX)
-        ds4_chat_append_max_effort_prefix(w->engine, out);
-    agent_append_system_prompt(w->engine, out, w->cfg->gen.system);
+        ds4_chat_append_max_effort_prefix(w->engine, &staged);
+    if (!agent_append_system_prompt(w->engine, &staged, w->cfg->gen.system)) {
+        ds4_tokens_free(&staged);
+        return false;
+    }
+    agent_tokens_take(out, &staged);
+    ds4_tokens_free(&staged);
+    return true;
 }
 
 static void agent_publish_system_status(agent_worker *w, const char *msg) {
@@ -4159,6 +4216,36 @@ static void worker_answer_queued_user_drain(agent_worker *w, char *text) {
     pthread_mutex_unlock(&w->mu);
 }
 
+/* Return ownership of a user message that could not be encoded or fit into the
+ * active context.  The UI restores it to editable input (or retains it in the
+ * non-interactive queue) instead of silently losing text that it already
+ * handed to the worker. */
+static void worker_return_user_text(agent_worker *w, char *text) {
+    if (!text) return;
+    pthread_mutex_lock(&w->mu);
+    if (w->returned_user_text) {
+        size_t old_len = strlen(w->returned_user_text);
+        size_t add_len = strlen(text);
+        w->returned_user_text = xrealloc(
+            w->returned_user_text, old_len + add_len + 3);
+        memcpy(w->returned_user_text + old_len, "\n\n", 2);
+        memcpy(w->returned_user_text + old_len + 2, text, add_len + 1);
+        free(text);
+    } else {
+        w->returned_user_text = text;
+    }
+    agent_wake_locked(w);
+    pthread_mutex_unlock(&w->mu);
+}
+
+static char *worker_take_returned_user_text(agent_worker *w) {
+    pthread_mutex_lock(&w->mu);
+    char *text = w->returned_user_text;
+    w->returned_user_text = NULL;
+    pthread_mutex_unlock(&w->mu);
+    return text;
+}
+
 /* Synchronize the live DS4 session to a transcript.  This is the agent's main
  * cache-saving operation: if the requested transcript extends the live session,
  * only the suffix is prefetched; otherwise the DS4 session rebuilds from the
@@ -4209,7 +4296,11 @@ static int agent_worker_sync_tokens(agent_worker *w, const ds4_tokens *tokens,
  * model families rebuilds this cache instead of restoring incompatible KV. */
 static bool agent_worker_reset_to_sysprompt(agent_worker *w, char *err, size_t err_len) {
     ds4_tokens sys = {0};
-    agent_worker_build_system_tokens(w, &sys);
+    if (!agent_worker_build_system_tokens(w, &sys)) {
+        snprintf(err, err_len, "failed to encode system prompt");
+        ds4_tokens_free(&sys);
+        return false;
+    }
 
     size_t text_len = 0;
     char *text = ds4_kvstore_render_tokens_text(w->engine, &sys, &text_len);
@@ -4235,13 +4326,12 @@ static bool agent_worker_reset_to_sysprompt(agent_worker *w, char *err, size_t e
     if (!loaded) {
         if (w->sysprompt_path)
             agent_publish_system_status(w, "Updating system prompt cache...");
-        ds4_tokens_free(&w->transcript);
-        ds4_tokens_copy(&w->transcript, &sys);
-        if (agent_worker_sync_tokens(w, &w->transcript, true, err, err_len) != 0) {
+        if (agent_worker_sync_tokens(w, &sys, true, err, err_len) != 0) {
             free(text);
             ds4_tokens_free(&sys);
             return false;
         }
+        agent_tokens_take(&w->transcript, &sys);
         if (w->sysprompt_path) {
             char save_err[160] = {0};
             char ignored_sha[41];
@@ -5309,7 +5399,14 @@ static bool agent_worker_strip_session(agent_worker *w, const char *prefix,
     }
 
     ds4_tokens stripped_tokens = {0};
-    ds4_tokenize_rendered_chat(w->engine, text, &stripped_tokens);
+    if (!ds4_tokenize_rendered_chat_checked(w->engine, text, &stripped_tokens)) {
+        snprintf(err, err_len, "failed to tokenize session transcript");
+        ds4_tokens_free(&stripped_tokens);
+        free(title);
+        free(text);
+        free(path);
+        return false;
+    }
     uint32_t stripped_token_count = (uint32_t)stripped_tokens.len;
     ds4_tokens_free(&stripped_tokens);
 
@@ -5654,16 +5751,30 @@ static void agent_worker_set_more(agent_worker *w, const char *path,
     w->more_valid = path && path[0] && next_line > 0;
 }
 
-static bool agent_tool_result_fits_context(agent_worker *w, const char *result,
-                                           int reserve_tokens,
-                                           int *tokens_out) {
+typedef enum {
+    AGENT_TOOL_FIT_ERROR = -1,
+    AGENT_TOOL_FIT_NO,
+    AGENT_TOOL_FIT_YES,
+} agent_tool_fit;
+
+static agent_tool_fit agent_tool_result_fits_context(
+        agent_worker *w, const char *result, int reserve_tokens,
+        int *tokens_out, char *err, size_t err_len) {
+    if (tokens_out) *tokens_out = -1;
     ds4_tokens tmp = {0};
     ds4_tokens_copy(&tmp, &w->transcript);
-    ds4_chat_append_message(w->engine, &tmp, "tool", result ? result : "");
+    if (!ds4_chat_append_message_checked(w->engine, &tmp, "tool",
+                                         result ? result : "")) {
+        ds4_tokens_free(&tmp);
+        if (err && err_len) snprintf(err, err_len, "failed to encode tool result");
+        return AGENT_TOOL_FIT_ERROR;
+    }
     int tokens = tmp.len;
     ds4_tokens_free(&tmp);
     if (tokens_out) *tokens_out = tokens;
-    return tokens + reserve_tokens < w->cfg->gen.ctx_size;
+    return reserve_tokens < w->cfg->gen.ctx_size &&
+           tokens < w->cfg->gen.ctx_size - reserve_tokens ?
+           AGENT_TOOL_FIT_YES : AGENT_TOOL_FIT_NO;
 }
 
 /* Read file text for the model.  Normal mode shows plain line numbers.  Raw
@@ -6212,9 +6323,29 @@ static void test_agent_edit_upto_requires_tail_after_newline_strip(void) {
     AGENT_TEST_ASSERT(strstr(err, "must include a unique tail anchor") != NULL);
 }
 
+static void test_agent_returned_user_text_preserves_ownership_and_order(void) {
+    agent_worker w = {0};
+    w.wake_fd[0] = -1;
+    w.wake_fd[1] = -1;
+    pthread_mutex_init(&w.mu, NULL);
+
+    worker_return_user_text(&w, xstrdup("first rejected message"));
+    worker_return_user_text(&w, xstrdup("second rejected message"));
+    char *returned = worker_take_returned_user_text(&w);
+    AGENT_TEST_ASSERT(returned != NULL);
+    AGENT_TEST_ASSERT(returned && !strcmp(
+        returned,
+        "first rejected message\n\nsecond rejected message"));
+    AGENT_TEST_ASSERT(worker_take_returned_user_text(&w) == NULL);
+
+    free(returned);
+    pthread_mutex_destroy(&w.mu);
+}
+
 static void ds4_agent_unit_tests_run(void) {
     test_agent_edit_upto_tail_newline_is_not_part_of_anchor();
     test_agent_edit_upto_requires_tail_after_newline_strip();
+    test_agent_returned_user_text_preserves_ownership_and_order();
 }
 #endif
 
@@ -7281,17 +7412,20 @@ static bool agent_worker_should_compact(agent_worker *w) {
     return ctx - used <= free_threshold;
 }
 
-static int agent_special_token_id(ds4_engine *engine, const char *rendered) {
+static bool agent_special_token_id(ds4_engine *engine, const char *rendered,
+                                   int *id_out) {
     ds4_tokens t = {0};
-    ds4_tokenize_rendered_chat(engine, rendered, &t);
-    int id = t.len == 1 ? t.v[0] : -1;
+    bool ok = ds4_tokenize_rendered_chat_checked(engine, rendered, &t) &&
+              t.len == 1;
+    if (id_out) *id_out = ok ? t.v[0] : -1;
     ds4_tokens_free(&t);
-    return id;
+    return ok;
 }
 
 /* Pick a recent verbatim tail for the compacted transcript.  Prefer a user
  * boundary inside the budget so the rebuilt context starts at a natural turn. */
-static int agent_compact_tail_start(agent_worker *w, int bottom, int sys_len) {
+static bool agent_compact_tail_start(agent_worker *w, int bottom, int sys_len,
+                                     int *start_out) {
     int tail_budget = w->cfg->gen.ctx_size / AGENT_COMPACT_TAIL_DIVISOR;
     if (tail_budget > AGENT_COMPACT_TAIL_CAP_TOKENS)
         tail_budget = AGENT_COMPACT_TAIL_CAP_TOKENS;
@@ -7300,13 +7434,18 @@ static int agent_compact_tail_start(agent_worker *w, int bottom, int sys_len) {
     int target = bottom - tail_budget;
     if (target < sys_len) target = sys_len;
 
-    int user_id = agent_special_token_id(w->engine, "<｜User｜>");
-    if (user_id < 0) return target;
+    int user_id = -1;
+    if (!agent_special_token_id(w->engine, "<｜User｜>", &user_id))
+        return false;
 
     for (int i = target; i < bottom; i++) {
-        if (w->transcript.v[i] == user_id) return i;
+        if (w->transcript.v[i] == user_id) {
+            *start_out = i;
+            return true;
+        }
     }
-    return target;
+    *start_out = target;
+    return true;
 }
 
 static void agent_tokens_append_range(ds4_tokens *dst, const ds4_tokens *src,
@@ -7350,22 +7489,46 @@ static bool agent_worker_compact(agent_worker *w, const char *reason,
     if (bottom <= 0) return true;
 
     ds4_tokens sys = {0};
-    agent_worker_build_system_tokens(w, &sys);
+    if (!agent_worker_build_system_tokens(w, &sys)) {
+        snprintf(err, err_len, "failed to encode system prompt for compaction");
+        ds4_tokens_free(&sys);
+        return false;
+    }
     if (bottom <= sys.len) {
         ds4_tokens_free(&sys);
         return true;
     }
 
-    agent_publishf(w,
-        "\n\x1b[1;95mCOMPACTING\x1b[0m %s: summarizing durable task state\n\x1b[38;5;245m",
-        reason && reason[0] ? reason : "context");
+    int tail_start = 0;
+    int think_end_id = -1;
+    int dsml_id = -1;
+    if (!agent_compact_tail_start(w, bottom, sys.len, &tail_start) ||
+        !agent_special_token_id(w->engine, "</think>", &think_end_id) ||
+        !agent_special_token_id(w->engine, "｜DSML｜", &dsml_id)) {
+        snprintf(err, err_len, "failed to resolve compaction control tokens");
+        ds4_tokens_free(&sys);
+        return false;
+    }
 
     char *prompt_text = agent_compact_make_prompt(reason);
     ds4_tokens prompt = {0};
     ds4_tokens_copy(&prompt, &w->transcript);
-    ds4_chat_append_message(w->engine, &prompt, "user", prompt_text);
+    bool prompt_ok = ds4_chat_append_message_checked(
+        w->engine, &prompt, "user", prompt_text);
     free(prompt_text);
-    ds4_chat_append_assistant_prefix(w->engine, &prompt, DS4_THINK_NONE);
+    if (prompt_ok)
+        prompt_ok = ds4_chat_append_assistant_prefix_checked(
+            w->engine, &prompt, DS4_THINK_NONE);
+    if (!prompt_ok) {
+        snprintf(err, err_len, "failed to encode compaction prompt");
+        ds4_tokens_free(&prompt);
+        ds4_tokens_free(&sys);
+        return false;
+    }
+
+    agent_publishf(w,
+        "\n\x1b[1;95mCOMPACTING\x1b[0m %s: summarizing durable task state\n\x1b[38;5;245m",
+        reason && reason[0] ? reason : "context");
 
     pthread_mutex_lock(&w->mu);
     w->status.state = AGENT_WORKER_COMPACTING;
@@ -7422,8 +7585,6 @@ static bool agent_worker_compact(agent_worker *w, const char *reason,
      * cannot accidentally continue from the private compaction exchange. */
     agent_buf summary = {0};
     char eval_err[160] = {0};
-    int think_end_id = agent_special_token_id(w->engine, "</think>");
-    int dsml_id = agent_special_token_id(w->engine, "｜DSML｜");
     double t0 = now_sec();
     for (int i = 0; i < summary_max; i++) {
         if (worker_should_interrupt(w)) {
@@ -7482,7 +7643,6 @@ static bool agent_worker_compact(agent_worker *w, const char *reason,
         return false;
     }
 
-    int tail_start = agent_compact_tail_start(w, bottom, sys.len);
     ds4_tokens compacted = {0};
     ds4_tokens_copy(&compacted, &sys);
 
@@ -7493,9 +7653,17 @@ static bool agent_worker_compact(agent_worker *w, const char *reason,
     if (summary_msg.len && summary_msg.ptr[summary_msg.len - 1] != '\n')
         agent_buf_puts(&summary_msg, "\n");
     agent_buf_puts(&summary_msg, "[End compacted summary. Recent conversation continues verbatim below.]\n\n");
-    ds4_chat_append_message(w->engine, &compacted, "system", summary_msg.ptr);
+    bool summary_ok = ds4_chat_append_message_checked(
+        w->engine, &compacted, "system", summary_msg.ptr);
     free(summary_msg.ptr);
     free(summary.ptr);
+    if (!summary_ok) {
+        snprintf(err, err_len, "failed to encode compaction summary");
+        ds4_session_invalidate(w->session);
+        ds4_tokens_free(&compacted);
+        ds4_tokens_free(&sys);
+        return false;
+    }
 
     agent_tokens_append_range(&compacted, &w->transcript, tail_start, bottom);
 
@@ -7505,12 +7673,12 @@ static bool agent_worker_compact(agent_worker *w, const char *reason,
 
     ds4_tokens old_transcript = {0};
     ds4_tokens_copy(&old_transcript, &w->transcript);
-    ds4_tokens_free(&w->transcript);
-    w->transcript = compacted;
+    agent_tokens_take(&w->transcript, &compacted);
+    ds4_tokens_free(&compacted);
     if (agent_worker_sync_tokens(w, &w->transcript, true, err, err_len) != 0) {
         ds4_session_invalidate(w->session);
-        ds4_tokens_free(&w->transcript);
-        w->transcript = old_transcript;
+        agent_tokens_take(&w->transcript, &old_transcript);
+        ds4_tokens_free(&old_transcript);
         ds4_tokens_free(&sys);
         return false;
     }
@@ -7519,11 +7687,23 @@ static bool agent_worker_compact(agent_worker *w, const char *reason,
     ds4_tokens_free(&sys);
     char *bash_update = agent_bash_jobs_compaction_observation(w);
     if (bash_update) {
-        ds4_chat_append_message(w->engine, &w->transcript, "tool", bash_update);
-        w->session_dirty = true;
-        agent_trace_text(w, "tool-after-compaction", bash_update, strlen(bash_update));
-        agent_publish(w, "\x1b[90mCOMPACTING added bash job update after rebuild\x1b[0m\n",
-                      strlen("\x1b[90mCOMPACTING added bash job update after rebuild\x1b[0m\n"));
+        if (ds4_chat_append_message_checked(
+                w->engine, &w->transcript, "tool", bash_update)) {
+            w->session_dirty = true;
+            agent_trace_text(w, "tool-after-compaction", bash_update,
+                             strlen(bash_update));
+            agent_publish(w,
+                "\x1b[90mCOMPACTING added bash job update after rebuild\x1b[0m\n",
+                strlen("\x1b[90mCOMPACTING added bash job update after rebuild\x1b[0m\n"));
+        } else {
+            /* The compacted transcript and live session are already committed.
+             * This auxiliary observation failing to encode must not make a
+             * successful compaction look rolled back to its caller. */
+            agent_publish_system_status(
+                w, "Compaction succeeded, but the bash job update could not be encoded.");
+            agent_trace(w,
+                "compaction kept rebuilt context after bash update encode failure");
+        }
         free(bash_update);
     }
     agent_trace(w, "compacted reason=\"%s\" old=%d new=%d tail_start=%d tail=%d",
@@ -7575,7 +7755,11 @@ static int worker_force_generated_text(agent_worker *w,
                                        char *err,
                                        size_t err_len) {
     ds4_tokens tokens = {0};
-    ds4_tokenize_text(w->engine, text, &tokens);
+    if (!ds4_tokenize_text_checked(w->engine, text, &tokens)) {
+        snprintf(err, err_len, "failed to tokenize forced generated text");
+        ds4_tokens_free(&tokens);
+        return 1;
+    }
     if (tokens.len > max_tokens - *generated) {
         snprintf(err, err_len, "not enough generation room to force %s", text);
         ds4_tokens_free(&tokens);
@@ -7671,7 +7855,48 @@ static int worker_run_turn(agent_worker *w, const char *user_text) {
         agent_set_error(w, compact_err[0] ? compact_err : "context compaction failed");
         return 1;
     }
-    agent_worker_maybe_append_datetime_context(w);
+
+    ds4_tokens staged_turn = {0};
+    ds4_tokens_copy(&staged_turn, &w->transcript);
+    bool added_datetime = !w->datetime_context_injected;
+    char datetime_message[256] = {0};
+    bool turn_ok = !added_datetime ||
+        agent_append_datetime_context(w, &staged_turn,
+                                      datetime_message,
+                                      sizeof(datetime_message));
+    if (turn_ok)
+        turn_ok = ds4_chat_append_message_checked(
+            w->engine, &staged_turn, "user", user_text ? user_text : "");
+    agent_assistant_prefix_effects prefix_effects;
+    if (turn_ok)
+        turn_ok = agent_stage_assistant_round_prefix(
+            w, &staged_turn, think_mode, &prefix_effects);
+    if (!turn_ok) {
+        ds4_tokens_free(&staged_turn);
+        worker_return_user_text(w, xstrdup(user_text ? user_text : ""));
+        agent_set_error(w, "failed to encode user turn");
+        return 1;
+    }
+    if (w->cfg->gen.ctx_size <= 0 ||
+        staged_turn.len >= w->cfg->gen.ctx_size) {
+        char fit_err[256];
+        snprintf(fit_err, sizeof(fit_err),
+                 "user turn does not fit context (prompt=%d tokens, ctx=%d); "
+                 "the message was returned for editing",
+                 staged_turn.len, w->cfg->gen.ctx_size);
+        ds4_tokens_free(&staged_turn);
+        worker_return_user_text(w, xstrdup(user_text ? user_text : ""));
+        agent_set_error(w, fit_err);
+        return 1;
+    }
+    agent_tokens_take(&w->transcript, &staged_turn);
+    ds4_tokens_free(&staged_turn);
+    agent_apply_assistant_prefix_effects(w, &prefix_effects);
+    if (added_datetime) {
+        agent_trace_text(w, "datetime-context", datetime_message,
+                         strlen(datetime_message));
+        w->datetime_context_injected = true;
+    }
     agent_trace_text(w, "user", user_text ? user_text : "",
                      user_text ? strlen(user_text) : 0);
     if (!w->session_title) {
@@ -7680,7 +7905,6 @@ static int worker_run_turn(agent_worker *w, const char *user_text) {
         agent_session_identity_sha(w->session_title, w->session_created_at,
                                    w->session_sha);
     }
-    ds4_chat_append_message(w->engine, &w->transcript, "user", user_text);
 
     uint64_t rng = cfg->gen.seed ? cfg->gen.seed :
         ((uint64_t)time(NULL) ^ ((uint64_t)getpid() << 32) ^ (uint64_t)clock());
@@ -7710,8 +7934,11 @@ static int worker_run_turn(agent_worker *w, const char *user_text) {
             agent_set_error(w, compact_err[0] ? compact_err : "context compaction failed");
             return 1;
         }
-        agent_worker_maybe_append_system_prompt_reminder(w);
-        ds4_chat_append_assistant_prefix(w->engine, &w->transcript, think_mode);
+        if (tool_round > 0 &&
+            !agent_worker_append_assistant_round_prefix(w, think_mode)) {
+            agent_set_error(w, "failed to encode assistant prompt");
+            return 1;
+        }
 
         const ds4_tokens *prompt_for_sync = &w->transcript;
         int old_pos = ds4_session_pos(w->session);
@@ -7914,9 +8141,17 @@ static int worker_run_turn(agent_worker *w, const char *user_text) {
             tool_result = agent_execute_tool_calls(w, &dsml.calls);
         }
         int projected_tokens = 0;
-        if (!agent_tool_result_fits_context(w, tool_result,
-                                            AGENT_TOOL_RESULT_RESERVE_TOKENS,
-                                            &projected_tokens))
+        char fit_err[160] = {0};
+        agent_tool_fit fit = agent_tool_result_fits_context(
+            w, tool_result, AGENT_TOOL_RESULT_RESERVE_TOKENS,
+            &projected_tokens, fit_err, sizeof(fit_err));
+        if (fit == AGENT_TOOL_FIT_ERROR) {
+            free(tool_result);
+            agent_dsml_parser_free(&dsml);
+            agent_set_error(w, fit_err);
+            return 1;
+        }
+        if (fit == AGENT_TOOL_FIT_NO)
         {
             if (!agent_worker_compact(w, "tool result would exceed context",
                                       compact_err, sizeof(compact_err)))
@@ -7931,9 +8166,16 @@ static int worker_run_turn(agent_worker *w, const char *user_text) {
                 agent_set_error(w, compact_err[0] ? compact_err : "context compaction failed");
                 return 1;
             }
-            if (!agent_tool_result_fits_context(w, tool_result,
-                                                AGENT_TOOL_RESULT_RESERVE_TOKENS,
-                                                &projected_tokens))
+            fit = agent_tool_result_fits_context(
+                w, tool_result, AGENT_TOOL_RESULT_RESERVE_TOKENS,
+                &projected_tokens, fit_err, sizeof(fit_err));
+            if (fit == AGENT_TOOL_FIT_ERROR) {
+                free(tool_result);
+                agent_dsml_parser_free(&dsml);
+                agent_set_error(w, fit_err);
+                return 1;
+            }
+            if (fit == AGENT_TOOL_FIT_NO)
             {
                 free(tool_result);
                 agent_buf b = {0};
@@ -7946,7 +8188,15 @@ static int worker_run_turn(agent_worker *w, const char *user_text) {
                          AGENT_TOOL_RESULT_RESERVE_TOKENS);
                 agent_buf_puts(&b, msg);
                 tool_result = agent_buf_take(&b);
-                if (!agent_tool_result_fits_context(w, tool_result, 16, NULL)) {
+                fit = agent_tool_result_fits_context(
+                    w, tool_result, 16, NULL, fit_err, sizeof(fit_err));
+                if (fit == AGENT_TOOL_FIT_ERROR) {
+                    free(tool_result);
+                    agent_dsml_parser_free(&dsml);
+                    agent_set_error(w, fit_err);
+                    return 1;
+                }
+                if (fit == AGENT_TOOL_FIT_NO) {
                     free(tool_result);
                     agent_dsml_parser_free(&dsml);
                     agent_set_error(w, "context full after compaction");
@@ -7954,14 +8204,46 @@ static int worker_run_turn(agent_worker *w, const char *user_text) {
                 }
             }
         }
-        ds4_chat_append_message(w->engine, &w->transcript, "tool", tool_result);
+        if (!ds4_chat_append_message_checked(
+                w->engine, &w->transcript, "tool", tool_result)) {
+            free(tool_result);
+            agent_dsml_parser_free(&dsml);
+            agent_set_error(w, "failed to encode tool result");
+            return 1;
+        }
         free(tool_result);
         agent_dsml_parser_free(&dsml);
 
         char *queued_user = worker_request_queued_user_drain(w);
         if (queued_user && queued_user[0]) {
+            ds4_tokens staged_queued_user = {0};
+            ds4_tokens_copy(&staged_queued_user, &w->transcript);
+            bool queued_ok = ds4_chat_append_message_checked(
+                w->engine, &staged_queued_user, "user", queued_user);
+            if (!queued_ok) {
+                ds4_tokens_free(&staged_queued_user);
+                worker_return_user_text(w, queued_user);
+                queued_user = NULL;
+                agent_set_error(w, "failed to encode queued user message");
+                return 1;
+            }
+            if (w->cfg->gen.ctx_size <= 0 ||
+                staged_queued_user.len >= w->cfg->gen.ctx_size) {
+                char fit_error[256];
+                snprintf(fit_error, sizeof(fit_error),
+                         "queued user message does not fit context "
+                         "(prompt=%d tokens, ctx=%d); the message was returned "
+                         "for editing",
+                         staged_queued_user.len, w->cfg->gen.ctx_size);
+                ds4_tokens_free(&staged_queued_user);
+                worker_return_user_text(w, queued_user);
+                queued_user = NULL;
+                agent_set_error(w, fit_error);
+                return 1;
+            }
+            agent_tokens_take(&w->transcript, &staged_queued_user);
+            ds4_tokens_free(&staged_queued_user);
             agent_trace_text(w, "queued_user", queued_user, strlen(queued_user));
-            ds4_chat_append_message(w->engine, &w->transcript, "user", queued_user);
             pthread_mutex_lock(&w->mu);
             w->user_activity = true;
             w->session_dirty = true;
@@ -9437,6 +9719,12 @@ static void editor_write_welcome_banner(agent_editor *editor,
  * and model thread.  After this returns, all DS4 session mutation happens on
  * the worker thread. */
 static int agent_worker_init(agent_worker *w, ds4_engine *engine, agent_config *cfg) {
+    if (ds4_engine_chat_format(engine) != DS4_CHAT_FORMAT_DEEPSEEK_V4) {
+        fprintf(stderr,
+                "ds4-agent: Qwen3.6 is not supported yet: its native chat/tool "
+                "renderer is not compatible with the DeepSeek DSML agent protocol\n");
+        return -1;
+    }
     memset(w, 0, sizeof(*w));
     w->engine = engine;
     w->cfg = cfg;
@@ -9497,6 +9785,7 @@ static void agent_worker_free(agent_worker *w) {
     free(w->session_title);
     free(w->legacy_session_path_to_delete);
     free(w->queued_user_drain_text);
+    free(w->returned_user_text);
     if (w->wake_fd[0] >= 0) close(w->wake_fd[0]);
     if (w->wake_fd[1] >= 0) close(w->wake_fd[1]);
     if (w->trace) fclose(w->trace);
@@ -9751,6 +10040,10 @@ static int run_agent_non_interactive(ds4_engine *engine, agent_config *cfg) {
         }
         free(out);
 
+        char *returned_user = worker_take_returned_user_text(&worker);
+        if (returned_user)
+            agent_prompt_queue_push_front(&queue, returned_user);
+
         if (worker_take_queued_user_drain_request(&worker)) {
             char *queued = agent_prompt_queue_take_all(&queue);
             worker_answer_queued_user_drain(&worker, queued);
@@ -9892,6 +10185,21 @@ static int run_agent(ds4_engine *engine, agent_config *cfg) {
         char *out = NULL;
         size_t out_len = 0;
         worker_consume(&worker, &out, &out_len, &st);
+        char *returned_user = worker_take_returned_user_text(&worker);
+        if (returned_user) {
+            if (editor.active) {
+                if (editor.edit.buf && editor.edit.len) {
+                    char *editing = xstrndup(editor.edit.buf, editor.edit.len);
+                    agent_prompt_queue_push(&queue, editing);
+                    free(editing);
+                }
+                editor_replace_input(&editor, returned_user);
+            } else {
+                agent_prompt_queue_push_front(&queue, returned_user);
+                returned_user = NULL;
+            }
+            free(returned_user);
+        }
         build_prompt_text(&st, prompt, sizeof(prompt));
         int footer_cols = editor.edit.cols > 0 ? (int)editor.edit.cols : 80;
         build_footer_text(&st, &queue, footer_cols, statusline, sizeof(statusline));
