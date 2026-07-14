@@ -633,9 +633,8 @@ typedef struct {
     int tool_call_ids_len;
     int tool_call_ids_cap;
     tool_calls calls;
-    /* Presence matters for Qwen's fail-closed tool gate: an empty tool_calls
-     * array still opts into a wire protocol whose output parser is not wired
-     * up yet.  DeepSeek keeps using calls.len exactly as before. */
+    /* True only for an actual tool payload. Nullable/empty compatibility
+     * fields emitted by SDK serializers remain semantically tool-free. */
     bool has_tool_fields;
     bool has_role_field;
     bool content_has_nontext;
@@ -1207,13 +1206,16 @@ bad:
     return false;
 }
 
-static bool parse_tool_calls_value(const char **p, tool_calls *calls) {
+static bool parse_tool_calls_value(const char **p, tool_calls *calls,
+                                   bool *has_items) {
+    if (has_items) *has_items = false;
     json_ws(p);
     if (json_lit(p, "null")) return true;
     if (**p != '[') return false;
     (*p)++;
     json_ws(p);
     while (**p && **p != ']') {
+        if (has_items) *has_items = true;
         if (**p != '{') return false;
         (*p)++;
         tool_call tc = {0};
@@ -1743,29 +1745,37 @@ static bool parse_messages(const char **p, chat_msgs *msgs) {
                     goto fail;
                 }
             } else if (!strcmp(key, "tool_call_id")) {
-                msg.has_tool_fields = true;
                 char *id = NULL;
-                if (!json_string(p, &id)) {
+                json_ws(p);
+                if (json_lit(p, "null")) {
+                    /* Nullable SDK field with no tool semantics. */
+                } else if (!json_string(p, &id)) {
                     free(key);
                     goto fail;
+                } else {
+                    msg.has_tool_fields = true;
+                    chat_msg_add_tool_call_id(&msg, id);
                 }
-                chat_msg_add_tool_call_id(&msg, id);
                 free(id);
             } else if (!strcmp(key, "tool_calls")) {
-                msg.has_tool_fields = true;
                 tool_calls_free(&msg.calls);
-                if (!parse_tool_calls_value(p, &msg.calls)) {
+                bool has_items = false;
+                if (!parse_tool_calls_value(p, &msg.calls, &has_items)) {
                     free(key);
                     goto fail;
                 }
+                msg.has_tool_fields = msg.has_tool_fields || has_items;
             } else if (!strcmp(key, "function_call")) {
                 /* Legacy OpenAI tool-call field.  DeepSeek historically
-                 * ignored it; remember only its presence so Qwen can reject
-                 * the unsupported protocol rather than silently dropping it. */
-                msg.has_tool_fields = true;
-                if (!json_skip_value(p)) {
-                    free(key);
-                    goto fail;
+                 * ignores it.  Reject a real payload for Qwen, while accepting
+                 * the nullable compatibility field emitted by some SDKs. */
+                json_ws(p);
+                if (!json_lit(p, "null")) {
+                    msg.has_tool_fields = true;
+                    if (!json_skip_value(p)) {
+                        free(key);
+                        goto fail;
+                    }
                 }
             } else if (!json_skip_value(p)) {
                 free(key);
@@ -12486,6 +12496,31 @@ static void test_qwen_tool_gate_accepts_semantically_tool_free_requests(void) {
     tool_schema_orders_free(&orders);
 }
 
+static void test_qwen_chat_ir_accepts_empty_tool_compat_fields(void) {
+    const char *p =
+        "[{\"role\":\"user\",\"content\":\"hi\","
+        "\"tool_call_id\":null,\"tool_calls\":null,"
+        "\"function_call\":null},"
+        "{\"role\":\"assistant\",\"content\":\"hello\","
+        "\"tool_calls\":[]}]";
+    chat_msgs msgs = {0};
+    TEST_ASSERT(parse_messages(&p, &msgs));
+    TEST_ASSERT(msgs.len == 2);
+    TEST_ASSERT(!msgs.v[0].has_tool_fields);
+    TEST_ASSERT(!msgs.v[1].has_tool_fields);
+    TEST_ASSERT(msgs.v[0].calls.len == 0 && msgs.v[1].calls.len == 0);
+
+    ds4_chat_message *ir = NULL;
+    size_t n_ir = 0;
+    char err[192] = {0};
+    TEST_ASSERT(qwen_chat_messages_borrow(
+        &msgs, false, &ir, &n_ir, err, sizeof(err)));
+    TEST_ASSERT(ir && n_ir == 2);
+
+    free(ir);
+    chat_msgs_free(&msgs);
+}
+
 static void assert_qwen_chat_ir_rejects(const char *json,
                                         const char *error_fragment) {
     const char *p = json;
@@ -12534,7 +12569,8 @@ static void test_qwen_chat_ir_rejects_unsupported_protocol_shapes(void) {
         "system message must be first");
     assert_qwen_chat_ir_rejects(
         "[{\"role\":\"user\",\"content\":\"hi\"},"
-        "{\"role\":\"assistant\",\"content\":\"\",\"tool_calls\":[]}]",
+        "{\"role\":\"assistant\",\"content\":\"\","
+        "\"tool_calls\":[{}]}]",
         "tools and tool_calls are disabled");
     assert_qwen_chat_ir_rejects(
         "[{\"role\":\"user\",\"content\":\"hi\"},"
@@ -16588,6 +16624,7 @@ static void ds4_server_unit_tests_run(void) {
     test_qwen_endpoint_gate_is_family_aware();
     test_qwen_chat_ir_borrows_typed_untrusted_content();
     test_qwen_tool_gate_accepts_semantically_tool_free_requests();
+    test_qwen_chat_ir_accepts_empty_tool_compat_fields();
     test_qwen_chat_ir_rejects_unsupported_protocol_shapes();
     test_message_content_flags_preserve_legacy_flattening();
     test_request_defaults_use_min_p_filtering();
