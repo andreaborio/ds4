@@ -265,13 +265,26 @@ bool ds4_ssd_resident_pressure_plan_make(
     }
 
     out->physical_bytes = memory->physical_bytes;
-    const uint64_t file_inactive_bytes =
+    const uint64_t bounded_inactive_bytes =
         memory->inactive_bytes < memory->file_backed_bytes ?
             memory->inactive_bytes : memory->file_backed_bytes;
+    out->pressure_status_available = memory->pressure_status_available;
+    out->pressure_normal = memory->pressure_status_available &&
+                           memory->pressure_normal;
+    /* inactive_bytes and file_backed_bytes are separate VM aggregates, not a
+     * proven intersection. Their minimum is only a bounded working-set proxy.
+     * macOS can reclaim that proxy aggressively while system pressure is
+     * normal; elevated or unavailable pressure keeps the previous half-credit
+     * fail-closed policy. Purgeable pages may overlap inactive queues, so take
+     * the larger pool instead of adding both. The SSD cache planner below stays
+     * on half-credit in every state because it wires new cache pages. */
+    out->inactive_credit_bytes = out->pressure_normal ?
+        bounded_inactive_bytes : bounded_inactive_bytes / 2u;
+    const uint64_t reclaimable_working_set =
+        memory->purgeable_bytes > out->inactive_credit_bytes ?
+            memory->purgeable_bytes : out->inactive_credit_bytes;
     uint64_t reclaimable = saturating_add_u64(memory->free_bytes,
-                                               memory->purgeable_bytes);
-    reclaimable = saturating_add_u64(reclaimable,
-                                      file_inactive_bytes / 2u);
+                                               reclaimable_working_set);
     if (reclaimable > memory->physical_bytes) {
         reclaimable = memory->physical_bytes;
     }

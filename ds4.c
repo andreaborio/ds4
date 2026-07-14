@@ -30414,10 +30414,14 @@ static bool ds4_engine_resolve_residency(ds4_engine               *e,
             fprintf(stderr,
                     "ds4: Qwen resident pressure preflight: model/runtime + "
                     "headroom/margin %.2f GiB required; %.2f GiB currently "
-                    "reclaimable on %.2f GiB RAM\n",
+                    "reclaimable on %.2f GiB RAM (%.2f GiB bounded inactive "
+                    "credit; pressure %s)\n",
                     (double)pressure.required_bytes / 1073741824.0,
                     (double)pressure.reclaimable_bytes / 1073741824.0,
-                    (double)pressure.physical_bytes / 1073741824.0);
+                    (double)pressure.physical_bytes / 1073741824.0,
+                    (double)pressure.inactive_credit_bytes / 1073741824.0,
+                    !pressure.pressure_status_available ? "unknown" :
+                        (pressure.pressure_normal ? "normal" : "elevated"));
         }
 
         if (e->residency_requested == DS4_RESIDENCY_RESIDENT &&

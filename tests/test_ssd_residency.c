@@ -113,11 +113,72 @@ int main(void) {
     };
     assert(ds4_ssd_resident_pressure_plan_make(
         &pressure_memory, 20 * GIB, 1 * GIB, &pressure));
-    assert(pressure.reclaimable_bytes == 36 * GIB);
+    assert(pressure.inactive_credit_bytes == 4 * GIB);
+    assert(pressure.reclaimable_bytes == 34 * GIB);
     assert(pressure.current_headroom_bytes == 4 * GIB);
     assert(pressure.pressure_margin_bytes == 1 * GIB);
     assert(pressure.required_bytes == 26 * GIB);
     assert(pressure.fits);
+
+    /* Normal Darwin pressure allows the complete bounded inactive working-set
+     * proxy as resident admission credit. Elevated or unavailable pressure
+     * retains conservative half credit. */
+    pressure_memory = (ds4_ssd_host_memory){
+        .physical_bytes = 64 * GIB,
+        .free_bytes = 4 * GIB,
+        .inactive_bytes = 24 * GIB,
+        .file_backed_bytes = 20 * GIB,
+        .pressure_status_available = true,
+        .pressure_normal = true,
+    };
+    assert(ds4_ssd_resident_pressure_plan_make(
+        &pressure_memory, 18 * GIB, 1 * GIB, &pressure));
+    assert(pressure.inactive_credit_bytes == 20 * GIB);
+    assert(pressure.reclaimable_bytes == 24 * GIB);
+    assert(pressure.pressure_normal);
+    assert(pressure.fits);
+    pressure_memory.pressure_normal = false;
+    assert(ds4_ssd_resident_pressure_plan_make(
+        &pressure_memory, 18 * GIB, 1 * GIB, &pressure));
+    assert(pressure.inactive_credit_bytes == 10 * GIB);
+    assert(pressure.reclaimable_bytes == 14 * GIB);
+    assert(!pressure.pressure_normal);
+    assert(!pressure.fits);
+    pressure_memory.pressure_status_available = false;
+    pressure_memory.pressure_normal = true;
+    assert(ds4_ssd_resident_pressure_plan_make(
+        &pressure_memory, 18 * GIB, 1 * GIB, &pressure));
+    assert(pressure.inactive_credit_bytes == 10 * GIB);
+    assert(!pressure.pressure_normal);
+    assert(!pressure.fits);
+
+    /* Purgeable pages may already belong to an inactive queue. The resident
+     * gate uses the larger reclaimable pool and never adds both. */
+    pressure_memory = (ds4_ssd_host_memory){
+        .physical_bytes = 64 * GIB,
+        .free_bytes = 4 * GIB,
+        .purgeable_bytes = 12 * GIB,
+        .inactive_bytes = 20 * GIB,
+        .file_backed_bytes = 20 * GIB,
+        .pressure_status_available = true,
+        .pressure_normal = true,
+    };
+    assert(ds4_ssd_resident_pressure_plan_make(
+        &pressure_memory, 1 * GIB, 0, &pressure));
+    assert(pressure.inactive_credit_bytes == 20 * GIB);
+    assert(pressure.reclaimable_bytes == 24 * GIB);
+    pressure_memory = (ds4_ssd_host_memory){
+        .physical_bytes = 16 * GIB,
+        .free_bytes = 16 * GIB,
+        .inactive_bytes = 16 * GIB,
+        .file_backed_bytes = 16 * GIB,
+        .pressure_status_available = true,
+        .pressure_normal = true,
+    };
+    assert(ds4_ssd_resident_pressure_plan_make(
+        &pressure_memory, 19 * GIB, 0, &pressure));
+    assert(pressure.reclaimable_bytes == 16 * GIB);
+    assert(!pressure.fits);
 
     /* Live pressure is an independent residency gate: equality is safe, but
      * one byte less reclaimable memory fails closed even on a 64 GiB host. */
@@ -274,6 +335,39 @@ int main(void) {
            floor.working_set_experts == 0);
     assert(qwen_adaptive.cache_bytes <=
            qwen_adaptive.safety_wire_budget_bytes);
+
+    /* Pressure status only controls the resident gate. The strict SSD planner
+     * must produce the same plan for an otherwise identical snapshot. */
+    ds4_ssd_adaptive_cache_plan qwen_adaptive_normal = {0};
+    qwen_memory.inactive_bytes = 4 * GIB;
+    qwen_memory.file_backed_bytes = 6 * GIB;
+    qwen_memory.purgeable_bytes = 1 * GIB;
+    assert(ds4_ssd_adaptive_cache_plan_make_strict_with_static_reserve(
+        &qwen_memory,
+        512 * MIB,
+        5 * GIB / 2u,
+        false,
+        QWEN35_N_LAYER,
+        QWEN35_N_EXPERT_USED,
+        qwen_expert_bytes,
+        qwen_max_cacheable,
+        &qwen_adaptive));
+    qwen_memory.pressure_status_available = true;
+    qwen_memory.pressure_normal = true;
+    assert(ds4_ssd_adaptive_cache_plan_make_strict_with_static_reserve(
+        &qwen_memory,
+        512 * MIB,
+        5 * GIB / 2u,
+        false,
+        QWEN35_N_LAYER,
+        QWEN35_N_EXPERT_USED,
+        qwen_expert_bytes,
+        qwen_max_cacheable,
+        &qwen_adaptive_normal));
+    assert(qwen_adaptive_normal.reclaimable_bytes ==
+           qwen_adaptive.reclaimable_bytes);
+    assert(qwen_adaptive_normal.cache_experts == qwen_adaptive.cache_experts);
+    assert(qwen_adaptive_normal.cache_bytes == qwen_adaptive.cache_bytes);
 
     qwen_memory = (ds4_ssd_host_memory){
         .physical_bytes = 64 * GIB,

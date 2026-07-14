@@ -18,6 +18,7 @@
 #include <sys/mman.h>
 #include <sys/sysctl.h>
 #include <mach/mach.h>
+#include <dispatch/source.h>
 
 #include "ds4.h"
 #include "ds4_gpu.h"
@@ -3270,6 +3271,18 @@ int ds4_gpu_host_memory_snapshot(ds4_ssd_host_memory *out) {
         .recommended_bytes = recommended_bytes,
         .task_footprint_bytes = (uint64_t)task_vm.phys_footprint,
     };
+    int pressure_level = 0;
+    size_t pressure_level_bytes = sizeof(pressure_level);
+    if (sysctlbyname("kern.memorystatus_vm_pressure_level",
+                     &pressure_level,
+                     &pressure_level_bytes,
+                     NULL,
+                     0) == 0 &&
+        pressure_level_bytes == sizeof(pressure_level)) {
+        snapshot.pressure_status_available = true;
+        snapshot.pressure_normal =
+            pressure_level == DISPATCH_MEMORYPRESSURE_NORMAL;
+    }
     const uint64_t page_bytes = (uint64_t)page_size;
     if (!ds4_gpu_page_count_bytes(free_pages,
                                   page_bytes,

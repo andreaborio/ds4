@@ -55,9 +55,12 @@ typedef struct {
 typedef struct {
     uint64_t physical_bytes;
     uint64_t reclaimable_bytes;
+    uint64_t inactive_credit_bytes;
     uint64_t current_headroom_bytes;
     uint64_t pressure_margin_bytes;
     uint64_t required_bytes;
+    bool pressure_status_available;
+    bool pressure_normal;
     bool fits;
 } ds4_ssd_resident_pressure_plan;
 
@@ -81,6 +84,10 @@ typedef struct {
     uint64_t purgeable_bytes;
     uint64_t inactive_bytes;
     uint64_t file_backed_bytes;
+    /* Darwin's current system pressure state. The resident planner may use a
+     * larger bounded inactive working-set credit while pressure is normal. */
+    bool pressure_status_available;
+    bool pressure_normal;
 } ds4_ssd_host_memory;
 
 typedef struct {
