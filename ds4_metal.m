@@ -194,6 +194,7 @@ static uint64_t g_stream_expert_cache_bytes;
 static uint64_t g_stream_expert_cache_expert_bytes;
 static uint32_t g_stream_expert_cache_entry_count;
 static uint32_t g_stream_expert_cache_budget_override;
+static uint32_t g_stream_expert_cache_required_floor;
 static uint32_t g_stream_expert_cache_mlock_budget_cap;
 static uint8_t g_stream_expert_cache_mlock_relief_applied;
 static uint64_t g_stream_expert_cache_hits;
@@ -3158,6 +3159,7 @@ void ds4_gpu_set_quality(bool quality) {
 
 void ds4_gpu_set_ssd_streaming(bool enabled) {
     g_ssd_streaming_mode = enabled ? 1 : 0;
+    g_stream_expert_cache_required_floor = 0;
     ds4_gpu_stream_expert_cache_clear_all(1);
     if (g_ssd_streaming_mode) {
         fprintf(stderr,
@@ -3171,6 +3173,12 @@ void ds4_gpu_set_streaming_expert_cache_budget(uint32_t experts) {
     }
     g_stream_expert_cache_budget_override = experts;
     ds4_gpu_stream_expert_cache_clear_all(1);
+}
+
+void ds4_gpu_set_streaming_expert_cache_required_floor(uint32_t experts) {
+    /* Budget changes preserve this model contract; SSD-mode reset/cleanup
+     * clears it before another model can reuse the process-global backend. */
+    g_stream_expert_cache_required_floor = experts;
 }
 
 void ds4_gpu_set_streaming_expert_cache_expert_bytes(uint64_t bytes) {
@@ -7125,6 +7133,7 @@ int ds4_gpu_synchronize(void) {
 }
 
 void ds4_gpu_cleanup(void) {
+    g_stream_expert_cache_required_floor = 0;
     if (!g_initialized) return;
 
     @autoreleasepool {
@@ -7968,6 +7977,10 @@ uint64_t ds4_gpu_internal_stream_expert_cache_decode_tokens(void) {
 
 uint64_t ds4_gpu_internal_stream_expert_timing_selected_calls(void) {
     return g_stream_expert_timing_selected_calls;
+}
+
+uint32_t ds4_gpu_internal_stream_expert_cache_required_floor(void) {
+    return g_stream_expert_cache_required_floor;
 }
 
 uint32_t ds4_gpu_stream_expert_cache_budget_for_expert_size(
@@ -26200,6 +26213,18 @@ int ds4_gpu_qwen35_routed_moe_top8_tensor(
         return 0;
     }
 
+    const uint32_t cache_budget =
+        ds4_gpu_stream_expert_cache_configured_budget();
+    if (g_stream_expert_cache_required_floor != 0 &&
+        cache_budget < g_stream_expert_cache_required_floor) {
+        fprintf(stderr,
+                "ds4: Metal Qwen top-8 configured cache %u is below the "
+                "required %u-expert floor\n",
+                cache_budget,
+                g_stream_expert_cache_required_floor);
+        return 0;
+    }
+
     const bool selected_timing =
         ds4_gpu_stream_expert_timing_summary_enabled();
     const double selected_t0 = selected_timing ? ds4_gpu_now_ms() : 0.0;
@@ -26258,8 +26283,6 @@ int ds4_gpu_qwen35_routed_moe_top8_tensor(
         down_abs_offsets[i] = down_offset + down_rel;
     }
 
-    const uint32_t cache_budget =
-        ds4_gpu_stream_expert_cache_configured_budget();
     if (cache_budget < unique_selected ||
         !ds4_gpu_stream_expert_cache_note_expert_size(gate_expert_bytes,
                                                       down_expert_bytes)) {

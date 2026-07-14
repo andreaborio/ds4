@@ -1471,6 +1471,7 @@ static void test_metal_qwen35_primitives(void) {
 #ifdef __APPLE__
 extern uint64_t ds4_gpu_internal_stream_expert_cache_decode_tokens(void);
 extern uint64_t ds4_gpu_internal_stream_expert_timing_selected_calls(void);
+extern uint32_t ds4_gpu_internal_stream_expert_cache_required_floor(void);
 extern int ds4_gpu_internal_moe_selected_trace_inspect(
     const char *path, uint32_t requested_width, uint32_t *file_width,
     uint64_t *record_count, int *legacy);
@@ -1979,6 +1980,7 @@ static void test_metal_q4_selected_slots_runtime_count(void) {
     ds4_gpu_set_streaming_expert_cache_expert_bytes(per_expert_bytes);
     ds4_gpu_set_streaming_expert_cache_budget(6);
     ds4_gpu_set_ssd_streaming(true);
+    TEST_ASSERT(ds4_gpu_internal_stream_expert_cache_required_floor() == 0);
 
     test_metal_q4_slots_result top4 = {0};
     TEST_ASSERT(test_metal_q4_selected_slots_case(
@@ -2142,6 +2144,9 @@ static void test_metal_q4_selected_slots_runtime_count(void) {
         TEST_ASSERT(setenv("DS4_MOE_RECORD_SELECTED_IDS",
                            trace_path, 1) == 0);
 
+        ds4_gpu_set_streaming_expert_cache_required_floor(0);
+        TEST_ASSERT(
+            ds4_gpu_internal_stream_expert_cache_required_floor() == 0);
         ds4_gpu_set_streaming_expert_cache_budget(8);
         TEST_ASSERT(test_metal_qwen_top8_case(
             model_map, model_size,
@@ -2261,12 +2266,60 @@ static void test_metal_q4_selected_slots_runtime_count(void) {
     TEST_ASSERT(sync_warm.decode_tokens == 2);
     unsetenv("DS4_METAL_STREAMING_EXPERT_PREAD_THREADS");
 
+    /* Qwen's full-model safety floor is independent from the eight experts
+     * needed by one layer. A lazy mlock cap below that floor must stop the
+     * next layer before selected-ID readback or SSD/cache mutations. */
+    ds4_gpu_set_streaming_expert_cache_required_floor(321);
+    TEST_ASSERT(
+        ds4_gpu_internal_stream_expert_cache_required_floor() == 321);
+    ds4_gpu_set_streaming_expert_cache_budget(320);
+    TEST_ASSERT(ds4_gpu_stream_expert_cache_configured_count() == 320);
+    TEST_ASSERT(
+        ds4_gpu_internal_stream_expert_cache_required_floor() == 321);
+    test_metal_qwen_top8_result floor_reject = {0};
+    TEST_ASSERT(test_metal_qwen_top8_case(
+        model_map, model_size,
+        gate_offset, up_offset, down_offset,
+        gate_expert_bytes, down_expert_bytes,
+        router_selected[0], router_weights[0], router_logits[0],
+        false, &floor_reject));
+    TEST_ASSERT(floor_reject.hits == 0);
+    TEST_ASSERT(floor_reject.misses == 0);
+    TEST_ASSERT(floor_reject.pread_bytes == 0);
+    TEST_ASSERT(floor_reject.current_entries == 0);
+    TEST_ASSERT(floor_reject.decode_tokens == 0);
+    TEST_ASSERT(ds4_gpu_internal_stream_expert_timing_selected_calls() == 0);
+
+    ds4_gpu_set_streaming_expert_cache_budget(321);
+    TEST_ASSERT(ds4_gpu_stream_expert_cache_configured_count() == 321);
+    TEST_ASSERT(
+        ds4_gpu_internal_stream_expert_cache_required_floor() == 321);
+    test_metal_qwen_top8_result floor_accept = {0};
+    TEST_ASSERT(test_metal_qwen_top8_case(
+        model_map, model_size,
+        gate_offset, up_offset, down_offset,
+        gate_expert_bytes, down_expert_bytes,
+        router_selected[0], router_weights[0], router_logits[0],
+        true, &floor_accept));
+    TEST_ASSERT(floor_accept.hits == 0);
+    TEST_ASSERT(floor_accept.misses == 8);
+    TEST_ASSERT(floor_accept.pread_bytes == 8u * per_expert_bytes);
+    TEST_ASSERT(floor_accept.current_entries == 8);
+    TEST_ASSERT(floor_accept.decode_tokens == 1);
+    TEST_ASSERT(ds4_gpu_internal_stream_expert_timing_selected_calls() == 1);
+    const float floor_expected = test_metal_qwen_top8_expected(
+        router_selected[0], router_weights[0]);
+    for (uint32_t row = 0; row < OUT_DIM; row++) {
+        TEST_ASSERT(isfinite(floor_accept.out[row]));
+        TEST_ASSERT(fabsf(floor_accept.out[row] - floor_expected) < 0.1f);
+    }
+
     fprintf(stderr,
             "ds4-test: Q4 selected slots n=4/n=6 output=%.6f "
             "misses=%llu/%llu pread=%llu/%llu; "
             "Qwen top8 cold/warm/dup=%llu/%llu/%llu misses; "
             "active cold/warm/pressure=%llu/%llu/%llu misses; "
-            "sync cold/warm hits=%llu/%llu\n",
+            "sync cold/warm hits=%llu/%llu; floor 320/321=%llu/%llu misses\n",
             top4.out[0],
             (unsigned long long)top4.misses,
             (unsigned long long)top6.misses,
@@ -2279,9 +2332,12 @@ static void test_metal_q4_selected_slots_runtime_count(void) {
             (unsigned long long)active_warm.misses,
             (unsigned long long)active_pressure.misses,
             (unsigned long long)sync_cold.hits,
-            (unsigned long long)sync_warm.hits);
+            (unsigned long long)sync_warm.hits,
+            (unsigned long long)floor_reject.misses,
+            (unsigned long long)floor_accept.misses);
 
     ds4_gpu_set_ssd_streaming(false);
+    TEST_ASSERT(ds4_gpu_internal_stream_expert_cache_required_floor() == 0);
     ds4_gpu_set_streaming_expert_cache_budget(0);
     ds4_gpu_set_streaming_expert_cache_expert_bytes(0);
     ds4_gpu_set_model_fd(-1);

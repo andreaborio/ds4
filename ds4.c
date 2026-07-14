@@ -30769,6 +30769,13 @@ static bool ds4_engine_configure_qwen35_metal_streaming(ds4_engine *e) {
                 "supported Q4_K_S artifact\n");
         return false;
     }
+    if (geometry.minimum_cache_experts > UINT32_MAX) {
+        fprintf(stderr,
+                "ds4: Qwen SSD required cache floor exceeds the backend ABI\n");
+        return false;
+    }
+    ds4_gpu_set_streaming_expert_cache_required_floor(
+        (uint32_t)geometry.minimum_cache_experts);
 
     ds4_model_map_span_vec page_spans = {0};
     uint64_t static_payload_bytes = 0;

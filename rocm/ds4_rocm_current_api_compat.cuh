@@ -174,6 +174,11 @@ extern "C" void ds4_gpu_set_streaming_expert_cache_budget(uint32_t experts) {
     g_stream_expert_cache_budget = experts;
 }
 
+extern "C" void ds4_gpu_set_streaming_expert_cache_required_floor(
+        uint32_t experts) {
+    (void)experts;
+}
+
 extern "C" void ds4_gpu_set_streaming_expert_cache_expert_bytes(uint64_t bytes) {
     (void)bytes;
 }
