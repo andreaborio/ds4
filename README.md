@@ -148,7 +148,7 @@ the runtime needs.
 | DeepSeek V4 Flash | `main` | Primary supported path | Metal, adaptive SSD streaming, 16–64 GB measurements |
 | DeepSeek V4 PRO | `main` | Supported upstream path | High-memory and distributed inference |
 | GLM 5.2 | `codex/glm52-upstream-clean-bench` | Experimental branch | Correct streamed prefill and Metal performance on 64 GB |
-| Qwen3.6-35B-A3B (`qwen35moe`) | `feat/qwen-support` | Experimental branch | Metal AUTO mapping, live-pressure fallback, strict SSD cache, and resident/SSD kernels implemented and model-free validated; clean post-slab model run and physical 16 GB gate pending |
+| Qwen3.6-35B-A3B (`qwen35moe`) | `feat/qwen-metal-structural-opt` | Experimental, model-backed measured | Metal AUTO mapping, live-pressure fallback, strict SSD cache, resident prefill, and parallel resident decode; physical 16 GB gate pending |
 
 ### Experimental Qwen3.6 Metal AUTO path
 
@@ -209,10 +209,13 @@ reported as geometric means rather than selecting the fastest run.
 | DeepSeek V4 Flash decode, direct upstream/fork A/B | 12.63 t/s | 12.58 t/s | -0.43% | Performance parity, not a speedup |
 | GLM 5.2 short-prompt prefill, indexed prepare off/on | 3.79 t/s | 9.15 t/s | **2.42×** | Isolated developer A/B; independently reproduced previously |
 | GLM 5.2 decode in the same runs | 0.96 t/s | 0.91 t/s | -4.7% | No decode improvement |
+| Qwen3.6 resident decode, serial/parallel top-8 router | 37.00 t/s | **62.96 t/s** | **+70.2%** | Six-run balanced A/B; output hash identical |
+| Qwen3.6 resident end-to-end, quiet desktop | — | **223.73 prefill / 65.63 generation t/s** | — | Five-run median; zero process swaps |
 
 Test host: MacBook Pro M5 Pro, 64 GB unified memory, Metal, internal 1 TB SSD,
 AC power. DeepSeek used the 86.72 GB (80.76 GiB) IQ2XXS model; GLM used the
-244.14 GiB ds4-native model.
+244.14 GiB ds4-native model; Qwen used the normalized 19.37 GiB
+`Qwen3.6-35B-A3B-ds4-Q4_K_S.gguf` artifact in guarded resident AUTO mode.
 
 The DeepSeek row compares upstream `80ebbc3` with fork `1523b26`, using an
 A/B/B/A order, 3,000 cached and preloaded experts, 128 prefill tokens, and 256
@@ -225,6 +228,15 @@ pure upstream GLM binary cannot load this ds4-native GGUF, so this is an isolate
 feature A/B, **not** a whole-binary fork/upstream comparison. All four retained
 outputs are byte-identical. One concurrent-load-contaminated run was discarded
 and rerun.
+
+The Qwen router row uses serial/parallel/parallel/serial/serial/parallel order
+on the same warm resident model. All six outputs share SHA-256
+`a650b56ceb47dc8715f87c125c7eeab506bc4a510512cedbd190e38c46df5f33`.
+Five additional quiet-desktop runs measured a 65.63 t/s generation median and
+223.73 t/s prefill median; under active compositor and Codex GPU contention the
+same binary measured 50.20 t/s generation. These are achievable local results,
+not a guarantee under arbitrary interactive GPU load. Full commands and raw
+conditions are in [`tests/qwen/README.md`](tests/qwen/README.md).
 
 These are fresh development measurements, not a universal performance claim.
 The full conditions and limitations are recorded in
