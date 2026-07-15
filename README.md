@@ -167,10 +167,16 @@ DS4_QWEN_EXPERIMENTAL_METAL=1 ./ds4 \
 Qwen AUTO selects the full-model mapped Metal mode only when both the fixed Metal
 working-set budget and a point-in-time host-memory pressure check pass. Under
 pressure it falls back to SSD and lazily grows the routed-expert cache to the
-largest complete routing tier admitted by the current conservative snapshot,
-after independently reserving the 2.50 GiB
-static page set, context/runtime memory, and system headroom. `--resident`
-fails unless both admission checks pass; because pressure can change after the
+largest complete routing tier admitted by the current conservative snapshot.
+Above 16 GiB the planner independently reserves the 2.50 GiB static page set,
+context/runtime memory, and system headroom. On a 16 GiB Mac, AUTO keeps the
+complete static charge but lets those unpinned, pageable GGUF pages share system
+headroom. It selects the largest complete 320-expert cache cycle admitted by
+the remaining live and platform budgets rather than imposing a fixed low-RAM
+floor. Bounded file-backed inactive pages receive full credit only while macOS
+reports normal pressure; unknown or elevated pressure retains half-credit and
+fails closed near the boundary. `--resident` fails unless both admission checks
+pass; because pressure can change after the
 snapshot, this is a conservative admission policy rather than a future-memory
 guarantee. `--ssd-streaming` remains the reproducible forced-streaming override.
 In SSD mode Qwen grows its Metal expert cache in 321-expert slabs (about
@@ -189,9 +195,10 @@ The hard SSD cache floor is 321 complete routed experts (about 0.53 GiB); 640
 (about 1.06 GiB) is a useful controlled small-cache tier. Startup and the
 per-layer path fail closed if the effective locked cache falls below the floor.
 The runtime has completed model-backed resident and SSD generation on an M5 Pro
-with 64 GiB. A physical 16 GiB Mac has not yet been benchmarked, so no
-machine-specific 16 GiB speed or no-swap guarantee is claimed; AUTO still uses
-the same pressure-aware admission and safe SSD fallback on every Mac. See
+with 64 GiB, plus a bounded SSD smoke on a physical M1 Pro with 16 GiB. The
+latest small-Mac regression run used a conservative 321-expert cache, completed
+the 43+32-token request at 4.06/7.03 prefill/generation t/s, and added no
+swapouts; it is a compatibility check, not an SSD speed claim. See
 [`tests/qwen/README.md`](tests/qwen/README.md) for the exact artifact contract,
 reproducible evidence, and current limitations.
 
@@ -202,58 +209,38 @@ or Strix Halo result until it is re-measured on that backend.
 
 ## Measured results
 
-Same machine, model, power state, and bounded workload; paired results are
-reported as geometric means rather than selecting the fastest run.
+This table keeps only the latest retained model-backed result for each active
+line. Within each row, the machine, model, power state, and bounded workload are
+held constant.
 
 | Experiment | Control | Fork / optimized | Difference | Verdict |
 | --- | ---: | ---: | ---: | --- |
 | DeepSeek V4 Flash decode, direct upstream/fork A/B | 12.63 t/s | 12.58 t/s | -0.43% | Performance parity, not a speedup |
-| GLM 5.2 short-prompt prefill, indexed prepare off/on | 3.79 t/s | 9.15 t/s | **2.42×** | Isolated developer A/B; independently reproduced previously |
-| GLM 5.2 decode in the same runs | 0.96 t/s | 0.91 t/s | -4.7% | No decode improvement |
-| Qwen3.6 resident decode, serial/parallel top-8 router | 37.00 t/s | **62.96 t/s** | **+70.2%** | Six-run balanced A/B; output hash identical |
-| Qwen3.6 resident end-to-end, quiet desktop | — | **223.73 prefill / 65.63 generation t/s** | — | Five-run median; zero process swaps |
-| Qwen3.6 server Thinking sampler, short context | 39.71 t/s | **58.59 t/s** | **+47.6%** | Full-vocabulary min-p A/B; 768 reference samples preserve token and RNG state |
-| Qwen3.6 full-attention decode, positions 1,428–1,628 | 36.18 t/s | **44.06 t/s** | **+21.8%** | Adjacent serial/parallel GQA A/B; output hash identical |
-| Qwen3.6 DSBox-like Thinking turn, positions 1,426–1,930 | — | **320.30 prefill / 41.04 generation t/s** | — | 504 generated tokens; 43.22→38.70 t/s across the growing prefix |
+| GLM 5.2 short-prompt prefill, indexed prepare off/on | 3.79 t/s | 9.15 t/s | **2.42×** | Isolated developer A/B; no decode improvement |
+| Qwen3.6 resident prefill, separate/paired Q4 gate+up | 209.34 prefill / 58.71 generation t/s | **258.08 prefill** / 57.81 generation t/s | **+23.3% prefill** / -1.5% generation | Six-run interleaved A/B; the 0.90 t/s generation delta is noise, decode path unchanged, greedy output identical |
 
 Test host: MacBook Pro M5 Pro, 64 GB unified memory, Metal, internal 1 TB SSD,
 AC power. DeepSeek used the 86.72 GB (80.76 GiB) IQ2XXS model; GLM used the
 244.14 GiB ds4-native model; Qwen used the normalized 19.37 GiB
 `Qwen3.6-35B-A3B-ds4-Q4_K_S.gguf` artifact in guarded resident AUTO mode.
 
-The DeepSeek row compares upstream `80ebbc3` with fork `1523b26`, using an
-A/B/B/A order, 3,000 cached and preloaded experts, 128 prefill tokens, and 256
-generated tokens. All four frontier-logit hashes are identical. The first
-upstream leg recorded 36 global swapout pages; the other three recorded zero.
-
-The GLM rows compare indexed-prefill preparation disabled and enabled on the
-same compatible `4eab362` fork build, using two clean repetitions per arm. The
-pure upstream GLM binary cannot load this ds4-native GGUF, so this is an isolated
-feature A/B, **not** a whole-binary fork/upstream comparison. All four retained
-outputs are byte-identical. One concurrent-load-contaminated run was discarded
-and rerun.
-
-The Qwen router row uses serial/parallel/parallel/serial/serial/parallel order
-on the same warm resident model. All six outputs share SHA-256
+The Qwen result is the final same-binary `A1/B1/B2/A2/A3/B3` comparison. All
+six outputs share SHA-256
 `a650b56ceb47dc8715f87c125c7eeab506bc4a510512cedbd190e38c46df5f33`.
-Five additional quiet-desktop runs measured a 65.63 t/s generation median and
-223.73 t/s prefill median; under active compositor and Codex GPU contention the
-same binary measured 50.20 t/s generation. These are achievable local results,
-not a guarantee under arbitrary interactive GPU load. The Thinking sampler
-screens the 248,077-token vocabulary before exponentiation, using a narrow
-rounding guard at the min-p boundary while preserving the reference token/RNG
-sequence. At long context, the parallel GQA kernel
-replaces per-cache-token threadgroup barriers with eight SIMD-local online
-softmax scans and one merge. The 200-token long-context A/B shares SHA-256
-`7111fd2b619195bd56b85b2d1baf3bb2b6aea377dea5d6da394e43a6b2c9bbf5`.
-Neither optimization changes or further quantizes model weights. Full commands,
-conditions, fallbacks, and oracle limits are in
-[`tests/qwen/README.md`](tests/qwen/README.md).
+It retained the same argmax and top-64 next-token set, and system swap use did
+not move. The earlier fixed llama.cpp b10016 CLI reference was 252.1 prefill and
+60.3 generation t/s. A mechanical comparison puts the latest DS4 at +2.4%
+prefill and -4.1% generation, but the runs were recorded in different sessions,
+so the defensible speedup claim remains the controlled **+23.3% over the
+previous DS4 dispatch**, with no decode-path change, rather than a cross-runtime
+win.
 
-These are fresh development measurements, not a universal performance claim.
-The full conditions and limitations are recorded in
+Full commands, all samples, numerical checks, the rejected fused prototype, and
+the latest physical 16 GiB SSD regression smoke are recorded in
+[`docs/benchmarks/2026-07-15-qwen-ds4-vs-llamacpp.md`](docs/benchmarks/2026-07-15-qwen-ds4-vs-llamacpp.md).
+Earlier development campaigns remain in
 [`docs/benchmarks/2026-07-14-m5-pro.md`](docs/benchmarks/2026-07-14-m5-pro.md);
-the prior independent SSD campaign is in
+the independent SSD campaign is in
 [`SSD_STREAMING_VERIFICATION.md`](SSD_STREAMING_VERIFICATION.md).
 
 ## Memory safety is part of performance

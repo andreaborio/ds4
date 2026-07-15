@@ -287,15 +287,18 @@ complete routes.  A smaller accepted cache emits an anti-thrashing warning.
 This is a benchmark tier, not the automatic production choice or a guarantee
 that 640 experts fit every machine under current memory pressure.  When AUTO
 selects SSD and no count or byte budget is supplied, the Qwen-specific strict
-planner independently charges the 2.50 GiB static page set, context/runtime,
-current-pressure margin, and Metal headroom, then chooses the largest complete
-320-expert cycle admitted by the conservative snapshot and planner.  Expert
+planner charges the 2.50 GiB static page set, context/runtime,
+current-pressure margin, and Metal headroom. Above 16 GiB those reserves remain
+independent. On a 16 GiB Mac the unpinned static pages share ordinary headroom,
+AUTO consumes the largest complete 320-expert cycle admitted by the live and
+platform budgets, and bounded file-backed inactive pages receive full credit
+only under normal macOS pressure. Unknown or elevated pressure retains
+half-credit and fails closed near the boundary. Expert
 slots are populated and locked lazily, but Metal cache storage is allocated in
 321-expert slabs (about 0.529 GiB), so the first route allocates one complete
 working set plus its safety slot and later routes grow storage incrementally.
 The planner charges the complete cache budget rather than only the currently
-populated slots.  The generic DeepSeek low-RAM floor-only tuning and its 4 GiB
-slab default are deliberately unchanged and are not applied to Qwen.
+populated slots. The generic DeepSeek 4 GiB slab default remains unchanged.
 
 ### AUTO and resident validation
 
@@ -421,9 +424,84 @@ change or further quantize dense model weights.
 Model-backed AUTO is pressure-dependent by design.  A 64 GiB Mac is not an
 unconditional resident tier: if other applications consume unified memory,
 AUTO can correctly choose SSD.  A physical 16 GiB machine is expected to use
-SSD for this 19.37 GiB tensor payload, but still receives the largest cache that
-fits the same safety accounting.  No physical 16 GiB throughput or no-swap
-result is claimed until that hardware is actually measured.
+SSD for this 19.37 GiB tensor payload. AUTO caps that host tier at the safe
+budget computed from a normal-pressure snapshot and rounds down to complete
+320-expert cycles; the selected count is pressure-dependent. A bounded physical
+M1 Pro 16 GiB server smoke is now recorded below; the full sustained cold/warm
+gate remains open.
+
+### Physical M1 Pro 16 GiB admission smoke
+
+On 2026-07-15, the branch based on `1fdfe080ea63` was built natively on a
+MacBook Pro (`MacBookPro18,3`), Apple M1 Pro 8-core, 16 GiB, macOS 26.5
+(`25F71`). The machine was on battery at 38%. The normalized Q4_K_S artifact
+had the SHA-256 recorded below. The server used Metal AUTO, context 8,192,
+power 100, eight CPU threads, and the automatically capped 321-expert cache.
+
+The preflight reported 5.69 GiB reclaimable, a 2.50 GiB shared
+static/headroom reserve, 0.25 GiB pressure margin, 0.37 GiB runtime, and a
+2.56 GiB safe expert budget. AUTO resolved to SSD and readiness succeeded.
+Two identical non-thinking server requests contained 32 prompt tokens and
+reached the 64-token generation cap:
+
+| Run | Prefill | Generation | Total | Result |
+| --- | ---: | ---: | ---: | --- |
+| First | 4.17 t/s | 8.71 t/s | 15.025 s | 64 tokens |
+| Immediate repeat | 5.45 t/s | 8.83 t/s | 13.120 s | byte-identical content |
+
+macOS pressure remained normal; the lowest sampled availability was 50%. The
+swapout counter remained exactly 2,010,446 and reported swap use remained
+395.31 MiB before and after both requests. The first run followed model copy and
+hash activity, so this is admission, generation, and no-new-swapout evidence,
+not a controlled cold-device benchmark or the complete preregistered sustained
+16 GiB gate.
+
+The first admission build above still capped Qwen AUTO at the floor despite its
+larger safe budget. A follow-up removed that model-specific cap while leaving
+the pressure reserves and DeepSeek's separately measured low-RAM ceiling
+unchanged. The same host then ran a warm-cache B/A/B, two identical 32+64-token
+requests per arm:
+
+| Arm | Cache | Generation runs | Mean | Process RSS |
+| --- | ---: | ---: | ---: | ---: |
+| B1 | AUTO 1,281 (2.11 GiB) | 9.85 / 9.71 t/s | 9.78 t/s | 2.48 GiB |
+| A | Explicit 321 (0.53 GiB) | 8.45 / 8.87 t/s | 8.66 t/s | 0.86 GiB |
+| B2 | AUTO 1,281 (2.11 GiB) | 9.38 / 9.59 t/s | 9.49 t/s | 2.51 GiB |
+
+The combined AUTO mean was 9.63 t/s, 11.2% above the control. Pressure stayed
+normal with at least 46% reported availability; swap use stayed at 387.62 MiB
+and the swapout counter remained exactly 2,010,466. One output from each cache
+size was byte-identical, SHA-256
+`81a77f323f8fafb9d1e7d68038c198a54ed0948b5cc0ffdd2d66df7c78e0d3fd`.
+This comparison was on battery with a warm file cache (61% and discharging at
+the end) and does not replace the preregistered cold/warm sustained gate.
+
+### Same-artifact llama.cpp comparison
+
+The official llama.cpp b10016 macOS arm64 release was tested with the same
+normalized GGUF. On the M1 Pro 16 GiB host, default Metal mmap/autofit did not
+complete its first `pp32` test before macOS entered elevated pressure; swapouts
+rose by 178,744 pages and swap use grew by about 2.61 GiB. Minimal scalar
+`pp1`/`tg4` attempts with all MoE layers on CPU and with a 4 GiB Metal fit
+margin also entered elevated pressure. They were stopped by the pressure
+watchdog, so no unsafe partial t/s value is reported.
+
+On the M5 Pro 64 GiB host, the full artifact fit and both runtimes stayed under
+normal pressure with zero new swapouts. Three page-touched DS4 resident runs
+measured a 218.30 t/s prefill median and 63.94 t/s generation median. Three
+llama.cpp CLI runs on the same 43-token rendered prompt measured 252.1 and
+60.3 t/s. DS4 was 13.4% slower in prefill, 6.0% faster in generation, and 4.0%
+faster by the derived complete 43+96-token time. The canonical rendered prompt
+produced the same exact 43 token IDs in both tokenizers, and both CLIs produced
+the same visible continuation through `return curr`.
+
+The official `llama-bench` reference measured median `pp43` 508.969 t/s,
+`tg96` 57.596 t/s, and combined `pp43+tg96` 80.032 t/s. Its synthetic prompt
+microbenchmark excludes real chat-template/final-logits/sampling work and is
+recorded separately rather than compared directly with DS4's sampled CLI
+prefill. Exact commands, all samples, memory evidence, and the 16 GiB failure
+probes are in
+[`../../docs/benchmarks/2026-07-15-qwen-ds4-vs-llamacpp.md`](../../docs/benchmarks/2026-07-15-qwen-ds4-vs-llamacpp.md).
 
 ### Reproduce the resident coding benchmark
 
@@ -459,6 +537,16 @@ router and routed-MoE kernels keep all top-8 routes on Metal.  The fixed batch
 scratch allocation is included in the resident admission budget and the graph
 lifetime test.  `DS4_QWEN_DISABLE_RESIDENT_BATCH_PREFILL=1` selects the scalar
 fallback for differential diagnosis.
+
+For the production 256-expert, top-8 Q4 graph, resident batches larger than
+four tokens use the existing paired selected-expert matvec for gate and up.
+This avoids two separate routed passes while preserving the later activation
+and down projection. Quality mode, decode, and SSD streaming retain their
+previous paths. Set `DS4_QWEN_DISABLE_RESIDENT_PREFILL_PAIR_MV=1` to restore
+the separate resident gate/up dispatches without disabling the rest of batch
+prefill. The controlled M5 Pro A/B, numerical comparison, and physical 16 GiB
+SSD regression smoke are recorded in
+[`../../docs/benchmarks/2026-07-15-qwen-ds4-vs-llamacpp.md`](../../docs/benchmarks/2026-07-15-qwen-ds4-vs-llamacpp.md).
 
 With the model pages warm and memory pressure normal, three consecutive n96
 runs of the command above measured 170.29/30.40, 179.63/30.47, and
