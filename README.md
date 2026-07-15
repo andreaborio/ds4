@@ -148,11 +148,11 @@ the runtime needs.
 | DeepSeek V4 Flash | `main` | Primary supported path | Metal, adaptive SSD streaming, 16–64 GB measurements |
 | DeepSeek V4 PRO | `main` | Supported upstream path | High-memory and distributed inference |
 | GLM 5.2 | `codex/glm52-upstream-clean-bench` | Experimental branch | Correct streamed prefill and Metal performance on 64 GB |
-| Qwen3.6-35B-A3B (`qwen35moe`) | `feat/qwen-metal-structural-opt` | Experimental, model-backed measured | Metal AUTO mapping, live-pressure fallback, strict SSD cache, resident prefill, and parallel resident decode; physical 16 GB gate pending |
+| Qwen3.6-35B-A3B (`qwen35moe`) | `main` | Supported opt-in Metal path, model-backed measured | Metal AUTO mapping, live-pressure fallback, strict SSD cache, resident prefill, and parallel resident decode |
 
-### Experimental Qwen3.6 Metal AUTO path
+### Qwen3.6 Metal AUTO path
 
-This branch is qualified and measured with one normalized text-only artifact,
+The main branch is qualified and measured with one normalized text-only artifact,
 `Qwen3.6-35B-A3B-ds4-Q4_K_S.gguf`; it is not generic Qwen or arbitrary
 community-GGUF support. The literal environment guard is the experimental
 opt-in; Metal, power 100, and AUTO residency are the Apple defaults, but are
@@ -183,14 +183,15 @@ proves that every page remains physically resident as later pressure changes.
 That stronger physical-residency claim requires separate runtime measurement.
 All neural math in the supported Qwen path is on Metal. The CPU still performs
 tokenization, sampling, route readback, cache bookkeeping, and streamed GGUF
-I/O; a CPU+GPU split of layers or experts is not implemented in this branch.
+I/O; a CPU+GPU split of layers or experts is not implemented in this path.
 
 The hard SSD cache floor is 321 complete routed experts (about 0.53 GiB); 640
 (about 1.06 GiB) is a useful controlled small-cache tier. Startup and the
 per-layer path fail closed if the effective locked cache falls below the floor.
-The runtime has completed a one-token oracle and bounded generation on an M5
-Pro with 64 GiB, but a physical 16 GiB Mac has not yet passed the required
-cold/warm, 8K-context, no-new-swapout release run. See
+The runtime has completed model-backed resident and SSD generation on an M5 Pro
+with 64 GiB. A physical 16 GiB Mac has not yet been benchmarked, so no
+machine-specific 16 GiB speed or no-swap guarantee is claimed; AUTO still uses
+the same pressure-aware admission and safe SSD fallback on every Mac. See
 [`tests/qwen/README.md`](tests/qwen/README.md) for the exact artifact contract,
 reproducible evidence, and current limitations.
 

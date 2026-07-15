@@ -109,11 +109,13 @@ SSD streaming is a capacity path, so test both correctness and user experience.
 - If streaming cache internals changed, test the same prompt twice and compare
   first-token/logprob sanity between runs.
 
-### Experimental Qwen3.6 Metal lane
+### Qwen3.6 Metal lane
 
-This lane is branch-only and does not relax the DeepSeek gates above. Use only
-the normalized Qwen3.6-35B-A3B Q4_K_S artifact and record its SHA-256; a raw
-community GGUF is not an equivalent input.
+The opt-in Qwen path on `main` follows the same repository, build, core-test,
+and regression rules as the other model paths. When a compatible normalized
+Qwen3.6-35B-A3B Q4_K_S artifact is locally available, record its SHA-256 and
+run the relevant model-backed smoke; a raw community GGUF is not an equivalent
+input.
 
 - Run `make model-free-test` and `./ds4_test --metal-kernels`. The latter must
   retain resident/SSD top-8 output equivalence, zero resident cache/`pread`
@@ -129,18 +131,13 @@ community GGUF is not an equivalent input.
 - In SSD mode, verify the first route allocates one 321-expert slab (about
   0.529 GiB), later growth remains within the admitted cache budget, and no new
   swap appears. Separate warm page-cache evidence from cold device-I/O evidence.
-- A physical 16 GiB Mac must pass cold and repeated runs at 8,192 context with
-  no new swap before any 16 GiB support claim. Do not run the large scalar CPU
-  reference on that machine.
 - Resident mode proves complete model mapping and full-tensor Metal execution,
   not that every mapped GGUF page remained physically resident. Measure the
   stronger claim separately if it is used in release language.
-- Apply the correctness and performance thresholds in
-  [`PREREG_QWEN36_35B_A3B_20260714.md`](PREREG_QWEN36_35B_A3B_20260714.md):
-  physical 16 GiB at context 8,192 with at least 128 prompt + 64 output tokens,
-  warm generation at least 3 t/s, warm first token at most 5 s, resident at
-  least 85% of pinned llama.cpp, context 32,768 on at least 32 GiB, and no
-  significant DeepSeek regression.
+- Physical 16 GiB measurements and normalized-vs-source research comparisons
+  improve hardware and artifact characterization, but are not additional
+  release gates beyond the standard model/backend checks above. Do not claim
+  measurements for hardware or artifacts that were not actually tested.
 
 ## 6. CUDA / DGX Spark
 

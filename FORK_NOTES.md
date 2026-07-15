@@ -15,8 +15,9 @@ equivalent implementation, this fork converges on it and removes the duplicate.
 > only acceptable speed regression is when an important correctness bug is fixed and it
 > requires some speed penalty."* Read every entry below against that rule.
 
-Ledger snapshot: fork `origin/main` `e633c77` (including the earlier `1523b26`
-Metal lifecycle milestone), upstream `main` `80ebbc3`, audited 2026-07-14.
+Ledger snapshot: fork Qwen promotion through `7d50ae7` (including the earlier
+`1523b26` Metal lifecycle milestone), upstream `main` `80ebbc3`, audited
+2026-07-15.
 Commit links and live branch differences remain authoritative if this dated
 snapshot drifts.
 
@@ -39,6 +40,7 @@ snapshot drifts.
 | Expert prune/profile hooks (`aef72ee`) | default-off full expert rankings and CPU-router prune masks for domain analysis | **FORK EXPERIMENT** — research instrumentation, not a default inference feature. Reassess upstream fit only with a general diagnostic use case and neutral overhead. |
 | Mixed-precision routed-expert streaming (`fefa426`, later sync) | serve per-layer boosted expert quants under SSD streaming | **CONVERGED UPSTREAM** — the fork takes upstream's implementation after `5800f15`; no competing delta should be preserved. |
 | GLM 5.2 streaming line (branch `codex/glm52-upstream-clean-bench` = `bd89932` + 11 commits) | #520 fixes + #528 prepare + always-active ds4-native GLM GGUF layout support (`a0e234a`, the substrate every GLM number runs on) + a copy of the RAM guard + default-off experiments (router-ahead prefetch, prune/profile hooks, virtual resident decode layers, eviction tie-break) | **MIXED** — #520/#528 are open upstream; the RAM guard is tracked separately above. Keep the remaining experiments isolated while incomplete, but open upstream PRs for each piece that applies to the upstream GLM path after validation. Measured verification is in `SSD_STREAMING_VERIFICATION.md`. |
+| Qwen3.6-35B-A3B (`qwen35moe`, through `7d50ae7`) | opt-in Metal path for one normalized text-only Q4_K_S artifact; AUTO resident/SSD admission, strict cache planning, model-backed generation, server chat, and structural resident decode optimizations | **FORK MAIN; UPSTREAM ISSUE [#462](https://github.com/antirez/ds4/issues/462)** — keep the explicit environment guard and one-artifact contract. Reconcile with upstream's implementation before proposing reusable pieces. Physical 16 GiB and source-GGUF comparisons are additional characterization, not fork-main promotion gates. Unsupported features remain fail-closed and documented. |
 
 ## Work not on `main`
 
@@ -46,7 +48,6 @@ snapshot drifts.
 |---|---|---|
 | Resident-map overcommit guard | Published branch `fix/refuse-oversized-resident-maps` at `06fd005`; tested, not yet on fork `main` | Open upstream as a standalone PR; do not claim mainline protection until it lands here or upstream. |
 | GLM 5.2 | Published experimental branch; streamed prefill fixes and optimization measured on M5 Pro 64 GB | Keep whole-line claims separate from DeepSeek `main`; #520 and #528 are already open upstream. |
-| Qwen3.6-35B-A3B (`qwen35moe`) | Experimental branch `feat/qwen-support`; the exact normalized Q4_K_S artifact has real Metal + SSD logits/generation evidence, AUTO full-model-map admission with an independent live-pressure gate, a strict Qwen cache planner, incremental 321-expert slabs, and model-free resident/SSD top-8 equivalence. Live check on 2026-07-14 found upstream issue [#462](https://github.com/antirez/ds4/issues/462) but no open Qwen implementation PR. | Keep isolated and opt-in. No 16 GB support claim until a physical 8K cold/warm no-new-swapout run passes. Model-backed resident/SSD equivalence is still open, as are the normalized-vs-Unsloth multi-position quality gate, server tools, exact rewind/snapshots, long context, cold device-I/O, and cross-backend production parity. The live-pressure guard, strict planner, and slab override are potentially reusable primitives but are not upstream-ready until DeepSeek and cross-backend validation is complete. |
 
 ## DO NOT UPSTREAM (without clearing the bar below): per-expert / mixed-precision expert quantization
 

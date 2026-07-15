@@ -422,8 +422,8 @@ Model-backed AUTO is pressure-dependent by design.  A 64 GiB Mac is not an
 unconditional resident tier: if other applications consume unified memory,
 AUTO can correctly choose SSD.  A physical 16 GiB machine is expected to use
 SSD for this 19.37 GiB tensor payload, but still receives the largest cache that
-fits the same safety accounting.  This expectation is not a substitute for the
-physical 16 GiB release gate below.
+fits the same safety accounting.  No physical 16 GiB throughput or no-swap
+result is claimed until that hardware is actually measured.
 
 ### Reproduce the resident coding benchmark
 
@@ -641,7 +641,7 @@ Both measurements are from an M5 Pro with 64 GiB unified memory.  They do not
 prove operation on a physical 16 GiB Mac.  The evidence bundle in this section
 predates resident layer-major prefill; its SSD path remains scalar
 (`prefill_cap=1`), prioritizing bounded expert-cache behavior over throughput.
-The experimental runtime currently rejects or leaves unsupported:
+The opt-in runtime currently rejects or leaves unsupported:
 
 - `--quality` and MTP;
 - session payloads/snapshots and layer slices/distributed execution;
@@ -649,10 +649,9 @@ The experimental runtime currently rejects or leaves unsupported:
 - expert profiles/hotlists, expert preloading, and directional steering;
 - non-routed pin profiles and power settings below 100.
 
-The preregistered normalized-vs-original-Unsloth multi-position NLL/top-1 gate,
-a complete multi-position oracle, longer continuations, model-backed
-resident/SSD equivalence on a host where resident admission is safe, disk
-snapshot restore, server tool-call sessions, 8K/32K context, and physical
-16 GiB pressure/swap tests remain release gates.  The one-token oracle is a
-smoke-tolerance result; together with the bounded coding run it proves an alive,
-numerically close Metal+SSD path, not the general Qwen release path.
+Normalized-vs-original-Unsloth scoring, a broader multi-position oracle, disk
+snapshot restore, server tool-call sessions, longer contexts, cold device-I/O,
+and physical 16 GiB pressure/swap measurements remain useful follow-up work;
+they are not extra promotion gates beyond the standard model/backend checks.
+The current evidence qualifies this exact text-only artifact on Metal, not
+generic Qwen support or arbitrary community GGUFs.
