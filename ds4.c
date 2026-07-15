@@ -31809,7 +31809,7 @@ static bool ds4_engine_configure_qwen35_metal_streaming(ds4_engine *e) {
             geometry.per_expert_bytes,
             geometry.max_cacheable_experts,
             &auto_plan);
-    if (auto_plan.low_ram_floor_ceiling_active &&
+    if (auto_plan.low_ram_shared_static_headroom_active &&
         auto_plan.pageable_static_reserve_bytes != 0) {
         fprintf(stderr,
                 "ds4: Qwen SSD low-RAM preflight: pressure %s, reclaimable "

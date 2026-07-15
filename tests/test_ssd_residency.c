@@ -301,7 +301,8 @@ int main(void) {
 
     /* Qwen keeps the complete static mapping charged on 16 GiB, but those
      * unpinned pages share ordinary headroom because macOS can reclaim and
-     * stream them again. AUTO wires only the safe floor on this host tier. */
+     * stream them again. Unlike DeepSeek's measured low-RAM performance cap,
+     * Qwen consumes the largest complete tier admitted by its safety budget. */
     ds4_ssd_host_memory qwen_memory = {
         .physical_bytes = 16 * GIB,
         .recommended_bytes = 12 * GIB,
@@ -318,7 +319,8 @@ int main(void) {
         qwen_expert_bytes,
         qwen_max_cacheable,
         &qwen_adaptive));
-    assert(qwen_adaptive.low_ram_floor_ceiling_active);
+    assert(qwen_adaptive.low_ram_shared_static_headroom_active);
+    assert(!qwen_adaptive.low_ram_floor_ceiling_active);
     assert(qwen_adaptive.pageable_static_reserve_bytes == 5 * GIB / 2u);
     assert(qwen_adaptive.platform_static_reserve_bytes == 5 * GIB / 2u);
     assert(qwen_adaptive.current_headroom_bytes == 5 * GIB / 2u);
@@ -326,16 +328,17 @@ int main(void) {
     assert(qwen_adaptive.platform_wire_budget_bytes == 9 * GIB);
     assert(qwen_adaptive.cache_envelope_bytes ==
            qwen_adaptive.safety_wire_budget_bytes);
-    assert(qwen_adaptive.cache_experts == floor.minimum_cache_experts);
-    assert(qwen_adaptive.cache_bytes == floor.minimum_cache_bytes);
+    assert(qwen_adaptive.cache_experts == 5441);
+    assert(qwen_adaptive.cache_bytes ==
+           UINT64_C(5441) * qwen_expert_bytes);
     assert(qwen_adaptive.cache_bytes <=
            qwen_adaptive.safety_wire_budget_bytes);
 
     /* Physical M1 Pro 16 GiB snapshot captured after the original Qwen AUTO
      * launch was rejected despite green pressure. With normal pressure, full
-     * bounded file-backed credit admits exactly the floor. The same page counts
-     * must fail closed when pressure is elevated because half-credit leaves the
-     * safe wire budget below 321 experts. */
+     * bounded file-backed credit admits three complete working-set cycles plus
+     * the safety slot. The same page counts must fail closed when pressure is
+     * elevated because half-credit leaves the safe budget below 321 experts. */
     const uint64_t darwin_page_bytes = UINT64_C(16384);
     qwen_memory = (ds4_ssd_host_memory){
         .physical_bytes = 16 * GIB,
@@ -363,7 +366,11 @@ int main(void) {
     assert(qwen_m1_normal.current_headroom_bytes == 5 * GIB / 2u);
     assert(qwen_m1_normal.current_wire_budget_bytes >=
            floor.minimum_cache_bytes);
-    assert(qwen_m1_normal.cache_experts == floor.minimum_cache_experts);
+    assert(qwen_m1_normal.low_ram_shared_static_headroom_active);
+    assert(!qwen_m1_normal.low_ram_floor_ceiling_active);
+    assert(qwen_m1_normal.cache_experts == 961);
+    assert(qwen_m1_normal.cache_bytes ==
+           UINT64_C(961) * qwen_expert_bytes);
 
     qwen_memory.pressure_normal = false;
     ds4_ssd_adaptive_cache_plan qwen_m1_elevated = {0};
@@ -415,6 +422,7 @@ int main(void) {
         qwen_max_cacheable,
         &qwen_adaptive));
     assert(!qwen_adaptive.low_ram_floor_ceiling_active);
+    assert(!qwen_adaptive.low_ram_shared_static_headroom_active);
     assert(qwen_adaptive.current_headroom_bytes == 4 * GIB);
     assert(qwen_adaptive.platform_headroom_bytes == 8 * GIB);
     assert(qwen_adaptive.cache_experts == qwen_max_cacheable);

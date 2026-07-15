@@ -112,6 +112,10 @@ typedef struct {
     uint64_t cache_envelope_bytes;
     uint64_t wire_budget_bytes;
     uint64_t cache_bytes;
+    /* Qwen <=16 GiB: pageable static weights share ordinary headroom and
+     * normal pressure permits full bounded file-inactive credit. */
+    bool low_ram_shared_static_headroom_active;
+    /* DeepSeek <=16 GiB: measured performance policy caps AUTO at its floor. */
     bool low_ram_floor_ceiling_active;
     uint32_t cache_experts;
 } ds4_ssd_adaptive_cache_plan;

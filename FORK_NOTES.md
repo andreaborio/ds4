@@ -15,7 +15,7 @@ equivalent implementation, this fork converges on it and removes the duplicate.
 > only acceptable speed regression is when an important correctness bug is fixed and it
 > requires some speed penalty."* Read every entry below against that rule.
 
-Ledger snapshot: fork Qwen promotion through `1fdfe08` (including the earlier
+Ledger snapshot: fork Qwen promotion through `ba2fb31` (including the earlier
 `1523b26` Metal lifecycle milestone), upstream `main` `80ebbc3`, audited
 2026-07-15.
 Commit links and live branch differences remain authoritative if this dated
@@ -40,7 +40,7 @@ snapshot drifts.
 | Expert prune/profile hooks (`aef72ee`) | default-off full expert rankings and CPU-router prune masks for domain analysis | **FORK EXPERIMENT** — research instrumentation, not a default inference feature. Reassess upstream fit only with a general diagnostic use case and neutral overhead. |
 | Mixed-precision routed-expert streaming (`fefa426`, later sync) | serve per-layer boosted expert quants under SSD streaming | **CONVERGED UPSTREAM** — the fork takes upstream's implementation after `5800f15`; no competing delta should be preserved. |
 | GLM 5.2 streaming line (branch `codex/glm52-upstream-clean-bench` = `bd89932` + 11 commits) | #520 fixes + #528 prepare + always-active ds4-native GLM GGUF layout support (`a0e234a`, the substrate every GLM number runs on) + a copy of the RAM guard + default-off experiments (router-ahead prefetch, prune/profile hooks, virtual resident decode layers, eviction tie-break) | **MIXED** — #520/#528 are open upstream; the RAM guard is tracked separately above. Keep the remaining experiments isolated while incomplete, but open upstream PRs for each piece that applies to the upstream GLM path after validation. Measured verification is in `SSD_STREAMING_VERIFICATION.md`. |
-| Qwen3.6-35B-A3B (`qwen35moe`, through `1fdfe08` plus the pending 16 GiB admission fix) | opt-in Metal path for one normalized text-only Q4_K_S artifact; AUTO resident/SSD admission, pressure-aware low-RAM floor, model-backed generation, server chat, and structural resident decode optimizations | **FORK MAIN; UPSTREAM ISSUE [#462](https://github.com/antirez/ds4/issues/462)** — keep the explicit environment guard and one-artifact contract. Reconcile with upstream's implementation before proposing reusable pieces. A physical M1 Pro 16 GiB smoke now starts at the 321-expert floor and completes two 64-token generations at 8.71/8.83 t/s with no new swapout; the full AC-powered cold/warm sustained gate remains open. Unsupported features remain fail-closed and documented. |
+| Qwen3.6-35B-A3B (`qwen35moe`, through `ba2fb31` plus the pending dynamic low-RAM cache fix) | opt-in Metal path for one normalized text-only Q4_K_S artifact; AUTO resident/SSD admission, pressure-sized low-RAM cache, model-backed generation, server chat, and structural resident decode optimizations | **FORK MAIN; UPSTREAM ISSUE [#462](https://github.com/antirez/ds4/issues/462)** — keep the explicit environment guard and one-artifact contract. Reconcile with upstream's implementation before proposing reusable pieces. A physical M1 Pro 16 GiB B/A/B selected 1,281 experts, averaged 9.63 t/s versus 8.66 t/s at 321 (+11.2%), and added no swapout; the full AC-powered cold/warm sustained gate remains open. Unsupported features remain fail-closed and documented. |
 
 ## Work not on `main`
 

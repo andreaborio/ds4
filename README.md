@@ -171,11 +171,12 @@ largest complete routing tier admitted by the current conservative snapshot.
 Above 16 GiB the planner independently reserves the 2.50 GiB static page set,
 context/runtime memory, and system headroom. On a 16 GiB Mac, AUTO keeps the
 complete static charge but lets those unpinned, pageable GGUF pages share system
-headroom. It admits only the 321-expert floor and gives bounded file-backed
-inactive pages full credit only while macOS reports normal pressure; unknown or
-elevated pressure retains half-credit and fails closed near the boundary.
-`--resident`
-fails unless both admission checks pass; because pressure can change after the
+headroom. It selects the largest complete 320-expert cache cycle admitted by
+the remaining live and platform budgets rather than imposing a fixed low-RAM
+floor. Bounded file-backed inactive pages receive full credit only while macOS
+reports normal pressure; unknown or elevated pressure retains half-credit and
+fails closed near the boundary. `--resident` fails unless both admission checks
+pass; because pressure can change after the
 snapshot, this is a conservative admission policy rather than a future-memory
 guarantee. `--ssd-streaming` remains the reproducible forced-streaming override.
 In SSD mode Qwen grows its Metal expert cache in 321-expert slabs (about
@@ -195,7 +196,7 @@ The hard SSD cache floor is 321 complete routed experts (about 0.53 GiB); 640
 per-layer path fail closed if the effective locked cache falls below the floor.
 The runtime has completed model-backed resident and SSD generation on an M5 Pro
 with 64 GiB, plus a bounded AUTO SSD smoke on a physical M1 Pro with 16 GiB.
-That small-Mac smoke completed two 32-prompt + 64-generation-token server turns
+That small-Mac path completed a cache-capacity B/A/B at 321 and 1,281 experts
 without new swapouts; it is not yet the preregistered cold/warm sustained gate.
 See
 [`tests/qwen/README.md`](tests/qwen/README.md) for the exact artifact contract,
@@ -238,6 +239,25 @@ This smoke used macOS 26.5 on battery at 38%. The first run followed model-file
 copy/hash activity and was not a controlled cold-page-cache measurement. Both
 requests returned the same 64 generated tokens. The lowest sampled
 `memory_pressure` availability was 50%, still normal.
+
+A follow-up on the same host removed the provisional Qwen floor-only ceiling
+and used the planner's complete safe budget. AUTO selected 1,281 experts
+(2.11 GiB) in both measured arms around an explicit 321-expert control, with
+two identical 32+64-token requests per arm:
+
+| B/A/B arm | Generation runs | Mean | Process RSS after two requests |
+| --- | ---: | ---: | ---: |
+| AUTO, 1,281 experts (B1) | 9.85 / 9.71 t/s | 9.78 t/s | 2.48 GiB |
+| Explicit control, 321 experts (A) | 8.45 / 8.87 t/s | 8.66 t/s | 0.86 GiB |
+| AUTO, 1,281 experts (B2) | 9.38 / 9.59 t/s | 9.49 t/s | 2.51 GiB |
+
+The four AUTO generations average 9.63 t/s, **11.2% above** the interleaved
+321-expert control. macOS pressure remained normal with at least 46% reported
+availability, swapout stayed exactly 2,010,466, and compared 321/1,281 outputs
+were byte-identical (SHA-256 `81a77f323f8fafb9d1e7d68038c198a54ed0948b5cc0ffdd2d66df7c78e0d3fd`).
+The comparison ran from a warm file cache on battery and is a cache-policy A/B,
+not a cold-device result; the second AUTO arm ended at 61% battery while
+discharging.
 
 The DeepSeek row compares upstream `80ebbc3` with fork `1523b26`, using an
 A/B/B/A order, 3,000 cached and preloaded experts, 128 prefill tokens, and 256

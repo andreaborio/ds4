@@ -346,12 +346,14 @@ static bool ds4_ssd_adaptive_cache_plan_make_policy(
         ds4_ssd_low_ram_cache_policy(memory->physical_bytes);
     const bool qwen_low_ram_policy =
         !apply_deepseek_tuning && low_ram_host;
-    out->low_ram_floor_ceiling_active = low_ram_host;
-    /* A 16 GiB host cannot retain Flash's complete static working set and a
-     * useful expert cache simultaneously.  The measured winner there is the
-     * minimum safe expert tier, with static tensors left pageable.  Larger
-     * hosts reserve the strict always-used static set before spending the
-     * remaining reclaimable memory on wired experts. */
+    out->low_ram_shared_static_headroom_active = qwen_low_ram_policy;
+    out->low_ram_floor_ceiling_active =
+        apply_deepseek_tuning && low_ram_host;
+    /* DeepSeek Flash's measured <=16 GiB policy leaves its complete static set
+     * pageable and later caps AUTO at the minimum expert tier. Strict Qwen
+     * retains the static charge on the same host class; the overlap with
+     * ordinary headroom is accounted for separately below. Larger hosts keep
+     * the strict static reserve independent of headroom. */
     const uint64_t static_reserve_bytes =
         apply_deepseek_tuning && low_ram_host ? 0 :
                                                 static_working_set_bytes;
@@ -490,10 +492,9 @@ static bool ds4_ssd_adaptive_cache_plan_make_policy(
     if (raw_experts < out->floor.minimum_cache_experts) return false;
 
     /* DeepSeek measurements on M1 16 GiB show that the second complete cache
-     * tier loses end-to-end time as page-cache displacement dominates.  Qwen
-     * uses the same low-RAM ceiling for a different safety reason: only the
-     * minimum wired tier was admitted by its normal-pressure policy.  AUTO
-     * therefore keeps both paths at their correctness floor on this host tier. */
+     * tier loses end-to-end time as page-cache displacement dominates. Keep
+     * that model-specific performance ceiling; Qwen instead consumes every
+     * complete tier admitted by the pressure and platform budgets above. */
     if (out->low_ram_floor_ceiling_active &&
         raw_experts > out->floor.minimum_cache_experts) {
         raw_experts = out->floor.minimum_cache_experts;

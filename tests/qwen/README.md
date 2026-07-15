@@ -290,9 +290,10 @@ selects SSD and no count or byte budget is supplied, the Qwen-specific strict
 planner charges the 2.50 GiB static page set, context/runtime,
 current-pressure margin, and Metal headroom. Above 16 GiB those reserves remain
 independent. On a 16 GiB Mac the unpinned static pages share ordinary headroom,
-AUTO is capped at the 321-expert floor, and bounded file-backed inactive pages
-receive full credit only under normal macOS pressure. Unknown or elevated
-pressure retains half-credit and fails closed near the boundary. Expert
+AUTO consumes the largest complete 320-expert cycle admitted by the live and
+platform budgets, and bounded file-backed inactive pages receive full credit
+only under normal macOS pressure. Unknown or elevated pressure retains
+half-credit and fails closed near the boundary. Expert
 slots are populated and locked lazily, but Metal cache storage is allocated in
 321-expert slabs (about 0.529 GiB), so the first route allocates one complete
 working set plus its safety slot and later routes grow storage incrementally.
@@ -424,9 +425,10 @@ Model-backed AUTO is pressure-dependent by design.  A 64 GiB Mac is not an
 unconditional resident tier: if other applications consume unified memory,
 AUTO can correctly choose SSD.  A physical 16 GiB machine is expected to use
 SSD for this 19.37 GiB tensor payload. AUTO caps that host tier at the safe
-321-expert floor and admits it only from a normal-pressure snapshot. A bounded
-physical M1 Pro 16 GiB server smoke is now recorded below; the full sustained
-cold/warm gate remains open.
+budget computed from a normal-pressure snapshot and rounds down to complete
+320-expert cycles; the selected count is pressure-dependent. A bounded physical
+M1 Pro 16 GiB server smoke is now recorded below; the full sustained cold/warm
+gate remains open.
 
 ### Physical M1 Pro 16 GiB admission smoke
 
@@ -453,6 +455,26 @@ swapout counter remained exactly 2,010,446 and reported swap use remained
 hash activity, so this is admission, generation, and no-new-swapout evidence,
 not a controlled cold-device benchmark or the complete preregistered sustained
 16 GiB gate.
+
+The first admission build above still capped Qwen AUTO at the floor despite its
+larger safe budget. A follow-up removed that model-specific cap while leaving
+the pressure reserves and DeepSeek's separately measured low-RAM ceiling
+unchanged. The same host then ran a warm-cache B/A/B, two identical 32+64-token
+requests per arm:
+
+| Arm | Cache | Generation runs | Mean | Process RSS |
+| --- | ---: | ---: | ---: | ---: |
+| B1 | AUTO 1,281 (2.11 GiB) | 9.85 / 9.71 t/s | 9.78 t/s | 2.48 GiB |
+| A | Explicit 321 (0.53 GiB) | 8.45 / 8.87 t/s | 8.66 t/s | 0.86 GiB |
+| B2 | AUTO 1,281 (2.11 GiB) | 9.38 / 9.59 t/s | 9.49 t/s | 2.51 GiB |
+
+The combined AUTO mean was 9.63 t/s, 11.2% above the control. Pressure stayed
+normal with at least 46% reported availability; swap use stayed at 387.62 MiB
+and the swapout counter remained exactly 2,010,466. One output from each cache
+size was byte-identical, SHA-256
+`81a77f323f8fafb9d1e7d68038c198a54ed0948b5cc0ffdd2d66df7c78e0d3fd`.
+This comparison was on battery with a warm file cache (61% and discharging at
+the end) and does not replace the preregistered cold/warm sustained gate.
 
 ### Reproduce the resident coding benchmark
 
