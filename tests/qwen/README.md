@@ -476,6 +476,33 @@ size was byte-identical, SHA-256
 This comparison was on battery with a warm file cache (61% and discharging at
 the end) and does not replace the preregistered cold/warm sustained gate.
 
+### Same-artifact llama.cpp comparison
+
+The official llama.cpp b10016 macOS arm64 release was tested with the same
+normalized GGUF. On the M1 Pro 16 GiB host, default Metal mmap/autofit did not
+complete its first `pp32` test before macOS entered elevated pressure; swapouts
+rose by 178,744 pages and swap use grew by about 2.61 GiB. Minimal scalar
+`pp1`/`tg4` attempts with all MoE layers on CPU and with a 4 GiB Metal fit
+margin also entered elevated pressure. They were stopped by the pressure
+watchdog, so no unsafe partial t/s value is reported.
+
+On the M5 Pro 64 GiB host, the full artifact fit and both runtimes stayed under
+normal pressure with zero new swapouts. Three page-touched DS4 resident runs
+measured a 218.30 t/s prefill median and 63.94 t/s generation median. Three
+llama.cpp CLI runs on the same 43-token rendered prompt measured 252.1 and
+60.3 t/s. DS4 was 13.4% slower in prefill, 6.0% faster in generation, and 4.0%
+faster by the derived complete 43+96-token time. The canonical rendered prompt
+produced the same exact 43 token IDs in both tokenizers, and both CLIs produced
+the same visible continuation through `return curr`.
+
+The official `llama-bench` reference measured median `pp43` 508.969 t/s,
+`tg96` 57.596 t/s, and combined `pp43+tg96` 80.032 t/s. Its synthetic prompt
+microbenchmark excludes real chat-template/final-logits/sampling work and is
+recorded separately rather than compared directly with DS4's sampled CLI
+prefill. Exact commands, all samples, memory evidence, and the 16 GiB failure
+probes are in
+[`../../docs/benchmarks/2026-07-15-qwen-ds4-vs-llamacpp.md`](../../docs/benchmarks/2026-07-15-qwen-ds4-vs-llamacpp.md).
+
 ### Reproduce the resident coding benchmark
 
 This is the resident counterpart of the bounded coding smoke below.  It uses

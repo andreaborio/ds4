@@ -209,8 +209,9 @@ or Strix Halo result until it is re-measured on that backend.
 
 ## Measured results
 
-Same machine, model, power state, and bounded workload; paired results are
-reported as geometric means rather than selecting the fastest run.
+Within each row, the machine, model, power state, and bounded workload are held
+constant. Paired A/B results use geometric means; standalone repeated runs
+state their median rather than selecting the fastest sample.
 
 | Experiment | Control | Fork / optimized | Difference | Verdict |
 | --- | ---: | ---: | ---: | --- |
@@ -219,6 +220,7 @@ reported as geometric means rather than selecting the fastest run.
 | GLM 5.2 decode in the same runs | 0.96 t/s | 0.91 t/s | -4.7% | No decode improvement |
 | Qwen3.6 resident decode, serial/parallel top-8 router | 37.00 t/s | **62.96 t/s** | **+70.2%** | Six-run balanced A/B; output hash identical |
 | Qwen3.6 resident end-to-end, quiet desktop | — | **223.73 prefill / 65.63 generation t/s** | — | Five-run median; zero process swaps |
+| Qwen3.6 resident CLI, llama.cpp b10016 / DS4 | 252.1 prefill / 60.3 generation t/s | 218.30 prefill / **63.94 generation t/s** | -13.4% prefill / **+6.0% generation; +4.0% aggregate** | Same 43-token rendered prompt and visible 96-token continuation; three-run medians, page-touched resident, zero swapouts |
 | Qwen3.6 server Thinking sampler, short context | 39.71 t/s | **58.59 t/s** | **+47.6%** | Full-vocabulary min-p A/B; 768 reference samples preserve token and RNG state |
 | Qwen3.6 full-attention decode, positions 1,428–1,628 | 36.18 t/s | **44.06 t/s** | **+21.8%** | Adjacent serial/parallel GQA A/B; output hash identical |
 | Qwen3.6 DSBox-like Thinking turn, positions 1,426–1,930 | — | **320.30 prefill / 41.04 generation t/s** | — | 504 generated tokens; 43.22→38.70 t/s across the growing prefix |
@@ -259,6 +261,14 @@ The comparison ran from a warm file cache on battery and is a cache-policy A/B,
 not a cold-device result; the second AUTO arm ended at 61% battery while
 discharging.
 
+The official llama.cpp b10016 runtime was then tried on the same 16 GiB host
+and GGUF. Default Metal mmap/autofit could not complete even the first `pp32`
+benchmark before elevated pressure; swap use grew by about 2.61 GiB. Scalar
+`pp1`/`tg4` probes with all MoE layers on CPU and with a 4 GiB Metal fit margin
+also entered elevated pressure and were stopped. mmap is file-backed demand
+paging, not an admission-controlled expert cache, so there is no safe
+llama.cpp t/s result to report for this artifact on that host.
+
 The DeepSeek row compares upstream `80ebbc3` with fork `1523b26`, using an
 A/B/B/A order, 3,000 cached and preloaded experts, 128 prefill tokens, and 256
 generated tokens. All four frontier-logit hashes are identical. The first
@@ -291,6 +301,8 @@ conditions, fallbacks, and oracle limits are in
 These are fresh development measurements, not a universal performance claim.
 The full conditions and limitations are recorded in
 [`docs/benchmarks/2026-07-14-m5-pro.md`](docs/benchmarks/2026-07-14-m5-pro.md);
+the cross-runtime Qwen comparison is in
+[`docs/benchmarks/2026-07-15-qwen-ds4-vs-llamacpp.md`](docs/benchmarks/2026-07-15-qwen-ds4-vs-llamacpp.md);
 the prior independent SSD campaign is in
 [`SSD_STREAMING_VERIFICATION.md`](SSD_STREAMING_VERIFICATION.md).
 
