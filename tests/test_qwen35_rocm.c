@@ -254,6 +254,105 @@ done:
     free(proj);free(ld);free(bt);free(st_ref);free(st_got);free(out_ref);free(out_got);free(q);free(k);free(v);
 }
 
+// Weight-based ops: the weight lives in the "model map".  Register a host
+// buffer as the map (UMA maps it device-side) and pass offset 0.
+static void test_conv_step(void) {
+    enum { NC = 200, K = 4 };
+    float in[NC], w[NC*K], st_ref[NC*(K-1)], st_got[NC*(K-1)], out_ref[NC], out_got[NC];
+    for (int i=0;i<NC;i++) in[i]=frand();
+    for (int i=0;i<NC*K;i++) w[i]=frand();
+    for (int i=0;i<NC*(K-1);i++) { st_ref[i]=frand(); st_got[i]=st_ref[i]; }
+    ds4_qwen_ref_causal_conv1d_silu_f32(out_ref, st_ref, in, w, 1, NC, K);
+    ds4_gpu_set_model_map(w, sizeof(w));
+    ds4_gpu_tensor *di=up_f32(in,NC), *dst=up_f32(st_got,NC*(K-1)), *dout=ds4_gpu_tensor_alloc(NC*4);
+    if (!ds4_gpu_qwen35_causal_conv_step_tensor(dout,dst,di,w,sizeof(w),0,NC,K)) { fprintf(stderr,"conv_step dispatch failed\n"); fails++; return; }
+    ds4_gpu_synchronize();
+    down_f32(dout,out_got,NC); down_f32(dst,st_got,NC*(K-1));
+    fails+=compare("conv_step.out",out_got,out_ref,NC,2e-6f);
+    fails+=compare("conv_step.state",st_got,st_ref,NC*(K-1),2e-6f);
+    ds4_gpu_tensor_free(di);ds4_gpu_tensor_free(dst);ds4_gpu_tensor_free(dout);
+}
+
+static void test_conv_sequence(void) {
+    enum { NT = 7, NC = 128, K = 4 };
+    float in[NT*NC], w[NC*K], st_ref[NC*(K-1)], st_got[NC*(K-1)], out_ref[NT*NC], out_got[NT*NC];
+    for (int i=0;i<NT*NC;i++) in[i]=frand();
+    for (int i=0;i<NC*K;i++) w[i]=frand();
+    for (int i=0;i<NC*(K-1);i++) { st_ref[i]=frand(); st_got[i]=st_ref[i]; }
+    ds4_qwen_ref_causal_conv1d_silu_f32(out_ref, st_ref, in, w, NT, NC, K);
+    ds4_gpu_set_model_map(w, sizeof(w));
+    ds4_gpu_tensor *di=up_f32(in,NT*NC), *dst=up_f32(st_got,NC*(K-1)), *dout=ds4_gpu_tensor_alloc(NT*NC*4);
+    if (!ds4_gpu_qwen35_causal_conv_sequence_tensor(dout,dst,di,w,sizeof(w),0,NT,NC,K)) { fprintf(stderr,"conv_seq dispatch failed\n"); fails++; return; }
+    ds4_gpu_synchronize();
+    down_f32(dout,out_got,NT*NC); down_f32(dst,st_got,NC*(K-1));
+    fails+=compare("conv_sequence.out",out_got,out_ref,NT*NC,2e-6f);
+    fails+=compare("conv_sequence.state",st_got,st_ref,NC*(K-1),2e-6f);
+    ds4_gpu_tensor_free(di);ds4_gpu_tensor_free(dst);ds4_gpu_tensor_free(dout);
+}
+
+static void test_rmsnorm_gated(void) {
+    enum { NV = 6, D = 200 };
+    float in[NV*D], gate[NV*D], w[D], ref[NV*D], got[NV*D];
+    for (int i=0;i<NV*D;i++){ in[i]=frand(); gate[i]=frand()*3.0f; }
+    for (int i=0;i<D;i++) w[i]=frand()*0.5f+1.0f;
+    ds4_qwen_ref_rmsnorm_gated_f32(ref, in, gate, w, NV, D, 1e-6f);
+    ds4_gpu_set_model_map(w, sizeof(w));
+    ds4_gpu_tensor *di=up_f32(in,NV*D), *dg=up_f32(gate,NV*D), *dout=ds4_gpu_tensor_alloc(NV*D*4);
+    if (!ds4_gpu_qwen35_rmsnorm_gated_tensor(dout,di,dg,w,sizeof(w),0,NV,D,1e-6f)) { fprintf(stderr,"rmsnorm_gated dispatch failed\n"); fails++; return; }
+    ds4_gpu_synchronize();
+    down_f32(dout,got,NV*D);
+    fails+=compare("rmsnorm_gated",got,ref,NV*D,5e-6f);
+    ds4_gpu_tensor_free(di);ds4_gpu_tensor_free(dg);ds4_gpu_tensor_free(dout);
+}
+
+static void test_gd_controls(void) {
+    enum { NT = 4, NVH = 32 };
+    float alpha[NT*NVH], betal[NT*NVH], ssm_a[NVH], dt_bias[NVH];
+    float ld_ref[NT*NVH], bt_ref[NT*NVH], ld_got[NT*NVH], bt_got[NT*NVH];
+    for (int i=0;i<NT*NVH;i++){ alpha[i]=frand()*2.0f; betal[i]=frand()*2.0f; }
+    for (int i=0;i<NVH;i++){ ssm_a[i]=-fabsf(frand())-0.1f; dt_bias[i]=frand()*0.5f; }
+    ds4_qwen_ref_gated_delta_controls_f32(ld_ref, bt_ref, alpha, betal, ssm_a, dt_bias, NT, NVH);
+    // Pack ssm_a and dt_bias into one model map.
+    float wbuf[2*NVH]; memcpy(wbuf, ssm_a, sizeof(ssm_a)); memcpy(wbuf+NVH, dt_bias, sizeof(dt_bias));
+    ds4_gpu_set_model_map(wbuf, sizeof(wbuf));
+    ds4_gpu_tensor *da=up_f32(alpha,NT*NVH), *db=up_f32(betal,NT*NVH);
+    ds4_gpu_tensor *dld=ds4_gpu_tensor_alloc(NT*NVH*4), *dbt=ds4_gpu_tensor_alloc(NT*NVH*4);
+    if (!ds4_gpu_qwen35_gated_delta_controls_batch_tensor(dld,dbt,da,db,wbuf,sizeof(wbuf),0,(uint64_t)NVH*4,NT,NVH)) { fprintf(stderr,"gd_controls dispatch failed\n"); fails++; return; }
+    ds4_gpu_synchronize();
+    down_f32(dld,ld_got,NT*NVH); down_f32(dbt,bt_got,NT*NVH);
+    fails+=compare("gd_controls.log_decay",ld_got,ld_ref,NT*NVH,5e-6f);
+    fails+=compare("gd_controls.beta",bt_got,bt_ref,NT*NVH,2e-6f);
+    ds4_gpu_tensor_free(da);ds4_gpu_tensor_free(db);ds4_gpu_tensor_free(dld);ds4_gpu_tensor_free(dbt);
+}
+
+static void test_embedding_q8_0(void) {
+    enum { NROW = 4, NEMBD = 64, NBLK = NEMBD/32 };
+    // Build a Q8_0 table: per 32-elem block = 2-byte f16 scale (=1.0) + 32 int8.
+    const uint16_t f16_one = 0x3C00u; // 1.0 in half
+    const size_t row_bytes = NBLK*34;
+    unsigned char table[NROW*NBLK*34];
+    float ref[NEMBD];
+    int8_t qv[NROW][NEMBD];
+    for (int r=0;r<NROW;r++)
+        for (int i=0;i<NEMBD;i++) qv[r][i] = (int8_t)((int)(frand()*100.0f));
+    for (int r=0;r<NROW;r++)
+        for (int b=0;b<NBLK;b++) {
+            unsigned char *blk = table + (r*NBLK + b)*34;
+            memcpy(blk, &f16_one, 2);
+            for (int i=0;i<32;i++) blk[2+i] = (unsigned char)qv[r][b*32+i];
+        }
+    const int row = 2;
+    for (int i=0;i<NEMBD;i++) ref[i] = 1.0f * (float)qv[row][i];
+    ds4_gpu_set_model_map(table, sizeof(table));
+    ds4_gpu_tensor *dout=ds4_gpu_tensor_alloc(NEMBD*4);
+    if (!ds4_gpu_qwen35_dequant_embedding_q8_0_tensor(dout,table,sizeof(table),0,row,NEMBD)) { fprintf(stderr,"embed dispatch failed\n"); fails++; return; }
+    ds4_gpu_synchronize();
+    float got[NEMBD]; down_f32(dout,got,NEMBD);
+    fails+=compare("embedding_q8_0",got,ref,NEMBD,2e-3f); // f16 scale exact here; int8->float exact
+    ds4_gpu_tensor_free(dout);
+    (void)row_bytes;
+}
+
 int main(void) {
     if (!ds4_gpu_init()) { fprintf(stderr, "ds4_gpu_init failed\n"); return 2; }
     test_split_q_gate();
@@ -266,6 +365,11 @@ int main(void) {
     test_gd_step(128);   // step_128 fast path
     test_gd_step(64);    // generic reduction path
     test_gd_sequence_128();
+    test_conv_step();
+    test_conv_sequence();
+    test_rmsnorm_gated();
+    test_gd_controls();
+    test_embedding_q8_0();
     ds4_gpu_cleanup();
     if (fails) { fprintf(stderr, "\n%d qwen35 ROCm parity check(s) FAILED\n", fails); return 1; }
     fprintf(stderr, "\nAll qwen35 ROCm parity checks passed\n");
