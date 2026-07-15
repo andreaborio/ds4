@@ -276,8 +276,10 @@ bool ds4_ssd_resident_pressure_plan_make(
      * macOS can reclaim that proxy aggressively while system pressure is
      * normal; elevated or unavailable pressure keeps the previous half-credit
      * fail-closed policy. Purgeable pages may overlap inactive queues, so take
-     * the larger pool instead of adding both. The SSD cache planner below stays
-     * on half-credit in every state because it wires new cache pages. */
+     * the larger pool instead of adding both. The SSD cache planner below
+     * normally stays on half-credit because it wires new cache pages; its
+     * bounded Qwen low-RAM path may take full credit only while pressure is
+     * explicitly normal and AUTO remains capped at the safe expert floor. */
     out->inactive_credit_bytes = out->pressure_normal ?
         bounded_inactive_bytes : bounded_inactive_bytes / 2u;
     const uint64_t reclaimable_working_set =
@@ -340,16 +342,19 @@ static bool ds4_ssd_adaptive_cache_plan_make_policy(
                                           &out->floor)) {
         return false;
     }
-    out->low_ram_floor_ceiling_active =
-        apply_deepseek_tuning &&
+    const bool low_ram_host =
         ds4_ssd_low_ram_cache_policy(memory->physical_bytes);
+    const bool qwen_low_ram_policy =
+        !apply_deepseek_tuning && low_ram_host;
+    out->low_ram_floor_ceiling_active = low_ram_host;
     /* A 16 GiB host cannot retain Flash's complete static working set and a
      * useful expert cache simultaneously.  The measured winner there is the
      * minimum safe expert tier, with static tensors left pageable.  Larger
      * hosts reserve the strict always-used static set before spending the
      * remaining reclaimable memory on wired experts. */
     const uint64_t static_reserve_bytes =
-        out->low_ram_floor_ceiling_active ? 0 : static_working_set_bytes;
+        apply_deepseek_tuning && low_ram_host ? 0 :
+                                                static_working_set_bytes;
     out->pageable_static_reserve_bytes =
         static_already_pinned ? 0 : static_reserve_bytes;
     out->platform_static_reserve_bytes = static_reserve_bytes;
@@ -357,10 +362,30 @@ static bool ds4_ssd_adaptive_cache_plan_make_policy(
     const uint64_t file_inactive_bytes =
         memory->inactive_bytes < memory->file_backed_bytes ?
             memory->inactive_bytes : memory->file_backed_bytes;
-    uint64_t reclaimable = saturating_add_u64(memory->free_bytes,
-                                               memory->purgeable_bytes);
-    reclaimable = saturating_add_u64(reclaimable,
-                                      file_inactive_bytes / 2u);
+    uint64_t reclaimable = 0;
+    if (qwen_low_ram_policy &&
+        memory->pressure_status_available && memory->pressure_normal) {
+        /* On a normal-pressure 16 GiB Mac the Qwen static set remains
+         * pageable, and wiring only the minimum expert tier is bounded.  Give
+         * the bounded file-backed inactive set full credit so a green system
+         * is not rejected merely because cached GGUF pages are counted as
+         * used.  Purgeable pages may overlap that set, so take max(), not a
+         * sum.  Missing or elevated pressure retains the half-credit policy
+         * below and therefore fails closed near this boundary. */
+        const uint64_t reclaimable_working_set =
+            memory->purgeable_bytes > file_inactive_bytes ?
+                memory->purgeable_bytes : file_inactive_bytes;
+        reclaimable = saturating_add_u64(memory->free_bytes,
+                                          reclaimable_working_set);
+    } else {
+        reclaimable = saturating_add_u64(memory->free_bytes,
+                                          memory->purgeable_bytes);
+        reclaimable = saturating_add_u64(reclaimable,
+                                          file_inactive_bytes / 2u);
+    }
+    if (reclaimable > memory->physical_bytes) {
+        reclaimable = memory->physical_bytes;
+    }
     out->reclaimable_bytes = reclaimable;
 
     const uint64_t two_gib = 2u * DS4_GIB;
@@ -369,14 +394,20 @@ static bool ds4_ssd_adaptive_cache_plan_make_policy(
     if (out->current_headroom_bytes < two_gib) {
         out->current_headroom_bytes = two_gib;
     }
-    if (apply_deepseek_tuning && static_already_pinned) {
+    /* DeepSeek's pageable static set already shares ordinary headroom.  The
+     * Qwen strict policy keeps the static charge independent on larger hosts,
+     * but on a 16 GiB host it must share headroom: the pages are not pinned and
+     * can be reclaimed by macOS while DS4 streams them again from the GGUF. */
+    const bool pageable_static_overlaps_headroom =
+        apply_deepseek_tuning || qwen_low_ram_policy;
+    if (pageable_static_overlaps_headroom && static_already_pinned) {
         /* The live snapshot has already fallen by the pinned bytes.  Preserve
          * the same pre-pin max(base, static) policy by charging only the
          * residual base slack not covered by that drop. */
         out->current_headroom_bytes =
             out->current_headroom_bytes > static_reserve_bytes ?
                 out->current_headroom_bytes - static_reserve_bytes : 0;
-    } else if (apply_deepseek_tuning &&
+    } else if (pageable_static_overlaps_headroom &&
                out->current_headroom_bytes <
                out->pageable_static_reserve_bytes) {
         out->current_headroom_bytes = out->pageable_static_reserve_bytes;
@@ -389,14 +420,14 @@ static bool ds4_ssd_adaptive_cache_plan_make_policy(
     if (out->platform_headroom_bytes < two_gib) {
         out->platform_headroom_bytes = two_gib;
     }
-    if (apply_deepseek_tuning && static_already_pinned) {
+    if (pageable_static_overlaps_headroom && static_already_pinned) {
         /* Pinned pages are irreversible pressure and therefore additive to
          * the ordinary platform slack.  Pageable static pages can instead
          * occupy that slack and remain reclaimable, so max() is sufficient. */
         out->platform_headroom_bytes = saturating_add_u64(
             out->platform_headroom_bytes,
             out->platform_static_reserve_bytes);
-    } else if (apply_deepseek_tuning &&
+    } else if (pageable_static_overlaps_headroom &&
                out->platform_headroom_bytes <
                out->platform_static_reserve_bytes) {
         out->platform_headroom_bytes = out->platform_static_reserve_bytes;
@@ -405,7 +436,7 @@ static bool ds4_ssd_adaptive_cache_plan_make_policy(
     uint64_t current_reserve =
         saturating_add_u64(out->current_headroom_bytes,
                            out->pressure_margin_bytes);
-    if (!apply_deepseek_tuning) {
+    if (!pageable_static_overlaps_headroom) {
         /* Qwen's strict bounded mode treats the mapped static page set as an
          * independent charge.  It is not allowed to consume the ordinary
          * host-pressure headroom that protects the rest of the system. */
@@ -425,7 +456,7 @@ static bool ds4_ssd_adaptive_cache_plan_make_policy(
 
     uint64_t platform_reserve =
         saturating_add_u64(runtime_bytes, out->platform_headroom_bytes);
-    if (!apply_deepseek_tuning) {
+    if (!pageable_static_overlaps_headroom) {
         platform_reserve = saturating_add_u64(
             platform_reserve,
             out->platform_static_reserve_bytes);
@@ -458,11 +489,11 @@ static bool ds4_ssd_adaptive_cache_plan_make_policy(
     if (raw_experts > UINT32_MAX) raw_experts = UINT32_MAX;
     if (raw_experts < out->floor.minimum_cache_experts) return false;
 
-    /* Measured M1 16 GiB runs show that the second complete cache tier loses
-     * end-to-end time despite reducing expert reads: page-cache displacement
-     * dominates.  AUTO therefore uses only the correctness floor on hosts of
-     * this size, while an explicit cache count remains available for controlled
-     * experiments. */
+    /* DeepSeek measurements on M1 16 GiB show that the second complete cache
+     * tier loses end-to-end time as page-cache displacement dominates.  Qwen
+     * uses the same low-RAM ceiling for a different safety reason: only the
+     * minimum wired tier was admitted by its normal-pressure policy.  AUTO
+     * therefore keeps both paths at their correctness floor on this host tier. */
     if (out->low_ram_floor_ceiling_active &&
         raw_experts > out->floor.minimum_cache_experts) {
         raw_experts = out->floor.minimum_cache_experts;

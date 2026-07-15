@@ -84,8 +84,9 @@ typedef struct {
     uint64_t purgeable_bytes;
     uint64_t inactive_bytes;
     uint64_t file_backed_bytes;
-    /* Darwin's current system pressure state. The resident planner may use a
-     * larger bounded inactive working-set credit while pressure is normal. */
+    /* Darwin's current system pressure state. The resident planner and the
+     * bounded Qwen low-RAM policy may use a larger inactive working-set credit
+     * while pressure is normal. */
     bool pressure_status_available;
     bool pressure_normal;
 } ds4_ssd_host_memory;
@@ -94,9 +95,9 @@ typedef struct {
     ds4_ssd_expert_cache_floor floor;
     uint64_t reclaimable_bytes;
     /* Pageable static weights compete with the wired expert cache for the
-     * same unified-memory budget.  On hosts above the low-RAM tier, AUTO
-     * preserves at least this much headroom unless those weights were already
-     * pinned and therefore visible in the live host-memory snapshot. */
+     * same unified-memory budget. AUTO preserves this charge unless the model
+     * policy explicitly lets pageable pages share ordinary system headroom or
+     * those weights were already pinned and visible in the live snapshot. */
     uint64_t pageable_static_reserve_bytes;
     /* recommendedMaxWorkingSetSize is a fixed platform limit, so pinned
      * static bytes remain charged here even though a post-pin current-memory

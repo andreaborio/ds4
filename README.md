@@ -167,9 +167,14 @@ DS4_QWEN_EXPERIMENTAL_METAL=1 ./ds4 \
 Qwen AUTO selects the full-model mapped Metal mode only when both the fixed Metal
 working-set budget and a point-in-time host-memory pressure check pass. Under
 pressure it falls back to SSD and lazily grows the routed-expert cache to the
-largest complete routing tier admitted by the current conservative snapshot,
-after independently reserving the 2.50 GiB
-static page set, context/runtime memory, and system headroom. `--resident`
+largest complete routing tier admitted by the current conservative snapshot.
+Above 16 GiB the planner independently reserves the 2.50 GiB static page set,
+context/runtime memory, and system headroom. On a 16 GiB Mac, AUTO keeps the
+complete static charge but lets those unpinned, pageable GGUF pages share system
+headroom. It admits only the 321-expert floor and gives bounded file-backed
+inactive pages full credit only while macOS reports normal pressure; unknown or
+elevated pressure retains half-credit and fails closed near the boundary.
+`--resident`
 fails unless both admission checks pass; because pressure can change after the
 snapshot, this is a conservative admission policy rather than a future-memory
 guarantee. `--ssd-streaming` remains the reproducible forced-streaming override.
@@ -189,9 +194,10 @@ The hard SSD cache floor is 321 complete routed experts (about 0.53 GiB); 640
 (about 1.06 GiB) is a useful controlled small-cache tier. Startup and the
 per-layer path fail closed if the effective locked cache falls below the floor.
 The runtime has completed model-backed resident and SSD generation on an M5 Pro
-with 64 GiB. A physical 16 GiB Mac has not yet been benchmarked, so no
-machine-specific 16 GiB speed or no-swap guarantee is claimed; AUTO still uses
-the same pressure-aware admission and safe SSD fallback on every Mac. See
+with 64 GiB, plus a bounded AUTO SSD smoke on a physical M1 Pro with 16 GiB.
+That small-Mac smoke completed two 32-prompt + 64-generation-token server turns
+without new swapouts; it is not yet the preregistered cold/warm sustained gate.
+See
 [`tests/qwen/README.md`](tests/qwen/README.md) for the exact artifact contract,
 reproducible evidence, and current limitations.
 
@@ -220,6 +226,18 @@ Test host: MacBook Pro M5 Pro, 64 GB unified memory, Metal, internal 1 TB SSD,
 AC power. DeepSeek used the 86.72 GB (80.76 GiB) IQ2XXS model; GLM used the
 244.14 GiB ds4-native model; Qwen used the normalized 19.37 GiB
 `Qwen3.6-35B-A3B-ds4-Q4_K_S.gguf` artifact in guarded resident AUTO mode.
+
+Physical small-Mac admission smoke, reported separately because it is neither a
+paired optimization A/B nor the same host/power state as the table above:
+
+| Host and mode | Workload | First run | Immediate repeat | Memory result |
+| --- | --- | ---: | ---: | --- |
+| M1 Pro 8-core, 16 GB, Metal AUTO→SSD, 321 experts | ctx 8,192; 32 prompt + 64 generated tokens | 4.17 prefill / **8.71 generation t/s** | 5.45 prefill / **8.83 generation t/s** | Normal pressure throughout; swapout counter and 395.31 MiB swap use unchanged |
+
+This smoke used macOS 26.5 on battery at 38%. The first run followed model-file
+copy/hash activity and was not a controlled cold-page-cache measurement. Both
+requests returned the same 64 generated tokens. The lowest sampled
+`memory_pressure` availability was 50%, still normal.
 
 The DeepSeek row compares upstream `80ebbc3` with fork `1523b26`, using an
 A/B/B/A order, 3,000 cached and preloaded experts, 128 prefill tokens, and 256

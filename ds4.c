@@ -31798,7 +31798,8 @@ static bool ds4_engine_configure_qwen35_metal_streaming(ds4_engine *e) {
                 "ds4: Qwen SSD cache planning requires a host-memory snapshot\n");
         return false;
     }
-    if (!ds4_ssd_adaptive_cache_plan_make_strict_with_static_reserve(
+    const bool auto_plan_ok =
+        ds4_ssd_adaptive_cache_plan_make_strict_with_static_reserve(
             &memory,
             e->residency_plan.runtime_bytes,
             static_page_coverage_bytes,
@@ -31807,7 +31808,24 @@ static bool ds4_engine_configure_qwen35_metal_streaming(ds4_engine *e) {
             QWEN35_N_EXPERT_USED,
             geometry.per_expert_bytes,
             geometry.max_cacheable_experts,
-            &auto_plan)) {
+            &auto_plan);
+    if (auto_plan.low_ram_floor_ceiling_active &&
+        auto_plan.pageable_static_reserve_bytes != 0) {
+        fprintf(stderr,
+                "ds4: Qwen SSD low-RAM preflight: pressure %s, reclaimable "
+                "%.2f GiB; pageable static/headroom reserve %.2f GiB + "
+                "margin %.2f GiB + runtime %.2f GiB; safe expert budget "
+                "%.2f GiB (floor %.2f GiB)\n",
+                !memory.pressure_status_available ? "unknown" :
+                    (memory.pressure_normal ? "normal" : "elevated"),
+                (double)auto_plan.reclaimable_bytes / 1073741824.0,
+                (double)auto_plan.current_headroom_bytes / 1073741824.0,
+                (double)auto_plan.pressure_margin_bytes / 1073741824.0,
+                (double)e->residency_plan.runtime_bytes / 1073741824.0,
+                (double)auto_plan.current_wire_budget_bytes / 1073741824.0,
+                (double)geometry.minimum_cache_bytes / 1073741824.0);
+    }
+    if (!auto_plan_ok) {
         fprintf(stderr,
                 "ds4: Qwen SSD cache cannot fit the static %.2f GiB set, "
                 "runtime, and safe %" PRIu64 "-expert floor under current "

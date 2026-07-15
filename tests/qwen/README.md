@@ -287,15 +287,17 @@ complete routes.  A smaller accepted cache emits an anti-thrashing warning.
 This is a benchmark tier, not the automatic production choice or a guarantee
 that 640 experts fit every machine under current memory pressure.  When AUTO
 selects SSD and no count or byte budget is supplied, the Qwen-specific strict
-planner independently charges the 2.50 GiB static page set, context/runtime,
-current-pressure margin, and Metal headroom, then chooses the largest complete
-320-expert cycle admitted by the conservative snapshot and planner.  Expert
+planner charges the 2.50 GiB static page set, context/runtime,
+current-pressure margin, and Metal headroom. Above 16 GiB those reserves remain
+independent. On a 16 GiB Mac the unpinned static pages share ordinary headroom,
+AUTO is capped at the 321-expert floor, and bounded file-backed inactive pages
+receive full credit only under normal macOS pressure. Unknown or elevated
+pressure retains half-credit and fails closed near the boundary. Expert
 slots are populated and locked lazily, but Metal cache storage is allocated in
 321-expert slabs (about 0.529 GiB), so the first route allocates one complete
 working set plus its safety slot and later routes grow storage incrementally.
 The planner charges the complete cache budget rather than only the currently
-populated slots.  The generic DeepSeek low-RAM floor-only tuning and its 4 GiB
-slab default are deliberately unchanged and are not applied to Qwen.
+populated slots. The generic DeepSeek 4 GiB slab default remains unchanged.
 
 ### AUTO and resident validation
 
@@ -421,9 +423,36 @@ change or further quantize dense model weights.
 Model-backed AUTO is pressure-dependent by design.  A 64 GiB Mac is not an
 unconditional resident tier: if other applications consume unified memory,
 AUTO can correctly choose SSD.  A physical 16 GiB machine is expected to use
-SSD for this 19.37 GiB tensor payload, but still receives the largest cache that
-fits the same safety accounting.  No physical 16 GiB throughput or no-swap
-result is claimed until that hardware is actually measured.
+SSD for this 19.37 GiB tensor payload. AUTO caps that host tier at the safe
+321-expert floor and admits it only from a normal-pressure snapshot. A bounded
+physical M1 Pro 16 GiB server smoke is now recorded below; the full sustained
+cold/warm gate remains open.
+
+### Physical M1 Pro 16 GiB admission smoke
+
+On 2026-07-15, the branch based on `1fdfe080ea63` was built natively on a
+MacBook Pro (`MacBookPro18,3`), Apple M1 Pro 8-core, 16 GiB, macOS 26.5
+(`25F71`). The machine was on battery at 38%. The normalized Q4_K_S artifact
+had the SHA-256 recorded below. The server used Metal AUTO, context 8,192,
+power 100, eight CPU threads, and the automatically capped 321-expert cache.
+
+The preflight reported 5.69 GiB reclaimable, a 2.50 GiB shared
+static/headroom reserve, 0.25 GiB pressure margin, 0.37 GiB runtime, and a
+2.56 GiB safe expert budget. AUTO resolved to SSD and readiness succeeded.
+Two identical non-thinking server requests contained 32 prompt tokens and
+reached the 64-token generation cap:
+
+| Run | Prefill | Generation | Total | Result |
+| --- | ---: | ---: | ---: | --- |
+| First | 4.17 t/s | 8.71 t/s | 15.025 s | 64 tokens |
+| Immediate repeat | 5.45 t/s | 8.83 t/s | 13.120 s | byte-identical content |
+
+macOS pressure remained normal; the lowest sampled availability was 50%. The
+swapout counter remained exactly 2,010,446 and reported swap use remained
+395.31 MiB before and after both requests. The first run followed model copy and
+hash activity, so this is admission, generation, and no-new-swapout evidence,
+not a controlled cold-device benchmark or the complete preregistered sustained
+16 GiB gate.
 
 ### Reproduce the resident coding benchmark
 
