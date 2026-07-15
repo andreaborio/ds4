@@ -4367,7 +4367,8 @@ static void test_think_tool_recovery(void) {
         free(piece);
         TEST_ASSERT(thinking.inside);
         rec = chat_think_tool_recovery(&srv, &text, &thinking, &scan_from,
-                                       &completion, 512, err, sizeof(err));
+                                       &completion, 512, false,
+                                       err, sizeof(err));
         TEST_ASSERT(rec >= 0);
         if (rec == 1) {
             triggered_at = i;
