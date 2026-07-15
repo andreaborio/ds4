@@ -1272,9 +1272,11 @@ extern "C" int ds4_gpu_qwen35_router_softmax_top8_tensor(
     return ds4_gpu_qwen35_router_softmax_top8_batch_tensor(selected, selected_weight, logits, 1u);
 }
 
-// Resident Qwen top-8 routed MoE: delegate to the existing ROCm Q4_K MoE core
-// as one top-8 pass into `out`.  The two-half/streaming machinery in the Metal
-// path is a residency optimization; resident ROCm needs only the single pass.
+// Resident Qwen top-8 routed MoE.  The shared ROCm Q4_K MoE core is specialized
+// for DeepSeek's top-6 (fused sum6 kernels); Qwen routes top-8.  Run it as two
+// independent 4-expert halves and add the partial outputs — the same split the
+// Metal resident/streaming paths use.  selected_half0/half1 are offset-0/16
+// views into selected_top8, so they already point at experts [0..3] and [4..7].
 extern "C" int ds4_gpu_qwen35_routed_moe_top8_tensor(
         ds4_gpu_tensor *out, ds4_gpu_tensor *partial0, ds4_gpu_tensor *partial1,
         ds4_gpu_tensor *gate, ds4_gpu_tensor *up, ds4_gpu_tensor *mid, ds4_gpu_tensor *experts,
@@ -1287,13 +1289,22 @@ extern "C" int ds4_gpu_qwen35_routed_moe_top8_tensor(
         const ds4_gpu_tensor *weights_half0, const ds4_gpu_tensor *weights_half1,
         uint32_t n_total_expert, float clamp, const ds4_gpu_tensor *x,
         uint32_t layer_index, bool trusted_gpu_route) {
-    (void)partial0; (void)partial1; (void)selected_half0; (void)selected_half1;
-    (void)weights_half0; (void)weights_half1; (void)trusted_gpu_route;
-    return ds4_gpu_routed_moe_one_tensor(
-        out, gate, up, mid, experts, model_map, model_size, gate_offset, up_offset, down_offset,
+    (void)selected_top8; (void)weights_top8; (void)trusted_gpu_route;
+    if (!partial0 || !partial1 || !selected_half0 || !selected_half1 ||
+        !weights_half0 || !weights_half1) return 0;
+    int ok = ds4_gpu_routed_moe_one_tensor(
+        partial0, gate, up, mid, experts, model_map, model_size, gate_offset, up_offset, down_offset,
         gate_type, down_type, gate_expert_bytes, gate_row_bytes, down_expert_bytes, down_row_bytes,
-        expert_in_dim, expert_mid_dim, out_dim, selected_top8, weights_top8,
-        n_total_expert, 8u, clamp, x, layer_index);
+        expert_in_dim, expert_mid_dim, out_dim, selected_half0, weights_half0,
+        n_total_expert, 4u, clamp, x, layer_index);
+    if (!ok) return 0;
+    ok = ds4_gpu_routed_moe_one_tensor(
+        partial1, gate, up, mid, experts, model_map, model_size, gate_offset, up_offset, down_offset,
+        gate_type, down_type, gate_expert_bytes, gate_row_bytes, down_expert_bytes, down_row_bytes,
+        expert_in_dim, expert_mid_dim, out_dim, selected_half1, weights_half1,
+        n_total_expert, 4u, clamp, x, layer_index);
+    if (!ok) return 0;
+    return ds4_gpu_add_tensor(out, partial0, partial1, out_dim);
 }
 
 // Profiling counters (stubs — resident route always takes the GPU path).
