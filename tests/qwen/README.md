@@ -379,11 +379,20 @@ is temperature 1, top-p 1, and min-p 0.05; the old full-vocabulary path called
 token.  The optimized sampler rejects logits conservatively below the relative
 min-p boundary before exponentiation, retains the exact eligible probabilities
 once, and samples them in the original vocabulary order.  A model-free
-reference gate covers three distributions and 128 seeds each: all 384 selected
-tokens and post-sample RNG states are identical to the prior algorithm.  On a
+reference gate covers six cases, including three temperatures around the min-p
+boundary, and 128 seeds each: all 768 selected tokens and post-sample RNG states
+are identical to the prior algorithm.  The logarithmic pre-screen keeps only a
+32-epsilon rounding guard; the former full-natural-log guard still evaluated
+thousands of probabilities that the exact min-p check could never retain on
+flat distributions.  On a
 31-token server prompt, two pre-change Thinking runs measured 39.55 and 39.86
 t/s; three post-change runs measured 59.01, 58.59, and 58.48 t/s.  The medians
-are 39.71 and 58.59 t/s, a 47.6% improvement.
+are 39.71 and 58.59 t/s, a 47.6% improvement.  After narrowing the guard, an
+active-desktop parity check measured 46.61 t/s without Thinking and 46.54 t/s
+with Thinking at short context; at a 1,403-token prefix the same pair measured
+33.03 and 33.19 t/s.  The lower absolute pair reflects shared compositor/Codex
+GPU load; the near-identical pairs show that full-vocabulary sampling no longer
+adds a material decode penalty.
 
 For context positions at or above 256, full-attention decode now uses a second
 structural optimization.  Eight SIMD groups scan independent cache slices,

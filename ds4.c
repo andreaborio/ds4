@@ -27858,11 +27858,17 @@ static int sample_full_vocab(
         const float min_rel = min_p > 0.0f ? min_p : 0.0f;
         /* min-p is relative to the maximum probability, so normalization
          * cancels and logits far below max can be rejected before expf().
-         * Keep a full natural-log unit as a conservative guard band; the
-         * authoritative expf comparison still handles every value near the
-         * cutoff.  Qwen's 248k vocabulary otherwise paid for two expf calls
-         * per token even though min-p normally retains only a small tail. */
-        const float log_screen = min_rel > 0.0f ? logf(min_rel) - 1.0f : -FLT_MAX;
+         * Keep a small rounding guard around the logarithmic cutoff; the
+         * authoritative expf comparison still handles every value near it.
+         * A whole natural-log unit of guard made flat Qwen distributions pay
+         * for thousands of expf() calls that were guaranteed to be rejected. */
+        float log_screen = -FLT_MAX;
+        if (min_rel > 0.0f) {
+            const float log_cutoff = logf(min_rel);
+            const float log_guard = 32.0f * FLT_EPSILON *
+                fmaxf(1.0f, fabsf(log_cutoff));
+            log_screen = log_cutoff - log_guard;
+        }
         for (uint32_t i = 0; i < n_vocab; i++) {
             const float v = logits[i];
             if (!isfinite(v)) continue;

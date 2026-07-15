@@ -13843,19 +13843,40 @@ static void test_min_p_sampling_fast_path_is_token_identical(void) {
     TEST_ASSERT(logits != NULL);
     if (!logits) return;
 
-    const float min_ps[] = {0.0f, 0.05f, 0.95f};
+    static const struct {
+        float temperature;
+        float min_p;
+        bool flat;
+        bool boundary;
+    } cases[] = {
+        {1.0f, 0.0f, false, false},
+        {1.0f, 0.05f, false, false},
+        {1.0f, 0.95f, true, false},
+        {0.2f, 0.05f, false, true},
+        {1.0f, 0.05f, false, true},
+        {1.8f, 0.05f, false, true},
+    };
     for (size_t scenario = 0;
-         scenario < sizeof(min_ps) / sizeof(min_ps[0]); scenario++) {
+         scenario < sizeof(cases) / sizeof(cases[0]); scenario++) {
         for (int i = 0; i < N; i++) {
-            if (scenario == 2) {
+            if (cases[scenario].flat) {
                 /* More than the local candidate capacity exercises the
                  * production overflow allocation without changing ties. */
                 logits[i] = 3.0f;
+            } else if (cases[scenario].boundary) {
+                float scaled = logf(cases[scenario].min_p);
+                const int steps = i % 129 - 64;
+                for (int step = 0; step < abs(steps); step++) {
+                    scaled = nextafterf(
+                        scaled, steps < 0 ? -FLT_MAX : FLT_MAX);
+                }
+                logits[i] = 5.0f + cases[scenario].temperature * scaled;
             } else {
                 const uint32_t mixed = (uint32_t)i * 2654435761u;
                 logits[i] = 5.0f - (float)(mixed % 12000u) * 0.001f;
             }
         }
+        if (cases[scenario].boundary) logits[0] = 5.0f;
         logits[17] = -1000.0f;
         logits[29] = -500.0f;
 
@@ -13863,9 +13884,11 @@ static void test_min_p_sampling_fast_path_is_token_identical(void) {
             uint64_t expected_rng = seed;
             uint64_t actual_rng = seed;
             const int expected = test_sample_min_p_reference(
-                logits, N, 1.0f, min_ps[scenario], &expected_rng);
+                logits, N, cases[scenario].temperature,
+                cases[scenario].min_p, &expected_rng);
             const int actual = ds4_sample_logits(
-                logits, N, 1.0f, 0, 1.0f, min_ps[scenario], &actual_rng);
+                logits, N, cases[scenario].temperature, 0, 1.0f,
+                cases[scenario].min_p, &actual_rng);
             TEST_ASSERT(actual == expected);
             TEST_ASSERT(actual_rng == expected_rng);
         }
