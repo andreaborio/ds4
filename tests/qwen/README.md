@@ -538,6 +538,16 @@ scratch allocation is included in the resident admission budget and the graph
 lifetime test.  `DS4_QWEN_DISABLE_RESIDENT_BATCH_PREFILL=1` selects the scalar
 fallback for differential diagnosis.
 
+For the production 256-expert, top-8 Q4 graph, resident batches larger than
+four tokens use the existing paired selected-expert matvec for gate and up.
+This avoids two separate routed passes while preserving the later activation
+and down projection. Quality mode, decode, and SSD streaming retain their
+previous paths. Set `DS4_QWEN_DISABLE_RESIDENT_PREFILL_PAIR_MV=1` to restore
+the separate resident gate/up dispatches without disabling the rest of batch
+prefill. The controlled M5 Pro A/B, numerical comparison, and physical 16 GiB
+SSD regression smoke are recorded in
+[`../../docs/benchmarks/2026-07-15-qwen-ds4-vs-llamacpp.md`](../../docs/benchmarks/2026-07-15-qwen-ds4-vs-llamacpp.md).
+
 With the model pages warm and memory pressure normal, three consecutive n96
 runs of the command above measured 170.29/30.40, 179.63/30.47, and
 175.77/30.32 t/s for prefill/generation: medians of 175.77 and 30.40 t/s.  An

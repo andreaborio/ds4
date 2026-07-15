@@ -27993,7 +27993,22 @@ int ds4_gpu_routed_moe_batch_tensor(
              getenv("DS4_METAL_Q4_TABLE_RESIDENCY_SET") != NULL ||
              q4_batch_table_queue_residency ||
              ds4_gpu_q4_table_model_residency_enabled());
+        /* Qwen resident prefill selects eight Q4 experts per token.  At the
+         * <=64-token graph cap the existing paired matvec reuses each input
+         * row and selected ID for gate/up, avoiding the two separate routed
+         * passes without changing the decode or SSD paths. */
+        const bool use_qwen_resident_prefill_pair_mv =
+            !g_quality_mode &&
+            !g_ssd_streaming_mode &&
+            getenv("DS4_QWEN_DISABLE_RESIDENT_PREFILL_PAIR_MV") == NULL &&
+            gate_type == DS4_METAL_TENSOR_Q4_K &&
+            down_type == DS4_METAL_TENSOR_Q4_K &&
+            n_total_expert == 256u &&
+            n_expert == 8u &&
+            n_tokens > 4u &&
+            g_moe_mul_mv_id_q4_k_pair_pipeline != nil;
         const bool use_mm_id =
+            !use_qwen_resident_prefill_pair_mv &&
             !use_q4_batch_expert_table &&
             !use_iq2_batch_selected_addr &&
             n_tokens >= 32u &&
@@ -28010,7 +28025,7 @@ int ds4_gpu_routed_moe_batch_tensor(
          */
         const bool use_tiny_pair_mv =
             !g_quality_mode &&
-            n_tokens <= 4u &&
+            (n_tokens <= 4u || use_qwen_resident_prefill_pair_mv) &&
             !use_q4_batch_expert_table &&
             !use_mm_id &&
             ((gate_type == DS4_METAL_TENSOR_IQ2_XXS && g_moe_mul_mv_id_iq2_xxs_pair_pipeline) ||
