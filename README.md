@@ -195,10 +195,10 @@ The hard SSD cache floor is 321 complete routed experts (about 0.53 GiB); 640
 (about 1.06 GiB) is a useful controlled small-cache tier. Startup and the
 per-layer path fail closed if the effective locked cache falls below the floor.
 The runtime has completed model-backed resident and SSD generation on an M5 Pro
-with 64 GiB, plus a bounded AUTO SSD smoke on a physical M1 Pro with 16 GiB.
-That small-Mac path completed a cache-capacity B/A/B at 321 and 1,281 experts
-without new swapouts; it is not yet the preregistered cold/warm sustained gate.
-See
+with 64 GiB, plus a bounded SSD smoke on a physical M1 Pro with 16 GiB. The
+latest small-Mac regression run used a conservative 321-expert cache, completed
+the 43+32-token request at 4.06/7.03 prefill/generation t/s, and added no
+swapouts; it is a compatibility check, not an SSD speed claim. See
 [`tests/qwen/README.md`](tests/qwen/README.md) for the exact artifact contract,
 reproducible evidence, and current limitations.
 
@@ -209,101 +209,38 @@ or Strix Halo result until it is re-measured on that backend.
 
 ## Measured results
 
-Within each row, the machine, model, power state, and bounded workload are held
-constant. Paired A/B results use geometric means; standalone repeated runs
-state their median rather than selecting the fastest sample.
+This table keeps only the latest retained model-backed result for each active
+line. Within each row, the machine, model, power state, and bounded workload are
+held constant.
 
 | Experiment | Control | Fork / optimized | Difference | Verdict |
 | --- | ---: | ---: | ---: | --- |
 | DeepSeek V4 Flash decode, direct upstream/fork A/B | 12.63 t/s | 12.58 t/s | -0.43% | Performance parity, not a speedup |
-| GLM 5.2 short-prompt prefill, indexed prepare off/on | 3.79 t/s | 9.15 t/s | **2.42×** | Isolated developer A/B; independently reproduced previously |
-| GLM 5.2 decode in the same runs | 0.96 t/s | 0.91 t/s | -4.7% | No decode improvement |
-| Qwen3.6 resident decode, serial/parallel top-8 router | 37.00 t/s | **62.96 t/s** | **+70.2%** | Six-run balanced A/B; output hash identical |
-| Qwen3.6 resident end-to-end, quiet desktop | — | **223.73 prefill / 65.63 generation t/s** | — | Five-run median; zero process swaps |
-| Qwen3.6 resident CLI, llama.cpp b10016 / DS4 | 252.1 prefill / 60.3 generation t/s | 218.30 prefill / **63.94 generation t/s** | -13.4% prefill / **+6.0% generation; +4.0% aggregate** | Same 43-token rendered prompt and visible 96-token continuation; three-run medians, page-touched resident, zero swapouts |
-| Qwen3.6 server Thinking sampler, short context | 39.71 t/s | **58.59 t/s** | **+47.6%** | Full-vocabulary min-p A/B; 768 reference samples preserve token and RNG state |
-| Qwen3.6 full-attention decode, positions 1,428–1,628 | 36.18 t/s | **44.06 t/s** | **+21.8%** | Adjacent serial/parallel GQA A/B; output hash identical |
-| Qwen3.6 DSBox-like Thinking turn, positions 1,426–1,930 | — | **320.30 prefill / 41.04 generation t/s** | — | 504 generated tokens; 43.22→38.70 t/s across the growing prefix |
+| GLM 5.2 short-prompt prefill, indexed prepare off/on | 3.79 t/s | 9.15 t/s | **2.42×** | Isolated developer A/B; no decode improvement |
+| Qwen3.6 resident prefill, separate/paired Q4 gate+up | 209.34 prefill / 58.71 generation t/s | **258.08 prefill** / 57.81 generation t/s | **+23.3% prefill** / -1.5% generation | Six-run interleaved A/B; the 0.90 t/s generation delta is noise, decode path unchanged, greedy output identical |
 
 Test host: MacBook Pro M5 Pro, 64 GB unified memory, Metal, internal 1 TB SSD,
 AC power. DeepSeek used the 86.72 GB (80.76 GiB) IQ2XXS model; GLM used the
 244.14 GiB ds4-native model; Qwen used the normalized 19.37 GiB
 `Qwen3.6-35B-A3B-ds4-Q4_K_S.gguf` artifact in guarded resident AUTO mode.
 
-Physical small-Mac admission smoke, reported separately because it is neither a
-paired optimization A/B nor the same host/power state as the table above:
-
-| Host and mode | Workload | First run | Immediate repeat | Memory result |
-| --- | --- | ---: | ---: | --- |
-| M1 Pro 8-core, 16 GB, Metal AUTO→SSD, 321 experts | ctx 8,192; 32 prompt + 64 generated tokens | 4.17 prefill / **8.71 generation t/s** | 5.45 prefill / **8.83 generation t/s** | Normal pressure throughout; swapout counter and 395.31 MiB swap use unchanged |
-
-This smoke used macOS 26.5 on battery at 38%. The first run followed model-file
-copy/hash activity and was not a controlled cold-page-cache measurement. Both
-requests returned the same 64 generated tokens. The lowest sampled
-`memory_pressure` availability was 50%, still normal.
-
-A follow-up on the same host removed the provisional Qwen floor-only ceiling
-and used the planner's complete safe budget. AUTO selected 1,281 experts
-(2.11 GiB) in both measured arms around an explicit 321-expert control, with
-two identical 32+64-token requests per arm:
-
-| B/A/B arm | Generation runs | Mean | Process RSS after two requests |
-| --- | ---: | ---: | ---: |
-| AUTO, 1,281 experts (B1) | 9.85 / 9.71 t/s | 9.78 t/s | 2.48 GiB |
-| Explicit control, 321 experts (A) | 8.45 / 8.87 t/s | 8.66 t/s | 0.86 GiB |
-| AUTO, 1,281 experts (B2) | 9.38 / 9.59 t/s | 9.49 t/s | 2.51 GiB |
-
-The four AUTO generations average 9.63 t/s, **11.2% above** the interleaved
-321-expert control. macOS pressure remained normal with at least 46% reported
-availability, swapout stayed exactly 2,010,466, and compared 321/1,281 outputs
-were byte-identical (SHA-256 `81a77f323f8fafb9d1e7d68038c198a54ed0948b5cc0ffdd2d66df7c78e0d3fd`).
-The comparison ran from a warm file cache on battery and is a cache-policy A/B,
-not a cold-device result; the second AUTO arm ended at 61% battery while
-discharging.
-
-The official llama.cpp b10016 runtime was then tried on the same 16 GiB host
-and GGUF. Default Metal mmap/autofit could not complete even the first `pp32`
-benchmark before elevated pressure; swap use grew by about 2.61 GiB. Scalar
-`pp1`/`tg4` probes with all MoE layers on CPU and with a 4 GiB Metal fit margin
-also entered elevated pressure and were stopped. mmap is file-backed demand
-paging, not an admission-controlled expert cache, so there is no safe
-llama.cpp t/s result to report for this artifact on that host.
-
-The DeepSeek row compares upstream `80ebbc3` with fork `1523b26`, using an
-A/B/B/A order, 3,000 cached and preloaded experts, 128 prefill tokens, and 256
-generated tokens. All four frontier-logit hashes are identical. The first
-upstream leg recorded 36 global swapout pages; the other three recorded zero.
-
-The GLM rows compare indexed-prefill preparation disabled and enabled on the
-same compatible `4eab362` fork build, using two clean repetitions per arm. The
-pure upstream GLM binary cannot load this ds4-native GGUF, so this is an isolated
-feature A/B, **not** a whole-binary fork/upstream comparison. All four retained
-outputs are byte-identical. One concurrent-load-contaminated run was discarded
-and rerun.
-
-The Qwen router row uses serial/parallel/parallel/serial/serial/parallel order
-on the same warm resident model. All six outputs share SHA-256
+The Qwen result is the final same-binary `A1/B1/B2/A2/A3/B3` comparison. All
+six outputs share SHA-256
 `a650b56ceb47dc8715f87c125c7eeab506bc4a510512cedbd190e38c46df5f33`.
-Five additional quiet-desktop runs measured a 65.63 t/s generation median and
-223.73 t/s prefill median; under active compositor and Codex GPU contention the
-same binary measured 50.20 t/s generation. These are achievable local results,
-not a guarantee under arbitrary interactive GPU load. The Thinking sampler
-screens the 248,077-token vocabulary before exponentiation, using a narrow
-rounding guard at the min-p boundary while preserving the reference token/RNG
-sequence. At long context, the parallel GQA kernel
-replaces per-cache-token threadgroup barriers with eight SIMD-local online
-softmax scans and one merge. The 200-token long-context A/B shares SHA-256
-`7111fd2b619195bd56b85b2d1baf3bb2b6aea377dea5d6da394e43a6b2c9bbf5`.
-Neither optimization changes or further quantizes model weights. Full commands,
-conditions, fallbacks, and oracle limits are in
-[`tests/qwen/README.md`](tests/qwen/README.md).
+It retained the same argmax and top-64 next-token set, and system swap use did
+not move. The earlier fixed llama.cpp b10016 CLI reference was 252.1 prefill and
+60.3 generation t/s. A mechanical comparison puts the latest DS4 at +2.4%
+prefill and -4.1% generation, but the runs were recorded in different sessions,
+so the defensible speedup claim remains the controlled **+23.3% over the
+previous DS4 dispatch**, with no decode-path change, rather than a cross-runtime
+win.
 
-These are fresh development measurements, not a universal performance claim.
-The full conditions and limitations are recorded in
+Full commands, all samples, numerical checks, the rejected fused prototype, and
+the latest physical 16 GiB SSD regression smoke are recorded in
+[`docs/benchmarks/2026-07-15-qwen-ds4-vs-llamacpp.md`](docs/benchmarks/2026-07-15-qwen-ds4-vs-llamacpp.md).
+Earlier development campaigns remain in
 [`docs/benchmarks/2026-07-14-m5-pro.md`](docs/benchmarks/2026-07-14-m5-pro.md);
-the cross-runtime Qwen comparison is in
-[`docs/benchmarks/2026-07-15-qwen-ds4-vs-llamacpp.md`](docs/benchmarks/2026-07-15-qwen-ds4-vs-llamacpp.md);
-the prior independent SSD campaign is in
+the independent SSD campaign is in
 [`SSD_STREAMING_VERIFICATION.md`](SSD_STREAMING_VERIFICATION.md).
 
 ## Memory safety is part of performance
