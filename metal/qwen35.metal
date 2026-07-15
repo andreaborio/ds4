@@ -1432,6 +1432,160 @@ kernel void kernel_qwen35_gqa_decode_f32(
     }
 }
 
+// Long-context decode variant.  The scalar-token kernel above uses the whole
+// threadgroup for one K dot product and therefore crosses three threadgroup
+// barriers for every cached token.  Here each SIMD group scans an independent
+// strided slice of the cache, retaining its query and partial softmax output in
+// registers.  One final threadgroup reduction merges the independently stable
+// online-softmax states.  Qwen's 256-wide head maps to eight values per lane on
+// Apple GPU SIMD32, so eight cache tokens advance concurrently with no barrier
+// inside the context loop.
+//
+// Dispatch requirements:
+//   grid = n_query_head threadgroups
+//   threads_per_threadgroup >= head_dim
+//   scratch = n_simdgroup * (head_dim + 2) + 1 floats
+kernel void kernel_qwen35_gqa_decode_parallel_f32(
+        constant ds4_metal_args_qwen35_gqa_decode &args [[buffer(0)]],
+        device const char *query       [[buffer(1)]],
+        device const char *key_cache   [[buffer(2)]],
+        device const char *value_cache [[buffer(3)]],
+        device       char *output      [[buffer(4)]],
+        threadgroup float *scratch     [[threadgroup(0)]],
+        uint3 group [[threadgroup_position_in_grid]],
+        ushort3 thread_pos [[thread_position_in_threadgroup]],
+        ushort lane [[thread_index_in_simdgroup]],
+        ushort simdgroup [[simdgroup_index_in_threadgroup]],
+        ushort simd_width [[threads_per_simdgroup]],
+        ushort3 threads [[threads_per_threadgroup]]) {
+    constexpr uint max_dims_per_lane = 8u;
+    const uint query_head = group.x;
+    const uint tid = thread_pos.x;
+    if (query_head >= args.n_query_head || args.n_kv == 0u ||
+        args.n_kv_head == 0u || args.head_dim == 0u ||
+        args.n_query_head % args.n_kv_head != 0u ||
+        threads.x < args.head_dim || simd_width == 0u) {
+        return;
+    }
+
+    const uint n_simdgroup =
+        (threads.x + simd_width - 1u) / simd_width;
+    const uint dims_per_lane =
+        (args.head_dim + simd_width - 1u) / simd_width;
+    if (n_simdgroup == 0u || n_simdgroup > simd_width ||
+        dims_per_lane > max_dims_per_lane) {
+        return;
+    }
+
+    const uint query_per_kv = args.n_query_head / args.n_kv_head;
+    const uint kv_head = query_head / query_per_kv;
+    const uint64_t query_base =
+        (uint64_t)query_head * args.query_head_stride;
+    const uint64_t output_base =
+        (uint64_t)query_head * args.output_head_stride;
+    const float scale = 1.0f / sqrt((float)args.head_dim);
+
+    float query_lane[max_dims_per_lane];
+    float accumulator[max_dims_per_lane];
+    for (uint j = 0u; j < max_dims_per_lane; j++) {
+        const uint dim = (uint)lane + j * (uint)simd_width;
+        query_lane[j] = dim < args.head_dim
+            ? qwen35_metal_load_f32(
+                  query,
+                  query_base + (uint64_t)dim * args.query_dim_stride)
+            : 0.0f;
+        accumulator[j] = 0.0f;
+    }
+
+    float local_max = -INFINITY;
+    float local_sum = 0.0f;
+    for (uint token = (uint)simdgroup;
+         token < args.n_kv;
+         token += n_simdgroup) {
+        const uint64_t key_base =
+            (uint64_t)token * args.key_token_stride +
+            (uint64_t)kv_head * args.key_head_stride;
+        float dot_product = 0.0f;
+        for (uint j = 0u; j < max_dims_per_lane; j++) {
+            const uint dim = (uint)lane + j * (uint)simd_width;
+            if (dim < args.head_dim) {
+                dot_product += query_lane[j] * qwen35_metal_load_f32(
+                    key_cache,
+                    key_base + (uint64_t)dim * args.key_dim_stride);
+            }
+        }
+        const float score = simd_sum(dot_product) * scale;
+        const float next_max = max(local_max, score);
+        const float previous_factor = exp(local_max - next_max);
+        const float current_factor = exp(score - next_max);
+        local_sum = local_sum * previous_factor + current_factor;
+
+        const uint64_t value_base =
+            (uint64_t)token * args.value_token_stride +
+            (uint64_t)kv_head * args.value_head_stride;
+        for (uint j = 0u; j < max_dims_per_lane; j++) {
+            const uint dim = (uint)lane + j * (uint)simd_width;
+            if (dim < args.head_dim) {
+                accumulator[j] =
+                    accumulator[j] * previous_factor +
+                    qwen35_metal_load_f32(
+                        value_cache,
+                        value_base +
+                            (uint64_t)dim * args.value_dim_stride) *
+                        current_factor;
+            }
+        }
+        local_max = next_max;
+    }
+
+    const uint partial_values = n_simdgroup * args.head_dim;
+    const uint max_base = partial_values;
+    const uint sum_base = max_base + n_simdgroup;
+    const uint denominator_index = sum_base + n_simdgroup;
+    for (uint j = 0u; j < max_dims_per_lane; j++) {
+        const uint dim = (uint)lane + j * (uint)simd_width;
+        if (dim < args.head_dim) {
+            scratch[(uint)simdgroup * args.head_dim + dim] = accumulator[j];
+        }
+    }
+    if (lane == 0u) {
+        scratch[max_base + (uint)simdgroup] = local_max;
+        scratch[sum_base + (uint)simdgroup] = local_sum;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (simdgroup == 0u) {
+        const float partial_max = lane < n_simdgroup
+            ? scratch[max_base + (uint)lane]
+            : -INFINITY;
+        const float merged_max = simd_max(partial_max);
+        const float merge_scale = lane < n_simdgroup
+            ? exp(partial_max - merged_max)
+            : 0.0f;
+        const float partial_sum = lane < n_simdgroup
+            ? scratch[sum_base + (uint)lane] * merge_scale
+            : 0.0f;
+        const float denominator = simd_sum(partial_sum);
+        if (lane < n_simdgroup) {
+            scratch[max_base + (uint)lane] = merge_scale;
+        }
+        if (lane == 0u) scratch[denominator_index] = denominator;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (tid < args.head_dim) {
+        float numerator = 0.0f;
+        for (uint part = 0u; part < n_simdgroup; part++) {
+            numerator += scratch[part * args.head_dim + tid] *
+                         scratch[max_base + part];
+        }
+        qwen35_metal_store_f32(
+            output,
+            output_base + (uint64_t)tid * args.output_dim_stride,
+            numerator / scratch[denominator_index]);
+    }
+}
+
 // Layer-major causal GQA for a prompt chunk.  K/V rows for the complete chunk
 // are written to the persistent cache before this dispatch; each query group
 // limits its online-softmax scan to position0 + query_token + 1, so future

@@ -13779,6 +13779,100 @@ static void test_request_defaults_use_min_p_filtering(void) {
     request_free(&r);
 }
 
+static uint64_t test_sampling_rng_next(uint64_t *state) {
+    uint64_t x = *state;
+    if (x == 0) x = 0x9e3779b97f4a7c15ULL;
+    x ^= x >> 12;
+    x ^= x << 25;
+    x ^= x >> 27;
+    *state = x;
+    return x * 0x2545f4914f6cdd1dULL;
+}
+
+static float test_sampling_rng_f32(uint64_t *state) {
+    const uint64_t x = test_sampling_rng_next(state);
+    return (float)((x >> 40) & 0xffffffu) / 16777216.0f;
+}
+
+/* Reference for the original full-vocabulary top-p=1 min-p sampler.  Keep it
+ * deliberately allocation-free and slow: this test protects token and RNG
+ * equivalence while the production path screens logits before expf(). */
+static int test_sample_min_p_reference(const float *logits, uint32_t n_vocab,
+                                       float temperature, float min_p,
+                                       uint64_t *rng) {
+    float max_logit = -1.0e30f;
+    int best = 0;
+    uint32_t finite = 0;
+    for (uint32_t i = 0; i < n_vocab; i++) {
+        const float v = logits[i];
+        if (!isfinite(v)) continue;
+        finite++;
+        if (v > max_logit) {
+            max_logit = v;
+            best = (int)i;
+        }
+    }
+    if (finite == 0) return best;
+
+    const float min_rel = min_p > 0.0f ? min_p : 0.0f;
+    float sum = 0.0f;
+    for (uint32_t i = 0; i < n_vocab; i++) {
+        const float v = logits[i];
+        if (!isfinite(v)) continue;
+        const float p = expf((v - max_logit) / temperature);
+        if (p < min_rel) continue;
+        sum += p;
+    }
+    if (sum <= 0.0f || !isfinite(sum)) return best;
+
+    float r = test_sampling_rng_f32(rng) * sum;
+    for (uint32_t i = 0; i < n_vocab; i++) {
+        const float v = logits[i];
+        if (!isfinite(v)) continue;
+        const float p = expf((v - max_logit) / temperature);
+        if (p < min_rel) continue;
+        r -= p;
+        if (r <= 0.0f) return (int)i;
+    }
+    return best;
+}
+
+static void test_min_p_sampling_fast_path_is_token_identical(void) {
+    enum { N = 4096 };
+    float *logits = malloc((size_t)N * sizeof(*logits));
+    TEST_ASSERT(logits != NULL);
+    if (!logits) return;
+
+    const float min_ps[] = {0.0f, 0.05f, 0.95f};
+    for (size_t scenario = 0;
+         scenario < sizeof(min_ps) / sizeof(min_ps[0]); scenario++) {
+        for (int i = 0; i < N; i++) {
+            if (scenario == 2) {
+                /* More than the local candidate capacity exercises the
+                 * production overflow allocation without changing ties. */
+                logits[i] = 3.0f;
+            } else {
+                const uint32_t mixed = (uint32_t)i * 2654435761u;
+                logits[i] = 5.0f - (float)(mixed % 12000u) * 0.001f;
+            }
+        }
+        logits[17] = -1000.0f;
+        logits[29] = -500.0f;
+
+        for (uint64_t seed = 0; seed < 128; seed++) {
+            uint64_t expected_rng = seed;
+            uint64_t actual_rng = seed;
+            const int expected = test_sample_min_p_reference(
+                logits, N, 1.0f, min_ps[scenario], &expected_rng);
+            const int actual = ds4_sample_logits(
+                logits, N, 1.0f, 0, 1.0f, min_ps[scenario], &actual_rng);
+            TEST_ASSERT(actual == expected);
+            TEST_ASSERT(actual_rng == expected_rng);
+        }
+    }
+    free(logits);
+}
+
 static void test_reasoning_effort_mapping(void) {
     ds4_think_mode mode = DS4_THINK_NONE;
     TEST_ASSERT(parse_reasoning_effort_name("low", &mode) && mode == DS4_THINK_HIGH);
@@ -16634,6 +16728,7 @@ static void ds4_server_unit_tests_run(void) {
     test_qwen_chat_ir_rejects_unsupported_protocol_shapes();
     test_message_content_flags_preserve_legacy_flattening();
     test_request_defaults_use_min_p_filtering();
+    test_min_p_sampling_fast_path_is_token_identical();
     test_reasoning_effort_mapping();
     test_api_thinking_controls_parse();
     test_render_think_max_prompt_prefix();

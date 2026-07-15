@@ -21639,8 +21639,21 @@ int ds4_gpu_qwen35_gqa_decode_tensor(
     }
 
     @autoreleasepool {
-        id<MTLComputePipelineState> pipeline =
-            ds4_gpu_get_pipeline("kernel_qwen35_gqa_decode_f32");
+        bool parallel_gqa =
+            n_kv >= 256u &&
+            getenv("DS4_QWEN_DISABLE_PARALLEL_GQA_DECODE") == NULL;
+        id<MTLComputePipelineState> pipeline = ds4_gpu_get_pipeline(
+            parallel_gqa
+                ? "kernel_qwen35_gqa_decode_parallel_f32"
+                : "kernel_qwen35_gqa_decode_f32");
+        NSUInteger width = pipeline ? pipeline.threadExecutionWidth : 0u;
+        if (parallel_gqa &&
+            (width == 0u ||
+             ((NSUInteger)head_dim + width - 1u) / width > 8u)) {
+            parallel_gqa = false;
+            pipeline = ds4_gpu_get_pipeline("kernel_qwen35_gqa_decode_f32");
+            width = pipeline ? pipeline.threadExecutionWidth : 0u;
+        }
         id<MTLBuffer> query_buf = ds4_gpu_tensor_buffer(query);
         id<MTLBuffer> key_buf = ds4_gpu_tensor_buffer(key_cache);
         id<MTLBuffer> value_buf = ds4_gpu_tensor_buffer(value_cache);
@@ -21654,7 +21667,6 @@ int ds4_gpu_qwen35_gqa_decode_tensor(
             return 0;
         }
 
-        const NSUInteger width = pipeline.threadExecutionWidth;
         if (width == 0 || head_dim > NSUIntegerMax - (width - 1u)) return 0;
         const NSUInteger preferred =
             (((NSUInteger)head_dim + width - 1u) / width) * width;
@@ -21662,6 +21674,13 @@ int ds4_gpu_qwen35_gqa_decode_tensor(
         const NSUInteger nth =
             ds4_gpu_qwen35_reduction_threads(pipeline, preferred, &nsg);
         if (nth < head_dim || nth != preferred) return 0;
+        if (parallel_gqa &&
+            nsg > (NSUIntegerMax - 1u) / ((NSUInteger)head_dim + 2u)) {
+            return 0;
+        }
+        const NSUInteger scratch_f32 = parallel_gqa
+            ? nsg * ((NSUInteger)head_dim + 2u) + 1u
+            : nsg + 4u;
         const uint64_t head_bytes = (uint64_t)head_dim * sizeof(float);
         const uint64_t token_bytes = (uint64_t)n_kv_head * head_bytes;
         ds4_gpu_qwen35_gqa_decode_args args = {
@@ -21693,11 +21712,14 @@ int ds4_gpu_qwen35_gqa_decode_tensor(
         [enc setBuffer:value_buf offset:ds4_gpu_tensor_offset(value_cache) atIndex:3];
         [enc setBuffer:out_buf offset:ds4_gpu_tensor_offset(out) atIndex:4];
         [enc setThreadgroupMemoryLength:
-             ds4_gpu_qwen35_threadgroup_f32_bytes(nsg + 4u) atIndex:0];
+             ds4_gpu_qwen35_threadgroup_f32_bytes(scratch_f32) atIndex:0];
         [enc dispatchThreadgroups:MTLSizeMake(n_query_head, 1, 1)
              threadsPerThreadgroup:MTLSizeMake(nth, 1, 1)];
         ds4_gpu_end_compute_encoder(cb, enc);
-        if (!ds4_gpu_finish_command_buffer(cb, owned, "Qwen GQA")) return 0;
+        if (!ds4_gpu_finish_command_buffer(
+                cb, owned, parallel_gqa ? "Qwen parallel GQA" : "Qwen GQA")) {
+            return 0;
+        }
     }
     return 1;
 }

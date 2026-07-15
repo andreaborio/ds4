@@ -211,6 +211,9 @@ reported as geometric means rather than selecting the fastest run.
 | GLM 5.2 decode in the same runs | 0.96 t/s | 0.91 t/s | -4.7% | No decode improvement |
 | Qwen3.6 resident decode, serial/parallel top-8 router | 37.00 t/s | **62.96 t/s** | **+70.2%** | Six-run balanced A/B; output hash identical |
 | Qwen3.6 resident end-to-end, quiet desktop | — | **223.73 prefill / 65.63 generation t/s** | — | Five-run median; zero process swaps |
+| Qwen3.6 server Thinking sampler, short context | 39.71 t/s | **58.59 t/s** | **+47.6%** | Full-vocabulary min-p A/B; 384 reference samples preserve token and RNG state |
+| Qwen3.6 full-attention decode, positions 1,428–1,628 | 36.18 t/s | **44.06 t/s** | **+21.8%** | Adjacent serial/parallel GQA A/B; output hash identical |
+| Qwen3.6 DSBox-like Thinking turn, positions 1,426–1,930 | — | **320.30 prefill / 41.04 generation t/s** | — | 504 generated tokens; 43.22→38.70 t/s across the growing prefix |
 
 Test host: MacBook Pro M5 Pro, 64 GB unified memory, Metal, internal 1 TB SSD,
 AC power. DeepSeek used the 86.72 GB (80.76 GiB) IQ2XXS model; GLM used the
@@ -235,8 +238,15 @@ on the same warm resident model. All six outputs share SHA-256
 Five additional quiet-desktop runs measured a 65.63 t/s generation median and
 223.73 t/s prefill median; under active compositor and Codex GPU contention the
 same binary measured 50.20 t/s generation. These are achievable local results,
-not a guarantee under arbitrary interactive GPU load. Full commands and raw
-conditions are in [`tests/qwen/README.md`](tests/qwen/README.md).
+not a guarantee under arbitrary interactive GPU load. The Thinking sampler
+screens the 248,077-token vocabulary before exponentiation while preserving
+the reference token/RNG sequence. At long context, the parallel GQA kernel
+replaces per-cache-token threadgroup barriers with eight SIMD-local online
+softmax scans and one merge. The 200-token long-context A/B shares SHA-256
+`7111fd2b619195bd56b85b2d1baf3bb2b6aea377dea5d6da394e43a6b2c9bbf5`.
+Neither optimization changes or further quantizes model weights. Full commands,
+conditions, fallbacks, and oracle limits are in
+[`tests/qwen/README.md`](tests/qwen/README.md).
 
 These are fresh development measurements, not a universal performance claim.
 The full conditions and limitations are recorded in

@@ -27850,25 +27850,47 @@ static int sample_full_vocab(
     if (finite == 0) return sample_argmax(logits, n_vocab);
 
     if (top_p >= 1.0f) {
+        enum { LOCAL_CANDIDATES = 256 };
+        sample_candidate local[LOCAL_CANDIDATES];
+        sample_candidate *cand = local;
+        uint32_t n = 0;
         float sum = 0.0f;
         const float min_rel = min_p > 0.0f ? min_p : 0.0f;
+        /* min-p is relative to the maximum probability, so normalization
+         * cancels and logits far below max can be rejected before expf().
+         * Keep a full natural-log unit as a conservative guard band; the
+         * authoritative expf comparison still handles every value near the
+         * cutoff.  Qwen's 248k vocabulary otherwise paid for two expf calls
+         * per token even though min-p normally retains only a small tail. */
+        const float log_screen = min_rel > 0.0f ? logf(min_rel) - 1.0f : -FLT_MAX;
         for (uint32_t i = 0; i < n_vocab; i++) {
             const float v = logits[i];
             if (!isfinite(v)) continue;
-            const float p = expf((v - max_logit) / temperature);
+            const float scaled = (v - max_logit) / temperature;
+            if (scaled < log_screen) continue;
+            const float p = expf(scaled);
             if (p < min_rel) continue;
+            if (n == LOCAL_CANDIDATES && cand == local) {
+                cand = xmalloc((size_t)finite * sizeof(cand[0]));
+                memcpy(cand, local, sizeof(local));
+            }
+            cand[n++] = (sample_candidate){.id = (int)i, .prob = p};
             sum += p;
         }
-        if (sum <= 0.0f || !isfinite(sum)) return best;
-        float r = sample_rng_f32(rng) * sum;
-        for (uint32_t i = 0; i < n_vocab; i++) {
-            const float v = logits[i];
-            if (!isfinite(v)) continue;
-            const float p = expf((v - max_logit) / temperature);
-            if (p < min_rel) continue;
-            r -= p;
-            if (r <= 0.0f) return (int)i;
+        if (sum <= 0.0f || !isfinite(sum) || n == 0) {
+            if (cand != local) free(cand);
+            return best;
         }
+        float r = sample_rng_f32(rng) * sum;
+        for (uint32_t i = 0; i < n; i++) {
+            r -= cand[i].prob;
+            if (r <= 0.0f) {
+                const int id = cand[i].id;
+                if (cand != local) free(cand);
+                return id;
+            }
+        }
+        if (cand != local) free(cand);
         return best;
     }
 

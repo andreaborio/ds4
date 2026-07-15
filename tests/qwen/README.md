@@ -373,6 +373,42 @@ against 63.09 t/s for the two standard matvecs (+0.36%), with fully overlapping
 ranges.  That result is below run-to-run noise and does not justify another
 kernel.  Neither experiment changes or further quantizes any model weights.
 
+Thinking mode exposed a separate server-side cost.  Its fixed sampling policy
+is temperature 1, top-p 1, and min-p 0.05; the old full-vocabulary path called
+`expf()` twice across all 248,077 selectable Qwen tokens for every generated
+token.  The optimized sampler rejects logits conservatively below the relative
+min-p boundary before exponentiation, retains the exact eligible probabilities
+once, and samples them in the original vocabulary order.  A model-free
+reference gate covers three distributions and 128 seeds each: all 384 selected
+tokens and post-sample RNG states are identical to the prior algorithm.  On a
+31-token server prompt, two pre-change Thinking runs measured 39.55 and 39.86
+t/s; three post-change runs measured 59.01, 58.59, and 58.48 t/s.  The medians
+are 39.71 and 58.59 t/s, a 47.6% improvement.
+
+For context positions at or above 256, full-attention decode now uses a second
+structural optimization.  Eight SIMD groups scan independent cache slices,
+keep their query and stable online-softmax accumulators in registers, then
+merge the eight partial states once per query head.  This removes three
+threadgroup barriers per cached token from the former serial-context kernel.
+`DS4_QWEN_DISABLE_PARALLEL_GQA_DECODE=1` restores that kernel for controlled
+diagnosis.  The standalone Metal oracle covers cache frontiers 1, 7, 257,
+1,025, and 4,097; maximum absolute error is 8.39e-5 at the longest frontier,
+and K/V/query guard regions remain unchanged.
+
+A model-backed adjacent A/B used the same 1,428-token prompt, 200-token greedy
+generation, and warm resident model.  Serial and parallel prefill measured
+320.44 and 321.79 t/s respectively, making the host/GPU state comparable;
+decode measured 36.18 and 44.06 t/s, a 21.8% improvement.  Both responses have
+SHA-256
+`7111fd2b619195bd56b85b2d1baf3bb2b6aea377dea5d6da394e43a6b2c9bbf5`.
+A DSBox-like Thinking request spanning positions 1,426 through 1,930 measured
+320.30 prefill and 41.04 generation t/s; its 50-token decode windows declined
+gradually from 43.22 to 38.70 t/s as the attention prefix grew.  The complete
+504-token response has SHA-256
+`868c9de51f2154ccd092768aa1a112fd5660140fb8174a2b0eef2cba03fe94d8`.
+These changes optimize sampling and attention scheduling only; they do not
+change or further quantize dense model weights.
+
 Model-backed AUTO is pressure-dependent by design.  A 64 GiB Mac is not an
 unconditional resident tier: if other applications consume unified memory,
 AUTO can correctly choose SSD.  A physical 16 GiB machine is expected to use

@@ -822,7 +822,7 @@ static bool test_gqa_decode(
         N_QUERY_HEAD = 16,
         N_KV_HEAD = 2,
         HEAD_DIM = 256,
-        MAX_KV = 7,
+        MAX_KV = 4097,
         QUERY_DIM_STRIDE = 4,
         QUERY_HEAD_STRIDE = (HEAD_DIM + 3) * QUERY_DIM_STRIDE,
         KEY_DIM_STRIDE = 4,
@@ -937,34 +937,60 @@ static bool test_gqa_decode(
         .output_head_stride = OUTPUT_HEAD_STRIDE,
         .output_dim_stride = OUTPUT_DIM_STRIDE,
     };
-    static const uint32_t frontiers[] = {1, 3, MAX_KV};
+    static const uint32_t serial_frontiers[] = {1, 3, 7};
+    static const uint32_t parallel_frontiers[] = {1, 7, 257, 1025, MAX_KV};
     bool ok = true;
-    for (size_t run = 0; run < sizeof(frontiers) / sizeof(frontiers[0]); run++) {
-        args.n_kv = frontiers[run];
-        memset(output.contents, 0x5a, output_bytes);
-        if (!cpu_gqa_reference(
-                expected, query_host, key_host, value_host, &args) ||
-            !dispatch_kernel(
-                device, queue, library, @"kernel_qwen35_gqa_decode_f32",
-                &args, sizeof(args),
-                @[query, key_cache, value_cache, output], @[],
-                N_QUERY_HEAD, HEAD_DIM, true, 1, 4)) {
-            ok = false;
-            break;
-        }
+    for (int variant = 0; variant < 2 && ok; variant++) {
+        const uint32_t *frontiers = variant == 0
+            ? serial_frontiers : parallel_frontiers;
+        const size_t frontier_count = variant == 0
+            ? sizeof(serial_frontiers) / sizeof(serial_frontiers[0])
+            : sizeof(parallel_frontiers) / sizeof(parallel_frontiers[0]);
+        NSString *kernel = variant == 0
+            ? @"kernel_qwen35_gqa_decode_f32"
+            : @"kernel_qwen35_gqa_decode_parallel_f32";
+        const NSUInteger scratch_planes = variant == 0 ? 1u : HEAD_DIM + 2u;
+        const NSUInteger scratch_extra = variant == 0 ? 4u : 1u;
+        for (size_t run = 0; run < frontier_count; run++) {
+            args.n_kv = frontiers[run];
+            memset(output.contents, 0x5a, output_bytes);
+            if (!cpu_gqa_reference(
+                    expected, query_host, key_host, value_host, &args) ||
+                !dispatch_kernel(
+                    device, queue, library, kernel,
+                    &args, sizeof(args),
+                    @[query, key_cache, value_cache, output], @[],
+                    N_QUERY_HEAD, HEAD_DIM, true,
+                    scratch_planes, scratch_extra)) {
+                ok = false;
+                break;
+            }
 
-        const uint8_t *output_data = output.contents;
-        for (uint32_t head = 0; head < N_QUERY_HEAD; head++) {
-            for (uint32_t dim = 0; dim < HEAD_DIM; dim++) {
-                const size_t offset =
+            const uint8_t *output_data = output.contents;
+            for (uint32_t head = 0; head < N_QUERY_HEAD; head++) {
+                for (uint32_t dim = 0; dim < HEAD_DIM; dim++) {
+                    const size_t offset =
+                        (size_t)head * OUTPUT_HEAD_STRIDE +
+                        (size_t)dim * OUTPUT_DIM_STRIDE;
+                    actual[(size_t)head * HEAD_DIM + dim] =
+                        host_load_f32(output_data, offset);
+                    for (size_t padding = sizeof(float);
+                         padding < OUTPUT_DIM_STRIDE; padding++) {
+                        if (output_data[offset + padding] != 0x5au) {
+                            fprintf(stderr, "GQA output padding overwritten\n");
+                            ok = false;
+                            break;
+                        }
+                    }
+                    if (!ok) break;
+                }
+                if (!ok) break;
+                const size_t tail =
                     (size_t)head * OUTPUT_HEAD_STRIDE +
-                    (size_t)dim * OUTPUT_DIM_STRIDE;
-                actual[(size_t)head * HEAD_DIM + dim] =
-                    host_load_f32(output_data, offset);
-                for (size_t padding = sizeof(float);
-                     padding < OUTPUT_DIM_STRIDE; padding++) {
-                    if (output_data[offset + padding] != 0x5au) {
-                        fprintf(stderr, "GQA output padding overwritten\n");
+                    (size_t)HEAD_DIM * OUTPUT_DIM_STRIDE;
+                for (size_t padding = 0; padding < 16u; padding++) {
+                    if (output_data[tail + padding] != 0x5au) {
+                        fprintf(stderr, "GQA output head padding overwritten\n");
                         ok = false;
                         break;
                     }
@@ -972,33 +998,21 @@ static bool test_gqa_decode(
                 if (!ok) break;
             }
             if (!ok) break;
-            const size_t tail =
-                (size_t)head * OUTPUT_HEAD_STRIDE +
-                (size_t)HEAD_DIM * OUTPUT_DIM_STRIDE;
-            for (size_t padding = 0; padding < 16u; padding++) {
-                if (output_data[tail + padding] != 0x5au) {
-                    fprintf(stderr, "GQA output head padding overwritten\n");
-                    ok = false;
-                    break;
-                }
+            char label[80];
+            snprintf(label, sizeof(label), "%s GQA cache frontier %u",
+                     variant == 0 ? "serial" : "parallel", frontiers[run]);
+            if (!check_f32(label, actual, expected,
+                           N_QUERY_HEAD * HEAD_DIM, 2.0e-4f, 2.0e-4f)) {
+                ok = false;
+                break;
             }
-            if (!ok) break;
-        }
-        if (!ok) break;
-        char label[64];
-        snprintf(label, sizeof(label), "GQA cache frontier %u",
-                 frontiers[run]);
-        if (!check_f32(label, actual, expected,
-                       N_QUERY_HEAD * HEAD_DIM, 2.0e-4f, 2.0e-4f)) {
-            ok = false;
-            break;
-        }
-        if (memcmp(query.contents, query_host, query_bytes) != 0 ||
-            memcmp(key_cache.contents, key_snapshot, key_bytes) != 0 ||
-            memcmp(value_cache.contents, value_snapshot, value_bytes) != 0) {
-            fprintf(stderr, "GQA mutated a read-only input/cache\n");
-            ok = false;
-            break;
+            if (memcmp(query.contents, query_host, query_bytes) != 0 ||
+                memcmp(key_cache.contents, key_snapshot, key_bytes) != 0 ||
+                memcmp(value_cache.contents, value_snapshot, value_bytes) != 0) {
+                fprintf(stderr, "GQA mutated a read-only input/cache\n");
+                ok = false;
+                break;
+            }
         }
     }
 
@@ -1326,6 +1340,12 @@ int main(int argc, const char *argv[]) {
         }
 
         printf("Qwen Metal fixture on %s\n", device.name.UTF8String);
+        if (getenv("DS4_TEST_QWEN_GQA_ONLY") != NULL) {
+            const bool ok = test_gqa_decode(device, queue, library);
+            if (!ok) return 1;
+            puts("Qwen Metal GQA fixtures passed");
+            return 0;
+        }
         const bool ok =
             test_router_softmax_top8(device, queue, library) &&
             test_embedding_q8_0(device, queue, library) &&
