@@ -101,6 +101,80 @@ table, so it must not be presented as a direct 508.969-versus-218.30 DS4
 comparison. The combined and actual CLI rows are the more useful local-use
 numbers.
 
+## M5 Pro resident-prefill follow-up: paired Q4 gate/up
+
+The production resident path was profiled on the same 43-token request before
+changing its dispatch policy. The prompt is submitted as one Metal command
+buffer and waits only after the complete graph. Its GPU duration was
+209.238 ms versus about 212.65 ms of measured prefill wall time, so another
+CPU queue or synchronization change was not the useful target. One chunk
+contains 1,143 compute dispatches and 20 blits. Representative routed-MoE
+stages took 2.649 ms in a Gated DeltaNet layer and 3.619 ms in a full-attention
+layer, while causal convolution, the recurrent DeltaNet stage, and GQA took
+0.136, 0.405, and 0.284 ms respectively in the same trace.
+
+Inside the routed MoE, the Q4 gate and up projections were separate selected-
+expert passes of about 0.9 ms each. The resident Qwen geometry can instead
+reuse the existing paired Q4 selected-expert matvec: it loads each activation
+row and selected expert ID once for both projections. The dispatch policy now
+selects that kernel only when all of the following hold:
+
+- quality mode and SSD streaming are off;
+- gate and down tensors are Q4_K;
+- the graph has 256 routed experts, top-8 selection, and more than four tokens;
+- the already existing paired-Q4 pipeline is available.
+
+No shader or model format changed. Decode remains on the one-token path, SSD
+streaming cannot select the new branch, and
+`DS4_QWEN_DISABLE_RESIDENT_PREFILL_PAIR_MV=1` restores the previous resident
+dispatch for differential tests.
+
+The final clean binary was tested in `A1/B1/B2/A2/A3/B3` order, where A set the
+fallback variable and B used the new default. The machine was active during
+this follow-up, so the controlled same-session delta is more useful than the
+absolute rate or a comparison with the cleaner baseline above.
+
+| Path | Prefill samples | Generation samples | Median prefill | Median generation |
+| --- | --- | --- | ---: | ---: |
+| Previous resident dispatch (A) | 212.93 / 208.46 / 209.34 | 58.51 / 58.85 / 58.71 | 209.34 t/s | 58.71 t/s |
+| Paired Q4 gate/up (B) | 253.81 / 263.21 / 258.08 | 57.73 / 59.00 / 57.81 | **258.08 t/s** | 57.81 t/s |
+
+The resident-prefill median improved by **23.3%**. The 0.90 t/s generation
+difference is within observed run noise, and the changed condition is false
+for decode. All six visible continuations were byte-identical with SHA-256
+`a650b56ceb47dc8715f87c125c7eeab506bc4a510512cedbd190e38c46df5f33`.
+Global swap use remained exactly 114.94 MiB, every process reported zero
+swaps, and no benchmark process remained afterward.
+
+The final next-token comparison against the fallback retained the same
+argmax token, 20/20 top-20 overlap, 64/64 top-64 overlap, 98/100 top-100
+overlap, cosine similarity 0.999253315635, RMSE 0.080182463, and maximum
+absolute difference 0.410542610 over the 248,077 valid vocabulary entries.
+Those values match the established resident batch-versus-scalar tolerance
+(RMSE 0.07970 and maximum 0.40870 for this prompt).
+
+Two scope checks were retained. A 28-token prompt improved by 5.0%, and a
+136-token prompt spanning three chunks improved by 5.1%; the canonical
+43-token request improved by 24.7% in that sweep. A second prototype fused
+SwiGLU into the paired projection, but its complete-run median was 254.11 t/s
+versus 255.51 t/s for pair-only. That roughly 1 t/s difference is noise and
+did not justify the extra kernel wiring, so the fused prototype was removed.
+
+### Physical 16 GiB SSD regression smoke
+
+The final source was also copied to an isolated directory and built natively
+on the connected M1 Pro 16 GiB host. DSBox reported `runtime: idle` before and
+after the run, and no existing `ds4` process was touched. The canonical prompt
+was run with forced SSD streaming, a conservative 321-expert cache, context
+160, and a 32-token generation cap. It completed at 4.06 t/s prefill and
+7.03 t/s generation. System-wide free memory started at 80%, reached a minimum
+of 55%, and recovered to 76%; the global swapout counter did not move and swap
+use decreased from 1,740.25 to 1,732.19 MiB. The sampled process RSS peaked at
+about 678 MiB, DSBox remained idle, and no `ds4` process remained.
+
+This is a no-regression smoke, not an SSD speed claim: the paired resident
+branch is explicitly false in SSD mode, whose prefill remains scalar.
+
 ## M1 Pro, 16 GiB: bounded streaming versus mmap pressure
 
 The second host was a physical MacBook Pro with an Apple M1 Pro 8-core,
