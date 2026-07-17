@@ -209,39 +209,62 @@ or Strix Halo result until it is re-measured on that backend.
 
 ## Measured results
 
-This table keeps only the latest retained model-backed result for each active
-line. Within each row, the machine, model, power state, and bounded workload are
-held constant.
+These are indicative local measurements, not a leaderboard. Do not compare rows
+unless the row explicitly says it is a paired A/B: model, quantization, context,
+cache policy, prompt shape, runtime branch, and host all change the number.
+Paired A/B rows use geometric means or medians from the recorded runs rather
+than the single fastest sample.
 
-| Experiment | Control | Fork / optimized | Difference | Verdict |
-| --- | ---: | ---: | ---: | --- |
-| DeepSeek V4 Flash decode, direct upstream/fork A/B | 12.63 t/s | 12.58 t/s | -0.43% | Performance parity, not a speedup |
-| GLM 5.2 short-prompt prefill, indexed prepare off/on | 3.79 t/s | 9.15 t/s | **2.42×** | Isolated developer A/B; no decode improvement |
-| Qwen3.6 resident prefill, separate/paired Q4 gate+up | 209.34 prefill / 58.71 generation t/s | **258.08 prefill** / 57.81 generation t/s | **+23.3% prefill** / -1.5% generation | Six-run interleaved A/B; the 0.90 t/s generation delta is noise, decode path unchanged, greedy output identical |
+| Model / artifact | Host | Mode and workload | Prefill | Generation / decode | What the number means |
+| --- | --- | --- | ---: | ---: | --- |
+| DeepSeek V4 Flash IQ2XXS, 86.72 GB | M5 Pro, 64 GB, Metal, internal SSD, AC | SSD streaming; 128 prompt + 256 generated tokens; 3,000 cached and preloaded experts | 20.75 t/s | 12.58 t/s | Fork `1523b26` is performance-neutral versus upstream `80ebbc3` at 12.63 t/s decode |
+| DeepSeek V4 Flash IQ2XXS, 86.72 GB | M5 Pro, 64 GB, Metal, internal SSD, AC | AUTO SSD streaming; DSBox API turn, 22-23 prompt + 64 generated tokens | — | 9.88 / 12.86 t/s | End-to-end app-server shape, not a `ds4-bench` microbenchmark |
+| DeepSeek V4 Flash IQ2XXS, 86.72 GB | M1 Pro, 16 GB, Metal | SSD streaming, 259 experts, 8,192 context, tiny DSBox API turn | — | 0.30 t/s cold; ~0.52 t/s warm | Experimental low-memory floor; useful proof of admission, not a speed target |
+| Qwen3.6-35B-A3B Q4_K_S, 20.81 GB file / 19.37 GiB tensor payload | M5 Pro, 64 GB, Metal, AC, resident | Same-binary Qwen resident prefill A/B, separate vs paired Q4 gate/up dispatch | 209.34 -> 258.08 t/s | 58.71 -> 57.81 t/s | Controlled +23.3% prefill improvement; generation delta is noise, decode path unchanged, greedy output identical |
+| Qwen3.6-35B-A3B Q4_K_S | M5 Pro, 64 GB, Metal, AC, resident | Earlier page-touched CLI reference; 43 prompt + 96 generated tokens | 218.30 t/s | 63.94 t/s | Same rendered prompt and visible continuation as the llama.cpp b10016 reference; useful context, not the headline A/B |
+| Qwen3.6-35B-A3B Q4_K_S | M1 Pro 8-core, 16 GB, Metal AUTO to SSD | Latest conservative 321-expert SSD regression smoke; 43 prompt + 32 generated tokens | 4.06 t/s | 7.03 t/s | Compatibility check under normal pressure with no new swapouts, not a 16 GB speed claim |
+| GLM 5.2 ds4-native GGUF, 244.14 GiB | M5 Pro, 64 GB, Metal, internal SSD, AC | SSD streaming; 288 prompt + 16 generated tokens; indexed-prefill prepare off/on | 3.79 -> 9.15 t/s | 0.96 -> 0.91 t/s | Isolated feature A/B: large prefill win, no decode win; not a fork-vs-upstream binary comparison |
 
-Test host: MacBook Pro M5 Pro, 64 GB unified memory, Metal, internal 1 TB SSD,
-AC power. DeepSeek used the 86.72 GB (80.76 GiB) IQ2XXS model; GLM used the
-244.14 GiB ds4-native model; Qwen used the normalized 19.37 GiB
-`Qwen3.6-35B-A3B-ds4-Q4_K_S.gguf` artifact in guarded resident AUTO mode.
+DeepSeek hardware reference rows from the standard `speed-bench` harness are
+reported separately because they use the normal `promessi_sposi.txt` sweep
+rather than the development prompts above:
 
-The Qwen result is the final same-binary `A1/B1/B2/A2/A3/B3` comparison. All
-six outputs share SHA-256
-`a650b56ceb47dc8715f87c125c7eeab506bc4a510512cedbd190e38c46df5f33`.
-It retained the same argmax and top-64 next-token set, and system swap use did
-not move. The earlier fixed llama.cpp b10016 CLI reference was 252.1 prefill and
-60.3 generation t/s. A mechanical comparison puts the latest DS4 at +2.4%
-prefill and -4.1% generation, but the runs were recorded in different sessions,
-so the defensible speedup claim remains the controlled **+23.3% over the
-previous DS4 dispatch**, with no decode-path change, rather than a cross-runtime
-win.
+| Host | Model | Context / workload | Prefill | Generation |
+| --- | --- | --- | ---: | ---: |
+| MacBook Pro M3 Max, 128 GB | DeepSeek V4 Flash q2 | short | 58.52 t/s | 26.68 t/s |
+| MacBook Pro M3 Max, 128 GB | DeepSeek V4 Flash q2 | 11,709 tokens | 250.11 t/s | 21.47 t/s |
+| MacBook Pro M5 Max, 128 GB | DeepSeek V4 Flash q2 | short | 87.25 t/s | 34.27 t/s |
+| MacBook Pro M5 Max, 128 GB | DeepSeek V4 Flash q2 | 11,707 tokens | 463.44 t/s | 25.90 t/s |
+| Mac Studio M3 Ultra, 512 GB | DeepSeek V4 Flash q2 | 11,709 tokens | 468.03 t/s | 27.39 t/s |
+| Mac Studio M3 Ultra, 512 GB | DeepSeek V4 Flash q4 | 12,018 tokens | 448.82 t/s | 26.62 t/s |
+| Mac Studio M3 Ultra, 512 GB | DeepSeek V4 PRO q2 | 32,768 tokens | 138.82 t/s | 9.56 t/s |
+| DGX Spark GB10, 128 GB | DeepSeek V4 Flash q2 | 7,047 tokens | 343.81 t/s | 13.75 t/s |
 
-Full commands, all samples, numerical checks, the rejected fused prototype, and
-the latest physical 16 GiB SSD regression smoke are recorded in
+The DeepSeek fork/upstream row above compares upstream `80ebbc3` with fork
+`1523b26`, using an A/B/B/A order, 3,000 cached and preloaded experts, 128
+prefill tokens, and 256 generated tokens. All four frontier-logit hashes are
+identical. The first upstream leg recorded 36 global swapout pages; the other
+three recorded zero.
+
+The GLM rows compare indexed-prefill preparation disabled and enabled on the
+same compatible `4eab362` fork build, using two clean repetitions per arm. The
+pure upstream GLM binary cannot load this ds4-native GGUF, so this is an isolated
+feature A/B. All four retained outputs are byte-identical. One concurrent-load
+contaminated run was discarded and rerun.
+
+The Qwen rows cover one normalized text-only artifact and the opt-in Metal path.
+They do not claim generic Qwen support, and they should not be used to compare
+Qwen against DeepSeek or GLM. The controlled Qwen claim is the +23.3% DS4
+resident prefill improvement over the immediately previous dispatch, not a
+cross-runtime win. Full commands, all samples, numerical checks, the rejected
+fused prototype, and the latest physical 16 GB SSD smoke are recorded in
 [`docs/benchmarks/2026-07-15-qwen-ds4-vs-llamacpp.md`](docs/benchmarks/2026-07-15-qwen-ds4-vs-llamacpp.md).
-Earlier development campaigns remain in
+Earlier DeepSeek and GLM conditions are recorded in
 [`docs/benchmarks/2026-07-14-m5-pro.md`](docs/benchmarks/2026-07-14-m5-pro.md);
 the independent SSD campaign is in
-[`SSD_STREAMING_VERIFICATION.md`](SSD_STREAMING_VERIFICATION.md).
+[`SSD_STREAMING_VERIFICATION.md`](SSD_STREAMING_VERIFICATION.md). The hardware
+reference rows are mirrored in
+[`docs/ENGINE_REFERENCE.md`](docs/ENGINE_REFERENCE.md).
 
 ## Memory safety is part of performance
 
