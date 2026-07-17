@@ -59,6 +59,30 @@ int ds4_gpu_synchronize(void);
 int ds4_gpu_set_model_map(const void *model_map, uint64_t model_size);
 int ds4_gpu_set_model_fd(int fd);
 int ds4_gpu_set_model_fd_for_map(int fd, const void *model_map);
+/* Install the deterministic Qwen expert sidecar as an alternate byte source.
+ * The descriptor remains owned by the engine and must stay open until clear()
+ * returns. bind_layer() associates the sidecar records with the canonical GGUF
+ * tensor offsets; cache keys deliberately remain those canonical offsets. */
+int ds4_gpu_qwen35_expert_pack_install(
+        int      fd,
+        uint64_t file_size,
+        uint64_t data_offset,
+        uint64_t gate_bytes,
+        uint64_t up_bytes,
+        uint64_t down_bytes,
+        uint32_t n_layer,
+        uint32_t n_expert);
+int ds4_gpu_qwen35_expert_pack_bind_layer(
+        uint32_t layer,
+        uint64_t model_size,
+        uint64_t gate_offset,
+        uint64_t up_offset,
+        uint64_t down_offset);
+/* Map each expert-major layer as one read-only Metal buffer.  Resident MoE
+ * kernels then keep their GPU-selected IDs and use the pack record size as
+ * the expert stride; no cache lookup, repack, or host readback is involved. */
+int ds4_gpu_qwen35_expert_pack_enable_resident(void);
+void ds4_gpu_qwen35_expert_pack_clear(void);
 int ds4_gpu_set_model_map_range(const void *model_map, uint64_t model_size, uint64_t map_offset, uint64_t map_size, uint64_t max_tensor_bytes);
 int ds4_gpu_set_model_map_spans(const void *model_map, uint64_t model_size, const uint64_t *offsets, const uint64_t *sizes, uint32_t count, uint64_t max_tensor_bytes);
 int ds4_gpu_cache_model_range(const void *model_map, uint64_t model_size, uint64_t offset, uint64_t bytes, const char *label);
@@ -75,6 +99,12 @@ int ds4_gpu_should_use_managed_kv_cache(uint64_t kv_cache_bytes, uint64_t contex
 void ds4_gpu_set_quality(bool quality);
 void ds4_gpu_set_ssd_streaming(bool enabled);
 void ds4_gpu_set_streaming_expert_cache_budget(uint32_t experts);
+/* Increase the live budget without discarding resident expert slots. */
+int ds4_gpu_grow_streaming_expert_cache_budget(uint32_t experts);
+/* Change the SSD cache phase. Growth preserves resident entries; shrinkage
+ * releases resident entries and their backing slabs after synchronizing all
+ * users. The model-lifetime required floor is never relaxed. */
+int ds4_gpu_reconfigure_streaming_expert_cache_budget(uint32_t experts);
 /* Optional model-lifetime fail-closed floor; zero disables the contract. */
 void ds4_gpu_set_streaming_expert_cache_required_floor(uint32_t experts);
 void ds4_gpu_set_streaming_expert_cache_expert_bytes(uint64_t bytes);
@@ -85,13 +115,45 @@ uint64_t ds4_gpu_recommended_working_set_size(void);
 int ds4_gpu_host_memory_snapshot(ds4_ssd_host_memory *out);
 uint32_t ds4_gpu_stream_expert_cache_configured_count(void);
 uint32_t ds4_gpu_stream_expert_cache_current_count(void);
+/* Complete gate + up + down payload for one logical routed expert.  This is
+ * exposed separately from the cumulative counters so benchmark tooling can
+ * report storage read amplification without changing the versioned stats ABI. */
+uint64_t ds4_gpu_stream_expert_cache_logical_expert_bytes(void);
+/* Benchmark-only window for unique (layer, expert) storage demand.  begin()
+ * clears a small backend bitmap; end() returns its cardinality and logical
+ * payload bytes, then disables the extra accounting.  Normal inference never
+ * enables this branch. */
+void ds4_gpu_stream_expert_io_measurement_begin(void);
+void ds4_gpu_stream_expert_io_measurement_end(uint64_t *unique_experts,
+                                              uint64_t *unique_bytes);
 
-/* Cumulative routed-expert streaming counters since model load. Snapshot the
-   delta across exactly the decode loop to attribute SSD traffic to generation.
-   pread_ms is parallel-read wall time, not the sum of worker times;
-   split_resident_wait_ms is time spent waiting for the already-submitted
-   resident-expert GPU stage after missing-expert I/O completed. Any out pointer
-   may be NULL. Zero on non-streaming or non-Metal backends. */
+/* Versioned cumulative snapshot for campaign attribution. Integer counters
+ * saturate at UINT64_MAX rather than wrapping. expert_loads counts complete
+ * logical expert records (gate + up + down). pread_syscalls counts actual
+ * pread(2) calls that returned at least one byte; EINTR/error/EOF returns do
+ * not count, while multiple successful partial reads count separately.
+ * pread_wall_ms is parallel-read wall time, not the sum of worker times. */
+#define DS4_GPU_STREAM_EXPERT_CACHE_STATS_VERSION_V1 1u
+typedef struct ds4_gpu_stream_expert_cache_stats_v1 {
+    uint32_t version;
+    uint32_t struct_size;
+    uint64_t hits;
+    uint64_t misses;
+    uint64_t evictions;
+    uint64_t expert_loads;
+    uint64_t pread_syscalls;
+    uint64_t pread_bytes;
+    double   pread_wall_ms;
+    double   split_resident_wait_ms;
+} ds4_gpu_stream_expert_cache_stats_v1;
+
+/* Returns zero only for a NULL output. Non-streaming backends return a valid,
+ * versioned all-zero payload so callers never need backend-specific branches. */
+int ds4_gpu_stream_expert_cache_snapshot_v1(
+        ds4_gpu_stream_expert_cache_stats_v1 *out);
+
+/* Legacy subset retained for source and ABI compatibility. Any out pointer may
+ * be NULL. Values have the same cumulative lifetime as snapshot_v1(). */
 void ds4_gpu_stream_expert_cache_stats(uint64_t *hits, uint64_t *misses,
                                        uint64_t *pread_bytes, double *pread_ms,
                                        double *split_resident_wait_ms);
@@ -111,6 +173,12 @@ typedef struct ds4_gpu_stream_expert_table {
  * cache itself is intentionally kept warm across sessions. */
 void ds4_gpu_stream_expert_cache_reset_route_hotness(void);
 void ds4_gpu_stream_expert_cache_release_resident(void);
+/* A layer lease pins only experts that are loaded while the lease is active;
+ * acquiring one never preloads the layer. The opaque non-zero id is bound to
+ * the acquiring thread and must be released by that same owner. */
+int ds4_gpu_stream_expert_cache_acquire_layer_lease(uint32_t layer,
+                                                    uint64_t *lease_id);
+int ds4_gpu_stream_expert_cache_release_layer_lease(uint64_t lease_id);
 uint32_t ds4_gpu_stream_expert_cache_budget_for_expert_size(
         uint64_t gate_expert_bytes,
         uint64_t down_expert_bytes);
@@ -122,6 +190,44 @@ int ds4_gpu_stream_expert_cache_begin_selected_load(
         const ds4_gpu_stream_expert_table *table,
         const int32_t                     *selected_ids,
         uint32_t                           n_selected);
+
+/* Qwen SSD prefill/decode can expose a completed GPU route before encoding the
+ * shared expert. The backend then owns one bounded pread generation while the
+ * encoder submits shared-expert work. A zero generation means the capability
+ * was unavailable and the caller must use the exact synchronous routed-MoE
+ * fallback. n_tokens may be one for decode or a prefill micro-block. */
+typedef struct ds4_gpu_qwen35_stream_io_ticket {
+    uint64_t generation;
+    uint32_t unique_experts;
+    uint32_t missing_experts;
+    uint32_t max_inflight_reads;
+    uint32_t asynchronous;
+} ds4_gpu_qwen35_stream_io_ticket;
+
+int ds4_gpu_qwen35_stream_io_overlap_capable(void);
+int ds4_gpu_qwen35_stream_batch_route_ready(
+        const ds4_gpu_stream_expert_table *table,
+        const ds4_gpu_tensor              *selected,
+        uint32_t                           n_tokens,
+        uint32_t                           n_selected,
+        ds4_gpu_qwen35_stream_io_ticket   *ticket);
+/* Select variant used by the integrated Qwen scheduler.  When expert grouping
+ * is requested, the backend builds the stable expert-major permutation from
+ * the ID array already made visible for I/O.  The legacy entry point above is
+ * exactly equivalent to passing request_expert_group=0. */
+int ds4_gpu_qwen35_stream_batch_route_ready_select(
+        const ds4_gpu_stream_expert_table *table,
+        const ds4_gpu_tensor              *selected,
+        uint32_t                           n_tokens,
+        uint32_t                           n_selected,
+        int                                request_expert_group,
+        ds4_gpu_qwen35_stream_io_ticket   *ticket);
+/* Called immediately after shared-expert encoding, finish() flushes that
+ * command buffer without waiting, then waits for pread and installs completed
+ * staging buffers on the encoder owner. The following routed-MoE call consumes
+ * the generation. abort() waits for workers but never installs staging. */
+int ds4_gpu_qwen35_stream_batch_finish(uint64_t generation);
+int ds4_gpu_qwen35_stream_batch_abort(uint64_t generation);
 #if defined(DS4_ROCM_BUILD) || (!defined(DS4_NO_GPU) && !defined(__APPLE__))
 int ds4_gpu_stream_expert_cache_prepare_selected_batch(
         const ds4_gpu_stream_expert_table *table,
@@ -629,6 +735,47 @@ int ds4_gpu_qwen35_gqa_prefill_tensor(
         uint32_t              n_kv_head,
         uint32_t              head_dim);
 
+/* K/V-tile reuse specialization for Qwen's 8:1 grouped-query geometry.  The
+ * capability is deliberately separate from policy: an engine resolves it
+ * once, combines it with its per-request feature mask, then passes that result
+ * as request_reuse.  The select wrappers preserve the existing kernel for a
+ * disabled feature, incompatible geometry, short context, or a device whose
+ * pipeline cannot host the 16-SIMD-group tile.  reuse_used reports the actual
+ * structural path and is suitable for strict campaign telemetry.
+ *
+ * A selected reuse dispatch is never retried through the legacy kernel after
+ * a GPU error: doing so could conceal a partial write and invalidate exact-run
+ * accounting. */
+int ds4_gpu_qwen35_gqa_reuse_capable(
+        uint32_t n_query_head,
+        uint32_t n_kv_head,
+        uint32_t head_dim);
+
+int ds4_gpu_qwen35_gqa_decode_select_tensor(
+        ds4_gpu_tensor       *out,
+        const ds4_gpu_tensor *query,
+        const ds4_gpu_tensor *key_cache,
+        const ds4_gpu_tensor *value_cache,
+        uint32_t              n_kv,
+        uint32_t              n_query_head,
+        uint32_t              n_kv_head,
+        uint32_t              head_dim,
+        int                   request_reuse,
+        int                  *reuse_used);
+
+int ds4_gpu_qwen35_gqa_prefill_select_tensor(
+        ds4_gpu_tensor       *out,
+        const ds4_gpu_tensor *query,
+        const ds4_gpu_tensor *key_cache,
+        const ds4_gpu_tensor *value_cache,
+        uint32_t              position0,
+        uint32_t              n_token,
+        uint32_t              n_query_head,
+        uint32_t              n_kv_head,
+        uint32_t              head_dim,
+        int                   request_reuse,
+        int                  *reuse_used);
+
 /* Fixed 256-expert Qwen router: stable full softmax, deterministic top-8
  * selection (lower expert ID wins ties), then top-8 renormalization.
  * Non-finite diagnostic input writes eight {-1, 0} ID/weight pairs while a
@@ -1128,6 +1275,56 @@ int ds4_gpu_routed_moe_batch_tensor(
         uint32_t                layer_index,
         uint32_t                n_tokens,
         bool                   *mid_is_f16);
+
+/* Expert-major scheduling for Qwen's fixed Q4 top-8 geometry.  Capability and
+ * request are deliberately separate: policy remains in ds4.c, while Metal
+ * reports expert_group_used only after it encoded a genuinely expert-major
+ * path.  SSD uses the stable CPU permutation captured at router-ready and
+ * scatters route intermediates back to canonical token/slot rows.  Resident
+ * mode reuses the existing GPU mm_id expert-major map and canonical scatter. */
+int ds4_gpu_qwen35_expert_group_capable(
+        uint32_t n_total_expert,
+        uint32_t n_expert,
+        uint32_t gate_type,
+        uint32_t down_type);
+
+int ds4_gpu_qwen35_routed_moe_batch_select_tensor(
+        ds4_gpu_tensor       *out,
+        ds4_gpu_tensor       *gate,
+        ds4_gpu_tensor       *up,
+        ds4_gpu_tensor       *mid,
+        ds4_gpu_tensor       *experts,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                gate_offset,
+        uint64_t                up_offset,
+        uint64_t                down_offset,
+        uint32_t                gate_type,
+        uint32_t                down_type,
+        uint64_t                gate_expert_bytes,
+        uint64_t                gate_row_bytes,
+        uint64_t                down_expert_bytes,
+        uint64_t                down_row_bytes,
+        uint32_t                expert_in_dim,
+        uint32_t                expert_mid_dim,
+        uint32_t                out_dim,
+        const ds4_gpu_tensor *selected,
+        const ds4_gpu_tensor *weights,
+        uint32_t                n_total_expert,
+        uint32_t                n_expert,
+        float                   clamp,
+        const ds4_gpu_tensor *x,
+        uint32_t                layer_index,
+        uint32_t                n_tokens,
+        bool                   *mid_is_f16,
+        int                     request_expert_group,
+        int                    *expert_group_used);
+
+/* Model-free ABI/permutation regression used by --metal-kernels. */
+int ds4_gpu_internal_qwen35_expert_group_test(void);
+/* Model-free source-translation/fail-closed regression used by
+ * --metal-kernels. */
+int ds4_gpu_internal_qwen35_expert_pack_test(void);
 
 /* =========================================================================
  * Hyper-Connection Kernels.

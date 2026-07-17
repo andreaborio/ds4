@@ -409,7 +409,7 @@ static bool ds4_ssd_adaptive_cache_plan_make_policy(
         out->current_headroom_bytes =
             out->current_headroom_bytes > static_reserve_bytes ?
                 out->current_headroom_bytes - static_reserve_bytes : 0;
-    } else if (pageable_static_overlaps_headroom &&
+    } else if (pageable_static_overlaps_headroom && !qwen_low_ram_policy &&
                out->current_headroom_bytes <
                out->pageable_static_reserve_bytes) {
         out->current_headroom_bytes = out->pageable_static_reserve_bytes;
@@ -417,6 +417,16 @@ static bool ds4_ssd_adaptive_cache_plan_make_policy(
     out->pressure_margin_bytes = memory->physical_bytes / 64u;
     if (out->pressure_margin_bytes < quarter_gib) {
         out->pressure_margin_bytes = quarter_gib;
+    }
+    if (qwen_low_ram_policy) {
+        /* Qwen's bounded <=16 GiB policy freezes one 2 GiB request reserve,
+         * including the pressure allowance.  The pageable static mapping may
+         * occupy that reserve and be reclaimed; charging max(static, 2 GiB)
+         * and then another pressure margin left useful RAM idle and violated
+         * the policy's single-headroom contract. */
+        out->current_headroom_bytes =
+            two_gib > out->pressure_margin_bytes
+                ? two_gib - out->pressure_margin_bytes : 0;
     }
     out->platform_headroom_bytes = memory->physical_bytes / 8u;
     if (out->platform_headroom_bytes < two_gib) {
@@ -429,7 +439,7 @@ static bool ds4_ssd_adaptive_cache_plan_make_policy(
         out->platform_headroom_bytes = saturating_add_u64(
             out->platform_headroom_bytes,
             out->platform_static_reserve_bytes);
-    } else if (pageable_static_overlaps_headroom &&
+    } else if (pageable_static_overlaps_headroom && !qwen_low_ram_policy &&
                out->platform_headroom_bytes <
                out->platform_static_reserve_bytes) {
         out->platform_headroom_bytes = out->platform_static_reserve_bytes;
@@ -518,6 +528,13 @@ static bool ds4_ssd_adaptive_cache_plan_make_policy(
 
     out->cache_experts = (uint32_t)cache_experts;
     out->cache_bytes = cache_experts * per_expert_bytes;
+    if (qwen_low_ram_policy &&
+        (!memory->pressure_status_available || !memory->pressure_normal)) {
+        /* The 2 GiB envelope deliberately spends more of a small host's free
+         * budget.  It is therefore valid only with an affirmative normal
+         * pressure signal; missing telemetry is not evidence of headroom. */
+        return false;
+    }
     return true;
 }
 

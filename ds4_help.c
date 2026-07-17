@@ -248,6 +248,8 @@ static void print_cli_diagnostics(FILE *fp, const help_colors *c) {
     opt(fp, c, "--inspect", "Load the model and print a summary only.");
     opt(fp, c, "--dump-tokens", "Tokenize the prompt exactly as written, then exit.");
     opt(fp, c, "--dump-logits FILE", "Write full next-token logits as JSON.");
+    opt(fp, c, "--dump-generation-evidence FILE",
+        "Write exact Qwen greedy token IDs and post-generation frontier logits as JSON.");
     opt(fp, c, "--dump-logprobs FILE", "Write greedy continuation top-logprobs as JSON.");
     opt(fp, c, "--logprobs-top-k N", "Alternatives stored by --dump-logprobs. Default: 20");
     opt(fp, c, "--expert-profile FILE", "Metal-only: write routed expert locality/cache simulation JSON.");
@@ -355,6 +357,7 @@ static void print_bench_specific(FILE *fp, const help_colors *c) {
     opt(fp, c, "--gen-tokens N", "Greedy decode tokens per frontier. 0 for pure prefill. Default: 128");
     opt(fp, c, "--csv FILE", "Write CSV there instead of stdout.");
     opt(fp, c, "--dump-frontier-logits-dir DIR", "Write one full-logit JSON file per frontier.");
+    opt(fp, c, "--dump-decode-evidence-dir DIR", "Write post-decode token IDs and final logits per frontier.");
     fputc('\n', fp);
 }
 

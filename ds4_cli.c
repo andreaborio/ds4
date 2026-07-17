@@ -36,6 +36,7 @@ typedef struct {
     uint64_t seed;
     bool dump_tokens;
     const char *dump_logits_path;
+    const char *dump_generation_evidence_path;
     const char *dump_logprobs_path;
     int dump_logprobs_top_k;
     const char *perplexity_file_path;
@@ -465,8 +466,8 @@ static int run_sampled_generation(ds4_engine *engine, const cli_config *cfg, con
 
     int max_tokens = cfg->gen.n_predict;
     int room = ds4_session_ctx(session) - ds4_session_pos(session);
-    if (room <= 1) max_tokens = 0;
-    else if (max_tokens > room - 1) max_tokens = room - 1;
+    if (room <= 0) max_tokens = 0;
+    else if (max_tokens > room) max_tokens = room;
 
     uint64_t rng = cfg->gen.seed ? cfg->gen.seed :
         ((uint64_t)time(NULL) ^ ((uint64_t)getpid() << 32) ^ (uint64_t)clock());
@@ -479,7 +480,16 @@ static int run_sampled_generation(ds4_engine *engine, const cli_config *cfg, con
 
         int toks[17];
         int ntok = 0;
-        if (cfg->gen.temperature <= 0.0f && ds4_engine_mtp_draft_tokens(engine) > 1 &&
+        const bool final_without_eval =
+            max_tokens - generated <= 1 ||
+            ds4_session_ctx(session) - ds4_session_pos(session) <= 1;
+        if (final_without_eval) {
+            /* Emitting the final visible token does not require advancing the
+             * model frontier.  This matches the canonical greedy loop and
+             * avoids losing one token at an exactly-full context. */
+            toks[0] = token;
+            ntok = 1;
+        } else if (cfg->gen.temperature <= 0.0f && ds4_engine_speculative_draft_tokens(engine) > 1 &&
             getenv("DS4_MTP_SPEC_DISABLE") == NULL) {
             cli_dist_busy_set(cfg, true);
             ntok = ds4_session_eval_speculative_argmax(session,
@@ -875,6 +885,13 @@ static int run_perplexity_file(ds4_engine *engine, const cli_config *cfg) {
 }
 
 static int run_generation(ds4_engine *engine, const cli_config *cfg) {
+    if (cfg->gen.dump_generation_evidence_path &&
+        !ds4_engine_is_qwen35(engine)) {
+        fprintf(stderr,
+                "ds4: --dump-generation-evidence requires a Qwen model\n");
+        return 1;
+    }
+
     ds4_tokens prompt = {0};
     if (!build_prompt(engine, &cfg->gen, &prompt)) {
         fprintf(stderr, "ds4: failed to tokenize prompt\n");
@@ -929,7 +946,8 @@ static int run_generation(ds4_engine *engine, const cli_config *cfg) {
         }
     } else if (cfg->engine.distributed.role == DS4_DISTRIBUTED_COORDINATOR ||
                cfg->gen.temperature > 0.0f ||
-               ds4_engine_mtp_draft_tokens(engine) > 1) {
+               (!ds4_engine_is_qwen35(engine) &&
+                ds4_engine_speculative_draft_tokens(engine) > 1)) {
         rc = run_sampled_generation(engine, cfg, &prompt);
     } else {
         token_printer printer = {
@@ -945,13 +963,73 @@ static int run_generation(ds4_engine *engine, const cli_config *cfg) {
             .input_tokens = prompt.len,
             .use_color = ds4_log_is_tty(stderr),
         };
-        rc = ds4_engine_generate_argmax(engine, &prompt, cfg->gen.n_predict,
-                                        cfg->gen.ctx_size,
-                                        print_generated_token,
-                                        generation_done,
-                                        &printer,
-                                        cli_prefill_progress_cb,
-                                        &progress);
+        if (cfg->gen.dump_generation_evidence_path) {
+            const int vocab = ds4_engine_vocab_size(engine);
+            int *token_ids = NULL;
+            float *final_logits = NULL;
+            if (vocab <= 0 || cfg->gen.n_predict < 0 ||
+                (cfg->gen.n_predict > 0 &&
+                 (size_t)cfg->gen.n_predict > SIZE_MAX / sizeof(*token_ids)) ||
+                (size_t)vocab > SIZE_MAX / sizeof(*final_logits)) {
+                fprintf(stderr,
+                        "ds4: invalid generation evidence buffer dimensions\n");
+                rc = 1;
+            } else {
+                /* Allocate before entering the engine: neither the prefill nor
+                 * decode timing window includes diagnostic memory setup. */
+                if (cfg->gen.n_predict > 0) {
+                    token_ids = malloc(
+                        (size_t)cfg->gen.n_predict * sizeof(*token_ids));
+                }
+                final_logits = malloc((size_t)vocab * sizeof(*final_logits));
+                if ((cfg->gen.n_predict > 0 && !token_ids) || !final_logits) {
+                    fprintf(stderr,
+                            "ds4: out of memory allocating generation evidence\n");
+                    rc = 1;
+                } else {
+                    ds4_qwen_generation_evidence evidence = {
+                        .token_ids = token_ids,
+                        .token_capacity = cfg->gen.n_predict,
+                        .final_logits = final_logits,
+                        .final_logits_capacity = vocab,
+                    };
+                    rc = ds4_engine_generate_argmax_with_evidence(
+                        engine, &prompt, cfg->gen.n_predict,
+                        cfg->gen.ctx_size,
+                        print_generated_token,
+                        generation_done,
+                        &printer,
+                        cli_prefill_progress_cb,
+                        &progress,
+                        &evidence);
+                    if (rc == 0) {
+                        char evidence_err[256] = {0};
+                        if (ds4_qwen_generation_evidence_write_json_atomic(
+                                cfg->gen.dump_generation_evidence_path,
+                                &evidence,
+                                evidence_err,
+                                sizeof(evidence_err)) != 0) {
+                            fprintf(stderr,
+                                    "ds4: failed to write generation evidence: %s\n",
+                                    evidence_err[0] ? evidence_err :
+                                        "unknown error");
+                            rc = 1;
+                        }
+                    }
+                }
+            }
+            free(final_logits);
+            free(token_ids);
+        } else {
+            rc = ds4_engine_generate_argmax(engine, &prompt,
+                                            cfg->gen.n_predict,
+                                            cfg->gen.ctx_size,
+                                            print_generated_token,
+                                            generation_done,
+                                            &printer,
+                                            cli_prefill_progress_cb,
+                                            &progress);
+        }
     }
 
     ds4_tokens_free(&prompt);
@@ -1160,8 +1238,8 @@ static int run_chat_turn(ds4_engine *engine, cli_config *cfg, repl_chat *chat, c
 
     int max_tokens = cfg->gen.n_predict;
     int room = ds4_session_ctx(chat->session) - ds4_session_pos(chat->session);
-    if (room <= 1) max_tokens = 0;
-    else if (max_tokens > room - 1) max_tokens = room - 1;
+    if (room <= 0) max_tokens = 0;
+    else if (max_tokens > room) max_tokens = room;
 
     uint64_t rng = cfg->gen.seed ? cfg->gen.seed :
         ((uint64_t)time(NULL) ^ ((uint64_t)getpid() << 32) ^ (uint64_t)clock());
@@ -1178,7 +1256,14 @@ static int run_chat_turn(ds4_engine *engine, cli_config *cfg, repl_chat *chat, c
 
         int toks[17];
         int ntok = 0;
-        if (cfg->gen.temperature <= 0.0f && ds4_engine_mtp_draft_tokens(engine) > 1 &&
+        const bool final_without_eval =
+            max_tokens - generated <= 1 ||
+            ds4_session_ctx(chat->session) -
+                ds4_session_pos(chat->session) <= 1;
+        if (final_without_eval) {
+            toks[0] = token;
+            ntok = 1;
+        } else if (cfg->gen.temperature <= 0.0f && ds4_engine_speculative_draft_tokens(engine) > 1 &&
             getenv("DS4_MTP_SPEC_DISABLE") == NULL) {
             cli_dist_busy_set(cfg, true);
             ntok = ds4_session_eval_speculative_argmax(chat->session,
@@ -1578,6 +1663,9 @@ static cli_config parse_options(int argc, char **argv) {
             c.gen.dump_tokens = true;
         } else if (!strcmp(arg, "--dump-logits")) {
             c.gen.dump_logits_path = need_arg(&i, argc, argv, arg);
+        } else if (!strcmp(arg, "--dump-generation-evidence")) {
+            c.gen.dump_generation_evidence_path =
+                need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--dump-logprobs")) {
             c.gen.dump_logprobs_path = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--logprobs-top-k")) {
@@ -1655,6 +1743,43 @@ static cli_config parse_options(int argc, char **argv) {
     if (c.gen.perplexity_file_path && c.gen.prompt) {
         fprintf(stderr, "ds4: --perplexity-file does not use -p/--prompt-file\n");
         exit(2);
+    }
+    if (c.gen.dump_generation_evidence_path) {
+        if (!c.gen.dump_generation_evidence_path[0]) {
+            fprintf(stderr,
+                    "ds4: --dump-generation-evidence requires a non-empty path\n");
+            exit(2);
+        }
+        if (!c.gen.prompt) {
+            fprintf(stderr,
+                    "ds4: --dump-generation-evidence requires -p or --prompt-file\n");
+            exit(2);
+        }
+        if (c.gen.temperature != 0.0f) {
+            fprintf(stderr,
+                    "ds4: --dump-generation-evidence requires --temp 0\n");
+            exit(2);
+        }
+        if (c.gen.n_predict < 0) {
+            fprintf(stderr,
+                    "ds4: --dump-generation-evidence requires non-negative --tokens\n");
+            exit(2);
+        }
+        if (ds4_dist_enabled(c.dist)) {
+            fprintf(stderr,
+                    "ds4: --dump-generation-evidence is unavailable for distributed generation\n");
+            exit(2);
+        }
+        if (c.inspect || c.gen.perplexity_file_path ||
+            c.gen.imatrix_dataset_path || c.gen.dump_tokens ||
+            c.gen.dump_logits_path || c.gen.dump_logprobs_path ||
+            c.gen.head_test || c.gen.first_token_test ||
+            c.gen.metal_graph_test || c.gen.metal_graph_full_test ||
+            c.gen.metal_graph_prompt_test) {
+            fprintf(stderr,
+                    "ds4: --dump-generation-evidence cannot be combined with another diagnostic mode\n");
+            exit(2);
+        }
     }
     c.engine.context_size = (uint32_t)c.gen.ctx_size;
     char dist_err[256];

@@ -47,6 +47,7 @@ typedef struct {
     uint64_t simulate_used_memory_bytes;
     double step_mul;
     const char *dump_frontier_logits_dir;
+    const char *dump_decode_evidence_dir;
     ds4_dist_options dist;
     bool warm_weights;
     bool quality;
@@ -58,6 +59,22 @@ static double bench_now_sec(void) {
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
     return (double)ts.tv_sec + (double)ts.tv_nsec / 1000000000.0;
+}
+
+static int compare_double_ascending(const void *a, const void *b) {
+    const double lhs = *(const double *)a;
+    const double rhs = *(const double *)b;
+    return (lhs > rhs) - (lhs < rhs);
+}
+
+static double nearest_rank_percentile(const double *sorted,
+                                      size_t count,
+                                      double percentile) {
+    if (!sorted || count == 0) return 0.0;
+    size_t rank = (size_t)ceil(percentile * (double)count);
+    if (rank == 0) rank = 1;
+    if (rank > count) rank = count;
+    return sorted[rank - 1];
 }
 
 static void usage(FILE *fp, const char *topic) {
@@ -229,6 +246,8 @@ static bench_config parse_options(int argc, char **argv) {
             c.csv_path = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--dump-frontier-logits-dir")) {
             c.dump_frontier_logits_dir = need_arg(&i, argc, argv, arg);
+        } else if (!strcmp(arg, "--dump-decode-evidence-dir")) {
+            c.dump_decode_evidence_dir = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--expert-profile")) {
             c.expert_profile_path = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "-t") || !strcmp(arg, "--threads")) {
@@ -356,6 +375,18 @@ static void json_write_string(FILE *fp, const char *s) {
     fputc('"', fp);
 }
 
+/* ds4-bench is built with -ffast-math, under which libc-style isfinite checks
+ * may be folded away.  Inspecting IEEE-754 exponent bits keeps JSON strict even
+ * if a diagnostic logits vector contains NaN or infinity. */
+static bool json_f32_is_finite(const float *value) {
+    uint32_t bits = 0;
+    unsigned char *dst = (unsigned char *)&bits;
+    const volatile unsigned char *src =
+        (const volatile unsigned char *)(const void *)value;
+    for (size_t i = 0; i < sizeof(bits); i++) dst[i] = src[i];
+    return (bits & UINT32_C(0x7f800000)) != UINT32_C(0x7f800000);
+}
+
 static int write_frontier_logits_json(
         const bench_config *cfg,
         ds4_engine         *engine,
@@ -417,7 +448,7 @@ static int write_frontier_logits_json(
     for (int i = 0; i < vocab; i++) {
         if (i) fputc(',', fp);
         if ((i % 8) == 0) fputs("\n    ", fp);
-        if (isfinite(logits[i])) fprintf(fp, "%.9g", logits[i]);
+        if (json_f32_is_finite(&logits[i])) fprintf(fp, "%.9g", logits[i]);
         else fputs("null", fp);
     }
     fputs("\n  ]\n}\n", fp);
@@ -427,6 +458,116 @@ static int write_frontier_logits_json(
         return 1;
     }
     free(logits);
+    return 0;
+}
+
+#define DS4_BENCH_DECODE_EVIDENCE_SCHEMA "ds4.qwen.decode-evidence/1"
+
+/* The decode timer must measure inference, not evidence serialization.  The
+ * caller therefore records token IDs into a preallocated RAM buffer and copies
+ * the final logits only after gen_t1.  This helper receives only immutable RAM
+ * snapshots and cannot accidentally touch the live session or GPU. */
+static int write_decode_evidence_json(
+        const bench_config *cfg,
+        int                 frontier,
+        const int          *token_ids,
+        int                 token_count,
+        int                 final_argmax,
+        const float        *final_logits,
+        int                 vocab) {
+    if (!cfg->dump_decode_evidence_dir) return 0;
+    if (token_count < 0 || (token_count > 0 && !token_ids) ||
+        !final_logits || vocab <= 0 || final_argmax < 0 || final_argmax >= vocab)
+    {
+        fprintf(stderr,
+                "ds4-bench: invalid in-memory decode evidence at frontier %d\n",
+                frontier);
+        return 1;
+    }
+    for (int i = 0; i < token_count; i++) {
+        if (token_ids[i] < 0 || token_ids[i] >= vocab) {
+            fprintf(stderr,
+                    "ds4-bench: invalid decoded token ID %d at frontier %d\n",
+                    token_ids[i],
+                    frontier);
+            return 1;
+        }
+    }
+
+    char path[PATH_MAX];
+    char tmp_path[PATH_MAX];
+    const int path_n = snprintf(path,
+                                sizeof(path),
+                                "%s/frontier_%06d.decode.json",
+                                cfg->dump_decode_evidence_dir,
+                                frontier);
+    if (path_n <= 0 || (size_t)path_n >= sizeof(path)) {
+        fprintf(stderr, "ds4-bench: decode evidence path is too long\n");
+        return 1;
+    }
+    const int tmp_n = snprintf(tmp_path, sizeof(tmp_path), "%s.tmp", path);
+    if (tmp_n <= 0 || (size_t)tmp_n >= sizeof(tmp_path)) {
+        fprintf(stderr, "ds4-bench: decode evidence temporary path is too long\n");
+        return 1;
+    }
+
+    FILE *fp = fopen(tmp_path, "wb");
+    if (!fp) {
+        fprintf(stderr,
+                "ds4-bench: failed to open %s: %s\n",
+                tmp_path,
+                strerror(errno));
+        return 1;
+    }
+
+    fprintf(fp,
+            "{\n  \"schema\":\"%s\",\n"
+            "  \"frontier_tokens\":%d,\n"
+            "  \"token_ids\":[",
+            DS4_BENCH_DECODE_EVIDENCE_SCHEMA,
+            frontier);
+    for (int i = 0; i < token_count; i++) {
+        if (i) fputc(',', fp);
+        if ((i % 16) == 0) fputs("\n    ", fp);
+        fprintf(fp, "%d", token_ids[i]);
+    }
+    fprintf(fp,
+            "%s  ],\n  \"final_argmax_id\":%d,\n  \"final_logits\":[",
+            token_count ? "\n" : "",
+            final_argmax);
+    for (int i = 0; i < vocab; i++) {
+        if (i) fputc(',', fp);
+        if ((i % 8) == 0) fputs("\n    ", fp);
+        if (json_f32_is_finite(&final_logits[i])) fprintf(fp, "%.9g", final_logits[i]);
+        else fputs("null", fp);
+    }
+    fputs("\n  ]\n}\n", fp);
+
+    /* A partially written JSON file must never match the campaign glob.  Close
+     * and validate the temporary file first, then publish it atomically. */
+    int write_errno = 0;
+    if (ferror(fp)) write_errno = errno ? errno : EIO;
+    if (fflush(fp) != 0 && write_errno == 0) write_errno = errno ? errno : EIO;
+    if (fclose(fp) != 0 && write_errno == 0) {
+        write_errno = errno ? errno : EIO;
+    }
+    if (write_errno != 0) {
+        fprintf(stderr,
+                "ds4-bench: failed to write %s: %s\n",
+                tmp_path,
+                strerror(write_errno));
+        remove(tmp_path);
+        return 1;
+    }
+    if (rename(tmp_path, path) != 0) {
+        const int rename_errno = errno;
+        fprintf(stderr,
+                "ds4-bench: failed to publish %s: %s\n",
+                path,
+                strerror(rename_errno));
+        remove(tmp_path);
+        return 1;
+    }
     return 0;
 }
 
@@ -596,11 +737,83 @@ int main(int argc, char **argv) {
             return 1;
         }
     }
-    fprintf(out, "ctx_tokens,prefill_tokens,prefill_tps,gen_tokens,gen_tps,kvcache_bytes,gen_hit_rate,gen_pread_gib_per_tok,gen_pread_ms_per_tok,gen_split_resident_wait_ms_per_tok\n");
+    fprintf(out,
+            "ctx_tokens,prefill_tokens,prefill_tps,prefill_wall_ms,ttft_ms,"
+            "prefill_hit_rate,prefill_evictions,prefill_expert_loads,"
+            "prefill_unique_experts,prefill_unique_expert_gib,"
+            "prefill_read_amplification,prefill_pread_syscalls,"
+            "prefill_pread_kib_per_syscall,prefill_pread_gib,"
+            "prefill_pread_gib_per_tok,prefill_pread_ms,"
+            "prefill_pread_ms_per_tok,prefill_split_resident_wait_ms,"
+            "prefill_split_resident_wait_ms_per_tok,gen_tokens,gen_tps,"
+            "gen_wall_ms,gen_tpot_p50_ms,gen_tpot_p95_ms,kvcache_bytes,"
+            "gen_hit_rate,gen_evictions,gen_expert_loads,gen_unique_experts,"
+            "gen_unique_expert_gib,gen_read_amplification,"
+            "gen_pread_syscalls,gen_pread_kib_per_syscall,"
+            "gen_pread_gib,gen_pread_gib_per_tok,gen_pread_ms,"
+            "gen_pread_ms_per_tok,gen_split_resident_wait_ms,"
+            "gen_split_resident_wait_ms_per_tok\n");
     fflush(out);
+
+    int *decode_token_ids = NULL;
+    float *decode_final_logits = NULL;
+    double *decode_token_ms = NULL;
+    int decode_vocab = 0;
+    if (cfg.gen_tokens > 0) {
+        if ((size_t)cfg.gen_tokens > SIZE_MAX / sizeof(decode_token_ms[0])) {
+            fprintf(stderr, "ds4-bench: invalid decode latency buffer size\n");
+            if (out != stdout) fclose(out);
+            ds4_session_free(session);
+            ds4_tokens_free(&prompt);
+            ds4_engine_close(engine);
+            return 1;
+        }
+        decode_token_ms = malloc(
+            (size_t)cfg.gen_tokens * sizeof(decode_token_ms[0]));
+        if (!decode_token_ms) {
+            fprintf(stderr, "ds4-bench: out of memory allocating decode latency buffer\n");
+            if (out != stdout) fclose(out);
+            ds4_session_free(session);
+            ds4_tokens_free(&prompt);
+            ds4_engine_close(engine);
+            return 1;
+        }
+    }
+    if (cfg.dump_decode_evidence_dir) {
+        decode_vocab = ds4_engine_vocab_size(engine);
+        if (decode_vocab <= 0 ||
+            (size_t)decode_vocab > SIZE_MAX / sizeof(decode_final_logits[0]) ||
+            (cfg.gen_tokens > 0 &&
+             (size_t)cfg.gen_tokens > SIZE_MAX / sizeof(decode_token_ids[0])))
+        {
+            fprintf(stderr, "ds4-bench: invalid decode evidence buffer size\n");
+            free(decode_token_ms);
+            if (out != stdout) fclose(out);
+            ds4_session_free(session);
+            ds4_tokens_free(&prompt);
+            ds4_engine_close(engine);
+            return 1;
+        }
+        if (cfg.gen_tokens > 0) {
+            decode_token_ids = malloc((size_t)cfg.gen_tokens * sizeof(decode_token_ids[0]));
+        }
+        decode_final_logits = malloc((size_t)decode_vocab * sizeof(decode_final_logits[0]));
+        if ((cfg.gen_tokens > 0 && !decode_token_ids) || !decode_final_logits) {
+            fprintf(stderr, "ds4-bench: out of memory allocating decode evidence buffers\n");
+            free(decode_token_ids);
+            free(decode_final_logits);
+            free(decode_token_ms);
+            if (out != stdout) fclose(out);
+            ds4_session_free(session);
+            ds4_tokens_free(&prompt);
+            ds4_engine_close(engine);
+            return 1;
+        }
+    }
 
     const int eos = ds4_token_eos(engine);
     const bool distributed = cfg.dist.role == DS4_DISTRIBUTED_COORDINATOR;
+    const bool replay_restore = ds4_engine_is_qwen35(engine);
     ds4_session_snapshot snap = {0};
     char err[256];
     int previous = 0;
@@ -613,13 +826,66 @@ int main(int argc, char **argv) {
             .cap = frontier,
         };
 
+        /* Attribute storage traffic before entering sync.  These counters are
+         * cumulative by design: taking both snapshots outside the timed call
+         * adds no instrumentation to the engine hot path and keeps prefill and
+         * decode I/O disjoint in the report. */
+        uint64_t prefill_cache_hits = 0, prefill_cache_misses = 0;
+        uint64_t prefill_cache_evictions = 0, prefill_expert_loads = 0;
+        uint64_t prefill_pread_syscalls = 0;
+        uint64_t prefill_pread_bytes = 0;
+        uint64_t prefill_unique_experts = 0;
+        uint64_t prefill_unique_bytes = 0;
+        double prefill_pread_ms = 0.0;
+        double prefill_split_resident_wait_ms = 0.0;
+#ifndef DS4_NO_GPU
+        ds4_gpu_stream_expert_cache_stats_v1 prefill_stats0 = {0};
+        if (!ds4_gpu_stream_expert_cache_snapshot_v1(&prefill_stats0)) {
+            fprintf(stderr, "ds4-bench: failed to snapshot prefill cache counters\n");
+            rc = 1;
+            break;
+        }
+        ds4_gpu_stream_expert_io_measurement_begin();
+#endif
         const double prefill_t0 = bench_now_sec();
-        if (ds4_session_sync(session, &prefix, err, sizeof(err)) != 0) {
+        const int prefill_rc =
+            ds4_session_sync(session, &prefix, err, sizeof(err));
+        const double prefill_t1 = bench_now_sec();
+#ifndef DS4_NO_GPU
+        ds4_gpu_stream_expert_io_measurement_end(
+            &prefill_unique_experts, &prefill_unique_bytes);
+#endif
+        if (prefill_rc != 0) {
             fprintf(stderr, "ds4-bench: prefill to %d failed: %s\n", frontier, err);
             rc = 1;
             break;
         }
-        const double prefill_t1 = bench_now_sec();
+#ifndef DS4_NO_GPU
+        {
+            ds4_gpu_stream_expert_cache_stats_v1 prefill_stats1 = {0};
+            if (!ds4_gpu_stream_expert_cache_snapshot_v1(&prefill_stats1)) {
+                fprintf(stderr, "ds4-bench: failed to snapshot prefill cache counters\n");
+                rc = 1;
+                break;
+            }
+            prefill_cache_hits = prefill_stats1.hits - prefill_stats0.hits;
+            prefill_cache_misses = prefill_stats1.misses - prefill_stats0.misses;
+            prefill_cache_evictions =
+                prefill_stats1.evictions - prefill_stats0.evictions;
+            prefill_expert_loads =
+                prefill_stats1.expert_loads - prefill_stats0.expert_loads;
+            prefill_pread_syscalls =
+                prefill_stats1.pread_syscalls - prefill_stats0.pread_syscalls;
+            prefill_pread_bytes =
+                prefill_stats1.pread_bytes - prefill_stats0.pread_bytes;
+            prefill_pread_ms =
+                prefill_stats1.pread_wall_ms - prefill_stats0.pread_wall_ms;
+            prefill_split_resident_wait_ms =
+                prefill_stats1.split_resident_wait_ms -
+                prefill_stats0.split_resident_wait_ms;
+        }
+#endif
+        if (rc != 0) break;
         const double prefill_sec = prefill_t1 - prefill_t0;
         const int prefill_tokens = frontier - previous;
 
@@ -628,7 +894,7 @@ int main(int argc, char **argv) {
             break;
         }
 
-        if (cfg.gen_tokens > 0 && !distributed) {
+        if (cfg.gen_tokens > 0 && !distributed && !replay_restore) {
             if (ds4_session_save_snapshot(session, &snap, err, sizeof(err)) != 0) {
                 fprintf(stderr, "ds4-bench: snapshot at %d failed: %s\n", frontier, err);
                 rc = 1;
@@ -640,16 +906,23 @@ int main(int argc, char **argv) {
            counters across exactly the gen loop so hit-rate and exposed miss-wait are
            scoped to decode (Metal streaming only; zero elsewhere). */
         uint64_t gen_cache_hits = 0, gen_cache_misses = 0;
+        uint64_t gen_cache_evictions = 0, gen_expert_loads = 0;
+        uint64_t gen_pread_syscalls = 0;
         uint64_t gen_pread_bytes = 0;
+        uint64_t gen_unique_experts = 0;
+        uint64_t gen_unique_bytes = 0;
         double gen_pread_ms = 0.0;
         double gen_split_resident_wait_ms = 0.0;
+        int decode_token_count = 0;
+        double first_token_ready_sec = 0.0;
 #ifndef DS4_NO_GPU
-        uint64_t cache_hits0 = 0, cache_misses0 = 0;
-        uint64_t cache_pread_bytes0 = 0;
-        double cache_pread0 = 0.0, cache_split_resident_wait0 = 0.0;
-        ds4_gpu_stream_expert_cache_stats(&cache_hits0, &cache_misses0,
-                                           &cache_pread_bytes0, &cache_pread0,
-                                           &cache_split_resident_wait0);
+        ds4_gpu_stream_expert_cache_stats_v1 gen_stats0 = {0};
+        if (!ds4_gpu_stream_expert_cache_snapshot_v1(&gen_stats0)) {
+            fprintf(stderr, "ds4-bench: failed to snapshot decode cache counters\n");
+            rc = 1;
+            break;
+        }
+        ds4_gpu_stream_expert_io_measurement_begin();
 #endif
         const double gen_t0 = bench_now_sec();
         for (int i = 0; i < cfg.gen_tokens; i++) {
@@ -658,42 +931,99 @@ int main(int argc, char **argv) {
                 rc = 1;
                 break;
             }
+            const double token_t0 = bench_now_sec();
             const int token = ds4_session_argmax_excluding(session, eos);
             if (token < 0) {
                 fprintf(stderr, "ds4-bench: failed to choose non-EOS token at frontier %d\n", frontier);
                 rc = 1;
                 break;
             }
+            if (i == 0) {
+                /* TTFT stops when the first token is selectable, before its
+                 * eval.  Add this small selection interval to the isolated
+                 * prefill timing, excluding snapshot/evidence serialization. */
+                first_token_ready_sec = bench_now_sec() - gen_t0;
+            }
+            if (decode_token_ids) decode_token_ids[decode_token_count] = token;
             if (ds4_session_eval(session, token, err, sizeof(err)) != 0) {
                 fprintf(stderr, "ds4-bench: decode at frontier %d failed: %s\n", frontier, err);
                 rc = 1;
                 break;
             }
+            decode_token_ms[decode_token_count] =
+                (bench_now_sec() - token_t0) * 1000.0;
+            decode_token_count++;
         }
         const double gen_t1 = bench_now_sec();
 #ifndef DS4_NO_GPU
+        ds4_gpu_stream_expert_io_measurement_end(
+            &gen_unique_experts, &gen_unique_bytes);
         {
-            uint64_t cache_hits1 = 0, cache_misses1 = 0;
-            uint64_t cache_pread_bytes1 = 0;
-            double cache_pread1 = 0.0, cache_split_resident_wait1 = 0.0;
-            ds4_gpu_stream_expert_cache_stats(&cache_hits1, &cache_misses1,
-                                               &cache_pread_bytes1, &cache_pread1,
-                                               &cache_split_resident_wait1);
-            gen_cache_hits = cache_hits1 - cache_hits0;
-            gen_cache_misses = cache_misses1 - cache_misses0;
-            gen_pread_bytes = cache_pread_bytes1 - cache_pread_bytes0;
-            gen_pread_ms = cache_pread1 - cache_pread0;
+            ds4_gpu_stream_expert_cache_stats_v1 gen_stats1 = {0};
+            if (!ds4_gpu_stream_expert_cache_snapshot_v1(&gen_stats1)) {
+                fprintf(stderr, "ds4-bench: failed to snapshot decode cache counters\n");
+                rc = 1;
+                break;
+            }
+            gen_cache_hits = gen_stats1.hits - gen_stats0.hits;
+            gen_cache_misses = gen_stats1.misses - gen_stats0.misses;
+            gen_cache_evictions =
+                gen_stats1.evictions - gen_stats0.evictions;
+            gen_expert_loads =
+                gen_stats1.expert_loads - gen_stats0.expert_loads;
+            gen_pread_syscalls =
+                gen_stats1.pread_syscalls - gen_stats0.pread_syscalls;
+            gen_pread_bytes =
+                gen_stats1.pread_bytes - gen_stats0.pread_bytes;
+            gen_pread_ms =
+                gen_stats1.pread_wall_ms - gen_stats0.pread_wall_ms;
             gen_split_resident_wait_ms =
-                cache_split_resident_wait1 - cache_split_resident_wait0;
+                gen_stats1.split_resident_wait_ms -
+                gen_stats0.split_resident_wait_ms;
         }
 #endif
         if (rc != 0) break;
 
-        if (cfg.gen_tokens == 0) {
+        if (cfg.dump_decode_evidence_dir) {
+            if (decode_token_count != cfg.gen_tokens) {
+                fprintf(stderr,
+                        "ds4-bench: incomplete decode evidence at frontier %d\n",
+                        frontier);
+                rc = 1;
+                break;
+            }
+            /* Both operations deliberately occur after gen_t1.  In particular,
+             * serializing a ~1 MiB vocabulary must never depress reported TPS. */
+            if (ds4_session_copy_logits(session,
+                                        decode_final_logits,
+                                        decode_vocab) != decode_vocab)
+            {
+                fprintf(stderr,
+                        "ds4-bench: failed to copy final decode logits at frontier %d\n",
+                        frontier);
+                rc = 1;
+                break;
+            }
+            const int final_argmax = ds4_session_argmax(session);
+            if (write_decode_evidence_json(&cfg,
+                                           frontier,
+                                           decode_token_ids,
+                                           decode_token_count,
+                                           final_argmax,
+                                           decode_final_logits,
+                                           decode_vocab) != 0)
+            {
+                rc = 1;
+                break;
+            }
+        }
+
+        const bool need_restore = cfg.gen_tokens > 0 && frontier < cfg.ctx_max;
+        if (cfg.gen_tokens == 0 || !need_restore) {
             /* Pure prefill benchmark: leave the live session at the frontier. */
-        } else if (distributed) {
+        } else if (distributed || replay_restore) {
             if (ds4_session_sync(session, &prefix, err, sizeof(err)) != 0) {
-                fprintf(stderr, "ds4-bench: distributed replay restore at %d failed: %s\n", frontier, err);
+                fprintf(stderr, "ds4-bench: replay restore at %d failed: %s\n", frontier, err);
                 rc = 1;
                 break;
             }
@@ -706,27 +1036,101 @@ int main(int argc, char **argv) {
         }
 
         const double gen_sec = gen_t1 - gen_t0;
+        if (decode_token_count > 1) {
+            qsort(decode_token_ms,
+                  (size_t)decode_token_count,
+                  sizeof(decode_token_ms[0]),
+                  compare_double_ascending);
+        }
+        const double gen_tpot_p50_ms = nearest_rank_percentile(
+            decode_token_ms, (size_t)decode_token_count, 0.50);
+        const double gen_tpot_p95_ms = nearest_rank_percentile(
+            decode_token_ms, (size_t)decode_token_count, 0.95);
+        const double ttft_ms =
+            (prefill_sec + first_token_ready_sec) * 1000.0;
+        const uint64_t prefill_lookups =
+            prefill_cache_hits + prefill_cache_misses;
+        const double prefill_hit_rate = prefill_lookups ?
+            (double)prefill_cache_hits / (double)prefill_lookups : 0.0;
+        const double prefill_pread_gib =
+            (double)prefill_pread_bytes / (1024.0 * 1024.0 * 1024.0);
+        const double prefill_unique_expert_gib =
+            (double)prefill_unique_bytes / (1024.0 * 1024.0 * 1024.0);
+        const double prefill_read_amplification = prefill_unique_bytes > 0 ?
+            (double)prefill_pread_bytes / (double)prefill_unique_bytes : 0.0;
+        const double prefill_pread_kib_per_syscall =
+            prefill_pread_syscalls > 0 ?
+                ((double)prefill_pread_bytes / 1024.0) /
+                    (double)prefill_pread_syscalls : 0.0;
+        const double prefill_pread_gib_per_tok = prefill_tokens > 0 ?
+            prefill_pread_gib / (double)prefill_tokens : 0.0;
+        const double prefill_pread_ms_per_tok = prefill_tokens > 0 ?
+            prefill_pread_ms / (double)prefill_tokens : 0.0;
+        const double prefill_split_resident_wait_ms_per_tok =
+            prefill_tokens > 0 ?
+                prefill_split_resident_wait_ms / (double)prefill_tokens : 0.0;
         const uint64_t gen_lookups = gen_cache_hits + gen_cache_misses;
         const double gen_hit_rate = gen_lookups ?
             (double)gen_cache_hits / (double)gen_lookups : 0.0;
+        const double gen_pread_kib_per_syscall =
+            gen_pread_syscalls > 0 ?
+                ((double)gen_pread_bytes / 1024.0) /
+                    (double)gen_pread_syscalls : 0.0;
+        const double gen_pread_gib =
+            (double)gen_pread_bytes / (1024.0 * 1024.0 * 1024.0);
+        const double gen_unique_expert_gib =
+            (double)gen_unique_bytes / (1024.0 * 1024.0 * 1024.0);
+        const double gen_read_amplification = gen_unique_bytes > 0 ?
+            (double)gen_pread_bytes / (double)gen_unique_bytes : 0.0;
         const double gen_pread_gib_per_tok = cfg.gen_tokens > 0 ?
-            ((double)gen_pread_bytes / (1024.0 * 1024.0 * 1024.0)) /
-                (double)cfg.gen_tokens : 0.0;
+            gen_pread_gib / (double)cfg.gen_tokens : 0.0;
         const double gen_pread_ms_per_tok = cfg.gen_tokens > 0 ?
             gen_pread_ms / (double)cfg.gen_tokens : 0.0;
         const double gen_split_resident_wait_ms_per_tok = cfg.gen_tokens > 0 ?
             gen_split_resident_wait_ms / (double)cfg.gen_tokens : 0.0;
         fprintf(out,
-                "%d,%d,%.2f,%d,%.2f,%llu,%.4f,%.6f,%.4f,%.4f\n",
+                "%d,%d,%.2f,%.4f,%.4f,%.4f,%llu,%llu,%llu,%.6f,"
+                "%.6f,%llu,%.3f,%.6f,%.9f,%.4f,%.6f,%.4f,%.6f,"
+                "%d,%.2f,%.4f,%.4f,%.4f,%llu,%.4f,%llu,%llu,%llu,"
+                "%.6f,%.6f,%llu,%.3f,%.6f,%.9f,%.4f,%.4f,%.4f,%.4f\n",
                 frontier,
                 prefill_tokens,
                 prefill_sec > 0.0 ? (double)prefill_tokens / prefill_sec : 0.0,
+                prefill_sec * 1000.0,
+                ttft_ms,
+                prefill_hit_rate,
+                (unsigned long long)prefill_cache_evictions,
+                (unsigned long long)prefill_expert_loads,
+                (unsigned long long)prefill_unique_experts,
+                prefill_unique_expert_gib,
+                prefill_read_amplification,
+                (unsigned long long)prefill_pread_syscalls,
+                prefill_pread_kib_per_syscall,
+                prefill_pread_gib,
+                prefill_pread_gib_per_tok,
+                prefill_pread_ms,
+                prefill_pread_ms_per_tok,
+                prefill_split_resident_wait_ms,
+                prefill_split_resident_wait_ms_per_tok,
                 cfg.gen_tokens,
                 gen_sec > 0.0 ? (double)cfg.gen_tokens / gen_sec : 0.0,
+                gen_sec * 1000.0,
+                gen_tpot_p50_ms,
+                gen_tpot_p95_ms,
                 (unsigned long long)(distributed ? 0 : snap.len),
                 gen_hit_rate,
+                (unsigned long long)gen_cache_evictions,
+                (unsigned long long)gen_expert_loads,
+                (unsigned long long)gen_unique_experts,
+                gen_unique_expert_gib,
+                gen_read_amplification,
+                (unsigned long long)gen_pread_syscalls,
+                gen_pread_kib_per_syscall,
+                gen_pread_gib,
                 gen_pread_gib_per_tok,
+                gen_pread_ms,
                 gen_pread_ms_per_tok,
+                gen_split_resident_wait_ms,
                 gen_split_resident_wait_ms_per_tok);
         fflush(out);
 
@@ -735,6 +1139,9 @@ int main(int argc, char **argv) {
     }
 
     if (out != stdout) fclose(out);
+    free(decode_token_ms);
+    free(decode_token_ids);
+    free(decode_final_logits);
     ds4_session_snapshot_free(&snap);
     ds4_session_free(session);
     ds4_tokens_free(&prompt);

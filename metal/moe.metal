@@ -2000,6 +2000,149 @@ kernel void kernel_mul_mv_addr_q4_K_pair_swiglu_f32(
     (void)tiitg;
 }
 
+/* Host ABI is locked by ds4_qwen_expert_group_route's compile-time size
+ * assertion.  Keeping the schedule record explicit makes the important split
+ * visible here: work is dispatched expert-major, destinations remain
+ * token-major/slot-major. */
+struct ds4_metal_qwen35_expert_group_route {
+    uint32_t expert;
+    uint32_t token_row;
+    uint32_t route_slot;
+    uint32_t canonical_index;
+};
+
+kernel void kernel_mul_mv_addr_q4_K_pair_swiglu_grouped_f32(
+        constant ds4_metal_args_mul_mv_id & args,
+        constant ds4_metal_dsv4_moe_swiglu_weight_args & act,
+        device const ulong * gate_addrs,
+        device const ulong * up_addrs,
+        device const char * src1,
+        device       char * dst_gate,
+        device       char * dst_up,
+        device       char * dst_mid,
+        device const ds4_metal_qwen35_expert_group_route * routes,
+        device const char * weights,
+        threadgroup  char * shmem [[threadgroup(0)]],
+        uint3  tgpig[[threadgroup_position_in_grid]],
+        ushort tiitg[[thread_index_in_threadgroup]],
+        ushort tiisg[[thread_index_in_simdgroup]],
+        ushort sgitg[[simdgroup_index_in_threadgroup]]) {
+    const uint grouped_index = tgpig.z;
+    const ds4_metal_qwen35_expert_group_route route =
+        routes[grouped_index];
+    if (route.expert >= (uint)args.ne02 || route.expert >= 256u ||
+        route.token_row >= (uint)args.nei1 ||
+        route.route_slot >= (uint)args.nei0 ||
+        route.canonical_index !=
+            route.token_row * (uint)args.nei0 + route.route_slot) {
+        return;
+    }
+
+    tgpig.z = 0;
+    device const char *src0_gate_cur =
+        reinterpret_cast<device const char *>(gate_addrs[route.expert]);
+    device const char *src0_up_cur =
+        reinterpret_cast<device const char *>(up_addrs[route.expert]);
+    device const char *src1_cur =
+        src1 + (uint64_t)route.token_row * args.nb12;
+    const uint64_t dst_row = (uint64_t)route.canonical_index * args.ne0;
+    device char *dst_gate_cur = dst_gate + dst_row * sizeof(float);
+    device char *dst_up_cur = dst_up + dst_row * sizeof(float);
+
+    ds4_metal_args_mul_mv args0 = {
+        args.ne00, args.ne01, 1,
+        args.nb00, args.nb01, args.nb02, args.nb02,
+        args.ne10, 1, 1,
+        args.nb10, args.nb11, args.nb12, args.nb12,
+        args.ne0, 1, args.nr0, 1, 1,
+    };
+
+    kernel_mul_mv_q4_K_f32_impl<N_R0_Q4_K>(
+        args0, src0_gate_cur, src1_cur, dst_gate_cur,
+        shmem, tgpig, tiisg, sgitg);
+    kernel_mul_mv_q4_K_f32_impl<N_R0_Q4_K>(
+        args0, src0_up_cur, src1_cur, dst_up_cur,
+        shmem, tgpig, tiisg, sgitg);
+
+    const short NSG = FC_mul_mv_nsg;
+    const int first_row = (tgpig.x * NSG + sgitg) * N_R0_Q4_K;
+    device float *gate_f32 = (device float *)dst_gate_cur;
+    device float *up_f32 = (device float *)dst_up_cur;
+    device float *mid_f32 = (device float *)(
+        dst_mid + (uint64_t)route.canonical_index * act.mid_row_stride);
+    device const float *route_w = (device const float *)(
+        weights + (uint64_t)route.canonical_index * act.weight_stride);
+    const float c = act.clamp_value;
+    const float route_weight = route_w[0];
+
+    if (tiisg == 0) {
+        for (int row = 0;
+             row < N_R0_Q4_K && first_row + row < args.ne0;
+             ++row) {
+            const uint out_row = first_row + row;
+            float g = gate_f32[out_row];
+            float u = up_f32[out_row];
+            if (c > 1.0e-6f) {
+                g = min(g, c);
+                u = clamp(u, -c, c);
+            }
+            const float silu = g / (1.0f + exp(-g));
+            mid_f32[out_row] = silu * u * route_weight;
+        }
+    }
+
+    (void)tiitg;
+}
+
+/* Small model-free contract kernels.  They intentionally do no arithmetic in
+ * the scatter stage, so the host can demand bit identity (including signed
+ * zero and arbitrary finite payloads), then check that reduction observes
+ * canonical route slots 0..7 regardless of the expert-major dispatch order. */
+struct ds4_metal_qwen35_expert_group_test_args {
+    uint32_t route_count;
+    uint32_t n_tokens;
+    uint32_t routes_per_token;
+    uint32_t width;
+};
+
+kernel void kernel_qwen35_expert_group_scatter_test_f32(
+        constant ds4_metal_qwen35_expert_group_test_args & args,
+        device const ds4_metal_qwen35_expert_group_route * routes,
+        device const uint32_t * grouped_bits,
+        device uint32_t * canonical_bits,
+        uint gid [[thread_position_in_grid]]) {
+    const uint grouped = gid / args.width;
+    const uint column = gid - grouped * args.width;
+    if (grouped >= args.route_count || column >= args.width) return;
+    const ds4_metal_qwen35_expert_group_route route = routes[grouped];
+    if (route.canonical_index >= args.route_count ||
+        route.token_row >= args.n_tokens ||
+        route.route_slot >= args.routes_per_token ||
+        route.canonical_index !=
+            route.token_row * args.routes_per_token + route.route_slot) {
+        return;
+    }
+    canonical_bits[route.canonical_index * args.width + column] =
+        grouped_bits[grouped * args.width + column];
+}
+
+kernel void kernel_qwen35_expert_group_reduce_test_f32(
+        constant ds4_metal_qwen35_expert_group_test_args & args,
+        device const float * canonical,
+        device float * reduced,
+        uint gid [[thread_position_in_grid]]) {
+    const uint token = gid / args.width;
+    const uint column = gid - token * args.width;
+    if (token >= args.n_tokens || column >= args.width) return;
+    float sum = 0.0f;
+    /* This order is the numerical contract, not an optimization detail. */
+    for (uint slot = 0; slot < args.routes_per_token; ++slot) {
+        const uint canonical_index = token * args.routes_per_token + slot;
+        sum += canonical[canonical_index * args.width + column];
+    }
+    reduced[token * args.width + column] = sum;
+}
+
 kernel void kernel_q4_gather_slots6(
         constant ds4_metal_q4_gather_slots6_args &args,
         device const char *src_group0,
@@ -3400,7 +3543,9 @@ kernel void kernel_mul_mv_addr_q4_K_sum6_f32(
     uint16_t sc16[4];
     thread const uint8_t *sc8 = (thread const uint8_t *)sc16;
 
-    for (int expert_slot = 0; expert_slot < 6; expert_slot++) {
+    // The historical kernel name says sum6, but the address-table path also
+    // serves Qwen top-8 prefill. The host validates nei0 as either 6 or 8.
+    for (int expert_slot = 0; expert_slot < args.nei0; expert_slot++) {
         const int32_t expert = token_ids[expert_slot];
         if (expert < 0 || expert >= args.ne02 || expert >= 384) {
             return;

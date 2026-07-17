@@ -178,6 +178,24 @@ typedef struct {
 typedef void (*ds4_token_emit_fn)(void *ud, int token);
 typedef void (*ds4_generation_done_fn)(void *ud);
 
+/* Optional exact evidence for Qwen's canonical greedy generation loop.  The
+ * caller owns both buffers and must size them before generation: token_ids for
+ * n_predict entries and final_logits for ds4_engine_vocab_size().  Output
+ * counts and frontier fields are committed only after the live session is
+ * proven to contain every visible token. */
+typedef struct {
+    int   *token_ids;
+    int    token_capacity;
+    float *final_logits;
+    int    final_logits_capacity;
+
+    int prompt_tokens;
+    int token_count;
+    int final_argmax_id;
+    int final_logits_count;
+    int session_position;
+} ds4_qwen_generation_evidence;
+
 typedef struct {
     uint64_t total_bytes;
     uint64_t raw_bytes;
@@ -279,6 +297,25 @@ int ds4_engine_generate_argmax(ds4_engine *e, const ds4_tokens *prompt,
                                void *emit_ud,
                                ds4_session_progress_fn progress,
                                void *progress_ud);
+/* Evidence is supported only by the Qwen canonical argmax path.  Passing NULL
+ * is behaviorally identical to ds4_engine_generate_argmax(). */
+int ds4_engine_generate_argmax_with_evidence(
+        ds4_engine *e, const ds4_tokens *prompt,
+        int n_predict, int ctx_size,
+        ds4_token_emit_fn emit,
+        ds4_generation_done_fn done,
+        void *emit_ud,
+        ds4_session_progress_fn progress,
+        void *progress_ud,
+        ds4_qwen_generation_evidence *evidence);
+/* Publish a complete in-memory snapshot as
+ * ds4.qwen.generation-evidence/1 using a same-directory temporary file and an
+ * atomic rename.  Returns zero on success. */
+int ds4_qwen_generation_evidence_write_json_atomic(
+        const char *path,
+        const ds4_qwen_generation_evidence *evidence,
+        char *err,
+        size_t errlen);
 int ds4_engine_collect_imatrix(ds4_engine *e,
                                const char *dataset_path,
                                const char *output_path,
@@ -403,6 +440,12 @@ int ds4_engine_routed_quant_bits(ds4_engine *e);
 bool ds4_engine_has_output_head(ds4_engine *e);
 bool ds4_engine_has_mtp(ds4_engine *e);
 int ds4_engine_mtp_draft_tokens(ds4_engine *e);
+/* Maximum exact greedy speculative span exposed by the active model/runtime.
+ * This intentionally differs from ds4_engine_mtp_draft_tokens(): Qwen can use
+ * prompt lookup without having an MTP model, while callers need one common
+ * capability gate for the generation loop. */
+int ds4_engine_speculative_draft_tokens(ds4_engine *e);
+bool ds4_engine_is_qwen35(ds4_engine *e);
 const ds4_tokens *ds4_session_tokens(ds4_session *s);
 
 /* Low-level graph slice entry points used by distributed inference.  The

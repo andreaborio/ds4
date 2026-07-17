@@ -39,6 +39,7 @@
 #include "ds4.h"
 #include "ds4_distributed.h"
 #include "ds4_qwen.h"
+#include "ds4_qwen_expert_pack.h"
 #include "ds4_qwen_unicode.h"
 
 #ifndef DS4_NO_GPU
@@ -11912,6 +11913,180 @@ static void print_vec_stats(const char *name, const float *x, uint64_t n) {
         name, minv, maxv, sqrt(ss / (double)n));
 }
 
+/* Qwen optimization switches are diagnostic controls for one release path,
+ * not user-facing semantic modes.  Keeping the mask independent from Metal
+ * lets model-free tests validate campaign configuration without constructing
+ * a 35B graph. */
+typedef enum {
+    QWEN35_FEATURE_MACRO_PREFILL = 1u << 0,
+    QWEN35_FEATURE_PHASE_BUDGET  = 1u << 1,
+    QWEN35_FEATURE_LAYER_PIN     = 1u << 2,
+    QWEN35_FEATURE_IO_OVERLAP    = 1u << 3,
+    QWEN35_FEATURE_EXPERT_GROUP  = 1u << 4,
+    QWEN35_FEATURE_EXPERT_PACK   = 1u << 5,
+    QWEN35_FEATURE_GQA_REUSE     = 1u << 6,
+    QWEN35_FEATURE_PROMPT_LOOKUP = 1u << 7,
+} ds4_qwen35_feature;
+
+#define QWEN35_FEATURE_ALL_EXACT ((uint32_t)( \
+    QWEN35_FEATURE_MACRO_PREFILL | QWEN35_FEATURE_PHASE_BUDGET | \
+    QWEN35_FEATURE_LAYER_PIN | QWEN35_FEATURE_IO_OVERLAP | \
+    QWEN35_FEATURE_EXPERT_GROUP | QWEN35_FEATURE_EXPERT_PACK | \
+    QWEN35_FEATURE_GQA_REUSE | QWEN35_FEATURE_PROMPT_LOOKUP))
+
+/* Updated only when the corresponding production path exists.  The strict
+ * full-stack campaign gate intentionally fails while an implementation phase
+ * is incomplete instead of silently benchmarking a partial stack. */
+#define QWEN35_FEATURE_IMPLEMENTED ((uint32_t)( \
+    QWEN35_FEATURE_MACRO_PREFILL | QWEN35_FEATURE_PHASE_BUDGET | \
+    QWEN35_FEATURE_LAYER_PIN | QWEN35_FEATURE_IO_OVERLAP | \
+    QWEN35_FEATURE_EXPERT_GROUP | QWEN35_FEATURE_EXPERT_PACK | \
+    QWEN35_FEATURE_GQA_REUSE | QWEN35_FEATURE_PROMPT_LOOKUP))
+
+/* Byte geometry for the exact Qwen Metal runtime.  The fixed graph constant
+ * is checked against real tensor allocations by the private Metal lifecycle
+ * test; the other terms are kept symbolic so changes in model geometry fail
+ * visibly instead of silently shrinking host headroom. */
+#define QWEN35_METAL_GRAPH_FIXED_BYTES UINT64_C(83647812)
+#define QWEN35_METAL_GRAPH_CONTEXT_BYTES_PER_TOKEN \
+    ((uint64_t)QWEN35_FULL_ATTENTION_LAYER_COUNT * 2u * \
+         QWEN35_N_HEAD_KV * QWEN35_N_HEAD_DIM * sizeof(float) + \
+     sizeof(float))
+#define QWEN35_HOST_LOGITS_BYTES \
+    ((uint64_t)QWEN35_N_VOCAB * sizeof(float))
+#define QWEN35_RECURRENT_SNAPSHOT_BYTES \
+    ((uint64_t)QWEN35_RECURRENT_LAYER_COUNT * \
+     ((uint64_t)QWEN35_SSM_CONV_CHANNEL * \
+          (QWEN35_SSM_CONV_KERNEL - 1u) + \
+      (uint64_t)QWEN35_SSM_VALUE_HEAD * QWEN35_SSM_STATE * \
+          QWEN35_SSM_STATE) * sizeof(float))
+#define QWEN35_MACRO_BYTES_PER_TOKEN \
+    ((uint64_t)2u * QWEN35_N_EMBD * sizeof(float) + \
+     2u * sizeof(int32_t))
+#define QWEN35_PROMPT_LOOKUP_MAX_DRAFT 8u
+#define QWEN35_PROMPT_INDEX_CAP 32768u
+#define QWEN35_PROMPT_INDEX_ENTRY_BYTES 16u
+#define QWEN35_GQA_REUSE_MIN_CONTEXT 64u
+#define QWEN35_SSD_EXPERT_GROUP_MIN_TOKENS 8u
+#define QWEN35_RESIDENT_EXPERT_GROUP_MIN_TOKENS 32u
+#define QWEN35_MACRO_PREFILL_MAX 8192u
+#define QWEN35_PREFILL_MICRO_TOKENS 64u
+
+/* A suffix that fits one historical micro batch must stay on that path.  In
+ * particular, shrinking a warm decode cache for a 2..64 token agent/tool
+ * continuation costs more than the macro scheduler can recover. */
+static bool qwen35_prefill_suffix_needs_phase(uint32_t suffix_tokens) {
+    return suffix_tokens > QWEN35_PREFILL_MICRO_TOKENS;
+}
+
+static bool qwen35_u64_add(uint64_t a, uint64_t b, uint64_t *out) {
+    if (!out || b > UINT64_MAX - a) return false;
+    *out = a + b;
+    return true;
+}
+
+static bool qwen35_u64_mul(uint64_t a, uint64_t b, uint64_t *out) {
+    if (!out || (a != 0 && b > UINT64_MAX / a)) return false;
+    *out = a * b;
+    return true;
+}
+
+static bool qwen35_metal_persistent_runtime_bytes(
+        uint32_t  context_tokens,
+        uint64_t *bytes_out) {
+    uint64_t context_bytes = 0;
+    uint64_t total = QWEN35_METAL_GRAPH_FIXED_BYTES;
+    return context_tokens != 0 && context_tokens <= QWEN35_CONTEXT_LENGTH &&
+           qwen35_u64_mul(context_tokens,
+                          QWEN35_METAL_GRAPH_CONTEXT_BYTES_PER_TOKEN,
+                          &context_bytes) &&
+           qwen35_u64_add(total, context_bytes, &total) &&
+           qwen35_u64_add(total, QWEN35_HOST_LOGITS_BYTES, &total) &&
+           (*bytes_out = total, true);
+}
+
+static bool qwen35_macro_workspace_bytes(
+        uint32_t  macro_tokens,
+        uint64_t *bytes_out) {
+    uint64_t hidden_and_inputs = 0;
+    uint64_t host_inputs = 0;
+    uint64_t host_views = 0;
+    const uint64_t chunks =
+        (macro_tokens + QWEN35_PREFILL_MICRO_TOKENS - 1u) /
+        QWEN35_PREFILL_MICRO_TOKENS;
+    return macro_tokens != 0 &&
+           macro_tokens <= QWEN35_MACRO_PREFILL_MAX &&
+           qwen35_u64_mul(macro_tokens, QWEN35_MACRO_BYTES_PER_TOKEN,
+                          &hidden_and_inputs) &&
+           /* write_inputs() holds canonical host IDs and positions until both
+            * complete Metal uploads return.  They coexist with the device
+            * token/position tensors already included above. */
+           qwen35_u64_mul(macro_tokens, 2u * sizeof(int32_t),
+                          &host_inputs) &&
+           /* Four host pointer tables are live for every 64-row view.  The
+            * opaque view objects themselves are allocator noise covered by
+            * the fixed request headroom, but these explicit arrays are part
+            * of the deterministic phase peak. */
+           qwen35_u64_mul(chunks, 4u * sizeof(void *), &host_views) &&
+           qwen35_u64_add(QWEN35_RECURRENT_SNAPSHOT_BYTES,
+                          hidden_and_inputs, bytes_out) &&
+           qwen35_u64_add(*bytes_out, host_inputs, bytes_out) &&
+           qwen35_u64_add(*bytes_out, host_views, bytes_out);
+}
+
+static bool qwen35_prompt_lookup_workspace_bytes(
+        uint32_t  draft_tokens,
+        uint64_t *bytes_out) {
+    uint64_t logits_bytes = 0;
+    uint64_t hidden_input_and_tops = 0;
+    uint64_t total = QWEN35_RECURRENT_SNAPSHOT_BYTES;
+    return draft_tokens != 0 &&
+           draft_tokens <= QWEN35_PROMPT_LOOKUP_MAX_DRAFT &&
+           qwen35_u64_mul(draft_tokens, QWEN35_HOST_LOGITS_BYTES,
+                          &logits_bytes) &&
+           qwen35_u64_mul(
+               draft_tokens,
+               QWEN35_MACRO_BYTES_PER_TOKEN + sizeof(int32_t),
+               &hidden_input_and_tops) &&
+           qwen35_u64_add(total, logits_bytes, &total) &&
+           qwen35_u64_add(total, hidden_input_and_tops, bytes_out);
+}
+
+static bool qwen35_prompt_lookup_persistent_bytes(uint64_t *bytes_out) {
+    uint64_t verifier_bytes = 0;
+    uint64_t index_bytes = 0;
+    return bytes_out &&
+           qwen35_prompt_lookup_workspace_bytes(
+               QWEN35_PROMPT_LOOKUP_MAX_DRAFT, &verifier_bytes) &&
+           qwen35_u64_mul(QWEN35_PROMPT_INDEX_CAP,
+                          QWEN35_PROMPT_INDEX_ENTRY_BYTES, &index_bytes) &&
+           qwen35_u64_add(verifier_bytes, index_bytes, bytes_out);
+}
+
+typedef struct {
+    uint32_t implemented;
+    uint32_t expected;
+    uint32_t ablated;
+    uint32_t enabled;
+    bool require_full_stack;
+} ds4_qwen35_runtime_features;
+
+typedef struct {
+    FILE *fp;
+    pthread_mutex_t mu;
+    uint64_t sequence;
+    double last_flush_sec;
+    uint32_t records_since_flush;
+    bool mutex_ready;
+    bool failed;
+} ds4_qwen35_telemetry;
+
+typedef struct {
+    uint32_t accepted;
+    int deferred_token;
+    bool deferred_valid;
+} qwen35_prompt_verdict;
+
 #ifndef DS4_NO_GPU
 /*
  * Apple Metal stores the persistent attention-compressed KV cache in F16.  The
@@ -11949,7 +12124,11 @@ enum {
     QWEN35_GPU_MOE_SPLIT_WIDTH = QWEN35_N_EXPERT_USED / 2,
     /* One 64-token resident chunk reaches the existing Q8/TensorOps and
      * routed mm_id fast paths while adding only a small fixed scratch arena. */
-    QWEN35_GPU_PREFILL_CAP = 64,
+    QWEN35_GPU_PREFILL_CAP = QWEN35_PREFILL_MICRO_TOKENS,
+    /* The macro scheduler keeps only hidden rows at macro width; every other
+     * scratch tensor remains capped at 64 rows.  Eight thousand tokens need
+     * 128 MiB for both F32 planes, small enough for the guarded 16 GiB plan. */
+    QWEN35_GPU_MACRO_PREFILL_MAX = QWEN35_MACRO_PREFILL_MAX,
 };
 
 DS4_STATIC_ASSERT(ds4_qwen35_gpu_moe_top8,
@@ -11958,6 +12137,12 @@ DS4_STATIC_ASSERT(ds4_qwen35_gpu_moe_split_4x2,
                   QWEN35_GPU_MOE_SPLIT_WIDTH == 4 &&
                   QWEN35_GPU_MOE_SPLIT_COUNT * QWEN35_GPU_MOE_SPLIT_WIDTH ==
                       QWEN35_N_EXPERT_USED);
+DS4_STATIC_ASSERT(ds4_qwen35_graph_context_geometry,
+                  QWEN35_METAL_GRAPH_CONTEXT_BYTES_PER_TOKEN == 40964u);
+DS4_STATIC_ASSERT(ds4_qwen35_recurrent_snapshot_geometry,
+                  QWEN35_RECURRENT_SNAPSHOT_BYTES == UINT64_C(65863680));
+DS4_STATIC_ASSERT(ds4_qwen35_macro_row_geometry,
+                  QWEN35_MACRO_BYTES_PER_TOKEN == 16392u);
 
 typedef struct {
     uint32_t ctx_capacity;
@@ -12046,6 +12231,34 @@ typedef struct {
     ds4_gpu_tensor *logits;
 } ds4_qwen35_gpu_graph;
 
+typedef struct {
+    uint32_t n_token;
+    uint32_t n_chunk;
+    ds4_gpu_tensor *token_ids;
+    ds4_gpu_tensor *positions;
+    ds4_gpu_tensor *hidden[2];
+    ds4_gpu_tensor *state_snapshot;
+    ds4_gpu_tensor **token_view;
+    ds4_gpu_tensor **position_view;
+    ds4_gpu_tensor **hidden_view[2];
+    uint64_t conv_offset[QWEN35_N_LAYER];
+    uint64_t recurrent_offset[QWEN35_N_LAYER];
+    uint64_t snapshot_bytes;
+    bool snapshot_valid;
+} ds4_qwen35_macro_workspace;
+
+typedef struct {
+    ds4_qwen35_macro_workspace macro;
+    ds4_gpu_tensor *logits;
+    ds4_gpu_tensor *tops;
+    ds4_gpu_tensor *logits_view[QWEN35_PROMPT_LOOKUP_MAX_DRAFT];
+    ds4_gpu_tensor *top_view[QWEN35_PROMPT_LOOKUP_MAX_DRAFT];
+    uint32_t capacity;
+} ds4_qwen35_spec_workspace;
+
+static bool qwen35_gpu_graph_state_allocated(
+        const ds4_qwen35_gpu_graph *g);
+
 static bool qwen35_gpu_checked_mul_u64(
         uint64_t  a,
         uint64_t  b,
@@ -12080,6 +12293,248 @@ static ds4_gpu_tensor *qwen35_gpu_tensor_alloc_shape(
         return NULL;
     }
     return ds4_gpu_tensor_alloc(bytes);
+}
+
+static void qwen35_gpu_macro_workspace_free(
+        ds4_qwen35_macro_workspace *w) {
+    if (!w) return;
+    for (uint32_t chunk = 0; chunk < w->n_chunk; chunk++) {
+        if (w->hidden_view[1]) {
+            ds4_gpu_tensor_free(w->hidden_view[1][chunk]);
+        }
+        if (w->hidden_view[0]) {
+            ds4_gpu_tensor_free(w->hidden_view[0][chunk]);
+        }
+        if (w->position_view) {
+            ds4_gpu_tensor_free(w->position_view[chunk]);
+        }
+        if (w->token_view) {
+            ds4_gpu_tensor_free(w->token_view[chunk]);
+        }
+    }
+    free(w->hidden_view[1]);
+    free(w->hidden_view[0]);
+    free(w->position_view);
+    free(w->token_view);
+    ds4_gpu_tensor_free(w->state_snapshot);
+    ds4_gpu_tensor_free(w->hidden[1]);
+    ds4_gpu_tensor_free(w->hidden[0]);
+    ds4_gpu_tensor_free(w->positions);
+    ds4_gpu_tensor_free(w->token_ids);
+    memset(w, 0, sizeof(*w));
+}
+
+static bool qwen35_gpu_macro_workspace_alloc(
+        ds4_qwen35_macro_workspace *w,
+        uint32_t                    n_token) {
+    if (!w || w->n_token != 0 || n_token == 0 ||
+        n_token > QWEN35_GPU_MACRO_PREFILL_MAX) {
+        return false;
+    }
+
+    ds4_qwen35_macro_workspace next = {0};
+    next.n_token = n_token;
+    next.n_chunk =
+        (n_token + QWEN35_GPU_PREFILL_CAP - 1u) /
+        QWEN35_GPU_PREFILL_CAP;
+    for (uint32_t il = 0; il < QWEN35_N_LAYER; il++) {
+        next.conv_offset[il] = UINT64_MAX;
+        next.recurrent_offset[il] = UINT64_MAX;
+        if (ds4_qwen35_layer_is_full_attention(il)) continue;
+
+        const uint64_t conv_bytes =
+            (uint64_t)QWEN35_SSM_CONV_CHANNEL *
+            (QWEN35_SSM_CONV_KERNEL - 1u) * sizeof(float);
+        const uint64_t recurrent_bytes =
+            (uint64_t)QWEN35_SSM_VALUE_HEAD * QWEN35_SSM_STATE *
+            QWEN35_SSM_STATE * sizeof(float);
+        next.conv_offset[il] = next.snapshot_bytes;
+        if (!qwen35_gpu_checked_add_u64(
+                next.snapshot_bytes, conv_bytes, &next.snapshot_bytes)) {
+            return false;
+        }
+        next.recurrent_offset[il] = next.snapshot_bytes;
+        if (!qwen35_gpu_checked_add_u64(
+                next.snapshot_bytes, recurrent_bytes,
+                &next.snapshot_bytes)) {
+            return false;
+        }
+    }
+
+    next.token_ids = qwen35_gpu_tensor_alloc_shape(
+        sizeof(int32_t), n_token, 1, 1, 1);
+    next.positions = qwen35_gpu_tensor_alloc_shape(
+        sizeof(int32_t), n_token, 1, 1, 1);
+    next.hidden[0] = qwen35_gpu_tensor_alloc_shape(
+        sizeof(float), n_token, QWEN35_N_EMBD, 1, 1);
+    next.hidden[1] = qwen35_gpu_tensor_alloc_shape(
+        sizeof(float), n_token, QWEN35_N_EMBD, 1, 1);
+    next.state_snapshot = ds4_gpu_tensor_alloc(next.snapshot_bytes);
+    next.token_view = calloc(next.n_chunk, sizeof(next.token_view[0]));
+    next.position_view = calloc(
+        next.n_chunk, sizeof(next.position_view[0]));
+    next.hidden_view[0] = calloc(
+        next.n_chunk, sizeof(next.hidden_view[0][0]));
+    next.hidden_view[1] = calloc(
+        next.n_chunk, sizeof(next.hidden_view[1][0]));
+    if (!next.token_ids || !next.positions || !next.hidden[0] ||
+        !next.hidden[1] || !next.state_snapshot || !next.token_view ||
+        !next.position_view || !next.hidden_view[0] ||
+        !next.hidden_view[1]) {
+        qwen35_gpu_macro_workspace_free(&next);
+        return false;
+    }
+
+    for (uint32_t chunk = 0; chunk < next.n_chunk; chunk++) {
+        const uint32_t first = chunk * QWEN35_GPU_PREFILL_CAP;
+        const uint32_t remaining = n_token - first;
+        const uint32_t rows = remaining > QWEN35_GPU_PREFILL_CAP
+            ? QWEN35_GPU_PREFILL_CAP : remaining;
+        const uint64_t scalar_offset =
+            (uint64_t)first * sizeof(int32_t);
+        const uint64_t scalar_bytes =
+            (uint64_t)rows * sizeof(int32_t);
+        const uint64_t hidden_offset =
+            (uint64_t)first * QWEN35_N_EMBD * sizeof(float);
+        const uint64_t hidden_bytes =
+            (uint64_t)rows * QWEN35_N_EMBD * sizeof(float);
+        next.token_view[chunk] = ds4_gpu_tensor_view(
+            next.token_ids, scalar_offset, scalar_bytes);
+        next.position_view[chunk] = ds4_gpu_tensor_view(
+            next.positions, scalar_offset, scalar_bytes);
+        next.hidden_view[0][chunk] = ds4_gpu_tensor_view(
+            next.hidden[0], hidden_offset, hidden_bytes);
+        next.hidden_view[1][chunk] = ds4_gpu_tensor_view(
+            next.hidden[1], hidden_offset, hidden_bytes);
+        if (!next.token_view[chunk] || !next.position_view[chunk] ||
+            !next.hidden_view[0][chunk] || !next.hidden_view[1][chunk]) {
+            qwen35_gpu_macro_workspace_free(&next);
+            return false;
+        }
+    }
+
+    *w = next;
+    return true;
+}
+
+static bool qwen35_gpu_macro_workspace_write_inputs(
+        ds4_qwen35_macro_workspace *w,
+        const int                  *tokens,
+        uint32_t                    position) {
+    if (!w || !tokens || !w->token_ids || !w->positions ||
+        w->n_token == 0 || position > UINT32_MAX - w->n_token) {
+        return false;
+    }
+
+    int32_t *token_ids = malloc((size_t)w->n_token * sizeof(token_ids[0]));
+    int32_t *positions = malloc((size_t)w->n_token * sizeof(positions[0]));
+    if (!token_ids || !positions) {
+        free(positions);
+        free(token_ids);
+        return false;
+    }
+    bool ok = true;
+    for (uint32_t i = 0; i < w->n_token; i++) {
+        if (tokens[i] < 0 ||
+            (uint32_t)tokens[i] >= QWEN35_N_VALID_TOKEN) {
+            ok = false;
+            break;
+        }
+        token_ids[i] = tokens[i];
+        positions[i] = (int32_t)(position + i);
+    }
+    const uint64_t bytes =
+        (uint64_t)w->n_token * sizeof(token_ids[0]);
+    if (ok) {
+        ok = ds4_gpu_tensor_write(w->token_ids, 0, token_ids, bytes) != 0 &&
+             ds4_gpu_tensor_write(w->positions, 0, positions, bytes) != 0;
+    }
+    free(positions);
+    free(token_ids);
+    return ok;
+}
+
+static bool qwen35_gpu_macro_state_copy(
+        ds4_qwen35_gpu_graph       *g,
+        ds4_qwen35_macro_workspace *w,
+        bool                        restore) {
+    if (!qwen35_gpu_graph_state_allocated(g) || !w ||
+        !w->state_snapshot || w->snapshot_bytes == 0) {
+        return false;
+    }
+
+    bool ok = ds4_gpu_begin_commands() != 0;
+    for (uint32_t il = 0; ok && il < QWEN35_N_LAYER; il++) {
+        if (ds4_qwen35_layer_is_full_attention(il)) continue;
+        const uint64_t conv_bytes = ds4_gpu_tensor_bytes(g->conv[il]);
+        const uint64_t recurrent_bytes =
+            ds4_gpu_tensor_bytes(g->recurrent[il]);
+        if (restore) {
+            ok = ds4_gpu_tensor_copy(
+                     g->conv[il], 0,
+                     w->state_snapshot, w->conv_offset[il],
+                     conv_bytes) != 0 &&
+                 ds4_gpu_tensor_copy(
+                     g->recurrent[il], 0,
+                     w->state_snapshot, w->recurrent_offset[il],
+                     recurrent_bytes) != 0;
+        } else {
+            ok = ds4_gpu_tensor_copy(
+                     w->state_snapshot, w->conv_offset[il],
+                     g->conv[il], 0, conv_bytes) != 0 &&
+                 ds4_gpu_tensor_copy(
+                     w->state_snapshot, w->recurrent_offset[il],
+                     g->recurrent[il], 0, recurrent_bytes) != 0;
+        }
+    }
+    if (ok) ok = ds4_gpu_end_commands() != 0;
+    if (!ok) (void)ds4_gpu_synchronize();
+    if (ok && !restore) w->snapshot_valid = true;
+    return ok;
+}
+
+static void qwen35_gpu_spec_workspace_free(
+        ds4_qwen35_spec_workspace *w) {
+    if (!w) return;
+    for (uint32_t i = 0; i < QWEN35_PROMPT_LOOKUP_MAX_DRAFT; i++) {
+        ds4_gpu_tensor_free(w->top_view[i]);
+        ds4_gpu_tensor_free(w->logits_view[i]);
+    }
+    ds4_gpu_tensor_free(w->tops);
+    ds4_gpu_tensor_free(w->logits);
+    qwen35_gpu_macro_workspace_free(&w->macro);
+    memset(w, 0, sizeof(*w));
+}
+
+static bool qwen35_gpu_spec_workspace_alloc(
+        ds4_qwen35_spec_workspace *w,
+        uint32_t                   n_token) {
+    if (!w || w->macro.n_token != 0 || n_token == 0 ||
+        n_token > QWEN35_PROMPT_LOOKUP_MAX_DRAFT ||
+        !qwen35_gpu_macro_workspace_alloc(&w->macro, n_token)) {
+        return false;
+    }
+
+    const uint64_t logits_row_bytes = QWEN35_HOST_LOGITS_BYTES;
+    w->logits = qwen35_gpu_tensor_alloc_shape(
+        sizeof(float), n_token, QWEN35_N_VOCAB, 1, 1);
+    w->tops = qwen35_gpu_tensor_alloc_shape(
+        sizeof(int32_t), n_token, 1, 1, 1);
+    bool ok = w->logits && w->tops;
+    for (uint32_t i = 0; ok && i < n_token; i++) {
+        w->logits_view[i] = ds4_gpu_tensor_view(
+            w->logits, (uint64_t)i * logits_row_bytes,
+            logits_row_bytes);
+        w->top_view[i] = ds4_gpu_tensor_view(
+            w->tops, (uint64_t)i * sizeof(int32_t), sizeof(int32_t));
+        ok = w->logits_view[i] && w->top_view[i];
+    }
+    if (!ok) {
+        qwen35_gpu_spec_workspace_free(w);
+        return false;
+    }
+    w->capacity = n_token;
+    return true;
 }
 
 static void qwen35_gpu_graph_free(ds4_qwen35_gpu_graph *g) {
@@ -12319,6 +12774,16 @@ static bool qwen35_gpu_graph_validate_range(
            n_token <= g->ctx_capacity - position;
 }
 
+static bool qwen35_gpu_graph_validate_macro_range(
+        const ds4_qwen35_gpu_graph *g,
+        uint32_t                    position,
+        uint32_t                    n_token) {
+    return n_token != 0 && n_token <= QWEN35_GPU_MACRO_PREFILL_MAX &&
+           qwen35_gpu_graph_state_allocated(g) && g->state_valid &&
+           position == g->n_tokens && position <= g->ctx_capacity &&
+           n_token <= g->ctx_capacity - position;
+}
+
 static bool qwen35_gpu_graph_advance(
         ds4_qwen35_gpu_graph *g,
         uint32_t              position) {
@@ -12332,6 +12797,17 @@ static bool qwen35_gpu_graph_advance_range(
         uint32_t              position,
         uint32_t              n_token) {
     if (!qwen35_gpu_graph_validate_range(g, position, n_token)) return false;
+    g->n_tokens = position + n_token;
+    return true;
+}
+
+static bool qwen35_gpu_graph_advance_macro_range(
+        ds4_qwen35_gpu_graph *g,
+        uint32_t              position,
+        uint32_t              n_token) {
+    if (!qwen35_gpu_graph_validate_macro_range(g, position, n_token)) {
+        return false;
+    }
     g->n_tokens = position + n_token;
     return true;
 }
@@ -12961,7 +13437,10 @@ static bool qwen35_gpu_encode_full_attention_one(
         ds4_gpu_tensor                 *attention_out,
         uint32_t                        layer_index,
         uint32_t                        position,
-        bool                           *state_mutated) {
+        bool                           *state_mutated,
+        bool                            gqa_reuse,
+        ds4_session_progress_fn         activity,
+        void                           *activity_ud) {
     if (!graph || !model || !layer || !input || !attention_out ||
         !state_mutated || layer_index >= QWEN35_N_LAYER ||
         !ds4_qwen35_layer_is_full_attention(layer_index) ||
@@ -13077,8 +13556,9 @@ static bool qwen35_gpu_encode_full_attention_one(
                  cache_row_bytes) != 0;
     }
     QWEN35_PROFILE_ATTN_STAGE("kv_cache");
+    int gqa_reuse_used = 0;
     if (ok) {
-        ok = ds4_gpu_qwen35_gqa_decode_tensor(
+        ok = ds4_gpu_qwen35_gqa_decode_select_tensor(
                  graph->heads,
                  graph->query,
                  graph->full_attn_key[layer_index],
@@ -13086,7 +13566,21 @@ static bool qwen35_gpu_encode_full_attention_one(
                  position + 1u,
                  QWEN35_N_HEAD,
                  QWEN35_N_HEAD_KV,
-                 QWEN35_N_HEAD_DIM) != 0;
+                 QWEN35_N_HEAD_DIM,
+                 gqa_reuse ? 1 : 0,
+                 &gqa_reuse_used) != 0;
+        if (ok && gqa_reuse &&
+            position + 1u >= QWEN35_GQA_REUSE_MIN_CONTEXT &&
+            !gqa_reuse_used) {
+            ok = false;
+            if (activity) {
+                activity(activity_ud, "campaign_invalid",
+                         (int)layer_index + 1, QWEN35_N_LAYER);
+            }
+        } else if (ok && gqa_reuse_used && activity) {
+            activity(activity_ud, "gqa_reuse",
+                     (int)layer_index + 1, QWEN35_N_LAYER);
+        }
     }
     QWEN35_PROFILE_ATTN_STAGE("gqa");
     if (ok) {
@@ -13115,7 +13609,10 @@ static bool qwen35_gpu_encode_ffn_one(
         const ds4_qwen35_layer_weights *layer,
         ds4_gpu_tensor                 *hidden,
         uint32_t                        layer_index,
-        uint32_t                        position) {
+        uint32_t                        position,
+        bool                            io_overlap,
+        ds4_session_progress_fn         activity,
+        void                           *activity_ud) {
     if (!graph || !model || !layer || !hidden ||
         layer_index >= QWEN35_N_LAYER) {
         return false;
@@ -13177,6 +13674,44 @@ static bool qwen35_gpu_encode_ffn_one(
     }
     QWEN35_PROFILE_FFN_STAGE("router_top8");
 
+    ds4_gpu_qwen35_stream_io_ticket io_ticket = {0};
+    if (ok && io_overlap) {
+        const ds4_gpu_stream_expert_table stream_table = {
+            .model_map = model->map,
+            .model_size = model->size,
+            .layer = layer_index,
+            .n_total_expert = QWEN35_N_EXPERT,
+            .gate_offset = layer->ffn_gate_exps->abs_offset,
+            .up_offset = layer->ffn_up_exps->abs_offset,
+            .down_offset = layer->ffn_down_exps->abs_offset,
+            .gate_expert_bytes = gate_expert_bytes,
+            .down_expert_bytes = down_expert_bytes,
+        };
+        ok = ds4_gpu_qwen35_stream_batch_route_ready(
+                 &stream_table, graph->router_selected, 1u,
+                 QWEN35_N_EXPERT_USED, &io_ticket) != 0 &&
+             io_ticket.generation != 0;
+        if (ok && io_ticket.missing_experts != 0 &&
+            !io_ticket.asynchronous) {
+            /* A synchronous pread is exact, but calling it "overlap" would
+             * certify a partial stack.  Fail this leg and let the explicit
+             * io_overlap ablation exercise the synchronous implementation. */
+            (void)ds4_gpu_qwen35_stream_batch_abort(
+                io_ticket.generation);
+            memset(&io_ticket, 0, sizeof(io_ticket));
+            ok = false;
+        }
+        if (activity) {
+            activity(activity_ud, ok ? "router_ready" : "campaign_invalid",
+                     (int)layer_index + 1, QWEN35_N_LAYER);
+            if (ok) {
+                activity(activity_ud, "expert_io_begin",
+                         (int)io_ticket.missing_experts,
+                         (int)io_ticket.unique_experts);
+            }
+        }
+    }
+
     /* The shared expert is independent of the routed SSD read and remains on
      * the same command timeline.  Preserve the existing fused Q8 gate/up path
      * when available; Qwen has no SwiGLU clamp, hence limit=0. */
@@ -13235,6 +13770,20 @@ static bool qwen35_gpu_encode_ffn_one(
                  true) != 0;
     }
     QWEN35_PROFILE_FFN_STAGE("shared_gate_apply");
+    if (ok && io_ticket.generation != 0) {
+        if (activity) {
+            activity(activity_ud, "shared_done",
+                     (int)layer_index + 1, QWEN35_N_LAYER);
+        }
+        ok = ds4_gpu_qwen35_stream_batch_finish(
+                 io_ticket.generation) != 0;
+        if (activity) {
+            activity(activity_ud,
+                     ok ? "expert_io_ready" : "campaign_invalid",
+                     (int)io_ticket.missing_experts,
+                     (int)io_ticket.unique_experts);
+        }
+    }
     if (ok) {
         ok = ds4_gpu_qwen35_routed_moe_top8_tensor(
                  graph->moe_out,
@@ -13270,6 +13819,15 @@ static bool qwen35_gpu_encode_ffn_one(
                  layer_index,
                  true) != 0;
     }
+    if (io_ticket.generation != 0 && !ok) {
+        /* abort() is also safe after finish(): if routed-MoE already consumed
+         * the generation it simply reports no pending owner. */
+        (void)ds4_gpu_qwen35_stream_batch_abort(io_ticket.generation);
+    }
+    if (ok && io_ticket.generation != 0 && activity) {
+        activity(activity_ud, "routed_done",
+                 (int)layer_index + 1, QWEN35_N_LAYER);
+    }
     QWEN35_PROFILE_FFN_STAGE("routed_moe");
     if (ok) {
         ok = ds4_gpu_add_tensor(
@@ -13285,6 +13843,10 @@ static bool qwen35_gpu_encode_ffn_one(
                  hidden,
                  graph->attn_out,
                  QWEN35_N_EMBD) != 0;
+    }
+    if (ok && io_ticket.generation != 0 && activity) {
+        activity(activity_ud, "reduce_done",
+                 (int)layer_index + 1, QWEN35_N_LAYER);
     }
     QWEN35_PROFILE_FFN_STAGE("residual");
 #undef QWEN35_PROFILE_FFN_STAGE
@@ -13391,12 +13953,17 @@ static bool qwen35_gpu_encode_full_attention_batch(
         const ds4_model                *model,
         const ds4_qwen35_layer_weights *layer,
         const ds4_gpu_tensor           *input,
+        const ds4_gpu_tensor           *positions,
         ds4_gpu_tensor                 *attention_out,
         uint32_t                        layer_index,
         uint32_t                        position,
         uint32_t                        n_token,
-        bool                           *state_mutated) {
-    if (!graph || !model || !layer || !input || !attention_out ||
+        bool                           *state_mutated,
+        bool                            gqa_reuse,
+        ds4_session_progress_fn         activity,
+        void                           *activity_ud) {
+    if (!graph || !model || !layer || !input || !positions ||
+        !attention_out ||
         !state_mutated || n_token == 0 ||
         n_token > QWEN35_GPU_PREFILL_CAP ||
         layer_index >= QWEN35_N_LAYER ||
@@ -13462,7 +14029,7 @@ static bool qwen35_gpu_encode_full_attention_batch(
     if (ok) {
         ok = ds4_gpu_qwen35_rope_prefix_batch_tensor(
                  graph->batch_query,
-                 graph->batch_positions,
+                 positions,
                  n_token,
                  QWEN35_N_HEAD,
                  QWEN35_N_HEAD_DIM,
@@ -13472,7 +14039,7 @@ static bool qwen35_gpu_encode_full_attention_batch(
     if (ok) {
         ok = ds4_gpu_qwen35_rope_prefix_batch_tensor(
                  graph->batch_key,
-                 graph->batch_positions,
+                 positions,
                  n_token,
                  QWEN35_N_HEAD_KV,
                  QWEN35_N_HEAD_DIM,
@@ -13500,8 +14067,9 @@ static bool qwen35_gpu_encode_full_attention_batch(
                  0,
                  cache_bytes) != 0;
     }
+    int gqa_reuse_used = 0;
     if (ok) {
-        ok = ds4_gpu_qwen35_gqa_prefill_tensor(
+        ok = ds4_gpu_qwen35_gqa_prefill_select_tensor(
                  graph->batch_heads,
                  graph->batch_query,
                  graph->full_attn_key[layer_index],
@@ -13510,7 +14078,21 @@ static bool qwen35_gpu_encode_full_attention_batch(
                  n_token,
                  QWEN35_N_HEAD,
                  QWEN35_N_HEAD_KV,
-                 QWEN35_N_HEAD_DIM) != 0;
+                 QWEN35_N_HEAD_DIM,
+                 gqa_reuse ? 1 : 0,
+                 &gqa_reuse_used) != 0;
+        if (ok && gqa_reuse &&
+            position + n_token >= QWEN35_GQA_REUSE_MIN_CONTEXT &&
+            !gqa_reuse_used) {
+            ok = false;
+            if (activity) {
+                activity(activity_ud, "campaign_invalid",
+                         (int)layer_index + 1, QWEN35_N_LAYER);
+            }
+        } else if (ok && gqa_reuse_used && activity) {
+            activity(activity_ud, "gqa_reuse",
+                     (int)layer_index + 1, QWEN35_N_LAYER);
+        }
     }
     if (ok) {
         ok = ds4_gpu_qwen35_sigmoid_mul_tensor(
@@ -13535,7 +14117,12 @@ static bool qwen35_gpu_encode_ffn_batch(
         const ds4_qwen35_layer_weights *layer,
         ds4_gpu_tensor                 *hidden,
         uint32_t                        layer_index,
-        uint32_t                        n_token) {
+        uint32_t                        n_token,
+        bool                            io_overlap,
+        bool                            expert_group,
+        uint32_t                        expert_group_min_tokens,
+        ds4_session_progress_fn         activity,
+        void                           *activity_ud) {
     if (!graph || !model || !layer || !hidden || n_token == 0 ||
         n_token > QWEN35_GPU_PREFILL_CAP ||
         layer_index >= QWEN35_N_LAYER) {
@@ -13567,6 +14154,12 @@ static bool qwen35_gpu_encode_ffn_batch(
         gate_expert_bytes / QWEN35_N_FF_EXP;
     const uint64_t down_row_bytes =
         down_expert_bytes / QWEN35_N_EMBD;
+    /* Do not merely relax the campaign assertion below the crossover.  The
+     * request itself selects backend kernels: on resident Metal, asking for
+     * grouping at 8..31 rows would disable the established paired matvec even
+     * though mm_id grouping starts only at 32. */
+    const bool request_expert_group =
+        expert_group && n_token >= expert_group_min_tokens;
 
     bool ok = ds4_gpu_rms_norm_weight_rows_tensor(
                   graph->batch_norm, hidden, model->map, model->size,
@@ -13584,6 +14177,42 @@ static bool qwen35_gpu_encode_ffn_batch(
                  graph->batch_router_weight,
                  graph->batch_router_logits,
                  n_token) != 0;
+    }
+
+    ds4_gpu_qwen35_stream_io_ticket io_ticket = {0};
+    if (ok && io_overlap) {
+        const ds4_gpu_stream_expert_table stream_table = {
+            .model_map = model->map,
+            .model_size = model->size,
+            .layer = layer_index,
+            .n_total_expert = QWEN35_N_EXPERT,
+            .gate_offset = layer->ffn_gate_exps->abs_offset,
+            .up_offset = layer->ffn_up_exps->abs_offset,
+            .down_offset = layer->ffn_down_exps->abs_offset,
+            .gate_expert_bytes = gate_expert_bytes,
+            .down_expert_bytes = down_expert_bytes,
+        };
+        ok = ds4_gpu_qwen35_stream_batch_route_ready_select(
+                 &stream_table, graph->batch_router_selected, n_token,
+                 QWEN35_N_EXPERT_USED, request_expert_group ? 1 : 0,
+                 &io_ticket) != 0 &&
+             io_ticket.generation != 0;
+        if (ok && io_ticket.missing_experts != 0 &&
+            !io_ticket.asynchronous) {
+            (void)ds4_gpu_qwen35_stream_batch_abort(
+                io_ticket.generation);
+            memset(&io_ticket, 0, sizeof(io_ticket));
+            ok = false;
+        }
+        if (activity) {
+            activity(activity_ud, ok ? "router_ready" : "campaign_invalid",
+                     (int)layer_index + 1, QWEN35_N_LAYER);
+            if (ok) {
+                activity(activity_ud, "expert_io_begin",
+                         (int)io_ticket.missing_experts,
+                         (int)io_ticket.unique_experts);
+            }
+        }
     }
     if (ok) {
         ok = qwen35_gpu_matmul_dense_pair_batch(
@@ -13629,9 +14258,24 @@ static bool qwen35_gpu_encode_ffn_batch(
                  n_token,
                  QWEN35_N_EMBD) != 0;
     }
+    if (ok && io_ticket.generation != 0) {
+        if (activity) {
+            activity(activity_ud, "shared_done",
+                     (int)layer_index + 1, QWEN35_N_LAYER);
+        }
+        ok = ds4_gpu_qwen35_stream_batch_finish(
+                 io_ticket.generation) != 0;
+        if (activity) {
+            activity(activity_ud,
+                     ok ? "expert_io_ready" : "campaign_invalid",
+                     (int)io_ticket.missing_experts,
+                     (int)io_ticket.unique_experts);
+        }
+    }
     if (ok) {
         bool mid_is_f16 = false;
-        ok = ds4_gpu_routed_moe_batch_tensor(
+        int expert_group_used = 0;
+        ok = ds4_gpu_qwen35_routed_moe_batch_select_tensor(
                  graph->batch_moe_out,
                  graph->batch_routed_gate,
                  graph->batch_routed_up,
@@ -13659,10 +14303,33 @@ static bool qwen35_gpu_encode_ffn_batch(
                  graph->batch_norm,
                  layer_index,
                  n_token,
-                 &mid_is_f16) != 0;
+                 &mid_is_f16,
+                 request_expert_group ? 1 : 0,
+                 &expert_group_used) != 0;
+        /* Grouping is an exact scheduling optimization, not a best-effort
+         * heuristic in the campaign.  Below the backend-specific crossover
+         * it is intentionally inapplicable; at or above it, a silent return
+         * to token-major work would invalidate the ablation evidence. */
+        if (ok && request_expert_group && !expert_group_used) {
+            ok = false;
+            if (activity) {
+                activity(activity_ud, "campaign_invalid",
+                         (int)layer_index + 1, QWEN35_N_LAYER);
+            }
+        } else if (ok && expert_group_used && activity) {
+            activity(activity_ud, "expert_group",
+                     (int)layer_index + 1, QWEN35_N_LAYER);
+        }
         if (ok) {
             ds4_gpu_internal_qwen35_resident_route_stats_add(n_token);
         }
+    }
+    if (io_ticket.generation != 0 && !ok) {
+        (void)ds4_gpu_qwen35_stream_batch_abort(io_ticket.generation);
+    }
+    if (ok && io_ticket.generation != 0 && activity) {
+        activity(activity_ud, "routed_done",
+                 (int)layer_index + 1, QWEN35_N_LAYER);
     }
     const uint32_t hidden_values = n_token * QWEN35_N_EMBD;
     if (ok) {
@@ -13679,7 +14346,33 @@ static bool qwen35_gpu_encode_ffn_batch(
                  graph->batch_attn_out,
                  hidden_values) != 0;
     }
+    if (ok && io_ticket.generation != 0 && activity) {
+        activity(activity_ud, "reduce_done",
+                 (int)layer_index + 1, QWEN35_N_LAYER);
+    }
     return ok;
+}
+
+static bool qwen35_gpu_encode_output_head_to(
+        ds4_qwen35_gpu_graph     *graph,
+        const ds4_model          *model,
+        const ds4_qwen35_weights *weights,
+        const ds4_gpu_tensor     *hidden,
+        ds4_gpu_tensor           *logits) {
+    return graph && model && weights && hidden && logits &&
+           weights->output_norm && weights->output &&
+           ds4_gpu_rms_norm_weight_tensor(
+               graph->output_norm,
+               hidden,
+               model->map,
+               model->size,
+               weights->output_norm->abs_offset,
+               QWEN35_N_EMBD,
+               1.0e-6f) != 0 &&
+           qwen35_gpu_matmul_dense(
+               logits, model, weights->output,
+               QWEN35_N_EMBD, QWEN35_N_VOCAB,
+               graph->output_norm);
 }
 
 /* True layer-major resident prefill.  Dense projections consume n_token rows
@@ -13693,7 +14386,13 @@ static DS4_MAYBE_UNUSED bool qwen35_gpu_forward_prefill_chunk(
         ds4_qwen35_gpu_graph      *graph,
         const int                 *tokens,
         uint32_t                   n_token,
-        uint32_t                   position) {
+        uint32_t                   position,
+        bool                       gqa_reuse,
+        bool                       io_overlap,
+        bool                       expert_group,
+        uint32_t                   expert_group_min_tokens,
+        ds4_session_progress_fn    activity,
+        void                      *activity_ud) {
     if (!model || !weights || !graph || !tokens || n_token == 0 ||
         n_token > QWEN35_GPU_PREFILL_CAP ||
         model->family != DS4_MODEL_FAMILY_QWEN35_MOE ||
@@ -13752,8 +14451,10 @@ static DS4_MAYBE_UNUSED bool qwen35_gpu_forward_prefill_chunk(
             &weights->layer[layer_index];
         if (ds4_qwen35_layer_is_full_attention(layer_index)) {
             ok = qwen35_gpu_encode_full_attention_batch(
-                graph, model, layer, current, graph->batch_attn_out,
-                layer_index, position, n_token, &state_mutated);
+                graph, model, layer, current, graph->batch_positions,
+                graph->batch_attn_out,
+                layer_index, position, n_token, &state_mutated,
+                gqa_reuse, activity, activity_ud);
             if (!ok) failed_stage = "batched full attention";
         } else {
             ok = qwen35_gpu_encode_gdn_batch(
@@ -13771,7 +14472,9 @@ static DS4_MAYBE_UNUSED bool qwen35_gpu_forward_prefill_chunk(
         }
         if (ok) {
             ok = qwen35_gpu_encode_ffn_batch(
-                graph, model, layer, next, layer_index, n_token);
+                graph, model, layer, next, layer_index, n_token,
+                io_overlap, expert_group, expert_group_min_tokens,
+                activity, activity_ud);
             if (!ok) failed_stage = "batched FFN";
         }
         if (ok) {
@@ -13847,6 +14550,558 @@ static DS4_MAYBE_UNUSED bool qwen35_gpu_forward_prefill_chunk(
     return false;
 }
 
+static bool qwen35_gpu_macro_restore(
+        ds4_qwen35_gpu_graph       *graph,
+        ds4_qwen35_macro_workspace *workspace,
+        uint32_t                    position) {
+    if (!graph || !workspace || !workspace->snapshot_valid ||
+        ds4_gpu_synchronize() == 0 ||
+        !qwen35_gpu_macro_state_copy(graph, workspace, true)) {
+        if (graph) {
+            graph->state_valid = false;
+            graph->n_tokens = 0;
+        }
+        return false;
+    }
+
+    /* Full-attention rows written past position are append-only garbage.  The
+     * attention kernels receive the visible prefix length explicitly, so
+     * restoring the host frontier makes those rows unreachable until the next
+     * append overwrites them. */
+    graph->n_tokens = position;
+    graph->state_valid = true;
+    return true;
+}
+
+/* Process a complete macro tile layer-by-layer while retaining the proven
+ * 64-row causal kernels as micro-operations.  Only hidden rows scale with the
+ * macro width; router/MoE/attention scratch remains fixed at 64 rows. */
+static DS4_MAYBE_UNUSED bool qwen35_gpu_forward_prefill_macro(
+        float                     *logits,
+        const ds4_model           *model,
+        const ds4_qwen35_weights  *weights,
+        ds4_qwen35_gpu_graph      *graph,
+        const int                 *tokens,
+        uint32_t                   n_token,
+        uint32_t                   position,
+        ds4_session_progress_fn    activity,
+        void                      *activity_ud,
+        ds4_session_cancel_fn      cancel,
+        void                      *cancel_ud,
+        bool                       layer_pin,
+        bool                       gqa_reuse,
+        bool                       io_overlap,
+        bool                       expert_group,
+        uint32_t                   expert_group_min_tokens,
+        bool                      *cancelled) {
+    if (cancelled) *cancelled = false;
+    if (!model || !weights || !graph || !tokens || n_token == 0 ||
+        n_token > QWEN35_GPU_MACRO_PREFILL_MAX ||
+        model->family != DS4_MODEL_FAMILY_QWEN35_MOE ||
+        !model->map || model->size == 0 ||
+        !qwen35_gpu_graph_validate_macro_range(graph, position, n_token) ||
+        !weights->token_embd ||
+        weights->token_embd->type != DS4_TENSOR_Q8_0 ||
+        weights->token_embd->dim[1] != QWEN35_N_VOCAB ||
+        !weights->output_norm || !weights->output ||
+        weights->output->dim[1] != QWEN35_N_VOCAB) {
+        return false;
+    }
+
+    ds4_qwen35_macro_workspace workspace = {0};
+    const char *failed_stage = "workspace allocation";
+    bool ok = qwen35_gpu_macro_workspace_alloc(&workspace, n_token) &&
+              qwen35_gpu_macro_workspace_write_inputs(
+                  &workspace, tokens, position);
+    if (ok) {
+        failed_stage = "state snapshot";
+        ok = qwen35_gpu_macro_state_copy(graph, &workspace, false);
+    }
+
+    /* IDs and positions are uploaded once, before any command buffer can see
+     * them.  Reusing graph->batch_* with host writes per microchunk would race
+     * queued Metal work because ds4_gpu_tensor_write() is an immediate memcpy,
+     * not a command-buffer operation. */
+    if (ok) {
+        failed_stage = "embedding begin";
+        ok = ds4_gpu_begin_commands() != 0;
+    }
+    for (uint32_t chunk = 0; ok && chunk < workspace.n_chunk; chunk++) {
+        const uint32_t first = chunk * QWEN35_GPU_PREFILL_CAP;
+        const uint32_t remaining = n_token - first;
+        const uint32_t rows = remaining > QWEN35_GPU_PREFILL_CAP
+            ? QWEN35_GPU_PREFILL_CAP : remaining;
+        failed_stage = "batched embedding";
+        ok = ds4_gpu_qwen35_dequant_embedding_q8_0_batch_tensor(
+                 workspace.hidden_view[0][chunk],
+                 workspace.token_view[chunk],
+                 model->map,
+                 model->size,
+                 weights->token_embd->abs_offset,
+                 rows,
+                 QWEN35_N_VOCAB,
+                 QWEN35_N_EMBD) != 0;
+    }
+    if (ok) {
+        failed_stage = "embedding completion";
+        ok = ds4_gpu_end_commands() != 0;
+    }
+
+    uint32_t current_plane = 0;
+    uint32_t next_plane = 1;
+    bool state_mutated = false;
+    for (uint32_t layer_index = 0;
+         ok && layer_index < QWEN35_N_LAYER;
+         layer_index++) {
+        if (cancel && cancel(cancel_ud)) {
+            if (cancelled) *cancelled = true;
+            failed_stage = "cancellation";
+            ok = false;
+            break;
+        }
+
+        uint64_t layer_lease = 0;
+        if (layer_pin) {
+            failed_stage = "layer lease acquire";
+            ok = ds4_gpu_stream_expert_cache_acquire_layer_lease(
+                     layer_index, &layer_lease) != 0;
+            if (ok && layer_lease != 0 && activity) {
+                /* The campaign needs proof that the eviction barrier was
+                 * acquired, not merely that the feature bit was advertised. */
+                activity(activity_ud, "layer_lease",
+                         (int)layer_index + 1, QWEN35_N_LAYER);
+            }
+        }
+        if (ok) {
+            failed_stage = "layer begin";
+            ok = ds4_gpu_begin_commands() != 0;
+        }
+        const ds4_qwen35_layer_weights *layer =
+            &weights->layer[layer_index];
+        for (uint32_t chunk = 0;
+             ok && chunk < workspace.n_chunk;
+             chunk++) {
+            if (cancel && cancel(cancel_ud)) {
+                if (cancelled) *cancelled = true;
+                failed_stage = "cancellation";
+                ok = false;
+                break;
+            }
+            const uint32_t first = chunk * QWEN35_GPU_PREFILL_CAP;
+            const uint32_t remaining = n_token - first;
+            const uint32_t rows = remaining > QWEN35_GPU_PREFILL_CAP
+                ? QWEN35_GPU_PREFILL_CAP : remaining;
+            ds4_gpu_tensor *current =
+                workspace.hidden_view[current_plane][chunk];
+            ds4_gpu_tensor *next =
+                workspace.hidden_view[next_plane][chunk];
+
+            if (ds4_qwen35_layer_is_full_attention(layer_index)) {
+                failed_stage = "batched full attention";
+                ok = qwen35_gpu_encode_full_attention_batch(
+                    graph, model, layer, current,
+                    workspace.position_view[chunk],
+                    graph->batch_attn_out,
+                    layer_index, position + first, rows,
+                    &state_mutated, gqa_reuse,
+                    activity, activity_ud);
+            } else {
+                failed_stage = "batched Gated DeltaNet";
+                ok = qwen35_gpu_encode_gdn_batch(
+                    graph, model, layer, current,
+                    graph->batch_attn_out,
+                    layer_index, rows, &state_mutated);
+            }
+            if (ok) {
+                failed_stage = "batched attention residual";
+                ok = ds4_gpu_add_tensor(
+                         next,
+                         current,
+                         graph->batch_attn_out,
+                         rows * QWEN35_N_EMBD) != 0;
+            }
+            if (ok) {
+                failed_stage = "batched FFN";
+                ok = qwen35_gpu_encode_ffn_batch(
+                    graph, model, layer, next, layer_index, rows,
+                    io_overlap, expert_group, expert_group_min_tokens,
+                    activity, activity_ud);
+            }
+        }
+        if (ok) {
+            failed_stage = "layer completion";
+            ok = ds4_gpu_end_commands() != 0;
+        }
+        if (layer_lease != 0) {
+            /* Release also fences the last routed consumer.  Do it on failure
+             * as well: leaving a lease behind would make rollback appear to
+             * succeed while every later phase transition is correctly
+             * blocked by the cache owner. */
+            const bool released =
+                ds4_gpu_stream_expert_cache_release_layer_lease(
+                    layer_lease) != 0;
+            if (!released) {
+                failed_stage = "layer lease release";
+                ok = false;
+            }
+        }
+        if (ok) {
+            const uint32_t swap = current_plane;
+            current_plane = next_plane;
+            next_plane = swap;
+            if (activity) {
+                activity(activity_ud, "prefill_layer",
+                         (int)(layer_index + 1u), QWEN35_N_LAYER);
+            }
+        }
+    }
+
+    ds4_gpu_tensor *last_hidden = NULL;
+    if (ok && logits) {
+        const uint64_t row_bytes =
+            (uint64_t)QWEN35_N_EMBD * sizeof(float);
+        last_hidden = ds4_gpu_tensor_view(
+            workspace.hidden[current_plane],
+            (uint64_t)(n_token - 1u) * row_bytes,
+            row_bytes);
+        failed_stage = "last-token view";
+        ok = last_hidden != NULL;
+    }
+    if (ok && logits) {
+        failed_stage = "output begin";
+        ok = ds4_gpu_begin_commands() != 0;
+    }
+    if (ok && logits) {
+        failed_stage = "output norm";
+        ok = ds4_gpu_rms_norm_weight_tensor(
+                 graph->output_norm,
+                 last_hidden,
+                 model->map,
+                 model->size,
+                 weights->output_norm->abs_offset,
+                 QWEN35_N_EMBD,
+                 1.0e-6f) != 0;
+    }
+    if (ok && logits) {
+        failed_stage = "output projection";
+        ok = qwen35_gpu_matmul_dense(
+            graph->logits, model, weights->output,
+            QWEN35_N_EMBD, QWEN35_N_VOCAB,
+            graph->output_norm);
+    }
+    if (ok && logits) {
+        failed_stage = "output completion";
+        ok = ds4_gpu_end_commands() != 0;
+    }
+    if (ok && logits) {
+        failed_stage = "logits readback";
+        ok = ds4_gpu_tensor_read(
+                 graph->logits,
+                 0,
+                 logits,
+                 (uint64_t)QWEN35_N_VOCAB * sizeof(float)) != 0;
+    }
+    if (ok) {
+        failed_stage = "timeline commit";
+        ok = qwen35_gpu_graph_advance_macro_range(
+            graph, position, n_token);
+    }
+
+    ds4_gpu_tensor_free(last_hidden);
+    if (ok) {
+        qwen35_gpu_macro_workspace_free(&workspace);
+        return true;
+    }
+
+    /* Even a failure before the first stateful kernel may leave embedding or
+     * a partially encoded command buffer referring to workspace views.  Join
+     * the queue before freeing those parent buffers; the recurrent snapshot is
+     * only needed once a stateful kernel actually ran. */
+    const bool restored = state_mutated
+        ? qwen35_gpu_macro_restore(graph, &workspace, position)
+        : ds4_gpu_synchronize() != 0;
+    if (!restored && graph->state_valid) {
+        (void)qwen35_gpu_graph_mark_state_invalid(graph);
+    }
+    fprintf(stderr,
+            "ds4: Metal Qwen macro prefill [%u,%u) failed at %s "
+            "(mutated=%d restored=%d cancelled=%d)\n",
+            position,
+            position + n_token,
+            failed_stage ? failed_stage : "unknown stage",
+            state_mutated ? 1 : 0,
+            restored ? 1 : 0,
+            cancelled && *cancelled ? 1 : 0);
+    qwen35_gpu_macro_workspace_free(&workspace);
+    return false;
+}
+
+static qwen35_prompt_verdict qwen35_prompt_verdict_make(
+        const int     *draft,
+        uint32_t       draft_n,
+        int            initial_top,
+        const int32_t *row_top,
+        uint32_t       row_top_n);
+
+/* Verify a prompt-derived suffix with the exact one-token kernels, but keep
+ * weights layer-hot across the short draft.  `tops[i]` is L(H+d0..di); the
+ * first draft has already been checked against L(H), so row i verifies the
+ * next draft.  Partial accepts restore the recurrent snapshot here and are
+ * replayed by the session through the ordinary commit path. */
+static bool qwen35_gpu_verify_prompt_suffix_exact(
+        const ds4_model           *model,
+        const ds4_qwen35_weights  *weights,
+        ds4_qwen35_gpu_graph      *graph,
+        const int                 *tokens,
+        uint32_t                   n_token,
+        uint32_t                   position,
+        ds4_qwen35_spec_workspace *reusable_workspace,
+        bool                       layer_pin,
+        bool                       gqa_reuse,
+        bool                       io_overlap,
+        ds4_session_progress_fn    activity,
+        void                      *activity_ud,
+        ds4_session_cancel_fn      cancel,
+        void                      *cancel_ud,
+        uint32_t                  *accepted_prefix,
+        float                     *full_accept_logits,
+        bool                      *state_usable,
+        bool                      *cancelled) {
+    if (accepted_prefix) *accepted_prefix = 0;
+    if (state_usable) *state_usable = false;
+    if (cancelled) *cancelled = false;
+    if (!model || !weights || !graph || !tokens || !reusable_workspace ||
+        !accepted_prefix ||
+        !full_accept_logits || !state_usable || n_token == 0 ||
+        n_token > QWEN35_PROMPT_LOOKUP_MAX_DRAFT ||
+        reusable_workspace->capacity < n_token ||
+        model->family != DS4_MODEL_FAMILY_QWEN35_MOE ||
+        !model->map || model->size == 0 ||
+        !qwen35_gpu_graph_validate_macro_range(graph, position, n_token) ||
+        !weights->token_embd ||
+        weights->token_embd->type != DS4_TENSOR_Q8_0 ||
+        !weights->output_norm || !weights->output ||
+        weights->output->dim[1] != QWEN35_N_VOCAB) {
+        return false;
+    }
+
+    /* The phase planner charges the maximum verifier footprint, and the
+     * session owns that allocation for its full lifetime.  A shallow working
+     * copy lets us narrow the active token count without resizing/freeing any
+     * Metal resource on a decode hit. */
+    ds4_qwen35_spec_workspace workspace = *reusable_workspace;
+    workspace.macro.n_token = n_token;
+    workspace.macro.snapshot_valid = false;
+    const char *failed_stage = "workspace input";
+    bool ok = qwen35_gpu_macro_workspace_write_inputs(
+                  &workspace.macro, tokens, position);
+    if (ok) {
+        failed_stage = "state snapshot";
+        ok = qwen35_gpu_macro_state_copy(
+            graph, &workspace.macro, false);
+    }
+    /* Build one-row hidden views.  They are deliberately local to the exact
+     * verifier: the macro scheduler's 64-row views have a different causal
+     * contract and cannot be passed to one-token kernels. */
+    ds4_gpu_tensor *hidden_row[2][QWEN35_PROMPT_LOOKUP_MAX_DRAFT] = {{0}};
+    const uint64_t hidden_row_bytes =
+        (uint64_t)QWEN35_N_EMBD * sizeof(float);
+    if (ok) {
+        for (uint32_t plane = 0; ok && plane < 2; plane++) {
+            for (uint32_t row = 0; ok && row < n_token; row++) {
+                hidden_row[plane][row] = ds4_gpu_tensor_view(
+                    workspace.macro.hidden[plane],
+                    (uint64_t)row * hidden_row_bytes,
+                    hidden_row_bytes);
+                ok = hidden_row[plane][row] != NULL;
+            }
+        }
+        if (!ok) failed_stage = "hidden row views";
+    }
+
+    /* Embed into independent destinations.  All row views are immutable once
+     * queued, so a later token cannot race a shared-memory host rewrite. */
+    if (ok) {
+        failed_stage = "row embedding begin";
+        ok = ds4_gpu_begin_commands() != 0;
+    }
+    for (uint32_t row = 0; ok && row < n_token; row++) {
+        failed_stage = "row embedding";
+        ok = ds4_gpu_qwen35_dequant_embedding_q8_0_tensor(
+                 hidden_row[0][row],
+                 model->map,
+                 model->size,
+                 weights->token_embd->abs_offset,
+                 (uint32_t)tokens[row],
+                 QWEN35_N_EMBD) != 0;
+    }
+    if (ok) {
+        failed_stage = "row embedding completion";
+        ok = ds4_gpu_end_commands() != 0;
+    }
+
+    uint32_t current_plane = 0;
+    uint32_t next_plane = 1;
+    bool state_mutated = false;
+    bool lease_failed = false;
+    for (uint32_t layer_index = 0;
+         ok && layer_index < QWEN35_N_LAYER;
+         layer_index++) {
+        if (cancel && cancel(cancel_ud)) {
+            if (cancelled) *cancelled = true;
+            failed_stage = "cancellation";
+            ok = false;
+            break;
+        }
+        uint64_t layer_lease = 0;
+        if (layer_pin) {
+            failed_stage = "layer lease acquire";
+            ok = ds4_gpu_stream_expert_cache_acquire_layer_lease(
+                     layer_index, &layer_lease) != 0;
+        }
+        if (ok) {
+            failed_stage = "layer begin";
+            ok = ds4_gpu_begin_commands() != 0;
+        }
+        const ds4_qwen35_layer_weights *layer =
+            &weights->layer[layer_index];
+        for (uint32_t row = 0; ok && row < n_token; row++) {
+            if (cancel && cancel(cancel_ud)) {
+                if (cancelled) *cancelled = true;
+                failed_stage = "cancellation";
+                ok = false;
+                break;
+            }
+            ds4_gpu_tensor *current = hidden_row[current_plane][row];
+            ds4_gpu_tensor *next = hidden_row[next_plane][row];
+            if (ds4_qwen35_layer_is_full_attention(layer_index)) {
+                failed_stage = "full attention";
+                ok = qwen35_gpu_encode_full_attention_one(
+                    graph, model, layer, current, graph->attn_out,
+                    layer_index, position + row, &state_mutated,
+                    gqa_reuse, activity, activity_ud);
+            } else {
+                failed_stage = "Gated DeltaNet";
+                ok = qwen35_gpu_encode_gdn_one(
+                    graph, model, layer, current, graph->attn_out,
+                    layer_index, position + row, &state_mutated);
+            }
+            if (ok) {
+                failed_stage = "attention residual";
+                ok = ds4_gpu_add_tensor(
+                         next, current, graph->attn_out,
+                         QWEN35_N_EMBD) != 0;
+            }
+            if (ok) {
+                failed_stage = "FFN";
+                ok = qwen35_gpu_encode_ffn_one(
+                    graph, model, layer, next,
+                    layer_index, position + row,
+                    io_overlap, activity, activity_ud);
+            }
+        }
+        if (ok) {
+            failed_stage = "layer completion";
+            ok = ds4_gpu_end_commands() != 0;
+        }
+        if (layer_lease != 0 &&
+            !ds4_gpu_stream_expert_cache_release_layer_lease(layer_lease)) {
+            failed_stage = "layer lease release";
+            lease_failed = true;
+            ok = false;
+        }
+        if (ok) {
+            const uint32_t swap = current_plane;
+            current_plane = next_plane;
+            next_plane = swap;
+            if (activity) {
+                activity(activity_ud, "decode_verify",
+                         (int)(layer_index + 1u), QWEN35_N_LAYER);
+            }
+        }
+    }
+
+    if (ok) {
+        failed_stage = "output begin";
+        ok = ds4_gpu_begin_commands() != 0;
+    }
+    for (uint32_t row = 0; ok && row < n_token; row++) {
+        failed_stage = "output head";
+        ok = qwen35_gpu_encode_output_head_to(
+            graph, model, weights,
+            hidden_row[current_plane][row], workspace.logits_view[row]);
+        if (ok) {
+            failed_stage = "valid-vocabulary argmax";
+            ok = ds4_gpu_argmax_tensor(
+                     workspace.top_view[row],
+                     workspace.logits_view[row],
+                     QWEN35_N_VALID_TOKEN) != 0;
+        }
+    }
+    if (ok) {
+        failed_stage = "output completion";
+        ok = ds4_gpu_end_commands() != 0;
+    }
+
+    int32_t tops[QWEN35_PROMPT_LOOKUP_MAX_DRAFT] = {0};
+    if (ok) {
+        failed_stage = "top readback";
+        ok = ds4_gpu_tensor_read(
+                 workspace.tops, 0, tops,
+                 (uint64_t)n_token * sizeof(tops[0])) != 0;
+    }
+    const qwen35_prompt_verdict verdict = ok
+        ? qwen35_prompt_verdict_make(
+              tokens, n_token, tokens[0], tops, n_token)
+        : (qwen35_prompt_verdict){0};
+    const uint32_t accepted = verdict.accepted;
+    if (ok && accepted == n_token) {
+        failed_stage = "last logits readback";
+        ok = ds4_gpu_tensor_read(
+                 workspace.logits_view[n_token - 1u], 0,
+                 full_accept_logits, QWEN35_HOST_LOGITS_BYTES) != 0;
+    }
+    if (ok && accepted == n_token) {
+        failed_stage = "timeline commit";
+        ok = qwen35_gpu_graph_advance_macro_range(
+            graph, position, n_token);
+    }
+    if (ok && accepted != n_token) {
+        failed_stage = "partial restore";
+        ok = qwen35_gpu_macro_restore(
+            graph, &workspace.macro, position);
+    }
+
+    for (uint32_t plane = 0; plane < 2; plane++) {
+        for (uint32_t row = 0; row < n_token; row++) {
+            ds4_gpu_tensor_free(hidden_row[plane][row]);
+        }
+    }
+    if (ok) {
+        *accepted_prefix = accepted;
+        *state_usable = true;
+        return true;
+    }
+
+    const bool restored = state_mutated
+        ? qwen35_gpu_macro_restore(graph, &workspace.macro, position)
+        : ds4_gpu_synchronize() != 0;
+    *state_usable = restored && !lease_failed;
+    if (!*state_usable && graph->state_valid) {
+        (void)qwen35_gpu_graph_mark_state_invalid(graph);
+    }
+    fprintf(stderr,
+            "ds4: Metal Qwen prompt verifier [%u,%u) failed at %s "
+            "(mutated=%d restored=%d lease_failed=%d cancelled=%d)\n",
+            position, position + n_token,
+            failed_stage ? failed_stage : "unknown stage",
+            state_mutated ? 1 : 0,
+            restored ? 1 : 0,
+            lease_failed ? 1 : 0,
+            cancelled && *cancelled ? 1 : 0);
+    return false;
+}
+
 /* Encode exactly one token on either a new or caller-owned command batch.
  * Resident prefill may leave the batch open and advance the host timeline
  * after encoding: Metal command queues preserve the recurrent/KV dependencies,
@@ -13862,7 +15117,11 @@ static DS4_MAYBE_UNUSED bool qwen35_gpu_forward_token_commands(
         int                        token,
         uint32_t                   position,
         bool                       commands_preopened,
-        bool                       finish_commands) {
+        bool                       finish_commands,
+        bool                       gqa_reuse,
+        bool                       io_overlap,
+        ds4_session_progress_fn    activity,
+        void                      *activity_ud) {
     if (!model || !weights || !graph ||
         model->family != DS4_MODEL_FAMILY_QWEN35_MOE ||
         !model->map || model->size == 0 ||
@@ -13903,7 +15162,8 @@ static DS4_MAYBE_UNUSED bool qwen35_gpu_forward_token_commands(
         if (ds4_qwen35_layer_is_full_attention(layer_index)) {
             ok = qwen35_gpu_encode_full_attention_one(
                 graph, model, layer, current, graph->attn_out,
-                layer_index, position, &state_mutated);
+                layer_index, position, &state_mutated,
+                gqa_reuse, activity, activity_ud);
             if (!ok) failed_stage = "full attention";
         } else {
             ok = qwen35_gpu_encode_gdn_one(
@@ -13919,7 +15179,8 @@ static DS4_MAYBE_UNUSED bool qwen35_gpu_forward_token_commands(
         }
         if (ok) {
             ok = qwen35_gpu_encode_ffn_one(
-                graph, model, layer, next, layer_index, position);
+                graph, model, layer, next, layer_index, position,
+                io_overlap, activity, activity_ud);
             if (!ok) failed_stage = "FFN";
         }
         if (ok) {
@@ -14014,9 +15275,14 @@ static DS4_MAYBE_UNUSED bool qwen35_gpu_forward_token(
         const ds4_qwen35_weights  *weights,
         ds4_qwen35_gpu_graph      *graph,
         int                        token,
-        uint32_t                   position) {
+        uint32_t                   position,
+        bool                       gqa_reuse,
+        bool                       io_overlap,
+        ds4_session_progress_fn    activity,
+        void                      *activity_ud) {
     return qwen35_gpu_forward_token_commands(
-        logits, model, weights, graph, token, position, false, true);
+        logits, model, weights, graph, token, position, false, true,
+        gqa_reuse, io_overlap, activity, activity_ud);
 }
 #endif /* __APPLE__ */
 
@@ -25657,9 +26923,467 @@ struct ds4_engine {
     ds4_distributed_options distributed;
     bool qwen_raw_runtime;
     bool qwen_metal_runtime;
+    uint32_t qwen35_planned_context_tokens;
+    uint32_t qwen35_macro_tokens;
+    uint32_t qwen35_prefill_cache_experts;
+    uint32_t qwen35_decode_cache_experts;
+    uint64_t qwen35_prefill_workspace_bytes;
+    uint64_t qwen35_decode_workspace_bytes;
+    uint64_t qwen35_request_headroom_bytes;
+    bool qwen35_pressure_gate_required;
+    ds4_qwen35_runtime_features qwen35_features;
+    ds4_qwen35_telemetry qwen35_telemetry;
+#if defined(__APPLE__) && !defined(DS4_NO_GPU)
+    /* The Metal page-in workers borrow this descriptor.  Keep the reader (and
+     * therefore its fd) alive until the final accelerator fence and generic
+     * GPU teardown have both completed. */
+    ds4_qwen_expert_pack *qwen35_expert_pack;
+    bool qwen35_expert_pack_ready;
+#endif
     bool metal_ready;
     bool mtp_ready;
 };
+
+typedef struct {
+    const char *name;
+    uint32_t bit;
+} ds4_qwen35_feature_name;
+
+static const ds4_qwen35_feature_name qwen35_feature_names[] = {
+    {"macro_prefill", QWEN35_FEATURE_MACRO_PREFILL},
+    {"phase_budget", QWEN35_FEATURE_PHASE_BUDGET},
+    {"layer_pin", QWEN35_FEATURE_LAYER_PIN},
+    {"io_overlap", QWEN35_FEATURE_IO_OVERLAP},
+    {"expert_group", QWEN35_FEATURE_EXPERT_GROUP},
+    {"expert_pack", QWEN35_FEATURE_EXPERT_PACK},
+    {"gqa_reuse", QWEN35_FEATURE_GQA_REUSE},
+    {"prompt_lookup", QWEN35_FEATURE_PROMPT_LOOKUP},
+};
+
+typedef struct {
+    const char *path;
+    uint8_t payload_sha256[DS4_QWEN_EXPERT_PACK_SHA256_BYTES];
+    uint8_t gguf_sha256[DS4_QWEN_EXPERT_PACK_SHA256_BYTES];
+} ds4_qwen35_expert_pack_env;
+
+static DS4_MAYBE_UNUSED int qwen35_hex_nibble(unsigned char c) {
+    if (c >= '0' && c <= '9') return (int)(c - '0');
+    if (c >= 'a' && c <= 'f') return (int)(c - 'a') + 10;
+    if (c >= 'A' && c <= 'F') return (int)(c - 'A') + 10;
+    return -1;
+}
+
+/* Campaign digests are trusted only as exact 32-byte hexadecimal values.  No
+ * whitespace, 0x prefix, truncated hash, or permissive numeric conversion is
+ * accepted: those would turn a stale sidecar into an ambiguous identity. */
+static DS4_MAYBE_UNUSED bool qwen35_sha256_hex_parse(
+        const char *text,
+        uint8_t     digest[DS4_QWEN_EXPERT_PACK_SHA256_BYTES]) {
+    if (!text || !digest ||
+        strlen(text) != DS4_QWEN_EXPERT_PACK_SHA256_BYTES * 2u) {
+        return false;
+    }
+    for (size_t i = 0; i < DS4_QWEN_EXPERT_PACK_SHA256_BYTES; i++) {
+        const int hi = qwen35_hex_nibble((unsigned char)text[i * 2u]);
+        const int lo = qwen35_hex_nibble((unsigned char)text[i * 2u + 1u]);
+        if (hi < 0 || lo < 0) return false;
+        digest[i] = (uint8_t)((hi << 4) | lo);
+    }
+    return true;
+}
+
+static DS4_MAYBE_UNUSED bool qwen35_expert_pack_env_parse_values(
+        const char                       *path,
+        const char                       *payload_sha256,
+        const char                       *version,
+        const char                       *gguf_sha256,
+        ds4_qwen35_expert_pack_env       *out,
+        char                             *err,
+        size_t                            errlen) {
+    if (out) memset(out, 0, sizeof(*out));
+    if (!out || !path || !path[0] || !payload_sha256 ||
+        !payload_sha256[0] || !version || !version[0] ||
+        !gguf_sha256 || !gguf_sha256[0]) {
+        if (err && errlen) {
+            snprintf(err, errlen,
+                     "expert pack requires PATH, SHA256, VERSION, and "
+                     "GGUF_SHA256 campaign variables");
+        }
+        return false;
+    }
+    if (strcmp(version, "1") != 0) {
+        if (err && errlen) {
+            snprintf(err, errlen,
+                     "DS4_QWEN_EXPERT_PACK_VERSION must be exactly 1");
+        }
+        return false;
+    }
+    if (!qwen35_sha256_hex_parse(payload_sha256, out->payload_sha256)) {
+        if (err && errlen) {
+            snprintf(err, errlen,
+                     "DS4_QWEN_EXPERT_PACK_SHA256 must be exactly 64 hex digits");
+        }
+        memset(out, 0, sizeof(*out));
+        return false;
+    }
+    if (!qwen35_sha256_hex_parse(gguf_sha256, out->gguf_sha256)) {
+        if (err && errlen) {
+            snprintf(err, errlen,
+                     "DS4_QWEN_GGUF_SHA256 must be exactly 64 hex digits");
+        }
+        memset(out, 0, sizeof(*out));
+        return false;
+    }
+    out->path = path;
+    return true;
+}
+
+static DS4_MAYBE_UNUSED bool qwen35_expert_pack_should_install(
+        ds4_residency_mode residency,
+        bool               ssd_streaming,
+        uint32_t           ablated) {
+    const bool supported_mode =
+        (residency == DS4_RESIDENCY_SSD && ssd_streaming) ||
+        (residency == DS4_RESIDENCY_RESIDENT && !ssd_streaming);
+    return supported_mode &&
+           (ablated & QWEN35_FEATURE_EXPERT_PACK) == 0;
+}
+
+static bool qwen35_feature_mask_parse(
+        const char *text,
+        uint32_t   *mask_out,
+        char       *err,
+        size_t      errlen) {
+    if (!mask_out) return false;
+    *mask_out = 0;
+    if (!text || !text[0]) return true;
+
+    const char *p = text;
+    while (*p) {
+        while (*p && isspace((unsigned char)*p)) p++;
+        const char *begin = p;
+        while (*p && *p != ',') p++;
+        const char *end = p;
+        while (end > begin && isspace((unsigned char)end[-1])) end--;
+        const size_t len = (size_t)(end - begin);
+        if (len == 0) {
+            if (err && errlen) {
+                snprintf(err, errlen,
+                         "DS4_QWEN_ABLATE contains an empty feature name");
+            }
+            return false;
+        }
+
+        bool found = false;
+        for (size_t i = 0;
+             i < sizeof(qwen35_feature_names) /
+                 sizeof(qwen35_feature_names[0]);
+             i++) {
+            const char *name = qwen35_feature_names[i].name;
+            if (strlen(name) == len && memcmp(begin, name, len) == 0) {
+                *mask_out |= qwen35_feature_names[i].bit;
+                found = true;
+                break;
+            }
+        }
+        if (!found) {
+            if (err && errlen) {
+                snprintf(err, errlen,
+                         "DS4_QWEN_ABLATE has unknown feature '%.*s'",
+                         (int)len, begin);
+            }
+            return false;
+        }
+        if (*p == ',') {
+            p++;
+            if (!*p) {
+                if (err && errlen) {
+                    snprintf(err, errlen,
+                             "DS4_QWEN_ABLATE ends with an empty feature name");
+                }
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
+static bool qwen35_env_bool(
+        const char *name,
+        bool       *value_out,
+        char       *err,
+        size_t      errlen) {
+    if (!name || !value_out) return false;
+    const char *value = getenv(name);
+    if (!value || !value[0] || strcmp(value, "0") == 0) {
+        *value_out = false;
+        return true;
+    }
+    if (strcmp(value, "1") == 0) {
+        *value_out = true;
+        return true;
+    }
+    if (err && errlen) {
+        snprintf(err, errlen, "%s must be 0 or 1", name);
+    }
+    return false;
+}
+
+static void qwen35_feature_mask_format(
+        uint32_t mask,
+        char    *buf,
+        size_t   buflen) {
+    if (!buf || buflen == 0) return;
+    size_t used = 0;
+    buf[0] = '\0';
+    for (size_t i = 0;
+         i < sizeof(qwen35_feature_names) / sizeof(qwen35_feature_names[0]);
+         i++) {
+        if ((mask & qwen35_feature_names[i].bit) == 0) continue;
+        if (used >= buflen) break;
+        const size_t remaining = buflen - used;
+        const int n = snprintf(buf + used,
+                               remaining,
+                               "%s%s",
+                               used ? "," : "",
+                               qwen35_feature_names[i].name);
+        if (n <= 0) break;
+        const size_t add = (size_t)n;
+        if (add >= remaining) return;
+        used += add;
+    }
+    if (used == 0) snprintf(buf, buflen, "none");
+}
+
+static bool qwen35_telemetry_open(ds4_engine *e) {
+    if (!e) return false;
+    const char *path = getenv("DS4_QWEN_TELEMETRY_JSONL");
+    if (!path || !path[0]) return true;
+
+    FILE *fp = fopen(path, "a");
+    if (!fp) {
+        fprintf(stderr,
+                "ds4: cannot open Qwen telemetry %s: %s\n",
+                path, strerror(errno));
+        return false;
+    }
+    if (pthread_mutex_init(&e->qwen35_telemetry.mu, NULL) != 0) {
+        fprintf(stderr, "ds4: cannot initialize Qwen telemetry lock\n");
+        fclose(fp);
+        return false;
+    }
+    e->qwen35_telemetry.fp = fp;
+    e->qwen35_telemetry.mutex_ready = true;
+    e->qwen35_telemetry.last_flush_sec = now_sec();
+    /* Layer-stage telemetry can produce hundreds of records per token.  Full
+     * buffering keeps the campaign observer from injecting one write syscall
+     * into every measured stage; qwen35_telemetry_emit still forces phase and
+     * failure boundaries and publishes in-flight progress at least once per
+     * second. */
+    (void)setvbuf(fp, NULL, _IOFBF, 64u * 1024u);
+    return true;
+}
+
+static bool qwen35_telemetry_is_flush_boundary(const char *event) {
+    return strcmp(event, "capabilities") == 0 ||
+           strcmp(event, "runtime_fallback") == 0 ||
+           strcmp(event, "campaign_invalid") == 0 ||
+           strcmp(event, "memory_pressure") == 0 ||
+           strcmp(event, "prefill_begin") == 0 ||
+           strcmp(event, "prefill_commit") == 0 ||
+           strcmp(event, "prefill_abort") == 0 ||
+           strcmp(event, "runtime_close") == 0;
+}
+
+/* Fields are internal JSON fragments with constant keys.  Centralizing the
+ * framing prevents individual hot paths from opening files or inventing
+ * incompatible schemas; with telemetry disabled this is one predictable
+ * pointer check. */
+static void qwen35_telemetry_emit(
+        ds4_engine *e,
+        const char *event,
+        const char *fields_fmt,
+        ...) {
+    if (!e || !event || !e->qwen35_telemetry.fp ||
+        !e->qwen35_telemetry.mutex_ready || e->qwen35_telemetry.failed) {
+        return;
+    }
+
+    ds4_qwen35_telemetry *t = &e->qwen35_telemetry;
+    pthread_mutex_lock(&t->mu);
+    const double timestamp = now_sec();
+    bool ok = fprintf(t->fp,
+                      "{\"schema\":1,\"seq\":%" PRIu64
+                      ",\"monotonic_sec\":%.6f,\"event\":\"%s\"",
+                      ++t->sequence, timestamp, event) >= 0;
+    if (ok && fields_fmt && fields_fmt[0]) {
+        ok = fputc(',', t->fp) != EOF;
+        if (ok) {
+            va_list ap;
+            va_start(ap, fields_fmt);
+            ok = vfprintf(t->fp, fields_fmt, ap) >= 0;
+            va_end(ap);
+        }
+    }
+    if (ok) ok = fputs("}\n", t->fp) >= 0;
+    if (ok) {
+        t->records_since_flush++;
+        const bool flush = qwen35_telemetry_is_flush_boundary(event) ||
+                           timestamp - t->last_flush_sec >= 1.0 ||
+                           t->records_since_flush >= 256u;
+        if (flush) {
+            ok = fflush(t->fp) == 0;
+            if (ok) {
+                t->last_flush_sec = timestamp;
+                t->records_since_flush = 0;
+            }
+        }
+    }
+    const bool report_failure = !ok && !t->failed;
+    if (!ok) t->failed = true;
+    pthread_mutex_unlock(&t->mu);
+
+    if (report_failure) {
+        fprintf(stderr,
+                "ds4: Qwen telemetry write failed; disabling telemetry\n");
+    }
+}
+
+static void qwen35_telemetry_close(ds4_engine *e) {
+    if (!e || !e->qwen35_telemetry.mutex_ready) return;
+    ds4_qwen35_telemetry *t = &e->qwen35_telemetry;
+    qwen35_telemetry_emit(e, "runtime_close", NULL);
+    pthread_mutex_lock(&t->mu);
+    FILE *fp = t->fp;
+    t->fp = NULL;
+    pthread_mutex_unlock(&t->mu);
+    if (fp && fclose(fp) != 0) {
+        fprintf(stderr, "ds4: Qwen telemetry close failed: %s\n",
+                strerror(errno));
+    }
+    pthread_mutex_destroy(&t->mu);
+    memset(t, 0, sizeof(*t));
+}
+
+static bool qwen35_runtime_features_init(ds4_engine *e) {
+    if (!e) return false;
+    ds4_qwen35_runtime_features *f = &e->qwen35_features;
+    memset(f, 0, sizeof(*f));
+    f->implemented = QWEN35_FEATURE_IMPLEMENTED;
+
+    char err[192] = {0};
+    if (!qwen35_feature_mask_parse(
+            getenv("DS4_QWEN_ABLATE"), &f->ablated,
+            err, sizeof(err)) ||
+        !qwen35_env_bool(
+            "DS4_QWEN_REQUIRE_FULL_STACK", &f->require_full_stack,
+            err, sizeof(err))) {
+        fprintf(stderr, "ds4: %s\n",
+                err[0] ? err : "invalid Qwen optimization configuration");
+        return false;
+    }
+    return qwen35_telemetry_open(e);
+}
+
+static bool qwen35_runtime_features_finalize(ds4_engine *e) {
+    if (!e) return false;
+    ds4_qwen35_runtime_features *f = &e->qwen35_features;
+    if (e->backend == DS4_BACKEND_METAL) {
+#if defined(__APPLE__) && !defined(DS4_NO_GPU)
+        if (!ds4_gpu_qwen35_gqa_reuse_capable(
+                QWEN35_N_HEAD, QWEN35_N_HEAD_KV,
+                QWEN35_N_HEAD_DIM)) {
+            f->implemented &= ~QWEN35_FEATURE_GQA_REUSE;
+        }
+        const ds4_qwen35_layer_weights *group_probe =
+            &e->qwen35_weights.layer[0];
+        if (!group_probe->ffn_gate_exps ||
+            !group_probe->ffn_down_exps ||
+            !ds4_gpu_qwen35_expert_group_capable(
+                QWEN35_N_EXPERT,
+                QWEN35_N_EXPERT_USED,
+                group_probe->ffn_gate_exps->type,
+                group_probe->ffn_down_exps->type)) {
+            /* Capability is queried after Metal residency has been selected:
+             * SSD and resident grouping use different kernels, so probing at
+             * compile time would advertise a path the active engine cannot
+             * actually execute. */
+            f->implemented &= ~QWEN35_FEATURE_EXPERT_GROUP;
+        }
+#else
+        f->implemented &= ~(QWEN35_FEATURE_GQA_REUSE |
+                            QWEN35_FEATURE_EXPERT_GROUP);
+#endif
+        if (e->residency == DS4_RESIDENCY_SSD && e->ssd_streaming) {
+            f->expected = QWEN35_FEATURE_ALL_EXACT;
+            if (e->qwen35_macro_tokens <= QWEN35_PREFILL_MICRO_TOKENS) {
+                f->implemented &= ~QWEN35_FEATURE_MACRO_PREFILL;
+            }
+#if defined(__APPLE__) && !defined(DS4_NO_GPU)
+            if ((f->ablated & QWEN35_FEATURE_EXPERT_PACK) == 0 &&
+                !e->qwen35_expert_pack_ready) {
+                /* The code path exists, but this engine did not authorize and
+                 * install the campaign artifact.  Advertising it here would
+                 * let a strict first run silently benchmark GGUF fallback. */
+                f->implemented &= ~QWEN35_FEATURE_EXPERT_PACK;
+            }
+#else
+            f->implemented &= ~QWEN35_FEATURE_EXPERT_PACK;
+#endif
+#if defined(__APPLE__) && !defined(DS4_NO_GPU)
+            if (!ds4_gpu_qwen35_stream_io_overlap_capable()) {
+                /* Capability is checked only after the SSD cache, model fd,
+                 * and selected-address pipelines are configured.  Checking
+                 * earlier would incorrectly disable overlap during engine
+                 * construction; accepting it later would hide a partial
+                 * first run behind the generic synchronous loader. */
+                f->implemented &= ~QWEN35_FEATURE_IO_OVERLAP;
+            }
+#else
+            f->implemented &= ~QWEN35_FEATURE_IO_OVERLAP;
+#endif
+        } else if (e->residency == DS4_RESIDENCY_RESIDENT) {
+            f->expected = QWEN35_FEATURE_EXPERT_GROUP |
+                          QWEN35_FEATURE_GQA_REUSE |
+                          QWEN35_FEATURE_PROMPT_LOOKUP;
+        }
+    }
+    f->enabled = f->implemented & f->expected & ~f->ablated;
+
+    char implemented[192];
+    char expected[192];
+    char enabled[192];
+    char ablated[192];
+    qwen35_feature_mask_format(f->implemented, implemented,
+                               sizeof(implemented));
+    qwen35_feature_mask_format(f->expected, expected, sizeof(expected));
+    qwen35_feature_mask_format(f->enabled, enabled, sizeof(enabled));
+    qwen35_feature_mask_format(f->ablated, ablated, sizeof(ablated));
+    fprintf(stderr,
+            "ds4: Qwen exact-stack capabilities implemented=[%s] "
+            "expected=[%s] enabled=[%s] ablated=[%s] strict=%d\n",
+            implemented, expected, enabled, ablated,
+            f->require_full_stack ? 1 : 0);
+    qwen35_telemetry_emit(
+        e, "capabilities",
+        "\"implemented\":\"%s\",\"expected\":\"%s\","
+        "\"enabled\":\"%s\",\"ablated\":\"%s\",\"strict\":%s",
+        implemented, expected, enabled, ablated,
+        f->require_full_stack ? "true" : "false");
+
+    const uint32_t missing = f->expected & ~f->enabled;
+    if (f->require_full_stack && missing != 0) {
+        char missing_names[192];
+        qwen35_feature_mask_format(missing, missing_names,
+                                   sizeof(missing_names));
+        fprintf(stderr,
+                "ds4: strict Qwen full-stack run refused; missing or "
+                "ablated capabilities: %s\n",
+                missing_names);
+        return false;
+    }
+    return true;
+}
 
 static bool cpu_directional_steering_enabled(
         const float *dirs,
@@ -28498,6 +30222,25 @@ static void ds4_acquire_instance_lock(void) {
     atexit(ds4_release_instance_lock);
 }
 
+enum {
+    QWEN35_PROMPT_NGRAM = 4,
+    QWEN35_PROMPT_INDEX_PROBES = 4,
+};
+
+typedef struct {
+    uint64_t hash;
+    uint32_t start_plus_one;
+} ds4_qwen35_prompt_index_entry;
+
+DS4_STATIC_ASSERT(ds4_qwen35_prompt_index_entry_geometry,
+                  sizeof(ds4_qwen35_prompt_index_entry) ==
+                      QWEN35_PROMPT_INDEX_ENTRY_BYTES);
+
+typedef struct {
+    ds4_qwen35_prompt_index_entry *entry;
+    uint32_t indexed_len;
+} ds4_qwen35_prompt_index;
+
 struct ds4_session {
     ds4_engine *engine;
     ds4_dist_session *distributed;
@@ -28505,6 +30248,7 @@ struct ds4_session {
     ds4_gpu_graph graph;
 #if defined(__APPLE__)
     ds4_qwen35_gpu_graph qwen35_gpu_graph;
+    ds4_qwen35_spec_workspace qwen35_spec_workspace;
 #endif
 #endif
     ds4_kv_cache cpu_cache;
@@ -28512,6 +30256,7 @@ struct ds4_session {
     ds4_qwen35_cpu_cache qwen35_cpu_cache;
     ds4_qwen35_cpu_scratch qwen35_cpu_scratch;
     token_vec checkpoint;
+    ds4_qwen35_prompt_index qwen35_prompt_index;
     float *logits;
     float *mtp_logits;
     int mtp_draft_token;
@@ -28531,6 +30276,181 @@ struct ds4_session {
     bool checkpoint_valid;
     bool mtp_draft_valid;
 };
+
+static uint64_t qwen35_prompt_ngram_hash(const int *tokens) {
+    uint64_t hash = UINT64_C(1469598103934665603);
+    for (uint32_t i = 0; i < QWEN35_PROMPT_NGRAM; i++) {
+        uint32_t value = (uint32_t)tokens[i];
+        for (uint32_t byte = 0; byte < sizeof(value); byte++) {
+            hash ^= (uint8_t)(value >> (byte * 8u));
+            hash *= UINT64_C(1099511628211);
+        }
+    }
+    return hash;
+}
+
+static void qwen35_prompt_index_reset(ds4_qwen35_prompt_index *index) {
+    if (!index) return;
+    if (index->entry) {
+        memset(index->entry, 0,
+               (size_t)QWEN35_PROMPT_INDEX_CAP * sizeof(index->entry[0]));
+    }
+    index->indexed_len = 0;
+}
+
+static bool qwen35_prompt_index_entry_matches(
+        const token_vec *history,
+        uint32_t         candidate,
+        uint32_t         key_start) {
+    return history && candidate + QWEN35_PROMPT_NGRAM <=
+                          (uint32_t)history->len &&
+           key_start + QWEN35_PROMPT_NGRAM <= (uint32_t)history->len &&
+           memcmp(&history->v[candidate], &history->v[key_start],
+                  (size_t)QWEN35_PROMPT_NGRAM * sizeof(history->v[0])) == 0;
+}
+
+static void qwen35_prompt_index_insert(
+        ds4_qwen35_prompt_index *index,
+        const token_vec         *history,
+        uint32_t                 start) {
+    if (!index || !index->entry || !history ||
+        start + QWEN35_PROMPT_NGRAM >= (uint32_t)history->len) {
+        return;
+    }
+    const uint64_t hash = qwen35_prompt_ngram_hash(&history->v[start]);
+    const uint32_t mask = QWEN35_PROMPT_INDEX_CAP - 1u;
+    uint32_t victim = (uint32_t)hash & mask;
+    uint32_t oldest = UINT32_MAX;
+    for (uint32_t probe = 0; probe < QWEN35_PROMPT_INDEX_PROBES; probe++) {
+        const uint32_t slot = ((uint32_t)hash + probe) & mask;
+        const ds4_qwen35_prompt_index_entry *entry = &index->entry[slot];
+        if (entry->start_plus_one == 0) {
+            victim = slot;
+            oldest = 0;
+            break;
+        }
+        const uint32_t prior = entry->start_plus_one - 1u;
+        if (entry->hash == hash &&
+            qwen35_prompt_index_entry_matches(history, prior, start)) {
+            victim = slot;
+            oldest = 0;
+            break;
+        }
+        if (prior < oldest) {
+            oldest = prior;
+            victim = slot;
+        }
+    }
+    index->entry[victim] = (ds4_qwen35_prompt_index_entry){
+        .hash = hash,
+        .start_plus_one = start + 1u,
+    };
+}
+
+static bool qwen35_prompt_index_sync(
+        ds4_qwen35_prompt_index *index,
+        const token_vec         *history) {
+    if (!index || !index->entry || !history || history->len < 0) {
+        return false;
+    }
+    if (index->indexed_len > (uint32_t)history->len) {
+        qwen35_prompt_index_reset(index);
+    }
+    /* Add a key only once it has a following token.  The current terminal
+     * suffix is therefore never allowed to overwrite the previous occurrence
+     * that can actually provide a draft. */
+    while (index->indexed_len < (uint32_t)history->len) {
+        index->indexed_len++;
+        if (index->indexed_len > QWEN35_PROMPT_NGRAM) {
+            qwen35_prompt_index_insert(
+                index, history,
+                index->indexed_len - QWEN35_PROMPT_NGRAM - 1u);
+        }
+    }
+    return true;
+}
+
+static uint32_t qwen35_prompt_index_draft(
+        ds4_qwen35_prompt_index *index,
+        const token_vec         *history,
+        int                     *draft,
+        uint32_t                 draft_cap) {
+    if (!index || !history || !draft || draft_cap == 0 ||
+        history->len < QWEN35_PROMPT_NGRAM ||
+        !qwen35_prompt_index_sync(index, history)) {
+        return 0;
+    }
+
+    const uint32_t key_start =
+        (uint32_t)history->len - QWEN35_PROMPT_NGRAM;
+    const uint64_t hash = qwen35_prompt_ngram_hash(&history->v[key_start]);
+    const uint32_t mask = QWEN35_PROMPT_INDEX_CAP - 1u;
+    uint32_t best = UINT32_MAX;
+    for (uint32_t probe = 0; probe < QWEN35_PROMPT_INDEX_PROBES; probe++) {
+        const ds4_qwen35_prompt_index_entry *entry =
+            &index->entry[((uint32_t)hash + probe) & mask];
+        if (entry->start_plus_one == 0 || entry->hash != hash) continue;
+        const uint32_t candidate = entry->start_plus_one - 1u;
+        if (candidate >= key_start ||
+            !qwen35_prompt_index_entry_matches(
+                history, candidate, key_start)) {
+            continue;
+        }
+        if (best == UINT32_MAX || candidate > best) best = candidate;
+    }
+    if (best == UINT32_MAX) return 0;
+
+    uint32_t source = best + QWEN35_PROMPT_NGRAM;
+    uint32_t n = 0;
+    while (n < draft_cap && source + n < (uint32_t)history->len) {
+        draft[n] = history->v[source + n];
+        n++;
+    }
+    return n;
+}
+
+static uint32_t qwen35_prompt_draft_before_eos(
+        const int *draft,
+        uint32_t   draft_n,
+        int        eos_token) {
+    if (!draft) return 0;
+    for (uint32_t i = 0; i < draft_n; i++) {
+        if (draft[i] == eos_token) return i;
+    }
+    return draft_n;
+}
+
+/* Reduce target rows into the exact speculative contract.  The correction
+ * after a partial match and the bonus after a full match are both represented
+ * by logits at the committed frontier; generation samples that deferred token
+ * on its next loop.  This avoids a second token queue/state machine and makes
+ * it impossible to evaluate either token twice. */
+static qwen35_prompt_verdict qwen35_prompt_verdict_make(
+        const int     *draft,
+        uint32_t       draft_n,
+        int            initial_top,
+        const int32_t *row_top,
+        uint32_t       row_top_n) {
+    qwen35_prompt_verdict verdict = {0};
+    if (!draft || draft_n == 0) return verdict;
+    if (initial_top != draft[0]) {
+        verdict.deferred_token = initial_top;
+        verdict.deferred_valid = true;
+        return verdict;
+    }
+    verdict.accepted = 1;
+    while (verdict.accepted < draft_n && row_top &&
+           verdict.accepted - 1u < row_top_n &&
+           row_top[verdict.accepted - 1u] == draft[verdict.accepted]) {
+        verdict.accepted++;
+    }
+    const uint32_t frontier_row = verdict.accepted - 1u;
+    if (row_top && frontier_row < row_top_n) {
+        verdict.deferred_token = row_top[frontier_row];
+        verdict.deferred_valid = true;
+    }
+    return verdict;
+}
 
 /* =========================================================================
  * Session Snapshot Payloads.
@@ -28918,6 +30838,7 @@ static bool ds4_session_qwen35_reset_timeline(ds4_session *s) {
     s->checkpoint.len = 0;
     s->checkpoint_valid = false;
     s->mtp_draft_valid = false;
+    qwen35_prompt_index_reset(&s->qwen35_prompt_index);
     return ok;
 }
 
@@ -29415,6 +31336,24 @@ bool ds4_engine_has_mtp(ds4_engine *e) {
 
 int ds4_engine_mtp_draft_tokens(ds4_engine *e) {
     return ds4_engine_has_mtp(e) ? e->mtp_draft_tokens : 0;
+}
+
+int ds4_engine_speculative_draft_tokens(ds4_engine *e) {
+    if (!e || e->backend == DS4_BACKEND_CPU ||
+        e->distributed.role != DS4_DISTRIBUTED_NONE) {
+        return 0;
+    }
+    if (ds4_engine_has_mtp(e)) return e->mtp_draft_tokens;
+    if (e->model.family == DS4_MODEL_FAMILY_QWEN35_MOE &&
+        e->qwen_metal_runtime &&
+        (e->qwen35_features.enabled & QWEN35_FEATURE_PROMPT_LOOKUP) != 0) {
+        return (int)QWEN35_PROMPT_LOOKUP_MAX_DRAFT;
+    }
+    return 0;
+}
+
+bool ds4_engine_is_qwen35(ds4_engine *e) {
+    return e && e->model.family == DS4_MODEL_FAMILY_QWEN35_MOE;
 }
 
 const ds4_tokens *ds4_session_tokens(ds4_session *s) {
@@ -30545,6 +32484,352 @@ int ds4_engine_collect_imatrix(ds4_engine *e,
 #endif
 }
 
+#define DS4_QWEN_GENERATION_EVIDENCE_SCHEMA \
+    "ds4.qwen.generation-evidence/1"
+
+typedef enum {
+    QWEN35_EVIDENCE_FRONTIER_INVALID = -1,
+    QWEN35_EVIDENCE_FRONTIER_READY = 0,
+    QWEN35_EVIDENCE_FRONTIER_EVAL_LAST = 1,
+} qwen35_evidence_frontier_action;
+
+static void qwen35_generation_evidence_set_err(
+        char       *err,
+        size_t      errlen,
+        const char *message) {
+    if (err && errlen != 0) {
+        snprintf(err, errlen, "%s", message ? message : "unknown error");
+    }
+}
+
+static bool qwen35_generation_evidence_prepare(
+        ds4_qwen_generation_evidence *evidence,
+        int                           prompt_tokens,
+        int                           n_predict,
+        int                           vocab,
+        char                         *err,
+        size_t                        errlen) {
+    if (!evidence) return true;
+    if (prompt_tokens <= 0 || n_predict < 0 || vocab <= 0 ||
+        evidence->token_capacity < n_predict ||
+        (n_predict > 0 && !evidence->token_ids) ||
+        evidence->final_logits_capacity < vocab ||
+        !evidence->final_logits) {
+        qwen35_generation_evidence_set_err(
+            err, errlen, "invalid or undersized generation evidence buffers");
+        return false;
+    }
+
+    evidence->prompt_tokens = prompt_tokens;
+    evidence->token_count = 0;
+    evidence->final_argmax_id = -1;
+    evidence->final_logits_count = 0;
+    evidence->session_position = -1;
+    return true;
+}
+
+static bool qwen35_generation_evidence_record(
+        ds4_qwen_generation_evidence *evidence,
+        int                           token) {
+    if (!evidence) return true;
+    if (!evidence->token_ids || token < 0 ||
+        evidence->token_count < 0 ||
+        evidence->token_count >= evidence->token_capacity) {
+        return false;
+    }
+    evidence->token_ids[evidence->token_count++] = token;
+    return true;
+}
+
+static qwen35_evidence_frontier_action
+qwen35_generation_evidence_frontier_action(
+        int prompt_tokens,
+        int token_count,
+        int session_position) {
+    if (prompt_tokens <= 0 || token_count < 0 || session_position < 0 ||
+        prompt_tokens > INT_MAX - token_count) {
+        return QWEN35_EVIDENCE_FRONTIER_INVALID;
+    }
+    const int expected = prompt_tokens + token_count;
+    if (session_position == expected) {
+        return QWEN35_EVIDENCE_FRONTIER_READY;
+    }
+    if (token_count > 0 && session_position == expected - 1) {
+        return QWEN35_EVIDENCE_FRONTIER_EVAL_LAST;
+    }
+    return QWEN35_EVIDENCE_FRONTIER_INVALID;
+}
+
+static bool qwen35_generation_evidence_checkpoint_matches(
+        const ds4_tokens                    *checkpoint,
+        const ds4_tokens                    *prompt,
+        const ds4_qwen_generation_evidence *evidence,
+        int                                  committed_tokens) {
+    if (!checkpoint || !prompt || !evidence || prompt->len <= 0 ||
+        committed_tokens < 0 || committed_tokens > evidence->token_count ||
+        prompt->len > INT_MAX - committed_tokens ||
+        checkpoint->len != prompt->len + committed_tokens ||
+        (prompt->len > 0 && (!checkpoint->v || !prompt->v)) ||
+        (committed_tokens > 0 && !evidence->token_ids)) {
+        return false;
+    }
+    if (memcmp(checkpoint->v, prompt->v,
+               (size_t)prompt->len * sizeof(prompt->v[0])) != 0) {
+        return false;
+    }
+    return committed_tokens == 0 ||
+           memcmp(checkpoint->v + prompt->len,
+                  evidence->token_ids,
+                  (size_t)committed_tokens * sizeof(evidence->token_ids[0])) == 0;
+}
+
+static int qwen35_generation_evidence_logits_argmax(
+        const float *logits,
+        int          count) {
+    if (!logits || count <= 0) return -1;
+    int best = -1;
+    float best_value = 0.0f;
+    for (int token = 0; token < count; token++) {
+        const float value = logits[token];
+        if (!isfinite(value)) continue;
+        if (best < 0 || value > best_value) {
+            best = token;
+            best_value = value;
+        }
+    }
+    return best;
+}
+
+static int qwen35_generation_evidence_selectable_vocab(
+        int physical_vocab) {
+    /* Evidence intentionally preserves every physical output-head row so a
+     * control and a candidate can compare the complete tensor numerically.
+     * Qwen's final 243 rows are padding, though: they are not legal token IDs
+     * and must never participate in semantic argmax validation.  Small
+     * model-free fixtures use synthetic vocabularies, so all of their rows
+     * remain selectable. */
+    if (physical_vocab == (int)QWEN35_N_VOCAB) {
+        return (int)QWEN35_N_VALID_TOKEN;
+    }
+    /* Synthetic fixtures are deliberately smaller than the real vocabulary.
+     * Any other vector that enters the padded range is malformed, not a new
+     * token geometry, and must fail closed. */
+    return physical_vocab > 0 &&
+           physical_vocab <= (int)QWEN35_N_VALID_TOKEN
+        ? physical_vocab
+        : -1;
+}
+
+static bool qwen35_generation_evidence_capture(
+        ds4_session                  *session,
+        const ds4_tokens             *prompt,
+        ds4_qwen_generation_evidence *evidence,
+        char                         *err,
+        size_t                        errlen) {
+    if (!session || !prompt || !evidence ||
+        evidence->token_count < 0 ||
+        !qwen35_generation_evidence_checkpoint_matches(
+            ds4_session_tokens(session), prompt, evidence,
+            evidence->token_count)) {
+        qwen35_generation_evidence_set_err(
+            err, errlen, "generation evidence checkpoint does not match visible tokens");
+        return false;
+    }
+    const int vocab = ds4_engine_vocab_size(session->engine);
+    const int selectable_vocab =
+        ds4_engine_effective_vocab_size(session->engine);
+    const int position = ds4_session_pos(session);
+    if (vocab <= 0 || selectable_vocab <= 0 || selectable_vocab > vocab ||
+        evidence->final_logits_capacity < vocab ||
+        ds4_session_copy_logits(
+            session, evidence->final_logits,
+            evidence->final_logits_capacity) != vocab) {
+        qwen35_generation_evidence_set_err(
+            err, errlen, "failed to copy generation evidence frontier logits");
+        return false;
+    }
+    const int final_argmax = ds4_session_argmax(session);
+    const int copied_argmax = qwen35_generation_evidence_logits_argmax(
+        evidence->final_logits, selectable_vocab);
+    if (final_argmax < 0 || final_argmax != copied_argmax) {
+        qwen35_generation_evidence_set_err(
+            err, errlen,
+            "generation evidence argmax does not match selectable logits");
+        return false;
+    }
+
+    evidence->final_argmax_id = final_argmax;
+    evidence->final_logits_count = vocab;
+    evidence->session_position = position;
+    return true;
+}
+
+static bool qwen35_generation_evidence_complete(
+        const ds4_qwen_generation_evidence *evidence,
+        char                               *err,
+        size_t                              errlen) {
+    if (!evidence || evidence->prompt_tokens <= 0 ||
+        evidence->token_count < 0 ||
+        evidence->token_count > evidence->token_capacity ||
+        (evidence->token_count > 0 && !evidence->token_ids) ||
+        evidence->final_logits_count <= 0 ||
+        evidence->final_logits_count > evidence->final_logits_capacity ||
+        !evidence->final_logits ||
+        evidence->prompt_tokens > INT_MAX - evidence->token_count ||
+        evidence->session_position !=
+            evidence->prompt_tokens + evidence->token_count ||
+        evidence->final_argmax_id < 0) {
+        qwen35_generation_evidence_set_err(
+            err, errlen, "incomplete generation evidence snapshot");
+        return false;
+    }
+    const int selectable_vocab =
+        qwen35_generation_evidence_selectable_vocab(
+            evidence->final_logits_count);
+    if (selectable_vocab <= 0 ||
+        evidence->final_argmax_id >= selectable_vocab) {
+        qwen35_generation_evidence_set_err(
+            err, errlen, "incomplete generation evidence snapshot");
+        return false;
+    }
+    for (int i = 0; i < evidence->token_count; i++) {
+        if (evidence->token_ids[i] < 0 ||
+            evidence->token_ids[i] >= selectable_vocab) {
+            qwen35_generation_evidence_set_err(
+                err, errlen, "generation evidence contains an invalid token ID");
+            return false;
+        }
+    }
+    if (qwen35_generation_evidence_logits_argmax(
+            evidence->final_logits,
+            selectable_vocab) != evidence->final_argmax_id) {
+        qwen35_generation_evidence_set_err(
+            err, errlen, "generation evidence final argmax is inconsistent");
+        return false;
+    }
+    return true;
+}
+
+int ds4_qwen_generation_evidence_write_json_atomic(
+        const char                          *path,
+        const ds4_qwen_generation_evidence *evidence,
+        char                                *err,
+        size_t                               errlen) {
+    if (err && errlen != 0) err[0] = '\0';
+    if (!path || !path[0]) {
+        qwen35_generation_evidence_set_err(
+            err, errlen, "generation evidence path is empty");
+        return 1;
+    }
+    if (!qwen35_generation_evidence_complete(evidence, err, errlen)) {
+        return 1;
+    }
+
+    static const char suffix[] = ".tmp.XXXXXX";
+    const size_t path_len = strlen(path);
+    if (path_len > SIZE_MAX - sizeof(suffix)) {
+        qwen35_generation_evidence_set_err(
+            err, errlen, "generation evidence path is too long");
+        return 1;
+    }
+    char *tmp_path = malloc(path_len + sizeof(suffix));
+    if (!tmp_path) {
+        qwen35_generation_evidence_set_err(
+            err, errlen, "out of memory creating generation evidence path");
+        return 1;
+    }
+    memcpy(tmp_path, path, path_len);
+    memcpy(tmp_path + path_len, suffix, sizeof(suffix));
+
+    const int fd = mkstemp(tmp_path);
+    if (fd < 0) {
+        if (err && errlen != 0) {
+            snprintf(err, errlen,
+                     "failed to create generation evidence temporary file: %s",
+                     strerror(errno));
+        }
+        free(tmp_path);
+        return 1;
+    }
+    FILE *fp = fdopen(fd, "wb");
+    if (!fp) {
+        const int saved_errno = errno;
+        close(fd);
+        unlink(tmp_path);
+        if (err && errlen != 0) {
+            snprintf(err, errlen,
+                     "failed to open generation evidence temporary stream: %s",
+                     strerror(saved_errno));
+        }
+        free(tmp_path);
+        return 1;
+    }
+
+    fprintf(fp,
+            "{\n  \"schema\":\"%s\",\n"
+            "  \"prompt_tokens\":%d,\n"
+            "  \"session_position\":%d,\n"
+            "  \"token_ids\":[",
+            DS4_QWEN_GENERATION_EVIDENCE_SCHEMA,
+            evidence->prompt_tokens,
+            evidence->session_position);
+    for (int i = 0; i < evidence->token_count; i++) {
+        if (i) fputc(',', fp);
+        if ((i % 16) == 0) fputs("\n    ", fp);
+        fprintf(fp, "%d", evidence->token_ids[i]);
+    }
+    fprintf(fp,
+            "%s  ],\n  \"final_argmax_id\":%d,\n"
+            "  \"final_logits\":[",
+            evidence->token_count ? "\n" : "",
+            evidence->final_argmax_id);
+    for (int i = 0; i < evidence->final_logits_count; i++) {
+        if (i) fputc(',', fp);
+        if ((i % 8) == 0) fputs("\n    ", fp);
+        if (isfinite(evidence->final_logits[i])) {
+            fprintf(fp, "%.9g", evidence->final_logits[i]);
+        } else {
+            fputs("null", fp);
+        }
+    }
+    fputs("\n  ]\n}\n", fp);
+
+    int write_errno = 0;
+    if (ferror(fp)) write_errno = errno ? errno : EIO;
+    if (fflush(fp) != 0 && write_errno == 0) {
+        write_errno = errno ? errno : EIO;
+    }
+    if (write_errno == 0 && fsync(fileno(fp)) != 0) {
+        write_errno = errno ? errno : EIO;
+    }
+    if (fclose(fp) != 0 && write_errno == 0) {
+        write_errno = errno ? errno : EIO;
+    }
+    if (write_errno != 0) {
+        unlink(tmp_path);
+        if (err && errlen != 0) {
+            snprintf(err, errlen,
+                     "failed to write generation evidence: %s",
+                     strerror(write_errno));
+        }
+        free(tmp_path);
+        return 1;
+    }
+    if (rename(tmp_path, path) != 0) {
+        const int saved_errno = errno;
+        unlink(tmp_path);
+        if (err && errlen != 0) {
+            snprintf(err, errlen,
+                     "failed to publish generation evidence: %s",
+                     strerror(saved_errno));
+        }
+        free(tmp_path);
+        return 1;
+    }
+    free(tmp_path);
+    return 0;
+}
+
 static int generate_qwen35_argmax(
         ds4_engine              *e,
         const ds4_tokens        *prompt,
@@ -30554,10 +32839,20 @@ static int generate_qwen35_argmax(
         ds4_generation_done_fn   done,
         void                    *emit_ud,
         ds4_session_progress_fn  progress,
-        void                    *progress_ud) {
+        void                    *progress_ud,
+        ds4_qwen_generation_evidence *evidence) {
     if (!e || !prompt || prompt->len <= 0 || prompt->len >= ctx_size) {
         fprintf(stderr,
                 "ds4: Qwen prompt is empty or leaves no context for generation\n");
+        return 1;
+    }
+
+    char err[256] = {0};
+    if (!qwen35_generation_evidence_prepare(
+            evidence, prompt->len, n_predict,
+            ds4_engine_vocab_size(e), err, sizeof(err))) {
+        fprintf(stderr, "ds4: Qwen generation evidence refused: %s\n",
+                err[0] ? err : "invalid evidence buffers");
         return 1;
     }
 
@@ -30568,7 +32863,6 @@ static int generate_qwen35_argmax(
     }
     ds4_session_set_progress(session, progress, progress_ud);
 
-    char err[256] = {0};
     const double prefill_t0 = now_sec();
     int rc = ds4_session_sync(session, prompt, err, sizeof(err));
     const double prefill_t1 = now_sec();
@@ -30585,12 +32879,11 @@ static int generate_qwen35_argmax(
     int decode_evals = 0;
     bool ok = true;
     const double decode_t0 = now_sec();
-    for (int i = 0;
-         i < n_predict && ds4_session_pos(session) < ctx_size;
-         i++) {
+    while (generated < n_predict &&
+           ds4_session_pos(session) < ctx_size) {
         if (trace_top) {
             char label[64];
-            snprintf(label, sizeof(label), "step %d", i);
+            snprintf(label, sizeof(label), "step %d", generated);
             print_top_logits(stderr,
                              label,
                              &e->vocab,
@@ -30605,30 +32898,126 @@ static int generate_qwen35_argmax(
             break;
         }
         if (token == e->vocab.eos_id) break;
-        if (emit) emit(emit_ud, token);
-        generated++;
 
-        if (i + 1 >= n_predict ||
-            ds4_session_pos(session) + 1 >= ctx_size) {
-            break;
-        }
+        const int remaining = n_predict - generated;
+        const int room = ctx_size - ds4_session_pos(session);
+        const bool need_next_logits = remaining > 1 && room > 1;
+        int accepted[1 + QWEN35_PROMPT_LOOKUP_MAX_DRAFT] = {0};
+        int n_accept = 1;
+        accepted[0] = token;
         const double eval_t0 = token_timing ? now_sec() : 0.0;
-        if (ds4_session_eval(session, token, err, sizeof(err)) != 0) {
-            fprintf(stderr, "ds4: Qwen decode failed: %s\n",
-                    err[0] ? err : "unknown error");
-            ok = false;
-            break;
+        if (need_next_logits &&
+            ds4_engine_speculative_draft_tokens(e) > 1 &&
+            getenv("DS4_MTP_SPEC_DISABLE") == NULL) {
+            n_accept = ds4_session_eval_speculative_argmax(
+                session, token,
+                remaining < room ? remaining : room,
+                e->vocab.eos_id,
+                accepted,
+                (int)(sizeof(accepted) / sizeof(accepted[0])),
+                err, sizeof(err));
+            if (n_accept < 0) {
+                fprintf(stderr, "ds4: Qwen decode failed: %s\n",
+                        err[0] ? err : "unknown error");
+                ok = false;
+                break;
+            }
+            decode_evals += n_accept;
+        } else if (need_next_logits) {
+            if (ds4_session_eval(session, token, err, sizeof(err)) != 0) {
+                fprintf(stderr, "ds4: Qwen decode failed: %s\n",
+                        err[0] ? err : "unknown error");
+                ok = false;
+                break;
+            }
+            decode_evals++;
         }
-        if (token_timing) {
+        if (token_timing && need_next_logits) {
             fprintf(stderr,
-                    "ds4: Qwen decode eval %d took %.3f ms\n",
-                    decode_evals + 1,
+                    "ds4: Qwen decode eval cycle=%d accepted=%d took %.3f ms\n",
+                    decode_evals, n_accept,
                     (now_sec() - eval_t0) * 1000.0);
         }
-        decode_evals++;
+        for (int i = 0; i < n_accept && generated < n_predict; i++) {
+            if (accepted[i] == e->vocab.eos_id) break;
+            if (!qwen35_generation_evidence_record(evidence, accepted[i])) {
+                fprintf(stderr,
+                        "ds4: Qwen generation evidence token buffer overflow\n");
+                ok = false;
+                break;
+            }
+            if (emit) emit(emit_ud, accepted[i]);
+            generated++;
+        }
+        if (!ok) break;
+        if (!need_next_logits) break;
     }
     const double decode_t1 = now_sec();
     if (done) done(emit_ud);
+
+    if (ok && evidence) {
+        if (evidence->token_count != generated) {
+            qwen35_generation_evidence_set_err(
+                err, sizeof(err),
+                "visible token count differs from recorded evidence");
+            ok = false;
+        }
+        const qwen35_evidence_frontier_action action = ok ?
+            qwen35_generation_evidence_frontier_action(
+                evidence->prompt_tokens,
+                evidence->token_count,
+                ds4_session_pos(session)) :
+            QWEN35_EVIDENCE_FRONTIER_INVALID;
+        if (ok && action == QWEN35_EVIDENCE_FRONTIER_EVAL_LAST) {
+            /* The canonical loop intentionally emits its final visible token
+             * without evaluating it.  Evidence needs logits after that token,
+             * so advance it only now, after decode_t1: reported decode TPS and
+             * every normal caller remain unchanged. */
+            if (!qwen35_generation_evidence_checkpoint_matches(
+                    ds4_session_tokens(session), prompt, evidence,
+                    evidence->token_count - 1)) {
+                qwen35_generation_evidence_set_err(
+                    err, sizeof(err),
+                    "session prefix before final evidence token is inconsistent");
+                ok = false;
+            } else {
+                err[0] = '\0';
+                const int last_token =
+                    evidence->token_ids[evidence->token_count - 1];
+                if (ds4_session_eval(
+                        session, last_token, err, sizeof(err)) != 0) {
+                    if (!err[0]) {
+                        qwen35_generation_evidence_set_err(
+                            err, sizeof(err),
+                            "failed to evaluate final visible token");
+                    }
+                    ok = false;
+                }
+            }
+        } else if (ok && action != QWEN35_EVIDENCE_FRONTIER_READY) {
+            qwen35_generation_evidence_set_err(
+                err, sizeof(err),
+                "session frontier is not aligned with visible generation");
+            ok = false;
+        }
+        if (ok && qwen35_generation_evidence_frontier_action(
+                evidence->prompt_tokens,
+                evidence->token_count,
+                ds4_session_pos(session)) != QWEN35_EVIDENCE_FRONTIER_READY) {
+            qwen35_generation_evidence_set_err(
+                err, sizeof(err),
+                "session frontier did not reach all visible tokens");
+            ok = false;
+        }
+        if (ok && !qwen35_generation_evidence_capture(
+                session, prompt, evidence, err, sizeof(err))) {
+            ok = false;
+        }
+        if (!ok) {
+            fprintf(stderr, "ds4: Qwen generation evidence failed: %s\n",
+                    err[0] ? err : "unknown frontier error");
+        }
+    }
 
     ds4_log(stderr,
             DS4_LOG_TIMING,
@@ -30641,7 +33030,7 @@ static int generate_qwen35_argmax(
     return ok ? 0 : 1;
 }
 
-int ds4_engine_generate_argmax(
+int ds4_engine_generate_argmax_with_evidence(
         ds4_engine        *e,
         const ds4_tokens  *prompt,
         int                n_predict,
@@ -30650,12 +33039,18 @@ int ds4_engine_generate_argmax(
         ds4_generation_done_fn done,
         void              *emit_ud,
         ds4_session_progress_fn progress,
-        void              *progress_ud) {
+        void              *progress_ud,
+        ds4_qwen_generation_evidence *evidence) {
     if (!e) return 1;
     if (e->model.family == DS4_MODEL_FAMILY_QWEN35_MOE) {
         return generate_qwen35_argmax(
             e, prompt, n_predict, ctx_size,
-            emit, done, emit_ud, progress, progress_ud);
+            emit, done, emit_ud, progress, progress_ud, evidence);
+    }
+    if (evidence) {
+        fprintf(stderr,
+                "ds4: generation evidence is supported only by Qwen canonical argmax\n");
+        return 1;
     }
     const ds4_model *model = &e->model;
     const ds4_vocab *vocab = &e->vocab;
@@ -30693,6 +33088,23 @@ int ds4_engine_generate_argmax(
                                 e->directional_steering_attn_scale,
                                 e->directional_steering_ffn_scale,
                                 emit, done, emit_ud, progress, progress_ud);
+}
+
+int ds4_engine_generate_argmax(
+        ds4_engine        *e,
+        const ds4_tokens  *prompt,
+        int                n_predict,
+        int                ctx_size,
+        ds4_token_emit_fn  emit,
+        ds4_generation_done_fn done,
+        void              *emit_ud,
+        ds4_session_progress_fn progress,
+        void              *progress_ud) {
+    /* Keep the long-standing entry point allocation-free and model-neutral;
+     * evidence is a strictly opt-in Qwen diagnostic layered underneath it. */
+    return ds4_engine_generate_argmax_with_evidence(
+        e, prompt, n_predict, ctx_size,
+        emit, done, emit_ud, progress, progress_ud, NULL);
 }
 
 int ds4_engine_metal_graph_test(ds4_engine *e, const ds4_tokens *prompt) {
@@ -31199,10 +33611,10 @@ static bool ds4_file_size_bytes(const char *path, uint64_t *bytes_out) {
 }
 
 /* Keep residency planning model-aware without widening the public estimator.
- * Qwen's scalar correctness runtime owns full-context F32 K/V plus the fixed
- * recurrent state and scratch arena.  That CPU-shaped estimate is deliberately
- * conservative for the one-token Metal graph, and therefore safe to reuse
- * while the Metal executor remains experimental. */
+ * Metal has a different fixed scratch graph from the scalar CPU runtime.  Its
+ * exact persistent allocation is used here. SSD transients are charged later
+ * to phase-specific cache envelopes; the resolver adds the decode verifier
+ * workspace only when it is evaluating a resident Qwen candidate. */
 static bool ds4_engine_context_memory_estimate_private(
         const ds4_engine   *e,
         int                 ctx_size,
@@ -31216,6 +33628,29 @@ static bool ds4_engine_context_memory_estimate_private(
         return true;
     }
     if ((uint32_t)ctx_size > QWEN35_CONTEXT_LENGTH) return false;
+
+    if (e->backend == DS4_BACKEND_METAL) {
+        uint64_t persistent_bytes = 0;
+        if (!qwen35_metal_persistent_runtime_bytes(
+                (uint32_t)ctx_size, &persistent_bytes)) {
+            return false;
+        }
+        *out = (ds4_context_memory){
+            .raw_bytes =
+                (uint64_t)QWEN35_FULL_ATTENTION_LAYER_COUNT * 2u *
+                QWEN35_N_HEAD_KV * QWEN35_N_HEAD_DIM * sizeof(float) *
+                (uint32_t)ctx_size,
+            .compressed_bytes = QWEN35_RECURRENT_SNAPSHOT_BYTES,
+            .scratch_bytes = persistent_bytes -
+                ((uint64_t)QWEN35_FULL_ATTENTION_LAYER_COUNT * 2u *
+                 QWEN35_N_HEAD_KV * QWEN35_N_HEAD_DIM * sizeof(float) *
+                 (uint32_t)ctx_size) - QWEN35_RECURRENT_SNAPSHOT_BYTES,
+            .total_bytes = persistent_bytes,
+            .prefill_cap = QWEN35_PREFILL_MICRO_TOKENS,
+            .raw_cap = (uint32_t)ctx_size,
+        };
+        return true;
+    }
 
     ds4_qwen35_cpu_cache_plan cache = {0};
     ds4_qwen35_cpu_scratch_plan scratch = {0};
@@ -31317,6 +33752,29 @@ static bool ds4_engine_resolve_residency(ds4_engine               *e,
                 "ds4: could not estimate context memory for residency planning\n");
         return false;
     }
+    uint64_t qwen_resident_decode_workspace = 0;
+    bool qwen_resident_decode_workspace_charged = false;
+    if (e->backend == DS4_BACKEND_METAL &&
+        e->model.family == DS4_MODEL_FAMILY_QWEN35_MOE &&
+        e->residency_requested != DS4_RESIDENCY_SSD) {
+        /* Prompt verification is an always-available resident capability, so
+         * AUTO must admit its peak before choosing full-model mapped mode.
+         * SSD has a different phase envelope and removes this provisional
+         * charge below before its cache planner runs. */
+        if (!qwen35_prompt_lookup_persistent_bytes(
+                &qwen_resident_decode_workspace) ||
+            !qwen35_u64_add(context.scratch_bytes,
+                            qwen_resident_decode_workspace,
+                            &context.scratch_bytes) ||
+            !qwen35_u64_add(context.total_bytes,
+                            qwen_resident_decode_workspace,
+                            &context.total_bytes)) {
+            fprintf(stderr,
+                    "ds4: could not reserve Qwen resident decode workspace\n");
+            return false;
+        }
+        qwen_resident_decode_workspace_charged = true;
+    }
     if (e->model.family == DS4_MODEL_FAMILY_QWEN35_MOE) {
         fprintf(stderr,
                 "ds4: Qwen residency runtime %.2f GiB at context %u "
@@ -31394,6 +33852,27 @@ static bool ds4_engine_resolve_residency(ds4_engine               *e,
         }
     }
 #endif
+    if (qwen_resident_decode_workspace_charged &&
+        e->residency_plan.resolved == DS4_RESIDENCY_SSD) {
+        /* The SSD planner reserves this workspace in decode_peak and must not
+         * lose an expert-cache tier to a duplicate provisional charge. */
+        if (e->residency_plan.runtime_bytes <
+                qwen_resident_decode_workspace ||
+            e->residency_plan.required_bytes <
+                qwen_resident_decode_workspace) {
+            fprintf(stderr,
+                    "ds4: invalid Qwen resident-workspace accounting\n");
+            return false;
+        }
+        e->residency_plan.runtime_bytes -=
+            qwen_resident_decode_workspace;
+        e->residency_plan.required_bytes -=
+            qwen_resident_decode_workspace;
+        qwen_resident_decode_workspace_charged = false;
+    }
+    e->qwen35_decode_workspace_bytes =
+        qwen_resident_decode_workspace_charged ?
+            qwen_resident_decode_workspace : 0;
     e->residency = e->residency_plan.resolved;
     e->ssd_streaming = e->residency == DS4_RESIDENCY_SSD;
 
@@ -31744,6 +34223,243 @@ static bool ds4_engine_qwen35_metal_options_valid(
 }
 
 #if defined(__APPLE__) && !defined(DS4_NO_GPU)
+static bool ds4_engine_plan_qwen35_metal_phases(
+        ds4_engine                                  *e,
+        const ds4_ssd_host_memory                   *memory,
+        uint64_t                                     static_page_bytes,
+        const ds4_qwen35_streaming_cache_geometry   *geometry,
+        ds4_ssd_adaptive_cache_plan                 *prefill_out,
+        ds4_ssd_adaptive_cache_plan                 *decode_out) {
+    if (!e || !memory || !geometry || !prefill_out || !decode_out) {
+        return false;
+    }
+
+    memset(prefill_out, 0, sizeof(*prefill_out));
+    memset(decode_out, 0, sizeof(*decode_out));
+
+    uint32_t macro_tokens = e->qwen35_planned_context_tokens;
+    if (macro_tokens > QWEN35_MACRO_PREFILL_MAX) {
+        macro_tokens = QWEN35_MACRO_PREFILL_MAX;
+    }
+    macro_tokens -= macro_tokens % QWEN35_PREFILL_MICRO_TOKENS;
+    if (macro_tokens < QWEN35_PREFILL_MICRO_TOKENS) {
+        macro_tokens = QWEN35_PREFILL_MICRO_TOKENS;
+    }
+
+    uint64_t prompt_lookup_persistent = 0;
+    if (!qwen35_prompt_lookup_persistent_bytes(
+            &prompt_lookup_persistent)) {
+        return false;
+    }
+
+    uint64_t macro_workspace = 0;
+    bool prefill_ok = false;
+    while (macro_tokens >= QWEN35_PREFILL_MICRO_TOKENS) {
+        uint64_t phase_workspace = 0;
+        uint64_t phase_runtime = 0;
+        if (!qwen35_macro_workspace_bytes(
+                macro_tokens, &macro_workspace) ||
+            !qwen35_u64_add(prompt_lookup_persistent,
+                            macro_workspace, &phase_workspace) ||
+            !qwen35_u64_add(e->residency_plan.runtime_bytes,
+                            phase_workspace, &phase_runtime)) {
+            return false;
+        }
+        if (ds4_ssd_adaptive_cache_plan_make_strict_with_static_reserve(
+                memory,
+                phase_runtime,
+                static_page_bytes,
+                false,
+                QWEN35_N_LAYER,
+                QWEN35_N_EXPERT_USED,
+                geometry->per_expert_bytes,
+                geometry->max_cacheable_experts,
+                prefill_out)) {
+            prefill_ok = true;
+            break;
+        }
+        if (macro_tokens == QWEN35_PREFILL_MICRO_TOKENS) break;
+        macro_tokens -= QWEN35_PREFILL_MICRO_TOKENS;
+    }
+    if (!prefill_ok) return false;
+
+    uint64_t decode_runtime = 0;
+    if (!qwen35_u64_add(e->residency_plan.runtime_bytes,
+                        prompt_lookup_persistent, &decode_runtime) ||
+        !ds4_ssd_adaptive_cache_plan_make_strict_with_static_reserve(
+            memory,
+            decode_runtime,
+            static_page_bytes,
+            false,
+            QWEN35_N_LAYER,
+            QWEN35_N_EXPERT_USED,
+            geometry->per_expert_bytes,
+            geometry->max_cacheable_experts,
+            decode_out)) {
+        return false;
+    }
+
+    e->qwen35_macro_tokens = macro_tokens;
+    /* The prompt verifier and its host n-gram index are allocated with every
+     * full-stack session before macro prefill starts.  Charge their persistent
+     * 74 MiB to both phase peaks; otherwise the 16 GiB planner could spend the
+     * same bytes twice on expert cache and violate its frozen 2 GiB margin. */
+    if (!qwen35_u64_add(prompt_lookup_persistent, macro_workspace,
+                        &e->qwen35_prefill_workspace_bytes)) {
+        return false;
+    }
+    e->qwen35_decode_workspace_bytes = prompt_lookup_persistent;
+    e->qwen35_prefill_cache_experts =
+        (uint32_t)geometry->minimum_cache_experts;
+    e->qwen35_request_headroom_bytes =
+        prefill_out->current_headroom_bytes +
+        prefill_out->pressure_margin_bytes;
+    e->qwen35_pressure_gate_required =
+        prefill_out->low_ram_shared_static_headroom_active;
+    return true;
+}
+
+static void ds4_engine_try_install_qwen35_expert_pack(ds4_engine *e) {
+    if (!e) return;
+    e->qwen35_expert_pack_ready = false;
+
+    if (!qwen35_expert_pack_should_install(
+            e->residency, e->ssd_streaming, e->qwen35_features.ablated)) {
+        if ((e->qwen35_features.ablated & QWEN35_FEATURE_EXPERT_PACK) != 0) {
+            fprintf(stderr,
+                    "ds4: Qwen expert pack disabled by campaign ablation\n");
+        }
+        return;
+    }
+
+    ds4_qwen35_expert_pack_env env = {0};
+    char err[256] = {0};
+    if (!qwen35_expert_pack_env_parse_values(
+            getenv("DS4_QWEN_EXPERT_PACK_PATH"),
+            getenv("DS4_QWEN_EXPERT_PACK_SHA256"),
+            getenv("DS4_QWEN_EXPERT_PACK_VERSION"),
+            getenv("DS4_QWEN_GGUF_SHA256"),
+            &env, err, sizeof(err))) {
+        fprintf(stderr,
+                "ds4: Qwen expert pack unavailable: %s; using canonical GGUF experts\n",
+                err[0] ? err : "invalid campaign identity");
+        return;
+    }
+
+    const ds4_qwen_expert_pack_geometry geometry =
+        ds4_qwen35_expert_pack_geometry();
+    ds4_qwen_expert_pack *pack = NULL;
+    if (ds4_qwen_expert_pack_open(
+            &pack, env.path, &geometry, err, sizeof(err)) !=
+        DS4_QWEN_EXPERT_PACK_OK) {
+        fprintf(stderr,
+                "ds4: Qwen expert pack unavailable: %s; using canonical GGUF experts\n",
+                err[0] ? err : "pack open or geometry validation failed");
+        return;
+    }
+
+    /* The campaign hashes both large artifacts before the timed run.  fstat
+     * binds that trusted GGUF digest to the descriptor actually held by this
+     * engine; the reader then authorizes both digests without rereading either
+     * multi-gigabyte payload and perturbing the cold page-cache state. */
+    struct stat model_stat;
+    if (fstat(e->model.fd, &model_stat) != 0 ||
+        !S_ISREG(model_stat.st_mode) || model_stat.st_size < 0 ||
+        (uint64_t)model_stat.st_size != e->model.size) {
+        snprintf(err, sizeof(err),
+                 "loaded GGUF descriptor identity does not match its mapped size");
+        goto unavailable;
+    }
+    if (ds4_qwen_expert_pack_validate_source_digest(
+            pack, (uint64_t)model_stat.st_size, env.gguf_sha256,
+            err, sizeof(err)) != DS4_QWEN_EXPERT_PACK_OK ||
+        ds4_qwen_expert_pack_validate_payload_digest(
+            pack, env.payload_sha256,
+            err, sizeof(err)) != DS4_QWEN_EXPERT_PACK_OK) {
+        goto unavailable;
+    }
+
+    const ds4_qwen_expert_pack_manifest *manifest =
+        ds4_qwen_expert_pack_manifest_get(pack);
+    if (!manifest ||
+        !ds4_gpu_qwen35_expert_pack_install(
+            ds4_qwen_expert_pack_fd(pack),
+            manifest->file_size,
+            manifest->data_offset,
+            manifest->gate_bytes,
+            manifest->up_bytes,
+            manifest->down_bytes,
+            manifest->geometry.n_layer,
+            manifest->geometry.n_expert)) {
+        snprintf(err, sizeof(err),
+                 "Metal rejected the verified expert pack geometry");
+        ds4_gpu_qwen35_expert_pack_clear();
+        goto unavailable;
+    }
+
+    /* Cache entries keep their canonical GGUF offsets as identity keys.  Bind
+     * each layer once so Metal can translate only the eventual read source to
+     * the expert-major sidecar; changing the key itself would split cache
+     * accounting between synchronous, overlapped and decode loaders. */
+    for (uint32_t layer_index = 0;
+         layer_index < QWEN35_N_LAYER;
+         layer_index++) {
+        const ds4_qwen35_layer_weights *layer =
+            &e->qwen35_weights.layer[layer_index];
+        if (!layer->ffn_gate_exps ||
+            !layer->ffn_up_exps ||
+            !layer->ffn_down_exps ||
+            !ds4_gpu_qwen35_expert_pack_bind_layer(
+                layer_index,
+                e->model.size,
+                layer->ffn_gate_exps->abs_offset,
+                layer->ffn_up_exps->abs_offset,
+                layer->ffn_down_exps->abs_offset)) {
+            snprintf(err, sizeof(err),
+                     "Metal rejected expert pack binding for layer %u",
+                     layer_index);
+            ds4_gpu_qwen35_expert_pack_clear();
+            goto unavailable;
+        }
+    }
+
+    e->qwen35_expert_pack = pack;
+    e->qwen35_expert_pack_ready = true;
+    fprintf(stderr,
+            "ds4: Qwen expert pack active: version %u, %u layers x %u experts, %.2f GiB payload\n",
+            DS4_QWEN_EXPERT_PACK_FORMAT_VERSION,
+            manifest->geometry.n_layer,
+            manifest->geometry.n_expert,
+            (double)manifest->data_size / 1073741824.0);
+    qwen35_telemetry_emit(
+        e, "expert_pack",
+        "\"active\":true,\"version\":%u,\"layers\":%u,"
+        "\"experts\":%u,\"file_bytes\":%" PRIu64
+        ",\"data_offset\":%" PRIu64 ",\"payload_bytes\":%" PRIu64,
+        DS4_QWEN_EXPERT_PACK_FORMAT_VERSION,
+        manifest->geometry.n_layer,
+        manifest->geometry.n_expert,
+        manifest->file_size,
+        manifest->data_offset,
+        manifest->data_size);
+    return;
+
+unavailable:
+    fprintf(stderr,
+            "ds4: Qwen expert pack unavailable: %s; using canonical GGUF experts\n",
+            err[0] ? err : "validation failed");
+    ds4_qwen_expert_pack_close(pack);
+}
+
+static void ds4_engine_disable_qwen35_expert_pack(ds4_engine *e) {
+    if (!e || !e->qwen35_expert_pack) return;
+    ds4_gpu_qwen35_expert_pack_clear();
+    ds4_qwen_expert_pack_close(e->qwen35_expert_pack);
+    e->qwen35_expert_pack = NULL;
+    e->qwen35_expert_pack_ready = false;
+    e->qwen35_features.enabled &= ~QWEN35_FEATURE_EXPERT_PACK;
+}
+
 static bool ds4_engine_configure_qwen35_metal_streaming(ds4_engine *e) {
     if (!e || e->backend != DS4_BACKEND_METAL ||
         e->residency != DS4_RESIDENCY_SSD || !e->ssd_streaming) {
@@ -31791,38 +34507,33 @@ static bool ds4_engine_configure_qwen35_metal_streaming(ds4_engine *e) {
     free(page_spans.v);
 
     uint32_t auto_experts = 0;
-    ds4_ssd_adaptive_cache_plan auto_plan = {0};
+    ds4_ssd_adaptive_cache_plan prefill_plan = {0};
+    ds4_ssd_adaptive_cache_plan decode_plan = {0};
     ds4_ssd_host_memory memory = {0};
     if (!ds4_gpu_host_memory_snapshot(&memory)) {
         fprintf(stderr,
                 "ds4: Qwen SSD cache planning requires a host-memory snapshot\n");
         return false;
     }
-    const bool auto_plan_ok =
-        ds4_ssd_adaptive_cache_plan_make_strict_with_static_reserve(
-            &memory,
-            e->residency_plan.runtime_bytes,
-            static_page_coverage_bytes,
-            false,
-            QWEN35_N_LAYER,
-            QWEN35_N_EXPERT_USED,
-            geometry.per_expert_bytes,
-            geometry.max_cacheable_experts,
-            &auto_plan);
-    if (auto_plan.low_ram_shared_static_headroom_active &&
-        auto_plan.pageable_static_reserve_bytes != 0) {
+    const bool auto_plan_ok = ds4_engine_plan_qwen35_metal_phases(
+        e, &memory, static_page_coverage_bytes, &geometry,
+        &prefill_plan, &decode_plan);
+    if (prefill_plan.low_ram_shared_static_headroom_active &&
+        prefill_plan.pageable_static_reserve_bytes != 0) {
         fprintf(stderr,
                 "ds4: Qwen SSD low-RAM preflight: pressure %s, reclaimable "
-                "%.2f GiB; pageable static/headroom reserve %.2f GiB + "
-                "margin %.2f GiB + runtime %.2f GiB; safe expert budget "
-                "%.2f GiB (floor %.2f GiB)\n",
+                "%.2f GiB; one request reserve %.2f GiB including pressure; "
+                "persistent runtime %.2f GiB, prefill phase workspace %.2f GiB; "
+                "prefill/decode cache envelopes %.2f/%.2f GiB "
+                "(floor %.2f GiB)\n",
                 !memory.pressure_status_available ? "unknown" :
                     (memory.pressure_normal ? "normal" : "elevated"),
-                (double)auto_plan.reclaimable_bytes / 1073741824.0,
-                (double)auto_plan.current_headroom_bytes / 1073741824.0,
-                (double)auto_plan.pressure_margin_bytes / 1073741824.0,
+                (double)prefill_plan.reclaimable_bytes / 1073741824.0,
+                (double)e->qwen35_request_headroom_bytes / 1073741824.0,
                 (double)e->residency_plan.runtime_bytes / 1073741824.0,
-                (double)auto_plan.current_wire_budget_bytes / 1073741824.0,
+                (double)e->qwen35_prefill_workspace_bytes / 1073741824.0,
+                (double)prefill_plan.cache_bytes / 1073741824.0,
+                (double)decode_plan.cache_bytes / 1073741824.0,
                 (double)geometry.minimum_cache_bytes / 1073741824.0);
     }
     if (!auto_plan_ok) {
@@ -31834,7 +34545,7 @@ static bool ds4_engine_configure_qwen35_metal_streaming(ds4_engine *e) {
                 geometry.minimum_cache_experts);
         return false;
     }
-    auto_experts = auto_plan.cache_experts;
+    auto_experts = decode_plan.cache_experts;
 
     uint32_t cache_experts = 0;
     if (!qwen35_streaming_cache_budget_from_request(
@@ -31851,13 +34562,13 @@ static bool ds4_engine_configure_qwen35_metal_streaming(ds4_engine *e) {
                 (double)geometry.per_expert_bytes / 1048576.0);
         return false;
     }
-    if (cache_experts > auto_plan.cache_experts) {
+    if (cache_experts > decode_plan.cache_experts) {
         fprintf(stderr,
                 "ds4: Qwen SSD cache request %u exceeds the current safe "
                 "host-memory budget of %u experts (static %.2f GiB, runtime "
                 "%.2f GiB); reduce the cache or memory pressure\n",
                 cache_experts,
-                auto_plan.cache_experts,
+                decode_plan.cache_experts,
                 (double)static_page_coverage_bytes / 1073741824.0,
                 (double)e->residency_plan.runtime_bytes / 1073741824.0);
         return false;
@@ -31870,9 +34581,24 @@ static bool ds4_engine_configure_qwen35_metal_streaming(ds4_engine *e) {
                 geometry.warning_cache_experts);
     }
 
+    if ((e->qwen35_features.ablated & QWEN35_FEATURE_PHASE_BUDGET) != 0) {
+        /* The phase-budget ablation keeps the macro workspace reservation for
+         * a fair scheduler comparison, but freezes one cache capacity that is
+         * safe in both envelopes. */
+        if (cache_experts > prefill_plan.cache_experts) {
+            cache_experts = prefill_plan.cache_experts;
+        }
+        e->qwen35_prefill_cache_experts = cache_experts;
+    }
     e->ssd_streaming_cache_experts = cache_experts;
+    e->qwen35_decode_cache_experts = cache_experts;
     e->ssd_streaming_cache_bytes =
         (uint64_t)cache_experts * geometry.per_expert_bytes;
+    /* A Qwen layer has only 256 routed experts, so a larger cold cache adds
+     * allocation/locking pressure but no prefill parallelism. On <=16 GiB AUTO
+     * hosts, start at the safe route floor and grow in-place before decode. */
+    const uint32_t initial_cache_experts =
+        e->qwen35_prefill_cache_experts;
     ds4_gpu_set_streaming_expert_cache_expert_bytes(
         geometry.per_expert_bytes);
     /* Grow the Qwen cache one complete route plus its in-flight safety slot
@@ -31880,12 +34606,13 @@ static bool ds4_engine_configure_qwen35_metal_streaming(ds4_engine *e) {
      * while preserving the generic DeepSeek slab default. */
     ds4_gpu_set_streaming_expert_cache_slab_target_bytes(
         geometry.minimum_cache_bytes);
-    ds4_gpu_set_streaming_expert_cache_budget(cache_experts);
+    ds4_gpu_set_streaming_expert_cache_budget(initial_cache_experts);
     if (!ds4_gpu_set_model_fd(e->model.fd)) {
         fprintf(stderr,
                 "ds4: Qwen SSD streaming failed to install the GGUF file descriptor\n");
         return false;
     }
+    ds4_engine_try_install_qwen35_expert_pack(e);
 
     ds4_model_map_span_vec exact_spans = {0};
     uint64_t exact_payload_bytes = 0;
@@ -31912,7 +34639,8 @@ static bool ds4_engine_configure_qwen35_metal_streaming(ds4_engine *e) {
 
     const uint32_t configured =
         ds4_gpu_stream_expert_cache_configured_count();
-    if ((uint64_t)configured < geometry.minimum_cache_experts ||
+    if (configured != initial_cache_experts ||
+        (uint64_t)configured < geometry.minimum_cache_experts ||
         (uint64_t)configured > geometry.max_cacheable_experts) {
         fprintf(stderr,
                 "ds4: Qwen SSD configured cache %u is outside the supported "
@@ -31926,21 +34654,57 @@ static bool ds4_engine_configure_qwen35_metal_streaming(ds4_engine *e) {
     fprintf(stderr,
             "ds4: experimental Qwen Metal SSD runtime: static %.2f GiB "
             "payload / %.2f GiB page reserve, %u exact spans, cache %u "
-            "experts (%.2f GiB; current conservative AUTO cap %u), model "
+            "experts prefill / %u decode target (%.2f GiB target; safe "
+            "decode cap %u), macro %u tokens / %.2f MiB total prefill "
+            "phase workspace, model "
             "slab target %" PRIu64 " experts (%.2f GiB; "
             "DS4_METAL_STREAMING_EXPERT_SLAB_MB overrides when set)\n",
             (double)static_payload_bytes / 1073741824.0,
             (double)static_page_coverage_bytes / 1073741824.0,
             exact_span_count,
             configured,
+            cache_experts,
             (double)e->ssd_streaming_cache_bytes / 1073741824.0,
-            auto_plan.cache_experts,
+            decode_plan.cache_experts,
+            e->qwen35_macro_tokens,
+            (double)e->qwen35_prefill_workspace_bytes / 1048576.0,
             geometry.minimum_cache_experts,
             (double)geometry.minimum_cache_bytes / 1073741824.0);
+    qwen35_telemetry_emit(
+        e, "memory_plan",
+        "\"residency\":\"ssd\",\"physical_bytes\":%" PRIu64
+        ",\"reclaimable_bytes\":%" PRIu64
+        ",\"runtime_bytes\":%" PRIu64
+        ",\"static_page_bytes\":%" PRIu64
+        ",\"request_headroom_bytes\":%" PRIu64
+        ",\"headroom_component_bytes\":%" PRIu64
+        ",\"pressure_margin_bytes\":%" PRIu64
+        ",\"pressure_normal\":%s,\"initial_cache_experts\":%u"
+        ",\"target_cache_experts\":%u,\"macro_tokens\":%u"
+        ",\"prefill_workspace_bytes\":%" PRIu64
+        ",\"decode_workspace_bytes\":%" PRIu64
+        ",\"expert_bytes\":%" PRIu64,
+        memory.physical_bytes,
+        prefill_plan.reclaimable_bytes,
+        e->residency_plan.runtime_bytes,
+        static_page_coverage_bytes,
+        e->qwen35_request_headroom_bytes,
+        prefill_plan.current_headroom_bytes,
+        prefill_plan.pressure_margin_bytes,
+        (memory.pressure_status_available && memory.pressure_normal)
+            ? "true" : "false",
+        configured,
+        cache_experts,
+        e->qwen35_macro_tokens,
+        e->qwen35_prefill_workspace_bytes,
+        e->qwen35_decode_workspace_bytes,
+        geometry.per_expert_bytes);
     return true;
 }
 
-static bool ds4_engine_configure_qwen35_metal_resident(ds4_engine *e) {
+static bool ds4_engine_configure_qwen35_metal_resident(
+        ds4_engine *e,
+        bool        warm_weights) {
     if (!e || e->backend != DS4_BACKEND_METAL ||
         e->residency != DS4_RESIDENCY_RESIDENT || e->ssd_streaming ||
         !e->model.map || e->model.tensor_data_pos >= e->model.size) {
@@ -31963,22 +34727,91 @@ static bool ds4_engine_configure_qwen35_metal_resident(ds4_engine *e) {
     ds4_gpu_set_streaming_expert_cache_slab_target_bytes(0);
     (void)ds4_gpu_set_model_fd(-1);
 
-    if (!ds4_gpu_set_model_map_range(
-            e->model.map,
-            e->model.size,
-            e->model.tensor_data_pos,
-            e->model.size - e->model.tensor_data_pos,
-            e->model.max_tensor_bytes)) {
+    const char *pack_path = getenv("DS4_QWEN_EXPERT_PACK_PATH");
+    if (pack_path && pack_path[0]) {
+        ds4_engine_try_install_qwen35_expert_pack(e);
+        if (e->qwen35_expert_pack_ready &&
+            !ds4_gpu_qwen35_expert_pack_enable_resident()) {
+            /* A verified pack is still an optimization.  If this device
+             * cannot expose one layer as a no-copy Metal buffer, drop the
+             * alternate store and preserve the canonical resident path. */
+            fprintf(stderr,
+                    "ds4: Qwen expert-major resident mapping unavailable; "
+                    "using canonical GGUF experts\n");
+            ds4_engine_disable_qwen35_expert_pack(e);
+        }
+    }
+    if (warm_weights && e->qwen35_expert_pack_ready) {
+        /* Touching the canonical routed tensors would make both 17 GiB
+         * copies resident.  The no-copy pack mappings are faulted in by
+         * Metal; a future pack-specific warm pass can prefetch only them. */
+        fprintf(stderr,
+                "ds4: --warm-weights skips canonical routed experts for "
+                "Qwen expert-major resident mode\n");
+    } else if (warm_weights) {
+        model_warm_weights(&e->model);
+    }
+
+    uint64_t mapped_model_bytes = e->model.size - e->model.tensor_data_pos;
+    if (e->qwen35_expert_pack_ready) {
+        ds4_model_map_span_vec spans = {0};
+        const bool spans_ready =
+            qwen35_weights_model_map_non_routed_spans(
+                &e->model,
+                &e->qwen35_weights,
+                &spans,
+                &mapped_model_bytes);
+        const bool mapped = spans_ready &&
+            metal_graph_install_model_spans(
+                &e->model, &spans, "Qwen resident non-routed");
+        free(spans.v);
+        if (!mapped) {
+            fprintf(stderr,
+                    "ds4: Qwen expert-major non-routed mapping unavailable; "
+                    "using canonical GGUF experts\n");
+            ds4_engine_disable_qwen35_expert_pack(e);
+            if (warm_weights) model_warm_weights(&e->model);
+            mapped_model_bytes =
+                e->model.size - e->model.tensor_data_pos;
+        }
+    }
+    if (!e->qwen35_expert_pack_ready &&
+        !ds4_gpu_set_model_map_range(
+                   e->model.map,
+                   e->model.size,
+                   e->model.tensor_data_pos,
+                   mapped_model_bytes,
+                   e->model.max_tensor_bytes)) {
         fprintf(stderr,
                 "ds4: Qwen resident mode could not install the complete Metal model map\n");
         return false;
     }
 
+    uint64_t resident_weight_bytes = mapped_model_bytes;
+    const ds4_qwen_expert_pack_manifest *pack_manifest =
+        e->qwen35_expert_pack_ready
+            ? ds4_qwen_expert_pack_manifest_get(e->qwen35_expert_pack)
+            : NULL;
+    if (pack_manifest &&
+        pack_manifest->data_size <= UINT64_MAX - resident_weight_bytes) {
+        resident_weight_bytes += pack_manifest->data_size;
+    }
     fprintf(stderr,
             "ds4: experimental Qwen Metal resident runtime: mapped %.2f GiB "
-            "of tensor data; SSD expert cache disabled\n",
-            (double)(e->model.size - e->model.tensor_data_pos) /
-                1073741824.0);
+            "of %s tensor data; SSD expert cache disabled; exact decode "
+            "workspace %.2f MiB reserved\n",
+            (double)resident_weight_bytes / 1073741824.0,
+            e->qwen35_expert_pack_ready ? "expert-major" : "canonical GGUF",
+            (double)e->qwen35_decode_workspace_bytes / 1048576.0);
+    qwen35_telemetry_emit(
+        e, "memory_plan",
+        "\"residency\":\"resident\",\"runtime_bytes\":%" PRIu64
+        ",\"model_bytes\":%" PRIu64
+        ",\"decode_workspace_bytes\":%" PRIu64
+        ",\"cache_experts\":0",
+        e->residency_plan.runtime_bytes,
+        resident_weight_bytes,
+        e->qwen35_decode_workspace_bytes);
     return true;
 }
 #endif
@@ -32033,6 +34866,8 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
     e->ssd_streaming_cache_experts = opt->ssd_streaming_cache_experts;
     e->ssd_streaming_cache_bytes = opt->ssd_streaming_cache_bytes;
     e->ssd_streaming_preload_experts = opt->ssd_streaming_preload_experts;
+    e->qwen35_planned_context_tokens = opt->context_size != 0
+        ? opt->context_size : 32768u;
     if (e->power_percent > 100) e->power_percent = 100;
     e->mtp_draft_tokens = opt->mtp_draft_tokens > 0 ? opt->mtp_draft_tokens : 1;
     if (e->mtp_draft_tokens > 16) e->mtp_draft_tokens = 16;
@@ -32091,6 +34926,10 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
             *out = e;
             return 0;
         }
+        if (!qwen35_runtime_features_init(e)) {
+            ds4_engine_close(e);
+            return 1;
+        }
 
         /* Both executors remain behind exact-value validation gates.  A value
          * other than the literal string "1" is deliberately not accepted. */
@@ -32146,6 +34985,10 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
             e->qwen_raw_runtime = true;
             fprintf(stderr,
                     "ds4: experimental Qwen CPU runtime enabled for model-backed validation\n");
+            if (!qwen35_runtime_features_finalize(e)) {
+                ds4_engine_close(e);
+                return 1;
+            }
             *out = e;
             return 0;
         }
@@ -32181,9 +35024,9 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
                 ds4_engine_configure_qwen35_metal_streaming(e);
         } else if (e->residency == DS4_RESIDENCY_RESIDENT &&
                    !e->ssd_streaming) {
-            if (opt->warm_weights) model_warm_weights(&e->model);
             configured =
-                ds4_engine_configure_qwen35_metal_resident(e);
+                ds4_engine_configure_qwen35_metal_resident(
+                    e, opt->warm_weights);
         }
         if (!configured) {
             fprintf(stderr,
@@ -32197,6 +35040,10 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
         fprintf(stderr,
                 "ds4: experimental Qwen Metal %s runtime enabled\n",
                 ds4_residency_mode_name(e->residency));
+        if (!qwen35_runtime_features_finalize(e)) {
+            ds4_engine_close(e);
+            return 1;
+        }
         *out = e;
         return 0;
 #else
@@ -32833,6 +35680,7 @@ bool ds4_engine_context_memory_estimate_with_prefill(
 
 void ds4_engine_close(ds4_engine *e) {
     if (!e) return;
+    qwen35_telemetry_close(e);
     ds4_expert_profile_close();
     weights_free(&e->weights);
     vocab_free(&e->vocab);
@@ -32845,7 +35693,19 @@ void ds4_engine_close(ds4_engine *e) {
         fprintf(stderr,
                 "ds4: accelerator synchronization failed during engine shutdown\n");
     }
+#if defined(__APPLE__)
+    if (e->qwen35_expert_pack) {
+        ds4_gpu_qwen35_expert_pack_clear();
+    }
+#endif
     ds4_gpu_cleanup();
+#if defined(__APPLE__)
+    /* Generic GPU cleanup joins the page-in workers.  Only now is it safe to
+     * close the descriptor those workers borrowed from the sidecar reader. */
+    ds4_qwen_expert_pack_close(e->qwen35_expert_pack);
+    e->qwen35_expert_pack = NULL;
+    e->qwen35_expert_pack_ready = false;
+#endif
 #endif
     if (e->mtp_ready) model_close(&e->mtp_model);
     model_close(&e->model);
@@ -32951,6 +35811,30 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
             free(s);
             return 1;
         }
+        /* The verifier workspace also owns the recurrent-state snapshot used
+         * to make a multi-tile macro sync atomic.  Allocate it for every Qwen
+         * Metal session, including the prompt_lookup ablation; the phase
+         * planner already reserves these bytes in every paired leg. */
+        if (!qwen35_gpu_spec_workspace_alloc(
+                &s->qwen35_spec_workspace,
+                QWEN35_PROMPT_LOOKUP_MAX_DRAFT)) {
+            qwen35_gpu_graph_free(&s->qwen35_gpu_graph);
+            free(s);
+            return 1;
+        }
+        if ((e->qwen35_features.enabled & QWEN35_FEATURE_PROMPT_LOOKUP) != 0) {
+            s->qwen35_prompt_index.entry = calloc(
+                QWEN35_PROMPT_INDEX_CAP,
+                sizeof(s->qwen35_prompt_index.entry[0]));
+            if (!s->qwen35_prompt_index.entry) {
+                free(s->qwen35_prompt_index.entry);
+                qwen35_gpu_spec_workspace_free(
+                    &s->qwen35_spec_workspace);
+                qwen35_gpu_graph_free(&s->qwen35_gpu_graph);
+                free(s);
+                return 1;
+            }
+        }
         ds4_gpu_stream_expert_cache_reset_route_hotness();
         if (e->ssd_streaming_cold) {
             ds4_gpu_stream_expert_cache_release_resident();
@@ -33045,6 +35929,7 @@ void ds4_session_free(ds4_session *s) {
             fprintf(stderr,
                     "ds4: failed to synchronize before Qwen graph free\n");
         }
+        qwen35_gpu_spec_workspace_free(&s->qwen35_spec_workspace);
         qwen35_gpu_graph_free(&s->qwen35_gpu_graph);
 #endif
     } else {
@@ -33053,6 +35938,7 @@ void ds4_session_free(ds4_session *s) {
     ds4_session_imatrix_disable(s);   /* frees the on-edge imatrix collector if enabled */
 #endif
     token_vec_free(&s->checkpoint);
+    free(s->qwen35_prompt_index.entry);
     free(s->logits);
     free(s->mtp_logits);
     free(s);
@@ -33773,6 +36659,22 @@ static int ds4_session_sync_qwen35_with_forward(
 }
 
 #if defined(__APPLE__) && !defined(DS4_NO_GPU)
+static void ds4_session_qwen35_metal_activity(
+        void       *ud,
+        const char *event,
+        int         current,
+        int         total);
+
+static bool ds4_session_qwen35_decode_gqa_reuse_enabled(
+        const ds4_session *s) {
+    if (!s || !s->engine) return false;
+    if (getenv("DS4_QWEN_DISABLE_DECODE_GQA_REUSE") != NULL) {
+        return false;
+    }
+    return (s->engine->qwen35_features.enabled &
+            QWEN35_FEATURE_GQA_REUSE) != 0;
+}
+
 static bool ds4_session_qwen35_metal_forward_commit(
         ds4_session *s,
         int          token,
@@ -33783,13 +36685,22 @@ static bool ds4_session_qwen35_metal_forward_commit(
     }
 
     const uint32_t position = (uint32_t)s->checkpoint.len;
+    const bool io_overlap =
+        (s->engine->qwen35_features.enabled &
+         QWEN35_FEATURE_IO_OVERLAP) != 0;
+    const bool gqa_reuse =
+        ds4_session_qwen35_decode_gqa_reuse_enabled(s);
     if (!qwen35_gpu_forward_token(
             logits,
             &s->engine->model,
             &s->engine->qwen35_weights,
             &s->qwen35_gpu_graph,
             token,
-            position) ||
+            position,
+            gqa_reuse,
+            io_overlap,
+            ds4_session_qwen35_metal_activity,
+            s) ||
         s->qwen35_gpu_graph.n_tokens != position + 1u) {
         return false;
     }
@@ -33812,6 +36723,11 @@ static bool ds4_session_qwen35_metal_forward_queued_commit(
     }
 
     const uint32_t position = (uint32_t)s->checkpoint.len;
+    const bool io_overlap =
+        (s->engine->qwen35_features.enabled &
+         QWEN35_FEATURE_IO_OVERLAP) != 0;
+    const bool gqa_reuse =
+        ds4_session_qwen35_decode_gqa_reuse_enabled(s);
     if (!qwen35_gpu_forward_token_commands(
             logits,
             &s->engine->model,
@@ -33820,7 +36736,11 @@ static bool ds4_session_qwen35_metal_forward_queued_commit(
             token,
             position,
             commands_preopened,
-            finish_commands) ||
+            finish_commands,
+            gqa_reuse,
+            io_overlap,
+            ds4_session_qwen35_metal_activity,
+            s) ||
         s->qwen35_gpu_graph.n_tokens != position + 1u) {
         return false;
     }
@@ -33850,7 +36770,18 @@ static bool ds4_session_qwen35_metal_prefill_chunk_commit(
             &s->qwen35_gpu_graph,
             tokens,
             n_token,
-            position) ||
+            position,
+            (s->engine->qwen35_features.enabled &
+             QWEN35_FEATURE_GQA_REUSE) != 0,
+            (s->engine->qwen35_features.enabled &
+             QWEN35_FEATURE_IO_OVERLAP) != 0,
+            (s->engine->qwen35_features.enabled &
+             QWEN35_FEATURE_EXPERT_GROUP) != 0,
+            s->engine->residency == DS4_RESIDENCY_SSD
+                ? QWEN35_SSD_EXPERT_GROUP_MIN_TOKENS
+                : QWEN35_RESIDENT_EXPERT_GROUP_MIN_TOKENS,
+            ds4_session_qwen35_metal_activity,
+            s) ||
         s->qwen35_gpu_graph.n_tokens != position + n_token) {
         return false;
     }
@@ -33861,6 +36792,420 @@ static bool ds4_session_qwen35_metal_prefill_chunk_commit(
     s->checkpoint_valid = true;
     s->mtp_draft_valid = false;
     return true;
+}
+
+static void ds4_session_qwen35_metal_activity(
+        void       *ud,
+        const char *event,
+        int         current,
+        int         total) {
+    ds4_session *s = ud;
+    if (!s || !event) return;
+    qwen35_telemetry_emit(
+        s->engine, event, "\"current\":%d,\"total\":%d",
+        current, total);
+    if (s->progress) {
+        s->progress(s->progress_ud, event, current, total);
+    }
+}
+
+static bool ds4_session_qwen35_metal_prefill_macro_commit(
+        ds4_session *s,
+        const int   *tokens,
+        uint32_t     n_token,
+        float       *logits,
+        bool        *cancelled) {
+    if (cancelled) *cancelled = false;
+    if (!ds4_session_is_qwen35_metal(s) || !tokens || n_token == 0 ||
+        n_token > QWEN35_GPU_MACRO_PREFILL_MAX ||
+        !ds4_session_qwen35_timeline_valid(s)) {
+        return false;
+    }
+
+    /* Keep the public logits paired with the public token frontier.  Metal may
+     * finish the output head before a later timeline/checkpoint check fails;
+     * publishing directly into s->logits would then expose L(H + suffix) while
+     * the session still advertises H. */
+    float *pending_logits = logits
+        ? malloc((size_t)QWEN35_N_VOCAB * sizeof(pending_logits[0]))
+        : NULL;
+    if (logits && !pending_logits) return false;
+
+    const uint32_t position = (uint32_t)s->checkpoint.len;
+    const bool encoded = qwen35_gpu_forward_prefill_macro(
+        pending_logits,
+        &s->engine->model,
+        &s->engine->qwen35_weights,
+        &s->qwen35_gpu_graph,
+        tokens,
+        n_token,
+        position,
+        ds4_session_qwen35_metal_activity,
+        s,
+        ds4_session_cancelled_cb,
+        s,
+        (s->engine->qwen35_features.enabled &
+         QWEN35_FEATURE_LAYER_PIN) != 0,
+        (s->engine->qwen35_features.enabled &
+         QWEN35_FEATURE_GQA_REUSE) != 0,
+        (s->engine->qwen35_features.enabled &
+         QWEN35_FEATURE_IO_OVERLAP) != 0,
+        (s->engine->qwen35_features.enabled &
+         QWEN35_FEATURE_EXPERT_GROUP) != 0,
+        s->engine->residency == DS4_RESIDENCY_SSD
+            ? QWEN35_SSD_EXPERT_GROUP_MIN_TOKENS
+            : QWEN35_RESIDENT_EXPERT_GROUP_MIN_TOKENS,
+        cancelled);
+    if (!encoded ||
+        s->qwen35_gpu_graph.n_tokens != position + n_token) {
+        free(pending_logits);
+        return false;
+    }
+
+    for (uint32_t i = 0; i < n_token; i++) {
+        token_vec_push(&s->checkpoint, tokens[i]);
+    }
+    s->checkpoint_valid = true;
+    s->mtp_draft_valid = false;
+    if (pending_logits) {
+        memcpy(logits, pending_logits,
+               (size_t)QWEN35_N_VOCAB * sizeof(logits[0]));
+    }
+    free(pending_logits);
+    return true;
+}
+
+static bool ds4_session_qwen35_metal_macro_transaction_begin(
+        ds4_session *s,
+        uint32_t     start) {
+    if (!ds4_session_is_qwen35_metal(s) ||
+        !ds4_session_qwen35_timeline_valid(s) ||
+        s->qwen35_gpu_graph.n_tokens != start ||
+        !s->qwen35_spec_workspace.logits) {
+        return false;
+    }
+    ds4_qwen35_macro_workspace *snapshot =
+        &s->qwen35_spec_workspace.macro;
+    snapshot->snapshot_valid = false;
+    /* The recurrent snapshot restores the graph frontier, while row zero of
+     * the already-resident verifier logits preserves the sampling frontier.
+     * No extra 66 MiB transaction allocation is needed on the 16 GiB host. */
+    if (start != 0 &&
+        ds4_gpu_tensor_write(
+            s->qwen35_spec_workspace.logits, 0,
+            s->logits, QWEN35_HOST_LOGITS_BYTES) == 0) {
+        return false;
+    }
+    return qwen35_gpu_macro_state_copy(
+        &s->qwen35_gpu_graph, snapshot, false);
+}
+
+static bool ds4_session_qwen35_metal_macro_transaction_restore(
+        ds4_session *s,
+        uint32_t     start) {
+    if (!ds4_session_is_qwen35_metal(s)) return false;
+    ds4_qwen35_macro_workspace *snapshot =
+        &s->qwen35_spec_workspace.macro;
+    bool ok = qwen35_gpu_macro_restore(
+        &s->qwen35_gpu_graph, snapshot, start);
+    if (ok && start != 0) {
+        ok = ds4_gpu_tensor_read(
+                 s->qwen35_spec_workspace.logits, 0,
+                 s->logits, QWEN35_HOST_LOGITS_BYTES) != 0;
+    }
+    snapshot->snapshot_valid = false;
+    if (!ok) {
+        (void)ds4_session_qwen35_reset_timeline(s);
+        return false;
+    }
+
+    /* Full-attention rows beyond start are append-only and become invisible
+     * when the frontier is rewound; recurrent state and logits were restored
+     * above.  The n-gram index is cheap to rebuild and must not describe the
+     * discarded suffix. */
+    s->checkpoint.len = (int)start;
+    s->checkpoint_valid = start != 0;
+    s->mtp_draft_valid = false;
+    qwen35_prompt_index_reset(&s->qwen35_prompt_index);
+    return ds4_session_qwen35_timeline_valid(s);
+}
+
+/* Model-free white-box proof for the multi-tile transaction contract.  A real
+ * model is deliberately unnecessary here: the invariant is that recurrent
+ * state, public logits, and every host frontier move back together after any
+ * later tile has committed. */
+bool ds4_internal_qwen35_macro_transaction_rollback_test(void) {
+    const uint32_t start = 2u;
+    const uint64_t logits_bytes = QWEN35_HOST_LOGITS_BYTES;
+    const float original_conv[4] = {1.25f, -2.5f, 3.75f, -4.0f};
+    const float original_recurrent[4] = {5.5f, -6.25f, 7.0f, -8.75f};
+    const float mutated[4] = {91.0f, 92.0f, 93.0f, 94.0f};
+    float restored_conv[4] = {0};
+    float restored_recurrent[4] = {0};
+    ds4_engine *engine = calloc(1, sizeof(*engine));
+    ds4_session *session = calloc(1, sizeof(*session));
+    float *expected_logits = malloc((size_t)logits_bytes);
+    bool ok = engine && session && expected_logits;
+    if (!ok) goto done;
+
+    engine->model.family = DS4_MODEL_FAMILY_QWEN35_MOE;
+    engine->backend = DS4_BACKEND_METAL;
+    engine->qwen_metal_runtime = true;
+    session->engine = engine;
+    session->ctx_size = 4;
+    session->logits = malloc((size_t)logits_bytes);
+    if (!session->logits ||
+        !qwen35_gpu_graph_alloc(&session->qwen35_gpu_graph, 4u) ||
+        !qwen35_gpu_spec_workspace_alloc(
+            &session->qwen35_spec_workspace, 1u)) {
+        ok = false;
+        goto done;
+    }
+
+    uint32_t recurrent_layer = UINT32_MAX;
+    for (uint32_t il = 0; il < QWEN35_N_LAYER; il++) {
+        if (!ds4_qwen35_layer_is_full_attention(il)) {
+            recurrent_layer = il;
+            break;
+        }
+    }
+    if (recurrent_layer == UINT32_MAX) {
+        ok = false;
+        goto done;
+    }
+
+    for (uint32_t i = 0; i < QWEN35_N_VOCAB; i++) {
+        expected_logits[i] =
+            (float)((int)(i % 101u) - 50) * 0.25f;
+    }
+    memcpy(session->logits, expected_logits, (size_t)logits_bytes);
+    ok = ds4_gpu_tensor_write(
+             session->qwen35_gpu_graph.conv[recurrent_layer], 0,
+             original_conv, sizeof(original_conv)) != 0 &&
+         ds4_gpu_tensor_write(
+             session->qwen35_gpu_graph.recurrent[recurrent_layer], 0,
+             original_recurrent, sizeof(original_recurrent)) != 0;
+    if (!ok) goto done;
+
+    token_vec_push(&session->checkpoint, 11);
+    token_vec_push(&session->checkpoint, 22);
+    session->checkpoint_valid = true;
+    session->qwen35_gpu_graph.n_tokens = start;
+    session->qwen35_gpu_graph.state_valid = true;
+    if (!ds4_session_qwen35_metal_macro_transaction_begin(session, start) ||
+        ds4_gpu_synchronize() == 0) {
+        ok = false;
+        goto done;
+    }
+
+    /* Simulate one already-committed macro tile before a later failure. */
+    ok = ds4_gpu_tensor_write(
+             session->qwen35_gpu_graph.conv[recurrent_layer], 0,
+             mutated, sizeof(mutated)) != 0 &&
+         ds4_gpu_tensor_write(
+             session->qwen35_gpu_graph.recurrent[recurrent_layer], 0,
+             mutated, sizeof(mutated)) != 0;
+    if (!ok) goto done;
+    memset(session->logits, 0xa5, (size_t)logits_bytes);
+    token_vec_push(&session->checkpoint, 33);
+    session->qwen35_gpu_graph.n_tokens = start + 1u;
+    session->mtp_draft_valid = true;
+    session->qwen35_prompt_index.indexed_len = 123u;
+
+    ok = ds4_session_qwen35_metal_macro_transaction_restore(
+             session, start) &&
+         ds4_gpu_synchronize() != 0 &&
+         ds4_gpu_tensor_read(
+             session->qwen35_gpu_graph.conv[recurrent_layer], 0,
+             restored_conv, sizeof(restored_conv)) != 0 &&
+         ds4_gpu_tensor_read(
+             session->qwen35_gpu_graph.recurrent[recurrent_layer], 0,
+             restored_recurrent, sizeof(restored_recurrent)) != 0 &&
+         memcmp(restored_conv, original_conv, sizeof(original_conv)) == 0 &&
+         memcmp(restored_recurrent, original_recurrent,
+                sizeof(original_recurrent)) == 0 &&
+         memcmp(session->logits, expected_logits,
+                (size_t)logits_bytes) == 0 &&
+         session->qwen35_gpu_graph.state_valid &&
+         session->qwen35_gpu_graph.n_tokens == start &&
+         session->checkpoint_valid &&
+         session->checkpoint.len == (int)start &&
+         !session->mtp_draft_valid &&
+         session->qwen35_prompt_index.indexed_len == 0u &&
+         !session->qwen35_spec_workspace.macro.snapshot_valid &&
+         ds4_session_qwen35_timeline_valid(session);
+
+done:
+    if (session) {
+        (void)ds4_gpu_synchronize();
+        qwen35_gpu_spec_workspace_free(&session->qwen35_spec_workspace);
+        qwen35_gpu_graph_free(&session->qwen35_gpu_graph);
+        token_vec_free(&session->checkpoint);
+        free(session->logits);
+    }
+    free(expected_logits);
+    free(session);
+    free(engine);
+    return ok;
+}
+
+static int ds4_session_qwen35_metal_finish_prefill_cache(
+        ds4_session *s,
+        char        *err,
+        size_t       errlen,
+        bool         report_phase_budget) {
+    if (!s || !s->engine->ssd_streaming) return 0;
+    const uint32_t current =
+        ds4_gpu_stream_expert_cache_configured_count();
+    const uint32_t target = s->engine->qwen35_decode_cache_experts;
+    if (target <= current) {
+        if (report_phase_budget) {
+            qwen35_telemetry_emit(
+                s->engine, "phase_budget",
+                "\"phase\":\"decode\",\"from_experts\":%u,"
+                "\"to_experts\":%u,\"changed\":false",
+                current, current);
+        }
+        qwen35_telemetry_emit(
+            s->engine, "cache_phase",
+            "\"phase\":\"decode\",\"from_experts\":%u,"
+            "\"to_experts\":%u,\"changed\":false",
+            current, current);
+        return 0;
+    }
+    ds4_ssd_host_memory memory = {0};
+    if (s->engine->qwen35_pressure_gate_required &&
+        (!ds4_gpu_host_memory_snapshot(&memory) ||
+         !memory.pressure_status_available || !memory.pressure_normal)) {
+        qwen35_telemetry_emit(
+            s->engine, "memory_pressure",
+            "\"phase\":\"decode\",\"normal\":false,"
+            "\"action\":\"stop_before_cache_growth\"");
+        if (errlen) {
+            snprintf(err, errlen,
+                     "memory pressure is not normal; refusing Qwen decode "
+                     "cache growth");
+        }
+        return 1;
+    }
+    if (!ds4_gpu_grow_streaming_expert_cache_budget(target)) {
+        if (errlen) {
+            snprintf(err, errlen,
+                     "failed to grow Qwen SSD cache after prefill");
+        }
+        return 1;
+    }
+    if (report_phase_budget) {
+        qwen35_telemetry_emit(
+            s->engine, "phase_budget",
+            "\"phase\":\"decode\",\"from_experts\":%u,"
+            "\"to_experts\":%u,\"changed\":true",
+            current, target);
+    }
+    qwen35_telemetry_emit(
+        s->engine, "cache_phase",
+        "\"phase\":\"decode\",\"from_experts\":%u,"
+        "\"to_experts\":%u",
+        current, target);
+    if (getenv("DS4_METAL_MEMORY_REPORT") != NULL) {
+        fprintf(stderr,
+                "ds4: Qwen SSD cache budget grew in-place from %u to %u "
+                "experts after prefill\n",
+                current,
+                target);
+    }
+    return 0;
+}
+
+static void ds4_session_qwen35_metal_unwind_prefill_cache(
+        ds4_session *s,
+        bool         phase_prepared,
+        bool         report_phase_budget,
+        char        *err,
+        size_t       errlen) {
+    if (!phase_prepared) return;
+    char restore_err[192] = {0};
+    if (ds4_session_qwen35_metal_finish_prefill_cache(
+            s, restore_err, sizeof(restore_err),
+            report_phase_budget) == 0) {
+        return;
+    }
+
+    /* Keep the original execution failure while making the cache-restore
+     * failure visible. A later short continuation must never silently inherit
+     * the smaller prefill envelope. */
+    char original[192] = {0};
+    if (err && errlen != 0 && err[0] != '\0') {
+        snprintf(original, sizeof(original), "%s", err);
+    }
+    if (err && errlen != 0) {
+        snprintf(err, errlen, "%s%sfailed to restore decode cache: %s",
+                 original,
+                 original[0] ? "; " : "",
+                 restore_err[0] ? restore_err : "unknown error");
+    }
+    qwen35_telemetry_emit(
+        s->engine, "runtime_fallback",
+        "\"feature\":\"phase_budget\","
+        "\"reason\":\"decode_cache_restore_failed\","
+        "\"fatal\":true");
+}
+
+static int ds4_session_qwen35_metal_prepare_prefill_cache(
+        ds4_session *s,
+        char        *err,
+        size_t       errlen) {
+    if (!s || !s->engine->ssd_streaming) return 0;
+    const uint32_t current =
+        ds4_gpu_stream_expert_cache_configured_count();
+    const uint32_t target = s->engine->qwen35_prefill_cache_experts;
+    if (current == target) {
+        qwen35_telemetry_emit(
+            s->engine, "phase_budget",
+            "\"phase\":\"prefill\",\"from_experts\":%u,"
+            "\"to_experts\":%u,\"changed\":false",
+            current, target);
+        qwen35_telemetry_emit(
+            s->engine, "cache_phase",
+            "\"phase\":\"prefill\",\"from_experts\":%u,"
+            "\"to_experts\":%u,\"changed\":false",
+            current, target);
+        return 0;
+    }
+
+    ds4_ssd_host_memory memory = {0};
+    if (s->engine->qwen35_pressure_gate_required &&
+        (!ds4_gpu_host_memory_snapshot(&memory) ||
+         !memory.pressure_status_available || !memory.pressure_normal)) {
+        qwen35_telemetry_emit(
+            s->engine, "memory_pressure",
+            "\"phase\":\"prefill\",\"normal\":false,"
+            "\"action\":\"stop_before_workspace\"");
+        if (errlen) {
+            snprintf(err, errlen,
+                     "memory pressure is not normal; refusing Qwen macro "
+                     "workspace allocation");
+        }
+        return 1;
+    }
+    if (!ds4_gpu_reconfigure_streaming_expert_cache_budget(target)) {
+        if (errlen) {
+            snprintf(err, errlen,
+                     "failed to switch Qwen SSD cache to prefill phase");
+        }
+        return 1;
+    }
+    qwen35_telemetry_emit(
+        s->engine, "phase_budget",
+        "\"phase\":\"prefill\",\"from_experts\":%u,"
+        "\"to_experts\":%u,\"changed\":true",
+        current, target);
+    qwen35_telemetry_emit(
+        s->engine, "cache_phase",
+        "\"phase\":\"prefill\",\"from_experts\":%u,"
+        "\"to_experts\":%u",
+        current, target);
+    return 0;
 }
 
 static int ds4_session_sync_qwen35_metal(
@@ -33893,14 +37238,184 @@ static int ds4_session_sync_qwen35_metal(
     }
 
     const int start = s->checkpoint.len;
-    const bool batch_resident_prefill =
-        !s->engine->ssd_streaming &&
+    const double prefill_t0 = now_sec();
+    qwen35_telemetry_emit(
+        s->engine, "prefill_begin",
+        "\"start\":%d,\"total\":%d,\"suffix\":%d,"
+        "\"residency\":\"%s\"",
+        start, prompt->len, prompt->len - start,
+        s->engine->ssd_streaming ? "ssd" : "resident");
+    if (s->progress) {
+        s->progress(s->progress_ud, "prefill_begin", start, prompt->len);
+    }
+    const int suffix_tokens = prompt->len - start;
+    const bool long_prefill = qwen35_prefill_suffix_needs_phase(
+        (uint32_t)suffix_tokens);
+    const bool phase_feature_enabled =
+        (s->engine->qwen35_features.enabled &
+         QWEN35_FEATURE_PHASE_BUDGET) != 0;
+    const bool phase_budget =
+        s->engine->ssd_streaming && long_prefill && phase_feature_enabled;
+    /* Phase budgeting is deliberately independent from macro scheduling so a
+     * one-off macro ablation changes only ordering, not its cache envelope. */
+    if (phase_budget &&
+        ds4_session_qwen35_metal_prepare_prefill_cache(
+            s, err, errlen) != 0) {
+        qwen35_telemetry_emit(
+            s->engine, "prefill_abort",
+            "\"start\":%d,\"frontier\":%d,"
+            "\"reason\":\"prefill_phase_prepare\"",
+            start, s->checkpoint.len);
+        return 1;
+    }
+    const bool macro_prefill =
+        s->engine->ssd_streaming && long_prefill &&
+        (s->engine->qwen35_features.enabled &
+         QWEN35_FEATURE_MACRO_PREFILL) != 0 &&
+        s->engine->qwen35_macro_tokens > QWEN35_PREFILL_MICRO_TOKENS &&
+        getenv("DS4_MOE_RECORD_SELECTED_IDS") == NULL &&
+        getenv("DS4_MOE_REPLAY_SELECTED_IDS") == NULL &&
+        getenv("DS4_MOE_RECORD_SELECTED_HOTLIST") == NULL;
+    if (macro_prefill) {
+        if (!ds4_session_qwen35_metal_macro_transaction_begin(
+                s, (uint32_t)start)) {
+            if (errlen) {
+                snprintf(err, errlen,
+                         "failed to snapshot Qwen macro prefill transaction");
+            }
+            qwen35_telemetry_emit(
+                s->engine, "prefill_abort",
+                "\"start\":%d,\"frontier\":%d,"
+                "\"reason\":\"transaction_snapshot\"",
+                start, s->checkpoint.len);
+            ds4_session_qwen35_metal_unwind_prefill_cache(
+                s, phase_budget, phase_feature_enabled, err, errlen);
+            return 1;
+        }
+        uint32_t macro_tiles = 0;
+        for (int i = start; i < prompt->len;) {
+            if (ds4_session_cancelled(s)) {
+                const int attempted_frontier = s->checkpoint.len;
+                const bool restored =
+                    ds4_session_qwen35_metal_macro_transaction_restore(
+                        s, (uint32_t)start);
+                if (errlen) {
+                    snprintf(err, errlen, "interrupted%s",
+                             restored ? "" : "; transaction rollback failed");
+                }
+                qwen35_telemetry_emit(
+                    s->engine, "prefill_abort",
+                    "\"start\":%d,\"frontier\":%d,"
+                    "\"restored_start\":%s,\"reason\":\"cancelled\"",
+                    start, attempted_frontier,
+                    restored ? "true" : "false");
+                ds4_session_qwen35_metal_unwind_prefill_cache(
+                    s, phase_budget, phase_feature_enabled, err, errlen);
+                return DS4_SESSION_SYNC_INTERRUPTED;
+            }
+
+            const uint32_t remaining = (uint32_t)(prompt->len - i);
+            const uint32_t n_token =
+                remaining > s->engine->qwen35_macro_tokens
+                    ? s->engine->qwen35_macro_tokens : remaining;
+            const bool final_tile = i + (int)n_token == prompt->len;
+            bool cancelled = false;
+            const bool committed = n_token <= QWEN35_GPU_PREFILL_CAP
+                ? ds4_session_qwen35_metal_prefill_chunk_commit(
+                    s, &prompt->v[i], n_token,
+                    final_tile ? s->logits : NULL)
+                : ds4_session_qwen35_metal_prefill_macro_commit(
+                    s, &prompt->v[i], n_token,
+                    final_tile ? s->logits : NULL, &cancelled);
+            if (!committed) {
+                const int attempted_frontier = s->checkpoint.len;
+                const bool restored =
+                    ds4_session_qwen35_metal_macro_transaction_restore(
+                        s, (uint32_t)start);
+                if (errlen) {
+                    if (cancelled) {
+                        snprintf(
+                            err, errlen, "interrupted%s",
+                            restored ? "" :
+                                "; transaction rollback failed");
+                    } else {
+                        snprintf(
+                            err, errlen,
+                            "Qwen Metal macro prefill failed at position "
+                            "%d%s",
+                            i,
+                            restored ? "; initial frontier restored" :
+                                "; transaction rollback failed");
+                    }
+                }
+                qwen35_telemetry_emit(
+                    s->engine, "prefill_abort",
+                    "\"start\":%d,\"frontier\":%d,"
+                    "\"restored_start\":%s,\"reason\":\"%s\"",
+                    start, attempted_frontier,
+                    restored ? "true" : "false",
+                    cancelled ? "cancelled" : "macro_failure");
+                ds4_session_qwen35_metal_unwind_prefill_cache(
+                    s, phase_budget, phase_feature_enabled, err, errlen);
+                return cancelled ? DS4_SESSION_SYNC_INTERRUPTED : 1;
+            }
+
+            i += (int)n_token;
+            macro_tiles++;
+            if (s->progress) {
+                s->progress(
+                    s->progress_ud, "prefill_chunk", i, prompt->len);
+            }
+            qwen35_telemetry_emit(
+                s->engine, "prefill_chunk",
+                "\"start\":%d,\"end\":%d,\"tokens\":%u,"
+                "\"scheduler\":\"macro_layer_major\"",
+                i - (int)n_token, i, n_token);
+        }
+
+        const int finish = s->engine->ssd_streaming
+            ? ds4_session_qwen35_metal_finish_prefill_cache(
+                s, err, errlen, phase_feature_enabled)
+            : 0;
+        bool restored = true;
+        if (finish != 0) {
+            restored = ds4_session_qwen35_metal_macro_transaction_restore(
+                s, (uint32_t)start);
+            if (!restored && err && errlen != 0) {
+                const size_t used = strlen(err);
+                if (used < errlen - 1u) {
+                    snprintf(err + used, errlen - used,
+                             "%stransaction rollback failed",
+                             used ? "; " : "");
+                }
+            }
+        } else {
+            s->qwen35_spec_workspace.macro.snapshot_valid = false;
+        }
+        qwen35_telemetry_emit(
+            s->engine, finish == 0 ? "prefill_commit" : "prefill_abort",
+            "\"start\":%d,\"end\":%d,\"macro_tiles\":%u,"
+            "\"macro_capacity\":%u,\"restored_start\":%s,"
+            "\"elapsed_sec\":%.6f",
+            start, prompt->len, macro_tiles,
+            s->engine->qwen35_macro_tokens,
+            finish == 0 ? "false" : (restored ? "true" : "false"),
+            now_sec() - prefill_t0);
+        if (finish == 0 && s->progress) {
+            s->progress(s->progress_ud, "prefill_commit",
+                        prompt->len, prompt->len);
+        }
+        return finish;
+    }
+    const bool batch_ssd_prefill = s->engine->ssd_streaming;
+    const bool batch_layer_major_prefill =
+        (!s->engine->ssd_streaming || batch_ssd_prefill) &&
         prompt->len - start > 1 &&
         getenv("DS4_QWEN_DISABLE_RESIDENT_BATCH_PREFILL") == NULL &&
         getenv("DS4_MOE_RECORD_SELECTED_IDS") == NULL &&
         getenv("DS4_MOE_REPLAY_SELECTED_IDS") == NULL &&
         getenv("DS4_MOE_RECORD_SELECTED_HOTLIST") == NULL;
-    if (batch_resident_prefill) {
+    if (batch_layer_major_prefill) {
         uint32_t chunks = 0;
         uint32_t batched_tokens = 0;
         for (int i = start; i < prompt->len;) {
@@ -33910,6 +37425,8 @@ static int ds4_session_sync_qwen35_metal(
                     snprintf(err, errlen, "interrupted%s",
                              reset ? "" : "; Qwen Metal reset failed");
                 }
+                ds4_session_qwen35_metal_unwind_prefill_cache(
+                    s, phase_budget, phase_feature_enabled, err, errlen);
                 return DS4_SESSION_SYNC_INTERRUPTED;
             }
 
@@ -33936,6 +37453,8 @@ static int ds4_session_sync_qwen35_metal(
                              i,
                              reset ? "" : "; reset failed");
                 }
+                ds4_session_qwen35_metal_unwind_prefill_cache(
+                    s, phase_budget, phase_feature_enabled, err, errlen);
                 return 1;
             }
             i += (int)n_token;
@@ -33945,16 +37464,34 @@ static int ds4_session_sync_qwen35_metal(
                 s->progress(
                     s->progress_ud, "prefill_chunk", i, prompt->len);
             }
+            qwen35_telemetry_emit(
+                s->engine, "prefill_chunk",
+                "\"start\":%d,\"end\":%d,\"tokens\":%u",
+                i - (int)n_token, i, n_token);
         }
         if (getenv("DS4_METAL_MEMORY_REPORT") != NULL) {
             fprintf(stderr,
-                    "ds4: Qwen resident layer-major prefill encoded %u "
+                    "ds4: Qwen %s layer-major prefill encoded %u "
                     "tokens in %u chunk(s), cap=%u\n",
+                    batch_ssd_prefill ? "SSD" : "resident",
                     batched_tokens,
                     chunks,
                     QWEN35_GPU_PREFILL_CAP);
         }
-        return 0;
+        const int finish = s->engine->ssd_streaming
+            ? ds4_session_qwen35_metal_finish_prefill_cache(
+                s, err, errlen, phase_feature_enabled)
+            : 0;
+        qwen35_telemetry_emit(
+            s->engine, finish == 0 ? "prefill_commit" : "prefill_abort",
+            "\"start\":%d,\"end\":%d,\"chunks\":%u,"
+            "\"elapsed_sec\":%.6f",
+            start, prompt->len, chunks, now_sec() - prefill_t0);
+        if (finish == 0 && s->progress) {
+            s->progress(s->progress_ud, "prefill_commit",
+                        prompt->len, prompt->len);
+        }
+        return finish;
     }
 
     const bool queue_resident_prefill =
@@ -33976,6 +37513,8 @@ static int ds4_session_sync_qwen35_metal(
                 snprintf(err, errlen, "interrupted%s",
                          reset ? "" : "; Qwen Metal reset failed");
             }
+            ds4_session_qwen35_metal_unwind_prefill_cache(
+                s, phase_budget, phase_feature_enabled, err, errlen);
             return DS4_SESSION_SYNC_INTERRUPTED;
         }
         float *token_logits = i + 1 == prompt->len ? s->logits : NULL;
@@ -33999,6 +37538,8 @@ static int ds4_session_sync_qwen35_metal(
                          i,
                          reset ? "" : "; reset failed");
             }
+            ds4_session_qwen35_metal_unwind_prefill_cache(
+                s, phase_budget, phase_feature_enabled, err, errlen);
             return 1;
         }
         if (queue_resident_prefill && !finish_commands) {
@@ -34012,6 +37553,8 @@ static int ds4_session_sync_qwen35_metal(
                              i,
                              reset ? "" : "; reset failed");
                 }
+                ds4_session_qwen35_metal_unwind_prefill_cache(
+                    s, phase_budget, phase_feature_enabled, err, errlen);
                 return 1;
             }
             queued_command_buffers++;
@@ -34027,6 +37570,8 @@ static int ds4_session_sync_qwen35_metal(
                                  i,
                                  reset ? "" : "; reset failed");
                     }
+                    ds4_session_qwen35_metal_unwind_prefill_cache(
+                        s, phase_budget, phase_feature_enabled, err, errlen);
                     return 1;
                 }
                 commands_preopened = false;
@@ -34047,7 +37592,20 @@ static int ds4_session_sync_qwen35_metal(
                 intermediate_fences,
                 max_pending_command_buffers);
     }
-    return 0;
+    const int finish = s->engine->ssd_streaming
+        ? ds4_session_qwen35_metal_finish_prefill_cache(
+            s, err, errlen, phase_feature_enabled)
+        : 0;
+    qwen35_telemetry_emit(
+        s->engine, finish == 0 ? "prefill_commit" : "prefill_abort",
+        "\"start\":%d,\"end\":%d,\"chunks\":%d,"
+        "\"elapsed_sec\":%.6f",
+        start, prompt->len, prompt->len - start, now_sec() - prefill_t0);
+    if (finish == 0 && s->progress) {
+        s->progress(s->progress_ud, "prefill_commit",
+                    prompt->len, prompt->len);
+    }
+    return finish;
 }
 #endif
 
@@ -34542,8 +38100,10 @@ static int ds4_session_eval_qwen35_metal(
         if (errlen) snprintf(err, errlen, "Qwen session context is full");
         return 1;
     }
+    const uint32_t position = (uint32_t)s->checkpoint.len;
+    const bool trace = s->engine->qwen35_telemetry.fp != NULL;
+    const double t0 = trace ? now_sec() : 0.0;
     if (!ds4_session_qwen35_metal_forward_commit(s, token, s->logits)) {
-        const uint32_t position = (uint32_t)s->checkpoint.len;
         const bool reset = ds4_session_qwen35_reset_timeline(s);
         if (errlen) {
             snprintf(err, errlen,
@@ -34553,7 +38113,250 @@ static int ds4_session_eval_qwen35_metal(
         }
         return 1;
     }
+    if (trace) {
+        qwen35_telemetry_emit(
+            s->engine, "decode_token",
+            "\"position\":%u,\"token\":%d,\"elapsed_sec\":%.6f",
+            position, token, now_sec() - t0);
+    }
     return 0;
+}
+
+/* Commit a prompt-derived greedy suffix without changing the target stream.
+ * The caller has already committed first_token, so s->logits is L(H) for the
+ * new checkpoint H.  We first validate draft[0] for free against those logits,
+ * then run the remaining exact target work layer-major to keep each layer's
+ * expert weights hot.  A miss restores the recurrent frontier and replays only
+ * the proven prefix through the ordinary one-token transaction. */
+static int ds4_session_eval_qwen35_prompt_lookup_argmax(
+        ds4_session *s,
+        int          first_token,
+        int          max_tokens,
+        int          eos_token,
+        int         *accepted,
+        int          accepted_cap,
+        char        *err,
+        size_t       errlen) {
+    int n_accept = 1;
+    if (!ds4_session_is_qwen35_metal(s) || !accepted ||
+        (s->engine->qwen35_features.enabled &
+         QWEN35_FEATURE_PROMPT_LOOKUP) == 0 ||
+        !s->qwen35_prompt_index.entry ||
+        first_token == eos_token || max_tokens <= 1 || accepted_cap <= 1) {
+        return n_accept;
+    }
+
+    uint32_t draft_cap = QWEN35_PROMPT_LOOKUP_MAX_DRAFT;
+    if (draft_cap > (uint32_t)(max_tokens - n_accept)) {
+        draft_cap = (uint32_t)(max_tokens - n_accept);
+    }
+    if (draft_cap > (uint32_t)(accepted_cap - n_accept)) {
+        draft_cap = (uint32_t)(accepted_cap - n_accept);
+    }
+    const uint32_t room = (uint32_t)s->ctx_size -
+                          (uint32_t)s->checkpoint.len;
+    if (draft_cap > room) draft_cap = room;
+    if (draft_cap < 2u) return n_accept;
+
+    int draft[QWEN35_PROMPT_LOOKUP_MAX_DRAFT] = {0};
+    uint32_t draft_n = qwen35_prompt_index_draft(
+        &s->qwen35_prompt_index, &s->checkpoint, draft, draft_cap);
+    if (draft_n < 2u) return n_accept;
+    /* Generation callers stop on EOS without evaluating it.  Do not let a
+     * speculative batch commit EOS and leave the graph one row ahead of the
+     * baseline session frontier. */
+    draft_n = qwen35_prompt_draft_before_eos(
+        draft, draft_n, eos_token);
+    if (draft_n < 2u) return n_accept;
+    qwen35_telemetry_emit(
+        s->engine, "decode_draft",
+        "\"position\":%d,\"first_token\":%d,\"proposed\":%u",
+        s->checkpoint.len, first_token, draft_n);
+    ds4_session_qwen35_metal_activity(
+        s, "decode_draft", (int)draft_n, (int)draft_n);
+
+    /* This comparison is the first verification row and costs no Metal work:
+     * it is exactly the greedy token the normal decode path would sample. */
+    if (ds4_session_argmax(s) != draft[0]) {
+        qwen35_telemetry_emit(
+            s->engine, "decode_miss",
+            "\"position\":%d,\"first_token\":%d,"
+            "\"proposed\":%u,\"stage\":\"first_token\"",
+            s->checkpoint.len, first_token, draft_n);
+        ds4_session_qwen35_metal_activity(
+            s, "decode_miss", 0, (int)draft_n);
+        return n_accept;
+    }
+
+    float *pending_logits = malloc((size_t)QWEN35_N_VOCAB *
+                                   sizeof(pending_logits[0]));
+    if (!pending_logits) {
+        qwen35_telemetry_emit(
+            s->engine, "runtime_fallback",
+            "\"position\":%d,\"reason\":\"host_allocation\"",
+            s->checkpoint.len);
+        ds4_session_qwen35_metal_activity(
+            s, "campaign_invalid", 0, (int)draft_n);
+        if (s->engine->qwen35_features.require_full_stack) {
+            if (errlen) {
+                snprintf(err, errlen,
+                         "strict Qwen prompt verifier allocation failed");
+            }
+            return -1;
+        }
+        return n_accept;
+    }
+
+    const uint32_t position = (uint32_t)s->checkpoint.len;
+    const double started = now_sec();
+    uint32_t accepted_prefix = 0;
+    bool state_usable = false;
+    bool cancelled = false;
+    const bool verified = qwen35_gpu_verify_prompt_suffix_exact(
+        &s->engine->model,
+        &s->engine->qwen35_weights,
+        &s->qwen35_gpu_graph,
+        draft,
+        draft_n,
+        position,
+        &s->qwen35_spec_workspace,
+        (s->engine->qwen35_features.enabled &
+         QWEN35_FEATURE_LAYER_PIN) != 0,
+        (s->engine->qwen35_features.enabled &
+         QWEN35_FEATURE_GQA_REUSE) != 0,
+        (s->engine->qwen35_features.enabled &
+         QWEN35_FEATURE_IO_OVERLAP) != 0,
+        ds4_session_qwen35_metal_activity,
+        s,
+        ds4_session_cancelled_cb,
+        s,
+        &accepted_prefix,
+        pending_logits,
+        &state_usable,
+        &cancelled);
+    if (!verified) {
+        free(pending_logits);
+        qwen35_telemetry_emit(
+            s->engine, "runtime_fallback",
+            "\"position\":%u,\"proposed\":%u,"
+            "\"state_usable\":%s,\"cancelled\":%s,"
+            "\"elapsed_sec\":%.6f",
+            position, draft_n,
+            state_usable ? "true" : "false",
+            cancelled ? "true" : "false",
+            now_sec() - started);
+        ds4_session_qwen35_metal_activity(
+            s, "campaign_invalid", 0, (int)draft_n);
+        if (cancelled) {
+            if (errlen) snprintf(err, errlen, "interrupted");
+            return -1;
+        }
+        if (state_usable) {
+            if (s->engine->qwen35_features.require_full_stack) {
+                if (errlen) {
+                    snprintf(err, errlen,
+                             "strict Qwen prompt verifier runtime fallback");
+                }
+                return -1;
+            }
+            return n_accept;
+        }
+
+        const bool reset = ds4_session_qwen35_reset_timeline(s);
+        if (errlen) {
+            snprintf(err, errlen,
+                     "Qwen prompt verifier lost its exact frontier%s",
+                     reset ? "" : "; reset failed");
+        }
+        return -1;
+    }
+
+    if (accepted_prefix == 0 || accepted_prefix > draft_n) {
+        free(pending_logits);
+        const bool reset = ds4_session_qwen35_reset_timeline(s);
+        if (errlen) {
+            snprintf(err, errlen,
+                     "Qwen prompt verifier returned an invalid prefix%s",
+                     reset ? "" : "; reset failed");
+        }
+        return -1;
+    }
+
+    if (accepted_prefix == draft_n) {
+        /* The exact verifier already advanced the Metal frontier.  Publish the
+         * host checkpoint and logits together so no observer can see a mixed
+         * transaction if a future validation check is added here. */
+        if (s->qwen35_gpu_graph.n_tokens != position + draft_n) {
+            free(pending_logits);
+            const bool reset = ds4_session_qwen35_reset_timeline(s);
+            if (errlen) {
+                snprintf(err, errlen,
+                         "Qwen prompt verifier timeline mismatch%s",
+                         reset ? "" : "; reset failed");
+            }
+            return -1;
+        }
+        for (uint32_t i = 0; i < draft_n; i++) {
+            token_vec_push(&s->checkpoint, draft[i]);
+        }
+        memcpy(s->logits, pending_logits, QWEN35_HOST_LOGITS_BYTES);
+        s->checkpoint_valid = true;
+        s->mtp_draft_valid = false;
+    } else {
+        /* A partial verifier has restored Metal to `position`; replaying the
+         * accepted rows preserves the same command shape and reductions as
+         * baseline greedy decode.  Each replay publishes logits so a cancel
+         * between rows cannot expose a stale checkpoint/logit pair. */
+        if (s->qwen35_gpu_graph.n_tokens != position) {
+            free(pending_logits);
+            const bool reset = ds4_session_qwen35_reset_timeline(s);
+            if (errlen) {
+                snprintf(err, errlen,
+                         "Qwen prompt verifier rollback mismatch%s",
+                         reset ? "" : "; reset failed");
+            }
+            return -1;
+        }
+        for (uint32_t i = 0; i < accepted_prefix; i++) {
+            if (ds4_session_cancelled(s)) {
+                free(pending_logits);
+                if (errlen) snprintf(err, errlen, "interrupted");
+                return -1;
+            }
+            /* Publish every replay row, not only the last one.  This costs the
+             * same output projection already needed for exact verification
+             * and keeps logits paired with the checkpoint if cancellation is
+             * observed between two accepted rows. */
+            float *row_logits = s->logits;
+            if (!ds4_session_qwen35_metal_forward_commit(
+                    s, draft[i], row_logits)) {
+                free(pending_logits);
+                const bool reset = ds4_session_qwen35_reset_timeline(s);
+                if (errlen) {
+                    snprintf(err, errlen,
+                             "Qwen prompt verifier replay failed%s",
+                             reset ? "" : "; reset failed");
+                }
+                return -1;
+            }
+        }
+    }
+    free(pending_logits);
+
+    for (uint32_t i = 0; i < accepted_prefix; i++) {
+        accepted[n_accept++] = draft[i];
+    }
+    qwen35_telemetry_emit(
+        s->engine, "decode_accept",
+        "\"position\":%u,\"first_token\":%d,"
+        "\"proposed\":%u,\"accepted\":%u,\"full\":%s,"
+        "\"elapsed_sec\":%.6f",
+        position, first_token, draft_n, accepted_prefix,
+        accepted_prefix == draft_n ? "true" : "false",
+        now_sec() - started);
+    ds4_session_qwen35_metal_activity(
+        s, "decode_accept", (int)accepted_prefix, (int)draft_n);
+    return n_accept;
 }
 #endif
 
@@ -34671,13 +38474,10 @@ int ds4_session_eval(ds4_session *s, int token, char *err, size_t errlen) {
     return ds4_session_eval_internal(s, token, true, err, errlen);
 }
 
-/* Speculative decode state machine:
- * 1. commit the normal target token and use its logits to validate draft[0];
- * 2. let MTP recursively draft a tiny suffix from its own raw-cache frontier;
- * 3. verify the suffix with the target graph, committing only the accepted
- *    prefix and rolling back speculative Metal state on miss;
- * 4. fall back to ordinary one-token decode if the fast verifier cannot prove
- *    the target stream. */
+/* Exact greedy speculative state machine.  DeepSeek uses its MTP head as the
+ * proposal source; Qwen reuses a repeated prompt suffix.  Both paths commit a
+ * normal target token first, verify only against target-model logits, and fall
+ * back to the ordinary one-token transaction whenever a suffix is not proven. */
 int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
                                         int max_tokens, int eos_token,
                                         int *accepted, int accepted_cap,
@@ -34689,7 +38489,23 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
         accepted[0] = first_token;
         return 1;
     }
-    if (ds4_session_is_qwen35(s) || ds4_session_is_cpu(s)) {
+    if (ds4_session_is_qwen35(s)) {
+        if (!accepted || accepted_cap <= 0) return 0;
+        if (ds4_session_eval(s, first_token, err, errlen) != 0) return -1;
+        accepted[0] = first_token;
+#if defined(__APPLE__) && !defined(DS4_NO_GPU)
+        if (ds4_session_is_qwen35_metal(s)) {
+            return ds4_session_eval_qwen35_prompt_lookup_argmax(
+                s, first_token, max_tokens, eos_token,
+                accepted, accepted_cap, err, errlen);
+        }
+#else
+        (void)max_tokens;
+        (void)eos_token;
+#endif
+        return 1;
+    }
+    if (ds4_session_is_cpu(s)) {
         (void)max_tokens;
         (void)eos_token;
         if (!accepted || accepted_cap <= 0) return 0;

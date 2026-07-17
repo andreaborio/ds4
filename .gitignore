@@ -12,6 +12,7 @@
 /tests/cuda_long_context_smoke
 /build/
 /ds4flash.gguf
+*.experts.pack
 /TODO.md
 /gguf/
 *.o

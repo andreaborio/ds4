@@ -264,3 +264,49 @@ kernel void kernel_argsort_merge_f32_i32(
 
 // Host-visible merge variant used by DS4 top-k selection.
 template [[host_name("kernel_argsort_merge_f32_i32_desc")]] kernel argsort_merge_t kernel_argsort_merge_f32_i32<DS4_SORT_ORDER_DESC>;
+
+// Exact greedy selection used by Qwen prompt verification.  The generic
+// argsort intentionally serves several ranking consumers and historically did
+// not define a total order for ties or NaNs.  Decode does: it scans ascending
+// token IDs, ignores NaNs (`v > best` is false), and keeps the first equal
+// maximum.  Reducing (value, lowest-index) pairs reproduces that contract
+// without changing router/indexer ordering elsewhere.
+kernel void kernel_argmax_f32_i32_exact(
+        device const float   *src [[buffer(0)]],
+        device       int32_t *dst [[buffer(1)]],
+        constant     uint    &n   [[buffer(2)]],
+        threadgroup  float   *shared_value [[threadgroup(0)]],
+        threadgroup  uint    *shared_index [[threadgroup(1)]],
+        uint tid [[thread_index_in_threadgroup]],
+        uint ntg [[threads_per_threadgroup]]) {
+    float best_value = -INFINITY;
+    uint best_index = 0;
+    for (uint i = tid; i < n; i += ntg) {
+        const float value = src[i];
+        if (value > best_value) {
+            best_value = value;
+            best_index = i;
+        }
+    }
+    shared_value[tid] = best_value;
+    shared_index[tid] = best_index;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint stride = ntg >> 1; stride != 0; stride >>= 1) {
+        if (tid < stride) {
+            const float rhs_value = shared_value[tid + stride];
+            const uint rhs_index = shared_index[tid + stride];
+            const float lhs_value = shared_value[tid];
+            const uint lhs_index = shared_index[tid];
+            if (rhs_value > lhs_value ||
+                (!(lhs_value > rhs_value) &&
+                 !(rhs_value > lhs_value) &&
+                 rhs_index < lhs_index)) {
+                shared_value[tid] = rhs_value;
+                shared_index[tid] = rhs_index;
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    if (tid == 0) dst[0] = (int32_t)shared_index[0];
+}

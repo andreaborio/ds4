@@ -30,6 +30,7 @@ PROGRAMS := ds4 ds4-server ds4-bench ds4-eval ds4-agent
 .PHONY: all help clean test model-free-test cpu cuda cuda-spark cuda-generic cuda-regression FORCE \
 	strix-halo rocm metal build-isolation-test q4k-dot-test qwen-metadata-test \
 	qwen-reference-test qwen-unicode-test qwen-tokenizer-test \
+	qwen-expert-group-test qwen-expert-pack-test ds4-qwen-pack \
 	$(PROGRAMS) ds4_test ds4_agent_test
 
 ifeq ($(UNAME_S),Darwin)
@@ -47,7 +48,7 @@ CPU_BINDIR := $(BUILD_ROOT)/$(CPU_PROFILE)/bin
 
 METAL_LDLIBS := $(LDLIBS) -framework Foundation -framework Metal
 
-METAL_CORE_OBJS := $(addprefix $(METAL_OBJDIR)/,ds4.o ds4_build.o ds4_distributed.o ds4_ssd.o ds4_qwen.o ds4_qwen_unicode.o ds4_metal.o)
+METAL_CORE_OBJS := $(addprefix $(METAL_OBJDIR)/,ds4.o ds4_build.o ds4_distributed.o ds4_ssd.o ds4_qwen.o ds4_qwen_unicode.o ds4_qwen_expert_group.o ds4_qwen_expert_pack.o ds4_metal.o)
 CPU_CORE_OBJS := $(addprefix $(CPU_OBJDIR)/,ds4.o ds4_build.o ds4_distributed.o ds4_ssd.o ds4_qwen.o ds4_qwen_unicode.o)
 
 METAL_BINS := $(addprefix $(METAL_BINDIR)/,$(PROGRAMS))
@@ -64,6 +65,8 @@ METAL_TEST_BINS := \
 	$(METAL_BINDIR)/test_qwen_state \
 	$(METAL_BINDIR)/test_qwen_unicode \
 	$(METAL_BINDIR)/test_qwen_tokenizer \
+	$(METAL_BINDIR)/test_qwen_expert_group \
+	$(METAL_BINDIR)/test_qwen_expert_pack \
 	$(METAL_BINDIR)/test_ssd_residency
 
 all: metal
@@ -75,6 +78,7 @@ help:
 	@echo "  make test         Build and run the Metal test suite"
 	@echo "  make model-free-test"
 	@echo "                    Run all Metal gates that do not require a GGUF"
+	@echo "  make ds4-qwen-pack Build the verified Qwen expert sidecar tool"
 	@echo "  make build-isolation-test"
 	@echo "                    Prove Metal -> CPU -> Metal cannot mix artifacts"
 	@echo "  make clean        Remove build outputs and published root binaries"
@@ -186,7 +190,8 @@ $(CPU_OBJDIR)/ds4_qwen_unicode.o: ds4_qwen_unicode.c ds4_qwen_unicode.h \
 	@mkdir -p "$(@D)"
 	$(CC) $(CFLAGS) -DDS4_NO_GPU $(DEPFLAGS) -c -o $@ $<
 
-$(METAL_OBJDIR)/ds4_metal.o: ds4_metal.m ds4_gpu.h $(METAL_SRCS)
+$(METAL_OBJDIR)/ds4_metal.o: ds4_metal.m ds4_gpu.h \
+		ds4_qwen_expert_group.h $(METAL_SRCS)
 	@mkdir -p "$(@D)"
 	$(CC) $(OBJCFLAGS) $(DEPFLAGS) -c -o $@ ds4_metal.m
 
@@ -225,6 +230,21 @@ $(METAL_OBJDIR)/test_qwen_tokenizer.o: tests/test_qwen_tokenizer.c ds4.c \
 
 $(METAL_OBJDIR)/test_ssd_residency.o: tests/test_ssd_residency.c \
 		ds4_ssd.h ds4_qwen.h
+	@mkdir -p "$(@D)"
+	$(CC) $(CFLAGS) $(DEPFLAGS) -I. -c -o $@ $<
+
+$(METAL_OBJDIR)/ds4_qwen_pack_tool.o: tools/ds4_qwen_pack.c \
+		ds4_qwen_expert_pack.h
+	@mkdir -p "$(@D)"
+	$(CC) $(CFLAGS) $(DEPFLAGS) -I. -c -o $@ $<
+
+$(METAL_OBJDIR)/test_qwen_expert_pack.o: tests/test_qwen_expert_pack.c \
+		ds4_qwen_expert_pack.h
+	@mkdir -p "$(@D)"
+	$(CC) $(CFLAGS) $(DEPFLAGS) -I. -c -o $@ $<
+
+$(METAL_OBJDIR)/test_qwen_expert_group.o: tests/test_qwen_expert_group.c \
+		ds4_qwen_expert_group.h
 	@mkdir -p "$(@D)"
 	$(CC) $(CFLAGS) $(DEPFLAGS) -I. -c -o $@ $<
 
@@ -317,6 +337,34 @@ $(METAL_BINDIR)/test_qwen_unicode: \
 	@mkdir -p "$(@D)"
 	$(CC) -O2 -o $@ $^
 
+$(METAL_BINDIR)/ds4-qwen-pack: \
+		$(METAL_OBJDIR)/ds4_qwen_pack_tool.o \
+		$(METAL_OBJDIR)/ds4_qwen_expert_pack.o
+	@mkdir -p "$(@D)"
+	$(CC) $(CFLAGS) -o $@ $^ $(LDLIBS)
+
+$(METAL_BINDIR)/test_qwen_expert_pack: \
+		$(METAL_OBJDIR)/test_qwen_expert_pack.o \
+		$(METAL_OBJDIR)/ds4_qwen_expert_pack.o
+	@mkdir -p "$(@D)"
+	$(CC) $(CFLAGS) -o $@ $^ $(LDLIBS)
+
+$(METAL_BINDIR)/test_qwen_expert_group: \
+		$(METAL_OBJDIR)/test_qwen_expert_group.o \
+		$(METAL_OBJDIR)/ds4_qwen_expert_group.o
+	@mkdir -p "$(@D)"
+	$(CC) $(CFLAGS) -o $@ $^ $(LDLIBS)
+
+ds4-qwen-pack: $(METAL_BINDIR)/ds4-qwen-pack
+	@rm -f "$@"
+	@ln -s "$<" "$@"
+
+qwen-expert-pack-test: $(METAL_BINDIR)/test_qwen_expert_pack
+	$<
+
+qwen-expert-group-test: $(METAL_BINDIR)/test_qwen_expert_group
+	$<
+
 # Preserve the documented direct test-runner commands without letting a CPU
 # target publish over them.
 ds4_test: $(METAL_BINDIR)/ds4_test
@@ -359,10 +407,13 @@ model-free-test: metal ds4_test ds4_agent_test $(METAL_BINDIR)/test_q4k_dot \
 		$(METAL_BINDIR)/test_qwen_state \
 		$(METAL_BINDIR)/test_qwen_unicode \
 		$(METAL_BINDIR)/test_qwen_tokenizer \
+		$(METAL_BINDIR)/test_qwen_expert_group \
+		$(METAL_BINDIR)/test_qwen_expert_pack \
 		$(METAL_BINDIR)/test_ssd_residency
 	$(METAL_BINDIR)/ds4-eval --self-test-extractors
 	$(METAL_BINDIR)/ds4_agent_test
 	$(METAL_BINDIR)/ds4_test --server
+	$(METAL_BINDIR)/ds4_test --metal-kernels
 	$(METAL_BINDIR)/test_q4k_dot
 	$(METAL_BINDIR)/test_q4k_top8
 	$(METAL_BINDIR)/test_qwen_session
@@ -371,12 +422,15 @@ model-free-test: metal ds4_test ds4_agent_test $(METAL_BINDIR)/test_q4k_dot \
 	$(METAL_BINDIR)/test_qwen_state
 	$(METAL_BINDIR)/test_qwen_unicode
 	$(METAL_BINDIR)/test_qwen_tokenizer
+	$(METAL_BINDIR)/test_qwen_expert_group
+	$(METAL_BINDIR)/test_qwen_expert_pack
 	python3 tests/qwen/collect_gdn_reference.py --check
 	python3 tests/qwen/collect_attention_reference.py --check
 	python3 tests/qwen/test_v_tiling_contract.py
 	python3 tests/gen_qwen_unicode.py --check
 	$(METAL_BINDIR)/test_ssd_residency
 	python3 tests/test_qwen_metadata.py $(METAL_BINDIR)/ds4
+	python3 -m unittest tests/test_qwen_mac_campaign.py
 
 test: model-free-test
 	$(METAL_BINDIR)/ds4_test
@@ -419,6 +473,7 @@ help:
 	@echo "  make strix-halo          Build ROCm for Strix Halo / gfx1151"
 	@echo "  make rocm                Alias for make strix-halo"
 	@echo "  make cpu                 Build CPU-only ./ds4* binaries"
+	@echo "  make ds4-qwen-pack       Build the verified Qwen expert sidecar tool"
 	@echo "  make test                Build and run tests"
 	@echo "  make clean               Remove build outputs"
 
@@ -575,6 +630,8 @@ model-free-test: ds4 ds4_test ds4_agent_test ds4-eval q4k-dot-test \
 		tests/test_qwen_tokenizer \
 		tests/test_qwen_gdn_ref tests/test_qwen_attention_ref \
 		tests/test_qwen_state tests/test_qwen_unicode \
+		tests/test_qwen_expert_group \
+		tests/test_qwen_expert_pack \
 		tests/test_ssd_residency
 	./ds4-eval --self-test-extractors
 	./ds4_agent_test
@@ -586,12 +643,15 @@ model-free-test: ds4 ds4_test ds4_agent_test ds4-eval q4k-dot-test \
 	./tests/test_qwen_attention_ref
 	./tests/test_qwen_state
 	./tests/test_qwen_unicode
+	./tests/test_qwen_expert_group
+	./tests/test_qwen_expert_pack
 	python3 tests/qwen/collect_gdn_reference.py --check
 	python3 tests/qwen/collect_attention_reference.py --check
 	python3 tests/qwen/test_v_tiling_contract.py
 	python3 tests/gen_qwen_unicode.py --check
 	./tests/test_ssd_residency
 	python3 tests/test_qwen_metadata.py ./ds4
+	python3 -m unittest tests/test_qwen_mac_campaign.py
 
 test: model-free-test
 	./ds4_test
@@ -670,16 +730,39 @@ qwen-unicode-test: tests/test_qwen_unicode
 qwen-tokenizer-test: tests/test_qwen_tokenizer
 	./tests/test_qwen_tokenizer
 
+ds4-qwen-pack: tools/ds4_qwen_pack.c ds4_qwen_expert_pack.c \
+		ds4_qwen_expert_pack.h ds4_qwen.h
+	$(CC) $(CFLAGS) -I. -o $@ tools/ds4_qwen_pack.c \
+		ds4_qwen_expert_pack.c $(LDLIBS)
+
+tests/test_qwen_expert_pack: tests/test_qwen_expert_pack.c \
+		ds4_qwen_expert_pack.c ds4_qwen_expert_pack.h ds4_qwen.h
+	$(CC) $(CFLAGS) -I. -o $@ tests/test_qwen_expert_pack.c \
+		ds4_qwen_expert_pack.c $(LDLIBS)
+
+qwen-expert-pack-test: tests/test_qwen_expert_pack
+	./tests/test_qwen_expert_pack
+
+tests/test_qwen_expert_group: tests/test_qwen_expert_group.c \
+		ds4_qwen_expert_group.c ds4_qwen_expert_group.h
+	$(CC) $(CFLAGS) -I. -o $@ tests/test_qwen_expert_group.c \
+		ds4_qwen_expert_group.c $(LDLIBS)
+
+qwen-expert-group-test: tests/test_qwen_expert_group
+	./tests/test_qwen_expert_group
+
 endif
 
 clean:
 	rm -rf "$(BUILD_ROOT)"
 	rm -f ds4 ds4-server ds4-bench ds4-eval ds4-agent ds4_cpu ds4_native \
-		ds4_server_test ds4_test ds4_agent_test tests/test_q4k_dot \
+		ds4-qwen-pack ds4_server_test ds4_test ds4_agent_test tests/test_q4k_dot \
 		tests/test_q4k_top8 \
 		tests/test_qwen_session \
 		tests/test_qwen_tokenizer \
 		tests/test_qwen_gdn_ref tests/test_qwen_attention_ref \
 		tests/test_qwen_state tests/test_qwen_unicode \
+		tests/test_qwen_expert_group \
+		tests/test_qwen_expert_pack \
 		tests/test_ssd_residency tests/cuda_long_context_smoke \
 		tests/cuda_long_context_smoke.o *.o
