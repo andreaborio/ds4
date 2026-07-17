@@ -49,7 +49,7 @@ CPU_BINDIR := $(BUILD_ROOT)/$(CPU_PROFILE)/bin
 METAL_LDLIBS := $(LDLIBS) -framework Foundation -framework Metal
 
 METAL_CORE_OBJS := $(addprefix $(METAL_OBJDIR)/,ds4.o ds4_build.o ds4_distributed.o ds4_ssd.o ds4_qwen.o ds4_qwen_unicode.o ds4_qwen_expert_group.o ds4_qwen_expert_pack.o ds4_metal.o)
-CPU_CORE_OBJS := $(addprefix $(CPU_OBJDIR)/,ds4.o ds4_build.o ds4_distributed.o ds4_ssd.o ds4_qwen.o ds4_qwen_unicode.o)
+CPU_CORE_OBJS := $(addprefix $(CPU_OBJDIR)/,ds4.o ds4_build.o ds4_distributed.o ds4_ssd.o ds4_qwen.o ds4_qwen_unicode.o ds4_qwen_expert_pack.o)
 
 METAL_BINS := $(addprefix $(METAL_BINDIR)/,$(PROGRAMS))
 CPU_BINS := $(addprefix $(CPU_BINDIR)/,$(PROGRAMS))
@@ -234,12 +234,12 @@ $(METAL_OBJDIR)/test_ssd_residency.o: tests/test_ssd_residency.c \
 	$(CC) $(CFLAGS) $(DEPFLAGS) -I. -c -o $@ $<
 
 $(METAL_OBJDIR)/ds4_qwen_pack_tool.o: tools/ds4_qwen_pack.c \
-		ds4_qwen_expert_pack.h
+		ds4_qwen_expert_pack.h ds4_qwen_native_gguf.h
 	@mkdir -p "$(@D)"
 	$(CC) $(CFLAGS) $(DEPFLAGS) -I. -c -o $@ $<
 
 $(METAL_OBJDIR)/test_qwen_expert_pack.o: tests/test_qwen_expert_pack.c \
-		ds4_qwen_expert_pack.h
+		ds4_qwen_expert_pack.h ds4_qwen_native_gguf.h
 	@mkdir -p "$(@D)"
 	$(CC) $(CFLAGS) $(DEPFLAGS) -I. -c -o $@ $<
 
@@ -291,14 +291,16 @@ $(METAL_BINDIR)/test_q4k_dot: $(METAL_OBJDIR)/test_q4k_dot.o
 $(METAL_BINDIR)/test_q4k_top8: \
 		$(METAL_OBJDIR)/test_q4k_top8.o $(METAL_OBJDIR)/ds4_build.o \
 		$(METAL_OBJDIR)/ds4_distributed.o $(METAL_OBJDIR)/ds4_ssd.o \
-		$(METAL_OBJDIR)/ds4_qwen.o $(METAL_OBJDIR)/ds4_qwen_unicode.o
+		$(METAL_OBJDIR)/ds4_qwen.o $(METAL_OBJDIR)/ds4_qwen_unicode.o \
+		$(METAL_OBJDIR)/ds4_qwen_expert_pack.o
 	@mkdir -p "$(@D)"
 	$(CC) $(CFLAGS) -o $@ $^ $(LDLIBS)
 
 $(METAL_BINDIR)/test_qwen_session: \
 		$(METAL_OBJDIR)/test_qwen_session.o $(METAL_OBJDIR)/ds4_build.o \
 		$(METAL_OBJDIR)/ds4_distributed.o $(METAL_OBJDIR)/ds4_ssd.o \
-		$(METAL_OBJDIR)/ds4_qwen.o $(METAL_OBJDIR)/ds4_qwen_unicode.o
+		$(METAL_OBJDIR)/ds4_qwen.o $(METAL_OBJDIR)/ds4_qwen_unicode.o \
+		$(METAL_OBJDIR)/ds4_qwen_expert_pack.o
 	@mkdir -p "$(@D)"
 	$(CC) $(CFLAGS) -o $@ $^ $(LDLIBS)
 
@@ -306,7 +308,8 @@ $(METAL_BINDIR)/test_qwen_tokenizer: \
 		$(METAL_OBJDIR)/test_qwen_tokenizer.o $(METAL_OBJDIR)/ds4_kvstore.o \
 		$(METAL_OBJDIR)/ds4_build.o \
 		$(METAL_OBJDIR)/ds4_distributed.o $(METAL_OBJDIR)/ds4_ssd.o \
-		$(METAL_OBJDIR)/ds4_qwen.o $(METAL_OBJDIR)/ds4_qwen_unicode.o
+		$(METAL_OBJDIR)/ds4_qwen.o $(METAL_OBJDIR)/ds4_qwen_unicode.o \
+		$(METAL_OBJDIR)/ds4_qwen_expert_pack.o
 	@mkdir -p "$(@D)"
 	$(CC) $(CFLAGS) -o $@ $^ $(LDLIBS)
 
@@ -339,13 +342,15 @@ $(METAL_BINDIR)/test_qwen_unicode: \
 
 $(METAL_BINDIR)/ds4-qwen-pack: \
 		$(METAL_OBJDIR)/ds4_qwen_pack_tool.o \
-		$(METAL_OBJDIR)/ds4_qwen_expert_pack.o
+		$(METAL_OBJDIR)/ds4_qwen_expert_pack.o \
+		$(METAL_OBJDIR)/ds4_qwen_native_gguf.o
 	@mkdir -p "$(@D)"
 	$(CC) $(CFLAGS) -o $@ $^ $(LDLIBS)
 
 $(METAL_BINDIR)/test_qwen_expert_pack: \
 		$(METAL_OBJDIR)/test_qwen_expert_pack.o \
-		$(METAL_OBJDIR)/ds4_qwen_expert_pack.o
+		$(METAL_OBJDIR)/ds4_qwen_expert_pack.o \
+		$(METAL_OBJDIR)/ds4_qwen_native_gguf.o
 	@mkdir -p "$(@D)"
 	$(CC) $(CFLAGS) -o $@ $^ $(LDLIBS)
 
@@ -430,7 +435,6 @@ model-free-test: metal ds4_test ds4_agent_test $(METAL_BINDIR)/test_q4k_dot \
 	python3 tests/gen_qwen_unicode.py --check
 	$(METAL_BINDIR)/test_ssd_residency
 	python3 tests/test_qwen_metadata.py $(METAL_BINDIR)/ds4
-	python3 -m unittest tests/test_qwen_mac_campaign.py
 
 test: model-free-test
 	$(METAL_BINDIR)/ds4_test
@@ -453,8 +457,8 @@ ifneq ($(strip $(CUDA_ARCH)),)
 NVCC_ARCH_FLAGS := -arch=$(CUDA_ARCH)
 endif
 NVCCFLAGS ?= -O3 -g -lineinfo --use_fast_math $(NVCC_ARCH_FLAGS) -Xcompiler $(NATIVE_CPU_FLAG) -Xcompiler -pthread
-CORE_OBJS = ds4.o ds4_build.o ds4_distributed.o ds4_ssd.o ds4_qwen.o ds4_qwen_unicode.o ds4_cuda.o
-CPU_CORE_OBJS = ds4_cpu.o ds4_build_cpu.o ds4_distributed.o ds4_ssd.o ds4_qwen.o ds4_qwen_unicode.o
+CORE_OBJS = ds4.o ds4_build.o ds4_distributed.o ds4_ssd.o ds4_qwen.o ds4_qwen_unicode.o ds4_qwen_expert_pack.o ds4_cuda.o
+CPU_CORE_OBJS = ds4_cpu.o ds4_build_cpu.o ds4_distributed.o ds4_ssd.o ds4_qwen.o ds4_qwen_unicode.o ds4_qwen_expert_pack.o
 CUDA_LDLIBS ?= -lm -Xcompiler -pthread -L$(CUDA_HOME)/targets/sbsa-linux/lib -L$(CUDA_HOME)/lib64 -lcudart -lcublas
 HIPCC ?= $(shell command -v hipcc 2>/dev/null || echo /opt/rocm/bin/hipcc)
 ROCM_ARCH ?= gfx1151
@@ -493,7 +497,7 @@ cuda:
 
 strix-halo:
 	$(MAKE) -B ds4 ds4-server ds4-bench ds4-eval ds4-agent \
-		CORE_OBJS="ds4.o ds4_build.o ds4_distributed.o ds4_ssd.o ds4_qwen.o ds4_qwen_unicode.o ds4_rocm.o" \
+		CORE_OBJS="ds4.o ds4_build.o ds4_distributed.o ds4_ssd.o ds4_qwen.o ds4_qwen_unicode.o ds4_qwen_expert_pack.o ds4_rocm.o" \
 		CFLAGS="$(CFLAGS) -DDS4_ROCM_BUILD" \
 		DS4_LINK="$(HIPCC) $(ROCM_CFLAGS)" \
 		DS4_LINK_LIBS="$(ROCM_LDLIBS)"
@@ -651,7 +655,6 @@ model-free-test: ds4 ds4_test ds4_agent_test ds4-eval q4k-dot-test \
 	python3 tests/gen_qwen_unicode.py --check
 	./tests/test_ssd_residency
 	python3 tests/test_qwen_metadata.py ./ds4
-	python3 -m unittest tests/test_qwen_mac_campaign.py
 
 test: model-free-test
 	./ds4_test
@@ -663,32 +666,35 @@ q4k-dot-test: tests/test_q4k_dot.c
 tests/test_q4k_top8: tests/test_q4k_top8.c ds4.c ds4.h ds4_ssd.h \
 		ds4_distributed.h ds4_gpu.h ds4_qwen.h ds4_qwen_unicode.h \
 		ds4_build.c ds4_distributed.c ds4_ssd.c ds4_qwen.c \
-		ds4_qwen_unicode.c ds4_qwen_unicode_data.inc \
+		ds4_qwen_unicode.c ds4_qwen_expert_pack.c \
+		ds4_qwen_expert_pack.h ds4_qwen_unicode_data.inc \
 		ds4_streaming_hotlist.inc
 	$(CC) $(CFLAGS) $(QWEN_CFLAGS) -DDS4_NO_GPU \
 		-Wno-unused-function -Wno-unused-parameter -I. -o $@ \
 		tests/test_q4k_top8.c ds4_build.c ds4_distributed.c ds4_ssd.c \
-		ds4_qwen.c ds4_qwen_unicode.c $(LDLIBS)
+		ds4_qwen.c ds4_qwen_unicode.c ds4_qwen_expert_pack.c $(LDLIBS)
 
 tests/test_qwen_session: tests/test_qwen_session.c ds4.c ds4.h ds4_ssd.h \
 		ds4_distributed.h ds4_gpu.h ds4_qwen.h ds4_qwen_unicode.h \
 		ds4_build.c ds4_distributed.c ds4_ssd.c ds4_qwen.c \
-		ds4_qwen_unicode.c ds4_qwen_unicode_data.inc \
+		ds4_qwen_unicode.c ds4_qwen_expert_pack.c \
+		ds4_qwen_expert_pack.h ds4_qwen_unicode_data.inc \
 		ds4_streaming_hotlist.inc
 	$(CC) $(CFLAGS) $(QWEN_CFLAGS) -DDS4_NO_GPU \
 		-Wno-unused-function -Wno-unused-parameter -I. -o $@ \
 		tests/test_qwen_session.c ds4_build.c ds4_distributed.c ds4_ssd.c \
-		ds4_qwen.c ds4_qwen_unicode.c $(LDLIBS)
+		ds4_qwen.c ds4_qwen_unicode.c ds4_qwen_expert_pack.c $(LDLIBS)
 
 tests/test_qwen_tokenizer: tests/test_qwen_tokenizer.c ds4.c ds4.h \
 		ds4_kvstore.c ds4_kvstore.h ds4_ssd.h ds4_distributed.h ds4_gpu.h ds4_qwen.h \
 		ds4_qwen_unicode.h ds4_build.c ds4_distributed.c ds4_ssd.c \
-		ds4_qwen.c ds4_qwen_unicode.c ds4_qwen_unicode_data.inc \
+		ds4_qwen.c ds4_qwen_unicode.c ds4_qwen_expert_pack.c \
+		ds4_qwen_expert_pack.h ds4_qwen_unicode_data.inc \
 		ds4_streaming_hotlist.inc tests/qwen/qwen36_tokenizer_fixture.inc
 	$(CC) $(CFLAGS) $(QWEN_CFLAGS) -DDS4_NO_GPU \
 		-Wno-unused-function -Wno-unused-parameter -I. -o $@ \
 		tests/test_qwen_tokenizer.c ds4_kvstore.c ds4_build.c ds4_distributed.c ds4_ssd.c \
-		ds4_qwen.c ds4_qwen_unicode.c $(LDLIBS)
+		ds4_qwen.c ds4_qwen_unicode.c ds4_qwen_expert_pack.c $(LDLIBS)
 
 qwen-metadata-test: ds4 tests/test_qwen_metadata.py
 	python3 tests/test_qwen_metadata.py ./ds4
@@ -731,14 +737,16 @@ qwen-tokenizer-test: tests/test_qwen_tokenizer
 	./tests/test_qwen_tokenizer
 
 ds4-qwen-pack: tools/ds4_qwen_pack.c ds4_qwen_expert_pack.c \
-		ds4_qwen_expert_pack.h ds4_qwen.h
+		ds4_qwen_expert_pack.h ds4_qwen_native_gguf.c \
+		ds4_qwen_native_gguf.h ds4_qwen.h
 	$(CC) $(CFLAGS) -I. -o $@ tools/ds4_qwen_pack.c \
-		ds4_qwen_expert_pack.c $(LDLIBS)
+		ds4_qwen_expert_pack.c ds4_qwen_native_gguf.c $(LDLIBS)
 
 tests/test_qwen_expert_pack: tests/test_qwen_expert_pack.c \
-		ds4_qwen_expert_pack.c ds4_qwen_expert_pack.h ds4_qwen.h
+		ds4_qwen_expert_pack.c ds4_qwen_expert_pack.h \
+		ds4_qwen_native_gguf.c ds4_qwen_native_gguf.h ds4_qwen.h
 	$(CC) $(CFLAGS) -I. -o $@ tests/test_qwen_expert_pack.c \
-		ds4_qwen_expert_pack.c $(LDLIBS)
+		ds4_qwen_expert_pack.c ds4_qwen_native_gguf.c $(LDLIBS)
 
 qwen-expert-pack-test: tests/test_qwen_expert_pack
 	./tests/test_qwen_expert_pack

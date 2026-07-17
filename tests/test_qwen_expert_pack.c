@@ -2,6 +2,7 @@
 #define _FILE_OFFSET_BITS 64
 
 #include "ds4_qwen_expert_pack.h"
+#include "ds4_qwen_native_gguf.h"
 
 #include <dirent.h>
 #include <errno.h>
@@ -194,6 +195,36 @@ static bool files_equal(const char *a_path, const char *b_path) {
     return true;
 }
 
+static bool embed_file(
+        const char *source_path,
+        const char *container_path,
+        uint64_t    offset,
+        uint64_t   *source_bytes_out) {
+    const int source = open(source_path, O_RDONLY);
+    const int container = open(container_path, O_CREAT | O_TRUNC | O_RDWR, 0600);
+    CHECK(source >= 0 && container >= 0);
+    struct stat st;
+    CHECK(fstat(source, &st) == 0 && st.st_size >= 0);
+    CHECK(offset <= (uint64_t)INT64_MAX - (uint64_t)st.st_size);
+    CHECK(ftruncate(container, (off_t)(offset + (uint64_t)st.st_size)) == 0);
+    uint8_t buffer[8192];
+    uint64_t copied = 0;
+    while (copied < (uint64_t)st.st_size) {
+        size_t take = sizeof(buffer);
+        if ((uint64_t)take > (uint64_t)st.st_size - copied) {
+            take = (size_t)((uint64_t)st.st_size - copied);
+        }
+        CHECK(pread(source, buffer, take, (off_t)copied) == (ssize_t)take);
+        CHECK(pwrite(container, buffer, take,
+                     (off_t)(offset + copied)) == (ssize_t)take);
+        copied += take;
+    }
+    CHECK(fsync(container) == 0);
+    CHECK(close(source) == 0 && close(container) == 0);
+    if (source_bytes_out) *source_bytes_out = (uint64_t)st.st_size;
+    return true;
+}
+
 static bool span_matches_source(
         int source_fd,
         uint64_t source_offset,
@@ -256,9 +287,15 @@ static bool test_pack_format_and_invalidation(void) {
     char gguf[512];
     char pack_a[512];
     char pack_b[512];
+    char embedded_path[512];
+    char native_gguf[512];
     CHECK(snprintf(gguf, sizeof(gguf), "%s/model.gguf", directory) > 0);
     CHECK(snprintf(pack_a, sizeof(pack_a), "%s/experts.pack", directory) > 0);
     CHECK(snprintf(pack_b, sizeof(pack_b), "%s/experts-copy.pack", directory) > 0);
+    CHECK(snprintf(embedded_path, sizeof(embedded_path),
+                   "%s/embedded.bin", directory) > 0);
+    CHECK(snprintf(native_gguf, sizeof(native_gguf),
+                   "%s/model.ds4.gguf", directory) > 0);
 
     fixture_layout fixture;
     CHECK(write_fixture_gguf(gguf, &fixture));
@@ -272,6 +309,25 @@ static bool test_pack_format_and_invalidation(void) {
     CHECK(ds4_qwen_expert_pack_build(
         gguf, pack_b, &options, error, sizeof(error)));
     CHECK(files_equal(pack_a, pack_b));
+
+    const ds4_qwen_native_gguf_options native_options = {
+        .geometry = fixture_geometry(),
+        .filesystem_reserve_bytes = 0,
+    };
+    const bool native_built = ds4_qwen_native_gguf_build(
+        gguf, pack_a, native_gguf, &native_options,
+        error, sizeof(error));
+    if (!native_built) fprintf(stderr, "native build: %s\n", error);
+    CHECK(native_built);
+    CHECK(ds4_qwen_native_gguf_verify(
+        gguf, native_gguf, &native_options,
+        error, sizeof(error)));
+    struct stat native_stat;
+    struct stat pack_stat;
+    CHECK(stat(native_gguf, &native_stat) == 0);
+    CHECK(stat(pack_a, &pack_stat) == 0);
+    CHECK(native_stat.st_size > pack_stat.st_size);
+    CHECK((uint64_t)(native_stat.st_size - pack_stat.st_size) < 16384);
 
     ds4_qwen_expert_pack_geometry wrong = fixture_geometry();
     wrong.n_expert++;
@@ -364,6 +420,42 @@ static bool test_pack_format_and_invalidation(void) {
     }
     CHECK(close(source_fd) == 0);
 
+    /* The exact same bytes can live inside a larger GGUF tensor. The reader
+     * owns a duplicated descriptor and returns physical, container-relative
+     * offsets so callers never need a second offset convention. */
+    const uint64_t embedded_offset = 12345;
+    uint64_t embedded_bytes = 0;
+    CHECK(embed_file(pack_a, embedded_path, embedded_offset,
+                     &embedded_bytes));
+    const int embedded_fd = open(embedded_path, O_RDONLY);
+    CHECK(embedded_fd >= 0);
+    ds4_qwen_expert_pack *embedded = NULL;
+    CHECK(ds4_qwen_expert_pack_open_embedded(
+        &embedded, embedded_fd, embedded_offset, embedded_bytes,
+        &geometry, error, sizeof(error)) == DS4_QWEN_EXPERT_PACK_OK);
+    CHECK(ds4_qwen_expert_pack_file_offset(embedded) == embedded_offset);
+    CHECK(ds4_qwen_expert_pack_validate_source_file(
+        embedded, gguf, error,
+        sizeof(error)) == DS4_QWEN_EXPERT_PACK_OK);
+    CHECK(ds4_qwen_expert_pack_validate_payload_digest(
+        embedded, manifest->data_sha256, error,
+        sizeof(error)) == DS4_QWEN_EXPERT_PACK_OK);
+    CHECK(ds4_qwen_expert_pack_span_get(embedded, 1, 2, &span));
+    CHECK(span.gate.offset >= embedded_offset);
+    const int embedded_source_fd = open(gguf, O_RDONLY);
+    CHECK(embedded_source_fd >= 0);
+    CHECK(span_matches_source(
+        embedded_source_fd, fixture.source_offset[1][0][2],
+        ds4_qwen_expert_pack_fd(embedded), span.gate));
+    CHECK(close(embedded_source_fd) == 0);
+    ds4_qwen_expert_pack_close(embedded);
+    embedded = NULL;
+    CHECK(ds4_qwen_expert_pack_open_embedded(
+        &embedded, embedded_fd, embedded_offset, embedded_bytes + 1,
+        &geometry, error, sizeof(error)) == DS4_QWEN_EXPERT_PACK_FALLBACK);
+    CHECK(embedded == NULL);
+    CHECK(close(embedded_fd) == 0);
+
     /* Source identity is content-based: same-size edits deauthorize spans, and
      * restoring the exact byte makes the canonical GGUF valid again. */
     int mutable_source = open(gguf, O_RDWR);
@@ -443,6 +535,8 @@ static bool test_pack_format_and_invalidation(void) {
 
     CHECK(unlink(pack_b) == 0);
     CHECK(unlink(pack_a) == 0);
+    CHECK(unlink(embedded_path) == 0);
+    CHECK(unlink(native_gguf) == 0);
     CHECK(unlink(gguf) == 0);
     CHECK(rmdir(directory) == 0);
     return true;

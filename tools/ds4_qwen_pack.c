@@ -1,4 +1,5 @@
 #include "ds4_qwen_expert_pack.h"
+#include "ds4_qwen_native_gguf.h"
 
 #include <errno.h>
 #include <inttypes.h>
@@ -20,6 +21,8 @@ static const char *phase_name(ds4_qwen_expert_pack_phase phase) {
     case DS4_QWEN_EXPERT_PACK_WRITE_DATA: return "write experts";
     case DS4_QWEN_EXPERT_PACK_VERIFY_DATA: return "verify pack hash";
     case DS4_QWEN_EXPERT_PACK_VERIFY_SOURCE_SPANS: return "compare GGUF spans";
+    case DS4_QWEN_EXPERT_PACK_WRITE_NATIVE_GGUF: return "write native GGUF";
+    case DS4_QWEN_EXPERT_PACK_VERIFY_NATIVE_GGUF: return "verify native GGUF";
     }
     return "work";
 }
@@ -96,12 +99,15 @@ static void usage(FILE *stream, const char *program) {
     fprintf(stream,
             "usage:\n"
             "  %s build [--reserve-bytes N[KiB|MiB|GiB]] GGUF PACK\n"
-            "  %s verify GGUF PACK\n\n"
+            "  %s verify GGUF PACK\n"
+            "  %s native [--reserve-bytes N[KiB|MiB|GiB]] GGUF PACK OUTPUT.gguf\n"
+            "  %s verify-native GGUF OUTPUT.gguf\n\n"
             "The build command accepts only ds4's fixed Qwen3.6-35B-A3B "
             "Q4_K geometry.\n"
             "It writes PACK.tmp.*, verifies it completely, then atomically "
-            "renames it.\n",
-            program, program);
+            "renames it. The native command replaces the canonical routed "
+            "tensors with the verified pack inside one DS4-native GGUF.\n",
+            program, program, program, program);
 }
 
 static int build_pack(int argc, char **argv) {
@@ -196,6 +202,70 @@ static int verify_pack(int argc, char **argv) {
     return 0;
 }
 
+static int build_native(int argc, char **argv) {
+    uint64_t reserve = (uint64_t)DEFAULT_FILESYSTEM_RESERVE_GIB *
+                       1024 * 1024 * 1024;
+    int arg = 2;
+    if (arg < argc && strcmp(argv[arg], "--reserve-bytes") == 0) {
+        if (arg + 1 >= argc || !parse_bytes(argv[arg + 1], &reserve)) {
+            fprintf(stderr, "invalid --reserve-bytes value\n");
+            return 2;
+        }
+        arg += 2;
+    }
+    if (argc - arg != 3) {
+        usage(stderr, argv[0]);
+        return 2;
+    }
+    progress_state progress = {0};
+    const ds4_qwen_native_gguf_options options = {
+        .geometry = ds4_qwen35_expert_pack_geometry(),
+        .filesystem_reserve_bytes = reserve,
+        .progress = progress_report,
+        .progress_context = &progress,
+    };
+    char error[512] = {0};
+    const bool ok = ds4_qwen_native_gguf_build(
+        argv[arg], argv[arg + 1], argv[arg + 2],
+        &options, error, sizeof(error));
+    progress_finish(&progress);
+    if (!ok) {
+        fprintf(stderr, "ds4-qwen-pack: %s\n",
+                error[0] ? error : "native GGUF build failed");
+        return 1;
+    }
+    if (error[0]) {
+        fprintf(stderr, "ds4-qwen-pack: warning: %s\n", error);
+    }
+    printf("DS4-native expert-major GGUF installed atomically: %s\n",
+           argv[arg + 2]);
+    return 0;
+}
+
+static int verify_native(int argc, char **argv) {
+    if (argc != 4) {
+        usage(stderr, argv[0]);
+        return 2;
+    }
+    progress_state progress = {0};
+    const ds4_qwen_native_gguf_options options = {
+        .geometry = ds4_qwen35_expert_pack_geometry(),
+        .progress = progress_report,
+        .progress_context = &progress,
+    };
+    char error[512] = {0};
+    const bool ok = ds4_qwen_native_gguf_verify(
+        argv[2], argv[3], &options, error, sizeof(error));
+    progress_finish(&progress);
+    if (!ok) {
+        fprintf(stderr, "ds4-qwen-pack: %s\n",
+                error[0] ? error : "native GGUF verification failed");
+        return 1;
+    }
+    printf("DS4-native expert-major GGUF valid: %s\n", argv[3]);
+    return 0;
+}
+
 int main(int argc, char **argv) {
     if (argc < 2) {
         usage(stderr, argv[0]);
@@ -203,6 +273,10 @@ int main(int argc, char **argv) {
     }
     if (strcmp(argv[1], "build") == 0) return build_pack(argc, argv);
     if (strcmp(argv[1], "verify") == 0) return verify_pack(argc, argv);
+    if (strcmp(argv[1], "native") == 0) return build_native(argc, argv);
+    if (strcmp(argv[1], "verify-native") == 0) {
+        return verify_native(argc, argv);
+    }
     if (strcmp(argv[1], "--help") == 0 || strcmp(argv[1], "-h") == 0) {
         usage(stdout, argv[0]);
         return 0;

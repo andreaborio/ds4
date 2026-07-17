@@ -53,6 +53,8 @@ typedef struct {
 
 struct ds4_qwen_expert_pack {
     int fd;
+    uint64_t file_offset;
+    uint64_t extent_size;
     ds4_qwen_expert_pack_manifest manifest;
     pack_entry *entry;
     bool source_validated;
@@ -328,6 +330,11 @@ static bool hash_fd_range(
         ds4_qwen_expert_pack_phase           phase,
         char                                *error,
         size_t                               error_size) {
+#if defined(__APPLE__) && defined(F_NOCACHE)
+    /* Builders and verifiers intentionally stream multi-GiB artifacts. Keep
+     * those one-shot reads from evicting a live inference model's hot pages. */
+    (void)fcntl(fd, F_NOCACHE, 1);
+#endif
     uint8_t *buffer = malloc(PACK_IO_BYTES);
     if (!buffer) {
         set_error(error, error_size, "out of memory while hashing file");
@@ -1027,42 +1034,42 @@ static ds4_qwen_expert_pack_result pack_open_fallback(
     return DS4_QWEN_EXPERT_PACK_FALLBACK;
 }
 
-ds4_qwen_expert_pack_result ds4_qwen_expert_pack_open(
+static ds4_qwen_expert_pack_result expert_pack_open_owned_fd(
         ds4_qwen_expert_pack                 **out,
-        const char                            *pack_path,
+        int                                    owned_fd,
+        uint64_t                               file_offset,
+        uint64_t                               extent_size,
         const ds4_qwen_expert_pack_geometry   *expected_geometry,
+        const char                            *container_name,
         char                                  *error,
         size_t                                 error_size) {
     if (out) *out = NULL;
-    if (!out || !pack_path || !geometry_valid(expected_geometry)) {
-        set_error(error, error_size,
-                  "invalid expert pack path or expected geometry");
-        return DS4_QWEN_EXPERT_PACK_ERROR;
-    }
     ds4_qwen_expert_pack *pack = calloc(1, sizeof(*pack));
     if (!pack) {
+        if (owned_fd >= 0) close(owned_fd);
         set_error(error, error_size, "out of memory while opening expert pack");
         return DS4_QWEN_EXPERT_PACK_ERROR;
     }
-    pack->fd = -1;
-    pack->fd = open(pack_path, O_RDONLY);
-    if (pack->fd < 0) {
-        return pack_open_fallback(pack, error, error_size,
-                                  "expert pack unavailable: %s",
-                                  strerror(errno));
-    }
+    pack->fd = owned_fd;
+    pack->file_offset = file_offset;
+    pack->extent_size = extent_size;
     struct stat st;
-    if (fstat(pack->fd, &st) != 0 || !S_ISREG(st.st_mode) ||
-        st.st_size < PACK_HEADER_BYTES) {
+    if (pack->fd < 0 || fstat(pack->fd, &st) != 0 ||
+        !S_ISREG(st.st_mode) || st.st_size < 0 ||
+        extent_size < PACK_HEADER_BYTES ||
+        file_offset > (uint64_t)st.st_size ||
+        extent_size > (uint64_t)st.st_size - file_offset) {
         return pack_open_fallback(pack, error, error_size,
-                                  "expert pack is not a regular format-v1 file");
+                                  "%s is not a bounded regular format-v1 file",
+                                  container_name);
     }
     uint8_t header[PACK_HEADER_BYTES];
     char io_error[256] = {0};
-    if (!pread_all(pack->fd, header, sizeof(header), 0,
+    if (!pread_all(pack->fd, header, sizeof(header), file_offset,
                    io_error, sizeof(io_error))) {
         return pack_open_fallback(pack, error, error_size,
-                                  "cannot read expert pack header: %s", io_error);
+                                  "cannot read %s header: %s",
+                                  container_name, io_error);
     }
     if (memcmp(header, pack_magic, sizeof(pack_magic)) != 0 ||
         load_u32_le(header + 8) != DS4_QWEN_EXPERT_PACK_FORMAT_VERSION ||
@@ -1125,7 +1132,7 @@ ds4_qwen_expert_pack_result ds4_qwen_expert_pack_open(
         manifest.data_offset != expected_data_offset ||
         manifest.data_size != expected_data_size ||
         manifest.file_size != expected_file_size ||
-        manifest.file_size != (uint64_t)st.st_size ||
+        manifest.file_size != extent_size ||
         manifest.source_size == 0 || per_expert == 0) {
         return pack_open_fallback(pack, error, error_size,
                                   "expert pack sizes or offsets are invalid");
@@ -1145,7 +1152,8 @@ ds4_qwen_expert_pack_result ds4_qwen_expert_pack_open(
                   "out of memory while reading expert pack index");
         return DS4_QWEN_EXPERT_PACK_ERROR;
     }
-    if (!pread_all(pack->fd, table, table_bytes, PACK_HEADER_BYTES,
+    if (!pread_all(pack->fd, table, table_bytes,
+                   file_offset + PACK_HEADER_BYTES,
                    io_error, sizeof(io_error))) {
         free(table);
         return pack_open_fallback(pack, error, error_size,
@@ -1200,6 +1208,63 @@ ds4_qwen_expert_pack_result ds4_qwen_expert_pack_open(
     *out = pack;
     if (error && error_size) error[0] = '\0';
     return DS4_QWEN_EXPERT_PACK_OK;
+}
+
+ds4_qwen_expert_pack_result ds4_qwen_expert_pack_open(
+        ds4_qwen_expert_pack                 **out,
+        const char                            *pack_path,
+        const ds4_qwen_expert_pack_geometry   *expected_geometry,
+        char                                  *error,
+        size_t                                 error_size) {
+    if (out) *out = NULL;
+    if (!out || !pack_path || !geometry_valid(expected_geometry)) {
+        set_error(error, error_size,
+                  "invalid expert pack path or expected geometry");
+        return DS4_QWEN_EXPERT_PACK_ERROR;
+    }
+    const int fd = open(pack_path, O_RDONLY);
+    if (fd < 0) {
+        set_error(error, error_size, "expert pack unavailable: %s",
+                  strerror(errno));
+        return DS4_QWEN_EXPERT_PACK_FALLBACK;
+    }
+    struct stat st;
+    if (fstat(fd, &st) != 0 || st.st_size < 0) {
+        close(fd);
+        set_error(error, error_size,
+                  "expert pack is not a regular format-v1 file");
+        return DS4_QWEN_EXPERT_PACK_FALLBACK;
+    }
+    return expert_pack_open_owned_fd(
+        out, fd, 0, (uint64_t)st.st_size, expected_geometry,
+        "expert pack", error, error_size);
+}
+
+ds4_qwen_expert_pack_result ds4_qwen_expert_pack_open_embedded(
+        ds4_qwen_expert_pack                 **out,
+        int                                    fd,
+        uint64_t                               offset,
+        uint64_t                               bytes,
+        const ds4_qwen_expert_pack_geometry   *expected_geometry,
+        char                                  *error,
+        size_t                                 error_size) {
+    if (out) *out = NULL;
+    if (!out || fd < 0 || bytes < PACK_HEADER_BYTES ||
+        !geometry_valid(expected_geometry)) {
+        set_error(error, error_size,
+                  "invalid embedded expert pack descriptor or geometry");
+        return DS4_QWEN_EXPERT_PACK_ERROR;
+    }
+    const int owned_fd = dup(fd);
+    if (owned_fd < 0) {
+        set_error(error, error_size,
+                  "cannot duplicate embedded expert pack descriptor: %s",
+                  strerror(errno));
+        return DS4_QWEN_EXPERT_PACK_ERROR;
+    }
+    return expert_pack_open_owned_fd(
+        out, owned_fd, offset, bytes, expected_geometry,
+        "embedded expert pack", error, error_size);
 }
 
 const ds4_qwen_expert_pack_manifest *ds4_qwen_expert_pack_manifest_get(
@@ -1295,7 +1360,8 @@ ds4_qwen_expert_pack_result ds4_qwen_expert_pack_verify_payload(
     }
     pack->payload_validated = false;
     uint8_t digest[32];
-    if (!hash_fd_range(pack->fd, pack->manifest.data_offset,
+    if (!hash_fd_range(pack->fd,
+                       pack->file_offset + pack->manifest.data_offset,
                        pack->manifest.data_size, digest,
                        NULL, NULL, DS4_QWEN_EXPERT_PACK_VERIFY_DATA,
                        error, error_size)) {
@@ -1347,13 +1413,17 @@ bool ds4_qwen_expert_pack_span_get(
         (uint64_t)layer * pack->manifest.geometry.n_expert + expert;
     const pack_entry *entry = &pack->entry[index];
     *span = (ds4_qwen_expert_pack_span){
-        .gate = { .offset = entry->offset, .size = entry->gate_bytes },
+        .gate = {
+            .offset = pack->file_offset + entry->offset,
+            .size = entry->gate_bytes,
+        },
         .up = {
-            .offset = entry->offset + entry->gate_bytes,
+            .offset = pack->file_offset + entry->offset + entry->gate_bytes,
             .size = entry->up_bytes,
         },
         .down = {
-            .offset = entry->offset + entry->gate_bytes + entry->up_bytes,
+            .offset = pack->file_offset + entry->offset +
+                      entry->gate_bytes + entry->up_bytes,
             .size = entry->down_bytes,
         },
     };
@@ -1362,6 +1432,11 @@ bool ds4_qwen_expert_pack_span_get(
 
 int ds4_qwen_expert_pack_fd(const ds4_qwen_expert_pack *pack) {
     return pack ? pack->fd : -1;
+}
+
+uint64_t ds4_qwen_expert_pack_file_offset(
+        const ds4_qwen_expert_pack *pack) {
+    return pack ? pack->file_offset : 0;
 }
 
 static char *parent_directory(const char *path) {

@@ -8262,7 +8262,7 @@ int ds4_gpu_qwen35_expert_pack_install(
     uint64_t record_bytes = 0;
     uint64_t layer_bytes = 0;
     uint64_t payload_bytes = 0;
-    uint64_t expected_file_size = 0;
+    uint64_t payload_end = 0;
     int flags = -1;
 
     if (fd < 0 ||
@@ -8283,8 +8283,8 @@ int ds4_gpu_qwen35_expert_pack_install(
         !ds4_gpu_qwen35_expert_pack_mul_u64(
             layer_bytes, n_layer, &payload_bytes) ||
         !ds4_gpu_qwen35_expert_pack_add_u64(
-            data_offset, payload_bytes, &expected_file_size) ||
-        expected_file_size != file_size) {
+            data_offset, payload_bytes, &payload_end) ||
+        payload_end > file_size) {
         return 0;
     }
 

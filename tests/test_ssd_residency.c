@@ -307,6 +307,8 @@ int main(void) {
         .physical_bytes = 16 * GIB,
         .recommended_bytes = 12 * GIB,
         .free_bytes = 15 * GIB,
+        .pressure_status_available = true,
+        .pressure_normal = true,
     };
     ds4_ssd_adaptive_cache_plan qwen_adaptive = {0};
     assert(ds4_ssd_adaptive_cache_plan_make_strict_with_static_reserve(
@@ -323,22 +325,27 @@ int main(void) {
     assert(!qwen_adaptive.low_ram_floor_ceiling_active);
     assert(qwen_adaptive.pageable_static_reserve_bytes == 5 * GIB / 2u);
     assert(qwen_adaptive.platform_static_reserve_bytes == 5 * GIB / 2u);
-    assert(qwen_adaptive.current_headroom_bytes == 5 * GIB / 2u);
-    assert(qwen_adaptive.platform_headroom_bytes == 5 * GIB / 2u);
-    assert(qwen_adaptive.platform_wire_budget_bytes == 9 * GIB);
+    /* The 1.75 GiB field plus the separately recorded 0.25 GiB pressure
+     * margin is the policy's single 2 GiB request reserve.  Pageable static
+     * pages may occupy that reserve, so they are not charged a second time. */
+    assert(qwen_adaptive.current_headroom_bytes == 7 * GIB / 4u);
+    assert(qwen_adaptive.pressure_margin_bytes == GIB / 4u);
+    assert(qwen_adaptive.platform_headroom_bytes == 2 * GIB);
+    assert(qwen_adaptive.platform_wire_budget_bytes == 19 * GIB / 2u);
     assert(qwen_adaptive.cache_envelope_bytes ==
            qwen_adaptive.safety_wire_budget_bytes);
-    assert(qwen_adaptive.cache_experts == 5441);
+    assert(qwen_adaptive.cache_experts == 5761);
     assert(qwen_adaptive.cache_bytes ==
-           UINT64_C(5441) * qwen_expert_bytes);
+           UINT64_C(5761) * qwen_expert_bytes);
     assert(qwen_adaptive.cache_bytes <=
            qwen_adaptive.safety_wire_budget_bytes);
 
     /* Physical M1 Pro 16 GiB snapshot captured after the original Qwen AUTO
      * launch was rejected despite green pressure. With normal pressure, full
-     * bounded file-backed credit admits three complete working-set cycles plus
-     * the safety slot. The same page counts must fail closed when pressure is
-     * elevated because half-credit leaves the safe budget below 321 experts. */
+     * bounded file-backed credit admits four complete working-set cycles plus
+     * the safety slot. The same page counts must still fail closed when the
+     * pressure signal is elevated or unavailable, even if the arithmetic
+     * budget alone could hold the minimum tier. */
     const uint64_t darwin_page_bytes = UINT64_C(16384);
     qwen_memory = (ds4_ssd_host_memory){
         .physical_bytes = 16 * GIB,
@@ -363,14 +370,15 @@ int main(void) {
         &qwen_m1_normal));
     assert(qwen_m1_normal.reclaimable_bytes ==
            qwen_memory.free_bytes + qwen_memory.file_backed_bytes);
-    assert(qwen_m1_normal.current_headroom_bytes == 5 * GIB / 2u);
+    assert(qwen_m1_normal.current_headroom_bytes == 7 * GIB / 4u);
+    assert(qwen_m1_normal.pressure_margin_bytes == GIB / 4u);
     assert(qwen_m1_normal.current_wire_budget_bytes >=
            floor.minimum_cache_bytes);
     assert(qwen_m1_normal.low_ram_shared_static_headroom_active);
     assert(!qwen_m1_normal.low_ram_floor_ceiling_active);
-    assert(qwen_m1_normal.cache_experts == 961);
+    assert(qwen_m1_normal.cache_experts == 1281);
     assert(qwen_m1_normal.cache_bytes ==
-           UINT64_C(961) * qwen_expert_bytes);
+           UINT64_C(1281) * qwen_expert_bytes);
 
     qwen_memory.pressure_normal = false;
     ds4_ssd_adaptive_cache_plan qwen_m1_elevated = {0};
@@ -387,7 +395,8 @@ int main(void) {
     assert(qwen_m1_elevated.reclaimable_bytes ==
            qwen_memory.free_bytes + qwen_memory.purgeable_bytes +
                qwen_memory.file_backed_bytes / 2u);
-    assert(qwen_m1_elevated.wire_budget_bytes < floor.minimum_cache_bytes);
+    assert(qwen_m1_elevated.wire_budget_bytes >= floor.minimum_cache_bytes);
+    assert(qwen_m1_elevated.cache_experts == 641);
 
     qwen_memory.pressure_status_available = false;
     qwen_memory.pressure_normal = true;
@@ -404,7 +413,8 @@ int main(void) {
         &qwen_m1_unknown));
     assert(qwen_m1_unknown.reclaimable_bytes ==
            qwen_m1_elevated.reclaimable_bytes);
-    assert(qwen_m1_unknown.wire_budget_bytes < floor.minimum_cache_bytes);
+    assert(qwen_m1_unknown.wire_budget_bytes >= floor.minimum_cache_bytes);
+    assert(qwen_m1_unknown.cache_experts == 641);
 
     qwen_memory = (ds4_ssd_host_memory){
         .physical_bytes = 64 * GIB,

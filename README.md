@@ -152,17 +152,32 @@ the runtime needs.
 
 ### Qwen3.6 Metal AUTO path
 
-The main branch is qualified and measured with one normalized text-only artifact,
-`Qwen3.6-35B-A3B-ds4-Q4_K_S.gguf`; it is not generic Qwen or arbitrary
-community-GGUF support. The literal environment guard is the experimental
-opt-in; Metal, power 100, and AUTO residency are the Apple defaults, but are
-shown below for reproducibility:
+The main branch is qualified and measured with one normalized text-only
+artifact. The recommended release download is the single-layout
+`Qwen3.6-35B-A3B-DS4-ExpertMajor-v1-Q4_K_S.gguf` from
+[`andreaborio/Qwen3.6-35B-A3B-DS4-GGUF`](https://huggingface.co/andreaborio/Qwen3.6-35B-A3B-DS4-GGUF).
+It stores routed weights once in DS4's expert-major order and activates
+automatically; no sidecar variables are needed. The canonical
+`Qwen3.6-35B-A3B-ds4-Q4_K_S.gguf` remains supported during migration.
+The release artifact is 20,808,970,240 bytes (only 406,816 bytes larger than
+the canonical input) with SHA-256
+`fb2b344d49f0c3dfd854cfc11d92ffc873cc93a1d30bf4664e5aea6f1bfef839`.
+
+This is not generic Qwen or arbitrary community-GGUF support. The literal
+environment guard is the experimental opt-in; Metal, power 100, and AUTO
+residency are the Apple defaults, but are shown below for reproducibility:
 
 ```sh
 DS4_QWEN_EXPERIMENTAL_METAL=1 ./ds4 \
-  -m /absolute/path/to/Qwen3.6-35B-A3B-ds4-Q4_K_S.gguf \
+  -m /absolute/path/to/Qwen3.6-35B-A3B-DS4-ExpertMajor-v1-Q4_K_S.gguf \
   --metal --power 100 --ctx 8192 --nothink
 ```
+
+`ds4.expert_major.v1` is an explicit DS4 GGUF extension. Other loaders must
+reject this artifact unless they implement the layout; use the canonical file
+for llama.cpp, MLX, or other runtimes. Format details, conversion commands,
+compatibility boundaries, and measured parity are in
+[`docs/qwen-expert-major-store.md`](docs/qwen-expert-major-store.md).
 
 Qwen AUTO selects the full-model mapped Metal mode only when both the fixed Metal
 working-set budget and a point-in-time host-memory pressure check pass. Under
@@ -277,6 +292,11 @@ and still a work in progress.
   runtime, server, agent, KV-cache, distributed, backend, and debugging guide.
 - [`tests/qwen/README.md`](tests/qwen/README.md): experimental Qwen artifact
   contract, oracle procedure, Metal + SSD commands, measurements, and limits.
+- [`docs/qwen-expert-major-store.md`](docs/qwen-expert-major-store.md):
+  DS4-native GGUF layout, transactional converter, compatibility, and parity
+  evidence.
+- [`docs/expert-major-v2-roadmap.md`](docs/expert-major-v2-roadmap.md): generic
+  expert-major manifest and separate DeepSeek/GLM qualification plan.
 - [`CONTRIBUTING.md`](CONTRIBUTING.md): upstream-first contribution policy and
   correctness/performance gates.
 - [`FORK_NOTES.md`](FORK_NOTES.md): fork delta and upstreamability ledger.

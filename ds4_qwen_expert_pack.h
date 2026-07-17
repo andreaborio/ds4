@@ -67,6 +67,8 @@ typedef enum {
     DS4_QWEN_EXPERT_PACK_WRITE_DATA = 1,
     DS4_QWEN_EXPERT_PACK_VERIFY_DATA = 2,
     DS4_QWEN_EXPERT_PACK_VERIFY_SOURCE_SPANS = 3,
+    DS4_QWEN_EXPERT_PACK_WRITE_NATIVE_GGUF = 4,
+    DS4_QWEN_EXPERT_PACK_VERIFY_NATIVE_GGUF = 5,
 } ds4_qwen_expert_pack_phase;
 
 typedef void (*ds4_qwen_expert_pack_progress_fn)(
@@ -106,6 +108,19 @@ bool ds4_qwen_expert_pack_build(
 ds4_qwen_expert_pack_result ds4_qwen_expert_pack_open(
         ds4_qwen_expert_pack                 **out,
         const char                            *pack_path,
+        const ds4_qwen_expert_pack_geometry   *expected_geometry,
+        char                                  *error,
+        size_t                                 error_size);
+
+/* Open the same format when it is embedded as one opaque I8 tensor in a
+ * DS4-native GGUF. The descriptor is duplicated, so closing the returned
+ * pack never closes the model descriptor. Public slice offsets are absolute
+ * offsets in fd, just as they are for a sidecar whose base offset is zero. */
+ds4_qwen_expert_pack_result ds4_qwen_expert_pack_open_embedded(
+        ds4_qwen_expert_pack                 **out,
+        int                                    fd,
+        uint64_t                               offset,
+        uint64_t                               bytes,
         const ds4_qwen_expert_pack_geometry   *expected_geometry,
         char                                  *error,
         size_t                                 error_size);
@@ -162,5 +177,10 @@ bool ds4_qwen_expert_pack_span_get(
         ds4_qwen_expert_pack_span  *span);
 
 int ds4_qwen_expert_pack_fd(const ds4_qwen_expert_pack *pack);
+
+/* Absolute start of the pack container in its descriptor. This is zero for a
+ * sidecar and the opaque tensor's absolute offset for an embedded store. */
+uint64_t ds4_qwen_expert_pack_file_offset(
+        const ds4_qwen_expert_pack *pack);
 
 #endif
