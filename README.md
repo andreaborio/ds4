@@ -228,10 +228,15 @@ The hard SSD cache floor is 321 complete routed experts (about 0.53 GiB); 640
 (about 1.06 GiB) is a useful controlled small-cache tier. Startup and the
 per-layer path fail closed if the effective locked cache falls below the floor.
 The runtime has completed model-backed resident and SSD generation on an M5 Pro
-with 64 GiB, plus a bounded SSD smoke on a physical M1 Pro with 16 GiB. The
-latest small-Mac regression run used a conservative 321-expert cache, completed
-the 43+32-token request at 4.06/7.03 prefill/generation t/s, and added no
-swapouts; it is a compatibility check, not an SSD speed claim. See
+with 64 GiB, plus bounded SSD generation on a physical M1 Pro with 16 GiB. On
+production main `bd62a0b`, AUTO started with 321 cached experts for prefill and
+grew toward 2,241 for decode. One cold request completed at 10.56/8.24
+prefill/generation t/s; four subsequent distinct short prompts had medians of
+15.04/9.77 t/s, with normal memory pressure and no new swapouts. This recheck
+used the canonical migration GGUF; the native ExpertMajor v1 artifact was not
+copied to the 16 GiB host because only 3.6 GB of disk space was free. The older
+4.06/7.03 result remains a conservative 321-expert compatibility floor, not the
+current production speed. See
 [`tests/qwen/README.md`](tests/qwen/README.md) for the exact artifact contract,
 reproducible evidence, and current limitations.
 
@@ -249,7 +254,7 @@ each model uses a different artifact, context, and runtime path.
 | --- | --- | ---: | ---: | --- |
 | Qwen3.6-35B-A3B Q4_K_S, 20.81 GB | M5 Pro 64 GB, Metal resident | **258.08 t/s** | 57.81 t/s | Controlled DS4 prefill A/B, +23.3% over the previous dispatch; greedy output identical |
 | Qwen3.6-35B-A3B Q4_K_S, 20.81 GB | M5 Pro 64 GB, page-touched resident CLI | 218.30 t/s | **63.94 t/s** | Best retained real CLI generation number; same rendered prompt and visible continuation as the llama.cpp reference |
-| Qwen3.6-35B-A3B Q4_K_S, 20.81 GB | M1 Pro 16 GB, Metal AUTO to SSD | 4.06 t/s | 7.03 t/s | Latest conservative 16 GB compatibility smoke; no new swapouts |
+| Qwen3.6-35B-A3B Q4_K_S, 20.81 GB | M1 Pro 16 GB, Metal AUTO to SSD, canonical migration GGUF | **15.04 t/s** | **9.77 t/s** | Warm median over four distinct short prompts after one cold run; normal pressure, no new swapouts |
 | DeepSeek V4 Flash IQ2XXS, 86.72 GB | M5 Pro 64 GB, Metal SSD streaming | 20.75 t/s | 12.58 t/s | Direct upstream/fork A/B showed parity, not a fork speedup |
 | GLM 5.2 ds4-native GGUF, 244.14 GiB | M5 Pro 64 GB, Metal SSD streaming | **9.15 t/s** | 0.91 t/s | Indexed-prefill prepare A/B; big prefill win, no decode win |
 

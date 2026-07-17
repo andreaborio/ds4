@@ -175,6 +175,40 @@ about 678 MiB, DSBox remained idle, and no `ds4` process remained.
 This is a no-regression smoke, not an SSD speed claim: the paired resident
 branch is explicitly false in SSD mode, whose prefill remains scalar.
 
+### 2026-07-18 production-main recheck
+
+The same physical M1 Pro 16 GiB host was rechecked over the home LAN with the
+unified production runtime at `bd62a0b`, macOS 26.5, and the machine on battery
+at 56%. The test used the canonical migration artifact
+`Qwen3.6-35B-A3B-ds4-Q4_K_S.gguf` (20,808,563,424 bytes, SHA-256
+`c33efb67bde86c9ba1f9e79c2dc42627170963bef0e915ab9b91a55cfb6d0fcd`),
+context 8,192, AUTO SSD streaming, and macro prefill 64. AUTO began with 321
+cached experts for prefill and selected a 2,241-expert decode target. Different
+short non-thinking prompts were used for every sample so that live KV reuse
+could not inflate later measurements.
+
+| Run | State | Prompt tokens | Prefill | Generated tokens | Generation |
+| ---: | --- | ---: | ---: | ---: | ---: |
+| 1 | cold | 43 | 10.56 t/s | 64 | 8.24 t/s |
+| 2 | warm | 45 | 13.85 t/s | 64 | 9.71 t/s |
+| 3 | warm | 44 | 16.24 t/s | 64 | 9.83 t/s |
+| 4 | warm | 46 | 12.61 t/s | 58 | 9.25 t/s |
+| 5 | warm | 46 | 18.41 t/s | 53 | 10.29 t/s |
+
+The four warm runs had medians of 15.04 t/s prefill and 9.77 t/s generation;
+the five-run medians including the cold request were 13.85 and 9.71 t/s. Memory
+pressure stayed normal, free memory moved from 76% to 49%, process RSS was about
+3.70 GiB, swap use stayed at 830.06 MiB, and the global swapout counter remained
+exactly 2,209,613 before and after the run. The first two repeated reference
+prompts also preserved the output hashes produced by the earlier runtime.
+
+Only the canonical migration GGUF was tested on this host. The native
+ExpertMajor v1 artifact is published and runtime-supported, but was not copied
+to this Mac because only 3.6 GB of disk space was free; these numbers therefore
+must not be represented as a direct native-v1 speed measurement. The historical
+4.06/7.03 smoke above remains useful as a deliberately constrained lower bound,
+not as production-main throughput.
+
 ## M1 Pro, 16 GiB: bounded streaming versus mmap pressure
 
 The second host was a physical MacBook Pro with an Apple M1 Pro 8-core,
