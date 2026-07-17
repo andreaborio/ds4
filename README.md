@@ -164,13 +164,16 @@ model-backed promotion gate are in
 dated canonical/native benchmark gate is complete, the canonical DeepSeek GGUF
 remains the release reference. The first M5 Pro SSD tranche is recorded in
 [`docs/benchmarks/2026-07-17-deepseek-native-expert-major.md`](docs/benchmarks/2026-07-17-deepseek-native-expert-major.md).
+The distinctly named experimental artifact is
+[`DeepSeek-V4-Flash-DS4-ExpertMajor-v2-GGUF`](https://huggingface.co/andreaborio/DeepSeek-V4-Flash-DS4-ExpertMajor-v2-GGUF),
+with full conversion provenance and compatibility limits in its model card.
 
 ### Qwen3.6 Metal AUTO path
 
 The main branch is qualified and measured with one normalized text-only
 artifact. The recommended release download is the single-layout
 `Qwen3.6-35B-A3B-DS4-ExpertMajor-v1-Q4_K_S.gguf` from
-[`andreaborio/Qwen3.6-35B-A3B-DS4-GGUF`](https://huggingface.co/andreaborio/Qwen3.6-35B-A3B-DS4-GGUF).
+[`andreaborio/Qwen3.6-35B-A3B-DS4-ExpertMajor-v1-GGUF`](https://huggingface.co/andreaborio/Qwen3.6-35B-A3B-DS4-ExpertMajor-v1-GGUF).
 It stores routed weights once in DS4's expert-major order and activates
 automatically; no sidecar variables are needed. The canonical
 `Qwen3.6-35B-A3B-ds4-Q4_K_S.gguf` remains supported during migration.

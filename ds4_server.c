@@ -614,6 +614,15 @@ typedef struct {
      * happens to be named "tool_search". */
     bool responses_tool_search;
     char **prop;
+    /* JSON Schema primitive/container type for each property, in the same
+     * order as prop[].  Qwen's native tool syntax carries parameter values as
+     * text, so the server needs this metadata to reconstruct typed OpenAI JSON
+     * arguments instead of turning numbers, booleans, arrays, and objects into
+     * strings.  NULL means the schema did not declare one unambiguous type. */
+    char **prop_type;
+    /* True when the corresponding JSON Schema property explicitly permits
+     * null alongside its one concrete type (for example ["string","null"]). */
+    bool *prop_allows_null;
     int len;
     int cap;
 } tool_schema_order;
@@ -691,6 +700,10 @@ typedef struct {
     int cache_write_tokens;
     ds4_think_mode think_mode;
     bool has_tools;
+    /* Qwen uses <tool_call><function=...><parameter=...> rather than DSML.
+     * Keep the dialect decision on the request so response parsing and
+     * streaming never infer structure from model names or user content. */
+    bool qwen_tool_dialect;
     bool prompt_preserves_reasoning;
     /* For /v1/responses: emit reasoning_summary_* events / fields only when the
      * client opted in via reasoning.summary. Other APIs leave this false; the
@@ -787,8 +800,13 @@ static void tool_schema_order_free(tool_schema_order *o) {
     free(o->name);
     free(o->wire_name);
     free(o->namespace);
-    for (int i = 0; i < o->len; i++) free(o->prop[i]);
+    for (int i = 0; i < o->len; i++) {
+        free(o->prop[i]);
+        free(o->prop_type ? o->prop_type[i] : NULL);
+    }
     free(o->prop);
+    free(o->prop_type);
+    free(o->prop_allows_null);
     memset(o, 0, sizeof(*o));
 }
 
@@ -798,12 +816,29 @@ static void tool_schema_orders_free(tool_schema_orders *orders) {
     memset(orders, 0, sizeof(*orders));
 }
 
-static void tool_schema_order_prop_push(tool_schema_order *o, char *prop) {
+static void tool_schema_order_prop_push(tool_schema_order *o, char *prop,
+                                        char *type, bool allows_null) {
     if (o->len == o->cap) {
         o->cap = o->cap ? o->cap * 2 : 8;
         o->prop = xrealloc(o->prop, (size_t)o->cap * sizeof(o->prop[0]));
+        o->prop_type = xrealloc(o->prop_type,
+            (size_t)o->cap * sizeof(o->prop_type[0]));
+        o->prop_allows_null = xrealloc(o->prop_allows_null,
+            (size_t)o->cap * sizeof(o->prop_allows_null[0]));
     }
-    o->prop[o->len++] = prop;
+    o->prop[o->len] = prop;
+    o->prop_type[o->len] = type;
+    o->prop_allows_null[o->len] = allows_null;
+    o->len++;
+}
+
+static int tool_schema_order_prop_index(const tool_schema_order *o,
+                                        const char *name) {
+    if (!o || !name) return -1;
+    for (int i = 0; i < o->len; i++) {
+        if (o->prop[i] && !strcmp(o->prop[i], name)) return i;
+    }
+    return -1;
 }
 
 static int tool_schema_orders_find_index(const tool_schema_orders *orders, const char *name) {
@@ -1459,6 +1494,79 @@ done:
     return out;
 }
 
+static char *parse_schema_declared_type(const char *json,
+                                        bool *allows_null_out) {
+    if (allows_null_out) *allows_null_out = false;
+    const char *p = json;
+    json_ws(&p);
+    if (*p != '{') return NULL;
+    p++;
+    json_ws(&p);
+    while (*p && *p != '}') {
+        char *key = NULL;
+        if (!json_string(&p, &key)) return NULL;
+        json_ws(&p);
+        if (*p != ':') {
+            free(key);
+            return NULL;
+        }
+        p++;
+        if (!strcmp(key, "type")) {
+            free(key);
+            json_ws(&p);
+            if (*p == '"') {
+                char *type = NULL;
+                if (!json_string(&p, &type)) return NULL;
+                if (allows_null_out && !strcmp(type, "null")) {
+                    *allows_null_out = true;
+                }
+                return type;
+            }
+            /* JSON Schema also permits a type array.  Pick the single
+             * non-null member, which covers the common nullable form without
+             * pretending an actual union has one deterministic wire type. */
+            if (*p == '[') {
+                p++;
+                char *selected = NULL;
+                int nonnull = 0;
+                bool allows_null = false;
+                json_ws(&p);
+                while (*p && *p != ']') {
+                    char *type = NULL;
+                    if (!json_string(&p, &type)) {
+                        free(selected);
+                        return NULL;
+                    }
+                    if (!strcmp(type, "null")) {
+                        allows_null = true;
+                    } else {
+                        nonnull++;
+                        if (nonnull == 1) selected = xstrdup(type);
+                    }
+                    free(type);
+                    json_ws(&p);
+                    if (*p == ',') p++;
+                    json_ws(&p);
+                }
+                if (*p != ']' || nonnull > 1 || (!nonnull && !allows_null)) {
+                    free(selected);
+                    return NULL;
+                }
+                if (!nonnull) selected = xstrdup("null");
+                if (allows_null_out) *allows_null_out = allows_null;
+                return selected;
+            }
+            return NULL;
+        }
+        free(key);
+        if (!json_skip_value(&p)) return NULL;
+        json_ws(&p);
+        if (*p == ',') p++;
+        json_ws(&p);
+    }
+    return NULL;
+}
+
 static bool parse_schema_properties(const char *json, tool_schema_order *order) {
     const char *p = json;
     json_ws(&p);
@@ -1489,8 +1597,16 @@ static bool parse_schema_properties(const char *json, tool_schema_order *order) 
                     return false;
                 }
                 p++;
-                tool_schema_order_prop_push(order, prop);
-                if (!json_skip_value(&p)) return false;
+                char *property_schema = NULL;
+                if (!json_raw_value(&p, &property_schema)) {
+                    free(prop);
+                    return false;
+                }
+                bool allows_null = false;
+                char *type = parse_schema_declared_type(
+                    property_schema, &allows_null);
+                free(property_schema);
+                tool_schema_order_prop_push(order, prop, type, allows_null);
                 json_ws(&p);
                 if (*p == ',') p++;
                 json_ws(&p);
@@ -1657,7 +1773,9 @@ done:
  * already-direct schemas unchanged. Responses can additionally group tools in a
  * namespace item; those are flattened for DSML prompt rendering while preserving
  * their client-facing name and namespace for response output. */
-static bool parse_tools_value(const char **p, char **out, tool_schema_orders *orders) {
+static bool parse_tools_value_capture(const char **p, char **out,
+                                      tool_schema_orders *orders,
+                                      stop_list *raw_tools) {
     json_ws(p);
     if (json_lit(p, "null")) {
         *out = xstrdup("");
@@ -1671,6 +1789,7 @@ static bool parse_tools_value(const char **p, char **out, tool_schema_orders *or
     while (**p && **p != ']') {
         char *raw = NULL;
         if (!json_raw_value(p, &raw)) goto bad;
+        if (raw_tools) stop_list_push(raw_tools, xstrdup(raw));
         char *function = openai_function_schema_from_tool(raw);
         if (function) {
             append_raw_json_line(&schemas, function);
@@ -1700,6 +1819,11 @@ static bool parse_tools_value(const char **p, char **out, tool_schema_orders *or
 bad:
     buf_free(&schemas);
     return false;
+}
+
+static bool parse_tools_value(const char **p, char **out,
+                              tool_schema_orders *orders) {
+    return parse_tools_value_capture(p, out, orders, NULL);
 }
 
 static bool parse_messages(const char **p, chat_msgs *msgs) {
@@ -2759,7 +2883,7 @@ static bool qwen_endpoint_is_supported(ds4_chat_format format,
                            "this endpoint";
     if (err && errlen) {
         snprintf(err, errlen,
-                 "Qwen3.6 currently supports only tool-free "
+                 "Qwen3.6 currently supports only "
                  "/v1/chat/completions; %s is not supported",
                  endpoint);
     }
@@ -2770,6 +2894,59 @@ static bool qwen_endpoint_is_supported(ds4_chat_format format,
  * it before chat_msgs is freed.  No prompt string is inspected for structure:
  * roles and tool metadata are validated while they are still typed fields, and
  * message content remains untrusted data all the way into the Qwen renderer. */
+static void qwen_chat_messages_free(ds4_chat_message *messages,
+                                    size_t n_messages) {
+    if (!messages) return;
+    for (size_t i = 0; i < n_messages; i++) {
+        ds4_chat_tool_call *calls =
+            (ds4_chat_tool_call *)messages[i].tool_calls;
+        for (size_t j = 0; j < messages[i].n_tool_calls; j++) {
+            ds4_chat_tool_arg *args = (ds4_chat_tool_arg *)calls[j].args;
+            for (size_t k = 0; k < calls[j].n_args; k++) {
+                free((char *)args[k].name);
+                free((char *)args[k].value);
+            }
+            free(args);
+            free((char *)calls[j].name);
+        }
+        free(calls);
+    }
+    free(messages);
+}
+
+static bool qwen_chat_tool_call_from_openai(
+        const tool_call *src, ds4_chat_tool_call *dst,
+        char *err, size_t errlen) {
+    if (!src || !src->name || !src->name[0] || !src->arguments) {
+        if (err && errlen) snprintf(err, errlen,
+                                    "Qwen3.6 assistant tool_call is incomplete");
+        return false;
+    }
+
+    json_args parsed = {0};
+    if (!json_args_parse(src->arguments, &parsed)) {
+        if (err && errlen) snprintf(err, errlen,
+                                    "Qwen3.6 tool_call arguments must be a JSON object");
+        return false;
+    }
+
+    ds4_chat_tool_arg *args = parsed.len
+        ? xmalloc((size_t)parsed.len * sizeof(args[0])) : NULL;
+    if (args) memset(args, 0, (size_t)parsed.len * sizeof(args[0]));
+    for (int i = 0; i < parsed.len; i++) {
+        args[i].name = parsed.v[i].key;
+        args[i].value = parsed.v[i].value;
+        args[i].is_string = parsed.v[i].is_string;
+        parsed.v[i].key = NULL;
+        parsed.v[i].value = NULL;
+    }
+    dst->name = xstrdup(src->name);
+    dst->args = args;
+    dst->n_args = (size_t)parsed.len;
+    json_args_free(&parsed);
+    return true;
+}
+
 static bool qwen_chat_messages_borrow(const chat_msgs *msgs,
                                       bool has_active_tools,
                                       ds4_chat_message **messages_out,
@@ -2779,14 +2956,7 @@ static bool qwen_chat_messages_borrow(const chat_msgs *msgs,
     if (!messages_out || !n_messages_out) return false;
     *messages_out = NULL;
     *n_messages_out = 0;
-    if (has_active_tools) {
-        if (err && errlen) {
-            snprintf(err, errlen,
-                     "Qwen3.6 tools are disabled until Qwen tool-call output "
-                     "parsing is implemented");
-        }
-        return false;
-    }
+    (void)has_active_tools;
     if (!msgs || msgs->len <= 0) {
         if (err && errlen) {
             snprintf(err, errlen,
@@ -2810,7 +2980,7 @@ static bool qwen_chat_messages_borrow(const chat_msgs *msgs,
                 snprintf(err, errlen,
                          "Qwen3.6 message role is required");
             }
-            free(messages);
+            qwen_chat_messages_free(messages, (size_t)msgs->len);
             return false;
         } else if (!strcmp(role, "system")) {
             if (i != 0) {
@@ -2818,7 +2988,7 @@ static bool qwen_chat_messages_borrow(const chat_msgs *msgs,
                     snprintf(err, errlen,
                              "Qwen3.6 system message must be first");
                 }
-                free(messages);
+                qwen_chat_messages_free(messages, (size_t)msgs->len);
                 return false;
             }
             mapped = DS4_CHAT_ROLE_SYSTEM;
@@ -2833,33 +3003,34 @@ static bool qwen_chat_messages_borrow(const chat_msgs *msgs,
                          "Qwen3.6 does not support role 'developer'; use one "
                          "leading 'system' message");
             }
-            free(messages);
+            qwen_chat_messages_free(messages, (size_t)msgs->len);
             return false;
         } else if (!strcmp(role, "tool") || !strcmp(role, "function")) {
-            if (err && errlen) {
-                snprintf(err, errlen,
-                         "Qwen3.6 tools and tool messages are disabled until "
-                         "Qwen tool-call output parsing is implemented");
-            }
-            free(messages);
-            return false;
+            mapped = DS4_CHAT_ROLE_TOOL;
         } else {
             if (err && errlen) {
                 snprintf(err, errlen,
                          "Qwen3.6 does not support message role '%s'", role);
             }
-            free(messages);
+            qwen_chat_messages_free(messages, (size_t)msgs->len);
             return false;
         }
 
-        if (src->has_tool_fields || src->calls.len > 0 ||
-            src->tool_call_id || src->tool_call_ids_len > 0) {
+        if (src->has_tool_fields &&
+            mapped != DS4_CHAT_ROLE_ASSISTANT &&
+            mapped != DS4_CHAT_ROLE_TOOL) {
             if (err && errlen) {
                 snprintf(err, errlen,
-                         "Qwen3.6 tools and tool_calls are disabled until "
-                         "Qwen tool-call output parsing is implemented");
+                         "Qwen3.6 tool metadata is valid only on assistant or tool messages");
             }
-            free(messages);
+            qwen_chat_messages_free(messages, (size_t)msgs->len);
+            return false;
+        }
+        if (mapped == DS4_CHAT_ROLE_ASSISTANT && src->has_tool_fields &&
+            src->calls.len == 0) {
+            if (err && errlen) snprintf(err, errlen,
+                                        "Qwen3.6 assistant tool_calls are invalid or incomplete");
+            qwen_chat_messages_free(messages, (size_t)msgs->len);
             return false;
         }
         if (src->content_has_nontext) {
@@ -2868,7 +3039,7 @@ static bool qwen_chat_messages_borrow(const chat_msgs *msgs,
                          "Qwen3.6 server support is text-only; image, video, "
                          "audio, file, and other non-text content are not supported");
             }
-            free(messages);
+            qwen_chat_messages_free(messages, (size_t)msgs->len);
             return false;
         }
 
@@ -2876,6 +3047,27 @@ static bool qwen_chat_messages_borrow(const chat_msgs *msgs,
         messages[i].content = src->content ? src->content : "";
         messages[i].reasoning = src->reasoning_is_string
             ? src->reasoning : NULL;
+        if (src->calls.len > 0) {
+            if (mapped != DS4_CHAT_ROLE_ASSISTANT) {
+                if (err && errlen) snprintf(err, errlen,
+                                            "Qwen3.6 tool_calls require an assistant message");
+                qwen_chat_messages_free(messages, (size_t)msgs->len);
+                return false;
+            }
+            ds4_chat_tool_call *calls = xmalloc(
+                (size_t)src->calls.len * sizeof(calls[0]));
+            memset(calls, 0, (size_t)src->calls.len * sizeof(calls[0]));
+            messages[i].tool_calls = calls;
+            for (int j = 0; j < src->calls.len; j++) {
+                if (!qwen_chat_tool_call_from_openai(
+                        &src->calls.v[j], &calls[j], err, errlen)) {
+                    messages[i].n_tool_calls = (size_t)j;
+                    qwen_chat_messages_free(messages, (size_t)msgs->len);
+                    return false;
+                }
+                messages[i].n_tool_calls++;
+            }
+        }
     }
 
     if (!has_user) {
@@ -2883,7 +3075,7 @@ static bool qwen_chat_messages_borrow(const chat_msgs *msgs,
             snprintf(err, errlen,
                      "Qwen3.6 chat requires at least one user message");
         }
-        free(messages);
+        qwen_chat_messages_free(messages, (size_t)msgs->len);
         return false;
     }
 
@@ -2897,6 +3089,20 @@ static bool tool_schemas_are_active(const char *tool_schemas,
     return tool_schemas && tool_schemas[0] && !tool_choice_none;
 }
 
+static bool qwen_openai_tools_validate(const stop_list *raw_tools,
+                                       char *err, size_t errlen) {
+    for (int i = 0; raw_tools && i < raw_tools->len; i++) {
+        char *function = openai_function_schema_from_tool(raw_tools->v[i]);
+        if (!function) {
+            if (err && errlen) snprintf(err, errlen,
+                "Qwen3.6 /v1/chat/completions supports only OpenAI function tools");
+            return false;
+        }
+        free(function);
+    }
+    return true;
+}
+
 /* The API parsers are intentionally selective JSON parsers: they keep only
  * fields that affect model semantics, rendering, streaming, or cache keys, and
  * skip extension fields.  The output is always a rendered DS4 chat/completion
@@ -2907,11 +3113,13 @@ static bool parse_chat_request(ds4_engine *e, server *s, const char *body, int d
     const char *p = body;
     bool got_messages = false;
     bool tool_choice_none = false;
+    bool qwen_tool_choice_invalid = false;
     bool got_thinking = false;
     bool thinking_enabled = true;
     ds4_think_mode reasoning_effort = DS4_THINK_HIGH;
     chat_msgs msgs = {0};
     char *tool_schemas = NULL;
+    stop_list raw_tools = {0};
 
     json_ws(&p);
     if (*p != '{') goto bad;
@@ -2936,7 +3144,9 @@ static bool parse_chat_request(ds4_engine *e, server *s, const char *body, int d
         } else if (!strcmp(key, "tools")) {
             free(tool_schemas);
             tool_schemas = NULL;
-            if (!parse_tools_value(&p, &tool_schemas, &r->tool_orders)) {
+            stop_list_clear(&raw_tools);
+            if (!parse_tools_value_capture(&p, &tool_schemas,
+                                           &r->tool_orders, &raw_tools)) {
                 free(key);
                 goto bad;
             }
@@ -2949,10 +3159,15 @@ static bool parse_chat_request(ds4_engine *e, server *s, const char *body, int d
                     goto bad;
                 }
                 tool_choice_none = !strcmp(choice, "none");
+                qwen_tool_choice_invalid =
+                    strcmp(choice, "auto") && strcmp(choice, "none");
                 free(choice);
-            } else if (!json_skip_value(&p)) {
-                free(key);
-                goto bad;
+            } else {
+                qwen_tool_choice_invalid = true;
+                if (!json_skip_value(&p)) {
+                    free(key);
+                    goto bad;
+                }
             }
         } else if (!strcmp(key, "model")) {
             free(r->model);
@@ -3045,10 +3260,27 @@ static bool parse_chat_request(ds4_engine *e, server *s, const char *body, int d
         snprintf(err, errlen, "missing messages");
         chat_msgs_free(&msgs);
         free(tool_schemas);
+        id_list_free(&raw_tools);
         request_free(r);
         return false;
     }
     if (ds4_engine_chat_format(e) == DS4_CHAT_FORMAT_QWEN36) {
+        if (qwen_tool_choice_invalid) {
+            snprintf(err, errlen,
+                     "Qwen3.6 supports tool_choice=auto or tool_choice=none");
+            chat_msgs_free(&msgs);
+            free(tool_schemas);
+            id_list_free(&raw_tools);
+            request_free(r);
+            return false;
+        }
+        if (!qwen_openai_tools_validate(&raw_tools, err, errlen)) {
+            chat_msgs_free(&msgs);
+            free(tool_schemas);
+            id_list_free(&raw_tools);
+            request_free(r);
+            return false;
+        }
         if (!got_thinking && model_alias_disables_thinking(r->model)) thinking_enabled = false;
         if (!got_thinking && model_alias_enables_thinking(r->model)) thinking_enabled = true;
         r->think_mode = ds4_think_mode_for_context(
@@ -3063,29 +3295,36 @@ static bool parse_chat_request(ds4_engine *e, server *s, const char *body, int d
                                        err, errlen)) {
             chat_msgs_free(&msgs);
             free(tool_schemas);
+            id_list_free(&raw_tools);
             request_free(r);
             return false;
         }
         const ds4_chat_request chat = {
             .messages = messages,
             .n_messages = n_messages,
+            .tools_json = has_active_tools
+                ? (const char *const *)raw_tools.v : NULL,
+            .n_tools = has_active_tools ? (size_t)raw_tools.len : 0,
             .think_mode = r->think_mode,
             .add_generation_prompt = true,
             .preserve_thinking = false,
         };
         const bool rendered = ds4_render_qwen36_chat_checked(
             e, &chat, &r->prompt, &r->prompt_text, err, errlen);
-        free(messages);
+        qwen_chat_messages_free(messages, n_messages);
         if (!rendered) {
             chat_msgs_free(&msgs);
             free(tool_schemas);
+            id_list_free(&raw_tools);
             request_free(r);
             return false;
         }
-        r->has_tools = false;
+        r->has_tools = has_active_tools;
+        r->qwen_tool_dialect = true;
         r->prompt_preserves_reasoning = false;
         chat_msgs_free(&msgs);
         free(tool_schemas);
+        id_list_free(&raw_tools);
         return true;
     }
     r->has_tools = tool_schemas_are_active(tool_schemas, tool_choice_none);
@@ -3103,16 +3342,19 @@ static bool parse_chat_request(ds4_engine *e, server *s, const char *body, int d
     if (!ds4_tokenize_rendered_chat_checked(e, r->prompt_text, &r->prompt)) {
         chat_msgs_free(&msgs);
         free(tool_schemas);
+        id_list_free(&raw_tools);
         snprintf(err, errlen, "prompt tokenization failed");
         request_free(r);
         return false;
     }
     chat_msgs_free(&msgs);
     free(tool_schemas);
+    id_list_free(&raw_tools);
     return true;
 bad:
     chat_msgs_free(&msgs);
     free(tool_schemas);
+    id_list_free(&raw_tools);
     snprintf(err, errlen, "invalid JSON request");
     request_free(r);
     return false;
@@ -4576,6 +4818,12 @@ static void json_escape_fragment_n(buf *b, const char *s, size_t n) {
 #define DS4_INVOKE_END_SHORT "</" DS4_DSML_SHORT "invoke>"
 #define DS4_PARAM_START_SHORT "<" DS4_DSML_SHORT "parameter"
 #define DS4_PARAM_END_SHORT "</" DS4_DSML_SHORT "parameter>"
+#define QWEN_TOOL_CALL_START "<tool_call>"
+#define QWEN_TOOL_CALL_END "</tool_call>"
+#define QWEN_FUNCTION_START "<function="
+#define QWEN_FUNCTION_END "</function>"
+#define QWEN_PARAM_START "<parameter="
+#define QWEN_PARAM_END "</parameter>"
 
 static const char *find_any_tool_start(const char *s) {
     const char *best = NULL;
@@ -4617,6 +4865,57 @@ static void observe_tool_markers(const char *scan, bool *saw_start,
     } else if (!had_start && !start && find_any_tool_end(scan)) {
         if (orphan_end) *orphan_end = true;
     }
+}
+
+static const char *find_tool_start_for_dialect(const char *s,
+                                               bool qwen_tool_dialect) {
+    return qwen_tool_dialect ? strstr(s, QWEN_TOOL_CALL_START)
+                             : find_any_tool_start(s);
+}
+
+static const char *find_tool_end_for_dialect(const char *s,
+                                             bool qwen_tool_dialect) {
+    return qwen_tool_dialect ? strstr(s, QWEN_TOOL_CALL_END)
+                             : find_any_tool_end(s);
+}
+
+static const char *find_tool_start_bounded(const char *text, size_t text_len) {
+    static const char *const markers[] = {
+        DS4_TOOL_CALLS_START,
+        DS4_TOOL_CALLS_START_SHORT,
+        "<tool_calls>",
+        QWEN_TOOL_CALL_START,
+    };
+    if (!text) return NULL;
+    for (size_t offset = 0; offset < text_len; offset++) {
+        const size_t remaining = text_len - offset;
+        for (size_t i = 0; i < sizeof(markers) / sizeof(markers[0]); i++) {
+            const size_t marker_len = strlen(markers[i]);
+            if (remaining >= marker_len &&
+                memcmp(text + offset, markers[i], marker_len) == 0) {
+                return text + offset;
+            }
+        }
+    }
+    return NULL;
+}
+
+static void observe_tool_markers_for_dialect(
+        const char *scan, bool qwen_tool_dialect,
+        bool *saw_start, bool *saw_end, bool *orphan_end) {
+    if (!qwen_tool_dialect) {
+        observe_tool_markers(scan, saw_start, saw_end, orphan_end);
+        return;
+    }
+    if (!scan) return;
+    const bool had_start = *saw_start;
+    const char *start = find_tool_start_for_dialect(scan, true);
+    if (start) *saw_start = true;
+    const char *end_scan = had_start ? scan : (start ? start : NULL);
+    const char *end = end_scan ? find_tool_end_for_dialect(end_scan, true) : NULL;
+    if (end) *saw_end = true;
+    else if (!had_start && !start && find_tool_end_for_dialect(scan, true) &&
+             orphan_end) *orphan_end = true;
 }
 
 static size_t trim_tool_separator_ws(const char *raw, size_t start, size_t limit) {
@@ -4793,6 +5092,237 @@ static void split_reasoning_content(const char *text, size_t n, char **content_o
         *content_out = xstrdup(s);
     }
     free(s);
+}
+
+static char *qwen_tool_name_span(const char *start, const char *end) {
+    while (start < end && isspace((unsigned char)*start)) start++;
+    while (end > start && isspace((unsigned char)end[-1])) end--;
+    if (start == end) return NULL;
+    for (const char *p = start; p < end; p++) {
+        unsigned char c = (unsigned char)*p;
+        if (c < 0x20 || isspace(c) || c == '<' || c == '>') return NULL;
+    }
+    return xstrndup(start, (size_t)(end - start));
+}
+
+static char *qwen_tool_value_span(const char *start, const char *end) {
+    /* The canonical Qwen template puts one delimiter newline on each side of
+     * a parameter value.  Remove only those template bytes: ordinary leading
+     * or trailing spaces and additional newlines remain part of string data. */
+    if (start < end && *start == '\r' && start + 1 < end && start[1] == '\n')
+        start += 2;
+    else if (start < end && *start == '\n')
+        start++;
+    if (end > start && end[-1] == '\n') {
+        end--;
+        if (end > start && end[-1] == '\r') end--;
+    }
+    return xstrndup(start, (size_t)(end - start));
+}
+
+static bool qwen_json_value_matches_type(const char *value,
+                                         const char *type) {
+    const char *p = value ? value : "";
+    json_ws(&p);
+    const char *start = p;
+    if (!type || !strcmp(type, "string")) return true;
+    if (!strcmp(type, "object") && *p != '{') return false;
+    if (!strcmp(type, "array") && *p != '[') return false;
+    if (!strcmp(type, "boolean") && *p != 't' && *p != 'f') return false;
+    if (!strcmp(type, "null") && *p != 'n') return false;
+    if ((!strcmp(type, "number") || !strcmp(type, "integer")) &&
+        *p != '-' && !isdigit((unsigned char)*p)) return false;
+    if (strcmp(type, "object") && strcmp(type, "array") &&
+        strcmp(type, "boolean") && strcmp(type, "null") &&
+        strcmp(type, "number") && strcmp(type, "integer")) {
+        /* Unsupported/union schemas are intentionally treated as strings. */
+        return true;
+    }
+    if (!json_skip_value(&p)) return false;
+    const char *end = p;
+    json_ws(&p);
+    if (*p) return false;
+    if (!strcmp(type, "integer")) {
+        for (const char *q = start; q < end; q++) {
+            if (*q == '.' || *q == 'e' || *q == 'E') return false;
+        }
+    }
+    return true;
+}
+
+static bool qwen_json_value_is_null(const char *value) {
+    const char *p = value ? value : "";
+    json_ws(&p);
+    if (strncmp(p, "null", 4)) return false;
+    p += 4;
+    json_ws(&p);
+    return *p == '\0';
+}
+
+static bool qwen_tool_arg_add(buf *args, const char *tool_name,
+                              const char *param_name, const char *value,
+                              const tool_schema_orders *orders,
+                              stop_list *seen_params) {
+    const tool_schema_order *order =
+        tool_schema_orders_find(orders, tool_name);
+    const int prop_index = tool_schema_order_prop_index(order, param_name);
+    if (!order || prop_index < 0 ||
+        id_list_contains(seen_params, param_name)) return false;
+    const char *type = order->prop_type ? order->prop_type[prop_index] : NULL;
+    const bool allows_null = order->prop_allows_null &&
+        order->prop_allows_null[prop_index];
+    if (allows_null && qwen_json_value_is_null(value)) {
+        tool_call_json_args_add(args, param_name, "null", "false");
+        id_list_push_unique(seen_params, param_name);
+        return true;
+    }
+    const bool is_string = !type || !strcmp(type, "string") ||
+        (strcmp(type, "object") && strcmp(type, "array") &&
+         strcmp(type, "boolean") && strcmp(type, "null") &&
+         strcmp(type, "number") && strcmp(type, "integer"));
+    if (!qwen_json_value_matches_type(value, type)) return false;
+    tool_call_json_args_add(args, param_name, value,
+                            is_string ? "true" : "false");
+    id_list_push_unique(seen_params, param_name);
+    return true;
+}
+
+/* Parse Qwen3.6's native, tokenizer-authored tool dialect:
+ *
+ *   <tool_call>\n<function=name>\n<parameter=arg>\nvalue\n</parameter>...
+ *   </function>\n</tool_call>
+ *
+ * Unlike DSML, Qwen does not put a type marker on each parameter.  The type is
+ * recovered from the request's JSON Schema metadata.  The parser accepts
+ * multiple adjacent tool_call blocks and requires the final block to be the
+ * executable suffix, so a literal tag in ordinary prose is never partially
+ * executed. */
+static bool parse_generated_qwen_message_ex(
+        const char *text, bool require_thinking_closed,
+        const tool_schema_orders *orders,
+        char **content_out, char **reasoning_out, tool_calls *calls) {
+    text = text ? text : "";
+    const char *tool_search = text;
+    if (require_thinking_closed) {
+        const char *think_end = find_last_substr(text, "</think>");
+        if (!think_end) {
+            split_reasoning_content(text, strlen(text), content_out, reasoning_out);
+            return true;
+        }
+        tool_search = think_end + strlen("</think>");
+    }
+
+    const char *start = strstr(tool_search, QWEN_TOOL_CALL_START);
+    if (!start) {
+        split_reasoning_content(text, strlen(text), content_out, reasoning_out);
+        return true;
+    }
+    const size_t content_len =
+        trim_tool_separator_ws(text, 0, (size_t)(start - text));
+    const char *p = start;
+    const char *raw_end = NULL;
+
+    while (!strncmp(p, QWEN_TOOL_CALL_START,
+                    strlen(QWEN_TOOL_CALL_START))) {
+        p += strlen(QWEN_TOOL_CALL_START);
+        p = skip_ascii_ws(p);
+        if (strncmp(p, QWEN_FUNCTION_START,
+                    strlen(QWEN_FUNCTION_START))) return false;
+        const char *name_start = p + strlen(QWEN_FUNCTION_START);
+        const char *tag_end = strchr(name_start, '>');
+        if (!tag_end) return false;
+        char *tool_name = qwen_tool_name_span(name_start, tag_end);
+        if (!tool_name) return false;
+        if (!tool_schema_orders_find(orders, tool_name)) {
+            free(tool_name);
+            return false;
+        }
+        p = tag_end + 1;
+
+        buf args = {0};
+        stop_list seen_params = {0};
+        for (;;) {
+            p = skip_ascii_ws(p);
+            if (!strncmp(p, QWEN_FUNCTION_END,
+                         strlen(QWEN_FUNCTION_END))) {
+                p += strlen(QWEN_FUNCTION_END);
+                break;
+            }
+            if (strncmp(p, QWEN_PARAM_START,
+                        strlen(QWEN_PARAM_START))) {
+                free(tool_name);
+                buf_free(&args);
+                id_list_free(&seen_params);
+                return false;
+            }
+            const char *param_start = p + strlen(QWEN_PARAM_START);
+            tag_end = strchr(param_start, '>');
+            if (!tag_end) {
+                free(tool_name);
+                buf_free(&args);
+                id_list_free(&seen_params);
+                return false;
+            }
+            char *param_name = qwen_tool_name_span(param_start, tag_end);
+            if (!param_name) {
+                free(tool_name);
+                buf_free(&args);
+                id_list_free(&seen_params);
+                return false;
+            }
+            const char *value_start = tag_end + 1;
+            const char *value_end = strstr(value_start, QWEN_PARAM_END);
+            if (!value_end) {
+                free(param_name);
+                free(tool_name);
+                buf_free(&args);
+                id_list_free(&seen_params);
+                return false;
+            }
+            char *value = qwen_tool_value_span(value_start, value_end);
+            const bool added = qwen_tool_arg_add(
+                &args, tool_name, param_name, value, orders, &seen_params);
+            free(value);
+            free(param_name);
+            if (!added) {
+                free(tool_name);
+                buf_free(&args);
+                id_list_free(&seen_params);
+                return false;
+            }
+            p = value_end + strlen(QWEN_PARAM_END);
+        }
+
+        p = skip_ascii_ws(p);
+        if (strncmp(p, QWEN_TOOL_CALL_END,
+                    strlen(QWEN_TOOL_CALL_END))) {
+            free(tool_name);
+            buf_free(&args);
+            id_list_free(&seen_params);
+            return false;
+        }
+        p += strlen(QWEN_TOOL_CALL_END);
+        raw_end = p;
+
+        tool_call tc = {0};
+        tc.name = tool_name;
+        buf wrapped = {0};
+        buf_putc(&wrapped, '{');
+        buf_puts(&wrapped, args.ptr ? args.ptr : "");
+        buf_putc(&wrapped, '}');
+        tc.arguments = buf_take(&wrapped);
+        tool_calls_push(calls, tc);
+        buf_free(&args);
+        id_list_free(&seen_params);
+
+        p = skip_ascii_ws(p);
+    }
+
+    if (*p != '\0' || calls->len == 0) return false;
+    free(calls->raw_dsml);
+    calls->raw_dsml = xstrndup(start, (size_t)(raw_end - start));
+    split_reasoning_content(text, content_len, content_out, reasoning_out);
+    return true;
 }
 
 static bool parse_generated_message_ex(const char *text, bool require_thinking_closed,
@@ -5052,6 +5582,8 @@ static bool parse_generated_message_for_response(const char *text,
                                                  bool has_tools,
                                                  bool saw_tool_start,
                                                  bool require_thinking_closed,
+                                                 bool qwen_tool_dialect,
+                                                 const tool_schema_orders *orders,
                                                  const char **finish_io,
                                                  char *err,
                                                  size_t errlen,
@@ -5061,10 +5593,13 @@ static bool parse_generated_message_for_response(const char *text,
                                                  bool *recovered_out) {
     if (recovered_out) *recovered_out = false;
 
-    bool parsed_ok = parse_generated_message_ex(text ? text : "",
-                                                require_thinking_closed,
-                                                content_out, reasoning_out,
-                                                calls);
+    bool parsed_ok = qwen_tool_dialect
+        ? parse_generated_qwen_message_ex(text ? text : "",
+                                          require_thinking_closed, orders,
+                                          content_out, reasoning_out, calls)
+        : parse_generated_message_ex(text ? text : "",
+                                     require_thinking_closed,
+                                     content_out, reasoning_out, calls);
     if (parsed_ok) return true;
 
     free(*content_out);
@@ -5080,7 +5615,16 @@ static bool parse_generated_message_for_response(const char *text,
      * a last-resort assistant fallback instead of crashing the request. */
     const char *finish = finish_io && *finish_io ? *finish_io : "stop";
     if (has_tools && saw_tool_start && strcmp(finish, "error") != 0) {
-        if (finish_io) *finish_io = tool_parse_failure_recovery_finish(finish);
+        /* Qwen tool markup is hidden from the live OpenAI stream as soon as
+         * its marker is observed.  A malformed native call therefore cannot
+         * safely degrade to a successful empty assistant turn: make the
+         * terminal chunk fail closed.  DeepSeek keeps its existing
+         * model-visible DSML recovery/fallback contract. */
+        if (finish_io) {
+            *finish_io = qwen_tool_dialect
+                ? "error"
+                : tool_parse_failure_recovery_finish(finish);
+        }
         if (err && errlen) snprintf(err, errlen, "invalid tool call");
         if (recovered_out) *recovered_out = true;
     }
@@ -5483,6 +6027,9 @@ static const char *openai_tool_stream_id(server *s, openai_tool_stream *ts,
 static size_t text_stream_safe_limit(const char *raw, size_t start,
                                      size_t raw_len, bool has_tools,
                                      bool final);
+static size_t text_stream_safe_limit_for_dialect(
+    const char *raw, size_t start, size_t raw_len, bool has_tools,
+    bool final, bool qwen_tool_dialect);
 
 static bool sse_chat_delta_n(int fd, const request *r, const char *id,
                              const char *field, const char *text, size_t len) {
@@ -6258,9 +6805,12 @@ static bool openai_sse_stream_update(int fd, server *s, const request *r, const 
     }
 
     if (st->mode == OPENAI_STREAM_TEXT) {
-        const char *tool = r->has_tools ? find_any_tool_start(raw + st->emit_pos) : NULL;
-        size_t limit = text_stream_safe_limit(raw, st->emit_pos, raw_len,
-                                              r->has_tools, final);
+        const char *tool = r->has_tools ?
+            find_tool_start_for_dialect(raw + st->emit_pos,
+                                        r->qwen_tool_dialect) : NULL;
+        size_t limit = text_stream_safe_limit_for_dialect(
+            raw, st->emit_pos, raw_len, r->has_tools, final,
+            r->qwen_tool_dialect);
 
         if (limit > st->emit_pos) {
             if (!sse_chat_delta_n(fd, r, id, "content",
@@ -6272,7 +6822,13 @@ static bool openai_sse_stream_update(int fd, server *s, const request *r, const 
 
         if (tool) {
             st->emit_pos = (size_t)(tool - raw);
-            if (openai_tool_stream_init(&st->tool, raw, raw_len, st->emit_pos)) {
+            if (r->qwen_tool_dialect) {
+                /* Qwen's native syntax is parsed authoritatively at EOS. Hide
+                 * the markup once its marker is complete while still
+                 * streaming ordinary reasoning and text before that point. */
+                st->mode = OPENAI_STREAM_SUPPRESS;
+            } else if (openai_tool_stream_init(&st->tool, raw, raw_len,
+                                               st->emit_pos)) {
                 st->mode = OPENAI_STREAM_TOOL;
             } else {
                 st->mode = OPENAI_STREAM_SUPPRESS;
@@ -7768,6 +8324,39 @@ static size_t text_stream_safe_limit(const char *raw, size_t start,
              * across generated tokens. */
             const size_t max_marker = 80;
             size_t scan = raw_len - start > max_marker ? raw_len - max_marker : start;
+            for (size_t i = raw_len; i > scan; i--) {
+                if (raw[i - 1] == '<') {
+                    size_t marker = i - 1;
+                    if (marker < limit) limit = marker;
+                    break;
+                }
+            }
+            limit = trim_tool_separator_ws(raw, start, limit);
+        }
+    }
+    return utf8_stream_safe_len(raw, start, limit, final);
+}
+
+static size_t text_stream_safe_limit_for_dialect(
+        const char *raw, size_t start, size_t raw_len, bool has_tools,
+        bool final, bool qwen_tool_dialect) {
+    if (!qwen_tool_dialect) {
+        return text_stream_safe_limit(raw, start, raw_len, has_tools, final);
+    }
+    if (raw_len <= start) return raw_len;
+
+    size_t limit = raw_len;
+    if (has_tools) {
+        const char *tool = find_tool_start_for_dialect(raw + start, true);
+        if (tool) {
+            limit = trim_tool_separator_ws(raw, start, (size_t)(tool - raw));
+            return utf8_stream_safe_len(raw, start, limit, true);
+        }
+        if (!final) {
+            while (limit > start && isspace((unsigned char)raw[limit - 1])) limit--;
+            const size_t marker_len = strlen(QWEN_TOOL_CALL_START);
+            size_t scan = raw_len - start > marker_len ?
+                raw_len - marker_len : start;
             for (size_t i = raw_len; i > scan; i--) {
                 if (raw[i - 1] == '<') {
                     size_t marker = i - 1;
@@ -9855,11 +10444,13 @@ static int chat_think_tool_recovery(server *s,
                                     size_t *scan_from,
                                     int *completion,
                                     int max_tokens,
+                                    bool qwen_tool_dialect,
                                     char *err,
                                     size_t errlen) {
     if (!thinking->inside || !text->ptr) return 0;
     if (*scan_from > text->len) *scan_from = text->len;
-    if (!find_any_tool_start(text->ptr + *scan_from)) {
+    if (!find_tool_start_for_dialect(text->ptr + *scan_from,
+                                     qwen_tool_dialect)) {
         const size_t hold = 80; /* > longest stanza opening */
         *scan_from = text->len > hold ? text->len - hold : 0;
         return 0;
@@ -10421,6 +11012,11 @@ done:
 
 static bool should_canonicalize_tool_checkpoint(const server *s, const tool_calls *calls) {
     if (!calls || calls->len == 0) return false;
+    /* The canonicalizer below renders DeepSeek DSML.  Qwen history is already
+     * reconstructed by its typed chat renderer on the next request; applying
+     * the DSML suffix to a Qwen KV would corrupt the live dialect. */
+    if (s && ds4_engine_chat_format(s->engine) == DS4_CHAT_FORMAT_QWEN36)
+        return false;
     if (s && !s->disable_exact_dsml_tool_replay &&
         calls->raw_dsml && calls->raw_dsml[0])
     {
@@ -10831,6 +11427,7 @@ decode_again:
     int last_decode_log_completion = 0;
     thinking_state thinking = thinking_state_from_prompt(&j->req);
     const bool thinking_gates_tool_markers = ds4_think_mode_enabled(j->req.think_mode);
+    const bool qwen_tool_dialect = j->req.qwen_tool_dialect && j->req.has_tools;
     bool tool_scan_waiting_for_think_close =
         thinking_gates_tool_markers && thinking.inside;
     size_t think_recovery_scan_from = 0;
@@ -10985,6 +11582,7 @@ decode_again:
                         chat_think_tool_recovery(s, &text, &thinking,
                                                  &think_recovery_scan_from,
                                                  &completion, max_tokens,
+                                                 qwen_tool_dialect,
                                                  err, sizeof(err)) : 0;
                     if (recovered < 0) {
                         finish = "error";
@@ -11020,7 +11618,9 @@ decode_again:
                     bool orphan_end = false;
                     bool old_start = saw_tool_start;
                     bool old_end = saw_tool_end;
-                    observe_tool_markers(tool_scan, &saw_tool_start, &saw_tool_end, &orphan_end);
+                    observe_tool_markers_for_dialect(
+                        tool_scan, qwen_tool_dialect,
+                        &saw_tool_start, &saw_tool_end, &orphan_end);
                     if (orphan_end && !saw_orphan_tool_end) {
                         saw_orphan_tool_end = true;
                         server_log(DS4_LOG_WARNING,
@@ -11074,7 +11674,8 @@ decode_again:
                 break;
             }
 
-            if (j->req.kind == REQ_CHAT && j->req.has_tools && saw_tool_end) {
+            if (j->req.kind == REQ_CHAT && j->req.has_tools && saw_tool_end &&
+                !qwen_tool_dialect) {
                 finish = "tool_calls";
                 stop_decode = true;
                 break;
@@ -11088,7 +11689,7 @@ decode_again:
         snprintf(err, sizeof(err), "shutdown requested");
     }
 
-    if (j->req.kind == REQ_CHAT && j->req.has_tools &&
+    if (j->req.kind == REQ_CHAT && j->req.has_tools && !qwen_tool_dialect &&
         saw_tool_start && !saw_tool_end && strcmp(finish, "error") != 0)
     {
         /* Deterministically complete a simple truncation.  Anything more than
@@ -11123,7 +11724,8 @@ decode_again:
             tool_calls_free(&test_calls);
         }
         if (!completed_truncation) {
-            if (!j->req.stream && !dsml_recovery_attempted) {
+            if (!j->req.stream && !dsml_recovery_attempted &&
+                !j->req.qwen_tool_dialect) {
                 int recovery_tokens = 0;
                 char recovery_err[160] = {0};
                 server_log(DS4_LOG_WARNING,
@@ -11193,6 +11795,8 @@ decode_again:
             j->req.has_tools,
             saw_tool_start,
             ds4_think_mode_enabled(j->req.think_mode),
+            j->req.qwen_tool_dialect && j->req.has_tools,
+            &j->req.tool_orders,
             &final_finish,
             err,
             sizeof(err),
@@ -11205,7 +11809,8 @@ decode_again:
              * Semantic repair is intentionally avoided: if the parser cannot
              * execute the block, feed the model a tool error and the protocol
              * reminder so it owns the corrected next action. */
-            if (!j->req.stream && !dsml_recovery_attempted) {
+            if (!j->req.stream && !dsml_recovery_attempted &&
+                !j->req.qwen_tool_dialect) {
                 int recovery_tokens = 0;
                 char recovery_err[160] = {0};
                 const char *detail = err[0] ? err : "invalid tool call";
@@ -11245,16 +11850,7 @@ decode_again:
             if (!parsed_ok) {
                 /* Print raw DSML snippet for debugging */
                 size_t dsml_snippet_len = 0;
-                const char *dsml_start = NULL;
-                const char *p;
-                for (p = text.ptr; p && (size_t)(p - text.ptr) < text.len - 20; p++) {
-                    if ((strncmp(p, DS4_TOOL_CALLS_START, strlen(DS4_TOOL_CALLS_START)) == 0) ||
-                        (strncmp(p, DS4_TOOL_CALLS_START_SHORT, strlen(DS4_TOOL_CALLS_START_SHORT)) == 0) ||
-                        (strncmp(p, "<tool_calls>", 12) == 0)) {
-                        dsml_start = p;
-                        break;
-                    }
-                }
+                const char *dsml_start = find_tool_start_bounded(text.ptr, text.len);
                 if (dsml_start) {
                     dsml_snippet_len = text.len - (dsml_start - text.ptr);
                     if (dsml_snippet_len > 500) dsml_snippet_len = 500;
@@ -11684,8 +12280,7 @@ static void append_model_json(buf *b, const server *s, const char *id) {
                              ds4_engine_model_name(s->engine),
                              ds4_session_ctx(s->session),
                              s->default_tokens,
-                             ds4_engine_chat_format(s->engine) !=
-                                 DS4_CHAT_FORMAT_QWEN36);
+                             true);
 }
 
 static bool send_model(server *s, int fd, const char *id) {
@@ -11705,7 +12300,7 @@ static void append_models_json_values(buf *b,
     buf_puts(b, "{\"object\":\"list\",\"data\":[");
     if (format == DS4_CHAT_FORMAT_QWEN36) {
         append_model_json_values(b, "qwen3.6-35b-a3b", name, ctx,
-                                 default_tokens, false);
+                                 default_tokens, true);
     } else {
         append_model_json_values(b, "deepseek-v4-flash", name, ctx,
                                  default_tokens, true);
@@ -12400,6 +12995,8 @@ static void test_assert(bool cond, const char *file, int line, const char *expr)
 
 #define TEST_ASSERT(expr) test_assert((expr), __FILE__, __LINE__, #expr)
 
+static char *read_socket_text(int fd);
+
 static void test_qwen_endpoint_gate_is_family_aware(void) {
     char err[192] = {0};
 
@@ -12456,14 +13053,14 @@ static void test_qwen_chat_ir_borrows_typed_untrusted_content(void) {
     TEST_ASSERT(ir && ir[2].reasoning == msgs.v[2].reasoning);
     TEST_ASSERT(ir && ir[3].reasoning == NULL);
 
-    free(ir);
+    qwen_chat_messages_free(ir, n_ir);
     ir = NULL;
     n_ir = 0;
     err[0] = '\0';
-    TEST_ASSERT(!qwen_chat_messages_borrow(
+    TEST_ASSERT(qwen_chat_messages_borrow(
         &msgs, true, &ir, &n_ir, err, sizeof(err)));
-    TEST_ASSERT(ir == NULL && n_ir == 0);
-    TEST_ASSERT(strstr(err, "tools are disabled") != NULL);
+    TEST_ASSERT(ir != NULL && n_ir == 4);
+    qwen_chat_messages_free(ir, n_ir);
     chat_msgs_free(&msgs);
 }
 
@@ -12523,7 +13120,7 @@ static void test_qwen_chat_ir_accepts_empty_tool_compat_fields(void) {
         &msgs, false, &ir, &n_ir, err, sizeof(err)));
     TEST_ASSERT(ir && n_ir == 2);
 
-    free(ir);
+    qwen_chat_messages_free(ir, n_ir);
     chat_msgs_free(&msgs);
 }
 
@@ -12545,7 +13142,7 @@ static void assert_qwen_chat_ir_rejects(const char *json,
     TEST_ASSERT(n_ir == 0);
     TEST_ASSERT(strstr(err, error_fragment) != NULL);
 
-    free(ir);
+    qwen_chat_messages_free(ir, n_ir);
     chat_msgs_free(&msgs);
 }
 
@@ -12554,14 +13151,6 @@ static void test_qwen_chat_ir_rejects_unsupported_protocol_shapes(void) {
         "[{\"role\":\"developer\",\"content\":\"policy\"},"
         "{\"role\":\"user\",\"content\":\"hi\"}]",
         "role 'developer'");
-    assert_qwen_chat_ir_rejects(
-        "[{\"role\":\"function\",\"content\":\"result\"},"
-        "{\"role\":\"user\",\"content\":\"hi\"}]",
-        "tools and tool messages are disabled");
-    assert_qwen_chat_ir_rejects(
-        "[{\"role\":\"tool\",\"content\":\"result\"},"
-        "{\"role\":\"user\",\"content\":\"hi\"}]",
-        "tools and tool messages are disabled");
     assert_qwen_chat_ir_rejects(
         "[{\"role\":\"critic\",\"content\":\"nope\"},"
         "{\"role\":\"user\",\"content\":\"hi\"}]",
@@ -12577,12 +13166,12 @@ static void test_qwen_chat_ir_rejects_unsupported_protocol_shapes(void) {
         "[{\"role\":\"user\",\"content\":\"hi\"},"
         "{\"role\":\"assistant\",\"content\":\"\","
         "\"tool_calls\":[{}]}]",
-        "tools and tool_calls are disabled");
+        "tool_calls are invalid or incomplete");
     assert_qwen_chat_ir_rejects(
         "[{\"role\":\"user\",\"content\":\"hi\"},"
         "{\"role\":\"assistant\",\"content\":\"\","
         "\"function_call\":{\"name\":\"f\",\"arguments\":\"{}\"}}]",
-        "tools and tool_calls are disabled");
+        "tool_calls are invalid or incomplete");
     assert_qwen_chat_ir_rejects(
         "[{\"role\":\"user\",\"content\":["
         "{\"type\":\"text\",\"text\":\"describe this\"},"
@@ -12599,6 +13188,340 @@ static void test_qwen_chat_ir_rejects_unsupported_protocol_shapes(void) {
     assert_qwen_chat_ir_rejects(
         "[{\"role\":\"assistant\",\"content\":\"orphan\"}]",
         "at least one user message");
+}
+
+static tool_schema_orders make_qwen_tool_orders(void) {
+    tool_schema_orders orders = {0};
+    tool_schema_orders_add_json(&orders,
+        "{\"name\":\"typed_tool\",\"parameters\":{\"type\":\"object\","
+        "\"properties\":{"
+        "\"text\":{\"type\":\"string\"},"
+        "\"count\":{\"type\":\"integer\"},"
+        "\"ratio\":{\"type\":\"number\"},"
+        "\"enabled\":{\"type\":\"boolean\"},"
+        "\"items\":{\"type\":\"array\"},"
+        "\"config\":{\"type\":\"object\"},"
+        "\"nullable_text\":{\"type\":[\"string\",\"null\"]},"
+        "\"nullable_count\":{\"type\":[\"number\",\"null\"]},"
+        "\"nothing\":{\"type\":\"null\"}}}}" );
+    tool_schema_orders_add_json(&orders,
+        "{\"name\":\"get_weather\",\"parameters\":{\"type\":\"object\","
+        "\"properties\":{\"city\":{\"type\":\"string\"}}}}" );
+    return orders;
+}
+
+static void test_qwen_chat_ir_accepts_tool_roundtrip(void) {
+    const char *p =
+        "[{\"role\":\"user\",\"content\":\"weather\"},"
+        "{\"role\":\"assistant\",\"content\":\"\",\"tool_calls\":[{"
+        "\"id\":\"call_weather\",\"type\":\"function\",\"function\":{"
+        "\"name\":\"get_weather\",\"arguments\":\"{\\\"city\\\":\\\"Roma\\\"}\"}}]},"
+        "{\"role\":\"tool\",\"tool_call_id\":\"call_weather\","
+        "\"content\":\"{\\\"temperature_c\\\":28}\"}]";
+    chat_msgs msgs = {0};
+    TEST_ASSERT(parse_messages(&p, &msgs));
+    TEST_ASSERT(msgs.len == 3);
+
+    ds4_chat_message *ir = NULL;
+    size_t n_ir = 0;
+    char err[192] = {0};
+    TEST_ASSERT(qwen_chat_messages_borrow(
+        &msgs, true, &ir, &n_ir, err, sizeof(err)));
+    TEST_ASSERT(ir && n_ir == 3);
+    TEST_ASSERT(ir && ir[1].role == DS4_CHAT_ROLE_ASSISTANT);
+    TEST_ASSERT(ir && ir[1].n_tool_calls == 1);
+    TEST_ASSERT(ir && !strcmp(ir[1].tool_calls[0].name, "get_weather"));
+    TEST_ASSERT(ir && ir[1].tool_calls[0].n_args == 1);
+    TEST_ASSERT(ir && ir[1].tool_calls[0].args[0].is_string);
+    TEST_ASSERT(ir && !strcmp(ir[1].tool_calls[0].args[0].name, "city"));
+    TEST_ASSERT(ir && !strcmp(ir[1].tool_calls[0].args[0].value, "Roma"));
+    TEST_ASSERT(ir && ir[2].role == DS4_CHAT_ROLE_TOOL);
+    TEST_ASSERT(ir && strstr(ir[2].content, "temperature_c") != NULL);
+
+    qwen_chat_messages_free(ir, n_ir);
+    chat_msgs_free(&msgs);
+}
+
+static void test_qwen_native_tool_parser_single_multi_and_typed(void) {
+    tool_schema_orders orders = make_qwen_tool_orders();
+    char *content = NULL;
+    char *reasoning = NULL;
+    tool_calls calls = {0};
+
+    const char *single =
+        "<think>Need current data.</think>\n\n"
+        QWEN_TOOL_CALL_START "\n<function=get_weather>\n"
+        "<parameter=city>\nRoma\n" QWEN_PARAM_END "\n"
+        QWEN_FUNCTION_END "\n" QWEN_TOOL_CALL_END;
+    TEST_ASSERT(parse_generated_qwen_message_ex(
+        single, true, &orders, &content, &reasoning, &calls));
+    TEST_ASSERT(calls.len == 1);
+    TEST_ASSERT(!strcmp(calls.v[0].name, "get_weather"));
+    TEST_ASSERT(strstr(calls.v[0].arguments, "\"city\": \"Roma\"") != NULL);
+    TEST_ASSERT(reasoning && !strcmp(reasoning, "Need current data."));
+    TEST_ASSERT(content && content[0] == '\0');
+    free(content); free(reasoning); tool_calls_free(&calls);
+    content = reasoning = NULL;
+
+    const char *multi =
+        QWEN_TOOL_CALL_START "\n<function=get_weather>\n"
+        "<parameter=city>\nRoma\n" QWEN_PARAM_END "\n"
+        QWEN_FUNCTION_END "\n" QWEN_TOOL_CALL_END "\n"
+        QWEN_TOOL_CALL_START "\n<function=get_weather>\n"
+        "<parameter=city>\nMilano\n" QWEN_PARAM_END "\n"
+        QWEN_FUNCTION_END "\n" QWEN_TOOL_CALL_END;
+    TEST_ASSERT(parse_generated_qwen_message_ex(
+        multi, false, &orders, &content, &reasoning, &calls));
+    TEST_ASSERT(calls.len == 2);
+    TEST_ASSERT(strstr(calls.v[0].arguments, "Roma") != NULL);
+    TEST_ASSERT(strstr(calls.v[1].arguments, "Milano") != NULL);
+    free(content); free(reasoning); tool_calls_free(&calls);
+    content = reasoning = NULL;
+
+    const char *typed =
+        QWEN_TOOL_CALL_START "\n<function=typed_tool>\n"
+        "<parameter=text>\nRoma\n" QWEN_PARAM_END "\n"
+        "<parameter=count>\n17\n" QWEN_PARAM_END "\n"
+        "<parameter=ratio>\n1.5\n" QWEN_PARAM_END "\n"
+        "<parameter=enabled>\ntrue\n" QWEN_PARAM_END "\n"
+        "<parameter=items>\n[\"x\",2,false]\n" QWEN_PARAM_END "\n"
+        "<parameter=config>\n{\"z\":1}\n" QWEN_PARAM_END "\n"
+        "<parameter=nullable_text>\nnull\n" QWEN_PARAM_END "\n"
+        "<parameter=nullable_count>\nnull\n" QWEN_PARAM_END "\n"
+        "<parameter=nothing>\nnull\n" QWEN_PARAM_END "\n"
+        QWEN_FUNCTION_END "\n" QWEN_TOOL_CALL_END;
+    TEST_ASSERT(parse_generated_qwen_message_ex(
+        typed, false, &orders, &content, &reasoning, &calls));
+    TEST_ASSERT(calls.len == 1);
+    TEST_ASSERT(strstr(calls.v[0].arguments, "\"text\": \"Roma\"") != NULL);
+    TEST_ASSERT(strstr(calls.v[0].arguments, "\"count\": 17") != NULL);
+    TEST_ASSERT(strstr(calls.v[0].arguments, "\"ratio\": 1.5") != NULL);
+    TEST_ASSERT(strstr(calls.v[0].arguments, "\"enabled\": true") != NULL);
+    TEST_ASSERT(strstr(calls.v[0].arguments, "\"items\": [\"x\",2,false]") != NULL);
+    TEST_ASSERT(strstr(calls.v[0].arguments, "\"config\": {\"z\":1}") != NULL);
+    TEST_ASSERT(strstr(calls.v[0].arguments, "\"nullable_text\": null") != NULL);
+    TEST_ASSERT(strstr(calls.v[0].arguments, "\"nullable_count\": null") != NULL);
+    TEST_ASSERT(strstr(calls.v[0].arguments, "\"nothing\": null") != NULL);
+    free(content); free(reasoning); tool_calls_free(&calls);
+    tool_schema_orders_free(&orders);
+}
+
+static void assert_qwen_generated_tool_rejected(
+        const char *generated, const tool_schema_orders *orders) {
+    char *content = NULL;
+    char *reasoning = NULL;
+    tool_calls calls = {0};
+    TEST_ASSERT(!parse_generated_qwen_message_ex(
+        generated, false, orders, &content, &reasoning, &calls));
+    free(content);
+    free(reasoning);
+    tool_calls_free(&calls);
+}
+
+static void test_qwen_native_tool_parser_rejects_malformed_calls(void) {
+    tool_schema_orders orders = make_qwen_tool_orders();
+    assert_qwen_generated_tool_rejected(
+        QWEN_TOOL_CALL_START "<function=unknown></function>" QWEN_TOOL_CALL_END,
+        &orders);
+    assert_qwen_generated_tool_rejected(
+        QWEN_TOOL_CALL_START "<function=get_weather>"
+        "<parameter=country>IT</parameter>"
+        QWEN_FUNCTION_END QWEN_TOOL_CALL_END,
+        &orders);
+    assert_qwen_generated_tool_rejected(
+        QWEN_TOOL_CALL_START "<function=get_weather>"
+        "<parameter=city>Roma</parameter><parameter=city>Milano</parameter>"
+        QWEN_FUNCTION_END QWEN_TOOL_CALL_END,
+        &orders);
+    assert_qwen_generated_tool_rejected(
+        QWEN_TOOL_CALL_START "<function=typed_tool>"
+        "<parameter=count>not-an-integer</parameter>"
+        QWEN_FUNCTION_END QWEN_TOOL_CALL_END,
+        &orders);
+    assert_qwen_generated_tool_rejected(
+        QWEN_TOOL_CALL_START "<function=get_weather>"
+        "<parameter=city>Roma</parameter>" QWEN_FUNCTION_END,
+        &orders);
+    assert_qwen_generated_tool_rejected(
+        QWEN_TOOL_CALL_START "<function=get_weather>"
+        "<parameter=city>Roma</parameter>" QWEN_FUNCTION_END
+        QWEN_TOOL_CALL_END " suffix",
+        &orders);
+    tool_schema_orders_free(&orders);
+}
+
+static void test_qwen_tool_inside_thinking_is_not_executable(void) {
+    tool_schema_orders orders = make_qwen_tool_orders();
+    const char *generated =
+        "<think>Maybe " QWEN_TOOL_CALL_START "<function=get_weather>"
+        "<parameter=city>Roma</parameter>" QWEN_FUNCTION_END
+        QWEN_TOOL_CALL_END " but only as reasoning.</think>Final answer.";
+    char *content = NULL;
+    char *reasoning = NULL;
+    tool_calls calls = {0};
+    TEST_ASSERT(parse_generated_qwen_message_ex(
+        generated, true, &orders, &content, &reasoning, &calls));
+    TEST_ASSERT(calls.len == 0);
+    TEST_ASSERT(reasoning && strstr(reasoning, QWEN_TOOL_CALL_START) != NULL);
+    TEST_ASSERT(content && !strcmp(content, "Final answer."));
+    free(content); free(reasoning); tool_calls_free(&calls);
+    tool_schema_orders_free(&orders);
+}
+
+static void test_tool_marker_observation_is_dialect_specific(void) {
+    const char *qwen = QWEN_TOOL_CALL_START "<function=f></function>"
+                       QWEN_TOOL_CALL_END;
+    bool saw_start = false, saw_end = false, orphan = false;
+    observe_tool_markers_for_dialect(
+        qwen, false, &saw_start, &saw_end, &orphan);
+    TEST_ASSERT(!saw_start && !saw_end && !orphan);
+    observe_tool_markers_for_dialect(
+        qwen, true, &saw_start, &saw_end, &orphan);
+    TEST_ASSERT(saw_start && saw_end && !orphan);
+}
+
+static void test_bounded_tool_marker_scan_handles_short_qwen_output(void) {
+    const char *exact = QWEN_TOOL_CALL_START;
+    const char *with_suffix = QWEN_TOOL_CALL_START "x";
+    const char *with_prefix = "x" QWEN_TOOL_CALL_START;
+    TEST_ASSERT(find_tool_start_bounded(exact, strlen(exact)) == exact);
+    TEST_ASSERT(find_tool_start_bounded(with_suffix, strlen(with_suffix)) ==
+                with_suffix);
+    TEST_ASSERT(find_tool_start_bounded(with_prefix, strlen(with_prefix)) ==
+                with_prefix + 1);
+    TEST_ASSERT(find_tool_start_bounded("<tool", strlen("<tool")) == NULL);
+    TEST_ASSERT(find_tool_start_bounded(NULL, 0) == NULL);
+}
+
+static void test_qwen_openai_stream_hides_markup_and_streams_plain_text(void) {
+    int sv[2];
+    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+    if (sv[0] < 0 || sv[1] < 0) return;
+
+    request r;
+    request_init(&r, REQ_CHAT, 64);
+    r.stream = true;
+    r.has_tools = true;
+    r.qwen_tool_dialect = true;
+    r.think_mode = DS4_THINK_NONE;
+    TEST_ASSERT(request_uses_openai_live_stream(&r));
+    TEST_ASSERT(request_uses_structured_stream(&r));
+
+    openai_stream live = {0};
+    openai_stream_start(&r, &live);
+    TEST_ASSERT(sse_chunk(sv[0], &r, "chatcmpl_qwen", NULL, NULL));
+    const char *plain = "A visible answer";
+    TEST_ASSERT(openai_sse_stream_update(sv[0], NULL, &r,
+                                         "chatcmpl_qwen", &live,
+                                         plain, strlen(plain), false));
+    const char *raw_tool =
+        "A visible answer\n\n" QWEN_TOOL_CALL_START
+        "<function=get_weather><parameter=city>Roma</parameter>"
+        QWEN_FUNCTION_END QWEN_TOOL_CALL_END;
+    TEST_ASSERT(openai_sse_stream_update(sv[0], NULL, &r,
+                                         "chatcmpl_qwen", &live,
+                                         raw_tool, strlen(raw_tool), false));
+
+    tool_calls calls = {0};
+    tool_call tc = {
+        .name = xstrdup("get_weather"),
+        .arguments = xstrdup("{\"city\":\"Roma\"}"),
+    };
+    tool_calls_push(&calls, tc);
+    TEST_ASSERT(openai_sse_finish_live(
+        sv[0], NULL, &r, "chatcmpl_qwen", &live,
+        raw_tool, strlen(raw_tool), &calls, "tool_calls", 12, 4));
+    shutdown(sv[0], SHUT_WR);
+    char *out = read_socket_text(sv[1]);
+    const char *role = strstr(out, "\"role\":\"assistant\"");
+    const char *content = strstr(out, "A visible answer");
+    const char *tool = strstr(out, "\"tool_calls\"");
+    const char *finish = strstr(out, "\"finish_reason\":\"tool_calls\"");
+    const char *done = strstr(out, "data: [DONE]");
+    TEST_ASSERT(role && content && tool && finish && done);
+    TEST_ASSERT(role < content && content < tool && tool < finish && finish < done);
+    TEST_ASSERT(strstr(out, "\"name\":\"get_weather\"") != NULL);
+    TEST_ASSERT(strstr(out, "\\\"city\\\":\\\"Roma\\\"") != NULL);
+    TEST_ASSERT(strstr(out, QWEN_TOOL_CALL_START) == NULL);
+
+    free(out);
+    openai_stream_free(&live);
+    close(sv[0]);
+    close(sv[1]);
+
+    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+    if (sv[0] >= 0 && sv[1] >= 0) {
+        TEST_ASSERT(final_response(sv[0], false, &r, "chatcmpl_qwen_json",
+                                   "", NULL, &calls, "tool_calls", 12, 4));
+        shutdown(sv[0], SHUT_WR);
+        out = read_socket_text(sv[1]);
+        TEST_ASSERT(strstr(out, "\"message\":{\"role\":\"assistant\",\"content\":\"\"") != NULL);
+        TEST_ASSERT(strstr(out, "\"tool_calls\"") != NULL);
+        TEST_ASSERT(strstr(out, "\"finish_reason\":\"tool_calls\"") != NULL);
+        TEST_ASSERT(strstr(out, "\"name\":\"get_weather\"") != NULL);
+        free(out);
+        close(sv[0]);
+        close(sv[1]);
+    }
+    tool_calls_free(&calls);
+    request_free(&r);
+}
+
+static void test_qwen_malformed_openai_stream_fails_closed(void) {
+    int sv[2];
+    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+    if (sv[0] < 0 || sv[1] < 0) return;
+
+    request r;
+    request_init(&r, REQ_CHAT, 64);
+    r.stream = true;
+    r.has_tools = true;
+    r.qwen_tool_dialect = true;
+    r.think_mode = DS4_THINK_NONE;
+
+    tool_schema_orders orders = make_qwen_tool_orders();
+    const char *raw =
+        QWEN_TOOL_CALL_START "<function=unknown>"
+        QWEN_FUNCTION_END QWEN_TOOL_CALL_END;
+    char err[128] = {0};
+    char *content = NULL;
+    char *reasoning = NULL;
+    tool_calls calls = {0};
+    const char *finish = "stop";
+    bool recovered = false;
+    TEST_ASSERT(!parse_generated_message_for_response(
+        raw, true, true, false, true, &orders, &finish,
+        err, sizeof(err), &content, &reasoning, &calls, &recovered));
+    TEST_ASSERT(recovered);
+    TEST_ASSERT(!strcmp(finish, "error"));
+    TEST_ASSERT(!strcmp(err, "invalid tool call"));
+    TEST_ASSERT(calls.len == 0);
+
+    openai_stream live = {0};
+    openai_stream_start(&r, &live);
+    TEST_ASSERT(sse_chunk(sv[0], &r, "chatcmpl_qwen_bad", NULL, NULL));
+    TEST_ASSERT(openai_sse_stream_update(
+        sv[0], NULL, &r, "chatcmpl_qwen_bad", &live,
+        raw, strlen(raw), false));
+    TEST_ASSERT(openai_sse_finish_live(
+        sv[0], NULL, &r, "chatcmpl_qwen_bad", &live,
+        raw, strlen(raw), &calls, finish, 12, 4));
+    shutdown(sv[0], SHUT_WR);
+    char *out = read_socket_text(sv[1]);
+    TEST_ASSERT(strstr(out, "\"finish_reason\":\"error\"") != NULL);
+    TEST_ASSERT(strstr(out, "data: [DONE]") != NULL);
+    TEST_ASSERT(strstr(out, "\"tool_calls\"") == NULL);
+    TEST_ASSERT(strstr(out, QWEN_TOOL_CALL_START) == NULL);
+
+    free(out);
+    free(content);
+    free(reasoning);
+    tool_calls_free(&calls);
+    tool_schema_orders_free(&orders);
+    openai_stream_free(&live);
+    close(sv[0]);
+    close(sv[1]);
+    request_free(&r);
 }
 
 static void test_message_content_flags_preserve_legacy_flattening(void) {
@@ -14407,6 +15330,8 @@ static void test_tool_parse_failure_returns_recoverable_finish(void) {
                                                        true,
                                                        true,
                                                        false,
+                                                       false,
+                                                       NULL,
                                                        &finish,
                                                        err,
                                                        sizeof(err),
@@ -15526,11 +16451,11 @@ static void test_model_metadata_clamps_completion_to_context(void) {
     buf_free(&b);
 
     append_model_json_values(&b, "qwen3.6-35b-a3b",
-                             "Qwen3.6 35B A3B", 8192, 2048, false);
+                             "Qwen3.6 35B A3B", 8192, 2048, true);
     TEST_ASSERT(strstr(b.ptr, "\"id\":\"qwen3.6-35b-a3b\"") != NULL);
     TEST_ASSERT(strstr(b.ptr, "\"name\":\"Qwen3.6 35B A3B\"") != NULL);
-    TEST_ASSERT(strstr(b.ptr, "\"tools\"") == NULL);
-    TEST_ASSERT(strstr(b.ptr, "\"tool_choice\"") == NULL);
+    TEST_ASSERT(strstr(b.ptr, "\"tools\"") != NULL);
+    TEST_ASSERT(strstr(b.ptr, "\"tool_choice\"") != NULL);
     TEST_ASSERT(strstr(b.ptr, "\"reasoning_effort\"") != NULL);
     buf_free(&b);
 
@@ -15552,7 +16477,7 @@ static void test_model_metadata_clamps_completion_to_context(void) {
     TEST_ASSERT(strstr(b.ptr, "\"object\":\"list\"") != NULL);
     TEST_ASSERT(strstr(b.ptr, "\"id\":\"qwen3.6-35b-a3b\"") != NULL);
     TEST_ASSERT(strstr(b.ptr, "deepseek-v4") == NULL);
-    TEST_ASSERT(strstr(b.ptr, "\"tools\"") == NULL);
+    TEST_ASSERT(strstr(b.ptr, "\"tools\"") != NULL);
     buf_free(&b);
 }
 
@@ -15632,7 +16557,7 @@ static void test_think_recovery_tokenization_failure_is_error(void) {
     char err[160] = {0};
 
     TEST_ASSERT(chat_think_tool_recovery(
-        &s, &text, &thinking, &scan_from, &completion, 32,
+        &s, &text, &thinking, &scan_from, &completion, 32, false,
         err, sizeof(err)) == -1);
     TEST_ASSERT(!strcmp(err, "think tool recovery tokenization failed"));
     TEST_ASSERT(completion == 0);
@@ -16749,6 +17674,14 @@ static void ds4_server_unit_tests_run(void) {
     test_qwen_tool_gate_accepts_semantically_tool_free_requests();
     test_qwen_chat_ir_accepts_empty_tool_compat_fields();
     test_qwen_chat_ir_rejects_unsupported_protocol_shapes();
+    test_qwen_chat_ir_accepts_tool_roundtrip();
+    test_qwen_native_tool_parser_single_multi_and_typed();
+    test_qwen_native_tool_parser_rejects_malformed_calls();
+    test_qwen_tool_inside_thinking_is_not_executable();
+    test_tool_marker_observation_is_dialect_specific();
+    test_bounded_tool_marker_scan_handles_short_qwen_output();
+    test_qwen_openai_stream_hides_markup_and_streams_plain_text();
+    test_qwen_malformed_openai_stream_fails_closed();
     test_message_content_flags_preserve_legacy_flattening();
     test_request_defaults_use_min_p_filtering();
     test_min_p_sampling_fast_path_is_token_identical();
