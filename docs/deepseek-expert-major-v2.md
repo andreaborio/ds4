@@ -132,6 +132,67 @@ simdgroup could replace the shared RHS tile while another was still consuming
 it. The paired and split paths are byte-identical at the model frontier in the
 recorded 128- and 768-token controls.
 
+### Selected-address expert schedule
+
+Native Flash SSD prefill has one additional, deliberately narrow auto-policy.
+For batches from 256 through 760 tokens, the selected-address path orders
+routes expert-major before dispatching the paired IQ2 gate/up kernel. Mirrored
+M5 Pro measurements were neutral at 128 tokens, positive at 256 and 512, and
+positive in the isolated 760-token gate/up stage. At 768 tokens the existing
+`mm_id` path takes over, so the schedule stops before that crossover.
+
+Auto-selection requires every condition below:
+
+- Apple Metal SSD streaming with a native `ds4.expert_major.v2` store;
+- normal inference rather than quality mode or graph dumping;
+- exactly 256 routed experts with top-6 selection;
+- `IQ2_XXS` gate/up and `Q2_K` down tensors;
+- `n_tokens >= 256 && n_tokens <= 760`.
+
+The grouped pipeline is resolved lazily on its first eligible dispatch.
+Canonical DeepSeek files, resident execution on higher-memory Macs, decode,
+other context shapes, other quantizations, Qwen, GLM, CPU, CUDA, ROCm, and
+distributed execution therefore keep both their existing schedule and startup
+cost. The disable switch is the complete production rollback:
+
+```sh
+DS4_METAL_DISABLE_DEEPSEEK_EXPERT_GROUP_PREFILL=1 ./ds4 ...
+```
+
+Automatic selection also probes the backend's current selected-address
+eligibility. Existing fallback/debug controls such as disabling streaming
+selected-address, the expert address table, or routed pair fusion therefore
+continue to select their previous path instead of turning an optional schedule
+into an inference error. Explicit GROUP or TILE enable flags remain strict: an
+A/B fails if the requested schedule was not actually encoded.
+
+`DS4_METAL_ENABLE_DEEPSEEK_EXPERT_GROUP_PREFILL=1` can request the grouped
+schedule for shorter eligible SSD batches, or for a canonical DeepSeek SSD
+artifact, during an A/B. This explicit diagnostic does not broaden the
+native-only automatic policy.
+
+The campaign also keeps four independent research paths without enabling them
+by default:
+
+- `DS4_METAL_ENABLE_DEEPSEEK_PREFILL_IO_OVERLAP=1` starts selected-expert I/O
+  after router readback so it can overlap the shared-expert encode. It lost to
+  the simple grouped schedule on the measured unified-memory system.
+- `DS4_METAL_ENABLE_BALANCED_EXPERT_RECORD_PREAD=1` balances record tasks. It
+  recovered only a small fraction of the overlap loss and is not useful alone
+  in the measured cohort.
+- `DS4_METAL_ENABLE_DEEPSEEK_EXPERT_TILE_PREFILL=1` enables the lazy route-tile
+  kernels. All route-2/route-4, row-4/row-8, staged, and decoded-shared variants
+  were exact but slower because barriers and occupancy outweighed reuse.
+- `DS4_METAL_ENABLE_MOE_MM_ID_PAIR_NR16=1` selects the narrower long-prefill
+  pair tile. Its final 2K mirrored mean was 1.11% below NR32, so NR32 remains
+  the default.
+
+These switches are intentionally composable. They preserve the ability to
+repeat the full stack on a different memory tier or SSD and then ablate one
+piece at a time, without adding work to production execution that does not
+request them. Exact binary identities, paired results, zero-swap evidence, and
+frontier-logit hashes are recorded in the dated benchmark document.
+
 Only the small manifest is hashed at startup. The multi-gigabyte payload digest
 is an offline publication gate so model startup does not acquire a mandatory
 full-file read.

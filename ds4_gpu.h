@@ -223,18 +223,52 @@ int ds4_gpu_stream_expert_cache_begin_selected_load(
         const int32_t                     *selected_ids,
         uint32_t                           n_selected);
 
-/* Qwen SSD prefill/decode can expose a completed GPU route before encoding the
- * shared expert. The backend then owns one bounded pread generation while the
- * encoder submits shared-expert work. A zero generation means the capability
- * was unavailable and the caller must use the exact synchronous routed-MoE
- * fallback. n_tokens may be one for decode or a prefill micro-block. */
-typedef struct ds4_gpu_qwen35_stream_io_ticket {
+/* SSD routed MoE can expose a completed GPU route before encoding the shared
+ * expert. The backend then owns one bounded pread generation while the encoder
+ * submits shared-expert work. A zero generation means the capability was
+ * unavailable and the caller must use the exact synchronous routed-MoE
+ * fallback. */
+typedef struct ds4_gpu_stream_io_ticket {
     uint64_t generation;
     uint32_t unique_experts;
     uint32_t missing_experts;
     uint32_t max_inflight_reads;
     uint32_t asynchronous;
-} ds4_gpu_qwen35_stream_io_ticket;
+} ds4_gpu_stream_io_ticket;
+
+/* Family-neutral API used by both Qwen top-8 Q4 and DeepSeek top-6 IQ2/Q2.
+ * Types are passed explicitly so capability checks cannot accidentally
+ * advertise a selected-address kernel for the wrong model geometry. */
+int ds4_gpu_stream_io_overlap_capable(
+        uint32_t n_tokens,
+        uint32_t n_total_expert,
+        uint32_t n_selected,
+        uint32_t gate_type,
+        uint32_t down_type);
+/* True only when the ordinary SSD selected-address batch path is eligible
+ * under the current runtime policy.  Auto scheduling uses this probe so
+ * supported fallback/debug knobs keep selecting their historical path;
+ * explicit schedule requests remain fail-closed at the caller. */
+int ds4_gpu_stream_selected_addr_capable(
+        uint32_t n_tokens,
+        uint32_t n_total_expert,
+        uint32_t n_selected,
+        uint32_t gate_type,
+        uint32_t down_type);
+int ds4_gpu_stream_batch_route_ready_select(
+        const ds4_gpu_stream_expert_table *table,
+        const ds4_gpu_tensor              *selected,
+        uint32_t                           n_tokens,
+        uint32_t                           n_selected,
+        uint32_t                           gate_type,
+        uint32_t                           down_type,
+        int                                request_expert_group,
+        ds4_gpu_stream_io_ticket          *ticket);
+int ds4_gpu_stream_batch_finish(uint64_t generation);
+int ds4_gpu_stream_batch_abort(uint64_t generation);
+
+/* Compatibility names retained for the integrated Qwen exact-stack API. */
+typedef ds4_gpu_stream_io_ticket ds4_gpu_qwen35_stream_io_ticket;
 
 int ds4_gpu_qwen35_stream_io_overlap_capable(void);
 int ds4_gpu_qwen35_stream_batch_route_ready(
@@ -1319,6 +1353,48 @@ int ds4_gpu_qwen35_expert_group_capable(
         uint32_t n_expert,
         uint32_t gate_type,
         uint32_t down_type);
+
+/* Family-neutral scheduling request bits.  GROUP asks for the stable
+ * expert-major permutation; ROUTE_TILE additionally asks a compatible backend
+ * to batch consecutive routes for the same expert.  Callers may combine bits;
+ * schedule_used returns the exact subset actually encoded, so a stricter
+ * caller can require `(used & request) == request`. */
+enum {
+    DS4_GPU_EXPERT_SCHEDULE_GROUP = 1 << 0,
+    DS4_GPU_EXPERT_SCHEDULE_ROUTE_TILE = 1 << 1,
+};
+
+int ds4_gpu_routed_moe_batch_select_tensor(
+        ds4_gpu_tensor       *out,
+        ds4_gpu_tensor       *gate,
+        ds4_gpu_tensor       *up,
+        ds4_gpu_tensor       *mid,
+        ds4_gpu_tensor       *experts,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                gate_offset,
+        uint64_t                up_offset,
+        uint64_t                down_offset,
+        uint32_t                gate_type,
+        uint32_t                down_type,
+        uint64_t                gate_expert_bytes,
+        uint64_t                gate_row_bytes,
+        uint64_t                down_expert_bytes,
+        uint64_t                down_row_bytes,
+        uint32_t                expert_in_dim,
+        uint32_t                expert_mid_dim,
+        uint32_t                out_dim,
+        const ds4_gpu_tensor *selected,
+        const ds4_gpu_tensor *weights,
+        uint32_t                n_total_expert,
+        uint32_t                n_expert,
+        float                   clamp,
+        const ds4_gpu_tensor *x,
+        uint32_t                layer_index,
+        uint32_t                n_tokens,
+        bool                   *mid_is_f16,
+        int                     schedule_request,
+        int                    *schedule_used);
 
 int ds4_gpu_qwen35_routed_moe_batch_select_tensor(
         ds4_gpu_tensor       *out,

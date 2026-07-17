@@ -26,7 +26,77 @@ void ds4_qwen_expert_group_plan_init(ds4_qwen_expert_group_plan *plan) {
 void ds4_qwen_expert_group_plan_destroy(ds4_qwen_expert_group_plan *plan) {
     if (!plan) return;
     free(plan->storage);
+    free(plan->route_tile_storage);
     memset(plan, 0, sizeof(*plan));
+}
+
+static uint32_t build_route_tiles_unchecked(
+        ds4_qwen_expert_group_plan *plan,
+        uint32_t                    n_experts,
+        uint32_t                    max_routes_per_tile) {
+    uint32_t route_tile_count = 0;
+    for (uint32_t expert = 0; expert < n_experts; expert++) {
+        const uint32_t end = plan->expert_offsets[expert + 1u];
+        for (uint32_t begin = plan->expert_offsets[expert]; begin < end;) {
+            const uint32_t remaining = end - begin;
+            const uint32_t count = remaining < max_routes_per_tile
+                                     ? remaining
+                                     : max_routes_per_tile;
+            ds4_expert_group_route_tile *tile =
+                &plan->route_tiles[route_tile_count++];
+            tile->expert = expert;
+            tile->route_begin = begin;
+            tile->route_count = count;
+            tile->reserved = 0;
+            begin += count;
+        }
+    }
+    return route_tile_count;
+}
+
+ds4_qwen_expert_group_result ds4_qwen_expert_group_plan_retile(
+        ds4_qwen_expert_group_plan *plan,
+        uint32_t                    max_routes_per_tile) {
+    if (!plan || max_routes_per_tile == 0 ||
+        max_routes_per_tile > DS4_EXPERT_GROUP_ROUTE_TILE_SIZE ||
+        !plan->storage || !plan->expert_offsets || !plan->grouped_routes ||
+        !plan->canonical_to_grouped || !plan->route_tiles ||
+        plan->n_tokens == 0 || plan->routes_per_token == 0 ||
+        plan->n_experts == 0 || plan->route_count == 0 ||
+        plan->n_tokens > UINT32_MAX / plan->routes_per_token ||
+        plan->n_tokens * plan->routes_per_token != plan->route_count ||
+        plan->n_experts > plan->expert_capacity ||
+        plan->route_count > plan->route_capacity ||
+        plan->route_count > plan->route_tile_capacity ||
+        plan->expert_offsets[0] != 0 ||
+        plan->expert_offsets[plan->n_experts] != plan->route_count) {
+        return DS4_QWEN_EXPERT_GROUP_INVALID_ARGUMENT;
+    }
+
+    /* Validate every source range before overwriting the first tile.  Besides
+     * making malformed plans fail transactionally, this makes the expert
+     * boundary invariant explicit at the public API rather than relying on a
+     * caller to have used build immediately beforehand. */
+    for (uint32_t expert = 0; expert < plan->n_experts; expert++) {
+        const uint32_t begin = plan->expert_offsets[expert];
+        const uint32_t end = plan->expert_offsets[expert + 1u];
+        if (begin > end || end > plan->route_count) {
+            return DS4_QWEN_EXPERT_GROUP_INVALID_ARGUMENT;
+        }
+        for (uint32_t grouped = begin; grouped < end; grouped++) {
+            const ds4_qwen_expert_group_route route =
+                plan->grouped_routes[grouped];
+            if (route.expert != expert ||
+                route.canonical_index >= plan->route_count ||
+                plan->canonical_to_grouped[route.canonical_index] != grouped) {
+                return DS4_QWEN_EXPERT_GROUP_INVALID_ARGUMENT;
+            }
+        }
+    }
+
+    plan->route_tile_count = build_route_tiles_unchecked(
+        plan, plan->n_experts, max_routes_per_tile);
+    return DS4_QWEN_EXPERT_GROUP_OK;
 }
 
 ds4_qwen_expert_group_result ds4_qwen_expert_group_plan_reserve(
@@ -85,6 +155,12 @@ ds4_qwen_expert_group_result ds4_qwen_expert_group_plan_reserve(
               sizeof(ds4_qwen_expert_group_route);
     uint32_t *canonical_to_grouped = (uint32_t *)cursor;
 
+    /* Core growth must not discard an independently reserved tile buffer.
+     * Preserve its ownership while publishing the replacement permutation. */
+    void *const route_tile_storage = plan->route_tile_storage;
+    ds4_expert_group_route_tile *const route_tiles = plan->route_tiles;
+    const uint32_t route_tile_capacity = plan->route_tile_capacity;
+
     /* Publish the replacement only after all size checks and allocation have
      * succeeded.  This keeps the old, complete plan usable after an OOM. */
     free(plan->storage);
@@ -95,7 +171,38 @@ ds4_qwen_expert_group_result ds4_qwen_expert_group_plan_reserve(
     plan->active_experts = active_experts;
     plan->grouped_routes = grouped_routes;
     plan->canonical_to_grouped = canonical_to_grouped;
+    plan->route_tiles = route_tiles;
     plan->storage = storage;
+    plan->route_tile_storage = route_tile_storage;
+    plan->route_tile_capacity = route_tile_capacity;
+    return DS4_QWEN_EXPERT_GROUP_OK;
+}
+
+ds4_qwen_expert_group_result ds4_qwen_expert_group_plan_reserve_route_tiles(
+        ds4_qwen_expert_group_plan *plan,
+        uint32_t                    route_capacity) {
+    if (!plan || route_capacity == 0) {
+        return DS4_QWEN_EXPERT_GROUP_INVALID_ARGUMENT;
+    }
+    if (plan->route_tile_storage &&
+        plan->route_tile_capacity >= route_capacity) {
+        return DS4_QWEN_EXPERT_GROUP_OK;
+    }
+
+    if ((uint64_t)route_capacity >
+        SIZE_MAX / sizeof(ds4_expert_group_route_tile)) {
+        return DS4_QWEN_EXPERT_GROUP_OVERFLOW;
+    }
+    const size_t bytes =
+        (size_t)route_capacity * sizeof(ds4_expert_group_route_tile);
+    void *storage = malloc(bytes);
+    if (!storage) return DS4_QWEN_EXPERT_GROUP_OUT_OF_MEMORY;
+
+    free(plan->route_tile_storage);
+    plan->route_tile_storage = storage;
+    plan->route_tiles = (ds4_expert_group_route_tile *)storage;
+    plan->route_tile_capacity = route_capacity;
+    plan->route_tile_count = 0;
     return DS4_QWEN_EXPERT_GROUP_OK;
 }
 
@@ -173,11 +280,13 @@ ds4_qwen_expert_group_result ds4_qwen_expert_group_plan_build(
     }
 
     /* Metadata is committed last.  Every public dimension now describes a
-     * fully populated permutation rather than an intermediate counting pass. */
+     * fully populated permutation rather than an intermediate counting pass.
+     * Tile construction remains an explicit opt-in after this commit. */
     plan->n_tokens = n_tokens;
     plan->routes_per_token = routes_per_token;
     plan->n_experts = n_experts;
     plan->route_count = route_count;
     plan->active_expert_count = active_count;
+    plan->route_tile_count = 0;
     return DS4_QWEN_EXPERT_GROUP_OK;
 }

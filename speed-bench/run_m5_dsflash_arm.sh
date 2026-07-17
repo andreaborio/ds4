@@ -137,6 +137,18 @@ if [[ -e $prefix.logits || -e $prefix.summary || -e $prefix.csv ]]; then
     exit 2
 fi
 mkdir -p -- "$prefix.logits"
+
+# Make every artifact self-identifying.  Labels alone cannot distinguish two
+# dirty builds or reconstruct which opt-in ablation flags were active.
+bin_sha256=$(shasum -a 256 "$bin" | awk '{print $1}')
+repo_head=$(git -C "$root" rev-parse HEAD 2>/dev/null || print unknown)
+repo_diff_sha256=$(
+    git -C "$root" diff --binary 2>/dev/null | shasum -a 256 | awk '{print $1}'
+)
+model_bytes=$(stat -f %z "$model")
+model_mtime=$(stat -f %m "$model")
+env | LC_ALL=C sort |
+    awk -F= '/^DS4_(M5|METAL)_/ { print }' >"$prefix.env"
 vm_stat >"$prefix.vm.before"
 sysctl -n vm.swapusage >"$prefix.swap.before"
 
@@ -310,6 +322,14 @@ fi
     print -- "ctx_max=$ctx_max"
     print -- "step_mul=$step_mul"
     print -- "ctx_alloc=$ctx_alloc"
+    print -- "bin=$bin"
+    print -- "bin_sha256=$bin_sha256"
+    print -- "repo_head=$repo_head"
+    print -- "repo_diff_sha256=$repo_diff_sha256"
+    print -- "model=$model"
+    print -- "model_bytes=$model_bytes"
+    print -- "model_mtime_epoch=$model_mtime"
+    print -- "env_file=$prefix.env"
     print -- "pid=$run_pid"
     print -- "process_rc=$rc"
     print -- "rc=$final_rc"

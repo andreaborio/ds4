@@ -24396,6 +24396,160 @@ static bool metal_graph_encode_layer_ffn_batch(
     }
     DS4_METAL_PROFILE_FFN_STAGE("router");
 
+    ds4_gpu_stream_io_ticket routed_io_ticket = {0};
+    bool routed_io_overlap_required = false;
+#if defined(__APPLE__) && !defined(DS4_NO_GPU)
+    int routed_expert_schedule_request = 0;
+    const bool routed_expert_schedule_shape =
+        g->ssd_streaming &&
+        !g->quality &&
+        n_tokens >= 8u && n_tokens <= 760u &&
+        DS4_N_EXPERT == 256u &&
+        DS4_N_EXPERT_USED == 6u &&
+        layer->ffn_gate_exps->type == DS4_TENSOR_IQ2_XXS &&
+        layer->ffn_up_exps->type == DS4_TENSOR_IQ2_XXS &&
+        layer->ffn_down_exps->type == DS4_TENSOR_Q2_K &&
+        getenv("DS4_METAL_GRAPH_DUMP_PREFIX") == NULL;
+    /* The stable expert-major schedule is neutral at 128 tokens, then wins in
+     * mirrored runs at 256/512 and in the isolated gate-up stage at 760.  Auto
+     * therefore starts at 256 and stops before the 768-token mm_id crossover.
+     * The exact family/quantization/SSD gate above keeps full-resident Macs and
+     * every other model on their existing path; enable can force short-batch
+     * experiments and disable is the production rollback. */
+    const bool routed_expert_group_explicit =
+        getenv("DS4_METAL_ENABLE_DEEPSEEK_EXPERT_GROUP_PREFILL") != NULL;
+    const bool routed_expert_group_auto =
+        routed_expert_schedule_shape &&
+        model->native_expert_store_v2 &&
+        n_tokens >= 256u &&
+        ds4_gpu_stream_selected_addr_capable(
+            n_tokens,
+            DS4_N_EXPERT,
+            DS4_N_EXPERT_USED,
+            layer->ffn_gate_exps->type,
+            layer->ffn_down_exps->type) != 0;
+    const bool routed_expert_group_requested =
+        routed_expert_group_explicit || routed_expert_group_auto;
+    if (routed_expert_schedule_shape &&
+        routed_expert_group_requested &&
+        getenv("DS4_METAL_DISABLE_DEEPSEEK_EXPERT_GROUP_PREFILL") == NULL) {
+        routed_expert_schedule_request |= DS4_GPU_EXPERT_SCHEDULE_GROUP;
+    }
+    const bool routed_expert_tile_explicit =
+        getenv("DS4_METAL_ENABLE_DEEPSEEK_EXPERT_TILE_PREFILL") != NULL &&
+        getenv("DS4_METAL_DISABLE_DEEPSEEK_EXPERT_TILE_PREFILL") == NULL;
+    if (routed_expert_schedule_shape && routed_expert_tile_explicit) {
+        routed_expert_schedule_request |=
+            DS4_GPU_EXPERT_SCHEDULE_GROUP |
+            DS4_GPU_EXPERT_SCHEDULE_ROUTE_TILE;
+    }
+    const bool routed_expert_schedule_required =
+        routed_expert_group_explicit || routed_expert_tile_explicit;
+    /* DeepSeek selected-address prefill previously waited until routed MoE to
+     * allocate and fill its final expert slabs. Start that exact loader as
+     * soon as the router IDs are visible, then encode the independent shared
+     * expert while the bounded pread pool is active. This is deliberately
+     * opt-in until the full-stack/ablation campaign is complete. */
+    const bool routed_io_overlap_shape =
+        g->ssd_streaming &&
+        !g->quality &&
+        !layer_stage_profile &&
+        n_tokens >= 2u && n_tokens <= 760u &&
+        DS4_N_EXPERT == 256u &&
+        DS4_N_EXPERT_USED == 6u &&
+        layer->ffn_gate_exps->type == DS4_TENSOR_IQ2_XXS &&
+        layer->ffn_up_exps->type == DS4_TENSOR_IQ2_XXS &&
+        layer->ffn_down_exps->type == DS4_TENSOR_Q2_K &&
+        getenv("DS4_METAL_GRAPH_DUMP_PREFIX") == NULL;
+    routed_io_overlap_required =
+        routed_io_overlap_shape &&
+        getenv("DS4_METAL_REQUIRE_DEEPSEEK_PREFILL_IO_OVERLAP") != NULL;
+    const bool routed_io_overlap_requested =
+        routed_io_overlap_shape &&
+        (getenv("DS4_METAL_ENABLE_DEEPSEEK_PREFILL_IO_OVERLAP") != NULL ||
+         routed_io_overlap_required) &&
+        getenv("DS4_METAL_DISABLE_DEEPSEEK_PREFILL_IO_OVERLAP") == NULL;
+    if (ok && routed_io_overlap_required &&
+        !routed_io_overlap_requested) {
+        fprintf(stderr,
+                "ds4: required DeepSeek prefill I/O overlap is disabled\n");
+        ok = false;
+    }
+    if (ok && routed_io_overlap_requested) {
+        const ds4_gpu_stream_expert_table stream_table =
+            graph_stream_expert_table_make(model,
+                                           layer,
+                                           il,
+                                           gate_expert_bytes,
+                                           down_expert_bytes);
+        const bool capable = ds4_gpu_stream_io_overlap_capable(
+            n_tokens,
+            DS4_N_EXPERT,
+            DS4_N_EXPERT_USED,
+            layer->ffn_gate_exps->type,
+            layer->ffn_down_exps->type) != 0;
+        const int route_status = capable ?
+            ds4_gpu_stream_batch_route_ready_select(
+                &stream_table,
+                g->batch_router_selected,
+                n_tokens,
+                DS4_N_EXPERT_USED,
+                layer->ffn_gate_exps->type,
+                layer->ffn_down_exps->type,
+                routed_expert_schedule_request,
+                &routed_io_ticket) : 1;
+        const bool route_ready =
+            capable &&
+            route_status != 0 &&
+            routed_io_ticket.generation != 0;
+        const bool real_overlap =
+            route_ready &&
+            (routed_io_ticket.missing_experts == 0u ||
+             routed_io_ticket.asynchronous != 0u);
+        if (!real_overlap) {
+            if (routed_io_ticket.generation != 0) {
+                (void)ds4_gpu_stream_batch_abort(
+                    routed_io_ticket.generation);
+            }
+            memset(&routed_io_ticket, 0, sizeof(routed_io_ticket));
+            if (route_status == 0) {
+                /* Zero means the router-ready operation itself failed, not
+                 * merely that this engine lacks the optional capability. It
+                 * may already have committed command buffer A, so continuing
+                 * with an ordinary fallback could consume invalid route
+                 * state. */
+                fprintf(stderr,
+                        "ds4: DeepSeek prefill I/O overlap route-ready failed "
+                        "at layer %u\n",
+                        il);
+                ok = false;
+            } else if (routed_io_overlap_required) {
+                fprintf(stderr,
+                        "ds4: required DeepSeek prefill I/O overlap is unavailable "
+                        "at layer %u\n",
+                        il);
+                ok = false;
+            }
+        }
+        if (getenv("DS4_METAL_DEEPSEEK_PREFILL_IO_OVERLAP_PROFILE") != NULL) {
+            fprintf(stderr,
+                    "ds4: DeepSeek prefill I/O overlap layer=%u tokens=%u "
+                    "capable=%d ready=%d generation=%llu unique=%u "
+                    "missing=%u reads=%u async=%u strict=%d\n",
+                    il,
+                    n_tokens,
+                    capable ? 1 : 0,
+                    real_overlap ? 1 : 0,
+                    (unsigned long long)routed_io_ticket.generation,
+                    routed_io_ticket.unique_experts,
+                    routed_io_ticket.missing_experts,
+                    routed_io_ticket.max_inflight_reads,
+                    routed_io_ticket.asynchronous,
+                    routed_io_overlap_required ? 1 : 0);
+        }
+    }
+#endif
+
     if (ok) {
         ok = metal_graph_cuda_stream_prefill_batch_selected_load(g,
                                                                  model,
@@ -24440,12 +24594,14 @@ static bool metal_graph_encode_layer_ffn_batch(
 #endif
 
     const bool selected_readahead_shared =
+        routed_io_ticket.generation == 0 &&
         metal_graph_stream_prefill_selected_readahead_shared_enabled(g)
 #ifdef DS4_ROCM_BUILD
         && !rocm_batch_selected_async_started
 #endif
         ;
     if (ok &&
+        routed_io_ticket.generation == 0 &&
         metal_graph_stream_prefill_selected_readahead_enabled(g) &&
 #ifdef DS4_ROCM_BUILD
         !rocm_batch_selected_async_started &&
@@ -24556,6 +24712,7 @@ static bool metal_graph_encode_layer_ffn_batch(
 
     if (ok &&
         !shared_done &&
+        routed_io_ticket.generation == 0 &&
         (metal_graph_stream_prefill_selected_pagein_enabled(g) ||
          metal_graph_stream_prefill_selected_madvise_enabled(g))) {
         metal_graph_stream_pagein_job pagein_job;
@@ -24605,8 +24762,46 @@ static bool metal_graph_encode_layer_ffn_batch(
     }
 #endif
 
+#if defined(__APPLE__) && !defined(DS4_NO_GPU)
+    if (ok && routed_io_ticket.generation != 0) {
+        if (!shared_done) {
+            DS4_METAL_ENCODE_PREFILL_SHARED_EXPERT();
+            shared_done = ok;
+        }
+        if (ok &&
+            ds4_gpu_stream_batch_finish(
+                routed_io_ticket.generation) == 0) {
+            if (routed_io_overlap_required) {
+                fprintf(stderr,
+                        "ds4: required DeepSeek prefill I/O overlap failed "
+                        "at layer %u\n",
+                        il);
+                ok = false;
+            } else {
+                /* Most finish failures already drain/reset.  Abort as well so
+                 * generation/owner mismatch cannot strand pending state, then
+                 * keep the completed shared expert and let routed MoE use its
+                 * exact synchronous loader. */
+                (void)ds4_gpu_stream_batch_abort(
+                    routed_io_ticket.generation);
+                memset(&routed_io_ticket, 0, sizeof(routed_io_ticket));
+            }
+        }
+    }
+#endif
+
     if (ok) {
-        ok = ds4_gpu_routed_moe_batch_tensor(g->batch_routed_out,
+#if defined(__APPLE__) && !defined(DS4_NO_GPU)
+        int routed_expert_schedule_used = 0;
+#define DS4_GPU_DEEPSEEK_ROUTED_MOE(...) \
+        ds4_gpu_routed_moe_batch_select_tensor( \
+            __VA_ARGS__, routed_expert_schedule_request, \
+            &routed_expert_schedule_used)
+#else
+#define DS4_GPU_DEEPSEEK_ROUTED_MOE(...) \
+        ds4_gpu_routed_moe_batch_tensor(__VA_ARGS__)
+#endif
+        ok = DS4_GPU_DEEPSEEK_ROUTED_MOE(g->batch_routed_out,
                                                g->batch_routed_gate,
                                                g->batch_routed_up,
                                                g->batch_routed_mid,
@@ -24634,7 +24829,32 @@ static bool metal_graph_encode_layer_ffn_batch(
                                                il,
                                                n_tokens,
                                                &g->batch_routed_mid_is_f16) != 0;
+#undef DS4_GPU_DEEPSEEK_ROUTED_MOE
+#if defined(__APPLE__) && !defined(DS4_NO_GPU)
+        if (ok && routed_expert_schedule_required &&
+            routed_expert_schedule_request != 0 &&
+            (routed_expert_schedule_used &
+             routed_expert_schedule_request) !=
+                routed_expert_schedule_request) {
+            fprintf(stderr,
+                    "ds4: requested DeepSeek expert schedule 0x%x was not "
+                    "fully encoded (used=0x%x) at layer %u\n",
+                    routed_expert_schedule_request,
+                    routed_expert_schedule_used,
+                    il);
+            ok = false;
+        }
+#endif
     }
+#if defined(__APPLE__) && !defined(DS4_NO_GPU)
+    if (routed_io_ticket.generation != 0) {
+        if (!ok) {
+            (void)ds4_gpu_stream_batch_abort(
+                routed_io_ticket.generation);
+        }
+        memset(&routed_io_ticket, 0, sizeof(routed_io_ticket));
+    }
+#endif
     if (ok) {
         metal_graph_debug_dump_tensor("ffn_moe_gate_clamped", g->batch_routed_gate,
                                       (uint64_t)n_tokens * DS4_N_EXPERT_USED * down_in_dim, il, pos0);

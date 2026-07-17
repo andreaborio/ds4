@@ -2939,6 +2939,7 @@ static void test_metal_kernel_group(void) {
     test_metal_f16_prefill_matmul();
     test_metal_q8_0_prefill_matmul();
     test_metal_qwen35_primitives();
+    TEST_ASSERT(ds4_gpu_internal_qwen35_expert_group_test() != 0);
     test_metal_q4_selected_slots_runtime_count();
 }
 

@@ -2011,6 +2011,913 @@ struct ds4_metal_qwen35_expert_group_route {
     uint32_t canonical_index;
 };
 
+/* Four routes selecting the same expert form one Metal work tile.  The host
+ * constructs these records from the stable expert-major route list, so
+ * route_begin always addresses consecutive records with the same expert.
+ * Keeping this ABI separate from the route itself lets Qwen retain its
+ * established one-route-per-threadgroup kernel. */
+struct ds4_metal_expert_group_route_tile {
+    uint32_t expert;
+    uint32_t route_begin;
+    uint32_t route_count;
+    uint32_t reserved;
+};
+
+/* DeepSeek uses the same stable expert-major schedule as Qwen, but keeps its
+ * native IQ2 pair primitive. Work is reordered only while reading gate/up
+ * weights; every intermediate is scattered back to canonical token/slot
+ * storage so the Q2 down reduction observes exactly the baseline order. */
+kernel void kernel_mul_mv_addr_iq2_xxs_pair_swiglu_grouped_f32(
+        constant ds4_metal_args_mul_mv_id & args,
+        constant ds4_metal_dsv4_moe_swiglu_weight_args & act,
+        device const ulong * gate_addrs,
+        device const ulong * up_addrs,
+        device const char * src1,
+        device       char * dst_gate,
+        device       char * dst_up,
+        device       char * dst_mid,
+        device const ds4_metal_qwen35_expert_group_route * routes,
+        device const char * weights,
+        threadgroup  char * shmem [[threadgroup(0)]],
+        uint3  tgpig[[threadgroup_position_in_grid]],
+        ushort tiitg[[thread_index_in_threadgroup]],
+        ushort tiisg[[thread_index_in_simdgroup]],
+        ushort sgitg[[simdgroup_index_in_threadgroup]]) {
+    const uint grouped_index = tgpig.z;
+    const ds4_metal_qwen35_expert_group_route route =
+        routes[grouped_index];
+    if (route.expert >= (uint)args.ne02 || route.expert >= 256u ||
+        route.token_row >= (uint)args.nei1 ||
+        route.route_slot >= (uint)args.nei0 ||
+        route.canonical_index !=
+            route.token_row * (uint)args.nei0 + route.route_slot) {
+        return;
+    }
+
+    const ulong gate_addr = gate_addrs[route.expert];
+    const ulong up_addr = up_addrs[route.expert];
+    if (gate_addr == 0 || up_addr == 0) return;
+
+    tgpig.z = 0;
+    device const char *src0_gate_cur =
+        reinterpret_cast<device const char *>(gate_addr);
+    device const char *src0_up_cur =
+        reinterpret_cast<device const char *>(up_addr);
+    device const char *src1_cur =
+        src1 + (uint64_t)route.token_row * args.nb12;
+    const uint64_t dst_row = (uint64_t)route.canonical_index * args.ne0;
+    device char *dst_gate_cur = dst_gate + dst_row * sizeof(float);
+    device char *dst_up_cur = dst_up + dst_row * sizeof(float);
+
+    ds4_metal_args_mul_mv args0 = {
+        args.ne00, args.ne01, 1,
+        args.nb00, args.nb01, args.nb02, args.nb02,
+        args.ne10, 1, 1,
+        args.nb10, args.nb11, args.nb12, args.nb12,
+        args.ne0, 1, args.nr0, 1, 1,
+    };
+
+    kernel_mul_mv_iq2_xxs_pair_f32_impl<N_R0_IQ2_XXS>(
+        args0,
+        src0_gate_cur,
+        src0_up_cur,
+        src1_cur,
+        dst_gate_cur,
+        dst_up_cur,
+        shmem,
+        tgpig,
+        tiisg,
+        sgitg);
+
+    const short NSG = FC_mul_mv_nsg;
+    const int first_row =
+        (tgpig.x * NSG + sgitg) * N_R0_IQ2_XXS;
+    device float *gate_f32 = (device float *)dst_gate_cur;
+    device float *up_f32 = (device float *)dst_up_cur;
+    device float *mid_f32 = (device float *)(
+        dst_mid + (uint64_t)route.canonical_index * act.mid_row_stride);
+    device const float *route_w = (device const float *)(
+        weights + (uint64_t)route.canonical_index * act.weight_stride);
+    const float c = act.clamp_value;
+    const float route_weight = route_w[0];
+
+    if (tiisg == 0) {
+        for (int row = 0;
+             row < N_R0_IQ2_XXS && first_row + row < args.ne0;
+             ++row) {
+            const uint out_row = first_row + row;
+            float g = gate_f32[out_row];
+            float u = up_f32[out_row];
+            if (c > 1.0e-6f) {
+                g = min(g, c);
+                u = clamp(u, -c, c);
+            }
+            const float silu = g / (1.0f + exp(-g));
+            mid_f32[out_row] = silu * u * route_weight;
+        }
+    }
+
+    (void)tiitg;
+}
+
+/* DeepSeek Flash's ordinary grouped kernel only changes dispatch order: every
+ * route still fetches the same expert weights in an independent threadgroup.
+ * This tiled implementation makes the reuse explicit.  Four simdgroups
+ * consume up to four RHS rows for one expert while cooperatively staging all
+ * compressed IQ2 blocks for row_tile output rows.  Staging compressed blocks
+ * (rather than pre-dequantized floats) is deliberate: every route retains the
+ * baseline lane-local accumulation and simd_sum order, which keeps the result
+ * bit identical while cutting physical gate/up weight traffic.
+ *
+ * Flash geometry is 4096 input columns and 2048 output rows.  The row4
+ * specialization uses 8448 bytes of compressed weights plus 2176 bytes of IQ2
+ * lookup tables (10624 total).  Row8 uses 16896 + 2176 = 19072 bytes.  Both
+ * specializations stage the complete tile and therefore need only one
+ * threadgroup barrier. */
+template<int route_tile, int row_tile>
+void kernel_mul_mv_addr_iq2_xxs_pair_swiglu_tiled_f32_impl(
+        constant ds4_metal_args_mul_mv_id & args,
+        constant ds4_metal_dsv4_moe_swiglu_weight_args & act,
+        device const ulong * gate_addrs,
+        device const ulong * up_addrs,
+        device const char * src1,
+        device       char * dst_gate,
+        device       char * dst_up,
+        device       char * dst_mid,
+        device const ds4_metal_qwen35_expert_group_route * routes,
+        device const ds4_metal_expert_group_route_tile * tiles,
+        device const char * weights,
+        threadgroup  char * shmem,
+        uint3  tgpig,
+        ushort tiitg,
+        ushort tiisg,
+        ushort sgitg) {
+    static_assert(route_tile == 2 || route_tile == 4,
+                  "IQ2 expert tiles support only 2/4 routes");
+    static_assert(row_tile == 4 || row_tile == 8,
+                  "IQ2 expert tiles support only 4/8 output rows");
+    constexpr uint threadgroup_width = (uint)route_tile * 32u;
+    constexpr uint blocks_per_row = 16u;
+    constexpr uint bytes_per_block = 66u;
+    constexpr uint words_per_block = bytes_per_block / 2u;
+    constexpr uint rows_and_projections = row_tile * 2u;
+    constexpr uint compressed_words =
+        rows_and_projections * blocks_per_row * words_per_block;
+
+    const ds4_metal_expert_group_route_tile tile = tiles[tgpig.z];
+    const uint total_routes = (uint)args.nei0 * (uint)args.nei1;
+    if (tile.expert >= (uint)args.ne02 || tile.expert >= 256u ||
+        tile.route_count == 0u || tile.route_count > (uint)route_tile ||
+        tile.route_begin > total_routes ||
+        tile.route_count > total_routes - tile.route_begin ||
+        args.ne00 != 4096 || args.ne01 != 2048 ||
+        args.ne0 != 2048 || args.nei0 != 6 ||
+        args.nb01 != 16u * bytes_per_block) {
+        return;
+    }
+
+    const ulong gate_addr = gate_addrs[tile.expert];
+    const ulong up_addr = up_addrs[tile.expert];
+    if (gate_addr == 0u || up_addr == 0u) return;
+
+    const uint first_row = tgpig.x * row_tile;
+    const bool active_route = sgitg < tile.route_count;
+    ds4_metal_qwen35_expert_group_route route = {0u, 0u, 0u, 0u};
+    if (active_route) {
+        route = routes[tile.route_begin + (uint)sgitg];
+    }
+    const bool valid_route =
+        active_route && route.expert == tile.expert &&
+        route.token_row < (uint)args.nei1 &&
+        route.route_slot < (uint)args.nei0 &&
+        route.canonical_index ==
+            route.token_row * (uint)args.nei0 + route.route_slot;
+
+    device const uchar * gate_bytes =
+        reinterpret_cast<device const uchar *>(gate_addr);
+    device const uchar * up_bytes =
+        reinterpret_cast<device const uchar *>(up_addr);
+    device const float * y = valid_route ?
+        (device const float *)(src1 + (uint64_t)route.token_row * args.nb12) :
+        (device const float *)src1;
+
+    float sumg[row_tile] = {0.f};
+    float sumu[row_tile] = {0.f};
+    float yl[32];
+
+    threadgroup ulong * svalues = (threadgroup ulong *)shmem;
+    threadgroup uchar * ssigns =
+        (threadgroup uchar *)(svalues + 256u);
+    threadgroup ushort * compressed =
+        (threadgroup ushort *)(ssigns + 128u);
+
+    /* Load the same lookup representation used by the baseline helper.  The
+     * loader is indexed by the full threadgroup: reusing the old per-simdgroup
+     * pattern with four simdgroups would overrun both lookup arrays. */
+    for (uint i = (uint)tiitg; i < 256u; i += threadgroup_width) {
+        svalues[i] = ds4_metal_iq2xxs_grid[i];
+    }
+    for (uint i = (uint)tiitg; i < 128u; i += threadgroup_width) {
+        ssigns[i] = ds4_metal_ksigns_iq2xs[i];
+    }
+
+    /* Copy 16 complete IQ2 blocks for every gate/up output row.  ushort loads
+     * preserve the half scale bits, are naturally aligned by the 66-byte block
+     * ABI, and halve the scalar copy instruction count versus uchar staging. */
+    for (uint word_index = (uint)tiitg;
+         word_index < compressed_words;
+         word_index += threadgroup_width) {
+        const uint row_projection =
+            word_index / (blocks_per_row * words_per_block);
+        const uint within =
+            word_index % (blocks_per_row * words_per_block);
+        const uint row = row_projection % row_tile;
+        const uint projection = row_projection / row_tile;
+        const uint block = within / words_per_block;
+        const uint word = within % words_per_block;
+        const device ushort * source =
+            (device const ushort *)((projection == 0u ? gate_bytes : up_bytes) +
+                (uint64_t)(first_row + row) * args.nb01 +
+                (uint64_t)block * bytes_per_block);
+        compressed[word_index] = source[word];
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    /* Each iteration advances every lane by 32 IQ2 sub-blocks, exactly
+     * matching the baseline sequence lane, lane+32, lane+64, lane+96. */
+    for (uint stage = 0u; stage < 4u; ++stage) {
+
+        if (valid_route) {
+            const uint ib32 = stage * 32u + (uint)tiisg;
+            device const float * y32 = y + ib32 * 32u;
+            for (short i = 0; i < 32; ++i) yl[i] = y32[i];
+
+            const uint block_in_stage = (uint)tiisg / 8u;
+            const uint subblock = (uint)tiisg % 8u;
+            const uint block = stage * 4u + block_in_stage;
+            for (short row = 0; row < (short)row_tile; ++row) {
+                const uint gate_block_index =
+                    ((uint)row) * blocks_per_row + block;
+                const uint up_block_index =
+                    (row_tile + (uint)row) * blocks_per_row + block;
+                threadgroup const block_iq2_xxs * xg =
+                    (threadgroup const block_iq2_xxs *)compressed +
+                    gate_block_index;
+                threadgroup const block_iq2_xxs * xu =
+                    (threadgroup const block_iq2_xxs *)compressed +
+                    up_block_index;
+                threadgroup const ushort * qg = xg->qs + 4u * subblock;
+                threadgroup const ushort * qu = xu->qs + 4u * subblock;
+                threadgroup const uchar * aux8g =
+                    (threadgroup const uchar *)qg;
+                threadgroup const uchar * aux8u =
+                    (threadgroup const uchar *)qu;
+                const uint aux32g = (uint)qg[2] | ((uint)qg[3] << 16);
+                const uint aux32u = (uint)qu[2] | ((uint)qu[3] << 16);
+                const float dg = (float)xg->d *
+                    (0.5f + (float)(aux32g >> 28));
+                const float du = (float)xu->d *
+                    (0.5f + (float)(aux32u >> 28));
+
+                float sg = 0.f;
+                float su = 0.f;
+                for (short l = 0; l < 4; ++l) {
+                    threadgroup const uchar * gridg =
+                        (threadgroup const uchar *)(svalues + aux8g[l]);
+                    threadgroup const uchar * gridu =
+                        (threadgroup const uchar *)(svalues + aux8u[l]);
+                    const uchar signg =
+                        ssigns[(aux32g >> (7*l)) & 127];
+                    const uchar signu =
+                        ssigns[(aux32u >> (7*l)) & 127];
+                    for (short j = 0; j < 8; ++j) {
+                        const float v = yl[8*l + j];
+                        sg += v * (float)gridg[j] *
+                            (signg & ds4_metal_kmask_iq2xs[j] ? -1.f : 1.f);
+                        su += v * (float)gridu[j] *
+                            (signu & ds4_metal_kmask_iq2xs[j] ? -1.f : 1.f);
+                    }
+                }
+                sumg[row] += dg * sg;
+                sumu[row] += du * su;
+            }
+        }
+    }
+
+    if (!valid_route) return;
+    const uint64_t dst_row =
+        (uint64_t)route.canonical_index * (uint64_t)args.ne0;
+    device float * gate_out = (device float *)dst_gate + dst_row;
+    device float * up_out = (device float *)dst_up + dst_row;
+    device float * mid_out = (device float *)(
+        dst_mid + (uint64_t)route.canonical_index * act.mid_row_stride);
+    device const float * route_w = (device const float *)(
+        weights + (uint64_t)route.canonical_index * act.weight_stride);
+    const float c = act.clamp_value;
+    const float route_weight = route_w[0];
+
+    for (short row = 0;
+         row < (short)row_tile && first_row + (uint)row < (uint)args.ne0;
+         ++row) {
+        const float sum_gate = simd_sum(sumg[row]) * 0.25f;
+        const float sum_up = simd_sum(sumu[row]) * 0.25f;
+        if (tiisg == 0) {
+            const uint out_row = first_row + (uint)row;
+            gate_out[out_row] = sum_gate;
+            up_out[out_row] = sum_up;
+            float g = sum_gate;
+            float u = sum_up;
+            if (c > 1.0e-6f) {
+                g = min(g, c);
+                u = clamp(u, -c, c);
+            }
+            const float silu = g / (1.0f + exp(-g));
+            mid_out[out_row] = silu * u * route_weight;
+        }
+    }
+}
+
+/* Keep the original entry point as the conservative three-resident-tile
+ * specialization.  The host dispatches ceil(2048 / 4) row groups. */
+kernel void kernel_mul_mv_addr_iq2_xxs_pair_swiglu_tiled_f32(
+        constant ds4_metal_args_mul_mv_id & args,
+        constant ds4_metal_dsv4_moe_swiglu_weight_args & act,
+        device const ulong * gate_addrs,
+        device const ulong * up_addrs,
+        device const char * src1,
+        device       char * dst_gate,
+        device       char * dst_up,
+        device       char * dst_mid,
+        device const ds4_metal_qwen35_expert_group_route * routes,
+        device const ds4_metal_expert_group_route_tile * tiles,
+        device const char * weights,
+        threadgroup  char * shmem [[threadgroup(0)]],
+        uint3  tgpig[[threadgroup_position_in_grid]],
+        ushort tiitg[[thread_index_in_threadgroup]],
+        ushort tiisg[[thread_index_in_simdgroup]],
+        ushort sgitg[[simdgroup_index_in_threadgroup]]) {
+    kernel_mul_mv_addr_iq2_xxs_pair_swiglu_tiled_f32_impl<4, 4>(
+        args, act, gate_addrs, up_addrs, src1, dst_gate, dst_up, dst_mid,
+        routes, tiles, weights, shmem, tgpig, tiitg, tiisg, sgitg);
+}
+
+/* Two-route specialization for shallow expert buckets.  It stages the same
+ * row4 compressed tile as the four-route kernel, but uses only two
+ * simdgroups (64 threads).  The cooperative-copy stride follows the template
+ * route count, so every lookup and compressed word is still initialized
+ * before the single publishing barrier.  The host supplies route tiles with
+ * at most two records and allocates the same 10624 bytes of threadgroup
+ * memory as row4/route4. */
+kernel void kernel_mul_mv_addr_iq2_xxs_pair_swiglu_tiled_pair_f32(
+        constant ds4_metal_args_mul_mv_id & args,
+        constant ds4_metal_dsv4_moe_swiglu_weight_args & act,
+        device const ulong * gate_addrs,
+        device const ulong * up_addrs,
+        device const char * src1,
+        device       char * dst_gate,
+        device       char * dst_up,
+        device       char * dst_mid,
+        device const ds4_metal_qwen35_expert_group_route * routes,
+        device const ds4_metal_expert_group_route_tile * tiles,
+        device const char * weights,
+        threadgroup  char * shmem [[threadgroup(0)]],
+        uint3  tgpig[[threadgroup_position_in_grid]],
+        ushort tiitg[[thread_index_in_threadgroup]],
+        ushort tiisg[[thread_index_in_simdgroup]],
+        ushort sgitg[[simdgroup_index_in_threadgroup]]) {
+    kernel_mul_mv_addr_iq2_xxs_pair_swiglu_tiled_f32_impl<2, 4>(
+        args, act, gate_addrs, up_addrs, src1, dst_gate, dst_up, dst_mid,
+        routes, tiles, weights, shmem, tgpig, tiitg, tiisg, sgitg);
+}
+
+/* Row8 halves the number of row-group dispatches.  Its full compressed tile
+ * and lookup tables require exactly 19072 bytes of threadgroup memory; the
+ * host dispatches ceil(2048 / 8) row groups. */
+kernel void kernel_mul_mv_addr_iq2_xxs_pair_swiglu_tiled_r8_f32(
+        constant ds4_metal_args_mul_mv_id & args,
+        constant ds4_metal_dsv4_moe_swiglu_weight_args & act,
+        device const ulong * gate_addrs,
+        device const ulong * up_addrs,
+        device const char * src1,
+        device       char * dst_gate,
+        device       char * dst_up,
+        device       char * dst_mid,
+        device const ds4_metal_qwen35_expert_group_route * routes,
+        device const ds4_metal_expert_group_route_tile * tiles,
+        device const char * weights,
+        threadgroup  char * shmem [[threadgroup(0)]],
+        uint3  tgpig[[threadgroup_position_in_grid]],
+        ushort tiitg[[thread_index_in_threadgroup]],
+        ushort tiisg[[thread_index_in_simdgroup]],
+        ushort sgitg[[simdgroup_index_in_threadgroup]]) {
+    kernel_mul_mv_addr_iq2_xxs_pair_swiglu_tiled_f32_impl<4, 8>(
+        args, act, gate_addrs, up_addrs, src1, dst_gate, dst_up, dst_mid,
+        routes, tiles, weights, shmem, tgpig, tiitg, tiisg, sgitg);
+}
+
+/* Stage only 1024 input columns at a time.  The full-compressed variants
+ * above minimize barriers by keeping all 16 IQ2 blocks for every row in
+ * threadgroup memory.  This specialization trades three extra load/consume
+ * rounds for substantially lower residency pressure:
+ *
+ *   256 IQ2 lookup ulongs + 128 sign bytes = 2176 bytes
+ *   4 rows * gate/up * 4 IQ2 blocks * 66   = 2112 bytes
+ *                                             ----------
+ *                                             4288 bytes
+ *
+ * A simdgroup owns one route while all simdgroups cooperatively copy the
+ * selected expert's compressed blocks.  Inactive simdgroups in a short tail
+ * still execute both barriers.  For each lane the four stages consume slices
+ * lane, lane+32, lane+64, lane+96, preserving the baseline accumulation and
+ * simd_sum order exactly. */
+template<int route_tile>
+void kernel_mul_mv_addr_iq2_xxs_pair_swiglu_tiled_staged_f32_impl(
+        constant ds4_metal_args_mul_mv_id & args,
+        constant ds4_metal_dsv4_moe_swiglu_weight_args & act,
+        device const ulong * gate_addrs,
+        device const ulong * up_addrs,
+        device const char * src1,
+        device       char * dst_gate,
+        device       char * dst_up,
+        device       char * dst_mid,
+        device const ds4_metal_qwen35_expert_group_route * routes,
+        device const ds4_metal_expert_group_route_tile * tiles,
+        device const char * weights,
+        threadgroup  char * shmem,
+        uint3  tgpig,
+        ushort tiitg,
+        ushort tiisg,
+        ushort sgitg,
+        ushort3 threads) {
+    static_assert(route_tile == 2 || route_tile == 4,
+                  "staged IQ2 expert tiles support only 2/4 routes");
+    constexpr uint row_tile = 4u;
+    constexpr uint threadgroup_width = (uint)route_tile * 32u;
+    constexpr uint blocks_per_stage = 4u;
+    constexpr uint bytes_per_block = 66u;
+    constexpr uint words_per_block = bytes_per_block / 2u;
+    constexpr uint rows_and_projections = row_tile * 2u;
+    constexpr uint compressed_words =
+        rows_and_projections * blocks_per_stage * words_per_block;
+
+    const ds4_metal_expert_group_route_tile tile = tiles[tgpig.z];
+    const uint total_routes = (uint)args.nei0 * (uint)args.nei1;
+    const uint first_row = tgpig.x * row_tile;
+    const uint actual_thread_count =
+        (uint)threads.x * (uint)threads.y * (uint)threads.z;
+    if (actual_thread_count != threadgroup_width ||
+        tile.expert >= (uint)args.ne02 || tile.expert >= 256u ||
+        tile.route_count == 0u || tile.route_count > (uint)route_tile ||
+        tile.route_begin > total_routes ||
+        tile.route_count > total_routes - tile.route_begin ||
+        args.ne00 != 4096 || args.ne01 != 2048 ||
+        args.ne0 != 2048 || args.nei0 != 6 ||
+        args.nb01 != 16u * bytes_per_block ||
+        first_row >= (uint)args.ne0) {
+        return;
+    }
+
+    const ulong gate_addr = gate_addrs[tile.expert];
+    const ulong up_addr = up_addrs[tile.expert];
+    if (gate_addr == 0u || up_addr == 0u) return;
+
+    const bool active_route = (uint)sgitg < tile.route_count;
+    ds4_metal_qwen35_expert_group_route route = {0u, 0u, 0u, 0u};
+    if (active_route) {
+        route = routes[tile.route_begin + (uint)sgitg];
+    }
+    const bool valid_route =
+        active_route && route.expert == tile.expert &&
+        route.token_row < (uint)args.nei1 &&
+        route.route_slot < (uint)args.nei0 &&
+        route.canonical_index ==
+            route.token_row * (uint)args.nei0 + route.route_slot;
+
+    device const uchar * gate_bytes =
+        reinterpret_cast<device const uchar *>(gate_addr);
+    device const uchar * up_bytes =
+        reinterpret_cast<device const uchar *>(up_addr);
+    device const float * y = valid_route ?
+        (device const float *)(src1 +
+            (uint64_t)route.token_row * args.nb12) :
+        (device const float *)src1;
+
+    float sumg[row_tile] = {0.f};
+    float sumu[row_tile] = {0.f};
+    float yl[32];
+
+    threadgroup ulong * svalues = (threadgroup ulong *)shmem;
+    threadgroup uchar * ssigns =
+        (threadgroup uchar *)(svalues + 256u);
+    threadgroup ushort * compressed =
+        (threadgroup ushort *)(ssigns + 128u);
+
+    for (uint stage = 0u; stage < 4u; ++stage) {
+        /* The tables are published by the same first-stage barrier as the
+         * first compressed slab; no separate setup synchronization is
+         * needed. */
+        if (stage == 0u) {
+            for (uint i = (uint)tiitg;
+                 i < 256u;
+                 i += threadgroup_width) {
+                svalues[i] = ds4_metal_iq2xxs_grid[i];
+            }
+            for (uint i = (uint)tiitg;
+                 i < 128u;
+                 i += threadgroup_width) {
+                ssigns[i] = ds4_metal_ksigns_iq2xs[i];
+            }
+        }
+
+        for (uint word_index = (uint)tiitg;
+             word_index < compressed_words;
+             word_index += threadgroup_width) {
+            const uint row_projection =
+                word_index / (blocks_per_stage * words_per_block);
+            const uint within =
+                word_index % (blocks_per_stage * words_per_block);
+            const uint row = row_projection % row_tile;
+            const uint projection = row_projection / row_tile;
+            const uint block_in_stage = within / words_per_block;
+            const uint word = within % words_per_block;
+            const uint block = stage * blocks_per_stage + block_in_stage;
+            const device ushort * source =
+                (device const ushort *)(
+                    (projection == 0u ? gate_bytes : up_bytes) +
+                    (uint64_t)(first_row + row) * args.nb01 +
+                    (uint64_t)block * bytes_per_block);
+            compressed[word_index] = source[word];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        if (valid_route) {
+            const uint ib32 = stage * 32u + (uint)tiisg;
+            device const float * y32 = y + ib32 * 32u;
+            for (short i = 0; i < 32; ++i) yl[i] = y32[i];
+
+            const uint block_in_stage = (uint)tiisg / 8u;
+            const uint subblock = (uint)tiisg % 8u;
+            for (short row = 0; row < (short)row_tile; ++row) {
+                const uint gate_block_index =
+                    (uint)row * blocks_per_stage + block_in_stage;
+                const uint up_block_index =
+                    (row_tile + (uint)row) * blocks_per_stage +
+                    block_in_stage;
+                threadgroup const block_iq2_xxs * xg =
+                    (threadgroup const block_iq2_xxs *)compressed +
+                    gate_block_index;
+                threadgroup const block_iq2_xxs * xu =
+                    (threadgroup const block_iq2_xxs *)compressed +
+                    up_block_index;
+                threadgroup const ushort * qg =
+                    xg->qs + 4u * subblock;
+                threadgroup const ushort * qu =
+                    xu->qs + 4u * subblock;
+                threadgroup const uchar * aux8g =
+                    (threadgroup const uchar *)qg;
+                threadgroup const uchar * aux8u =
+                    (threadgroup const uchar *)qu;
+                const uint aux32g =
+                    (uint)qg[2] | ((uint)qg[3] << 16);
+                const uint aux32u =
+                    (uint)qu[2] | ((uint)qu[3] << 16);
+                const float dg = (float)xg->d *
+                    (0.5f + (float)(aux32g >> 28));
+                const float du = (float)xu->d *
+                    (0.5f + (float)(aux32u >> 28));
+
+                float sg = 0.f;
+                float su = 0.f;
+                for (short l = 0; l < 4; ++l) {
+                    threadgroup const uchar * gridg =
+                        (threadgroup const uchar *)(svalues + aux8g[l]);
+                    threadgroup const uchar * gridu =
+                        (threadgroup const uchar *)(svalues + aux8u[l]);
+                    const uchar signg =
+                        ssigns[(aux32g >> (7*l)) & 127];
+                    const uchar signu =
+                        ssigns[(aux32u >> (7*l)) & 127];
+                    for (short j = 0; j < 8; ++j) {
+                        const float v = yl[8*l + j];
+                        sg += v * (float)gridg[j] *
+                            (signg & ds4_metal_kmask_iq2xs[j] ? -1.f : 1.f);
+                        su += v * (float)gridu[j] *
+                            (signu & ds4_metal_kmask_iq2xs[j] ? -1.f : 1.f);
+                    }
+                }
+                sumg[row] += dg * sg;
+                sumu[row] += du * su;
+            }
+        }
+
+        /* This barrier is deliberately unconditional.  It protects the
+         * single compressed slab from the next stage's cooperative overwrite
+         * even when only one route in the tile is active. */
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    if (!valid_route) return;
+    const uint64_t dst_row =
+        (uint64_t)route.canonical_index * (uint64_t)args.ne0;
+    device float * gate_out = (device float *)dst_gate + dst_row;
+    device float * up_out = (device float *)dst_up + dst_row;
+    device float * mid_out = (device float *)(
+        dst_mid + (uint64_t)route.canonical_index * act.mid_row_stride);
+    device const float * route_w = (device const float *)(
+        weights + (uint64_t)route.canonical_index * act.weight_stride);
+    const float c = act.clamp_value;
+    const float route_weight = route_w[0];
+
+    for (short row = 0;
+         row < (short)row_tile &&
+             first_row + (uint)row < (uint)args.ne0;
+         ++row) {
+        const float sum_gate = simd_sum(sumg[row]) * 0.25f;
+        const float sum_up = simd_sum(sumu[row]) * 0.25f;
+        if (tiisg == 0) {
+            const uint out_row = first_row + (uint)row;
+            gate_out[out_row] = sum_gate;
+            up_out[out_row] = sum_up;
+            float g = sum_gate;
+            float u = sum_up;
+            if (c > 1.0e-6f) {
+                g = min(g, c);
+                u = clamp(u, -c, c);
+            }
+            const float silu = g / (1.0f + exp(-g));
+            mid_out[out_row] = silu * u * route_weight;
+        }
+    }
+}
+
+/* Four routes, four output rows, 128 threads, 4288 bytes threadgroup. */
+kernel void kernel_mul_mv_addr_iq2_xxs_pair_swiglu_tiled_staged_f32(
+        constant ds4_metal_args_mul_mv_id & args,
+        constant ds4_metal_dsv4_moe_swiglu_weight_args & act,
+        device const ulong * gate_addrs,
+        device const ulong * up_addrs,
+        device const char * src1,
+        device       char * dst_gate,
+        device       char * dst_up,
+        device       char * dst_mid,
+        device const ds4_metal_qwen35_expert_group_route * routes,
+        device const ds4_metal_expert_group_route_tile * tiles,
+        device const char * weights,
+        threadgroup  char * shmem [[threadgroup(0)]],
+        uint3  tgpig[[threadgroup_position_in_grid]],
+        ushort tiitg[[thread_index_in_threadgroup]],
+        ushort tiisg[[thread_index_in_simdgroup]],
+        ushort sgitg[[simdgroup_index_in_threadgroup]],
+        ushort3 threads[[threads_per_threadgroup]]) {
+    kernel_mul_mv_addr_iq2_xxs_pair_swiglu_tiled_staged_f32_impl<4>(
+        args, act, gate_addrs, up_addrs, src1, dst_gate, dst_up, dst_mid,
+        routes, tiles, weights, shmem, tgpig, tiitg, tiisg, sgitg, threads);
+}
+
+/* Two routes, four output rows, 64 threads, 4288 bytes threadgroup. */
+kernel void kernel_mul_mv_addr_iq2_xxs_pair_swiglu_tiled_pair_staged_f32(
+        constant ds4_metal_args_mul_mv_id & args,
+        constant ds4_metal_dsv4_moe_swiglu_weight_args & act,
+        device const ulong * gate_addrs,
+        device const ulong * up_addrs,
+        device const char * src1,
+        device       char * dst_gate,
+        device       char * dst_up,
+        device       char * dst_mid,
+        device const ds4_metal_qwen35_expert_group_route * routes,
+        device const ds4_metal_expert_group_route_tile * tiles,
+        device const char * weights,
+        threadgroup  char * shmem [[threadgroup(0)]],
+        uint3  tgpig[[threadgroup_position_in_grid]],
+        ushort tiitg[[thread_index_in_threadgroup]],
+        ushort tiisg[[thread_index_in_simdgroup]],
+        ushort sgitg[[simdgroup_index_in_threadgroup]],
+        ushort3 threads[[threads_per_threadgroup]]) {
+    kernel_mul_mv_addr_iq2_xxs_pair_swiglu_tiled_staged_f32_impl<2>(
+        args, act, gate_addrs, up_addrs, src1, dst_gate, dst_up, dst_mid,
+        routes, tiles, weights, shmem, tgpig, tiitg, tiisg, sgitg, threads);
+}
+
+/* Decode-shared DeepSeek IQ2 tile.  The compressed-tile variant above avoids
+ * rereading an expert's bytes for every route, but still decodes those bytes
+ * independently in all four simdgroups.  This variant moves that second kind
+ * of reuse into threadgroup memory as well: for each 1024-column stage, the
+ * whole threadgroup decodes gate/up for four output rows exactly once, then
+ * four simdgroups consume the same magnitudes, sign masks and F32 scales for
+ * their independent RHS rows.
+ *
+ * The 10240-byte layout is intentionally explicit and contains no F16 decoded
+ * values:
+ *
+ *   8 planes * 32 slices * 32 magnitudes = 8192 uchar
+ *   8 planes * 32 slices *  4 sign masks = 1024 uchar
+ *   8 planes * 32 slices *  1 scale      = 1024 float bytes
+ *
+ * A barrier after decode publishes a complete stage; the second barrier keeps
+ * every simdgroup out of the next overwrite until all active routes have
+ * consumed it.  Inactive tail simdgroups participate in both barriers. */
+kernel void kernel_mul_mv_addr_iq2_xxs_pair_swiglu_tiled_decode_f32(
+        constant ds4_metal_args_mul_mv_id & args,
+        constant ds4_metal_dsv4_moe_swiglu_weight_args & act,
+        device const ulong * gate_addrs,
+        device const ulong * up_addrs,
+        device const char * src1,
+        device       char * dst_gate,
+        device       char * dst_up,
+        device       char * dst_mid,
+        device const ds4_metal_qwen35_expert_group_route * routes,
+        device const ds4_metal_expert_group_route_tile * tiles,
+        device const char * weights,
+        threadgroup  char * shmem [[threadgroup(0)]],
+        uint3  tgpig[[threadgroup_position_in_grid]],
+        ushort tiitg[[thread_index_in_threadgroup]],
+        ushort tiisg[[thread_index_in_simdgroup]],
+        ushort sgitg[[simdgroup_index_in_threadgroup]],
+        ushort3 threads[[threads_per_threadgroup]]) {
+    constexpr uint route_tile = 4u;
+    constexpr uint row_tile = 4u;
+    constexpr uint slices_per_stage = 32u;
+    constexpr uint values_per_slice = 32u;
+    constexpr uint signs_per_slice = 4u;
+    constexpr uint plane_count = 2u * row_tile;
+    constexpr uint magnitude_count =
+        plane_count * slices_per_stage * values_per_slice;
+    constexpr uint sign_count =
+        plane_count * slices_per_stage * signs_per_slice;
+
+    const ds4_metal_expert_group_route_tile tile = tiles[tgpig.z];
+    const uint total_routes = (uint)args.nei0 * (uint)args.nei1;
+    const uint first_row = tgpig.x * row_tile;
+    const uint thread_count =
+        (uint)threads.x * (uint)threads.y * (uint)threads.z;
+    if (thread_count != 128u ||
+        tile.expert >= (uint)args.ne02 || tile.expert >= 256u ||
+        tile.route_count == 0u || tile.route_count > route_tile ||
+        tile.route_begin > total_routes ||
+        tile.route_count > total_routes - tile.route_begin ||
+        args.ne00 != 4096 || args.ne01 != 2048 ||
+        args.ne0 != 2048 || args.nei0 != 6 ||
+        args.nb01 != 16u * (uint)sizeof(block_iq2_xxs) ||
+        first_row >= (uint)args.ne0) {
+        return;
+    }
+
+    const ulong gate_addr = gate_addrs[tile.expert];
+    const ulong up_addr = up_addrs[tile.expert];
+    if (gate_addr == 0u || up_addr == 0u) return;
+
+    const bool active_route = (uint)sgitg < tile.route_count;
+    ds4_metal_qwen35_expert_group_route route = {0u, 0u, 0u, 0u};
+    if (active_route) {
+        route = routes[tile.route_begin + (uint)sgitg];
+    }
+    const bool valid_route =
+        active_route && route.expert == tile.expert &&
+        route.token_row < (uint)args.nei1 &&
+        route.route_slot < (uint)args.nei0 &&
+        route.canonical_index ==
+            route.token_row * (uint)args.nei0 + route.route_slot;
+
+    device const uchar * gate_bytes =
+        reinterpret_cast<device const uchar *>(gate_addr);
+    device const uchar * up_bytes =
+        reinterpret_cast<device const uchar *>(up_addr);
+    device const float * y = valid_route ?
+        (device const float *)(src1 +
+            (uint64_t)route.token_row * args.nb12) :
+        (device const float *)src1;
+
+    threadgroup uchar * decoded_magnitudes =
+        (threadgroup uchar *)shmem;
+    threadgroup uchar * decoded_signs =
+        decoded_magnitudes + magnitude_count;
+    threadgroup float * decoded_scales =
+        (threadgroup float *)(decoded_signs + sign_count);
+
+    float sumg[row_tile] = {0.f};
+    float sumu[row_tile] = {0.f};
+    float yl[values_per_slice];
+
+    /* Preserve the baseline lane order: lane, lane+32, lane+64, lane+96.
+     * Dequantization order is irrelevant to the sums; consumption below is
+     * still stage, row, l, j with the original simd_sum and 0.25 factor. */
+    for (uint stage = 0u; stage < 4u; ++stage) {
+        const uint plane_slice_count = plane_count * slices_per_stage;
+        for (uint item = (uint)tiitg;
+             item < plane_slice_count;
+             item += 128u) {
+            const uint plane = item / slices_per_stage;
+            const uint slice = item % slices_per_stage;
+            const uint row = plane % row_tile;
+            const uint projection = plane / row_tile;
+            const uint block = stage * 4u + slice / 8u;
+            const uint subblock = slice % 8u;
+            device const uchar * source_bytes =
+                projection == 0u ? gate_bytes : up_bytes;
+            device const block_iq2_xxs * source =
+                (device const block_iq2_xxs *)(source_bytes +
+                    (uint64_t)(first_row + row) * args.nb01) + block;
+            device const ushort * q = source->qs + 4u * subblock;
+            device const uchar * aux8 = (device const uchar *)q;
+            const uint aux32 = (uint)q[2] | ((uint)q[3] << 16);
+
+            const uint magnitude_base = item * values_per_slice;
+            const uint sign_base = item * signs_per_slice;
+            for (uint l = 0u; l < 4u; ++l) {
+                const ulong packed = ds4_metal_iq2xxs_grid[aux8[l]];
+                decoded_signs[sign_base + l] =
+                    ds4_metal_ksigns_iq2xs[(aux32 >> (7u*l)) & 127u];
+                for (uint j = 0u; j < 8u; ++j) {
+                    decoded_magnitudes[magnitude_base + 8u*l + j] =
+                        (uchar)((packed >> (8u*j)) & 0xffu);
+                }
+            }
+            decoded_scales[item] = (float)source->d *
+                (0.5f + (float)(aux32 >> 28));
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        if (valid_route) {
+            const uint slice = (uint)tiisg;
+            const uint ib32 = stage * slices_per_stage + slice;
+            device const float * y32 = y + ib32 * values_per_slice;
+            for (uint i = 0u; i < values_per_slice; ++i) {
+                yl[i] = y32[i];
+            }
+
+            for (short row = 0; row < (short)row_tile; ++row) {
+                const uint gate_item = (uint)row * slices_per_stage + slice;
+                const uint up_item =
+                    (row_tile + (uint)row) * slices_per_stage + slice;
+                const uint gate_magnitude_base =
+                    gate_item * values_per_slice;
+                const uint up_magnitude_base =
+                    up_item * values_per_slice;
+                const uint gate_sign_base = gate_item * signs_per_slice;
+                const uint up_sign_base = up_item * signs_per_slice;
+                float sg = 0.f;
+                float su = 0.f;
+                for (short l = 0; l < 4; ++l) {
+                    const uchar signg =
+                        decoded_signs[gate_sign_base + (uint)l];
+                    const uchar signu =
+                        decoded_signs[up_sign_base + (uint)l];
+                    for (short j = 0; j < 8; ++j) {
+                        const uint value_index = 8u*(uint)l + (uint)j;
+                        const float v = yl[value_index];
+                        sg += v * (float)decoded_magnitudes[
+                            gate_magnitude_base + value_index] *
+                            (signg & ds4_metal_kmask_iq2xs[j] ? -1.f : 1.f);
+                        su += v * (float)decoded_magnitudes[
+                            up_magnitude_base + value_index] *
+                            (signu & ds4_metal_kmask_iq2xs[j] ? -1.f : 1.f);
+                    }
+                }
+                sumg[row] += decoded_scales[gate_item] * sg;
+                sumu[row] += decoded_scales[up_item] * su;
+            }
+        }
+
+        /* Tail simdgroups must reach this barrier before the next stage
+         * overwrites the single decoded buffer. */
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    if (!valid_route) return;
+    const uint64_t dst_row =
+        (uint64_t)route.canonical_index * (uint64_t)args.ne0;
+    device float * gate_out = (device float *)dst_gate + dst_row;
+    device float * up_out = (device float *)dst_up + dst_row;
+    device float * mid_out = (device float *)(
+        dst_mid + (uint64_t)route.canonical_index * act.mid_row_stride);
+    device const float * route_w = (device const float *)(
+        weights + (uint64_t)route.canonical_index * act.weight_stride);
+    const float c = act.clamp_value;
+    const float route_weight = route_w[0];
+
+    for (short row = 0;
+         row < (short)row_tile && first_row + (uint)row < (uint)args.ne0;
+         ++row) {
+        const float reduced_gate = simd_sum(sumg[row]);
+        const float reduced_up = simd_sum(sumu[row]);
+        if (tiisg == 0) {
+            const uint out_row = first_row + (uint)row;
+            const float gate = reduced_gate * 0.25f;
+            const float up = reduced_up * 0.25f;
+            gate_out[out_row] = gate;
+            up_out[out_row] = up;
+            float g = gate;
+            float u = up;
+            if (c > 1.0e-6f) {
+                g = min(g, c);
+                u = clamp(u, -c, c);
+            }
+            const float silu = g / (1.0f + exp(-g));
+            mid_out[out_row] = silu * u * route_weight;
+        }
+    }
+}
+
 kernel void kernel_mul_mv_addr_q4_K_pair_swiglu_grouped_f32(
         constant ds4_metal_args_mul_mv_id & args,
         constant ds4_metal_dsv4_moe_swiglu_weight_args & act,
@@ -4434,6 +5341,7 @@ kernel void kernel_mul_mm_id(
     }
 }
 
+template<short NR1>
 kernel void kernel_mul_mm_id_iq2_xxs_pair_swiglu_f16(
         constant ds4_metal_args_mul_mm_id & args,
         constant ds4_metal_dsv4_moe_swiglu_weight_args & act,
@@ -4452,11 +5360,15 @@ kernel void kernel_mul_mm_id_iq2_xxs_pair_swiglu_f16(
     threadgroup half *sa = (threadgroup half *)(shmem);
     threadgroup half *sb = (threadgroup half *)(shmem + 4096);
 
-    constexpr int NR0 = 64;
-    constexpr int NR1 = 32;
-    constexpr int NK  = 32;
-    constexpr int NL0 = NK/16;
-    constexpr int NL1 = NK/8;
+    static_assert(NR1 == 16 || NR1 == 32,
+                  "paired IQ2 routed MM supports only 16/32 route tiles");
+    constexpr short NR0 = 64;
+    constexpr short NK  = 32;
+    constexpr short NL0 = NK/16;
+    constexpr short NL1 = NK/8;
+    constexpr short RHS_BLOCKS = NR1/8;
+    constexpr short RHS_MATS = NR1/16;
+    constexpr short NACC = 4*RHS_MATS;
 
     const int im = tgpig.z;
     const int r0 = tgpig.y*NR0;
@@ -4503,23 +5415,26 @@ kernel void kernel_mul_mm_id_iq2_xxs_pair_swiglu_f16(
         + args.nb10*iy);
 
     simdgroup_half8x8 ma[4];
-    simdgroup_half8x8 mb[2];
+    simdgroup_half8x8 mb[RHS_MATS];
 
-    simdgroup_float8x8 mc_gate[8];
-    simdgroup_float8x8 mc_up[8];
+    simdgroup_float8x8 mc_gate[NACC];
+    simdgroup_float8x8 mc_up[NACC];
 
-    for (short i = 0; i < 8; i++) {
+    for (short i = 0; i < NACC; i++) {
         mc_gate[i] = make_filled_simdgroup_matrix<float, 8>(0.f);
         mc_up[i] = make_filled_simdgroup_matrix<float, 8>(0.f);
     }
 
     for (int loop_k = 0; loop_k < args.ne00; loop_k += NK) {
-        const short sx_b = (tiitg%NL1);
-        const short sy_b = (tiitg/NL1)/8;
-        const short ly_b = (tiitg/NL1)%8;
-        const short ib_b = 4*sx_b + sy_b;
-        *(threadgroup half2x4 *)(sb + 64*ib_b + 8*ly_b) =
-            (half2x4)(*((device float2x4 *) y));
+        const short rhs_row = tiitg/NL1;
+        if (rhs_row < NR1) {
+            const short sx_b = tiitg%NL1;
+            const short sy_b = rhs_row/8;
+            const short ly_b = rhs_row%8;
+            const short ib_b = RHS_BLOCKS*sx_b + sy_b;
+            *(threadgroup half2x4 *)(sb + 64*ib_b + 8*ly_b) =
+                (half2x4)(*((device float2x4 *) y));
+        }
 
         half4x4 temp_gate;
         dequantize_iq2_xxs(xg, il, temp_gate);
@@ -4538,7 +5453,8 @@ kernel void kernel_mul_mm_id_iq2_xxs_pair_swiglu_f16(
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
         threadgroup const half * lsma_gate = (sa + 4*64*(sgitg%2));
-        threadgroup const half * lsmb = (sb + 2*64*(sgitg/2));
+        threadgroup const half * lsmb =
+            sb + RHS_MATS*64*(sgitg/2);
 
         FOR_UNROLL (short ik = 0; ik < NK/8; ik++) {
             simdgroup_barrier(mem_flags::mem_none);
@@ -4549,18 +5465,18 @@ kernel void kernel_mul_mm_id_iq2_xxs_pair_swiglu_f16(
 
             simdgroup_barrier(mem_flags::mem_none);
 
-            FOR_UNROLL (short i = 0; i < 2; i++) {
+            FOR_UNROLL (short i = 0; i < RHS_MATS; i++) {
                 simdgroup_load(mb[i], lsmb + 64*i, 8, 0, false);
             }
 
             simdgroup_barrier(mem_flags::mem_none);
 
-            FOR_UNROLL (short i = 0; i < 8; i++) {
+            FOR_UNROLL (short i = 0; i < NACC; i++) {
                 simdgroup_multiply_accumulate(mc_gate[i], mb[i/4], ma[i%4], mc_gate[i]);
             }
 
             lsma_gate += 8*64;
-            lsmb += 4*64;
+            lsmb += RHS_BLOCKS*64;
         }
 
         half4x4 temp_up;
@@ -4580,7 +5496,7 @@ kernel void kernel_mul_mm_id_iq2_xxs_pair_swiglu_f16(
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
         threadgroup const half * lsma_up = (sa + 4*64*(sgitg%2));
-        lsmb = (sb + 2*64*(sgitg/2));
+        lsmb = sb + RHS_MATS*64*(sgitg/2);
 
         FOR_UNROLL (short ik = 0; ik < NK/8; ik++) {
             simdgroup_barrier(mem_flags::mem_none);
@@ -4591,18 +5507,18 @@ kernel void kernel_mul_mm_id_iq2_xxs_pair_swiglu_f16(
 
             simdgroup_barrier(mem_flags::mem_none);
 
-            FOR_UNROLL (short i = 0; i < 2; i++) {
+            FOR_UNROLL (short i = 0; i < RHS_MATS; i++) {
                 simdgroup_load(mb[i], lsmb + 64*i, 8, 0, false);
             }
 
             simdgroup_barrier(mem_flags::mem_none);
 
-            FOR_UNROLL (short i = 0; i < 8; i++) {
+            FOR_UNROLL (short i = 0; i < NACC; i++) {
                 simdgroup_multiply_accumulate(mc_up[i], mb[i/4], ma[i%4], mc_up[i]);
             }
 
             lsma_up += 8*64;
-            lsmb += 4*64;
+            lsmb += RHS_BLOCKS*64;
         }
 
         /*
@@ -4625,12 +5541,13 @@ kernel void kernel_mul_mm_id_iq2_xxs_pair_swiglu_f16(
 
     threadgroup float * temp_gate = (threadgroup float *) shmem;
     threadgroup float * temp_up = temp_gate + NR0*NR1;
+    const short route_row_base = (NR1/2)*(sgitg >> 1);
     threadgroup float * temp_gate_str =
-        temp_gate + 32*(sgitg&1) + (16*(sgitg >> 1))*NR0;
+        temp_gate + 32*(sgitg&1) + route_row_base*NR0;
     threadgroup float * temp_up_str =
-        temp_up + 32*(sgitg&1) + (16*(sgitg >> 1))*NR0;
+        temp_up + 32*(sgitg&1) + route_row_base*NR0;
 
-    for (short i = 0; i < 8; i++) {
+    for (short i = 0; i < NACC; i++) {
         simdgroup_store(mc_gate[i], temp_gate_str + 8*(i%4) + 8*NR0*(i/4), NR0, 0, false);
         simdgroup_store(mc_up[i],   temp_up_str   + 8*(i%4) + 8*NR0*(i/4), NR0, 0, false);
     }
@@ -4665,6 +5582,18 @@ kernel void kernel_mul_mm_id_iq2_xxs_pair_swiglu_f16(
         }
     }
 }
+
+typedef decltype(kernel_mul_mm_id_iq2_xxs_pair_swiglu_f16<32>)
+    mul_mm_id_iq2_xxs_pair_swiglu_f16_n32_t;
+typedef decltype(kernel_mul_mm_id_iq2_xxs_pair_swiglu_f16<16>)
+    mul_mm_id_iq2_xxs_pair_swiglu_f16_n16_t;
+
+template [[host_name("kernel_mul_mm_id_iq2_xxs_pair_swiglu_f16")]]
+kernel mul_mm_id_iq2_xxs_pair_swiglu_f16_n32_t
+kernel_mul_mm_id_iq2_xxs_pair_swiglu_f16<32>;
+template [[host_name("kernel_mul_mm_id_iq2_xxs_pair_swiglu_f16_n16")]]
+kernel mul_mm_id_iq2_xxs_pair_swiglu_f16_n16_t
+kernel_mul_mm_id_iq2_xxs_pair_swiglu_f16<16>;
 
 typedef decltype(kernel_mul_mm_id<32, half, half4x4, simdgroup_half8x8, half, half2x4, simdgroup_half8x8, block_q2_K, QK_NL, dequantize_q2_K, float, float4x4, float, float2x4>) mul_mm_id;
 typedef decltype(kernel_mul_mm_id<32, half, half4x4, simdgroup_half8x8, half, half2x4, simdgroup_half8x8, block_q2_K, QK_NL, dequantize_q2_K, half, half4x4, half, half2x4>) mul_mm_id_f16_rhs;
