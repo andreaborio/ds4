@@ -4605,6 +4605,16 @@ kernel void kernel_mul_mm_id_iq2_xxs_pair_swiglu_f16(
             lsmb += 4*64;
         }
 
+        /*
+         * All four simdgroups consume the same staged RHS tile.  The next K
+         * iteration starts by replacing that tile, so a simdgroup-only
+         * barrier is insufficient here: a faster simdgroup could otherwise
+         * overwrite sb while a slower one is still accumulating the current
+         * up projection.  This race is much easier to hit in the paired
+         * kernel because each iteration performs two independent MMAs.
+         */
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
         il = (il + 2 < QK_NL) ? il + 2 : il % 2;
         xg = (il < 2) ? xg + (2 + QK_NL - 1)/QK_NL : xg;
         xu = (il < 2) ? xu + (2 + QK_NL - 1)/QK_NL : xu;

@@ -211,12 +211,19 @@ static int g_model_fd = -1;
 enum {
     DS4_QWEN35_EXPERT_PACK_LAYER_COUNT = 40,
     DS4_QWEN35_EXPERT_PACK_EXPERT_COUNT = 256,
+    DS4_EXPERT_STORE_MAX_LAYER = 61,
+    DS4_EXPERT_STORE_MAX_EXPERT = 384,
 };
 
 typedef struct {
     uint64_t gate_offset;
     uint64_t up_offset;
     uint64_t down_offset;
+    uint64_t data_offset;
+    uint64_t data_size;
+    uint64_t record_bytes;
+    uint64_t component_offset[3];
+    uint64_t component_bytes[3];
     uint8_t valid;
 } ds4_gpu_qwen35_expert_pack_layer;
 
@@ -230,19 +237,22 @@ typedef struct {
     uint64_t record_bytes;
     uint64_t layer_bytes;
     uint64_t model_size;
+    uint32_t n_layer;
+    uint32_t n_expert;
     uint32_t bound_layers;
     uint8_t active;
     uint8_t resident_active;
+    uint8_t embedded_v2;
     ds4_gpu_qwen35_expert_pack_layer
-        layers[DS4_QWEN35_EXPERT_PACK_LAYER_COUNT];
-    void *resident_maps[DS4_QWEN35_EXPERT_PACK_LAYER_COUNT];
-    uint64_t resident_map_bytes[DS4_QWEN35_EXPERT_PACK_LAYER_COUNT];
-    uint64_t resident_data_inner[DS4_QWEN35_EXPERT_PACK_LAYER_COUNT];
+        layers[DS4_EXPERT_STORE_MAX_LAYER];
+    void *resident_maps[DS4_EXPERT_STORE_MAX_LAYER];
+    uint64_t resident_map_bytes[DS4_EXPERT_STORE_MAX_LAYER];
+    uint64_t resident_data_inner[DS4_EXPERT_STORE_MAX_LAYER];
 } ds4_gpu_qwen35_expert_pack_state;
 
 static ds4_gpu_qwen35_expert_pack_state g_qwen35_expert_pack;
 static id<MTLBuffer> g_qwen35_expert_pack_resident_buffers[
-    DS4_QWEN35_EXPERT_PACK_LAYER_COUNT];
+    DS4_EXPERT_STORE_MAX_LAYER];
 static void ds4_gpu_qwen35_expert_pack_state_reset(void);
 static const void *g_model_map_ptr;
 static uint64_t g_model_map_size;
@@ -8203,7 +8213,7 @@ static int ds4_gpu_qwen35_expert_pack_ranges_overlap(
 
 static void ds4_gpu_qwen35_expert_pack_resident_reset(void) {
     for (uint32_t layer = 0;
-         layer < DS4_QWEN35_EXPERT_PACK_LAYER_COUNT;
+         layer < DS4_EXPERT_STORE_MAX_LAYER;
          layer++) {
         /* Release the no-copy Metal wrapper before unmapping its bytes. */
         g_qwen35_expert_pack_resident_buffers[layer] = nil;
@@ -8247,6 +8257,10 @@ void ds4_gpu_qwen35_expert_pack_clear(void) {
         ds4_gpu_model_residency_clear();
     }
     ds4_gpu_qwen35_expert_pack_state_reset();
+}
+
+void ds4_gpu_expert_store_v2_clear(void) {
+    ds4_gpu_qwen35_expert_pack_clear();
 }
 
 int ds4_gpu_qwen35_expert_pack_install(
@@ -8303,51 +8317,141 @@ int ds4_gpu_qwen35_expert_pack_install(
     g_qwen35_expert_pack.down_bytes = down_bytes;
     g_qwen35_expert_pack.record_bytes = record_bytes;
     g_qwen35_expert_pack.layer_bytes = layer_bytes;
+    g_qwen35_expert_pack.n_layer = n_layer;
+    g_qwen35_expert_pack.n_expert = n_expert;
+    for (uint32_t layer = 0; layer < n_layer; layer++) {
+        ds4_gpu_qwen35_expert_pack_layer *entry =
+            &g_qwen35_expert_pack.layers[layer];
+        entry->data_offset = data_offset + (uint64_t)layer * layer_bytes;
+        entry->data_size = layer_bytes;
+        entry->record_bytes = record_bytes;
+        entry->component_offset[0] = 0;
+        entry->component_offset[1] = gate_bytes;
+        entry->component_offset[2] = gate_bytes + up_bytes;
+        entry->component_bytes[0] = gate_bytes;
+        entry->component_bytes[1] = up_bytes;
+        entry->component_bytes[2] = down_bytes;
+    }
     g_qwen35_expert_pack.active = 1;
     return 1;
 }
 
-int ds4_gpu_qwen35_expert_pack_bind_layer(
+int ds4_gpu_expert_store_v2_layer_span(
+        uint32_t layer,
+        uint64_t model_size,
+        uint64_t *offset,
+        uint64_t *size) {
+    const ds4_gpu_qwen35_expert_pack_state *pack = &g_qwen35_expert_pack;
+    if (!pack->active || !pack->embedded_v2 ||
+        layer >= pack->n_layer || !pack->layers[layer].valid ||
+        pack->model_size != model_size || !offset || !size) {
+        return 0;
+    }
+    const ds4_gpu_qwen35_expert_pack_layer *entry = &pack->layers[layer];
+    if (!ds4_gpu_qwen35_expert_pack_range_valid(
+            entry->data_offset, entry->data_size, model_size)) {
+        return 0;
+    }
+    *offset = entry->data_offset;
+    *size = entry->data_size;
+    return 1;
+}
+
+int ds4_gpu_expert_store_v2_install(
+        int                                  fd,
+        uint64_t                             file_size,
+        uint32_t                             n_layer,
+        uint32_t                             n_expert,
+        const ds4_gpu_expert_store_layer_v2 *layers) {
+    struct stat st;
+    int flags = -1;
+    if (fd < 0 || !layers || n_layer == 0 ||
+        n_layer > DS4_EXPERT_STORE_MAX_LAYER || n_expert == 0 ||
+        n_expert > DS4_EXPERT_STORE_MAX_EXPERT ||
+        file_size > (uint64_t)LLONG_MAX ||
+        fstat(fd, &st) != 0 || st.st_size < 0 || !S_ISREG(st.st_mode) ||
+        (uint64_t)st.st_size != file_size ||
+        (flags = fcntl(fd, F_GETFL)) < 0 ||
+        (flags & O_ACCMODE) == O_WRONLY) {
+        return 0;
+    }
+    for (uint32_t layer = 0; layer < n_layer; layer++) {
+        const ds4_gpu_expert_store_layer_v2 *entry = &layers[layer];
+        uint64_t expected_record = 0;
+        uint64_t expected_layer = 0;
+        if (entry->record_bytes == 0 || entry->data_size == 0 ||
+            entry->component_offset[0] != 0) {
+            return 0;
+        }
+        for (uint32_t role = 0; role < 3; role++) {
+            if (entry->component_bytes[role] == 0 ||
+                entry->component_offset[role] != expected_record ||
+                !ds4_gpu_qwen35_expert_pack_add_u64(
+                    expected_record, entry->component_bytes[role],
+                    &expected_record)) {
+                return 0;
+            }
+        }
+        if (expected_record != entry->record_bytes ||
+            !ds4_gpu_qwen35_expert_pack_mul_u64(
+                entry->record_bytes, n_expert, &expected_layer) ||
+            expected_layer != entry->data_size ||
+            !ds4_gpu_qwen35_expert_pack_range_valid(
+                entry->data_offset, entry->data_size, file_size)) {
+            return 0;
+        }
+        if (layer != 0) {
+            const ds4_gpu_expert_store_layer_v2 *previous = &layers[layer - 1];
+            if (entry->data_offset < previous->data_offset + previous->data_size) {
+                return 0;
+            }
+        }
+    }
+    if (g_qwen35_expert_pack.active) ds4_gpu_qwen35_expert_pack_clear();
+    ds4_gpu_qwen35_expert_pack_state_reset();
+    g_qwen35_expert_pack.fd = fd;
+    g_qwen35_expert_pack.file_size = file_size;
+    g_qwen35_expert_pack.n_layer = n_layer;
+    g_qwen35_expert_pack.n_expert = n_expert;
+    g_qwen35_expert_pack.embedded_v2 = 1;
+    for (uint32_t layer = 0; layer < n_layer; layer++) {
+        ds4_gpu_qwen35_expert_pack_layer *destination =
+            &g_qwen35_expert_pack.layers[layer];
+        destination->data_offset = layers[layer].data_offset;
+        destination->data_size = layers[layer].data_size;
+        destination->record_bytes = layers[layer].record_bytes;
+        memcpy(destination->component_offset, layers[layer].component_offset,
+               sizeof(destination->component_offset));
+        memcpy(destination->component_bytes, layers[layer].component_bytes,
+               sizeof(destination->component_bytes));
+    }
+    g_qwen35_expert_pack.active = 1;
+    return 1;
+}
+
+static int ds4_gpu_expert_store_bind_layer_internal(
         uint32_t layer,
         uint64_t model_size,
         uint64_t gate_offset,
         uint64_t up_offset,
         uint64_t down_offset) {
     ds4_gpu_qwen35_expert_pack_state *pack = &g_qwen35_expert_pack;
-    if (!pack->active ||
-        layer >= DS4_QWEN35_EXPERT_PACK_LAYER_COUNT ||
-        model_size == 0) {
-        return 0;
-    }
-
-    uint64_t gate_total = 0;
-    uint64_t up_total = 0;
-    uint64_t down_total = 0;
-    if (!ds4_gpu_qwen35_expert_pack_mul_u64(
-            pack->gate_bytes,
-            DS4_QWEN35_EXPERT_PACK_EXPERT_COUNT,
-            &gate_total) ||
-        !ds4_gpu_qwen35_expert_pack_mul_u64(
-            pack->up_bytes,
-            DS4_QWEN35_EXPERT_PACK_EXPERT_COUNT,
-            &up_total) ||
-        !ds4_gpu_qwen35_expert_pack_mul_u64(
-            pack->down_bytes,
-            DS4_QWEN35_EXPERT_PACK_EXPERT_COUNT,
-            &down_total)) {
-        return 0;
-    }
+    if (!pack->active || layer >= pack->n_layer || model_size == 0) return 0;
 
     const uint64_t offsets[3] = {gate_offset, up_offset, down_offset};
-    const uint64_t totals[3] = {gate_total, up_total, down_total};
-    for (uint32_t i = 0; i < 3; i++) {
-        if (!ds4_gpu_qwen35_expert_pack_range_valid(
-                offsets[i], totals[i], model_size)) {
+    uint64_t totals[3] = {0, 0, 0};
+    for (uint32_t role = 0; role < 3; role++) {
+        if (!ds4_gpu_qwen35_expert_pack_mul_u64(
+                pack->layers[layer].component_bytes[role],
+                pack->n_expert, &totals[role]) ||
+            !ds4_gpu_qwen35_expert_pack_range_valid(
+                offsets[role], totals[role], model_size)) {
             return 0;
         }
-        for (uint32_t j = 0; j < i; j++) {
+        for (uint32_t previous = 0; previous < role; previous++) {
             if (ds4_gpu_qwen35_expert_pack_ranges_overlap(
-                    offsets[i], totals[i], offsets[j], totals[j])) {
+                    offsets[role], totals[role], offsets[previous],
+                    totals[previous])) {
                 return 0;
             }
         }
@@ -8360,31 +8464,31 @@ int ds4_gpu_qwen35_expert_pack_bind_layer(
                binding->up_offset == up_offset &&
                binding->down_offset == down_offset;
     }
-    if (pack->bound_layers != 0 && pack->model_size != model_size) {
-        return 0;
-    }
+    if (pack->bound_layers != 0 && pack->model_size != model_size) return 0;
 
-    /* Canonical tensor ranges must be globally unique. This makes resolution
-     * deterministic and turns a wrong model/layout binding into an immediate
-     * failure instead of silently selecting the first matching layer. */
-    for (uint32_t other = 0;
-         other < DS4_QWEN35_EXPERT_PACK_LAYER_COUNT;
-         other++) {
+    /* Canonical identity ranges must be globally unique even though their
+     * bytes are virtual in a native GGUF. This keeps every cache key and
+     * translated read deterministic. */
+    for (uint32_t other = 0; other < pack->n_layer; other++) {
         const ds4_gpu_qwen35_expert_pack_layer *old = &pack->layers[other];
         if (!old->valid) continue;
         const uint64_t old_offsets[3] = {
             old->gate_offset, old->up_offset, old->down_offset,
         };
-        for (uint32_t i = 0; i < 3; i++) {
-            for (uint32_t j = 0; j < 3; j++) {
-                if (ds4_gpu_qwen35_expert_pack_ranges_overlap(
-                        offsets[i], totals[i], old_offsets[j], totals[j])) {
+        for (uint32_t role = 0; role < 3; role++) {
+            for (uint32_t old_role = 0; old_role < 3; old_role++) {
+                uint64_t old_total = 0;
+                if (!ds4_gpu_qwen35_expert_pack_mul_u64(
+                        old->component_bytes[old_role], pack->n_expert,
+                        &old_total) ||
+                    ds4_gpu_qwen35_expert_pack_ranges_overlap(
+                        offsets[role], totals[role], old_offsets[old_role],
+                        old_total)) {
                     return 0;
                 }
             }
         }
     }
-
     if (pack->bound_layers == 0) pack->model_size = model_size;
     binding->gate_offset = gate_offset;
     binding->up_offset = up_offset;
@@ -8394,13 +8498,37 @@ int ds4_gpu_qwen35_expert_pack_bind_layer(
     return 1;
 }
 
+int ds4_gpu_qwen35_expert_pack_bind_layer(
+        uint32_t layer,
+        uint64_t model_size,
+        uint64_t gate_offset,
+        uint64_t up_offset,
+        uint64_t down_offset) {
+    if (g_qwen35_expert_pack.n_layer !=
+            DS4_QWEN35_EXPERT_PACK_LAYER_COUNT ||
+        g_qwen35_expert_pack.n_expert !=
+            DS4_QWEN35_EXPERT_PACK_EXPERT_COUNT) {
+        return 0;
+    }
+    return ds4_gpu_expert_store_bind_layer_internal(
+        layer, model_size, gate_offset, up_offset, down_offset);
+}
+
+int ds4_gpu_expert_store_v2_bind_layer(
+        uint32_t layer,
+        uint64_t model_size,
+        uint64_t gate_offset,
+        uint64_t up_offset,
+        uint64_t down_offset) {
+    return ds4_gpu_expert_store_bind_layer_internal(
+        layer, model_size, gate_offset, up_offset, down_offset);
+}
+
 int ds4_gpu_qwen35_expert_pack_enable_resident(void) {
     ds4_gpu_qwen35_expert_pack_state *pack = &g_qwen35_expert_pack;
     if (!pack->active || !g_initialized || !g_device ||
-        pack->bound_layers != DS4_QWEN35_EXPERT_PACK_LAYER_COUNT ||
-        pack->resident_active || pack->layer_bytes == 0 ||
-        pack->layer_bytes > NSUIntegerMax ||
-        pack->layer_bytes > (uint64_t)[g_device maxBufferLength]) {
+        pack->bound_layers != pack->n_layer || pack->n_layer == 0 ||
+        pack->resident_active) {
         return pack->resident_active ? 1 : 0;
     }
 
@@ -8408,14 +8536,15 @@ int ds4_gpu_qwen35_expert_pack_enable_resident(void) {
     if (page_long <= 0) return 0;
     const uint64_t page = (uint64_t)page_long;
     for (uint32_t layer = 0;
-         layer < DS4_QWEN35_EXPERT_PACK_LAYER_COUNT;
+         layer < pack->n_layer;
          layer++) {
-        uint64_t layer_delta = 0;
-        uint64_t file_offset = 0;
-        if (!ds4_gpu_qwen35_expert_pack_mul_u64(
-                layer, pack->layer_bytes, &layer_delta) ||
-            !ds4_gpu_qwen35_expert_pack_add_u64(
-                pack->data_offset, layer_delta, &file_offset)) {
+        const ds4_gpu_qwen35_expert_pack_layer *entry =
+            &pack->layers[layer];
+        const uint64_t file_offset = entry->data_offset;
+        const uint64_t layer_bytes = entry->data_size;
+        if (!entry->valid || layer_bytes == 0 ||
+            layer_bytes > NSUIntegerMax ||
+            layer_bytes > (uint64_t)[g_device maxBufferLength]) {
             ds4_gpu_qwen35_expert_pack_resident_reset();
             return 0;
         }
@@ -8424,7 +8553,7 @@ int ds4_gpu_qwen35_expert_pack_enable_resident(void) {
         uint64_t required_bytes = 0;
         uint64_t map_bytes = 0;
         if (!ds4_gpu_qwen35_expert_pack_add_u64(
-                data_inner, pack->layer_bytes, &required_bytes) ||
+                data_inner, layer_bytes, &required_bytes) ||
             !ds4_gpu_qwen35_expert_pack_align_up_u64(
                 required_bytes, page, &map_bytes) ||
             map_bytes == 0 ||
@@ -8466,12 +8595,16 @@ int ds4_gpu_qwen35_expert_pack_enable_resident(void) {
             return 0;
         }
         buffer.label = [NSString stringWithFormat:
-            @"ds4_qwen35_expert_major_layer_%u", layer];
+            @"ds4_expert_major_layer_%u", layer];
         g_qwen35_expert_pack_resident_buffers[layer] = buffer;
     }
 
     pack->resident_active = 1;
     return 1;
+}
+
+int ds4_gpu_expert_store_v2_enable_resident(void) {
+    return ds4_gpu_qwen35_expert_pack_enable_resident();
 }
 
 /* Resolve only an exact canonical layer binding.  The caller keeps the
@@ -8490,7 +8623,7 @@ static int ds4_gpu_qwen35_expert_pack_resident_layer(
         uint64_t      *expert_stride) {
     const ds4_gpu_qwen35_expert_pack_state *pack = &g_qwen35_expert_pack;
     if (!pack->active || !pack->resident_active ||
-        layer >= DS4_QWEN35_EXPERT_PACK_LAYER_COUNT ||
+        layer >= pack->n_layer ||
         !pack->layers[layer].valid ||
         pack->model_size != model_size ||
         pack->layers[layer].gate_offset != gate_offset ||
@@ -8501,12 +8634,62 @@ static int ds4_gpu_qwen35_expert_pack_resident_layer(
         !expert_stride) {
         return 0;
     }
+    const ds4_gpu_qwen35_expert_pack_layer *entry = &pack->layers[layer];
     *buffer = g_qwen35_expert_pack_resident_buffers[layer];
-    *gate_inner = pack->resident_data_inner[layer];
-    *up_inner = pack->resident_data_inner[layer] + pack->gate_bytes;
+    *gate_inner = pack->resident_data_inner[layer] +
+        entry->component_offset[0];
+    *up_inner = pack->resident_data_inner[layer] +
+        entry->component_offset[1];
     *down_inner = pack->resident_data_inner[layer] +
-        pack->gate_bytes + pack->up_bytes;
-    *expert_stride = pack->record_bytes;
+        entry->component_offset[2];
+    *expert_stride = entry->record_bytes;
+    return 1;
+}
+
+/* The same logical binding can be backed either by all resident layer
+ * buffers or, in SSD mode, by the one physical v2 layer span installed in the
+ * current model views.  Keeping the selection here prevents native GGUF
+ * addressing rules from leaking into the routed-MoE encoder. */
+static int ds4_gpu_qwen35_expert_pack_resolve_layer(
+        const void    *model_map,
+        uint32_t       layer,
+        uint64_t       model_size,
+        uint64_t       gate_offset,
+        uint64_t       up_offset,
+        uint64_t       down_offset,
+        id<MTLBuffer> *buffer,
+        uint64_t      *gate_inner,
+        uint64_t      *up_inner,
+        uint64_t      *down_inner,
+        uint64_t      *expert_stride) {
+    if (!g_ssd_streaming_mode) {
+        return ds4_gpu_qwen35_expert_pack_resident_layer(
+            layer, model_size, gate_offset, up_offset, down_offset,
+            buffer, gate_inner, up_inner, down_inner, expert_stride);
+    }
+
+    const ds4_gpu_qwen35_expert_pack_state *pack = &g_qwen35_expert_pack;
+    if (!pack->active || !pack->embedded_v2 ||
+        layer >= pack->n_layer || !pack->layers[layer].valid ||
+        pack->model_size != model_size ||
+        pack->layers[layer].gate_offset != gate_offset ||
+        pack->layers[layer].up_offset != up_offset ||
+        pack->layers[layer].down_offset != down_offset ||
+        !buffer || !gate_inner || !up_inner || !down_inner ||
+        !expert_stride) {
+        return 0;
+    }
+    const ds4_gpu_qwen35_expert_pack_layer *entry = &pack->layers[layer];
+    uint64_t physical_inner = 0;
+    id<MTLBuffer> physical = ds4_gpu_wrap_model_range(
+        model_map, model_size, entry->data_offset, entry->data_size,
+        &physical_inner);
+    if (!physical) return 0;
+    *buffer = physical;
+    *gate_inner = physical_inner + entry->component_offset[0];
+    *up_inner = physical_inner + entry->component_offset[1];
+    *down_inner = physical_inner + entry->component_offset[2];
+    *expert_stride = entry->record_bytes;
     return 1;
 }
 
@@ -8521,21 +8704,7 @@ static int ds4_gpu_qwen35_expert_pack_resolve(
     if (!pack->active) return 0;
     if (!source_fd || !source_offset || len == 0) return -1;
 
-    const uint64_t totals[3] = {
-        pack->gate_bytes * DS4_QWEN35_EXPERT_PACK_EXPERT_COUNT,
-        pack->up_bytes * DS4_QWEN35_EXPERT_PACK_EXPERT_COUNT,
-        pack->down_bytes * DS4_QWEN35_EXPERT_PACK_EXPERT_COUNT,
-    };
-    const uint64_t expert_bytes[3] = {
-        pack->gate_bytes, pack->up_bytes, pack->down_bytes,
-    };
-    const uint64_t record_offsets[3] = {
-        0, pack->gate_bytes, pack->gate_bytes + pack->up_bytes,
-    };
-
-    for (uint32_t layer = 0;
-         layer < DS4_QWEN35_EXPERT_PACK_LAYER_COUNT;
-         layer++) {
+    for (uint32_t layer = 0; layer < pack->n_layer; layer++) {
         const ds4_gpu_qwen35_expert_pack_layer *binding =
             &pack->layers[layer];
         if (!binding->valid) continue;
@@ -8545,28 +8714,29 @@ static int ds4_gpu_qwen35_expert_pack_resolve(
             binding->down_offset,
         };
         for (uint32_t kind = 0; kind < 3; kind++) {
-            if (canonical_offset < offsets[kind]) continue;
-            const uint64_t relative = canonical_offset - offsets[kind];
-            if (relative >= totals[kind]) continue;
-            if (len != expert_bytes[kind] ||
-                relative % expert_bytes[kind] != 0) {
+            uint64_t total = 0;
+            if (!ds4_gpu_qwen35_expert_pack_mul_u64(
+                    binding->component_bytes[kind], pack->n_expert,
+                    &total)) {
                 return -1;
             }
-            const uint64_t expert = relative / expert_bytes[kind];
-            uint64_t record_index = 0;
+            if (canonical_offset < offsets[kind]) continue;
+            const uint64_t relative = canonical_offset - offsets[kind];
+            if (relative >= total) continue;
+            if (len != binding->component_bytes[kind] ||
+                relative % binding->component_bytes[kind] != 0) {
+                return -1;
+            }
+            const uint64_t expert =
+                relative / binding->component_bytes[kind];
             uint64_t translated = 0;
             if (!ds4_gpu_qwen35_expert_pack_mul_u64(
-                    layer,
-                    DS4_QWEN35_EXPERT_PACK_EXPERT_COUNT,
-                    &record_index) ||
+                    expert, binding->record_bytes, &translated) ||
                 !ds4_gpu_qwen35_expert_pack_add_u64(
-                    record_index, expert, &record_index) ||
-                !ds4_gpu_qwen35_expert_pack_mul_u64(
-                    record_index, pack->record_bytes, &translated) ||
+                    binding->data_offset, translated, &translated) ||
                 !ds4_gpu_qwen35_expert_pack_add_u64(
-                    pack->data_offset, translated, &translated) ||
-                !ds4_gpu_qwen35_expert_pack_add_u64(
-                    translated, record_offsets[kind], &translated) ||
+                    translated, binding->component_offset[kind],
+                    &translated) ||
                 translated > pack->file_size ||
                 len > pack->file_size - translated) {
                 return -1;
@@ -8577,6 +8747,52 @@ static int ds4_gpu_qwen35_expert_pack_resolve(
         }
     }
     return -1;
+}
+
+/* Resolve one complete embedded-v2 expert record.  The cache stores gate,
+ * up, and down contiguously in the same order as the native GGUF, so one
+ * direct pread can fill the whole slab slot.  On the measured M5 SSD, three
+ * parallel component reads were faster than one 6.75 MiB read; full-record
+ * coalescing is therefore diagnostic opt-in while normal v2 execution keeps
+ * the established three-task pool. */
+static int ds4_gpu_expert_store_v2_resolve_record(
+        uint64_t gate_offset,
+        uint64_t up_offset,
+        uint64_t down_offset,
+        uint64_t gate_bytes,
+        uint64_t down_bytes,
+        int     *source_fd,
+        uint64_t *source_offset,
+        uint64_t *record_bytes) {
+    const ds4_gpu_qwen35_expert_pack_state *pack = &g_qwen35_expert_pack;
+    if (!pack->active || !pack->embedded_v2) return 0;
+    if (!source_fd || !source_offset || !record_bytes ||
+        gate_bytes == 0 || down_bytes == 0 ||
+        gate_bytes > (UINT64_MAX - down_bytes) / 2u) {
+        return -1;
+    }
+
+    int gate_fd = -1;
+    int up_fd = -1;
+    int down_fd = -1;
+    uint64_t gate_source = 0;
+    uint64_t up_source = 0;
+    uint64_t down_source = 0;
+    if (ds4_gpu_qwen35_expert_pack_resolve(
+            gate_offset, gate_bytes, &gate_fd, &gate_source) != 1 ||
+        ds4_gpu_qwen35_expert_pack_resolve(
+            up_offset, gate_bytes, &up_fd, &up_source) != 1 ||
+        ds4_gpu_qwen35_expert_pack_resolve(
+            down_offset, down_bytes, &down_fd, &down_source) != 1 ||
+        gate_fd != up_fd || gate_fd != down_fd ||
+        up_source != gate_source + gate_bytes ||
+        down_source != up_source + gate_bytes) {
+        return -1;
+    }
+    *source_fd = gate_fd;
+    *source_offset = gate_source;
+    *record_bytes = gate_bytes * 2u + down_bytes;
+    return 1;
 }
 
 static int ds4_gpu_model_views_cover_range(
@@ -9103,11 +9319,72 @@ typedef struct {
     uint64_t offset;
     uint64_t len;
     uint8_t *dst;
+    int source_fd;
+    uint64_t source_offset;
+    uint8_t direct_source;
     uint64_t read_bytes;
     uint64_t successful_syscalls;
     double ms;
     int ok;
 } ds4_gpu_stream_expert_pread_task;
+
+static int ds4_gpu_stream_expert_coalesced_record_pread_enabled(void) {
+    static int enabled = -1;
+    if (enabled < 0) {
+        enabled = getenv("DS4_METAL_ENABLE_COALESCED_EXPERT_RECORD_PREAD") != NULL;
+    }
+    return enabled;
+}
+
+static int ds4_gpu_stream_expert_append_record_tasks(
+        ds4_gpu_stream_expert_pread_task *tasks,
+        uint32_t                         capacity,
+        uint32_t                        *n_tasks,
+        uint64_t                         gate_offset,
+        uint64_t                         up_offset,
+        uint64_t                         down_offset,
+        uint64_t                         gate_bytes,
+        uint64_t                         down_bytes,
+        uint8_t                         *gate_dst,
+        uint8_t                         *up_dst,
+        uint8_t                         *down_dst,
+        bool                             allow_coalesced_record) {
+    if (!tasks || !n_tasks || !gate_dst || !up_dst || !down_dst) return 0;
+    int source_fd = -1;
+    uint64_t source_offset = 0;
+    uint64_t record_bytes = 0;
+    const int record = allow_coalesced_record ?
+        ds4_gpu_expert_store_v2_resolve_record(
+            gate_offset, up_offset, down_offset, gate_bytes, down_bytes,
+            &source_fd, &source_offset, &record_bytes) : 0;
+    const bool contiguous_dst =
+        up_dst == gate_dst + gate_bytes &&
+        down_dst == up_dst + gate_bytes;
+    if (record < 0) return 0;
+    if (record == 1 && contiguous_dst) {
+        if (*n_tasks >= capacity) return 0;
+        tasks[(*n_tasks)++] = (ds4_gpu_stream_expert_pread_task) {
+            .offset = gate_offset,
+            .len = record_bytes,
+            .dst = gate_dst,
+            .source_fd = source_fd,
+            .source_offset = source_offset,
+            .direct_source = 1,
+        };
+        return 1;
+    }
+    if (*n_tasks > capacity || capacity - *n_tasks < 3u) return 0;
+    tasks[(*n_tasks)++] = (ds4_gpu_stream_expert_pread_task) {
+        .offset = gate_offset, .len = gate_bytes, .dst = gate_dst,
+    };
+    tasks[(*n_tasks)++] = (ds4_gpu_stream_expert_pread_task) {
+        .offset = up_offset, .len = gate_bytes, .dst = up_dst,
+    };
+    tasks[(*n_tasks)++] = (ds4_gpu_stream_expert_pread_task) {
+        .offset = down_offset, .len = down_bytes, .dst = down_dst,
+    };
+    return 1;
+}
 
 typedef struct {
     int active;
@@ -9229,10 +9506,11 @@ static void ds4_gpu_stream_expert_cache_note_pread(
         uint64_t successful_syscalls,
         uint64_t bytes,
         double   ms) {
-    /* Expert loads and OS activity are intentionally distinct. The current
-     * loader completes one logical record with three spans, while each partial
-     * pread that returned bytes is a real syscall. Saturation preserves
-     * monotonic campaign deltas over arbitrarily long server lifetimes. */
+    /* Expert loads and OS activity are intentionally distinct. The production
+     * loader completes one logical record with three parallel spans; a native
+     * diagnostic may coalesce them. Every partial pread that returned bytes is
+     * still a real syscall. Saturation preserves monotonic campaign deltas over
+     * arbitrarily long server lifetimes. */
     ds4_gpu_stream_expert_counter_add(
         &g_stream_expert_cache_expert_loads, completed_expert_loads);
     ds4_gpu_stream_expert_counter_add(
@@ -9272,8 +9550,10 @@ static uint32_t ds4_gpu_stream_expert_pread_thread_count(uint32_t n_tasks) {
     return threads;
 }
 
-static int ds4_gpu_stream_expert_pread_into(
-        uint64_t  offset,
+static int ds4_gpu_stream_expert_pread_source_into(
+        uint64_t  canonical_offset,
+        int       source_fd,
+        uint64_t  source_offset,
         uint64_t  len,
         uint8_t  *dst,
         uint64_t *read_bytes,
@@ -9286,20 +9566,6 @@ static int ds4_gpu_stream_expert_pread_into(
         return 0;
     }
 
-    int source_fd = g_model_fd;
-    uint64_t source_offset = offset;
-    const int resolved = ds4_gpu_qwen35_expert_pack_resolve(
-        offset, len, &source_fd, &source_offset);
-    if (resolved < 0) {
-        /* Once installed, the pack is a strict model contract. Falling back to
-         * the old GGUF layout here would make corruption look like a harmless
-         * performance miss and could mix bytes from two different layouts. */
-        fprintf(stderr,
-                "ds4: Metal Qwen expert pack rejected unmappable canonical read offset=%llu len=%llu\n",
-                (unsigned long long)offset,
-                (unsigned long long)len);
-        return 0;
-    }
     if (source_fd < 0 ||
         source_offset > (uint64_t)LLONG_MAX ||
         len > (uint64_t)LLONG_MAX - source_offset) {
@@ -9334,7 +9600,7 @@ static int ds4_gpu_stream_expert_pread_into(
     if (!ok || pos != len) {
         fprintf(stderr,
                 "ds4: Metal streaming expert explicit pread failed canonical=%.2f GiB source=%.2f GiB len=%.2f MiB read=%.2f MiB\n",
-                ds4_gpu_gib(offset),
+                ds4_gpu_gib(canonical_offset),
                 ds4_gpu_gib(source_offset),
                 ds4_gpu_mib(len),
                 ds4_gpu_mib(pos));
@@ -9343,17 +9609,52 @@ static int ds4_gpu_stream_expert_pread_into(
     return 1;
 }
 
+static int ds4_gpu_stream_expert_pread_into(
+        uint64_t  offset,
+        uint64_t  len,
+        uint8_t  *dst,
+        uint64_t *read_bytes,
+        uint64_t *successful_syscalls,
+        double   *ms_out) {
+    int source_fd = g_model_fd;
+    uint64_t source_offset = offset;
+    const int resolved = ds4_gpu_qwen35_expert_pack_resolve(
+        offset, len, &source_fd, &source_offset);
+    if (resolved < 0) {
+        /* Once installed, the pack is a strict model contract. Falling back to
+         * the old GGUF layout here would make corruption look like a harmless
+         * performance miss and could mix bytes from two different layouts. */
+        fprintf(stderr,
+                "ds4: Metal expert pack rejected unmappable canonical read offset=%llu len=%llu\n",
+                (unsigned long long)offset,
+                (unsigned long long)len);
+        return 0;
+    }
+    return ds4_gpu_stream_expert_pread_source_into(
+        offset, source_fd, source_offset, len, dst,
+        read_bytes, successful_syscalls, ms_out);
+}
+
+static int ds4_gpu_stream_expert_pread_task_run(
+        ds4_gpu_stream_expert_pread_task *task) {
+    if (!task) return 0;
+    if (task->direct_source) {
+        return ds4_gpu_stream_expert_pread_source_into(
+            task->offset, task->source_fd, task->source_offset,
+            task->len, task->dst, &task->read_bytes,
+            &task->successful_syscalls, &task->ms);
+    }
+    return ds4_gpu_stream_expert_pread_into(
+        task->offset, task->len, task->dst, &task->read_bytes,
+        &task->successful_syscalls, &task->ms);
+}
+
 static void *ds4_gpu_stream_expert_pread_worker(void *arg) {
     ds4_gpu_stream_expert_pread_worker_args *wa =
         (ds4_gpu_stream_expert_pread_worker_args *)arg;
     for (uint32_t i = wa->worker_index; i < wa->n_tasks; i += wa->n_workers) {
         ds4_gpu_stream_expert_pread_task *task = &wa->tasks[i];
-        task->ok = ds4_gpu_stream_expert_pread_into(task->offset,
-                                                    task->len,
-                                                    task->dst,
-                                                    &task->read_bytes,
-                                                    &task->successful_syscalls,
-                                                    &task->ms);
+        task->ok = ds4_gpu_stream_expert_pread_task_run(task);
     }
     return NULL;
 }
@@ -9409,12 +9710,7 @@ static void *ds4_gpu_stream_expert_pread_pool_worker(void *arg) {
                 &g_stream_expert_pread_pool_tasks[task_index];
             pthread_mutex_unlock(&g_stream_expert_pread_pool_mutex);
 
-            task->ok = ds4_gpu_stream_expert_pread_into(task->offset,
-                                                        task->len,
-                                                        task->dst,
-                                                        &task->read_bytes,
-                                                        &task->successful_syscalls,
-                                                        &task->ms);
+            task->ok = ds4_gpu_stream_expert_pread_task_run(task);
 
             pthread_mutex_lock(&g_stream_expert_pread_pool_mutex);
         }
@@ -12077,29 +12373,22 @@ static ds4_gpu_stream_expert_cache_entry *ds4_gpu_stream_expert_cache_get_protec
     uint8_t *down_dst = (uint8_t *)[down_buf contents] + down_inner;
     if (!gate_dst || !up_dst || !down_dst) return NULL;
 
-    ds4_gpu_stream_expert_pread_task tasks[3] = {
-        {
-            .offset = gate_abs_offset,
-            .len = gate_expert_bytes,
-            .dst = gate_dst,
-        },
-        {
-            .offset = up_abs_offset,
-            .len = gate_expert_bytes,
-            .dst = up_dst,
-        },
-        {
-            .offset = down_abs_offset,
-            .len = down_expert_bytes,
-            .dst = down_dst,
-        },
-    };
+    ds4_gpu_stream_expert_pread_task tasks[3] = {0};
+    uint32_t n_tasks = 0;
+    if (!ds4_gpu_stream_expert_append_record_tasks(
+            tasks, 3, &n_tasks,
+            gate_abs_offset, up_abs_offset, down_abs_offset,
+            gate_expert_bytes, down_expert_bytes,
+            gate_dst, up_dst, down_dst,
+            ds4_gpu_stream_expert_coalesced_record_pread_enabled())) {
+        return NULL;
+    }
     uint64_t read_bytes = 0;
     double read_ms = 0.0;
     const int read_ok = ds4_gpu_stream_expert_pread_tasks(
-        tasks, 3, &read_bytes, &read_ms);
+        tasks, n_tasks, &read_bytes, &read_ms);
     const uint64_t pread_syscalls =
-        ds4_gpu_stream_expert_pread_successful_syscalls(tasks, 3);
+        ds4_gpu_stream_expert_pread_successful_syscalls(tasks, n_tasks);
     if (!read_ok) {
         ds4_gpu_stream_expert_cache_note_pread(
             layer, 0, pread_syscalls, read_bytes, read_ms);
@@ -12113,10 +12402,11 @@ static ds4_gpu_stream_expert_cache_entry *ds4_gpu_stream_expert_cache_get_protec
     [down_buf didModifyRange:NSMakeRange(down_inner, (NSUInteger)down_expert_bytes)];
     if (getenv("DS4_METAL_STREAMING_EXPERT_PREAD_PROFILE") != NULL) {
         fprintf(stderr,
-                "ds4: Metal streaming expert parallel pread layer=%u experts=1 tensors=3 "
+                "ds4: Metal streaming expert parallel pread layer=%u experts=1 reads=%u "
                 "threads=%u bytes=%.2f GiB wall=%.3f ms\n",
                 layer,
-                ds4_gpu_stream_expert_pread_thread_count(3),
+                n_tasks,
+                ds4_gpu_stream_expert_pread_thread_count(n_tasks),
                 ds4_gpu_gib(read_bytes),
                 read_ms);
     }
@@ -12619,21 +12909,15 @@ int ds4_gpu_stream_expert_cache_begin_selected_load(
             ds4_gpu_stream_expert_pending_load_release_buffers(p);
             return 0;
         }
-        p->tasks[p->n_tasks++] = (ds4_gpu_stream_expert_pread_task) {
-            .offset = p->gate_abs_offsets[slot],
-            .len = gate_expert_bytes,
-            .dst = gate_dst,
-        };
-        p->tasks[p->n_tasks++] = (ds4_gpu_stream_expert_pread_task) {
-            .offset = p->up_abs_offsets[slot],
-            .len = gate_expert_bytes,
-            .dst = up_dst,
-        };
-        p->tasks[p->n_tasks++] = (ds4_gpu_stream_expert_pread_task) {
-            .offset = p->down_abs_offsets[slot],
-            .len = down_expert_bytes,
-            .dst = down_dst,
-        };
+        if (!ds4_gpu_stream_expert_append_record_tasks(
+                p->tasks, DS4_METAL_STREAM_SELECTED_MAX_TASKS, &p->n_tasks,
+                p->gate_abs_offsets[slot], p->up_abs_offsets[slot],
+                p->down_abs_offsets[slot], gate_expert_bytes,
+                down_expert_bytes, gate_dst, up_dst, down_dst,
+                ds4_gpu_stream_expert_coalesced_record_pread_enabled())) {
+            ds4_gpu_stream_expert_pending_load_release_buffers(p);
+            return 0;
+        }
     }
 
     if (!ds4_gpu_stream_expert_cache_required_floor_satisfied()) {
@@ -12879,21 +13163,14 @@ static int ds4_gpu_stream_expert_cache_load_selected_missing(
                              down_inners[load_i];
         if (!gate_dst || !up_dst || !down_dst) return 0;
 
-        tasks[n_tasks++] = (ds4_gpu_stream_expert_pread_task) {
-            .offset = gate_abs_offsets[slot],
-            .len = gate_expert_bytes,
-            .dst = gate_dst,
-        };
-        tasks[n_tasks++] = (ds4_gpu_stream_expert_pread_task) {
-            .offset = up_abs_offsets[slot],
-            .len = gate_expert_bytes,
-            .dst = up_dst,
-        };
-        tasks[n_tasks++] = (ds4_gpu_stream_expert_pread_task) {
-            .offset = down_abs_offsets[slot],
-            .len = down_expert_bytes,
-            .dst = down_dst,
-        };
+        if (!ds4_gpu_stream_expert_append_record_tasks(
+                tasks, DS4_METAL_STREAM_SELECTED_MAX_TASKS, &n_tasks,
+                gate_abs_offsets[slot], up_abs_offsets[slot],
+                down_abs_offsets[slot], gate_expert_bytes,
+                down_expert_bytes, gate_dst, up_dst, down_dst,
+                ds4_gpu_stream_expert_coalesced_record_pread_enabled())) {
+            return 0;
+        }
     }
 
     if (!ds4_gpu_stream_expert_cache_required_floor_satisfied()) {
@@ -13702,25 +13979,19 @@ int ds4_gpu_qwen35_stream_batch_route_ready_select(
         uint8_t *down_dst =
             (uint8_t *)[p->down_bufs[load_i] contents] +
             p->down_inners[load_i];
-        if (!gate_dst || !up_dst || !down_dst ||
-            p->n_tasks > DS4_METAL_QWEN35_STREAM_MAX_TASKS - 3u) {
+        if (!gate_dst || !up_dst || !down_dst) {
             goto done;
         }
-        p->tasks[p->n_tasks++] = (ds4_gpu_stream_expert_pread_task) {
-            .offset = p->gate_abs_offsets[unique_i],
-            .len = p->gate_expert_bytes,
-            .dst = gate_dst,
-        };
-        p->tasks[p->n_tasks++] = (ds4_gpu_stream_expert_pread_task) {
-            .offset = p->up_abs_offsets[unique_i],
-            .len = p->gate_expert_bytes,
-            .dst = up_dst,
-        };
-        p->tasks[p->n_tasks++] = (ds4_gpu_stream_expert_pread_task) {
-            .offset = p->down_abs_offsets[unique_i],
-            .len = p->down_expert_bytes,
-            .dst = down_dst,
-        };
+        if (!ds4_gpu_stream_expert_append_record_tasks(
+                p->tasks, DS4_METAL_QWEN35_STREAM_MAX_TASKS, &p->n_tasks,
+                p->gate_abs_offsets[unique_i],
+                p->up_abs_offsets[unique_i],
+                p->down_abs_offsets[unique_i],
+                p->gate_expert_bytes, p->down_expert_bytes,
+                gate_dst, up_dst, down_dst,
+                ds4_gpu_stream_expert_coalesced_record_pread_enabled())) {
+            goto done;
+        }
     }
 
     p->state = p->n_tasks == 0 ? DS4_QWEN35_STREAM_IO_READY :
@@ -27360,7 +27631,7 @@ static int ds4_gpu_routed_moe_one_tensor_impl(
         uint64_t expert_major_up_inner = 0;
         uint64_t expert_major_down_inner = 0;
         uint64_t expert_major_stride = 0;
-        const bool use_resident_expert_major =
+        const bool use_expert_major =
             !g_ssd_streaming_mode &&
             ds4_gpu_qwen35_expert_pack_resident_layer(
                 layer_index,
@@ -27373,10 +27644,13 @@ static int ds4_gpu_routed_moe_one_tensor_impl(
                 &expert_major_up_inner,
                 &expert_major_down_inner,
                 &expert_major_stride) != 0;
-        if (use_resident_expert_major &&
-            (g_qwen35_expert_pack.gate_bytes != gate_expert_bytes ||
-             g_qwen35_expert_pack.up_bytes != gate_expert_bytes ||
-             g_qwen35_expert_pack.down_bytes != down_expert_bytes)) {
+        if (use_expert_major &&
+            (expert_major_up_inner !=
+                 expert_major_gate_inner + gate_expert_bytes ||
+             expert_major_down_inner !=
+                 expert_major_up_inner + gate_expert_bytes ||
+             expert_major_stride !=
+                 gate_expert_bytes * 2u + down_expert_bytes)) {
             fprintf(stderr,
                     "ds4: Metal expert-major record geometry does not match routed tensors\n");
             return 0;
@@ -27390,7 +27664,7 @@ static int ds4_gpu_routed_moe_one_tensor_impl(
             ds4_gpu_make_mul_mv_id_args(expert_mid_dim, out_dim, n_total_expert,
                                           down_row_bytes, down_expert_bytes,
                                           n_expert, n_expert, n_tokens, down_nr0);
-        if (use_resident_expert_major) {
+        if (use_expert_major) {
             gate_args.nb02 = expert_major_stride;
             down_args.nb02 = expert_major_stride;
         }
@@ -27432,7 +27706,7 @@ static int ds4_gpu_routed_moe_one_tensor_impl(
             getenv("DS4_METAL_ENABLE_Q4_GROUPED_EXPERTS") != NULL &&
             getenv("DS4_METAL_DISABLE_Q4_GROUPED_EXPERTS") == NULL;
         const bool use_q4_grouped_experts =
-            !use_resident_expert_major &&
+            !use_expert_major &&
             gate_type == DS4_METAL_TENSOR_Q4_K &&
             down_type == DS4_METAL_TENSOR_Q4_K &&
             n_expert == 6 &&
@@ -27455,7 +27729,7 @@ static int ds4_gpu_routed_moe_one_tensor_impl(
             getenv("DS4_METAL_Q4_GROUPED_CACHE_VIEWS") != NULL;
         const uint32_t q4_group6_expert_group_size = 64;
         const bool use_q4_group6_experts =
-            !use_resident_expert_major &&
+            !use_expert_major &&
             !use_q4_grouped_experts &&
             gate_type == DS4_METAL_TENSOR_Q4_K &&
             down_type == DS4_METAL_TENSOR_Q4_K &&
@@ -27472,7 +27746,7 @@ static int ds4_gpu_routed_moe_one_tensor_impl(
             getenv("DS4_METAL_DISABLE_Q4_GROUP6_EXPERT_TABLE") == NULL;
         const uint32_t q4_group8_expert_group_size = 48;
         const bool use_q4_group8_experts =
-            !use_resident_expert_major &&
+            !use_expert_major &&
             !use_q4_grouped_experts &&
             !use_q4_group6_experts &&
             gate_type == DS4_METAL_TENSOR_Q4_K &&
@@ -27490,7 +27764,7 @@ static int ds4_gpu_routed_moe_one_tensor_impl(
             getenv("DS4_METAL_DISABLE_Q4_GROUP8_EXPERT_TABLE") == NULL;
         const uint32_t q4_group24_expert_group_size = 16;
         const bool use_q4_group24_experts =
-            !use_resident_expert_major &&
+            !use_expert_major &&
             !use_q4_grouped_experts &&
             !use_q4_group6_experts &&
             !use_q4_group8_experts &&
@@ -27525,7 +27799,7 @@ static int ds4_gpu_routed_moe_one_tensor_impl(
             getenv("DS4_METAL_ENABLE_Q4_EXACT_TENSOR_ID") != NULL &&
             getenv("DS4_METAL_DISABLE_Q4_EXACT_TENSOR_ID") == NULL;
         const bool use_q4_exact_tensor_id =
-            !use_resident_expert_major &&
+            !use_expert_major &&
             !use_q4_grouped_experts &&
             !use_q4_group6_experts &&
             !use_q4_group8_experts &&
@@ -27563,7 +27837,7 @@ static int ds4_gpu_routed_moe_one_tensor_impl(
             ds4_gpu_q4_table_queue_residency_enabled(q4_expert_table_auto ||
                                                      q4_expert_address_auto);
         const bool use_q4_expert_address_table =
-            !use_resident_expert_major &&
+            !use_expert_major &&
             !use_q4_grouped_experts &&
             !use_q4_group6_experts &&
             !use_q4_group8_experts &&
@@ -27592,7 +27866,7 @@ static int ds4_gpu_routed_moe_one_tensor_impl(
             getenv("DS4_METAL_ENABLE_Q4_EXPERT_TABLE") != NULL ||
             q4_expert_table_auto;
         const bool use_q4_expert_table =
-            !use_resident_expert_major &&
+            !use_expert_major &&
             !use_q4_grouped_experts &&
             !use_q4_group6_experts &&
             !use_q4_group8_experts &&
@@ -27630,7 +27904,7 @@ static int ds4_gpu_routed_moe_one_tensor_impl(
             getenv("DS4_METAL_ENABLE_Q4_GATHER_SLOTS") != NULL &&
             getenv("DS4_METAL_DISABLE_Q4_GATHER_SLOTS") == NULL;
         const bool use_q4_gather_slots =
-            !use_resident_expert_major &&
+            !use_expert_major &&
             !use_q4_grouped_experts &&
             !use_q4_group6_experts &&
             !use_q4_group8_experts &&
@@ -27652,7 +27926,7 @@ static int ds4_gpu_routed_moe_one_tensor_impl(
             g_moe_mul_mv_slots6_q4_k_sum6_pipeline != nil &&
             enable_q4_gather_slots;
         const bool use_q4_selected_slots =
-            !use_resident_expert_major &&
+            !use_expert_major &&
             !use_q4_grouped_experts &&
             !use_q4_group6_experts &&
             !use_q4_group8_experts &&
@@ -27751,7 +28025,7 @@ static int ds4_gpu_routed_moe_one_tensor_impl(
         if (!use_selected_slots) {
             g_routed_moe_selected_override_n = 0;
         }
-        if (use_resident_expert_major) {
+        if (use_expert_major) {
             gate_buf = expert_major_buffer;
             up_buf = expert_major_buffer;
             down_buf = expert_major_buffer;
@@ -28567,7 +28841,7 @@ static int ds4_gpu_routed_moe_one_tensor_impl(
             moe_one_stage_layer_match;
         const char *moe_one_stage_filter = getenv("DS4_METAL_MOE_STAGE_PROFILE_FILTER");
         const char *moe_one_path =
-            use_resident_expert_major ? "qwen_expert_major" :
+            use_expert_major ? "qwen_expert_major" :
             use_q4_grouped_experts ? "q4_grouped_pair_swiglu" :
             use_q4_group6_experts ? "q4_group6_pair_swiglu" :
             use_q4_group8_experts ? "q4_group8_pair_swiglu" :
@@ -30658,6 +30932,132 @@ int ds4_gpu_internal_qwen35_expert_pack_test(void) {
         memcmp(actual_gate, model_gate, sizeof(actual_gate)) != 0) {
         goto cleanup;
     }
+
+    /* Exercise the v2 manifest adapter independently of Qwen's fixed layout.
+     * Layer 1 deliberately uses a different record geometry and starts after
+     * a 4 KiB gap, which proves translation and resident mapping use the
+     * per-layer descriptor rather than the v1 arithmetic. */
+    ds4_gpu_expert_store_layer_v2 v2_layers[2] = {
+        {
+            .data_offset = 4096,
+            .data_size = 45,
+            .record_bytes = 15,
+            .component_offset = {0, 3, 8},
+            .component_bytes = {3, 5, 7},
+        },
+        {
+            .data_offset = 8192,
+            .data_size = 48,
+            .record_bytes = 16,
+            .component_offset = {0, 4, 8},
+            .component_bytes = {4, 4, 8},
+        },
+    };
+    ds4_gpu_expert_store_layer_v2 overlapping[2];
+    memcpy(overlapping, v2_layers, sizeof(overlapping));
+    overlapping[1].data_offset = overlapping[0].data_offset;
+    const uint8_t v2_gate[4] = {0x41, 0x42, 0x43, 0x44};
+    const uint8_t v2_up[4] = {0x51, 0x52, 0x53, 0x54};
+    const uint8_t v2_down[8] = {
+        0x61, 0x62, 0x63, 0x64, 0x65, 0x66, 0x67, 0x68,
+    };
+    const uint64_t v2_record_offset = 8192 + 2u * 16u;
+    const uint64_t v2_gate_offset = 320u * 1024u;
+    const uint64_t v2_up_offset = 321u * 1024u;
+    const uint64_t v2_down_offset = 322u * 1024u;
+    if (ds4_gpu_expert_store_v2_install(
+            pack_fd, file_size, 2, 3, overlapping) ||
+        !ds4_gpu_internal_qwen35_expert_pack_pwrite_all(
+            pack_fd, v2_gate, sizeof(v2_gate), v2_record_offset) ||
+        !ds4_gpu_internal_qwen35_expert_pack_pwrite_all(
+            pack_fd, v2_up, sizeof(v2_up), v2_record_offset + 4) ||
+        !ds4_gpu_internal_qwen35_expert_pack_pwrite_all(
+            pack_fd, v2_down, sizeof(v2_down), v2_record_offset + 8) ||
+        !ds4_gpu_expert_store_v2_install(
+            pack_fd, file_size, 2, 3, v2_layers) ||
+        !ds4_gpu_expert_store_v2_bind_layer(
+            0, model_size, 300u * 1024u, 301u * 1024u, 302u * 1024u) ||
+        !ds4_gpu_expert_store_v2_bind_layer(
+            1, model_size, v2_gate_offset, v2_up_offset, v2_down_offset)) {
+        goto cleanup;
+    }
+    installed = 1;
+    uint64_t v2_span_offset = 0;
+    uint64_t v2_span_size = 0;
+    if (!ds4_gpu_expert_store_v2_layer_span(
+            1, model_size, &v2_span_offset, &v2_span_size) ||
+        v2_span_offset != v2_layers[1].data_offset ||
+        v2_span_size != v2_layers[1].data_size ||
+        ds4_gpu_expert_store_v2_layer_span(
+            2, model_size, &v2_span_offset, &v2_span_size)) {
+        goto cleanup;
+    }
+    if (ds4_gpu_qwen35_expert_pack_resolve(
+            v2_gate_offset + 2u * sizeof(v2_gate), sizeof(v2_gate),
+            &source_fd, &source_offset) != 1 ||
+        source_fd != pack_fd || source_offset != v2_record_offset ||
+        ds4_gpu_qwen35_expert_pack_resolve(
+            v2_up_offset + 2u * sizeof(v2_up), sizeof(v2_up),
+            &source_fd, &source_offset) != 1 ||
+        source_offset != v2_record_offset + 4 ||
+        ds4_gpu_qwen35_expert_pack_resolve(
+            v2_down_offset + 2u * sizeof(v2_down), sizeof(v2_down),
+            &source_fd, &source_offset) != 1 ||
+        source_offset != v2_record_offset + 8 ||
+        ds4_gpu_qwen35_expert_pack_resolve(
+            v2_gate_offset + 2u * sizeof(v2_gate), sizeof(v2_gate) - 1,
+            &source_fd, &source_offset) != -1) {
+        goto cleanup;
+    }
+    uint8_t v2_record[16] = {0};
+    ds4_gpu_stream_expert_pread_task v2_tasks[3] = {0};
+    uint32_t v2_n_tasks = 0;
+    uint64_t v2_read_bytes = 0;
+    double v2_read_ms = 0.0;
+    if (!ds4_gpu_stream_expert_append_record_tasks(
+            v2_tasks, 3, &v2_n_tasks,
+            v2_gate_offset + 2u * sizeof(v2_gate),
+            v2_up_offset + 2u * sizeof(v2_up),
+            v2_down_offset + 2u * sizeof(v2_down),
+            sizeof(v2_gate), sizeof(v2_down),
+            v2_record,
+            v2_record + sizeof(v2_gate),
+            v2_record + sizeof(v2_gate) + sizeof(v2_up),
+            true) ||
+        v2_n_tasks != 1 || !v2_tasks[0].direct_source ||
+        !ds4_gpu_stream_expert_pread_tasks(
+            v2_tasks, v2_n_tasks, &v2_read_bytes, &v2_read_ms) ||
+        v2_read_bytes != sizeof(v2_record) ||
+        v2_tasks[0].successful_syscalls != 1 ||
+        memcmp(v2_record, v2_gate, sizeof(v2_gate)) != 0 ||
+        memcmp(v2_record + sizeof(v2_gate), v2_up, sizeof(v2_up)) != 0 ||
+        memcmp(v2_record + sizeof(v2_gate) + sizeof(v2_up),
+               v2_down, sizeof(v2_down)) != 0 ||
+        !ds4_gpu_expert_store_v2_enable_resident()) {
+        goto cleanup;
+    }
+    resident_buffer = nil;
+    resident_gate_inner = 0;
+    resident_up_inner = 0;
+    resident_down_inner = 0;
+    resident_stride = 0;
+    const uint64_t v2_expected_inner =
+        v2_layers[1].data_offset % (uint64_t)sysconf(_SC_PAGESIZE);
+    if (!ds4_gpu_qwen35_expert_pack_resident_layer(
+            1, model_size, v2_gate_offset, v2_up_offset, v2_down_offset,
+            &resident_buffer, &resident_gate_inner, &resident_up_inner,
+            &resident_down_inner, &resident_stride) ||
+        !resident_buffer || resident_gate_inner != v2_expected_inner ||
+        resident_up_inner != v2_expected_inner + 4 ||
+        resident_down_inner != v2_expected_inner + 8 ||
+        resident_stride != 16 ||
+        memcmp((const uint8_t *)resident_buffer.contents +
+                   resident_gate_inner + 2u * resident_stride,
+               v2_gate, sizeof(v2_gate)) != 0) {
+        goto cleanup;
+    }
+    ds4_gpu_expert_store_v2_clear();
+    installed = 0;
     ok = 1;
 
 cleanup:
@@ -31168,9 +31568,26 @@ int ds4_gpu_qwen35_routed_moe_batch_select_tensor(
         uint64_t expert_major_up_inner = 0;
         uint64_t expert_major_down_inner = 0;
         uint64_t expert_major_stride = 0;
-        const bool use_resident_expert_major =
-            !g_ssd_streaming_mode &&
-            ds4_gpu_qwen35_expert_pack_resident_layer(
+        const bool batch_selected_addr_enabled =
+            ds4_gpu_stream_prefill_batch_selected_addr_enabled(n_tokens,
+                                                               n_total_expert,
+                                                               n_expert,
+                                                               gate_type,
+                                                               down_type);
+        uint64_t native_layer_offset = 0;
+        uint64_t native_layer_size = 0;
+        const bool native_expert_major_ssd =
+            g_ssd_streaming_mode &&
+            ds4_gpu_expert_store_v2_layer_span(
+                layer_index, model_size,
+                &native_layer_offset, &native_layer_size) != 0;
+        const bool request_expert_major =
+            !g_ssd_streaming_mode ||
+            (native_expert_major_ssd && !batch_selected_addr_enabled);
+        const bool use_expert_major =
+            request_expert_major &&
+            ds4_gpu_qwen35_expert_pack_resolve_layer(
+                model_map,
                 layer_index,
                 model_size,
                 gate_offset,
@@ -31181,20 +31598,24 @@ int ds4_gpu_qwen35_routed_moe_batch_select_tensor(
                 &expert_major_up_inner,
                 &expert_major_down_inner,
                 &expert_major_stride) != 0;
-        if (use_resident_expert_major &&
-            (g_qwen35_expert_pack.gate_bytes != gate_expert_bytes ||
-             g_qwen35_expert_pack.up_bytes != gate_expert_bytes ||
-             g_qwen35_expert_pack.down_bytes != down_expert_bytes)) {
+        if (native_expert_major_ssd && !batch_selected_addr_enabled &&
+            !use_expert_major) {
+            fprintf(stderr,
+                    "ds4: Metal native expert-major layer %u is not covered by the current SSD mapping\n",
+                    layer_index);
+            return 0;
+        }
+        if (use_expert_major &&
+            (expert_major_up_inner !=
+                 expert_major_gate_inner + gate_expert_bytes ||
+             expert_major_down_inner !=
+                 expert_major_up_inner + gate_expert_bytes ||
+             expert_major_stride !=
+                 gate_expert_bytes * 2u + down_expert_bytes)) {
             fprintf(stderr,
                     "ds4: Metal expert-major batch geometry does not match routed tensors\n");
             return 0;
         }
-        const bool batch_selected_addr_enabled =
-            ds4_gpu_stream_prefill_batch_selected_addr_enabled(n_tokens,
-                                                               n_total_expert,
-                                                               n_expert,
-                                                               gate_type,
-                                                               down_type);
         const bool use_iq2_batch_selected_addr =
             batch_selected_addr_enabled &&
             gate_type == DS4_METAL_TENSOR_IQ2_XXS &&
@@ -31237,7 +31658,7 @@ int ds4_gpu_qwen35_routed_moe_batch_select_tensor(
             ds4_gpu_make_mul_mv_id_args(expert_mid_dim, out_dim, n_total_expert,
                                           down_row_bytes, down_expert_bytes,
                                           n_expert, n_expert, n_tokens, down_nr0);
-        if (use_resident_expert_major) {
+        if (use_expert_major) {
             gate_args.nb02 = expert_major_stride;
             down_args.nb02 = expert_major_stride;
         }
@@ -31255,7 +31676,7 @@ int ds4_gpu_qwen35_routed_moe_batch_select_tensor(
             getenv("DS4_METAL_ENABLE_Q4_EXPERT_TABLE") != NULL ||
             q4_batch_expert_table_auto;
         const bool use_q4_batch_expert_table =
-            !use_resident_expert_major &&
+            !use_expert_major &&
             gate_type == DS4_METAL_TENSOR_Q4_K &&
             down_type == DS4_METAL_TENSOR_Q4_K &&
             n_expert == 6 &&
@@ -31336,7 +31757,10 @@ int ds4_gpu_qwen35_routed_moe_batch_select_tensor(
             gate_type == DS4_METAL_TENSOR_IQ2_XXS &&
             down_type == DS4_METAL_TENSOR_Q2_K &&
             n_expert == 6 &&
-            getenv("DS4_METAL_ENABLE_MOE_MM_ID_PAIR_SWIGLU") != NULL &&
+            /* The fused kernel is algebraically the same gate/up + SwiGLU +
+             * route-weight sequence as the split path, but reads the input
+             * activation once and never writes the two large F32 temporaries.
+             * Keep one disable-only switch for numerical/perf bisects. */
             getenv("DS4_METAL_DISABLE_MOE_MM_ID_PAIR_SWIGLU") == NULL &&
             getenv("DS4_METAL_MOE_WRITE_CLAMPED_ACT") == NULL &&
             getenv("DS4_METAL_GRAPH_DUMP_PREFIX") == NULL;
@@ -31352,7 +31776,7 @@ int ds4_gpu_qwen35_routed_moe_batch_select_tensor(
                                                         down_row_bytes, down_expert_bytes,
                                                         n_expert, n_expert, n_tokens,
                                                         request_mid_f16 ? sizeof(uint16_t) : sizeof(float));
-            if (use_resident_expert_major) {
+            if (use_expert_major) {
                 gate_mm_args.nb02 = expert_major_stride;
                 gate_mm_args.nb03 =
                     (uint64_t)n_total_expert * expert_major_stride;
@@ -31475,7 +31899,7 @@ int ds4_gpu_qwen35_routed_moe_batch_select_tensor(
         const bool actual_expert_group =
             use_stream_expert_group || use_resident_expert_group;
 
-        if (use_resident_expert_major) {
+        if (use_expert_major) {
             if (n_expert > 1 && (!expertsbuf ||
                 ds4_gpu_tensor_bytes(experts) < down_scratch_bytes)) {
                 if (!ds4_gpu_ensure_scratch_buffer(
@@ -31604,7 +32028,7 @@ int ds4_gpu_qwen35_routed_moe_batch_select_tensor(
             (moe_stage_layer == UINT32_MAX || moe_stage_layer == layer_index);
         const char *moe_stage_filter = getenv("DS4_METAL_MOE_STAGE_PROFILE_FILTER");
         const char *moe_path =
-            use_resident_expert_major ? "qwen_expert_major" :
+            use_expert_major ? "expert_major" :
             use_q4_batch_expert_table ? "q4_table_pair_swiglu" :
             use_stream_expert_group ? "qwen_q4_expert_group_stream_addr" :
             use_qwen_q4_batch_selected_addr ? "qwen_q4_batch_stream_addr" :

@@ -150,6 +150,21 @@ the runtime needs.
 | GLM 5.2 | `codex/glm52-upstream-clean-bench` | Experimental branch | Correct streamed prefill and Metal performance on 64 GB |
 | Qwen3.6-35B-A3B (`qwen35moe`) | `main` | Supported opt-in Metal path, model-backed measured | Metal AUTO mapping, live-pressure fallback, strict SSD cache, resident prefill, and parallel resident decode |
 
+### DeepSeek expert-major v2 format
+
+DS4 includes the experimental, self-describing `ds4.expert_major.v2` layout for
+DeepSeek V4. It stores each layer as adjacent gate/up/down expert records without
+requantizing and without keeping a second routed-weight copy. Canonical GGUFs
+remain byte-for-byte compatible with every existing backend; native v2 files
+currently require a complete local Apple Metal model and fail early elsewhere.
+
+Conversion, full byte-level verification, compatibility limits, and the
+model-backed promotion gate are in
+[`docs/deepseek-expert-major-v2.md`](docs/deepseek-expert-major-v2.md). Until a
+dated canonical/native benchmark gate is complete, the canonical DeepSeek GGUF
+remains the release reference. The first M5 Pro SSD tranche is recorded in
+[`docs/benchmarks/2026-07-17-deepseek-native-expert-major.md`](docs/benchmarks/2026-07-17-deepseek-native-expert-major.md).
+
 ### Qwen3.6 Metal AUTO path
 
 The main branch is qualified and measured with one normalized text-only

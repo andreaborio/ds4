@@ -38,6 +38,7 @@
 
 #include "ds4.h"
 #include "ds4_distributed.h"
+#include "ds4_expert_store.h"
 #include "ds4_qwen.h"
 #include "ds4_qwen_expert_pack.h"
 #include "ds4_qwen_native_gguf.h"
@@ -1611,6 +1612,7 @@ enum {
     DS4_TENSOR_Q2_K     = 10,
     DS4_TENSOR_Q4_K     = 12,
     DS4_TENSOR_IQ2_XXS  = 16,
+    DS4_TENSOR_I8       = 24,
     DS4_TENSOR_I32      = 26,
 };
 
@@ -1652,10 +1654,13 @@ typedef struct {
 
     ds4_model_family family;
 
-    /* A DS4-native Qwen file stores routed weights once in expert-major
-     * order.  The loader expands its directory into the same logical tensor
-     * inventory used by the canonical path; these fields retain the physical
-     * opaque-tensor extent needed to install the mandatory translator. */
+    /* DS4-native files store routed weights once in expert-major order. The
+     * loader expands their directory into the same logical tensor inventory
+     * used by canonical GGUFs; these extents retain the physical opaque store
+     * needed by the mandatory backend translator. */
+    bool native_expert_store_v2;
+    uint64_t native_expert_store_offset;
+    uint64_t native_expert_store_bytes;
     bool qwen_native_expert_major;
     uint64_t qwen_native_pack_offset;
     uint64_t qwen_native_pack_bytes;
@@ -1985,7 +1990,10 @@ static void parse_tensors(ds4_model *m, ds4_cursor *c) {
     }
 }
 
-static bool qwen35_canonical_routed_name(ds4_str name) {
+static bool canonical_routed_name(
+        ds4_str  name,
+        uint32_t *layer_out,
+        uint32_t *role_out) {
     if (!name.ptr || name.len == 0 || name.len >= 96) return false;
     char text[96];
     memcpy(text, name.ptr, (size_t)name.len);
@@ -2001,6 +2009,8 @@ static bool qwen35_canonical_routed_name(ds4_str name) {
         consumed = -1;
         if (sscanf(text, patterns[kind], &layer, &consumed) == 1 &&
             consumed >= 0 && text[consumed] == '\0') {
+            if (layer_out) *layer_out = layer;
+            if (role_out) *role_out = kind;
             return true;
         }
     }
@@ -2026,7 +2036,7 @@ static void model_expand_qwen35_native_expert_store(ds4_model *m) {
             store = tensor;
             store_count++;
         }
-        if (qwen35_canonical_routed_name(tensor->name)) {
+        if (canonical_routed_name(tensor->name, NULL, NULL)) {
             canonical_routed++;
         }
     }
@@ -2164,6 +2174,180 @@ static void model_expand_qwen35_native_expert_store(ds4_model *m) {
     ds4_qwen_expert_pack_close(pack);
 }
 
+/* v2 keeps every physical record self-describing, so DeepSeek Flash and Pro
+ * can share one loader even when routed quant types differ by layer. Logical
+ * tensor offsets below are stable identity ranges only; the validated store
+ * translates each exact expert read to its interleaved physical record. */
+static void model_expand_deepseek4_native_expert_store(ds4_model *m) {
+    if (!m || m->family != DS4_MODEL_FAMILY_DEEPSEEK4 ||
+        !m->tensors || m->n_tensors == 0) {
+        return;
+    }
+    ds4_tensor *store_tensor = NULL;
+    uint32_t store_count = 0;
+    uint32_t canonical_count = 0;
+    for (uint64_t i = 0; i < m->n_tensors; i++) {
+        ds4_tensor *tensor = &m->tensors[i];
+        if (ds4_streq(tensor->name, DS4_EXPERT_STORE_V2_TENSOR)) {
+            store_tensor = tensor;
+            store_count++;
+        }
+        if (canonical_routed_name(tensor->name, NULL, NULL)) {
+            canonical_count++;
+        }
+    }
+    if (store_count == 0) return;
+    if (store_count != 1 || canonical_count != 0 || !store_tensor ||
+        store_tensor->ndim != 1 || store_tensor->type != DS4_TENSOR_I8 ||
+        store_tensor->dim[0] != store_tensor->bytes ||
+        store_tensor->bytes == 0) {
+        ds4_die("malformed DS4-native expert-major v2 tensor inventory");
+    }
+
+    ds4_expert_store *store = NULL;
+    char error[256] = {0};
+    if (!ds4_expert_store_open_embedded(
+            &store, m->fd, store_tensor->abs_offset, store_tensor->bytes,
+            DS4_EXPERT_STORE_FAMILY_DEEPSEEK4, error, sizeof(error))) {
+        fprintf(stderr, "ds4: DS4-native DeepSeek expert store is invalid: %s\n",
+                error[0] ? error : "format or geometry mismatch");
+        exit(1);
+    }
+    const ds4_expert_store_manifest *manifest =
+        ds4_expert_store_manifest_get(store);
+    uint32_t metadata_layers = 0;
+    uint32_t metadata_experts = 0;
+    uint32_t metadata_experts_used = 0;
+    const uint64_t routed_count = manifest ?
+        (uint64_t)manifest->layer_count * 3u : 0;
+    const uint64_t expected_physical = manifest ?
+        manifest->source_tensor_count - routed_count + 1u : 0;
+    if (!manifest ||
+        !model_get_u32(m, "deepseek4.block_count", &metadata_layers) ||
+        !model_get_u32(m, "deepseek4.expert_count", &metadata_experts) ||
+        !model_get_u32(m, "deepseek4.expert_used_count",
+                       &metadata_experts_used) ||
+        manifest->layer_count != metadata_layers ||
+        manifest->expert_count != metadata_experts ||
+        manifest->expert_used_count != metadata_experts_used ||
+        manifest->source_tensor_count < routed_count ||
+        m->n_tensors != expected_physical) {
+        ds4_expert_store_close(store);
+        ds4_die("DS4-native DeepSeek store does not match GGUF metadata or tensor inventory");
+    }
+
+    ds4_tensor *logical = calloc(
+        (size_t)manifest->source_tensor_count, sizeof(logical[0]));
+    const size_t name_stride = 64;
+    char *names = calloc((size_t)routed_count, name_stride);
+    if (!logical || !names) {
+        free(logical);
+        free(names);
+        ds4_expert_store_close(store);
+        ds4_die("out of memory expanding DS4-native DeepSeek tensors");
+    }
+    uint64_t logical_count = 0;
+    for (uint64_t i = 0; i < m->n_tensors; i++) {
+        if (&m->tensors[i] == store_tensor) continue;
+        logical[logical_count++] = m->tensors[i];
+    }
+    if (logical_count + routed_count != manifest->source_tensor_count) {
+        free(logical);
+        free(names);
+        ds4_expert_store_close(store);
+        ds4_die("DS4-native DeepSeek logical tensor count mismatch");
+    }
+
+    uint64_t virtual_offset = store_tensor->abs_offset + manifest->data_offset;
+    const uint64_t store_end = store_tensor->abs_offset + store_tensor->bytes;
+    if (virtual_offset < store_tensor->abs_offset ||
+        store_end < store_tensor->abs_offset) {
+        free(logical);
+        free(names);
+        ds4_expert_store_close(store);
+        ds4_die("DS4-native DeepSeek expert-store range overflows");
+    }
+    const char *role_name[3] = {
+        "ffn_gate_exps", "ffn_up_exps", "ffn_down_exps",
+    };
+    for (uint32_t layer = 0; layer < manifest->layer_count; layer++) {
+        const ds4_expert_store_layer *entry =
+            ds4_expert_store_layer_get(store, layer);
+        if (!entry) {
+            free(logical);
+            free(names);
+            ds4_expert_store_close(store);
+            ds4_die("DS4-native DeepSeek layer manifest is missing");
+        }
+        for (uint32_t role = 0; role < 3; role++) {
+            const ds4_expert_store_component *component =
+                &entry->component[role];
+            const uint64_t synthetic_index = (uint64_t)layer * 3u + role;
+            char *name = names + synthetic_index * name_stride;
+            const int count = snprintf(
+                name, name_stride, "blk.%u.%s.weight", layer,
+                role_name[role]);
+            uint64_t matrix_bytes = 0;
+            if (count <= 0 || (size_t)count >= name_stride ||
+                component->expert_bytes >
+                    UINT64_MAX / manifest->expert_count) {
+                free(logical);
+                free(names);
+                ds4_expert_store_close(store);
+                ds4_die("DS4-native DeepSeek virtual tensor geometry overflows");
+            }
+            matrix_bytes = component->expert_bytes * manifest->expert_count;
+            if (virtual_offset > store_end ||
+                matrix_bytes > store_end - virtual_offset) {
+                free(logical);
+                free(names);
+                ds4_expert_store_close(store);
+                ds4_die("DS4-native DeepSeek virtual tensor range exceeds its store");
+            }
+            ds4_tensor *tensor = &logical[logical_count++];
+            *tensor = (ds4_tensor){
+                .name = {.ptr = name, .len = (uint64_t)count},
+                .ndim = 3,
+                .dim = {
+                    component->dim[0], component->dim[1], component->dim[2],
+                },
+                .type = component->ggml_type,
+                .rel_offset = virtual_offset - m->tensor_data_pos,
+                .abs_offset = virtual_offset,
+                .elements = component->dim[0] * component->dim[1] *
+                            component->dim[2],
+                .bytes = matrix_bytes,
+            };
+            virtual_offset += matrix_bytes;
+        }
+    }
+    if (logical_count != manifest->source_tensor_count) {
+        free(logical);
+        free(names);
+        ds4_expert_store_close(store);
+        ds4_die("DS4-native DeepSeek logical inventory is incomplete");
+    }
+
+    const uint64_t physical_count = m->n_tensors;
+    const uint64_t physical_offset = store_tensor->abs_offset;
+    const uint64_t physical_bytes = store_tensor->bytes;
+    free(m->tensors);
+    m->tensors = logical;
+    m->owned_tensor_names = names;
+    m->gguf_n_tensors = physical_count;
+    m->n_tensors = manifest->source_tensor_count;
+    m->native_expert_store_v2 = true;
+    m->native_expert_store_offset = physical_offset;
+    m->native_expert_store_bytes = physical_bytes;
+    m->max_tensor_bytes = 0;
+    for (uint64_t i = 0; i < m->n_tensors; i++) {
+        if (m->tensors[i].bytes > m->max_tensor_bytes) {
+            m->max_tensor_bytes = m->tensors[i].bytes;
+        }
+    }
+    ds4_expert_store_close(store);
+}
+
 /* Open and map the GGUF once.  Metal needs a shared mapping for no-copy
  * MTLBuffers; CPU uses a private read-only mapping to avoid Darwin VM stress.
  * Tokenizer-only callers pass prefetch_cpu=false so inspecting tokens never
@@ -2214,6 +2398,7 @@ static void model_open(ds4_model *m, const char *path, bool metal_mapping,
     parse_metadata(m, &c);
     m->family = model_family_from_metadata(m);
     parse_tensors(m, &c);
+    model_expand_deepseek4_native_expert_store(m);
     model_expand_qwen35_native_expert_store(m);
 
     if (!metal_mapping && prefetch_cpu &&
@@ -16510,6 +16695,43 @@ static bool metal_graph_stream_readahead_enabled(void) {
            getenv("DS4_METAL_DISABLE_STREAMING_READAHEAD") == NULL;
 }
 
+/* A native v2 GGUF exposes canonical expert tensors only as logical identity.
+ * Full-layer SSD prefill must map the physical expert-major payload instead.
+ * Decode/selected-address paths deliberately keep the smaller static mapping
+ * and fetch individual records through the expert cache. */
+static bool metal_graph_stream_layer_spans(
+        const ds4_weights       *weights,
+        uint64_t                 model_size,
+        uint32_t                 il,
+        bool                     decode_only,
+        ds4_model_map_span_vec  *spans) {
+    if (!weights || model_size == 0 || !spans || il >= DS4_N_LAYER) {
+        return false;
+    }
+    uint64_t expert_offset = 0;
+    uint64_t expert_size = 0;
+    const bool native_full_layer =
+        !decode_only &&
+        ds4_gpu_expert_store_v2_layer_span(
+            il, model_size,
+            &expert_offset, &expert_size) != 0;
+    if (!native_full_layer) {
+        return decode_only ?
+            weights_model_map_decode_layer_spans(weights, il, spans) :
+            weights_model_map_spans(weights, il, il, false, spans);
+    }
+
+    /* Start from the decode-static layer set, which already excludes routed
+     * experts, then add the one real record-interleaved payload. */
+    if (!weights_model_map_decode_layer_spans(weights, il, spans)) return false;
+    model_map_span_vec_append(
+        spans, expert_offset, expert_offset + expert_size, true);
+    if (expert_size > spans->max_tensor_bytes) {
+        spans->max_tensor_bytes = expert_size;
+    }
+    return model_map_span_vec_finish(spans);
+}
+
 static bool metal_graph_stream_madvise_willneed_enabled(void) {
     return getenv("DS4_METAL_ENABLE_STREAMING_MADVISE_WILLNEED") != NULL &&
            getenv("DS4_METAL_DISABLE_STREAMING_MADVISE_WILLNEED") == NULL;
@@ -17777,9 +17999,8 @@ static bool metal_graph_stream_prefill_layer_pagein_start(
     const uint32_t n_threads =
         metal_graph_stream_prefill_layer_pagein_threads();
     ds4_model_map_span_vec spans;
-    const bool spans_ok = decode_only ?
-        weights_model_map_decode_layer_spans(weights, il, &spans) :
-        weights_model_map_spans(weights, il, il, false, &spans);
+    const bool spans_ok = metal_graph_stream_layer_spans(
+        weights, model->size, il, decode_only, &spans);
     if (!spans_ok) return false;
     metal_graph_stream_pagein_range *ranges =
         xmalloc((size_t)spans.len * n_threads * sizeof(ranges[0]));
@@ -18044,7 +18265,8 @@ static void metal_graph_stream_readahead_layer(
         const ds4_weights *weights,
         uint32_t           il) {
     ds4_model_map_span_vec spans;
-    if (!weights_model_map_spans(weights, il, il, false, &spans)) return;
+    if (!metal_graph_stream_layer_spans(
+            weights, model->size, il, false, &spans)) return;
     metal_graph_stream_readahead_spans(model, &spans);
     free(spans.v);
 }
@@ -18281,7 +18503,8 @@ static bool metal_graph_stream_map_layer(
         const ds4_weights *weights,
         uint32_t           il) {
     ds4_model_map_span_vec spans;
-    if (!weights_model_map_spans(weights, il, il, false, &spans)) {
+    if (!metal_graph_stream_layer_spans(
+            weights, model->size, il, false, &spans)) {
         fprintf(stderr, "ds4: Metal SSD streaming could not build layer %u spans\n", il);
         return false;
     }
@@ -27105,6 +27328,8 @@ struct ds4_engine {
     uint32_t ssd_streaming_cache_experts;
     uint64_t ssd_streaming_cache_bytes;
     uint32_t ssd_streaming_preload_experts;
+    uint32_t deepseek_prefill_cache_experts;
+    uint32_t deepseek_decode_cache_experts;
     bool non_routed_weights_pinned;
     ds4_ssd_memory_lock simulated_memory;
     ds4_residency_mode residency_requested;
@@ -27132,6 +27357,8 @@ struct ds4_engine {
      * GPU teardown have both completed. */
     ds4_qwen_expert_pack *qwen35_expert_pack;
     bool qwen35_expert_pack_ready;
+    ds4_expert_store *expert_store_v2;
+    bool expert_store_v2_ready;
 #endif
     bool metal_ready;
     bool mtp_ready;
@@ -33696,6 +33923,15 @@ static bool ds4_engine_configure_streaming_auto_cache(ds4_engine *e) {
     }
 
     e->ssd_streaming_cache_experts = plan.cache_experts;
+    if (e->model.native_expert_store_v2 &&
+        plan.floor.minimum_cache_experts <= UINT32_MAX) {
+        /* Grouped native prefill reads one physical expert-major layer and
+         * does not consult the per-expert decode cache.  Keep only the
+         * correctness floor during that phase, then grow lazily for decode. */
+        e->deepseek_prefill_cache_experts =
+            (uint32_t)plan.floor.minimum_cache_experts;
+        e->deepseek_decode_cache_experts = plan.cache_experts;
+    }
     fprintf(stderr,
             "ds4: SSD streaming adaptive cache budget\n");
     fprintf(stderr,
@@ -33707,13 +33943,15 @@ static bool ds4_engine_configure_streaming_auto_cache(ds4_engine *e) {
             (double)memory.task_footprint_bytes / 1073741824.0);
     fprintf(stderr,
             "ds4:   free/speculative %.2f GiB, purgeable %.2f GiB, "
-            "inactive %.2f GiB, file-backed %.2f GiB; conservative "
-            "reclaimable %.2f GiB\n",
+            "inactive %.2f GiB, file-backed %.2f GiB; reclaimable %.2f GiB%s\n",
             (double)memory.free_bytes / 1073741824.0,
             (double)memory.purgeable_bytes / 1073741824.0,
             (double)memory.inactive_bytes / 1073741824.0,
             (double)memory.file_backed_bytes / 1073741824.0,
-            (double)plan.reclaimable_bytes / 1073741824.0);
+            (double)plan.reclaimable_bytes / 1073741824.0,
+            plan.normal_pressure_full_file_credit_active ?
+                " (normal-pressure full file-inactive credit, 64 GiB tier)" :
+                " (half file-inactive credit)");
     fprintf(stderr,
             "ds4:   current-pressure reserve %.2f + %.2f GiB + modeled "
             "runtime %.2f GiB; platform headroom %.2f GiB; wired budget %.2f GiB\n",
@@ -33745,6 +33983,13 @@ static bool ds4_engine_configure_streaming_auto_cache(ds4_engine *e) {
             "working-set cycles\n",
             e->ssd_streaming_cache_experts,
             (double)plan.cache_bytes / 1073741824.0);
+    if (e->deepseek_prefill_cache_experts != 0) {
+        fprintf(stderr,
+                "ds4:   native long-prefill cache phase: %u experts, "
+                "decode target: %u experts\n",
+                e->deepseek_prefill_cache_experts,
+                e->deepseek_decode_cache_experts);
+    }
     if (plan.low_ram_floor_ceiling_active) {
         fprintf(stderr,
                 "ds4:   low-RAM AUTO ceiling active (host <= 16 GiB): "
@@ -34509,6 +34754,136 @@ static bool ds4_engine_plan_qwen35_metal_phases(
         prefill_out->pressure_margin_bytes;
     e->qwen35_pressure_gate_required =
         prefill_out->low_ram_shared_static_headroom_active;
+    return true;
+}
+
+static bool ds4_engine_install_expert_store_v2(ds4_engine *e) {
+    if (!e || !e->model.native_expert_store_v2 ||
+        e->model.family != DS4_MODEL_FAMILY_DEEPSEEK4) {
+        return false;
+    }
+    char error[256] = {0};
+    ds4_expert_store *store = NULL;
+    if (!ds4_expert_store_open_embedded(
+            &store, e->model.fd,
+            e->model.native_expert_store_offset,
+            e->model.native_expert_store_bytes,
+            DS4_EXPERT_STORE_FAMILY_DEEPSEEK4,
+            error, sizeof(error))) {
+        fprintf(stderr, "ds4: native DeepSeek expert store could not be reopened: %s\n",
+                error[0] ? error : "format validation failed");
+        return false;
+    }
+    const ds4_expert_store_manifest *manifest =
+        ds4_expert_store_manifest_get(store);
+    if (!manifest || manifest->layer_count != DS4_N_LAYER ||
+        manifest->expert_count != DS4_N_EXPERT ||
+        manifest->expert_used_count != DS4_N_EXPERT_USED ||
+        manifest->source_tensor_count != e->model.n_tensors) {
+        fprintf(stderr,
+                "ds4: native DeepSeek expert store does not match the active shape profile\n");
+        ds4_expert_store_close(store);
+        return false;
+    }
+
+    ds4_gpu_expert_store_layer_v2 gpu_layers[DS4_MAX_LAYER];
+    memset(gpu_layers, 0, sizeof(gpu_layers));
+    uint64_t first_component_bytes[3] = {0, 0, 0};
+    for (uint32_t layer = 0; layer < manifest->layer_count; layer++) {
+        const ds4_expert_store_layer *entry =
+            ds4_expert_store_layer_get(store, layer);
+        const ds4_layer_weights *weights = &e->weights.layer[layer];
+        const ds4_tensor *tensor[3] = {
+            weights->ffn_gate_exps,
+            weights->ffn_up_exps,
+            weights->ffn_down_exps,
+        };
+        if (!entry || !tensor[0] || !tensor[1] || !tensor[2]) {
+            fprintf(stderr,
+                    "ds4: native DeepSeek store is missing bound layer %u\n",
+                    layer);
+            ds4_expert_store_close(store);
+            return false;
+        }
+        gpu_layers[layer].data_offset =
+            ds4_expert_store_file_offset(store) + entry->data_offset;
+        gpu_layers[layer].data_size = entry->data_size;
+        gpu_layers[layer].record_bytes = entry->record_bytes;
+        for (uint32_t role = 0; role < 3; role++) {
+            const ds4_expert_store_component *component =
+                &entry->component[role];
+            if (tensor[role]->type != component->ggml_type ||
+                tensor[role]->ndim != 3 ||
+                tensor[role]->dim[0] != component->dim[0] ||
+                tensor[role]->dim[1] != component->dim[1] ||
+                tensor[role]->dim[2] != component->dim[2] ||
+                tensor[role]->bytes !=
+                    component->expert_bytes * manifest->expert_count) {
+                fprintf(stderr,
+                        "ds4: native DeepSeek store geometry differs from logical layer %u role %u\n",
+                        layer, role);
+                ds4_expert_store_close(store);
+                return false;
+            }
+            gpu_layers[layer].component_offset[role] =
+                component->record_offset;
+            gpu_layers[layer].component_bytes[role] =
+                component->expert_bytes;
+            if (layer == 0) {
+                first_component_bytes[role] = component->expert_bytes;
+            } else if (e->ssd_streaming &&
+                       first_component_bytes[role] !=
+                           component->expert_bytes) {
+                /* The current SSD cache owns one slab size class. Resident
+                 * mode accepts per-layer records, but silently bypassing a
+                 * mixed native layer would address its interleaved bytes as a
+                 * canonical matrix. Fail before backend initialization. */
+                fprintf(stderr,
+                        "ds4: native DeepSeek SSD mode currently requires one routed record size class (layer %u differs)\n",
+                        layer);
+                ds4_expert_store_close(store);
+                return false;
+            }
+        }
+    }
+    if (!ds4_gpu_expert_store_v2_install(
+            ds4_expert_store_fd(store), e->model.size,
+            manifest->layer_count, manifest->expert_count, gpu_layers)) {
+        fprintf(stderr,
+                "ds4: Metal rejected the native DeepSeek expert-store manifest\n");
+        ds4_expert_store_close(store);
+        return false;
+    }
+    for (uint32_t layer = 0; layer < manifest->layer_count; layer++) {
+        const ds4_layer_weights *weights = &e->weights.layer[layer];
+        if (!ds4_gpu_expert_store_v2_bind_layer(
+                layer, e->model.size,
+                weights->ffn_gate_exps->abs_offset,
+                weights->ffn_up_exps->abs_offset,
+                weights->ffn_down_exps->abs_offset)) {
+            fprintf(stderr,
+                    "ds4: Metal rejected native expert-store binding for layer %u\n",
+                    layer);
+            ds4_gpu_expert_store_v2_clear();
+            ds4_expert_store_close(store);
+            return false;
+        }
+    }
+    if (!e->ssd_streaming &&
+        !ds4_gpu_expert_store_v2_enable_resident()) {
+        fprintf(stderr,
+                "ds4: Metal could not map native DeepSeek expert-major layers\n");
+        ds4_gpu_expert_store_v2_clear();
+        ds4_expert_store_close(store);
+        return false;
+    }
+    e->expert_store_v2 = store;
+    e->expert_store_v2_ready = true;
+    fprintf(stderr,
+            "ds4: DeepSeek embedded expert-major store active: v%u, %u layers x %u experts, %.2f GiB payload, %s mode\n",
+            manifest->version, manifest->layer_count, manifest->expert_count,
+            (double)manifest->data_size / 1073741824.0,
+            e->ssd_streaming ? "SSD" : "resident");
     return true;
 }
 
@@ -35490,6 +35865,15 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
         *out = e;
         return 0;
     }
+    if (e->model.native_expert_store_v2 &&
+        (e->backend != DS4_BACKEND_METAL || load_slice ||
+         opt->distributed.role != DS4_DISTRIBUTED_NONE)) {
+        fprintf(stderr,
+                "ds4: DS4-native DeepSeek expert-major v2 currently requires one complete local Metal model; canonical GGUF remains available for CPU, CUDA, ROCm, and distributed slices\n");
+        ds4_engine_close(e);
+        *out = NULL;
+        return 1;
+    }
     if (e->backend == DS4_BACKEND_CPU && !cpu_load_directional_steering(e)) {
         ds4_engine_close(e);
         *out = NULL;
@@ -35517,6 +35901,24 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
         }
         ds4_gpu_set_quality(e->quality);
         ds4_gpu_set_ssd_streaming(e->ssd_streaming);
+#if defined(__APPLE__)
+        if (e->model.native_expert_store_v2 &&
+            !ds4_engine_install_expert_store_v2(e)) {
+            fprintf(stderr,
+                    "ds4: failed to install mandatory native DeepSeek expert store\n");
+            ds4_engine_close(e);
+            *out = NULL;
+            return 1;
+        }
+#else
+        if (e->model.native_expert_store_v2) {
+            fprintf(stderr,
+                    "ds4: native DeepSeek expert-major v2 is not enabled on this backend\n");
+            ds4_engine_close(e);
+            *out = NULL;
+            return 1;
+        }
+#endif
         if (!ds4_engine_configure_streaming_auto_cache(e)) {
             ds4_engine_close(e);
             *out = NULL;
@@ -35606,7 +36008,8 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
                 }
             }
         }
-        ds4_gpu_set_streaming_expert_cache_budget(e->ssd_streaming_cache_experts);
+        ds4_gpu_set_streaming_expert_cache_budget(
+            e->ssd_streaming_cache_experts);
         (void)ds4_gpu_set_model_fd(e->model.fd);
         int model_map_ok = 0;
         uint64_t *load_offsets = NULL;
@@ -35676,6 +36079,35 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
                                                         load_sizes,
                                                         load_span_count,
                                                         spans.max_tensor_bytes);
+            free(spans.v);
+        } else if (e->model.native_expert_store_v2) {
+            ds4_model_map_span_vec spans = {0};
+            if (!weights_model_map_non_routed_spans(&e->weights, &spans)) {
+                fprintf(stderr,
+                        "ds4: native DeepSeek resident non-routed map is invalid\n");
+                ds4_engine_close(e);
+                *out = NULL;
+                return 1;
+            }
+            uint64_t *offsets =
+                xmalloc((size_t)spans.len * sizeof(offsets[0]));
+            uint64_t *sizes =
+                xmalloc((size_t)spans.len * sizeof(sizes[0]));
+            uint64_t span_bytes = 0;
+            for (uint32_t i = 0; i < spans.len; i++) {
+                offsets[i] = spans.v[i].off;
+                sizes[i] = spans.v[i].end - spans.v[i].off;
+                span_bytes += sizes[i];
+            }
+            load_offsets = offsets;
+            load_sizes = sizes;
+            load_span_count = spans.len;
+            model_map_ok = ds4_gpu_set_model_map_spans(
+                e->model.map, e->model.size, load_offsets, load_sizes,
+                load_span_count, spans.max_tensor_bytes);
+            fprintf(stderr,
+                    "ds4: native DeepSeek resident map: %.2f GiB non-routed plus expert-major layer buffers (%u spans)\n",
+                    (double)span_bytes / 1073741824.0, spans.len);
             free(spans.v);
         } else if (load_slice) {
             const bool map_output = load_output ||
@@ -35764,7 +36196,8 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
             *out = NULL;
             return 1;
         }
-        if (!ds4_engine_preload_pro_q4_expert_tables(e,
+        if (!e->model.native_expert_store_v2 &&
+            !ds4_engine_preload_pro_q4_expert_tables(e,
                                                      load_slice,
                                                      load_layer_start,
                                                      load_layer_end)) {
@@ -35933,6 +36366,9 @@ void ds4_engine_close(ds4_engine *e) {
                 "ds4: accelerator synchronization failed during engine shutdown\n");
     }
 #if defined(__APPLE__)
+    if (e->expert_store_v2) {
+        ds4_gpu_expert_store_v2_clear();
+    }
     if (e->qwen35_expert_pack) {
         ds4_gpu_qwen35_expert_pack_clear();
     }
@@ -35941,6 +36377,9 @@ void ds4_engine_close(ds4_engine *e) {
 #if defined(__APPLE__)
     /* Generic GPU cleanup joins the page-in workers.  Only now is it safe to
      * close the descriptor those workers borrowed from the sidecar reader. */
+    ds4_expert_store_close(e->expert_store_v2);
+    e->expert_store_v2 = NULL;
+    e->expert_store_v2_ready = false;
     ds4_qwen_expert_pack_close(e->qwen35_expert_pack);
     e->qwen35_expert_pack = NULL;
     e->qwen35_expert_pack_ready = false;
@@ -37848,6 +38287,108 @@ static int ds4_session_sync_qwen35_metal(
 }
 #endif
 
+#if defined(__APPLE__) && !defined(DS4_NO_GPU)
+static bool ds4_session_deepseek_long_prefill_phase_needed(
+        const ds4_session *s,
+        uint32_t           n_tokens) {
+    if (!s || !s->engine ||
+        !s->engine->model.native_expert_store_v2 ||
+        !s->engine->ssd_streaming ||
+        s->engine->deepseek_prefill_cache_experts == 0 ||
+        s->engine->deepseek_decode_cache_experts <=
+            s->engine->deepseek_prefill_cache_experts ||
+        getenv("DS4_METAL_DISABLE_DEEPSEEK_PHASE_CACHE") != NULL) {
+        return false;
+    }
+    const uint32_t selected_max =
+        metal_graph_stream_prefill_batch_selected_addr_auto_max();
+    return selected_max == 0 ? n_tokens >= 32u : n_tokens > selected_max;
+}
+
+static DS4_MAYBE_UNUSED int ds4_session_deepseek_prepare_prefill_cache(
+        ds4_session *s,
+        uint32_t     n_tokens,
+        bool        *changed,
+        char        *err,
+        size_t       errlen) {
+    if (changed) *changed = false;
+    if (!ds4_session_deepseek_long_prefill_phase_needed(s, n_tokens)) {
+        return 0;
+    }
+    const uint32_t current =
+        ds4_gpu_stream_expert_cache_configured_count();
+    const uint32_t target = s->engine->deepseek_prefill_cache_experts;
+    if (current == target) return 0;
+    if (!ds4_gpu_reconfigure_streaming_expert_cache_budget(target)) {
+        if (errlen) {
+            snprintf(err, errlen,
+                     "failed to shrink DeepSeek cache for long prefill");
+        }
+        return 1;
+    }
+    if (changed) *changed = true;
+    if (getenv("DS4_METAL_MEMORY_REPORT") != NULL) {
+        fprintf(stderr,
+                "ds4: DeepSeek native cache phase switched %u -> %u experts "
+                "for %u-token prefill\n",
+                current, target, n_tokens);
+    }
+    return 0;
+}
+
+static DS4_MAYBE_UNUSED int ds4_session_deepseek_finish_prefill_cache(
+        ds4_session *s,
+        bool         changed,
+        char        *err,
+        size_t       errlen) {
+    if (!changed) return 0;
+    const uint32_t current =
+        ds4_gpu_stream_expert_cache_configured_count();
+    const uint32_t target = s->engine->deepseek_decode_cache_experts;
+    if (target <= current) return 0;
+    if (!ds4_gpu_grow_streaming_expert_cache_budget(target)) {
+        if (errlen) {
+            snprintf(err, errlen,
+                     "failed to restore DeepSeek decode cache after prefill");
+        }
+        return 1;
+    }
+    if (getenv("DS4_METAL_MEMORY_REPORT") != NULL) {
+        fprintf(stderr,
+                "ds4: DeepSeek native cache phase restored %u -> %u experts "
+                "for decode\n",
+                current, target);
+    }
+    return 0;
+}
+#else
+static DS4_MAYBE_UNUSED int ds4_session_deepseek_prepare_prefill_cache(
+        ds4_session *s,
+        uint32_t     n_tokens,
+        bool        *changed,
+        char        *err,
+        size_t       errlen) {
+    (void)s;
+    (void)n_tokens;
+    (void)err;
+    (void)errlen;
+    if (changed) *changed = false;
+    return 0;
+}
+
+static DS4_MAYBE_UNUSED int ds4_session_deepseek_finish_prefill_cache(
+        ds4_session *s,
+        bool         changed,
+        char        *err,
+        size_t       errlen) {
+    (void)s;
+    (void)changed;
+    (void)err;
+    (void)errlen;
+    return 0;
+}
+#endif
+
 /* Bring the live backend state to exactly the supplied token prefix.
  *
  * ds4-server and the REPL are stateless at the text/API layer but stateful here:
@@ -37969,12 +38510,18 @@ int ds4_session_sync(ds4_session *s, const ds4_tokens *prompt, char *err, size_t
         const uint32_t resume_min = metal_graph_resume_prefill_min_tokens();
         if (suffix > 0 && (uint32_t)suffix >= resume_min) {
             bool cancelled = false;
+            bool phase_changed = false;
             ds4_sync_progress progress = {
                 .session = s,
                 .prompt = prompt,
                 .user = s->progress,
                 .user_ud = s->progress_ud,
             };
+            if (ds4_session_deepseek_prepare_prefill_cache(
+                    s, (uint32_t)suffix, &phase_changed,
+                    err, errlen) != 0) {
+                return 1;
+            }
             bool ok = metal_graph_prefill_chunked_range(&s->graph,
                                                         &e->model,
                                                         &e->weights,
@@ -37991,6 +38538,11 @@ int ds4_session_sync(ds4_session *s, const ds4_tokens *prompt, char *err, size_t
                                                         ds4_session_cancelled_cb,
                                                         s,
                                                         &cancelled);
+            if (ds4_session_deepseek_finish_prefill_cache(
+                    s, phase_changed, err, errlen) != 0) {
+                s->checkpoint_valid = false;
+                return 1;
+            }
             if (cancelled) {
                 snprintf(err, errlen, "interrupted");
                 s->checkpoint_valid = true;
@@ -38036,6 +38588,12 @@ int ds4_session_sync(ds4_session *s, const ds4_tokens *prompt, char *err, size_t
         snprintf(err, errlen, "%s prefill state reset failed", backend_name);
         return 1;
     }
+    bool phase_changed = false;
+    if (ds4_session_deepseek_prepare_prefill_cache(
+            s, (uint32_t)prompt->len, &phase_changed,
+            err, errlen) != 0) {
+        return 1;
+    }
     if (s->prefill_cap < (uint32_t)prompt->len) {
         bool cancelled = false;
         ds4_sync_progress progress = {
@@ -38054,6 +38612,11 @@ int ds4_session_sync(ds4_session *s, const ds4_tokens *prompt, char *err, size_t
             snprintf(err, errlen, "interrupted");
             s->checkpoint_valid = s->checkpoint.len > 0;
             s->mtp_draft_valid = false;
+            if (ds4_session_deepseek_finish_prefill_cache(
+                    s, phase_changed, err, errlen) != 0) {
+                s->checkpoint_valid = false;
+                return 1;
+            }
             return DS4_SESSION_SYNC_INTERRUPTED;
         }
     } else if (s->imatrix) {
@@ -38067,6 +38630,11 @@ int ds4_session_sync(ds4_session *s, const ds4_tokens *prompt, char *err, size_t
                                                ds4_session_cancelled_cb, s, &cancelled);
         if (cancelled) {
             snprintf(err, errlen, "interrupted");
+            if (ds4_session_deepseek_finish_prefill_cache(
+                    s, phase_changed, err, errlen) != 0) {
+                s->checkpoint_valid = false;
+                return 1;
+            }
             return DS4_SESSION_SYNC_INTERRUPTED;
         }
     } else {
@@ -38080,8 +38648,18 @@ int ds4_session_sync(ds4_session *s, const ds4_tokens *prompt, char *err, size_t
                                          &cancelled);
         if (cancelled) {
             snprintf(err, errlen, "interrupted");
+            if (ds4_session_deepseek_finish_prefill_cache(
+                    s, phase_changed, err, errlen) != 0) {
+                s->checkpoint_valid = false;
+                return 1;
+            }
             return DS4_SESSION_SYNC_INTERRUPTED;
         }
+    }
+    if (ds4_session_deepseek_finish_prefill_cache(
+            s, phase_changed, err, errlen) != 0) {
+        s->checkpoint_valid = false;
+        return 1;
     }
     if (!ok) {
         snprintf(err, errlen, "%s prefill failed", backend_name);

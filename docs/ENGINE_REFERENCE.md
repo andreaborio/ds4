@@ -806,6 +806,14 @@ including `response.output_text.delta`, function-call argument events, and
 terminal `response.completed` / `response.incomplete` / `response.failed`
 events.
 
+For a streaming request, the server sends the SSE response headers when
+prefill progress begins and writes an SSE comment keepalive every five seconds
+until the first generated event. This keeps slow long-context prefill from
+tripping ordinary client or proxy idle timers without changing inference or
+socket-stall limits. Non-streaming requests cannot use this mechanism; clients
+running long local agent prompts should stream and set an appropriately long
+stream-idle timeout.
+
 For browser JavaScript clients served from another origin, start the server with
 `--cors` to emit `Access-Control-Allow-*` headers. This only changes HTTP
 headers; it does not expose the server on the LAN. Use `--host 0.0.0.0`

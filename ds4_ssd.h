@@ -117,6 +117,9 @@ typedef struct {
     bool low_ram_shared_static_headroom_active;
     /* DeepSeek <=16 GiB: measured performance policy caps AUTO at its floor. */
     bool low_ram_floor_ceiling_active;
+    /* DeepSeek 64 GiB tier: normal pressure allows full credit for the bounded
+     * file-backed inactive set; the stable cache envelope remains authoritative. */
+    bool normal_pressure_full_file_credit_active;
     uint32_t cache_experts;
 } ds4_ssd_adaptive_cache_plan;
 

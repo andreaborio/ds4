@@ -649,10 +649,69 @@ int main(void) {
            8 * GIB + GIB / 5u);
     assert(adaptive.cache_experts == 4387);
 
+    /* A real 64 GiB post-pin snapshot can have little immediately free RAM but
+     * a large bounded file-backed inactive set. Normal pressure makes those
+     * pages reclaimable; full credit reaches the same 9/16 envelope instead of
+     * changing AUTO tiers according to which GGUF ran first. */
+    memory = (ds4_ssd_host_memory){
+        .physical_bytes = 64 * GIB,
+        .recommended_bytes = 51 * GIB + 84 * GIB / 100u,
+        .free_bytes = 13 * GIB + 30 * GIB / 100u,
+        .purgeable_bytes = 11 * GIB / 100u,
+        .inactive_bytes = 19 * GIB + 87 * GIB / 100u,
+        .file_backed_bytes = 22 * GIB + 43 * GIB / 100u,
+        .pressure_status_available = true,
+        .pressure_normal = true,
+    };
+    assert(ds4_ssd_adaptive_cache_plan_make_with_static_reserve(
+        &memory, 86 * GIB / 100u, 8 * GIB + GIB / 5u, true, 43, 6,
+        flash_expert_bytes, flash_max_cacheable, &adaptive));
+    assert(adaptive.normal_pressure_full_file_credit_active);
+    assert(adaptive.reclaimable_bytes ==
+           memory.free_bytes + memory.inactive_bytes);
+    assert(adaptive.cache_experts == 4387);
+
+    /* The unpinned launch must choose the same tier when a preceding model run
+     * has converted immediately-free pages into reclaimable GGUF cache. The
+     * independent Metal envelope still leaves ample platform headroom. */
+    memory = (ds4_ssd_host_memory){
+        .physical_bytes = 64 * GIB,
+        .recommended_bytes = 51 * GIB + 84 * GIB / 100u,
+        .free_bytes = 5 * GIB + 57 * GIB / 100u,
+        .purgeable_bytes = 3 * GIB / 100u,
+        .inactive_bytes = 26 * GIB + 66 * GIB / 100u,
+        .file_backed_bytes = 42 * GIB + 60 * GIB / 100u,
+        .pressure_status_available = true,
+        .pressure_normal = true,
+    };
+    assert(ds4_ssd_adaptive_cache_plan_make_with_static_reserve(
+        &memory, 19 * GIB / 100u, 8 * GIB + GIB / 5u, false, 43, 6,
+        flash_expert_bytes, flash_max_cacheable, &adaptive));
+    assert(adaptive.normal_pressure_full_file_credit_active);
+    assert(adaptive.current_headroom_bytes == GIB);
+    assert(adaptive.pressure_margin_bytes == GIB);
+    assert(adaptive.cache_experts == 4387);
+
+    /* The new credit is a measured 64 GiB policy, not a global relaxation.
+     * Larger hosts retain their prior half-credit accounting. */
+    memory.physical_bytes = 128 * GIB;
+    memory.recommended_bytes = 104 * GIB;
+    assert(ds4_ssd_adaptive_cache_plan_make_with_static_reserve(
+        &memory, 86 * GIB / 100u, 8 * GIB + GIB / 5u, true, 43, 6,
+        flash_expert_bytes, flash_max_cacheable, &adaptive));
+    assert(!adaptive.normal_pressure_full_file_credit_active);
+    assert(adaptive.reclaimable_bytes ==
+           memory.free_bytes + memory.purgeable_bytes +
+               memory.inactive_bytes / 2u);
+
     /* A warmer launch exposes more file-backed pages as reclaimable.  The
      * safety budget can now fit 4645, but the envelope prevents startup-order
      * feedback from growing the wired cache. */
-    memory.free_bytes = 41 * GIB + 27 * GIB / 100u;
+    memory = (ds4_ssd_host_memory){
+        .physical_bytes = 64 * GIB,
+        .recommended_bytes = 51 * GIB + 84 * GIB / 100u,
+        .free_bytes = 41 * GIB + 27 * GIB / 100u,
+    };
     assert(ds4_ssd_adaptive_cache_plan_make_with_static_reserve(
         &memory, 86 * GIB / 100u, 8 * GIB + GIB / 5u, false, 43, 6,
         flash_expert_bytes, flash_max_cacheable, &adaptive));

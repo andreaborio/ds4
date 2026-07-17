@@ -9,6 +9,8 @@ The important pieces are:
 - `quants.[ch]`: the deliberately small local quantization implementation used
   by the quantizer.  It implements the DS4 output formats we actually ship:
   `q8_0`, `q4_K`, `q2_K`, and `iq2_xxs`.
+- `ds4-expert-major.py`: deterministic DeepSeek canonical-to-native layout
+  converter and byte-level verifier for `ds4.expert_major.v2` GGUFs.
 - `imatrix/`: dataset and instructions for collecting routed-MoE activation
   importance with `ds4`.
 - `quality-testing/`: prompts and scripts used to compare local GGUF variants
@@ -23,6 +25,25 @@ make -C gguf-tools
 The quantizer is plain C and does not link GGML.  GGUF metadata handling,
 safetensors loading, FP4/FP8 dequantization, and the quantizers used by our Q2
 and Q4 recipes live in this directory.
+
+## Build A DS4-Native Expert-Major GGUF
+
+Reorder an already qualified DeepSeek GGUF without changing quantization:
+
+```sh
+python3 gguf-tools/ds4-expert-major.py inspect MODEL.gguf
+python3 gguf-tools/ds4-expert-major.py build --reserve-bytes 2GiB \
+  MODEL.gguf MODEL-DS4-ExpertMajor-v2.gguf
+python3 gguf-tools/ds4-expert-major.py verify \
+  MODEL.gguf MODEL-DS4-ExpertMajor-v2.gguf
+```
+
+The build includes a full verification unless `--skip-verify` is explicitly
+used for disposable development output. Publication must never use that flag.
+The extension stores routed weights once and is executable only by a runtime
+that implements `ds4.expert_major.v2`. Format invariants, backend limits, and
+the promotion gate are documented in
+[`../docs/deepseek-expert-major-v2.md`](../docs/deepseek-expert-major-v2.md).
 
 ## Generate An Imatrix
 

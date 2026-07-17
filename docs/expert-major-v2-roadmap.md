@@ -4,12 +4,14 @@
 Q4_K_S geometry. DeepSeek and GLM must not reuse that identifier: their routed
 tensor types, shapes, layer participation, and quantization can vary.
 
-The next format is a generic, versioned store discovered from the canonical
-GGUF rather than a second set of family-specific hard-coded offsets.
+The generic, versioned store is now implemented for DeepSeek behind
+`ds4.expert_major.v2`. It is discovered from the canonical GGUF rather than a
+second set of family-specific hard-coded offsets. Model-backed publication
+qualification remains open; GLM adoption remains a separate tranche.
 
 ## Format contract
 
-The converter will emit one opaque GGUF tensor plus a checksummed manifest.
+The converter emits one opaque GGUF tensor plus a checksummed manifest.
 For every routed layer the manifest records:
 
 - the canonical logical tensor identity and component role;
@@ -26,9 +28,11 @@ missing canonical routed weights.
 ## Runtime boundary
 
 The store API owns validation and logical-to-physical translation. Model-family
-code supplies only the expected tensor roles and supported geometry. Resident
-and SSD paths consume the same validated records, so there is no per-token
-repack and no separate format implementation in Metal, CUDA, or ROCm.
+code supplies only the expected tensor roles and supported geometry. The first
+consumer is local Apple Metal: resident and SSD paths consume the same
+validated records without per-token repack. Native CPU, CUDA, ROCm, and
+distributed execution fail early until their own translators are implemented;
+their canonical GGUF paths are unchanged.
 
 Canonical GGUF loading remains unchanged. The native extension becomes the
 recommended artifact for a family only after its own correctness and
@@ -37,19 +41,23 @@ must use the canonical GGUF.
 
 ## DeepSeek tranche
 
-1. Inventory Flash and PRO routed layers and every quant-type combination from
-   the actual release artifacts.
-2. Generalize the converter around manifest descriptors rather than Qwen's
-   fixed gate/up/down sizes.
-3. Add CPU/model-free fixtures for mixed quant types, skipped layers, corrupt
-   offsets, truncated extents, and cross-family rejection.
-4. Run canonical-versus-native SSD and full-resident parity where the model
-   fits, including long-context prefill and decode.
-5. Promote only if throughput is neutral within the predeclared variance band
+1. **Implemented:** discover the complete routed inventory and quant geometry
+   from the source GGUF.
+2. **Implemented:** manifest-driven converter instead of Qwen's fixed
+   gate/up/down sizes.
+3. **Implemented:** C/Python fixtures for mixed quant types, corrupt manifests,
+   corrupt payloads, structural bounds, and cross-family rejection.
+4. **In progress:** the first M5 Pro SSD parity tranche passes at 128 and 768
+   tokens; the 2K/8K/16K alternating gate and full-resident qualification on a
+   host where the model fits remain open.
+5. **Open:** promote only if throughput is neutral within the predeclared variance band
    and memory/swap behavior does not regress on both low- and high-RAM Macs.
 
-DeepSeek stays on its current mainline kernels and cache policy; adopting the
-container must not silently inherit Qwen's 16 GiB planner or feature flags.
+DeepSeek keeps an independently qualified runtime policy: the native store
+enables its paired IQ2 grouped-prefill kernel, a phase-aware long-prefill cache
+floor, and a normal-pressure AUTO tier only on 64--96 GiB Macs. Canonical
+DeepSeek, Qwen's 16 GiB planner, other model families, explicit cache budgets,
+and larger-memory hosts retain their existing policy boundaries.
 
 ## GLM tranche
 

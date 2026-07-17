@@ -30,7 +30,7 @@ PROGRAMS := ds4 ds4-server ds4-bench ds4-eval ds4-agent
 .PHONY: all help clean test model-free-test cpu cuda cuda-spark cuda-generic cuda-regression FORCE \
 	strix-halo rocm metal build-isolation-test q4k-dot-test qwen-metadata-test \
 	qwen-reference-test qwen-unicode-test qwen-tokenizer-test \
-	qwen-expert-group-test qwen-expert-pack-test ds4-qwen-pack \
+	qwen-expert-group-test qwen-expert-pack-test expert-store-test ds4-qwen-pack \
 	$(PROGRAMS) ds4_test ds4_agent_test
 
 ifeq ($(UNAME_S),Darwin)
@@ -48,8 +48,8 @@ CPU_BINDIR := $(BUILD_ROOT)/$(CPU_PROFILE)/bin
 
 METAL_LDLIBS := $(LDLIBS) -framework Foundation -framework Metal
 
-METAL_CORE_OBJS := $(addprefix $(METAL_OBJDIR)/,ds4.o ds4_build.o ds4_distributed.o ds4_ssd.o ds4_qwen.o ds4_qwen_unicode.o ds4_qwen_expert_group.o ds4_qwen_expert_pack.o ds4_metal.o)
-CPU_CORE_OBJS := $(addprefix $(CPU_OBJDIR)/,ds4.o ds4_build.o ds4_distributed.o ds4_ssd.o ds4_qwen.o ds4_qwen_unicode.o ds4_qwen_expert_pack.o)
+METAL_CORE_OBJS := $(addprefix $(METAL_OBJDIR)/,ds4.o ds4_build.o ds4_distributed.o ds4_ssd.o ds4_expert_store.o ds4_qwen.o ds4_qwen_unicode.o ds4_qwen_expert_group.o ds4_qwen_expert_pack.o ds4_metal.o)
+CPU_CORE_OBJS := $(addprefix $(CPU_OBJDIR)/,ds4.o ds4_build.o ds4_distributed.o ds4_ssd.o ds4_expert_store.o ds4_qwen.o ds4_qwen_unicode.o ds4_qwen_expert_pack.o)
 
 METAL_BINS := $(addprefix $(METAL_BINDIR)/,$(PROGRAMS))
 CPU_BINS := $(addprefix $(CPU_BINDIR)/,$(PROGRAMS))
@@ -67,6 +67,7 @@ METAL_TEST_BINS := \
 	$(METAL_BINDIR)/test_qwen_tokenizer \
 	$(METAL_BINDIR)/test_qwen_expert_group \
 	$(METAL_BINDIR)/test_qwen_expert_pack \
+	$(METAL_BINDIR)/test_expert_store \
 	$(METAL_BINDIR)/test_ssd_residency
 
 all: metal
@@ -248,6 +249,11 @@ $(METAL_OBJDIR)/test_qwen_expert_group.o: tests/test_qwen_expert_group.c \
 	@mkdir -p "$(@D)"
 	$(CC) $(CFLAGS) $(DEPFLAGS) -I. -c -o $@ $<
 
+$(METAL_OBJDIR)/test_expert_store.o: tests/test_expert_store.c \
+		ds4_expert_store.h
+	@mkdir -p "$(@D)"
+	$(CC) $(CFLAGS) $(DEPFLAGS) -I. -c -o $@ $<
+
 $(METAL_OBJDIR)/test_qwen_gdn_ref.o: tests/test_qwen_gdn_ref.c ds4_qwen_ref.h \
 		ds4_qwen.h tests/qwen/qwen36_gdn_golden.inc
 	@mkdir -p "$(@D)"
@@ -291,6 +297,7 @@ $(METAL_BINDIR)/test_q4k_dot: $(METAL_OBJDIR)/test_q4k_dot.o
 $(METAL_BINDIR)/test_q4k_top8: \
 		$(METAL_OBJDIR)/test_q4k_top8.o $(METAL_OBJDIR)/ds4_build.o \
 		$(METAL_OBJDIR)/ds4_distributed.o $(METAL_OBJDIR)/ds4_ssd.o \
+		$(METAL_OBJDIR)/ds4_expert_store.o \
 		$(METAL_OBJDIR)/ds4_qwen.o $(METAL_OBJDIR)/ds4_qwen_unicode.o \
 		$(METAL_OBJDIR)/ds4_qwen_expert_pack.o
 	@mkdir -p "$(@D)"
@@ -299,6 +306,7 @@ $(METAL_BINDIR)/test_q4k_top8: \
 $(METAL_BINDIR)/test_qwen_session: \
 		$(METAL_OBJDIR)/test_qwen_session.o $(METAL_OBJDIR)/ds4_build.o \
 		$(METAL_OBJDIR)/ds4_distributed.o $(METAL_OBJDIR)/ds4_ssd.o \
+		$(METAL_OBJDIR)/ds4_expert_store.o \
 		$(METAL_OBJDIR)/ds4_qwen.o $(METAL_OBJDIR)/ds4_qwen_unicode.o \
 		$(METAL_OBJDIR)/ds4_qwen_expert_pack.o
 	@mkdir -p "$(@D)"
@@ -308,6 +316,7 @@ $(METAL_BINDIR)/test_qwen_tokenizer: \
 		$(METAL_OBJDIR)/test_qwen_tokenizer.o $(METAL_OBJDIR)/ds4_kvstore.o \
 		$(METAL_OBJDIR)/ds4_build.o \
 		$(METAL_OBJDIR)/ds4_distributed.o $(METAL_OBJDIR)/ds4_ssd.o \
+		$(METAL_OBJDIR)/ds4_expert_store.o \
 		$(METAL_OBJDIR)/ds4_qwen.o $(METAL_OBJDIR)/ds4_qwen_unicode.o \
 		$(METAL_OBJDIR)/ds4_qwen_expert_pack.o
 	@mkdir -p "$(@D)"
@@ -360,6 +369,12 @@ $(METAL_BINDIR)/test_qwen_expert_group: \
 	@mkdir -p "$(@D)"
 	$(CC) $(CFLAGS) -o $@ $^ $(LDLIBS)
 
+$(METAL_BINDIR)/test_expert_store: \
+		$(METAL_OBJDIR)/test_expert_store.o \
+		$(METAL_OBJDIR)/ds4_expert_store.o
+	@mkdir -p "$(@D)"
+	$(CC) $(CFLAGS) -o $@ $^ $(LDLIBS)
+
 ds4-qwen-pack: $(METAL_BINDIR)/ds4-qwen-pack
 	@rm -f "$@"
 	@ln -s "$<" "$@"
@@ -369,6 +384,10 @@ qwen-expert-pack-test: $(METAL_BINDIR)/test_qwen_expert_pack
 
 qwen-expert-group-test: $(METAL_BINDIR)/test_qwen_expert_group
 	$<
+
+expert-store-test: $(METAL_BINDIR)/test_expert_store
+	DS4_EXPERT_STORE_PROBE=$(METAL_BINDIR)/test_expert_store \
+		python3 tests/test_expert_major.py
 
 # Preserve the documented direct test-runner commands without letting a CPU
 # target publish over them.
@@ -414,6 +433,7 @@ model-free-test: metal ds4_test ds4_agent_test $(METAL_BINDIR)/test_q4k_dot \
 		$(METAL_BINDIR)/test_qwen_tokenizer \
 		$(METAL_BINDIR)/test_qwen_expert_group \
 		$(METAL_BINDIR)/test_qwen_expert_pack \
+		$(METAL_BINDIR)/test_expert_store \
 		$(METAL_BINDIR)/test_ssd_residency
 	$(METAL_BINDIR)/ds4-eval --self-test-extractors
 	$(METAL_BINDIR)/ds4_agent_test
@@ -429,6 +449,8 @@ model-free-test: metal ds4_test ds4_agent_test $(METAL_BINDIR)/test_q4k_dot \
 	$(METAL_BINDIR)/test_qwen_tokenizer
 	$(METAL_BINDIR)/test_qwen_expert_group
 	$(METAL_BINDIR)/test_qwen_expert_pack
+	DS4_EXPERT_STORE_PROBE=$(METAL_BINDIR)/test_expert_store \
+		python3 tests/test_expert_major.py
 	python3 tests/qwen/collect_gdn_reference.py --check
 	python3 tests/qwen/collect_attention_reference.py --check
 	python3 tests/qwen/test_v_tiling_contract.py
@@ -457,8 +479,8 @@ ifneq ($(strip $(CUDA_ARCH)),)
 NVCC_ARCH_FLAGS := -arch=$(CUDA_ARCH)
 endif
 NVCCFLAGS ?= -O3 -g -lineinfo --use_fast_math $(NVCC_ARCH_FLAGS) -Xcompiler $(NATIVE_CPU_FLAG) -Xcompiler -pthread
-CORE_OBJS = ds4.o ds4_build.o ds4_distributed.o ds4_ssd.o ds4_qwen.o ds4_qwen_unicode.o ds4_qwen_expert_pack.o ds4_cuda.o
-CPU_CORE_OBJS = ds4_cpu.o ds4_build_cpu.o ds4_distributed.o ds4_ssd.o ds4_qwen.o ds4_qwen_unicode.o ds4_qwen_expert_pack.o
+CORE_OBJS = ds4.o ds4_build.o ds4_distributed.o ds4_ssd.o ds4_expert_store.o ds4_qwen.o ds4_qwen_unicode.o ds4_qwen_expert_pack.o ds4_cuda.o
+CPU_CORE_OBJS = ds4_cpu.o ds4_build_cpu.o ds4_distributed.o ds4_ssd.o ds4_expert_store.o ds4_qwen.o ds4_qwen_unicode.o ds4_qwen_expert_pack.o
 CUDA_LDLIBS ?= -lm -Xcompiler -pthread -L$(CUDA_HOME)/targets/sbsa-linux/lib -L$(CUDA_HOME)/lib64 -lcudart -lcublas
 HIPCC ?= $(shell command -v hipcc 2>/dev/null || echo /opt/rocm/bin/hipcc)
 ROCM_ARCH ?= gfx1151
@@ -497,7 +519,7 @@ cuda:
 
 strix-halo:
 	$(MAKE) -B ds4 ds4-server ds4-bench ds4-eval ds4-agent \
-		CORE_OBJS="ds4.o ds4_build.o ds4_distributed.o ds4_ssd.o ds4_qwen.o ds4_qwen_unicode.o ds4_qwen_expert_pack.o ds4_rocm.o" \
+		CORE_OBJS="ds4.o ds4_build.o ds4_distributed.o ds4_ssd.o ds4_expert_store.o ds4_qwen.o ds4_qwen_unicode.o ds4_qwen_expert_pack.o ds4_rocm.o" \
 		CFLAGS="$(CFLAGS) -DDS4_ROCM_BUILD" \
 		DS4_LINK="$(HIPCC) $(ROCM_CFLAGS)" \
 		DS4_LINK_LIBS="$(ROCM_LDLIBS)"
@@ -530,7 +552,7 @@ cuda-regression: tests/cuda_long_context_smoke
 	./tests/cuda_long_context_smoke
 
 ds4.o: ds4.c ds4.h ds4_ssd.h ds4_distributed.h ds4_gpu.h ds4_qwen.h \
-		ds4_qwen_unicode.h ds4_streaming_hotlist.inc
+		ds4_expert_store.h ds4_qwen_unicode.h ds4_streaming_hotlist.inc
 	$(CC) $(CFLAGS) -c -o $@ ds4.c
 
 ds4_build.o: ds4_build.c ds4.h FORCE
@@ -595,7 +617,7 @@ linenoise.o: linenoise.c linenoise.h
 	$(CC) $(CFLAGS) -c -o $@ linenoise.c
 
 ds4_cpu.o: ds4.c ds4.h ds4_ssd.h ds4_distributed.h ds4_gpu.h ds4_qwen.h \
-		ds4_qwen_unicode.h ds4_streaming_hotlist.inc
+		ds4_expert_store.h ds4_qwen_unicode.h ds4_streaming_hotlist.inc
 	$(CC) $(CFLAGS) -DDS4_NO_GPU -c -o $@ ds4.c
 
 ds4_cli_cpu.o: ds4_cli.c ds4.h ds4_ssd.h ds4_distributed.h ds4_help.h linenoise.h

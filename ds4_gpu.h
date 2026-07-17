@@ -59,6 +59,38 @@ int ds4_gpu_synchronize(void);
 int ds4_gpu_set_model_map(const void *model_map, uint64_t model_size);
 int ds4_gpu_set_model_fd(int fd);
 int ds4_gpu_set_model_fd_for_map(int fd, const void *model_map);
+typedef struct ds4_gpu_expert_store_layer_v2 {
+    uint64_t data_offset;
+    uint64_t data_size;
+    uint64_t record_bytes;
+    uint64_t component_offset[3];
+    uint64_t component_bytes[3];
+} ds4_gpu_expert_store_layer_v2;
+/* Install the validated, versioned expert-major store used by native
+ * DeepSeek GGUFs. Physical offsets are explicit per layer so mixed quant
+ * classes do not inherit Qwen v1's fixed record geometry. */
+int ds4_gpu_expert_store_v2_install(
+        int                                  fd,
+        uint64_t                             file_size,
+        uint32_t                             n_layer,
+        uint32_t                             n_expert,
+        const ds4_gpu_expert_store_layer_v2 *layers);
+int ds4_gpu_expert_store_v2_bind_layer(
+        uint32_t layer,
+        uint64_t model_size,
+        uint64_t gate_offset,
+        uint64_t up_offset,
+        uint64_t down_offset);
+/* Return the physical expert-major payload for one embedded v2 layer.  SSD
+ * mapping code uses this to replace the three virtual canonical expert spans
+ * with the one record-interleaved span consumed by routed ID kernels. */
+int ds4_gpu_expert_store_v2_layer_span(
+        uint32_t layer,
+        uint64_t model_size,
+        uint64_t *offset,
+        uint64_t *size);
+int ds4_gpu_expert_store_v2_enable_resident(void);
+void ds4_gpu_expert_store_v2_clear(void);
 /* Install the deterministic Qwen expert sidecar as an alternate byte source.
  * The descriptor remains owned by the engine and must stay open until clear()
  * returns. bind_layer() associates the sidecar records with the canonical GGUF

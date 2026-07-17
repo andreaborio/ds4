@@ -364,16 +364,26 @@ static bool ds4_ssd_adaptive_cache_plan_make_policy(
     const uint64_t file_inactive_bytes =
         memory->inactive_bytes < memory->file_backed_bytes ?
             memory->inactive_bytes : memory->file_backed_bytes;
+    const bool deepseek_64g_normal_credit =
+        apply_deepseek_tuning &&
+        memory->physical_bytes >= 64u * DS4_GIB &&
+        memory->physical_bytes < 96u * DS4_GIB &&
+        memory->pressure_status_available && memory->pressure_normal;
+    out->normal_pressure_full_file_credit_active =
+        deepseek_64g_normal_credit;
     uint64_t reclaimable = 0;
-    if (qwen_low_ram_policy &&
+    if ((qwen_low_ram_policy || deepseek_64g_normal_credit) &&
         memory->pressure_status_available && memory->pressure_normal) {
-        /* On a normal-pressure 16 GiB Mac the Qwen static set remains
-         * pageable, and wiring only the minimum expert tier is bounded.  Give
-         * the bounded file-backed inactive set full credit so a green system
-         * is not rejected merely because cached GGUF pages are counted as
-         * used.  Purgeable pages may overlap that set, so take max(), not a
-         * sum.  Missing or elevated pressure retains the half-credit policy
-         * below and therefore fails closed near this boundary. */
+        /* Under a qualified normal-pressure policy, give the bounded
+         * file-backed inactive set full credit so warm GGUF pages are not
+         * mistaken for irreversibly used RAM. Purgeable pages may overlap that
+         * set, so take max(), not a sum.
+         *
+         * Qwen uses this only for its bounded <=16 GiB floor. DeepSeek uses it
+         * only on the measured [64,96) GiB tier, where the independent 9/16
+         * cache envelope still caps wired growth at the retained M5 sweet
+         * spot. Missing/elevated pressure, smaller Macs, and >=96 GiB hosts
+         * preserve the half-credit policy below. */
         const uint64_t reclaimable_working_set =
             memory->purgeable_bytes > file_inactive_bytes ?
                 memory->purgeable_bytes : file_inactive_bytes;
@@ -410,6 +420,7 @@ static bool ds4_ssd_adaptive_cache_plan_make_policy(
             out->current_headroom_bytes > static_reserve_bytes ?
                 out->current_headroom_bytes - static_reserve_bytes : 0;
     } else if (pageable_static_overlaps_headroom && !qwen_low_ram_policy &&
+               !deepseek_64g_normal_credit &&
                out->current_headroom_bytes <
                out->pageable_static_reserve_bytes) {
         out->current_headroom_bytes = out->pageable_static_reserve_bytes;
@@ -417,6 +428,18 @@ static bool ds4_ssd_adaptive_cache_plan_make_policy(
     out->pressure_margin_bytes = memory->physical_bytes / 64u;
     if (out->pressure_margin_bytes < quarter_gib) {
         out->pressure_margin_bytes = quarter_gib;
+    }
+    if (deepseek_64g_normal_credit) {
+        /* On the qualified 64 GiB tier, the independent Metal envelope leaves
+         * roughly 14 GiB below recommendedMaxWorkingSetSize after static and
+         * runtime pages. Keeping another 8.2 GiB current-pressure reserve made
+         * AUTO depend on whether the previous GGUF was still in the file
+         * cache. Freeze one 2 GiB live-pressure reserve here (including this
+         * pressure margin); elevated or unavailable pressure never enters the
+         * branch. */
+        out->current_headroom_bytes =
+            two_gib > out->pressure_margin_bytes
+                ? two_gib - out->pressure_margin_bytes : 0;
     }
     if (qwen_low_ram_policy) {
         /* Qwen's bounded <=16 GiB policy freezes one 2 GiB request reserve,
