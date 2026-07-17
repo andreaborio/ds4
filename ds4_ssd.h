@@ -49,6 +49,21 @@ typedef struct {
     uint32_t cache_experts;
 } ds4_ssd_cache_plan;
 
+/* Initial LFU policy for the streaming expert hotlist. Adaptive keeps every
+ * ordered seed at priority one so live selections take over immediately.
+ * Legacy preserves the historical per-entry priorities (built-in rank or
+ * file hit count), while fixed is an explicit numeric A/B override. */
+typedef enum {
+    DS4_STREAMING_HOTLIST_PRIORITY_ADAPTIVE = 0,
+    DS4_STREAMING_HOTLIST_PRIORITY_LEGACY,
+    DS4_STREAMING_HOTLIST_PRIORITY_FIXED,
+} ds4_streaming_hotlist_priority_mode;
+
+typedef struct {
+    ds4_streaming_hotlist_priority_mode mode;
+    uint32_t priority;
+} ds4_streaming_hotlist_priority_policy;
+
 /* Point-in-time guard for AUTO full-model mapped mode. Metal's fixed
  * recommended working-set limit does not shrink when another process consumes
  * unified memory, so the live reclaimable budget must pass independently. */
@@ -127,6 +142,9 @@ bool ds4_parse_gib_arg(const char *s, uint64_t *bytes);
 bool ds4_parse_streaming_cache_experts_arg(const char *s,
                                            uint32_t   *experts,
                                            uint64_t   *bytes);
+bool ds4_parse_streaming_hotlist_priority_policy(
+        const char                            *s,
+        ds4_streaming_hotlist_priority_policy *out);
 
 uint32_t ds4_ssd_cache_experts_for_byte_budget(uint64_t bytes,
                                                uint64_t per_expert_bytes);

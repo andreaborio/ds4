@@ -117,6 +117,34 @@ Explicit cache budgets, canonical GGUFs, short prompts, other model families,
 and other backends do not enter this policy. Set
 `DS4_METAL_DISABLE_DEEPSEEK_PHASE_CACHE=1` only for an A/B diagnostic.
 
+### Hotlist admission priority
+
+The preload list is an ordering prior, not a permanent LFU score. By default,
+every built-in or file-backed hotlist entry starts at priority one, so a route
+selected by the live request immediately outranks an unused seed. The same top
+entries are still selected for preload, and their relative order is preserved
+within each layer; after that, live route frequency and the LRU tie-breaker own
+eviction.
+
+The policy is explicit and reversible:
+
+```sh
+# Production default. Omitting the variable is equivalent.
+DS4_METAL_STREAMING_EXPERT_HOTLIST_PRIORITY=adaptive ./ds4 ...
+
+# Historical behavior: built-in rank or the file's raw hit count.
+DS4_METAL_STREAMING_EXPERT_HOTLIST_PRIORITY=legacy ./ds4 ...
+
+# Give every preload entry a fixed positive initial priority.
+DS4_METAL_STREAMING_EXPERT_HOTLIST_PRIORITY=8 ./ds4 ...
+```
+
+With the adaptive default, a file hotlist's row order determines preload rank;
+its hit-count column is retained for provenance but does not become a long-lived
+cache score. Use `legacy` only to reproduce an older benchmark or a deliberately
+sticky domain profile. Invalid values fail engine startup. This changes cache
+admission and eviction only; routing, weights, and logits are unchanged.
+
 On the measured 64 GiB tier, normal memory pressure also makes AUTO insensitive
 to warm GGUF page-cache order: file-backed inactive pages receive full credit,
 and the current-pressure reserve is fixed at 2 GiB including its pressure
@@ -232,3 +260,5 @@ the compatibility reference.
 The first M5 Pro tranche, including the queue-depth ablation for full-record
 I/O, is in
 [`benchmarks/2026-07-17-deepseek-native-expert-major.md`](benchmarks/2026-07-17-deepseek-native-expert-major.md).
+The route-locality and adaptive-priority evidence is in
+[`benchmarks/2026-07-17-deepseek-qwen-transfer-audit.md`](benchmarks/2026-07-17-deepseek-qwen-transfer-audit.md).

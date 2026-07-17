@@ -19242,6 +19242,25 @@ static bool metal_graph_streaming_expert_hotlist_enabled(const ds4_gpu_graph *g)
            getenv("DS4_METAL_DISABLE_STREAMING_EXPERT_HOTLIST") == NULL;
 }
 
+static bool metal_graph_streaming_expert_hotlist_priority_policy(
+        ds4_streaming_hotlist_priority_policy *policy) {
+    const char *env =
+        getenv("DS4_METAL_STREAMING_EXPERT_HOTLIST_PRIORITY");
+    if (ds4_parse_streaming_hotlist_priority_policy(env, policy)) return true;
+    fprintf(stderr,
+            "ds4: invalid DS4_METAL_STREAMING_EXPERT_HOTLIST_PRIORITY=%s; "
+            "expected adaptive, legacy, or a positive integer\n",
+            env ? env : "");
+    return false;
+}
+
+static uint32_t metal_graph_streaming_expert_hotlist_initial_priority(
+        const ds4_streaming_hotlist_priority_policy *policy,
+        uint32_t                                      legacy_priority) {
+    return policy->mode == DS4_STREAMING_HOTLIST_PRIORITY_LEGACY ?
+        legacy_priority : policy->priority;
+}
+
 static bool metal_graph_streaming_expert_hotlist_add(
         uint32_t    layer,
         uint32_t    expert,
@@ -19266,6 +19285,7 @@ static bool metal_graph_streaming_expert_hotlist_add(
 static bool metal_graph_streaming_expert_hotlist_load_file(
         const char *path,
         uint32_t    max_entries,
+        const ds4_streaming_hotlist_priority_policy *priority_policy,
         int32_t     experts[DS4_MAX_LAYER][DS4_MAX_EXPERT],
         uint32_t    priorities[DS4_MAX_LAYER][DS4_MAX_EXPERT],
         uint32_t    counts[DS4_MAX_LAYER],
@@ -19311,8 +19331,11 @@ static bool metal_graph_streaming_expert_hotlist_load_file(
         unsigned long long hits = strtoull(p, &end, 10);
         if (end == p || errno != 0) goto bad_line;
         if (hits == 0) continue;
-        const uint32_t priority =
+        const uint32_t legacy_priority =
             hits > UINT32_MAX ? UINT32_MAX : (uint32_t)hits;
+        const uint32_t priority =
+            metal_graph_streaming_expert_hotlist_initial_priority(
+                priority_policy, legacy_priority);
         if (!metal_graph_streaming_expert_hotlist_add((uint32_t)layer,
                                                       (uint32_t)expert,
                                                       priority,
@@ -19352,6 +19375,7 @@ bad_line:
 
 static bool metal_graph_streaming_expert_hotlist_load_default(
         uint32_t    max_entries,
+        const ds4_streaming_hotlist_priority_policy *priority_policy,
         int32_t     experts[DS4_MAX_LAYER][DS4_MAX_EXPERT],
         uint32_t    priorities[DS4_MAX_LAYER][DS4_MAX_EXPERT],
         uint32_t    counts[DS4_MAX_LAYER],
@@ -19379,7 +19403,8 @@ static bool metal_graph_streaming_expert_hotlist_load_default(
         if (!metal_graph_streaming_expert_hotlist_add(
                 hotlist[i][0],
                 hotlist[i][1],
-                max_entries - loaded,
+                metal_graph_streaming_expert_hotlist_initial_priority(
+                    priority_policy, max_entries - loaded),
                 experts,
                 priorities,
                 counts,
@@ -25490,9 +25515,15 @@ static bool metal_graph_seed_streaming_expert_cache_from_hotlist(
     const char *path = getenv("DS4_METAL_STREAMING_EXPERT_HOTLIST");
     uint32_t loaded = 0;
     const bool from_file = path && path[0];
+    ds4_streaming_hotlist_priority_policy priority_policy;
+    if (!metal_graph_streaming_expert_hotlist_priority_policy(
+            &priority_policy)) {
+        return false;
+    }
     if (from_file) {
         if (!metal_graph_streaming_expert_hotlist_load_file(path,
                                                            preload_count,
+                                                           &priority_policy,
                                                            experts,
                                                            priorities,
                                                            counts,
@@ -25501,6 +25532,7 @@ static bool metal_graph_seed_streaming_expert_cache_from_hotlist(
             return false;
         }
     } else if (!metal_graph_streaming_expert_hotlist_load_default(preload_count,
+                                                                  &priority_policy,
                                                                   experts,
                                                                   priorities,
                                                                   counts,
@@ -25555,13 +25587,20 @@ static bool metal_graph_seed_streaming_expert_cache_from_hotlist(
         } else {
             source_name = "built-in";
         }
+        const char *priority_mode =
+            priority_policy.mode == DS4_STREAMING_HOTLIST_PRIORITY_LEGACY ?
+                "legacy" :
+            priority_policy.mode == DS4_STREAMING_HOTLIST_PRIORITY_FIXED ?
+                "fixed" : "adaptive";
         fprintf(stderr,
-                "ds4: Metal streaming expert hotlist seed source=%s preload=%u loaded=%u layers=%u experts=%u time=%.3f ms\n",
+                "ds4: Metal streaming expert hotlist seed source=%s preload=%u loaded=%u layers=%u experts=%u priority=%s:%u time=%.3f ms\n",
                 source_name,
                 preload_count,
                 loaded,
                 seeded_layers,
                 seeded_experts,
+                priority_mode,
+                priority_policy.priority,
                 (now_sec() - t0) * 1000.0);
     }
     return true;
@@ -34842,11 +34881,14 @@ static bool ds4_engine_qwen35_metal_options_valid(
         getenv("DS4_METAL_STREAMING_EXPERT_HOTLIST");
     const char *streaming_hotlist_profile =
         getenv("DS4_METAL_STREAMING_EXPERT_HOTLIST_PROFILE");
+    const char *streaming_hotlist_priority =
+        getenv("DS4_METAL_STREAMING_EXPERT_HOTLIST_PRIORITY");
     if ((opt->expert_profile_path && opt->expert_profile_path[0]) ||
         (expert_profile && expert_profile[0]) ||
         (expert_hotlist && expert_hotlist[0]) ||
         (streaming_hotlist && streaming_hotlist[0]) ||
-        (streaming_hotlist_profile && streaming_hotlist_profile[0])) {
+        (streaming_hotlist_profile && streaming_hotlist_profile[0]) ||
+        (streaming_hotlist_priority && streaming_hotlist_priority[0])) {
         fprintf(stderr,
                 "ds4: experimental Qwen Metal inference does not support "
                 "expert profiles or hotlists yet\n");
@@ -35662,6 +35704,20 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
                 "ds4: %s backend requested but it is unavailable in this build\n",
                 ds4_backend_name(opt->backend));
         return 1;
+    }
+    const char *hotlist_priority_env =
+        getenv("DS4_METAL_STREAMING_EXPERT_HOTLIST_PRIORITY");
+    if (opt->backend == DS4_BACKEND_METAL &&
+        hotlist_priority_env && hotlist_priority_env[0]) {
+        ds4_streaming_hotlist_priority_policy hotlist_priority;
+        if (!ds4_parse_streaming_hotlist_priority_policy(
+                hotlist_priority_env, &hotlist_priority)) {
+            fprintf(stderr,
+                    "ds4: invalid DS4_METAL_STREAMING_EXPERT_HOTLIST_PRIORITY=%s; "
+                    "expected adaptive, legacy, or a positive integer\n",
+                    hotlist_priority_env);
+            return 1;
+        }
     }
     fprintf(stderr,
             "ds4: build git=%s compiled=%s-%s runtime=%s\n",

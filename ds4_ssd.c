@@ -170,6 +170,33 @@ bool ds4_parse_streaming_cache_experts_arg(const char *s,
     return true;
 }
 
+bool ds4_parse_streaming_hotlist_priority_policy(
+        const char                            *s,
+        ds4_streaming_hotlist_priority_policy *out) {
+    if (!out) return false;
+    *out = (ds4_streaming_hotlist_priority_policy){
+        .mode = DS4_STREAMING_HOTLIST_PRIORITY_ADAPTIVE,
+        .priority = 1u,
+    };
+    if (!s || !s[0] || strcmp(s, "adaptive") == 0) return true;
+    if (strcmp(s, "legacy") == 0) {
+        out->mode = DS4_STREAMING_HOTLIST_PRIORITY_LEGACY;
+        out->priority = 0;
+        return true;
+    }
+
+    const size_t len = strlen(s);
+    for (size_t i = 0; i < len; i++) {
+        if (!isdigit((unsigned char)s[i])) return false;
+    }
+    errno = 0;
+    const unsigned long value = strtoul(s, NULL, 10);
+    if (errno != 0 || value == 0 || value > UINT32_MAX) return false;
+    out->mode = DS4_STREAMING_HOTLIST_PRIORITY_FIXED;
+    out->priority = (uint32_t)value;
+    return true;
+}
+
 uint32_t ds4_ssd_cache_experts_for_byte_budget(uint64_t bytes,
                                                uint64_t per_expert_bytes) {
     if (bytes == 0 || per_expert_bytes == 0) return 0;

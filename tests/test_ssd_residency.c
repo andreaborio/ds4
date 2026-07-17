@@ -52,6 +52,47 @@ static ds4_residency_plan plan(bool metal,
 }
 
 int main(void) {
+    ds4_streaming_hotlist_priority_policy hotlist_priority;
+    assert(ds4_parse_streaming_hotlist_priority_policy(NULL,
+                                                        &hotlist_priority));
+    assert(hotlist_priority.mode ==
+           DS4_STREAMING_HOTLIST_PRIORITY_ADAPTIVE);
+    assert(hotlist_priority.priority == 1);
+    assert(ds4_parse_streaming_hotlist_priority_policy("",
+                                                        &hotlist_priority));
+    assert(hotlist_priority.mode ==
+           DS4_STREAMING_HOTLIST_PRIORITY_ADAPTIVE);
+    assert(hotlist_priority.priority == 1);
+    assert(ds4_parse_streaming_hotlist_priority_policy("adaptive",
+                                                        &hotlist_priority));
+    assert(hotlist_priority.mode ==
+           DS4_STREAMING_HOTLIST_PRIORITY_ADAPTIVE);
+    assert(hotlist_priority.priority == 1);
+    assert(ds4_parse_streaming_hotlist_priority_policy("legacy",
+                                                        &hotlist_priority));
+    assert(hotlist_priority.mode ==
+           DS4_STREAMING_HOTLIST_PRIORITY_LEGACY);
+    assert(hotlist_priority.priority == 0);
+    assert(ds4_parse_streaming_hotlist_priority_policy("17",
+                                                        &hotlist_priority));
+    assert(hotlist_priority.mode == DS4_STREAMING_HOTLIST_PRIORITY_FIXED);
+    assert(hotlist_priority.priority == 17);
+    assert(ds4_parse_streaming_hotlist_priority_policy("4294967295",
+                                                        &hotlist_priority));
+    assert(hotlist_priority.mode == DS4_STREAMING_HOTLIST_PRIORITY_FIXED);
+    assert(hotlist_priority.priority == UINT32_MAX);
+    assert(!ds4_parse_streaming_hotlist_priority_policy("0",
+                                                         &hotlist_priority));
+    assert(!ds4_parse_streaming_hotlist_priority_policy("-1",
+                                                         &hotlist_priority));
+    assert(!ds4_parse_streaming_hotlist_priority_policy("1x",
+                                                         &hotlist_priority));
+    assert(!ds4_parse_streaming_hotlist_priority_policy("4294967296",
+                                                         &hotlist_priority));
+    assert(!ds4_parse_streaming_hotlist_priority_policy("LEGACY",
+                                                         &hotlist_priority));
+    assert(!ds4_parse_streaming_hotlist_priority_policy("adaptive", NULL));
+
     ds4_residency_plan p = plan(true,
                                 DS4_RESIDENCY_RESIDENT,
                                 UINT64_MAX,
