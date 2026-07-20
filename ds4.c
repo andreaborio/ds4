@@ -45040,6 +45040,35 @@ int ds4_engine_generate_argmax(
         emit, done, emit_ud, progress, progress_ud, NULL);
 }
 
+static int glm_metal_compare_f32(
+        const char  *name,
+        const float *cpu,
+        const float *gpu,
+        uint32_t     n,
+        float        tol) {
+    float max_abs = 0.0f;
+    uint32_t max_i = 0;
+    double ss = 0.0;
+    for (uint32_t i = 0; i < n; i++) {
+        const float d = fabsf(gpu[i] - cpu[i]);
+        if (d > max_abs) {
+            max_abs = d;
+            max_i = i;
+        }
+        ss += (double)d * (double)d;
+    }
+    const double rms = sqrt(ss / (double)n);
+    printf("  %s: max_abs=%.9g at %u cpu=%.9g gpu=%.9g rms_abs=%.9g\n",
+           name, max_abs, max_i, cpu[max_i], gpu[max_i], rms);
+    if (max_abs > tol) {
+        fprintf(stderr,
+                "ds4: GLM Metal %s mismatch, max_abs %.9g > %.9g\n",
+                name, max_abs, tol);
+        return 0;
+    }
+    return 1;
+}
+
 static int glm_metal_compare_i32_list(
         const char    *name,
         const int     *cpu,
