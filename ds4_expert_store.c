@@ -197,6 +197,8 @@ static bool quant_layout(uint32_t type, uint32_t *elements, uint32_t *bytes) {
     switch (type) {
     case 10: *elements = 256; *bytes = 84; return true;  /* Q2_K */
     case 12: *elements = 256; *bytes = 144; return true; /* Q4_K */
+    case 13: *elements = 256; *bytes = 176; return true; /* Q5_K */
+    case 14: *elements = 256; *bytes = 210; return true; /* Q6_K */
     case 16: *elements = 256; *bytes = 66; return true;  /* IQ2_XXS */
     default: return false;
     }
@@ -255,7 +257,8 @@ bool ds4_expert_store_open_embedded(
         version != DS4_EXPERT_STORE_V2_VERSION ||
         header_bytes != STORE_HEADER_BYTES ||
         family != expected_family ||
-        family != DS4_EXPERT_STORE_FAMILY_DEEPSEEK4 ||
+        (family != DS4_EXPERT_STORE_FAMILY_DEEPSEEK4 &&
+         family != DS4_EXPERT_STORE_FAMILY_GLM_DSA) ||
         layer_count == 0 || layer_count > DS4_EXPERT_STORE_V2_MAX_LAYERS ||
         expert_count == 0 || expert_count > DS4_EXPERT_STORE_V2_MAX_EXPERTS ||
         expert_used == 0 || expert_used > expert_count ||
@@ -312,6 +315,7 @@ bool ds4_expert_store_open_embedded(
     }
 
     uint64_t previous_end = data_offset;
+    uint32_t previous_layer = 0;
     for (uint32_t il = 0; il < layer_count; il++) {
         const uint8_t *entry = raw + (uint64_t)il * STORE_LAYER_BYTES;
         ds4_expert_store_layer *layer = &layers[il];
@@ -364,7 +368,11 @@ bool ds4_expert_store_open_embedded(
         }
         uint64_t expected_layer_bytes = 0;
         uint64_t layer_end = 0;
-        if (layer->layer != il || layer->expert_count != expert_count ||
+        if (layer->layer > DS4_EXPERT_STORE_V2_MAX_MODEL_LAYER ||
+            (il != 0 && layer->layer <= previous_layer) ||
+            (family == DS4_EXPERT_STORE_FAMILY_DEEPSEEK4 &&
+             layer->layer != il) ||
+            layer->expert_count != expert_count ||
             layer->record_bytes != expected_record_offset ||
             !mul_u64(layer->record_bytes, expert_count,
                      &expected_layer_bytes) ||
@@ -380,6 +388,7 @@ bool ds4_expert_store_open_embedded(
                       "expert manifest layer extent is invalid at layer %u", il);
             return false;
         }
+        previous_layer = layer->layer;
         previous_end = layer_end;
     }
     if (previous_end != store_size) {
@@ -447,8 +456,29 @@ const ds4_expert_store_manifest *ds4_expert_store_manifest_get(
 
 const ds4_expert_store_layer *ds4_expert_store_layer_get(
         const ds4_expert_store *store, uint32_t layer) {
-    if (!store || layer >= store->manifest.layer_count) return NULL;
-    return &store->layers[layer];
+    if (!store) return NULL;
+    if (layer < store->manifest.layer_count &&
+        store->layers[layer].layer == layer) {
+        return &store->layers[layer];
+    }
+    uint32_t lo = 0;
+    uint32_t hi = store->manifest.layer_count;
+    while (lo < hi) {
+        const uint32_t mid = lo + (hi - lo) / 2u;
+        if (store->layers[mid].layer < layer) lo = mid + 1u;
+        else hi = mid;
+    }
+    if (lo >= store->manifest.layer_count ||
+        store->layers[lo].layer != layer) {
+        return NULL;
+    }
+    return &store->layers[lo];
+}
+
+const ds4_expert_store_layer *ds4_expert_store_layer_at(
+        const ds4_expert_store *store, uint32_t index) {
+    if (!store || index >= store->manifest.layer_count) return NULL;
+    return &store->layers[index];
 }
 
 bool ds4_expert_store_slice_get(
@@ -461,11 +491,12 @@ bool ds4_expert_store_slice_get(
     if (offset) *offset = 0;
     if (bytes) *bytes = 0;
     if (!store || !offset || !bytes ||
-        layer >= store->manifest.layer_count ||
         expert >= store->manifest.expert_count || role >= 3) {
         return false;
     }
-    const ds4_expert_store_layer *entry = &store->layers[layer];
+    const ds4_expert_store_layer *entry =
+        ds4_expert_store_layer_get(store, layer);
+    if (!entry) return false;
     const ds4_expert_store_component *component = &entry->component[role];
     uint64_t relative = 0;
     if (!mul_u64(expert, entry->record_bytes, &relative) ||

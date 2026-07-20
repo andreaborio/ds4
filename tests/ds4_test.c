@@ -2040,7 +2040,7 @@ static bool test_metal_q4_selected_slots_case(
                 down_expert_bytes, down_row_bytes,
                 IN_DIM, MID_DIM, OUT_DIM,
                 selected, weights, TOTAL_EXPERT, n_expert,
-                0.0f, input, 0));
+                0.0f, input, 0, false));
             ds4_gpu_tensor_free(short_mid);
         }
     }
@@ -2054,7 +2054,7 @@ static bool test_metal_q4_selected_slots_case(
         down_expert_bytes, down_row_bytes,
         IN_DIM, MID_DIM, OUT_DIM,
         selected, weights, TOTAL_EXPERT, n_expert,
-        0.0f, input, 0) != 0;
+        0.0f, input, 0, false) != 0;
     TEST_ASSERT(ok);
     if (!ok) goto cleanup;
 
@@ -2945,6 +2945,7 @@ static void test_metal_kernel_group(void) {
 
 static void test_metal_qwen35_expert_pack(void) {
     TEST_ASSERT(ds4_gpu_internal_qwen35_expert_pack_test() != 0);
+    TEST_ASSERT(ds4_gpu_internal_expert_store_v2_kernel_test() != 0);
 }
 
 static void test_metal_short_prefill_ratio4(void) {

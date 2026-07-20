@@ -26,6 +26,10 @@ STORE_MAGIC = b"DS4EXPV2"
 STORE_TENSOR = "ds4.expert_major.v2"
 STORE_VERSION = 2
 STORE_FAMILY_DEEPSEEK4 = 1
+STORE_FAMILY_GLM_DSA = 2
+STORE_FAMILIES = {STORE_FAMILY_DEEPSEEK4, STORE_FAMILY_GLM_DSA}
+STORE_MAX_ROUTED_LAYERS = 79
+STORE_MAX_MODEL_LAYER = 127
 STORE_HEADER_BYTES = 256
 STORE_LAYER_BYTES = 224
 STORE_COMPONENT_BYTES = 56
@@ -60,8 +64,11 @@ TYPE_LAYOUT = {
     25: (1, 2), 26: (1, 4), 27: (1, 8), 28: (1, 8),
     29: (256, 56), 30: (1, 2),
 }
-ROUTED_TYPES = {10, 12, 16}  # Q2_K, Q4_K, IQ2_XXS
-TYPE_NAME = {10: "Q2_K", 12: "Q4_K", 16: "IQ2_XXS", 24: "I8"}
+ROUTED_TYPES = {10, 12, 13, 14, 16}  # Q2_K, Q4_K, Q5_K, Q6_K, IQ2_XXS
+TYPE_NAME = {
+    10: "Q2_K", 12: "Q4_K", 13: "Q5_K", 14: "Q6_K",
+    16: "IQ2_XXS", 24: "I8",
+}
 ROLE_NAME = ("gate", "up", "down")
 ROUTED_RE = re.compile(r"^blk\.(\d+)\.ffn_(gate|up|down)_exps\.weight$")
 
@@ -207,6 +214,7 @@ class Layer:
 @dataclasses.dataclass
 class StorePlan:
     source: GGUF
+    family: int
     layer_count: int
     expert_count: int
     expert_used_count: int
@@ -253,6 +261,10 @@ def load_gguf(path: Path) -> GGUF:
             "general.architecture", "general.alignment",
             "deepseek4.block_count", "deepseek4.expert_count",
             "deepseek4.expert_used_count",
+            "glm-dsa.block_count", "glm-dsa.expert_count",
+            "glm-dsa.expert_used_count",
+            "glm-dsa.leading_dense_block_count",
+            "glm-dsa.nextn_predict_layers",
         }
         for _ in range(n_kv):
             key = gguf_string(file)
@@ -306,29 +318,60 @@ def routed_inventory(gguf: GGUF) -> dict[int, dict[int, Tensor]]:
 
 
 def make_store_plan(source: GGUF) -> StorePlan:
-    if source.metadata.get("general.architecture") != "deepseek4":
-        raise FormatError("expert-major v2 currently accepts deepseek4 GGUFs only")
+    architecture = source.metadata.get("general.architecture")
     try:
-        layer_count = int(source.metadata["deepseek4.block_count"])
-        expert_count = int(source.metadata["deepseek4.expert_count"])
-        expert_used_count = int(source.metadata["deepseek4.expert_used_count"])
+        if architecture == "deepseek4":
+            family = STORE_FAMILY_DEEPSEEK4
+            model_layer_count = int(source.metadata["deepseek4.block_count"])
+            expert_count = int(source.metadata["deepseek4.expert_count"])
+            expert_used_count = int(source.metadata["deepseek4.expert_used_count"])
+            expected_layers = set(range(model_layer_count))
+            family_name = "DeepSeek"
+        elif architecture == "glm-dsa":
+            family = STORE_FAMILY_GLM_DSA
+            model_layer_count = int(source.metadata["glm-dsa.block_count"])
+            expert_count = int(source.metadata["glm-dsa.expert_count"])
+            expert_used_count = int(source.metadata["glm-dsa.expert_used_count"])
+            leading_dense = int(
+                source.metadata["glm-dsa.leading_dense_block_count"]
+            )
+            nextn_layers = int(source.metadata["glm-dsa.nextn_predict_layers"])
+            if not (0 <= leading_dense < model_layer_count and
+                    0 <= nextn_layers < model_layer_count):
+                raise FormatError("GLM dense/NextN layer metadata is invalid")
+            # Keep the GGUF self-contained. The NextN tail remains in the
+            # store even when the current decode graph stops before it.
+            expected_layers = set(range(leading_dense, model_layer_count))
+            family_name = "GLM"
+        else:
+            raise FormatError(
+                "expert-major v2 accepts deepseek4 and glm-dsa GGUFs only"
+            )
     except (KeyError, TypeError, ValueError) as exc:
-        raise FormatError("DeepSeek layer/expert metadata is incomplete") from exc
-    if not (1 <= layer_count <= 61 and 1 <= expert_count <= 384 and
+        raise FormatError(
+            f"{architecture or 'unknown'} layer/expert metadata is incomplete"
+        ) from exc
+
+    layer_count = len(expected_layers)
+    if not (1 <= model_layer_count <= STORE_MAX_ROUTED_LAYERS and
+            1 <= layer_count <= STORE_MAX_ROUTED_LAYERS and
+            1 <= expert_count <= 384 and
             1 <= expert_used_count <= expert_count):
-        raise FormatError("DeepSeek layer or expert counts are outside v2 limits")
+        raise FormatError(
+            f"{family_name} layer or expert counts are outside v2 limits"
+        )
 
     inventory = routed_inventory(source)
-    if set(inventory) != set(range(layer_count)):
-        missing = sorted(set(range(layer_count)) - set(inventory))
-        extra = sorted(set(inventory) - set(range(layer_count)))
+    if set(inventory) != expected_layers:
+        missing = sorted(expected_layers - set(inventory))
+        extra = sorted(set(inventory) - expected_layers)
         raise FormatError(f"routed layer inventory mismatch; missing={missing} extra={extra}")
 
     data_offset = align_up(STORE_HEADER_BYTES + layer_count * STORE_LAYER_BYTES,
                            STORE_ALIGNMENT)
     cursor = data_offset
     layers: list[Layer] = []
-    for layer_index in range(layer_count):
+    for layer_index in sorted(expected_layers):
         by_role = inventory[layer_index]
         if set(by_role) != {0, 1, 2}:
             raise FormatError(f"layer {layer_index} does not have gate/up/down")
@@ -360,6 +403,7 @@ def make_store_plan(source: GGUF) -> StorePlan:
     descriptor_bytes = b"".join(pack_layer(layer) for layer in layers)
     return StorePlan(
         source=source,
+        family=family,
         layer_count=layer_count,
         expert_count=expert_count,
         expert_used_count=expert_used_count,
@@ -397,7 +441,7 @@ def make_header(plan: StorePlan, source_digest: bytes, payload_digest: bytes,
     header[0:8] = STORE_MAGIC
     struct.pack_into(
         "<IIIIIIQQQQQQQ", header, 8,
-        STORE_VERSION, STORE_HEADER_BYTES, STORE_FAMILY_DEEPSEEK4,
+        STORE_VERSION, STORE_HEADER_BYTES, plan.family,
         plan.expert_used_count, plan.layer_count, plan.expert_count,
         plan.source_tensor_count, plan.layer_count, len(plan.descriptor_bytes),
         STORE_HEADER_BYTES, plan.data_offset, plan.data_size, plan.store_size,
@@ -570,7 +614,7 @@ def build(source_path: Path, destination: Path, reserve: int,
                    store_abs + STORE_HEADER_BYTES)
         payload_hash = hashlib.sha256()
         payload_cursor = plan.data_offset
-        for layer in plan.layers:
+        for ordinal, layer in enumerate(plan.layers, 1):
             zeros(payload_hash, layer.data_offset - payload_cursor)
             for expert in range(plan.expert_count):
                 for component in layer.components:
@@ -582,7 +626,7 @@ def build(source_path: Path, destination: Path, reserve: int,
                     copy_range(source_fd, src_offset, output_fd, dst_offset,
                                component.expert_bytes, payload_hash)
             payload_cursor = layer.data_offset + layer.data_size
-            print(f"\rwrite expert-major layers {layer.index + 1}/{plan.layer_count}",
+            print(f"\rwrite expert-major layers {ordinal}/{plan.layer_count}",
                   end="", file=sys.stderr, flush=True)
         print(file=sys.stderr)
         if payload_cursor != plan.store_size:
@@ -633,8 +677,8 @@ def parse_store(native: GGUF, tensor: Tensor) -> tuple[dict[str, object], list[L
          descriptor_offset, data_offset, data_size, store_size) = values
         source_size = struct.unpack_from("<Q", header, 88)[0]
         if (version != STORE_VERSION or header_bytes != STORE_HEADER_BYTES or
-                family != STORE_FAMILY_DEEPSEEK4 or
-                not 1 <= layer_count <= 61 or
+                family not in STORE_FAMILIES or
+                not 1 <= layer_count <= STORE_MAX_ROUTED_LAYERS or
                 not 1 <= expert_count <= 384 or
                 not 1 <= expert_used <= expert_count or
                 source_tensors <= layer_count * 3 or source_size == 0 or
@@ -652,6 +696,7 @@ def parse_store(native: GGUF, tensor: Tensor) -> tuple[dict[str, object], list[L
             raise FormatError("expert manifest SHA-256 mismatch")
     layers: list[Layer] = []
     previous_end = data_offset
+    previous_layer_index = -1
     for il in range(layer_count):
         entry = descriptors[il * STORE_LAYER_BYTES:(il + 1) * STORE_LAYER_BYTES]
         layer_index, entry_experts, record_bytes, layer_offset, layer_size = \
@@ -671,19 +716,24 @@ def parse_store(native: GGUF, tensor: Tensor) -> tuple[dict[str, object], list[L
             expected = tensor_nbytes(ggml_type, (d0, d1, 1))
             if expert_bytes != expected:
                 raise FormatError(f"component byte size mismatch at layer {il} role {role}")
-            synthetic = Tensor(f"blk.{il}.ffn_{ROLE_NAME[role]}_exps.weight",
+            synthetic = Tensor(
+                f"blk.{layer_index}.ffn_{ROLE_NAME[role]}_exps.weight",
                                (d0, d1, d2), ggml_type, 0,
                                expert_bytes * expert_count)
             components.append(Component(role, synthetic, expert_bytes,
                                         record_offset))
             record_cursor += expert_bytes
-        if (layer_index != il or entry_experts != expert_count or
+        if (layer_index <= previous_layer_index or
+                layer_index > STORE_MAX_MODEL_LAYER or
+                (family == STORE_FAMILY_DEEPSEEK4 and layer_index != il) or
+                entry_experts != expert_count or
                 record_bytes != record_cursor or layer_size != record_bytes * expert_count or
                 layer_offset < previous_end or layer_offset % STORE_ALIGNMENT or
                 layer_offset + layer_size > store_size or any(entry[200:])):
             raise FormatError(f"invalid layer descriptor {il}")
-        layers.append(Layer(il, expert_count, record_bytes, layer_offset,
+        layers.append(Layer(layer_index, expert_count, record_bytes, layer_offset,
                             layer_size, tuple(components)))
+        previous_layer_index = layer_index
         previous_end = layer_offset + layer_size
     if previous_end != store_size:
         raise FormatError("expert descriptors do not cover the complete payload")
@@ -711,7 +761,8 @@ def verify(source_path: Path, native_path: Path) -> None:
         raise FormatError("native GGUF must contain exactly one expert store")
     store = stores[0]
     manifest, layers = parse_store(native, store)
-    if (manifest["layer_count"] != plan.layer_count or
+    if (manifest["family"] != plan.family or
+            manifest["layer_count"] != plan.layer_count or
             manifest["expert_count"] != plan.expert_count or
             manifest["expert_used"] != plan.expert_used_count or
             manifest["source_tensors"] != len(source.tensors) or
@@ -743,7 +794,13 @@ def verify(source_path: Path, native_path: Path) -> None:
         payload_hash = hashlib.sha256()
         store_abs = store.abs_offset
         cursor = int(manifest["data_offset"])
-        for expected_layer, actual_layer in zip(plan.layers, layers):
+        for ordinal, (expected_layer, actual_layer) in enumerate(
+                zip(plan.layers, layers), 1):
+            if expected_layer.index != actual_layer.index:
+                raise FormatError(
+                    "manifest layer identity differs: "
+                    f"expected {expected_layer.index}, got {actual_layer.index}"
+                )
             gap = actual_layer.data_offset - cursor
             if gap:
                 padding = pread_exact(native_fd, gap, store_abs + cursor)
@@ -769,7 +826,7 @@ def verify(source_path: Path, native_path: Path) -> None:
                                actual_component.expert_bytes, payload_hash,
                                compare_fd=source_fd, compare_offset=src_offset)
             cursor = actual_layer.data_offset + actual_layer.data_size
-            print(f"\rverify expert-major layers {actual_layer.index + 1}/{plan.layer_count}",
+            print(f"\rverify expert-major layers {ordinal}/{plan.layer_count}",
                   end="", file=sys.stderr, flush=True)
         print(file=sys.stderr)
         if cursor != int(manifest["store_size"]):
@@ -790,7 +847,9 @@ def inspect(path: Path) -> None:
     _, _, output_size = native_layout(source, plan)
     routed_bytes = sum(layer.data_size for layer in plan.layers)
     print(f"architecture: {source.metadata['general.architecture']}")
+    print(f"family: {plan.family}")
     print(f"layers: {plan.layer_count}")
+    print(f"layer_ids: {plan.layers[0].index}..{plan.layers[-1].index}")
     print(f"experts: {plan.expert_count}")
     print(f"experts_used: {plan.expert_used_count}")
     print(f"routed_tensors: {plan.layer_count * 3}")

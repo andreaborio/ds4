@@ -11,12 +11,14 @@ enum {
     DS4_EXPERT_STORE_V2_VERSION = 2,
     DS4_EXPERT_STORE_V2_SHA256_BYTES = 32,
     DS4_EXPERT_STORE_V2_COMPONENTS = 3,
-    DS4_EXPERT_STORE_V2_MAX_LAYERS = 61,
+    DS4_EXPERT_STORE_V2_MAX_LAYERS = 79,
+    DS4_EXPERT_STORE_V2_MAX_MODEL_LAYER = 127,
     DS4_EXPERT_STORE_V2_MAX_EXPERTS = 384,
 };
 
 typedef enum {
     DS4_EXPERT_STORE_FAMILY_DEEPSEEK4 = 1,
+    DS4_EXPERT_STORE_FAMILY_GLM_DSA = 2,
 } ds4_expert_store_family;
 
 typedef enum {
@@ -82,6 +84,12 @@ const ds4_expert_store_manifest *ds4_expert_store_manifest_get(
 const ds4_expert_store_layer *ds4_expert_store_layer_get(
         const ds4_expert_store *store,
         uint32_t                layer);
+
+/* Descriptor-order access supports routed inventories with a dense prefix,
+ * such as GLM layers 3..78. */
+const ds4_expert_store_layer *ds4_expert_store_layer_at(
+        const ds4_expert_store *store,
+        uint32_t                index);
 
 /* Returns an absolute file offset for one complete component of one expert. */
 bool ds4_expert_store_slice_get(

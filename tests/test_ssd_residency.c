@@ -340,6 +340,30 @@ int main(void) {
     assert(floor.minimum_cache_bytes == UINT64_C(568000512));
     assert(floor.warning_cache_experts == 640);
 
+    /* GLM ExpertMajor keeps one complete route plus its in-flight safety slot
+     * on the measured 64 GiB Metal tier. The 96+ GiB policy remains the
+     * ordinary adaptive candidate until it has its own hardware evidence. */
+    ds4_ssd_adaptive_cache_plan glm_plan = {
+        .floor = {
+            .minimum_cache_experts = 601,
+        },
+        .cache_experts = 1801,
+    };
+    ds4_ssd_host_memory glm_memory = {
+        .physical_bytes = 64 * GIB,
+    };
+    assert(ds4_ssd_glm_expert_major_auto_cache_target(
+               &glm_memory, &glm_plan) == 601);
+    glm_memory.physical_bytes = 95 * GIB;
+    assert(ds4_ssd_glm_expert_major_auto_cache_target(
+               &glm_memory, &glm_plan) == 601);
+    glm_memory.physical_bytes = 96 * GIB;
+    assert(ds4_ssd_glm_expert_major_auto_cache_target(
+               &glm_memory, &glm_plan) == 1801);
+    assert(ds4_ssd_glm_expert_major_auto_cache_target(NULL, &glm_plan) == 0);
+    assert(ds4_ssd_glm_expert_major_auto_cache_target(
+               &glm_memory, NULL) == 0);
+
     /* Qwen keeps the complete static mapping charged on 16 GiB, but those
      * unpinned pages share ordinary headroom because macOS can reclaim and
      * stream them again. Unlike DeepSeek's measured low-RAM performance cap,

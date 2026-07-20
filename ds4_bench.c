@@ -9,10 +9,10 @@
  *
  * The benchmark walks one fixed token sequence to configurable context
  * frontiers, measuring only the newest prefill interval at each frontier.  It
- * then snapshots the live session in memory, performs a fixed greedy decode
- * run without allowing EOS, restores the snapshot, and continues to the next
- * frontier.  Snapshot save/restore time is intentionally outside both timing
- * windows.
+ * then snapshots the live session in memory when the payload is small enough,
+ * performs a fixed greedy decode run without allowing EOS, restores the
+ * snapshot or replays the prefix, and continues to the next frontier.  Snapshot
+ * save/restore time is intentionally outside both timing windows.
  */
 
 #include <errno.h>

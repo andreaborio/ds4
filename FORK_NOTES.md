@@ -15,9 +15,9 @@ equivalent implementation, this fork converges on it and removes the duplicate.
 > only acceptable speed regression is when an important correctness bug is fixed and it
 > requires some speed penalty."* Read every entry below against that rule.
 
-Ledger snapshot: fork Qwen promotion through `ba2fb31` (including the earlier
-`1523b26` Metal lifecycle milestone), upstream `main` `80ebbc3`, audited
-2026-07-15.
+Ledger snapshot: fork GLM ExpertMajor v2 promotion through `55d2bab` (including
+the earlier Qwen and Metal lifecycle milestones), upstream `main` `6d5572d`,
+audited 2026-07-20.
 Commit links and live branch differences remain authoritative if this dated
 snapshot drifts.
 
@@ -39,7 +39,7 @@ snapshot drifts.
 | RAM guard: refuse resident model maps larger than physical RAM | fail the non-streaming load when a map (or span-set total) exceeds 90% of `hw.memsize`, suggesting `--ssd-streaming`; `DS4_ALLOW_MODEL_OVERCOMMIT=1` opts out | **UPSTREAM PR REQUIRED; PR-ready** — branch `fix/refuse-oversized-resident-maps` (`06fd005`) on upstream main, tested (guard fires in ~3 s on an 80.8 GiB GGUF / 64 GB box, streaming + Metal kernels + streamed logprob vectors + cache-pressure suites pass). No hot-path code. |
 | Expert prune/profile hooks (`aef72ee`) | default-off full expert rankings and CPU-router prune masks for domain analysis | **FORK EXPERIMENT** — research instrumentation, not a default inference feature. Reassess upstream fit only with a general diagnostic use case and neutral overhead. |
 | Mixed-precision routed-expert streaming (`fefa426`, later sync) | serve per-layer boosted expert quants under SSD streaming | **CONVERGED UPSTREAM** — the fork takes upstream's implementation after `5800f15`; no competing delta should be preserved. |
-| GLM 5.2 streaming line (branch `codex/glm52-upstream-clean-bench` = `bd89932` + 11 commits) | #520 fixes + #528 prepare + always-active ds4-native GLM GGUF layout support (`a0e234a`, the substrate every GLM number runs on) + a copy of the RAM guard + default-off experiments (router-ahead prefetch, prune/profile hooks, virtual resident decode layers, eviction tie-break) | **MIXED** — #520/#528 are open upstream; the RAM guard is tracked separately above. Keep the remaining experiments isolated while incomplete, but open upstream PRs for each piece that applies to the upstream GLM path after validation. Measured verification is in `SSD_STREAMING_VERIFICATION.md`. |
+| GLM 5.2 ExpertMajor v2 (`55d2bab` release gate) | #520 correctness + #528 indexed prepare, compact DSA KV, physical grouped prefill, one-record selected decode reads, translated advisory I/O, tokenizer/prompt routing, measured 601-expert 64 GiB policy, embedded single-payload GGUF, and removal of the retired predicted-install path | **FORK MAIN, EXPERTMAJOR-ONLY METAL CONTRACT** — the broken port moved from 1.27 to 1.77-1.81 decode t/s; the final simple gate was 1.79 t/s and the old/new same-condition A/B was 1.75/1.74, restoring runtime parity with the qualified path. The earlier rested-storage median remains 11.08/1.90 t/s. Model-backed output is coherent and deterministic; synthetic canonical/native direct, scalar-batch, and grouped-batch math passes. #520/#528 remain open upstream. GLM canonical/non-Metal/distributed execution and old GLM layouts have no compatibility path. |
 | Qwen3.6-35B-A3B (`qwen35moe`, through `ba2fb31` plus the pending dynamic low-RAM cache fix) | opt-in Metal path for one normalized text-only Q4_K_S artifact; AUTO resident/SSD admission, pressure-sized low-RAM cache, model-backed generation, server chat, and structural resident decode optimizations | **FORK MAIN; UPSTREAM ISSUE [#462](https://github.com/antirez/ds4/issues/462)** — keep the explicit environment guard and one-artifact contract. Reconcile with upstream's implementation before proposing reusable pieces. A physical M1 Pro 16 GiB B/A/B selected 1,281 experts, averaged 9.63 t/s versus 8.66 t/s at 321 (+11.2%), and added no swapout; the full AC-powered cold/warm sustained gate remains open. Unsupported features remain fail-closed and documented. |
 
 ## Work not on `main`
@@ -47,7 +47,6 @@ snapshot drifts.
 | work | current status | promotion/upstream rule |
 |---|---|---|
 | Resident-map overcommit guard | Published branch `fix/refuse-oversized-resident-maps` at `06fd005`; tested, not yet on fork `main` | Open upstream as a standalone PR; do not claim mainline protection until it lands here or upstream. |
-| GLM 5.2 | Published experimental branch; streamed prefill fixes and optimization measured on M5 Pro 64 GB | Keep whole-line claims separate from DeepSeek `main`; #520 and #528 are already open upstream. |
 
 ## DO NOT UPSTREAM (without clearing the bar below): per-expert / mixed-precision expert quantization
 
