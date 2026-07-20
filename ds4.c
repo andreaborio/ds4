@@ -36109,34 +36109,24 @@ static double glm_graph_streaming_async_profile_ms(void) {
  * proxy) and issues advisory OS readahead for the predicted experts.  The
  * prediction never touches cache or compute state: mispredicted hints only
  * waste SSD bandwidth, and the real load path is unchanged.  The effective
- * engine profile selects advisory/off/install once at startup. */
+ * engine profile selects advisory or off once at startup. */
 typedef struct {
     const ds4_model   *model;
     const ds4_weights *weights;
     uint32_t           il;
-    ds4_glm_router_ahead_mode mode;
     float              x[DS4_MAX_EMBD];
 } glm_router_ahead_job;
-
-typedef struct {
-    uint32_t il;
-    int32_t  ids[DS4_MAX_EXPERT_USED];
-    bool     ready;
-} glm_router_ahead_result;
 
 static pthread_mutex_t g_glm_router_ahead_mutex = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t g_glm_router_ahead_cond = PTHREAD_COND_INITIALIZER;
 static glm_router_ahead_job g_glm_router_ahead_job;
-static glm_router_ahead_result g_glm_router_ahead_result;
 static bool g_glm_router_ahead_job_pending;
 static bool g_glm_router_ahead_worker_started;
 static const ds4_weights *g_glm_router_ahead_weights;
 
 static bool glm_router_ahead_prefetch_enabled(
         const ds4_glm_gpu_graph *g) {
-    return g &&
-           (g->glm_router_ahead == DS4_GLM_ROUTER_AHEAD_ADVISORY ||
-            g->glm_router_ahead == DS4_GLM_ROUTER_AHEAD_INSTALL);
+    return g && g->glm_router_ahead == DS4_GLM_ROUTER_AHEAD_ADVISORY;
 }
 
 /* CPU router selection from GPU logits with the prune mask applied.  Mirrors
@@ -36263,85 +36253,19 @@ static void *glm_router_ahead_worker(void *arg) {
         for (uint32_t i = 0; i < DS4_N_EXPERT_USED; i++) {
             ids[i] = (int32_t)selected[i];
         }
-        if (job.mode == DS4_GLM_ROUTER_AHEAD_INSTALL) {
-            /* Install mode: publish the prediction immediately so the decode
-             * thread's poll can start the cache load; the real preads make
-             * advisory hints redundant. */
-            pthread_mutex_lock(&g_glm_router_ahead_mutex);
-            g_glm_router_ahead_result.il = job.il;
-            memcpy(g_glm_router_ahead_result.ids, ids, sizeof(ids));
-            g_glm_router_ahead_result.ready = true;
-            pthread_mutex_unlock(&g_glm_router_ahead_mutex);
-            (void)ds4_gpu_glm_stream_prefetch_note_predicted(
-                    job.il,
-                    ids,
-                    DS4_N_EXPERT_USED);
-        } else {
-            (void)ds4_gpu_glm_stream_expert_prefetch_hint(
-                    job.il,
-                    ids,
-                    DS4_N_EXPERT_USED,
-                    job.model->map,
-                    job.model->size,
-                    l->ffn_gate_exps->abs_offset,
-                    l->ffn_up_exps->abs_offset,
-                    l->ffn_down_exps->abs_offset,
-                    gate_out * gate_row_bytes,
-                    down_out * down_row_bytes);
-        }
+        (void)ds4_gpu_glm_stream_expert_prefetch_hint(
+                job.il,
+                ids,
+                DS4_N_EXPERT_USED,
+                job.model->map,
+                job.model->size,
+                l->ffn_gate_exps->abs_offset,
+                l->ffn_up_exps->abs_offset,
+                l->ffn_down_exps->abs_offset,
+                gate_out * gate_row_bytes,
+                down_out * down_row_bytes);
     }
     return NULL;
-}
-
-/* Decode thread, called after the current layer's routed-MoE dispatch (pread
- * pool idle, this layer's expert buffers already bound): if the worker's
- * prediction for layer il+1 is ready, start streaming those experts into the
- * cache so the next layer's selected load mostly hits. */
-static void glm_router_ahead_prefetch_install_poll(
-        const ds4_glm_gpu_graph *g,
-        const ds4_model *model,
-        uint32_t         il) {
-    if (!g || g->glm_router_ahead != DS4_GLM_ROUTER_AHEAD_INSTALL) return;
-    const ds4_weights *weights = g_glm_router_ahead_weights;
-    if (!model || !weights) return;
-    const uint32_t il_next = il + 1u;
-    if (il_next < DS4_N_LEADING_DENSE) return;
-    if (il_next >= glm_graph_normal_layer_count()) return;
-    const ds4_layer_weights *l = &weights->layer[il_next];
-    if (!l->ffn_gate_exps || !l->ffn_up_exps || !l->ffn_down_exps) return;
-    int32_t ids[DS4_MAX_EXPERT_USED];
-    bool have = false;
-    pthread_mutex_lock(&g_glm_router_ahead_mutex);
-    if (g_glm_router_ahead_result.ready &&
-        g_glm_router_ahead_result.il == il_next) {
-        memcpy(ids, g_glm_router_ahead_result.ids, sizeof(ids));
-        g_glm_router_ahead_result.ready = false;
-        have = true;
-    }
-    pthread_mutex_unlock(&g_glm_router_ahead_mutex);
-    if (!have) return;
-
-    uint64_t gate_in = 0, gate_out = 0, gate_row_bytes = 0;
-    uint64_t down_in = 0, down_out = 0, down_row_bytes = 0;
-    (void)tensor_expert_bytes(model, l->ffn_gate_exps, 0,
-                              &gate_in, &gate_out, &gate_row_bytes);
-    (void)tensor_expert_bytes(model, l->ffn_down_exps, 0,
-                              &down_in, &down_out, &down_row_bytes);
-    const ds4_gpu_stream_expert_table table = {
-        .model_map = model->map,
-        .model_size = model->size,
-        .layer = il_next,
-        .n_total_expert = DS4_N_EXPERT,
-        .gate_offset = l->ffn_gate_exps->abs_offset,
-        .up_offset = l->ffn_up_exps->abs_offset,
-        .down_offset = l->ffn_down_exps->abs_offset,
-        .gate_expert_bytes = gate_out * gate_row_bytes,
-        .down_expert_bytes = down_out * down_row_bytes,
-    };
-    (void)ds4_gpu_glm_stream_expert_prefetch_load_begin(&table,
-                                                        il,
-                                                        ids,
-                                                        DS4_N_EXPERT_USED);
 }
 
 static bool glm_router_ahead_ensure_worker(void) {
@@ -36387,7 +36311,6 @@ static void glm_router_ahead_prefetch_submit(
         g_glm_router_ahead_job.model = model;
         g_glm_router_ahead_job.weights = weights;
         g_glm_router_ahead_job.il = il_next;
-        g_glm_router_ahead_job.mode = g->glm_router_ahead;
         g_glm_router_ahead_job_pending = true;
         pthread_cond_signal(&g_glm_router_ahead_cond);
     }
@@ -36534,12 +36457,9 @@ static bool glm_graph_encode_sparse_ffn_one(
                     DS4_N_EXPERT_USED) != 0;
             if (ok && glm_router_ahead_prefetch_enabled(g)) {
                 /* Commands were just synced by the early-load readback, so
-                 * this ffn_norm read is cheap; predict ahead off-thread.
-                 * Install mode consumes the prediction at il+1, so its
-                 * lookahead is pinned to 1. */
+                 * this ffn_norm read is cheap; predict ahead off-thread. */
                 const uint32_t lookahead =
-                    g->glm_router_ahead == DS4_GLM_ROUTER_AHEAD_INSTALL ?
-                        1u : glm_router_ahead_prefetch_lookahead(g);
+                    glm_router_ahead_prefetch_lookahead(g);
                 glm_router_ahead_prefetch_submit(g,
                                                  model,
                                                  il + lookahead,
@@ -36631,11 +36551,6 @@ static bool glm_graph_encode_sparse_ffn_one(
             g->router_weights,
             ffn_norm,
             false) != 0;
-    if (ok && uniform_streaming_selected_cache) {
-        /* Uniform (sync) path only: the generic path's selected load runs on
-         * the async worker, which would race the decode-thread-only harvest. */
-        glm_router_ahead_prefetch_install_poll(g, model, il);
-    }
     if (async_profile) {
         const double now_ms = glm_graph_streaming_async_profile_ms();
         if (async_path_profiled) {
@@ -47481,16 +47396,31 @@ static bool ds4_engine_configure_streaming_auto_cache(ds4_engine *e) {
         return false;
     }
 
-    e->ssd_streaming_cache_experts = plan.cache_experts;
-    e->ssd_streaming_cache_bytes = plan.cache_bytes;
+    uint32_t cache_experts = plan.cache_experts;
+    const bool glm_expert_major =
+        e->model.family == DS4_MODEL_FAMILY_GLM_DSA &&
+        e->model.native_expert_store_v2;
+    if (glm_expert_major) {
+        cache_experts = ds4_ssd_glm_expert_major_auto_cache_target(
+            &memory, &plan);
+        if (cache_experts == 0) {
+            fprintf(stderr,
+                    "ds4: GLM ExpertMajor AUTO cache policy could not choose "
+                    "a valid target\n");
+            return false;
+        }
+    }
+    e->ssd_streaming_cache_experts = cache_experts;
+    e->ssd_streaming_cache_bytes =
+        (uint64_t)cache_experts * geometry.per_expert_bytes;
     if (e->model.native_expert_store_v2 &&
         plan.floor.minimum_cache_experts <= UINT32_MAX) {
         /* Grouped native prefill reads one physical expert-major layer and
-         * does not consult the per-expert decode cache.  Keep only the
+         * does not consult the per-expert decode cache. Keep only the
          * correctness floor during that phase, then grow lazily for decode. */
         e->deepseek_prefill_cache_experts =
             (uint32_t)plan.floor.minimum_cache_experts;
-        e->deepseek_decode_cache_experts = plan.cache_experts;
+        e->deepseek_decode_cache_experts = cache_experts;
     }
     fprintf(stderr,
             "ds4: SSD streaming adaptive cache budget\n");
@@ -47544,7 +47474,15 @@ static bool ds4_engine_configure_streaming_auto_cache(ds4_engine *e) {
             "ds4:   cached expert count: %u (%.2f GiB), rounded to complete "
             "working-set cycles\n",
             e->ssd_streaming_cache_experts,
-            (double)plan.cache_bytes / 1073741824.0);
+            (double)e->ssd_streaming_cache_bytes / 1073741824.0);
+    if (glm_expert_major && cache_experts != plan.cache_experts) {
+        fprintf(stderr,
+                "ds4:   GLM ExpertMajor 64 GiB decode policy: holding AUTO "
+                "at the measured %u-expert route floor (adaptive candidate "
+                "was %u)\n",
+                cache_experts,
+                plan.cache_experts);
+    }
     if (e->deepseek_prefill_cache_experts != 0) {
         fprintf(stderr,
                 "ds4:   native long-prefill cache phase: %u experts, "
@@ -49043,7 +48981,6 @@ static const char *ds4_glm_router_ahead_mode_name(
     switch (mode) {
     case DS4_GLM_ROUTER_AHEAD_OFF: return "off";
     case DS4_GLM_ROUTER_AHEAD_ADVISORY: return "advisory";
-    case DS4_GLM_ROUTER_AHEAD_INSTALL: return "install-experimental";
     }
     return "invalid";
 }
@@ -49550,13 +49487,30 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
         *out = e;
         return 0;
     }
+    if (e->model.family == DS4_MODEL_FAMILY_GLM_DSA &&
+        !e->model.native_expert_store_v2) {
+        fprintf(stderr,
+                "ds4: GLM inference requires a DS4 ExpertMajor v2 GGUF; "
+                "canonical GLM execution is no longer supported\n");
+        ds4_engine_close(e);
+        *out = NULL;
+        return 1;
+    }
+    if (e->model.family == DS4_MODEL_FAMILY_GLM_DSA &&
+        (e->backend != DS4_BACKEND_METAL || !e->ssd_streaming || load_slice ||
+         opt->distributed.role != DS4_DISTRIBUTED_NONE)) {
+        fprintf(stderr,
+                "ds4: GLM ExpertMajor v2 requires one complete local Metal "
+                "model in SSD-streaming mode\n");
+        ds4_engine_close(e);
+        *out = NULL;
+        return 1;
+    }
     if (e->model.native_expert_store_v2 &&
         (e->backend != DS4_BACKEND_METAL || load_slice ||
         opt->distributed.role != DS4_DISTRIBUTED_NONE)) {
         fprintf(stderr,
-                "ds4: DS4-native expert-major v2 currently requires one "
-                "complete local Metal model; canonical GGUF remains available "
-                "for CPU, CUDA, ROCm, and distributed slices\n");
+                "ds4: ExpertMajor v2 requires one complete local Metal model\n");
         ds4_engine_close(e);
         *out = NULL;
         return 1;
@@ -49647,7 +49601,7 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
                 }
                 /*
                  * Validate only after AUTO or an NGB byte budget has resolved
-                 * to an exact expert count.  A cache at or below one token's
+                 * to an exact expert count. A cache at or below one token's
                  * cacheable routed working set must recycle a slab entry while
                  * that token is still in flight; measured streamed models can
                  * then produce silently different logits and output.

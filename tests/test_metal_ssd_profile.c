@@ -25,8 +25,7 @@ int main(void) {
            router == DS4_GLM_ROUTER_AHEAD_OFF);
     assert(ds4_profile_router_ahead_parse("1", &router) &&
            router == DS4_GLM_ROUTER_AHEAD_ADVISORY);
-    assert(ds4_profile_router_ahead_parse("install", &router) &&
-           router == DS4_GLM_ROUTER_AHEAD_INSTALL);
+    assert(!ds4_profile_router_ahead_parse("install", &router));
 
     clear_profile_env();
     ds4_metal_ssd_profile profile;

@@ -7,7 +7,6 @@
 typedef enum {
     DS4_GLM_ROUTER_AHEAD_OFF = 0,
     DS4_GLM_ROUTER_AHEAD_ADVISORY,
-    DS4_GLM_ROUTER_AHEAD_INSTALL,
 } ds4_glm_router_ahead_mode;
 
 typedef struct {

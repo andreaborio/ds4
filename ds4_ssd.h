@@ -191,6 +191,13 @@ bool ds4_ssd_adaptive_cache_plan_make_strict_with_static_reserve(
         uint64_t                    per_expert_bytes,
         uint64_t                    max_cacheable_experts,
         ds4_ssd_adaptive_cache_plan *out);
+/* GLM ExpertMajor is intentionally a model-specific runtime contract. On the
+ * measured 64 GiB Metal tier, one complete route plus the in-flight safety
+ * slot preserves more per-layer SSD concurrency than a larger hit-rate-driven
+ * cache. Larger hosts keep the adaptive candidate until they are measured. */
+uint32_t ds4_ssd_glm_expert_major_auto_cache_target(
+        const ds4_ssd_host_memory         *memory,
+        const ds4_ssd_adaptive_cache_plan *plan);
 bool ds4_ssd_resident_pressure_plan_make(
         const ds4_ssd_host_memory      *memory,
         uint64_t                        model_bytes,

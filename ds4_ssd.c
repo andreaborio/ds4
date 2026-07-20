@@ -654,6 +654,23 @@ bool ds4_ssd_adaptive_cache_plan_make(
         out);
 }
 
+uint32_t ds4_ssd_glm_expert_major_auto_cache_target(
+        const ds4_ssd_host_memory         *memory,
+        const ds4_ssd_adaptive_cache_plan *plan) {
+    if (!memory || !plan || plan->cache_experts == 0 ||
+        plan->floor.minimum_cache_experts == 0 ||
+        plan->floor.minimum_cache_experts > UINT32_MAX ||
+        plan->floor.minimum_cache_experts > plan->cache_experts) {
+        return 0;
+    }
+
+    const bool measured_64g_tier =
+        memory->physical_bytes >= 64u * DS4_GIB &&
+        memory->physical_bytes < 96u * DS4_GIB;
+    return measured_64g_tier ?
+        (uint32_t)plan->floor.minimum_cache_experts : plan->cache_experts;
+}
+
 bool ds4_ssd_working_set_after_reserve(uint64_t  recommended_bytes,
                                        uint64_t  runtime_bytes,
                                        uint64_t  external_reserved_bytes,

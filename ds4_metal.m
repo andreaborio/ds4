@@ -766,10 +766,11 @@ static uint64_t g_glm_prefetch_skip_cached;
 static uint64_t g_glm_prefetch_pred_compared;
 static uint64_t g_glm_prefetch_pred_matched;
 static double g_glm_prefetch_hint_ms;
-static uint64_t g_glm_prefetch_installed;
+/* Internal counters for the retired install prototype.  The mode is no
+ * longer selectable or declared in the backend API; keep these local until
+ * the prototype's storage helpers are folded into the generic cache loader. */
 static uint64_t g_glm_prefetch_drop_pool_busy;
 static uint64_t g_glm_prefetch_drop_no_buffers;
-static double g_glm_prefetch_harvest_wait_ms;
 static id<MTLBuffer> g_stream_expert_cache_gate_addr_buffers[DS4_METAL_STREAM_EXPERT_CACHE_MAX_LAYER];
 static id<MTLBuffer> g_stream_expert_cache_up_addr_buffers[DS4_METAL_STREAM_EXPERT_CACHE_MAX_LAYER];
 static id<MTLBuffer> g_stream_expert_cache_down_addr_buffers[DS4_METAL_STREAM_EXPERT_CACHE_MAX_LAYER];
@@ -3527,7 +3528,7 @@ void ds4_gpu_print_memory_report(const char *label) {
             g_stream_expert_cache_willneed_advise_bytes != 0 ||
             g_stream_expert_cache_pread_bytes != 0) {
             fprintf(stderr,
-                    "ds4:   streaming expert cache budget=%llu experts entries=%u expert=%.2f MiB target=%.2f GiB live=%.2f GiB, hits=%llu misses=%llu hit_rate=%.3f wraps=%llu evictions=%llu buffer_allocs=%llu buffer_reuses=%llu evict_dontneed=%.2f GiB miss_willneed=%.2f GiB miss_pread=%.2f GiB pread_ms=%.3f\n",
+                    "ds4:   streaming expert cache budget=%llu experts entries=%u expert=%.2f MiB target=%.2f GiB live=%.2f GiB, hits=%llu misses=%llu hit_rate=%.3f wraps=%llu evictions=%llu buffer_allocs=%llu buffer_reuses=%llu expert_loads=%llu pread_syscalls=%llu evict_dontneed=%.2f GiB miss_willneed=%.2f GiB miss_pread=%.2f GiB pread_ms=%.3f\n",
                     (unsigned long long)budget,
                     g_stream_expert_cache_entry_count,
                     ds4_gpu_mib(g_stream_expert_cache_expert_bytes),
@@ -3540,13 +3541,15 @@ void ds4_gpu_print_memory_report(const char *label) {
                     (unsigned long long)g_stream_expert_cache_evictions,
                     (unsigned long long)g_stream_expert_cache_buffer_allocs,
                     (unsigned long long)g_stream_expert_cache_buffer_reuses,
+                    (unsigned long long)g_stream_expert_cache_expert_loads,
+                    (unsigned long long)g_stream_expert_cache_pread_syscalls,
                     ds4_gpu_gib(g_stream_expert_cache_evict_advise_bytes),
                     ds4_gpu_gib(g_stream_expert_cache_willneed_advise_bytes),
                     ds4_gpu_gib(g_stream_expert_cache_pread_bytes),
                     g_stream_expert_cache_pread_ms);
         } else {
             fprintf(stderr,
-                    "ds4:   streaming expert cache budget=%llu experts entries=%u expert=%.2f MiB target=%.2f GiB live=%.2f GiB, hits=%llu misses=%llu hit_rate=%.3f wraps=%llu evictions=%llu buffer_allocs=%llu buffer_reuses=%llu\n",
+                    "ds4:   streaming expert cache budget=%llu experts entries=%u expert=%.2f MiB target=%.2f GiB live=%.2f GiB, hits=%llu misses=%llu hit_rate=%.3f wraps=%llu evictions=%llu buffer_allocs=%llu buffer_reuses=%llu expert_loads=%llu pread_syscalls=%llu\n",
                     (unsigned long long)budget,
                     g_stream_expert_cache_entry_count,
                     ds4_gpu_mib(g_stream_expert_cache_expert_bytes),
@@ -3558,7 +3561,9 @@ void ds4_gpu_print_memory_report(const char *label) {
                     (unsigned long long)g_stream_expert_cache_wraps,
                     (unsigned long long)g_stream_expert_cache_evictions,
                     (unsigned long long)g_stream_expert_cache_buffer_allocs,
-                    (unsigned long long)g_stream_expert_cache_buffer_reuses);
+                    (unsigned long long)g_stream_expert_cache_buffer_reuses,
+                    (unsigned long long)g_stream_expert_cache_expert_loads,
+                    (unsigned long long)g_stream_expert_cache_pread_syscalls);
         }
         if (g_glm_prefetch_hint_experts != 0 ||
             g_glm_prefetch_pred_compared != 0) {
@@ -3566,17 +3571,13 @@ void ds4_gpu_print_memory_report(const char *label) {
                 (double)g_glm_prefetch_pred_matched /
                 (double)g_glm_prefetch_pred_compared : 0.0;
             fprintf(stderr,
-                    "ds4:   router-ahead prefetch hinted=%llu skip_cached=%llu predicted_match=%llu/%llu acc=%.3f hint_ms=%.3f installed=%llu drop_pool_busy=%llu drop_no_buffers=%llu harvest_wait_ms=%.3f\n",
+                    "ds4:   router-ahead prefetch hinted=%llu skip_cached=%llu predicted_match=%llu/%llu acc=%.3f hint_ms=%.3f\n",
                     (unsigned long long)g_glm_prefetch_hint_experts,
                     (unsigned long long)g_glm_prefetch_skip_cached,
                     (unsigned long long)g_glm_prefetch_pred_matched,
                     (unsigned long long)g_glm_prefetch_pred_compared,
                     pred_acc,
-                    g_glm_prefetch_hint_ms,
-                    (unsigned long long)g_glm_prefetch_installed,
-                    (unsigned long long)g_glm_prefetch_drop_pool_busy,
-                    (unsigned long long)g_glm_prefetch_drop_no_buffers,
-                    g_glm_prefetch_harvest_wait_ms);
+                    g_glm_prefetch_hint_ms);
         }
         if (ds4_gpu_stream_expert_timing_summary_enabled()) {
             const ds4_gpu_stream_expert_timing_snapshot total =
@@ -10848,9 +10849,23 @@ static int ds4_gpu_stream_expert_coalesced_record_pread_enabled(void) {
     return enabled;
 }
 
+static int ds4_gpu_stream_expert_glm_full_record_default(void) {
+    /*
+     * Qwen's 6.75 MiB records benchmark best as three parallel component
+     * reads.  GLM ExpertMajor v2 has larger 11.81 MiB records and its
+     * qualified decode path used one contiguous pread per missing expert.
+     * Keep that distinction explicit instead of applying Qwen's I/O policy to
+     * every embedded-v2 store.
+     */
+    return g_glm_model_mode &&
+           g_qwen35_expert_pack.active &&
+           g_qwen35_expert_pack.embedded_v2;
+}
+
 static ds4_gpu_stream_expert_record_read_mode
 ds4_gpu_stream_expert_record_read_plan(void) {
-    if (ds4_gpu_stream_expert_coalesced_record_pread_enabled()) {
+    if (ds4_gpu_stream_expert_coalesced_record_pread_enabled() ||
+        ds4_gpu_stream_expert_glm_full_record_default()) {
         return DS4_GPU_STREAM_EXPERT_RECORD_FULL;
     }
     /* Environment policy is immutable after process startup, like the
@@ -11631,6 +11646,17 @@ static int ds4_gpu_stream_expert_cache_mlock(void *ptr, size_t len) {
     return mlock(ptr, len);
 }
 
+static int ds4_gpu_stream_expert_cache_should_mlock(void) {
+    /* GLM ExpertMajor is qualified on 64 GiB+ Metal hosts and keeps a small
+     * explicit cache relative to available unified memory.  Wiring each new
+     * 11.81 MiB slot adds measurable decode admission latency without helping
+     * residency on that profile; Metal already retains every in-flight shared
+     * buffer.  Other streamed models keep the pressure cap provided by mlock. */
+    return !(g_glm_model_mode &&
+             g_qwen35_expert_pack.active &&
+             g_qwen35_expert_pack.embedded_v2);
+}
+
 static id<MTLBuffer> ds4_gpu_stream_expert_alloc_buffer(
         uint64_t  len,
         NSString *label) {
@@ -11650,7 +11676,8 @@ static id<MTLBuffer> ds4_gpu_stream_expert_alloc_buffer(
     }
     buffer.label = label;
     g_stream_expert_cache_buffer_allocs++;
-    if (g_ssd_streaming_mode) {
+    if (g_ssd_streaming_mode &&
+        ds4_gpu_stream_expert_cache_should_mlock()) {
         void *ptr = [buffer contents];
         const NSUInteger n = [buffer length];
         const double t0 = ds4_gpu_now_ms();
@@ -11794,6 +11821,7 @@ static int ds4_gpu_stream_expert_slab_lock_slot(uint32_t slot) {
         g_stream_expert_cache_slab_slot_locked[slot]) {
         return 1;
     }
+    if (!ds4_gpu_stream_expert_cache_should_mlock()) return 1;
     uint32_t slab = UINT32_MAX;
     uint64_t base = 0;
     if (!ds4_gpu_stream_expert_slab_slot_range(slot, &slab, &base) ||
@@ -14675,9 +14703,19 @@ static int ds4_gpu_stream_expert_pending_load_matches(
 }
 
 static void ds4_gpu_glm_stream_prefetch_rdadvise(uint64_t offset, uint64_t len) {
-    if (g_model_fd < 0 || len == 0) return;
+    if (len == 0) return;
+
+    int source_fd = g_model_fd;
+    uint64_t source_offset = offset;
+    const int resolved = ds4_gpu_qwen35_expert_pack_resolve(
+        offset, len, &source_fd, &source_offset);
+    /* Router-ahead is advisory.  With an active expert-major store, never
+     * issue an advisory read against the canonical GGUF range when the
+     * corresponding physical record cannot be resolved: that would compete
+     * with the authoritative expert pread for unrelated pages. */
+    if (resolved < 0 || source_fd < 0) return;
 #if defined(F_RDADVISE)
-    uint64_t pos = offset;
+    uint64_t pos = source_offset;
     uint64_t rem = len;
     while (rem > 0) {
         const uint64_t chunk64 =
@@ -14686,7 +14724,7 @@ static void ds4_gpu_glm_stream_prefetch_rdadvise(uint64_t offset, uint64_t len) 
         struct radvisory ra;
         ra.ra_offset = (off_t)pos;
         ra.ra_count = (int)chunk64;
-        (void)fcntl(g_model_fd, F_RDADVISE, &ra);
+        (void)fcntl(source_fd, F_RDADVISE, &ra);
         pos += chunk64;
         rem -= chunk64;
     }
@@ -14753,32 +14791,6 @@ int ds4_gpu_glm_stream_expert_prefetch_hint(
     g_glm_prefetch_hint_ms += ds4_gpu_now_ms() - t0;
     pthread_mutex_unlock(&g_glm_prefetch_mutex);
     return hinted;
-}
-
-/* Record a prediction for accuracy accounting without issuing OS readahead
- * (install mode streams the real bytes immediately, so hints are redundant). */
-int ds4_gpu_glm_stream_prefetch_note_predicted(
-        uint32_t       layer,
-        const int32_t *expert_ids,
-        uint32_t       n_experts) {
-    if (!expert_ids ||
-        n_experts == 0 ||
-        n_experts > DS4_METAL_STREAM_EXPERT_CACHE_MAX_SELECTED ||
-        layer >= DS4_METAL_STREAM_EXPERT_CACHE_MAX_LAYER) {
-        return 0;
-    }
-    pthread_mutex_lock(&g_glm_prefetch_mutex);
-    g_glm_prefetch_predicted_n[layer] = 0;
-    for (uint32_t i = 0; i < n_experts; i++) {
-        if (expert_ids[i] < 0 ||
-            (uint32_t)expert_ids[i] >= DS4_METAL_STREAM_EXPERT_CACHE_MAX_EXPERT) {
-            continue;
-        }
-        g_glm_prefetch_predicted[layer][g_glm_prefetch_predicted_n[layer]++] =
-            expert_ids[i];
-    }
-    pthread_mutex_unlock(&g_glm_prefetch_mutex);
-    return 1;
 }
 
 /* Called with the layer's REAL selection to score the last prediction. */
@@ -14888,27 +14900,6 @@ static void ds4_gpu_glm_stream_prefetch_slot_reset(
     p->n_tasks = 0;
     p->n_loads = 0;
     p->prepare_ms = 0.0;
-}
-
-/* Decode thread only: complete an in-flight prefetch batch and install the
- * loaded experts as regular cache entries. */
-static void ds4_gpu_glm_stream_prefetch_slot_harvest(void) {
-    ds4_gpu_stream_expert_pending_load *p = &g_stream_expert_prefetch_slot;
-    if (!p->active) return;
-    const double t0 = ds4_gpu_now_ms();
-    if (!ds4_gpu_stream_expert_pread_pool_wait()) {
-        ds4_gpu_glm_stream_prefetch_slot_reset(p);
-        return;
-    }
-    p->active = 0;
-    if (ds4_gpu_stream_expert_pending_load_install(p,
-                                                   NULL,
-                                                   ds4_gpu_now_ms() -
-                                                       p->start_ms)) {
-        g_glm_prefetch_installed += p->n_loads;
-    }
-    ds4_gpu_glm_stream_prefetch_slot_reset(p);
-    g_glm_prefetch_harvest_wait_ms += ds4_gpu_now_ms() - t0;
 }
 
 int ds4_gpu_glm_stream_expert_prefetch_load_begin(
@@ -15095,7 +15086,6 @@ int ds4_gpu_stream_expert_cache_begin_selected_load(
         getenv("DS4_METAL_DISABLE_STREAMING_EXPERT_EARLY_LOAD") != NULL) {
         return 1;
     }
-    ds4_gpu_glm_stream_prefetch_slot_harvest();
     if (!table) return 0;
     const void *model_map = table->model_map;
     const uint64_t model_size = table->model_size;
@@ -40560,6 +40550,31 @@ int ds4_gpu_internal_expert_store_v2_kernel_test(void) {
             3, file_size, gate_offset, up_offset, down_offset) ||
         !ds4_gpu_set_model_map(native_map, file_size) ||
         !ds4_gpu_expert_store_v2_enable_resident()) {
+        goto cleanup;
+    }
+
+    stage = "native read policy";
+    ds4_gpu_stream_expert_pread_task policy_tasks[3] = {0};
+    uint32_t policy_task_count = 0;
+    if (!ds4_gpu_stream_expert_glm_full_record_default() ||
+        ds4_gpu_stream_expert_record_read_plan() !=
+            DS4_GPU_STREAM_EXPERT_RECORD_FULL ||
+        !ds4_gpu_stream_expert_append_record_tasks(
+            policy_tasks,
+            3,
+            &policy_task_count,
+            gate_offset,
+            up_offset,
+            down_offset,
+            expert_bytes,
+            expert_bytes,
+            native_payload,
+            native_payload + expert_bytes,
+            native_payload + expert_bytes * 2u,
+            ds4_gpu_stream_expert_record_read_plan()) ||
+        policy_task_count != 1u ||
+        !policy_tasks[0].direct_source ||
+        policy_tasks[0].len != record_bytes) {
         goto cleanup;
     }
 

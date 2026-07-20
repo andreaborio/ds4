@@ -40,10 +40,6 @@ bool ds4_profile_router_ahead_parse(
         *out = DS4_GLM_ROUTER_AHEAD_ADVISORY;
         return true;
     }
-    if (word_is(value, "2") || word_is(value, "install")) {
-        *out = DS4_GLM_ROUTER_AHEAD_INSTALL;
-        return true;
-    }
     return false;
 }
 
@@ -65,7 +61,7 @@ static bool env_router_mode(
     if (!value) return false;
     if (ds4_profile_router_ahead_parse(value, out)) return true;
     fprintf(stderr,
-            "ds4: ignoring invalid %s=%s (expected off/advisory/install)\n",
+            "ds4: ignoring invalid %s=%s (expected off/advisory)\n",
             name,
             value);
     return false;
