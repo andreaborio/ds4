@@ -459,6 +459,7 @@ model-free-test: metal ds4_test ds4_agent_test $(METAL_BINDIR)/test_q4k_dot \
 	$(METAL_BINDIR)/ds4_agent_test
 	$(METAL_BINDIR)/ds4_test --server
 	$(METAL_BINDIR)/ds4_test --metal-kernels
+	$(METAL_BINDIR)/ds4_test --metal-expert-pack
 	$(METAL_BINDIR)/test_q4k_dot
 	$(METAL_BINDIR)/test_q4k_top8
 	$(METAL_BINDIR)/test_qwen_session

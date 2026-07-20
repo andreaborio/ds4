@@ -1695,8 +1695,10 @@ int ds4_gpu_qwen35_routed_moe_batch_select_tensor(
 /* Model-free ABI/permutation regression used by --metal-kernels. */
 int ds4_gpu_internal_qwen35_expert_group_test(void);
 /* Model-free source-translation/fail-closed regression used by
- * --metal-kernels. */
+ * --metal-expert-pack. */
 int ds4_gpu_internal_qwen35_expert_pack_test(void);
+/* Canonical-vs-embedded GLM Q2 regression for direct and grouped execution. */
+int ds4_gpu_internal_expert_store_v2_kernel_test(void);
 
 /* =========================================================================
  * Hyper-Connection Kernels.
