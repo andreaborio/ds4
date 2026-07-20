@@ -81,6 +81,7 @@ used for publication.
 
 | Item | Value |
 |---|---|
+| Hugging Face repository | [`andreaborio/Qwen3.6-35B-A3B-DS4-GGUF`](https://huggingface.co/andreaborio/Qwen3.6-35B-A3B-DS4-GGUF) |
 | Artifact | `Qwen3.6-35B-A3B-DS4-ExpertMajor-v2-Q4_K_S.gguf` |
 | Artifact bytes | 20,808,566,880 |
 | Artifact SHA-256 | `d7c43a6388ec20e6fe5530850350f96fdb0ac37c5ce36d3e5f92b172c447f56b` |

@@ -202,6 +202,10 @@ The supported artifact is the single-layout
 routed weights once, activates automatically, and is 20,808,566,880 bytes with
 SHA-256
 `d7c43a6388ec20e6fe5530850350f96fdb0ac37c5ce36d3e5f92b172c447f56b`.
+Download it from
+[`andreaborio/Qwen3.6-35B-A3B-DS4-GGUF`](https://huggingface.co/andreaborio/Qwen3.6-35B-A3B-DS4-GGUF),
+where v2 is the current DSBox-selected release and the older layouts remain
+available only as versioned historical artifacts.
 No environment guard, sidecar variable, backend flag, resident flag, or power
 flag is part of normal startup:
 
