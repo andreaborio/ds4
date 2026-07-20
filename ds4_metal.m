@@ -34349,34 +34349,7 @@ int ds4_gpu_glm_routed_moe_one_tensor(
     uint64_t expert_major_up_inner = 0;
     uint64_t expert_major_down_inner = 0;
     uint64_t expert_major_stride = 0;
-    const BOOL use_expert_major =
-        has_expert_major &&
-        ds4_gpu_qwen35_expert_pack_resolve_layer(
-            model_map,
-            layer_index,
-            model_size,
-            gate_offset,
-            up_offset,
-            down_offset,
-            &expert_major_buffer,
-            &expert_major_gate_inner,
-            &expert_major_up_inner,
-            &expert_major_down_inner,
-            &expert_major_stride) != 0;
-    if (use_expert_major &&
-        (expert_major_up_inner !=
-             expert_major_gate_inner + gate_expert_bytes ||
-         expert_major_down_inner !=
-             expert_major_up_inner + up_expert_bytes ||
-         expert_major_stride != gate_expert_bytes + up_expert_bytes +
-                                down_expert_bytes ||
-         expert_major_bytes !=
-             (uint64_t)n_total_expert * expert_major_stride)) {
-        fprintf(stderr,
-                "ds4: Metal GLM ExpertMajor decode geometry mismatch at layer %u\n",
-                layer_index);
-        return 0;
-    }
+    BOOL use_expert_major = false;
 
     @autoreleasepool {
         id<MTLBuffer> xbuf = ds4_gpu_tensor_buffer(x);
@@ -34427,12 +34400,39 @@ int ds4_gpu_glm_routed_moe_one_tensor(
             ds4_gpu_stream_expert_cache_effective_cap(layer_index,
                                                       n_total_expert,
                                                       n_expert) != 0;
-        if (has_expert_major && !use_expert_major &&
-            !use_stream_expert_addr_table) {
-            fprintf(stderr,
-                    "ds4: Metal GLM ExpertMajor layer %u has no active decode byte source\n",
-                    layer_index);
-            return 0;
+        if (has_expert_major && !use_stream_expert_addr_table) {
+            use_expert_major =
+                ds4_gpu_qwen35_expert_pack_resolve_layer(
+                    model_map,
+                    layer_index,
+                    model_size,
+                    gate_offset,
+                    up_offset,
+                    down_offset,
+                    &expert_major_buffer,
+                    &expert_major_gate_inner,
+                    &expert_major_up_inner,
+                    &expert_major_down_inner,
+                    &expert_major_stride) != 0;
+            if (!use_expert_major) {
+                fprintf(stderr,
+                        "ds4: Metal GLM ExpertMajor layer %u has no active decode byte source\n",
+                        layer_index);
+                return 0;
+            }
+            if (expert_major_up_inner !=
+                    expert_major_gate_inner + gate_expert_bytes ||
+                expert_major_down_inner !=
+                    expert_major_up_inner + up_expert_bytes ||
+                expert_major_stride != gate_expert_bytes + up_expert_bytes +
+                                       down_expert_bytes ||
+                expert_major_bytes !=
+                    (uint64_t)n_total_expert * expert_major_stride) {
+                fprintf(stderr,
+                        "ds4: Metal GLM ExpertMajor decode geometry mismatch at layer %u\n",
+                        layer_index);
+                return 0;
+            }
         }
         int32_t stream_selected_ids[8] = {0, 0, 0, 0, 0, 0, 0, 0};
         ds4_gpu_stream_expert_cache_entry *stream_entries[8] = {
