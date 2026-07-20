@@ -42,6 +42,7 @@
 #include "ds4.h"
 #include "ds4_distributed.h"
 #include "ds4_expert_store.h"
+#include "ds4_profile.h"
 #include "ds4_qwen.h"
 #include "ds4_qwen_expert_pack.h"
 #include "ds4_qwen_native_gguf.h"
@@ -2291,6 +2292,202 @@ static void model_expand_qwen35_native_expert_store(ds4_model *m) {
     ds4_qwen_expert_pack_close(pack);
 }
 
+/* Expand the embedded GLM expert-major store into the canonical logical
+ * tensors expected by the existing validators and graph. The logical offsets
+ * are stable identities; Metal translates exact expert reads to interleaved
+ * physical records before execution. */
+static void model_expand_glm_native_expert_store(ds4_model *m) {
+    if (!m || m->family != DS4_MODEL_FAMILY_GLM_DSA ||
+        !m->tensors || m->n_tensors == 0) {
+        return;
+    }
+
+    ds4_tensor *store_tensor = NULL;
+    uint32_t store_count = 0;
+    uint32_t canonical_count = 0;
+    for (uint64_t i = 0; i < m->n_tensors; i++) {
+        ds4_tensor *tensor = &m->tensors[i];
+        if (ds4_streq(tensor->name, DS4_EXPERT_STORE_V2_TENSOR)) {
+            store_tensor = tensor;
+            store_count++;
+        }
+        if (canonical_routed_name(tensor->name, NULL, NULL)) {
+            canonical_count++;
+        }
+    }
+    if (store_count == 0) return;
+    if (store_count != 1 || canonical_count != 0 || !store_tensor ||
+        store_tensor->ndim != 1 || store_tensor->type != DS4_TENSOR_I8 ||
+        store_tensor->dim[0] != store_tensor->bytes ||
+        store_tensor->bytes == 0) {
+        ds4_die("malformed DS4-native GLM expert-major v2 tensor inventory");
+    }
+
+    ds4_expert_store *store = NULL;
+    char error[256] = {0};
+    if (!ds4_expert_store_open_embedded(
+            &store, m->fd, store_tensor->abs_offset, store_tensor->bytes,
+            DS4_EXPERT_STORE_FAMILY_GLM_DSA, error, sizeof(error))) {
+        fprintf(stderr, "ds4: DS4-native GLM expert store is invalid: %s\n",
+                error[0] ? error : "format or geometry mismatch");
+        exit(1);
+    }
+
+    const ds4_expert_store_manifest *manifest =
+        ds4_expert_store_manifest_get(store);
+    uint32_t metadata_layers = 0;
+    uint32_t metadata_leading_dense = 0;
+    uint32_t metadata_experts = 0;
+    uint32_t metadata_experts_used = 0;
+    const uint64_t routed_count = manifest ?
+        (uint64_t)manifest->layer_count * 3u : 0;
+    const uint64_t expected_physical = manifest &&
+        manifest->source_tensor_count >= routed_count ?
+        manifest->source_tensor_count - routed_count + 1u : 0;
+    if (!manifest ||
+        !model_get_u32(m, "glm-dsa.block_count", &metadata_layers) ||
+        !model_get_u32(m, "glm-dsa.leading_dense_block_count",
+                       &metadata_leading_dense) ||
+        !model_get_u32(m, "glm-dsa.expert_count", &metadata_experts) ||
+        !model_get_u32(m, "glm-dsa.expert_used_count",
+                       &metadata_experts_used) ||
+        metadata_leading_dense >= metadata_layers ||
+        manifest->layer_count != metadata_layers - metadata_leading_dense ||
+        manifest->expert_count != metadata_experts ||
+        manifest->expert_used_count != metadata_experts_used ||
+        m->n_tensors != expected_physical) {
+        ds4_expert_store_close(store);
+        ds4_die("DS4-native GLM store does not match GGUF metadata or tensor inventory");
+    }
+    for (uint32_t index = 0; index < manifest->layer_count; index++) {
+        const ds4_expert_store_layer *entry =
+            ds4_expert_store_layer_at(store, index);
+        if (!entry || entry->layer != metadata_leading_dense + index) {
+            ds4_expert_store_close(store);
+            ds4_die("DS4-native GLM routed layer inventory is incomplete");
+        }
+    }
+
+    ds4_tensor *logical = calloc(
+        (size_t)manifest->source_tensor_count, sizeof(logical[0]));
+    const size_t name_stride = 64;
+    char *names = calloc((size_t)routed_count, name_stride);
+    if (!logical || !names) {
+        free(logical);
+        free(names);
+        ds4_expert_store_close(store);
+        ds4_die("out of memory expanding DS4-native GLM tensors");
+    }
+    uint64_t logical_count = 0;
+    for (uint64_t i = 0; i < m->n_tensors; i++) {
+        if (&m->tensors[i] == store_tensor) continue;
+        logical[logical_count++] = m->tensors[i];
+    }
+    if (logical_count + routed_count != manifest->source_tensor_count) {
+        free(logical);
+        free(names);
+        ds4_expert_store_close(store);
+        ds4_die("DS4-native GLM logical tensor count mismatch");
+    }
+
+    const uint64_t store_end = store_tensor->abs_offset + store_tensor->bytes;
+    if (store_end < store_tensor->abs_offset) {
+        free(logical);
+        free(names);
+        ds4_expert_store_close(store);
+        ds4_die("DS4-native GLM expert-store range overflows");
+    }
+    const char *role_name[3] = {
+        "ffn_gate_exps", "ffn_up_exps", "ffn_down_exps",
+    };
+    for (uint32_t index = 0; index < manifest->layer_count; index++) {
+        const ds4_expert_store_layer *entry =
+            ds4_expert_store_layer_at(store, index);
+        if (!entry || entry->data_offset > store_tensor->bytes ||
+            store_tensor->abs_offset > UINT64_MAX - entry->data_offset) {
+            free(logical);
+            free(names);
+            ds4_expert_store_close(store);
+            ds4_die("DS4-native GLM physical layer range overflows");
+        }
+        uint64_t virtual_offset =
+            store_tensor->abs_offset + entry->data_offset;
+        for (uint32_t role = 0; role < 3; role++) {
+            const ds4_expert_store_component *component =
+                &entry->component[role];
+            const uint64_t synthetic_index = (uint64_t)index * 3u + role;
+            char *name = names + synthetic_index * name_stride;
+            const int count = snprintf(
+                name, name_stride, "blk.%u.%s.weight", entry->layer,
+                role_name[role]);
+            if (count <= 0 || (size_t)count >= name_stride ||
+                component->expert_bytes >
+                    UINT64_MAX / manifest->expert_count) {
+                free(logical);
+                free(names);
+                ds4_expert_store_close(store);
+                ds4_die("DS4-native GLM virtual tensor geometry overflows");
+            }
+            const uint64_t matrix_bytes =
+                component->expert_bytes * manifest->expert_count;
+            if (virtual_offset > store_end ||
+                matrix_bytes > store_end - virtual_offset) {
+                free(logical);
+                free(names);
+                ds4_expert_store_close(store);
+                ds4_die("DS4-native GLM virtual tensor range exceeds its store");
+            }
+            ds4_tensor *tensor = &logical[logical_count++];
+            *tensor = (ds4_tensor){
+                .name = {.ptr = name, .len = (uint64_t)count},
+                .ndim = 3,
+                .dim = {
+                    component->dim[0], component->dim[1], component->dim[2],
+                },
+                .type = component->ggml_type,
+                .rel_offset = virtual_offset - m->tensor_data_pos,
+                .abs_offset = virtual_offset,
+                .elements = component->dim[0] * component->dim[1] *
+                            component->dim[2],
+                .bytes = matrix_bytes,
+            };
+            virtual_offset += matrix_bytes;
+        }
+        if (virtual_offset != store_tensor->abs_offset + entry->data_offset +
+                                  entry->data_size) {
+            free(logical);
+            free(names);
+            ds4_expert_store_close(store);
+            ds4_die("DS4-native GLM logical layer does not cover its physical record extent");
+        }
+    }
+    if (logical_count != manifest->source_tensor_count) {
+        free(logical);
+        free(names);
+        ds4_expert_store_close(store);
+        ds4_die("DS4-native GLM logical inventory is incomplete");
+    }
+
+    const uint64_t physical_count = m->n_tensors;
+    const uint64_t physical_offset = store_tensor->abs_offset;
+    const uint64_t physical_bytes = store_tensor->bytes;
+    free(m->tensors);
+    m->tensors = logical;
+    m->owned_tensor_names = names;
+    m->gguf_n_tensors = physical_count;
+    m->n_tensors = manifest->source_tensor_count;
+    m->native_expert_store_v2 = true;
+    m->native_expert_store_offset = physical_offset;
+    m->native_expert_store_bytes = physical_bytes;
+    m->max_tensor_bytes = 0;
+    for (uint64_t i = 0; i < m->n_tensors; i++) {
+        if (m->tensors[i].bytes > m->max_tensor_bytes) {
+            m->max_tensor_bytes = m->tensors[i].bytes;
+        }
+    }
+    ds4_expert_store_close(store);
+}
+
 /* v2 keeps every physical record self-describing, so DeepSeek Flash and Pro
  * can share one loader even when routed quant types differ by layer. Logical
  * tensor offsets below are stable identity ranges only; the validated store
@@ -2515,6 +2712,7 @@ static void model_open(ds4_model *m, const char *path, bool metal_mapping,
     parse_metadata(m, &c);
     m->family = model_family_from_metadata(m);
     parse_tensors(m, &c);
+    model_expand_glm_native_expert_store(m);
     model_expand_deepseek4_native_expert_store(m);
     model_expand_qwen35_native_expert_store(m);
 
@@ -4606,6 +4804,22 @@ static bool glm_dsa_layer_has_indexer(uint32_t il) {
     return il >= 6u && ((il - 6u) % 4u) == 0u;
 }
 
+/* GLM exposes one bundled NextN predictor block after the normal transformer
+ * stack.  Session and checkpoint code needs this count in CPU-only builds too,
+ * so keep the shape helper outside the accelerator-only graph section. */
+static uint32_t glm_graph_normal_layer_count(void) {
+    if (DS4_N_LAYER <= DS4_N_NEXTN_PREDICT || DS4_N_LAYER > DS4_MAX_LAYER) {
+        return 0;
+    }
+    return DS4_N_LAYER - DS4_N_NEXTN_PREDICT;
+}
+
+static ds4_context_memory ds4_context_memory_estimate_with_prefill_mode(
+        ds4_backend backend,
+        int         ctx_size,
+        uint32_t    prefill_chunk,
+        bool        ssd_streaming);
+
 static bool weights_glm_dsa_layer_has_required(const ds4_layer_weights *l, uint32_t il) {
     if (!l) return false;
     if (!l->attn_norm ||
@@ -5526,14 +5740,81 @@ static void config_validate_deepseek4_model(const ds4_model *m) {
     config_expect_bool("expert_weights_norm", expert_weight_norm, true);
 }
 
+static void config_validate_glm_dsa_model(const ds4_model *m) {
+    g_ds4_shape = DS4_SHAPE_GLM52;
+    memset(g_ds4_compress_ratios, 0, sizeof(g_ds4_compress_ratios));
+
+    const uint32_t n_layer = required_u32(m, "glm-dsa.block_count");
+    const uint64_t n_ctx = required_u64_compat(m, "glm-dsa.context_length");
+    const uint32_t n_embd = required_u32(m, "glm-dsa.embedding_length");
+    const uint32_t n_vocab = required_u32(m, "glm-dsa.vocab_size");
+    const uint32_t n_ff_dense = required_u32(m, "glm-dsa.feed_forward_length");
+    const uint32_t n_head = required_u32(m, "glm-dsa.attention.head_count");
+    const uint32_t n_head_kv = required_u32(m, "glm-dsa.attention.head_count_kv");
+    const uint32_t n_head_dim = required_u32(m, "glm-dsa.attention.key_length");
+    const uint32_t n_value_dim = required_u32(m, "glm-dsa.attention.value_length");
+    const uint32_t n_rot = required_u32(m, "glm-dsa.rope.dimension_count");
+    const uint32_t n_lora_q = required_u32(m, "glm-dsa.attention.q_lora_rank");
+    const uint32_t n_kv_lora = required_u32(m, "glm-dsa.attention.kv_lora_rank");
+    const uint32_t n_key_mla = required_u32(m, "glm-dsa.attention.key_length_mla");
+    const uint32_t n_value_mla = required_u32(m, "glm-dsa.attention.value_length_mla");
+    const uint32_t n_expert = required_u32(m, "glm-dsa.expert_count");
+    const uint32_t n_expert_used = required_u32(m, "glm-dsa.expert_used_count");
+    const uint32_t n_ff_exp = required_u32(m, "glm-dsa.expert_feed_forward_length");
+    const uint32_t n_expert_shared = required_u32(m, "glm-dsa.expert_shared_count");
+    const uint32_t n_expert_group = required_u32(m, "glm-dsa.expert_group_count");
+    const uint32_t n_expert_group_used = required_u32(m, "glm-dsa.expert_group_used_count");
+    const uint32_t expert_gating_func = required_u32(m, "glm-dsa.expert_gating_func");
+    const uint32_t n_leading_dense = required_u32(m, "glm-dsa.leading_dense_block_count");
+    const uint32_t n_nextn = required_u32(m, "glm-dsa.nextn_predict_layers");
+    const uint32_t n_indexer_head = required_u32(m, "glm-dsa.attention.indexer.head_count");
+    const uint32_t n_indexer_head_dim = required_u32(m, "glm-dsa.attention.indexer.key_length");
+    const uint32_t n_indexer_top_k = required_u32(m, "glm-dsa.attention.indexer.top_k");
+
+    config_expect_u32("block_count", n_layer, DS4_N_LAYER);
+    config_expect_u64("context_length", n_ctx, DS4_ROPE_ORIG_CTX);
+    config_expect_u32("embedding_length", n_embd, DS4_N_EMBD);
+    config_expect_u32("vocab_size", n_vocab, DS4_N_VOCAB);
+    config_expect_u32("feed_forward_length", n_ff_dense, DS4_N_FF_DENSE);
+    config_expect_u32("attention.head_count", n_head, DS4_N_HEAD);
+    config_expect_u32("attention.head_count_kv", n_head_kv, DS4_N_HEAD_KV);
+    config_expect_u32("attention.key_length", n_head_dim, DS4_N_HEAD_DIM);
+    config_expect_u32("attention.value_length", n_value_dim, DS4_N_VALUE_DIM);
+    config_expect_u32("rope.dimension_count", n_rot, DS4_N_ROT);
+    config_expect_u32("attention.q_lora_rank", n_lora_q, DS4_N_LORA_Q);
+    config_expect_u32("attention.kv_lora_rank", n_kv_lora, DS4_N_KV_LORA);
+    config_expect_u32("attention.key_length_mla", n_key_mla, DS4_N_KEY_MLA);
+    config_expect_u32("attention.value_length_mla", n_value_mla, DS4_N_VALUE_MLA);
+    config_expect_u32("expert_count", n_expert, DS4_N_EXPERT);
+    config_expect_u32("expert_used_count", n_expert_used, DS4_N_EXPERT_USED);
+    config_expect_u32("expert_feed_forward_length", n_ff_exp, DS4_N_FF_EXP);
+    config_expect_u32("expert_shared_count", n_expert_shared, DS4_N_EXPERT_SHARED);
+    config_expect_u32("expert_group_count", n_expert_group, 1);
+    config_expect_u32("expert_group_used_count", n_expert_group_used, 1);
+    config_expect_u32("expert_gating_func", expert_gating_func, 2);
+    config_expect_u32("leading_dense_block_count", n_leading_dense, DS4_N_LEADING_DENSE);
+    config_expect_u32("nextn_predict_layers", n_nextn, DS4_N_NEXTN_PREDICT);
+    config_expect_u32("attention.indexer.head_count", n_indexer_head, DS4_N_INDEXER_HEAD);
+    config_expect_u32("attention.indexer.key_length", n_indexer_head_dim, DS4_N_INDEXER_HEAD_DIM);
+    config_expect_u32("attention.indexer.top_k", n_indexer_top_k, DS4_N_INDEXER_TOP_K);
+
+    const float rope_freq_base = required_f32(m, "glm-dsa.rope.freq_base");
+    config_expect_f32("rope.freq_base", rope_freq_base, DS4_ROPE_FREQ_BASE);
+    const float rms_eps = required_f32(m, "glm-dsa.attention.layer_norm_rms_epsilon");
+    config_expect_f32("attention.layer_norm_rms_epsilon", rms_eps, DS4_RMS_EPS);
+    const float expert_weight_scale = required_f32(m, "glm-dsa.expert_weights_scale");
+    config_expect_f32("expert_weights_scale", expert_weight_scale, DS4_EXPERT_WEIGHT_SCALE);
+    const bool expert_weight_norm = required_bool(m, "glm-dsa.expert_weights_norm");
+    config_expect_bool("expert_weights_norm", expert_weight_norm, true);
+}
+
 static void config_validate_model(const ds4_model *m) {
     switch (m->family) {
     case DS4_MODEL_FAMILY_DEEPSEEK4:
         config_validate_deepseek4_model(m);
         return;
     case DS4_MODEL_FAMILY_GLM_DSA:
-        /* GLM shape validation is performed while its architecture metadata
-         * is applied; its tensor layouts are validated after weight binding. */
+        config_validate_glm_dsa_model(m);
         return;
     case DS4_MODEL_FAMILY_QWEN35_MOE:
         config_validate_qwen35moe_model(m);
@@ -6036,39 +6317,6 @@ static void model_map_span_vec_include_layer_decode_static(ds4_model_map_span_ve
 #undef DS4_INCLUDE_TENSOR
 }
 
-static bool glm_stream_resident_decode_layer_supported(
-        const ds4_layer_weights *l,
-        uint32_t                 il) {
-    if (DS4_MODEL_FAMILY != DS4_MODEL_FAMILY_GLM_DSA ||
-        !l ||
-        il < DS4_N_LEADING_DENSE ||
-        !l->ffn_gate_exps ||
-        !l->ffn_up_exps ||
-        !l->ffn_down_exps) {
-        return false;
-    }
-    if (l->ffn_gate_exps->type == DS4_TENSOR_IQ2_XXS &&
-        l->ffn_up_exps->type == DS4_TENSOR_IQ2_XXS &&
-        (l->ffn_down_exps->type == DS4_TENSOR_IQ2_XXS ||
-         l->ffn_down_exps->type == DS4_TENSOR_Q2_K)) {
-        return true;
-    }
-    return l->ffn_gate_exps->type == l->ffn_up_exps->type &&
-           l->ffn_gate_exps->type == l->ffn_down_exps->type &&
-           (l->ffn_gate_exps->type == DS4_TENSOR_Q2_K ||
-            l->ffn_gate_exps->type == DS4_TENSOR_Q4_K);
-}
-
-static uint32_t g_glm_streaming_full_resident_layers;
-
-static bool glm_stream_resident_decode_layer_enabled(
-        const ds4_layer_weights *l,
-        uint32_t                 il) {
-    if (!glm_stream_resident_decode_layer_supported(l, il)) return false;
-    return g_glm_streaming_full_resident_layers != 0 &&
-           il - DS4_N_LEADING_DENSE < g_glm_streaming_full_resident_layers;
-}
-
 static bool glm_stream_expert_cache_addr_layout_supported(
         const ds4_weights       *w,
         const ds4_layer_weights *l,
@@ -6179,8 +6427,7 @@ static void model_map_span_vec_include_layer_decode(
     model_map_span_vec_include_layer_decode_static(spans, l);
     if (!weights_streaming_layer_experts_uniform(w, il) ||
         (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_GLM_DSA &&
-         !glm_stream_decode_experts_are_streamed(w, l, il)) ||
-        glm_stream_resident_decode_layer_enabled(l, il)) {
+         !glm_stream_decode_experts_are_streamed(w, l, il))) {
         model_map_span_vec_include_one(spans, l->ffn_gate_exps);
         model_map_span_vec_include_one(spans, l->ffn_up_exps);
         model_map_span_vec_include_one(spans, l->ffn_down_exps);
@@ -13556,8 +13803,22 @@ typedef struct {
     uint32_t n_expert;
 } glm_routed_moe_f32_mid_ctx;
 
-static bool glm_graph_gate_pair_type_supported(uint32_t gate_type, uint32_t up_type);
-static bool glm_graph_down_type_supported(uint32_t down_type);
+static bool glm_graph_gate_pair_type_supported(uint32_t gate_type,
+                                                uint32_t up_type) {
+    return gate_type == up_type &&
+           (gate_type == DS4_TENSOR_IQ2_XXS ||
+            gate_type == DS4_TENSOR_Q2_K ||
+            gate_type == DS4_TENSOR_Q4_K ||
+            gate_type == DS4_TENSOR_Q5_K);
+}
+
+static bool glm_graph_down_type_supported(uint32_t down_type) {
+    return down_type == DS4_TENSOR_IQ2_XXS ||
+           down_type == DS4_TENSOR_Q2_K ||
+           down_type == DS4_TENSOR_Q4_K ||
+           down_type == DS4_TENSOR_Q5_K ||
+           down_type == DS4_TENSOR_Q6_K;
+}
 
 static float glm_routed_moe_dot_f32(uint32_t type, int n, const uint8_t *row, const float *x) {
     if (type == DS4_TENSOR_IQ2_XXS) {
@@ -21798,38 +22059,6 @@ static bool metal_graph_decode_set_hash_selected_override(
     return ds4_gpu_routed_moe_set_selected_override(selected_i32, DS4_N_EXPERT_USED) != 0;
 }
 
-/* Optional static expert prune-mask for coding-specialized eval. Point
- * DS4_EXPERT_PRUNE_MASK at a 43-line x N_EXPERT grid of '0'/'1' ('1' = prune).
- * Applied to the CPU router's probs before top-k, so masked experts are never
- * selected (the token routes to its next-best surviving expert). Off by default;
- * only routed (non-hash) layers are affected. */
-static int8_t g_expert_prune_mask[DS4_MAX_LAYER][DS4_MAX_EXPERT];
-static int g_expert_prune_mask_state = -1; /* -1 unchecked, 0 inactive, 1 active */
-static void ds4_expert_prune_mask_ensure(void) {
-    if (g_expert_prune_mask_state >= 0) return;
-    g_expert_prune_mask_state = 0;
-    const char *path = getenv("DS4_EXPERT_PRUNE_MASK");
-    if (!path || !path[0]) return;
-    FILE *f = fopen(path, "r");
-    if (!f) { fprintf(stderr, "ds4: prune mask open failed: %s\n", path); return; }
-    long pruned = 0;
-    for (uint32_t il = 0; il < DS4_MAX_LAYER; il++) {
-        int c; uint32_t e = 0;
-        while ((c = fgetc(f)) != EOF && c != '\n') {
-            if ((c == '0' || c == '1') && e < DS4_MAX_EXPERT) {
-                g_expert_prune_mask[il][e] = (int8_t)(c == '1');
-                if (c == '1') pruned++;
-                e++;
-            }
-        }
-        if (c == EOF) break;
-    }
-    fclose(f);
-    g_expert_prune_mask_state = pruned > 0 ? 1 : 0;
-    fprintf(stderr, "ds4: expert prune mask %s (%ld experts pruned) from %s\n",
-            g_expert_prune_mask_state ? "ACTIVE" : "empty", pruned, path);
-}
-
 static bool metal_graph_decode_cpu_router(
         ds4_gpu_graph          *g,
         const ds4_model        *model,
@@ -21864,14 +22093,7 @@ static bool metal_graph_decode_cpu_router(
         layer_hash_selected_experts(selected, model, layer, (int)token);
         layer_hash_router_weights_from_probs(weights, probs, selected);
     } else {
-        ds4_expert_prune_mask_ensure();
-        if (g_expert_prune_mask_state == 1 && il < DS4_MAX_LAYER) {
-            for (uint32_t e = 0; e < DS4_N_EXPERT; e++) {
-                /* -ffast-math: use a large finite sentinel, not -INFINITY.
-                 * probs are sqrt(softplus(.)) >= 0, so this never wins top-k. */
-                if (g_expert_prune_mask[il][e]) probs[e] = -1e30f;
-            }
-        }
+        ds4_expert_prune_mask_apply_selection(il, probs, DS4_N_EXPERT);
         layer_topk_selected_experts_from_probs(selected, weights, model, layer, probs);
     }
     for (uint32_t i = 0; i < DS4_N_EXPERT_USED; i++) {
@@ -29585,13 +29807,6 @@ static bool glm_graph_layer_uses_full_indexer(uint32_t il) {
     return glm_dsa_layer_has_indexer(il);
 }
 
-static uint32_t glm_graph_normal_layer_count(void) {
-    if (DS4_N_LAYER <= DS4_N_NEXTN_PREDICT || DS4_N_LAYER > DS4_MAX_LAYER) {
-        return 0;
-    }
-    return DS4_N_LAYER - DS4_N_NEXTN_PREDICT;
-}
-
 static uint32_t glm_graph_full_indexer_layer_count_range(uint32_t layer_start,
                                                          uint32_t layer_end) {
     if (layer_start > layer_end) return 0;
@@ -29761,7 +29976,7 @@ static ds4_context_memory glm_graph_context_memory_estimate_for_compact_cap(
     return m;
 }
 
-ds4_context_memory ds4_context_memory_estimate_with_prefill_mode(
+static ds4_context_memory ds4_context_memory_estimate_with_prefill_mode(
         ds4_backend backend,
         int         ctx_size,
         uint32_t    prefill_chunk,
@@ -30246,9 +30461,7 @@ struct ds4_engine {
     uint32_t ssd_streaming_cache_experts;
     uint64_t ssd_streaming_cache_bytes;
     uint64_t ssd_streaming_prefill_headroom_bytes;
-    uint64_t ssd_streaming_full_layer_bytes;
     uint64_t startup_model_span_bytes;
-    uint32_t ssd_streaming_full_layers;
     uint32_t ssd_streaming_preload_experts;
     uint32_t deepseek_prefill_cache_experts;
     uint32_t deepseek_decode_cache_experts;
@@ -30257,10 +30470,10 @@ struct ds4_engine {
     ds4_residency_mode residency_requested;
     ds4_residency_mode residency;
     ds4_residency_plan residency_plan;
+    ds4_metal_ssd_profile metal_ssd_profile;
     bool quality;
     bool ssd_streaming;
     bool ssd_streaming_cold;
-    bool ssd_streaming_full_layers_set;
     ds4_distributed_options distributed;
     bool qwen_raw_runtime;
     bool qwen_metal_runtime;
@@ -30320,7 +30533,6 @@ static void ds4_engine_print_startup_memory(
     total = ds4_add_sat_u64(total, mem.scratch_bytes);
     total = ds4_add_sat_u64(total, e->startup_model_span_bytes);
     total = ds4_add_sat_u64(total, dynamic_expert_cache_bytes);
-    total = ds4_add_sat_u64(total, e->ssd_streaming_full_layer_bytes);
     total = ds4_add_sat_u64(total, expert_reserved_bytes);
 
     const bool color = ds4_log_is_tty(stderr);
@@ -30337,11 +30549,6 @@ static void ds4_engine_print_startup_memory(
             ds4_bytes_to_gib(mem.compressed_bytes),
             ds4_bytes_to_gib(mem.scratch_bytes),
             ds4_bytes_to_gib(e->startup_model_span_bytes));
-    if (e->ssd_streaming_full_layer_bytes != 0) {
-        fprintf(stderr,
-                " + full-layer experts %.2f GiB",
-                ds4_bytes_to_gib(e->ssd_streaming_full_layer_bytes));
-    }
     if (dynamic_expert_cache_bytes != 0) {
         fprintf(stderr,
                 " + expert cache %.2f GiB",
@@ -33981,6 +34188,9 @@ typedef struct {
     bool quality;
     bool ssd_streaming;
     bool ssd_streaming_cold;
+    bool glm_indexed_prefill_prepare;
+    ds4_glm_router_ahead_mode glm_router_ahead;
+    uint32_t glm_router_ahead_lookahead;
     bool generic_routed_moe;
     bool streaming_static_decode_map_current;
 } ds4_glm_gpu_graph;
@@ -34246,30 +34456,6 @@ static bool glm_graph_memory_guard_for_compact_cap(
     return false;
 }
 
-static bool glm_graph_memory_guard(
-        const ds4_model   *model,
-        const ds4_weights *weights,
-        bool               ssd_streaming,
-        uint32_t           ctx_size) {
-    const uint32_t work_ctx =
-        glm_graph_full_attention_cap(ctx_size, ssd_streaming);
-    const uint32_t compact_cap =
-        glm_graph_compact_cache_initial_cap(ctx_size, work_ctx);
-    return glm_graph_memory_guard_for_compact_cap(
-            model,
-            weights,
-            ssd_streaming,
-            false,
-            0,
-            0,
-            true,
-            true,
-            ctx_size,
-            compact_cap,
-            0,
-            "before Metal graph allocation");
-}
-
 static bool glm_graph_memory_guard_slice(
         const ds4_model   *model,
         const ds4_weights *weights,
@@ -34517,22 +34703,6 @@ static bool glm_graph_tensor_layout(
     return true;
 }
 
-static bool glm_graph_gate_pair_type_supported(uint32_t gate_type, uint32_t up_type) {
-    return gate_type == up_type &&
-           (gate_type == DS4_TENSOR_IQ2_XXS ||
-            gate_type == DS4_TENSOR_Q2_K ||
-            gate_type == DS4_TENSOR_Q4_K ||
-            gate_type == DS4_TENSOR_Q5_K);
-}
-
-static bool glm_graph_down_type_supported(uint32_t down_type) {
-    return down_type == DS4_TENSOR_IQ2_XXS ||
-           down_type == DS4_TENSOR_Q2_K ||
-           down_type == DS4_TENSOR_Q4_K ||
-           down_type == DS4_TENSOR_Q5_K ||
-           down_type == DS4_TENSOR_Q6_K;
-}
-
 static bool glm_graph_layer_uses_generic_routed_moe(
         const ds4_layer_weights *l) {
     return l &&
@@ -34578,10 +34748,6 @@ static bool glm_graph_stream_map_decode_layer(
     if (!g || !g->ssd_streaming) return true;
     g->streaming_static_decode_map_current = false;
     if (getenv("DS4_GLM_STREAMING_DECODE_FULL_LAYER_MAP") != NULL) {
-        return metal_graph_stream_map_layer(model, weights, il);
-    }
-    if (weights && il < DS4_N_LAYER &&
-        glm_stream_resident_decode_layer_enabled(&weights->layer[il], il)) {
         return metal_graph_stream_map_layer(model, weights, il);
     }
     if (weights && il < DS4_N_LAYER &&
@@ -35942,12 +36108,13 @@ static double glm_graph_streaming_async_profile_ms(void) {
  * residual-stream similarity of consecutive gating inputs makes this a good
  * proxy) and issues advisory OS readahead for the predicted experts.  The
  * prediction never touches cache or compute state: mispredicted hints only
- * waste SSD bandwidth, and the real load path is unchanged.
- * Enable with DS4_GLM_ROUTER_AHEAD_PREFETCH=1. */
+ * waste SSD bandwidth, and the real load path is unchanged.  The effective
+ * engine profile selects advisory/off/install once at startup. */
 typedef struct {
     const ds4_model   *model;
     const ds4_weights *weights;
     uint32_t           il;
+    ds4_glm_router_ahead_mode mode;
     float              x[DS4_MAX_EMBD];
 } glm_router_ahead_job;
 
@@ -35965,19 +36132,11 @@ static bool g_glm_router_ahead_job_pending;
 static bool g_glm_router_ahead_worker_started;
 static const ds4_weights *g_glm_router_ahead_weights;
 
-/* 0 = off, 1 = advisory OS readahead for the predicted next-layer experts,
- * 2 = additionally stream them into the expert cache (install mode). */
-static int glm_router_ahead_prefetch_level(void) {
-    static int cached = -1;
-    if (cached < 0) {
-        const char *v = getenv("DS4_GLM_ROUTER_AHEAD_PREFETCH");
-        cached = !v ? 0 : (atoi(v) >= 2 ? 2 : 1);
-    }
-    return cached;
-}
-
-static bool glm_router_ahead_prefetch_enabled(void) {
-    return glm_router_ahead_prefetch_level() != 0;
+static bool glm_router_ahead_prefetch_enabled(
+        const ds4_glm_gpu_graph *g) {
+    return g &&
+           (g->glm_router_ahead == DS4_GLM_ROUTER_AHEAD_ADVISORY ||
+            g->glm_router_ahead == DS4_GLM_ROUTER_AHEAD_INSTALL);
 }
 
 /* CPU router selection from GPU logits with the prune mask applied.  Mirrors
@@ -36066,16 +36225,11 @@ static bool glm_graph_cpu_masked_router_select_batch(
 /* Advisory mode: how many layers ahead the worker predicts and warms.
  * 1 gives the OS ~one layer of readahead runway, 2 doubles it at a small
  * prediction-accuracy cost (the gating-input proxy drifts with distance). */
-static uint32_t glm_router_ahead_prefetch_lookahead(void) {
-    static int cached = -1;
-    if (cached < 0) {
-        const char *v = getenv("DS4_GLM_ROUTER_AHEAD_LOOKAHEAD");
-        int parsed = v ? atoi(v) : 1;
-        if (parsed < 1) parsed = 1;
-        if (parsed > 4) parsed = 4;
-        cached = parsed;
-    }
-    return (uint32_t)cached;
+static uint32_t glm_router_ahead_prefetch_lookahead(
+        const ds4_glm_gpu_graph *g) {
+    if (!g || g->glm_router_ahead_lookahead < 1) return 1;
+    return g->glm_router_ahead_lookahead > 4 ? 4 :
+        g->glm_router_ahead_lookahead;
 }
 
 static void *glm_router_ahead_worker(void *arg) {
@@ -36109,7 +36263,7 @@ static void *glm_router_ahead_worker(void *arg) {
         for (uint32_t i = 0; i < DS4_N_EXPERT_USED; i++) {
             ids[i] = (int32_t)selected[i];
         }
-        if (glm_router_ahead_prefetch_level() >= 2) {
+        if (job.mode == DS4_GLM_ROUTER_AHEAD_INSTALL) {
             /* Install mode: publish the prediction immediately so the decode
              * thread's poll can start the cache load; the real preads make
              * advisory hints redundant. */
@@ -36144,9 +36298,10 @@ static void *glm_router_ahead_worker(void *arg) {
  * prediction for layer il+1 is ready, start streaming those experts into the
  * cache so the next layer's selected load mostly hits. */
 static void glm_router_ahead_prefetch_install_poll(
+        const ds4_glm_gpu_graph *g,
         const ds4_model *model,
         uint32_t         il) {
-    if (glm_router_ahead_prefetch_level() < 2) return;
+    if (!g || g->glm_router_ahead != DS4_GLM_ROUTER_AHEAD_INSTALL) return;
     const ds4_weights *weights = g_glm_router_ahead_weights;
     if (!model || !weights) return;
     const uint32_t il_next = il + 1u;
@@ -36154,8 +36309,6 @@ static void glm_router_ahead_prefetch_install_poll(
     if (il_next >= glm_graph_normal_layer_count()) return;
     const ds4_layer_weights *l = &weights->layer[il_next];
     if (!l->ffn_gate_exps || !l->ffn_up_exps || !l->ffn_down_exps) return;
-    if (glm_stream_resident_decode_layer_enabled(l, il_next)) return;
-
     int32_t ids[DS4_MAX_EXPERT_USED];
     bool have = false;
     pthread_mutex_lock(&g_glm_router_ahead_mutex);
@@ -36203,9 +36356,11 @@ static bool glm_router_ahead_ensure_worker(void) {
 }
 
 static void glm_router_ahead_prefetch_submit(
+        const ds4_glm_gpu_graph *g,
         const ds4_model      *model,
         uint32_t              il_next,
         const ds4_gpu_tensor *ffn_norm) {
+    if (!glm_router_ahead_prefetch_enabled(g)) return;
     const ds4_weights *weights = g_glm_router_ahead_weights;
     if (!model || !weights || !ffn_norm) return;
     if (il_next < DS4_N_LEADING_DENSE) return;
@@ -36215,7 +36370,6 @@ static void glm_router_ahead_prefetch_submit(
         !l->ffn_gate_exps || !l->ffn_up_exps || !l->ffn_down_exps) {
         return;
     }
-    if (glm_stream_resident_decode_layer_enabled(l, il_next)) return;
     if (!glm_router_ahead_ensure_worker()) return;
 
     pthread_mutex_lock(&g_glm_router_ahead_mutex);
@@ -36233,6 +36387,7 @@ static void glm_router_ahead_prefetch_submit(
         g_glm_router_ahead_job.model = model;
         g_glm_router_ahead_job.weights = weights;
         g_glm_router_ahead_job.il = il_next;
+        g_glm_router_ahead_job.mode = g->glm_router_ahead;
         g_glm_router_ahead_job_pending = true;
         pthread_cond_signal(&g_glm_router_ahead_cond);
     }
@@ -36305,15 +36460,11 @@ static bool glm_graph_encode_sparse_ffn_one(
                                          1,
                                          stage_t0);
     if (ok) ok = glm_graph_profile_router_selection(g, l, il, pos);
-    const bool resident_decode_layer =
-        g->ssd_streaming && glm_stream_resident_decode_layer_enabled(l, il);
     const bool generic_streaming_selected_cache =
         g->ssd_streaming &&
-        !resident_decode_layer &&
         glm_graph_layer_uses_generic_routed_moe(l);
     const bool uniform_streaming_selected_cache =
         g->ssd_streaming &&
-        !resident_decode_layer &&
         l->ffn_gate_exps->type == l->ffn_up_exps->type &&
         l->ffn_gate_exps->type == l->ffn_down_exps->type &&
         (l->ffn_gate_exps->type == DS4_TENSOR_Q2_K ||
@@ -36381,15 +36532,16 @@ static bool glm_graph_encode_sparse_ffn_one(
                     &table,
                     g->router_selected,
                     DS4_N_EXPERT_USED) != 0;
-            if (ok && glm_router_ahead_prefetch_enabled()) {
+            if (ok && glm_router_ahead_prefetch_enabled(g)) {
                 /* Commands were just synced by the early-load readback, so
                  * this ffn_norm read is cheap; predict ahead off-thread.
                  * Install mode consumes the prediction at il+1, so its
                  * lookahead is pinned to 1. */
                 const uint32_t lookahead =
-                    glm_router_ahead_prefetch_level() >= 2 ?
-                        1u : glm_router_ahead_prefetch_lookahead();
-                glm_router_ahead_prefetch_submit(model,
+                    g->glm_router_ahead == DS4_GLM_ROUTER_AHEAD_INSTALL ?
+                        1u : glm_router_ahead_prefetch_lookahead(g);
+                glm_router_ahead_prefetch_submit(g,
+                                                 model,
                                                  il + lookahead,
                                                  ffn_norm);
             }
@@ -36478,11 +36630,11 @@ static bool glm_graph_encode_sparse_ffn_one(
             g->router_selected,
             g->router_weights,
             ffn_norm,
-            resident_decode_layer) != 0;
-    if (ok && uniform_streaming_selected_cache && !resident_decode_layer) {
+            false) != 0;
+    if (ok && uniform_streaming_selected_cache) {
         /* Uniform (sync) path only: the generic path's selected load runs on
          * the async worker, which would race the decode-thread-only harvest. */
-        glm_router_ahead_prefetch_install_poll(model, il);
+        glm_router_ahead_prefetch_install_poll(g, model, il);
     }
     if (async_profile) {
         const double now_ms = glm_graph_streaming_async_profile_ms();
@@ -38812,7 +38964,11 @@ static bool glm_graph_forward_indexed_tokens(
     const uint32_t drain_interval =
         progress_flush_interval != 0 ? glm_graph_indexed_prefill_drain_interval() : 0u;
     const bool progress_requested = display_progress && work_total > 0;
-    ds4_gpu_set_glm_streaming_prefill_full_layer(false);
+    /* Indexed prefill must take the same full-layer path as plain prefill once
+     * a chunk can select more experts than the streaming cache can hold. */
+    const bool full_layer_prefill =
+        glm_graph_stream_prefill_full_layer_enabled(g, n_tokens);
+    ds4_gpu_set_glm_streaming_prefill_full_layer(full_layer_prefill);
 
     if (trace) {
         glm_graph_indexed_prefill_tracef(
@@ -38908,7 +39064,7 @@ static bool glm_graph_forward_indexed_tokens(
     const bool idx_prepare =
         g->ssd_streaming &&
         full_layer_prefill &&
-        getenv("DS4_METAL_ENABLE_GLM_INDEXED_PREFILL_PREPARE") != NULL;
+        g->glm_indexed_prefill_prepare;
     for (uint32_t il = g->layer_start; ok && il <= g->layer_end; il++) {
         const uint32_t slice_layer_done = il - g->layer_start + 1u;
         if (g->ssd_streaming) {
@@ -41306,6 +41462,7 @@ static int generate_glm_metal_argmax(
         bool                ssd_streaming,
         bool                ssd_streaming_cold,
         uint32_t            ssd_streaming_preload_experts,
+        const ds4_metal_ssd_profile *profile,
         ds4_token_emit_fn   emit,
         ds4_generation_done_fn done,
         void              * emit_ud,
@@ -41333,6 +41490,13 @@ static int generate_glm_metal_argmax(
         return 1;
     }
     g.quality = quality;
+    if (profile) {
+        g.glm_indexed_prefill_prepare =
+            profile->glm_indexed_prefill_prepare;
+        g.glm_router_ahead = profile->glm_router_ahead;
+        g.glm_router_ahead_lookahead =
+            profile->glm_router_ahead_lookahead;
+    }
     if ((uint32_t)prompt->len >= g.ctx_size) {
         fprintf(stderr,
                 "ds4: prompt length %d leaves no GLM Metal context room (ctx %u)\n",
@@ -41455,6 +41619,7 @@ static int generate_metal_graph_raw_swa(
         bool                ssd_streaming,
         bool                ssd_streaming_cold,
         uint32_t            ssd_streaming_preload_experts,
+        const ds4_metal_ssd_profile *profile,
         int                 power_percent,
         uint32_t            prefill_chunk,
         const char        * directional_steering_file,
@@ -41499,6 +41664,7 @@ static int generate_metal_graph_raw_swa(
                                          ssd_streaming,
                                          ssd_streaming_cold,
                                          ssd_streaming_preload_experts,
+                                         profile,
                                          emit,
                                          done,
                                          emit_ud,
@@ -41628,7 +41794,7 @@ static int generate_metal_graph_raw_swa(
 #endif
 
 #ifdef DS4_NO_GPU
-ds4_context_memory ds4_context_memory_estimate_with_prefill_mode(
+static ds4_context_memory ds4_context_memory_estimate_with_prefill_mode(
         ds4_backend backend,
         int         ctx_size,
         uint32_t    prefill_chunk,
@@ -45460,6 +45626,7 @@ int ds4_engine_generate_argmax_with_evidence(
                                             e->ssd_streaming,
                                             e->ssd_streaming_cold,
                                             e->ssd_streaming_preload_experts,
+                                            &e->metal_ssd_profile,
                                             e->power_percent,
                                             e->prefill_chunk,
                                             e->directional_steering_file,
@@ -46830,11 +46997,29 @@ static int glm_metal_graph_test(ds4_engine *e, const ds4_tokens *prompt) {
 }
 #endif
 
+#ifndef DS4_NO_GPU
+static bool ds4_engine_reject_native_expert_store_cpu_reference(
+        const ds4_engine *e,
+        const char       *diagnostic) {
+    if (!e || !e->model.native_expert_store_v2) return false;
+    fprintf(stderr,
+            "ds4: %s is disabled for DS4-native ExpertMajor v2: its CPU "
+            "reference expects canonical contiguous expert tensors; use "
+            "normal Metal inference or the ExpertMajor equivalence tests\n",
+            diagnostic);
+    return true;
+}
+#endif
+
 int ds4_engine_metal_graph_test(ds4_engine *e, const ds4_tokens *prompt) {
 #ifndef DS4_NO_GPU
     if (e && e->model.family == DS4_MODEL_FAMILY_QWEN35_MOE) {
         fprintf(stderr,
                 "ds4: the DeepSeek Metal graph diagnostic does not support Qwen\n");
+        return 1;
+    }
+    if (ds4_engine_reject_native_expert_store_cpu_reference(
+            e, "--metal-graph-test")) {
         return 1;
     }
     if (!e->metal_ready) {
@@ -46861,6 +47046,10 @@ int ds4_engine_metal_graph_full_test(ds4_engine *e, const ds4_tokens *prompt) {
                 "ds4: the DeepSeek full-graph diagnostic does not support Qwen\n");
         return 1;
     }
+    if (ds4_engine_reject_native_expert_store_cpu_reference(
+            e, "--metal-graph-full-test")) {
+        return 1;
+    }
     if (!e->metal_ready) {
         fprintf(stderr, "ds4: %s full graph test requested but backend is unavailable\n",
                 ds4_backend_name(e->backend));
@@ -46880,6 +47069,10 @@ int ds4_engine_metal_graph_prompt_test(ds4_engine *e, const ds4_tokens *prompt, 
     if (e && e->model.family == DS4_MODEL_FAMILY_QWEN35_MOE) {
         fprintf(stderr,
                 "ds4: the DeepSeek prompt-graph diagnostic does not support Qwen\n");
+        return 1;
+    }
+    if (ds4_engine_reject_native_expert_store_cpu_reference(
+            e, "--metal-graph-prompt-test")) {
         return 1;
     }
     if (!e->metal_ready) {
@@ -47255,11 +47448,20 @@ static bool ds4_engine_configure_streaming_auto_cache(ds4_engine *e) {
         return false;
     }
 
+    const uint64_t planned_runtime_bytes = ds4_add_sat_u64(
+            e->residency_plan.runtime_bytes,
+            e->ssd_streaming_prefill_headroom_bytes);
+    if (planned_runtime_bytes == UINT64_MAX) {
+        fprintf(stderr,
+                "ds4: SSD streaming runtime reserve byte accounting overflowed\n");
+        return false;
+    }
+
     ds4_ssd_adaptive_cache_plan plan;
     const bool plan_ok =
         ds4_ssd_adaptive_cache_plan_make_with_static_reserve(
         &memory,
-        e->residency_plan.runtime_bytes,
+        planned_runtime_bytes,
         strict_non_routed_bytes,
         e->non_routed_weights_pinned,
         geometry.cacheable_layers,
@@ -47280,6 +47482,7 @@ static bool ds4_engine_configure_streaming_auto_cache(ds4_engine *e) {
     }
 
     e->ssd_streaming_cache_experts = plan.cache_experts;
+    e->ssd_streaming_cache_bytes = plan.cache_bytes;
     if (e->model.native_expert_store_v2 &&
         plan.floor.minimum_cache_experts <= UINT32_MAX) {
         /* Grouped native prefill reads one physical expert-major layer and
@@ -47311,10 +47514,12 @@ static bool ds4_engine_configure_streaming_auto_cache(ds4_engine *e) {
                 " (half file-inactive credit)");
     fprintf(stderr,
             "ds4:   current-pressure reserve %.2f + %.2f GiB + modeled "
-            "runtime %.2f GiB; platform headroom %.2f GiB; wired budget %.2f GiB\n",
+            "runtime %.2f GiB + GLM overlapped-prefill %.2f GiB; platform "
+            "headroom %.2f GiB; wired budget %.2f GiB\n",
             (double)plan.current_headroom_bytes / 1073741824.0,
             (double)plan.pressure_margin_bytes / 1073741824.0,
             (double)e->residency_plan.runtime_bytes / 1073741824.0,
+            (double)e->ssd_streaming_prefill_headroom_bytes / 1073741824.0,
             (double)plan.platform_headroom_bytes / 1073741824.0,
             (double)plan.wire_budget_bytes / 1073741824.0);
     fprintf(stderr,
@@ -47323,8 +47528,8 @@ static bool ds4_engine_configure_streaming_auto_cache(ds4_engine *e) {
             (double)plan.safety_wire_budget_bytes / 1073741824.0,
             (double)plan.cache_envelope_bytes / 1073741824.0);
     fprintf(stderr,
-            "ds4:   strict non-routed weights %.2f GiB (%s); "
-            "pageable static reserve %.2f GiB\n",
+            "ds4:   strict non-routed weights %.2f GiB (%s); pageable "
+            "static reserve %.2f GiB\n",
             (double)strict_non_routed_bytes / 1073741824.0,
             e->non_routed_weights_pinned ?
                 "already pinned and reflected in snapshot" : "pageable",
@@ -48118,30 +48323,43 @@ static bool ds4_engine_plan_qwen35_metal_phases(
 }
 
 static bool ds4_engine_install_expert_store_v2(ds4_engine *e) {
-    if (!e || !e->model.native_expert_store_v2 ||
-        e->model.family != DS4_MODEL_FAMILY_DEEPSEEK4) {
+    if (!e || !e->model.native_expert_store_v2) {
         return false;
     }
+    const bool is_deepseek =
+        e->model.family == DS4_MODEL_FAMILY_DEEPSEEK4;
+    const bool is_glm = e->model.family == DS4_MODEL_FAMILY_GLM_DSA;
+    if (!is_deepseek && !is_glm) return false;
+    const uint32_t expected_family = is_glm ?
+        DS4_EXPERT_STORE_FAMILY_GLM_DSA :
+        DS4_EXPERT_STORE_FAMILY_DEEPSEEK4;
+    const char *family_name = is_glm ? "GLM" : "DeepSeek";
+    const uint32_t expected_layers = is_glm ?
+        DS4_N_LAYER - DS4_N_LEADING_DENSE : DS4_N_LAYER;
+
     char error[256] = {0};
     ds4_expert_store *store = NULL;
     if (!ds4_expert_store_open_embedded(
             &store, e->model.fd,
             e->model.native_expert_store_offset,
             e->model.native_expert_store_bytes,
-            DS4_EXPERT_STORE_FAMILY_DEEPSEEK4,
+            expected_family,
             error, sizeof(error))) {
-        fprintf(stderr, "ds4: native DeepSeek expert store could not be reopened: %s\n",
+        fprintf(stderr, "ds4: native %s expert store could not be reopened: %s\n",
+                family_name,
                 error[0] ? error : "format validation failed");
         return false;
     }
     const ds4_expert_store_manifest *manifest =
         ds4_expert_store_manifest_get(store);
-    if (!manifest || manifest->layer_count != DS4_N_LAYER ||
+    if (!manifest || manifest->family != expected_family ||
+        manifest->layer_count != expected_layers ||
         manifest->expert_count != DS4_N_EXPERT ||
         manifest->expert_used_count != DS4_N_EXPERT_USED ||
         manifest->source_tensor_count != e->model.n_tensors) {
         fprintf(stderr,
-                "ds4: native DeepSeek expert store does not match the active shape profile\n");
+                "ds4: native %s expert store does not match the active shape profile\n",
+                family_name);
         ds4_expert_store_close(store);
         return false;
     }
@@ -48149,26 +48367,38 @@ static bool ds4_engine_install_expert_store_v2(ds4_engine *e) {
     ds4_gpu_expert_store_layer_v2 gpu_layers[DS4_MAX_LAYER];
     memset(gpu_layers, 0, sizeof(gpu_layers));
     uint64_t first_component_bytes[3] = {0, 0, 0};
-    for (uint32_t layer = 0; layer < manifest->layer_count; layer++) {
+    for (uint32_t index = 0; index < manifest->layer_count; index++) {
         const ds4_expert_store_layer *entry =
-            ds4_expert_store_layer_get(store, layer);
+            ds4_expert_store_layer_at(store, index);
+        const uint32_t expected_layer = is_glm ?
+            DS4_N_LEADING_DENSE + index : index;
+        if (!entry || entry->layer != expected_layer ||
+            entry->layer >= DS4_N_LAYER) {
+            fprintf(stderr,
+                    "ds4: native %s store is missing routed layer %u\n",
+                    family_name, expected_layer);
+            ds4_expert_store_close(store);
+            return false;
+        }
+        const uint32_t layer = entry->layer;
         const ds4_layer_weights *weights = &e->weights.layer[layer];
         const ds4_tensor *tensor[3] = {
             weights->ffn_gate_exps,
             weights->ffn_up_exps,
             weights->ffn_down_exps,
         };
-        if (!entry || !tensor[0] || !tensor[1] || !tensor[2]) {
+        if (!tensor[0] || !tensor[1] || !tensor[2]) {
             fprintf(stderr,
-                    "ds4: native DeepSeek store is missing bound layer %u\n",
-                    layer);
+                    "ds4: native %s store is missing logical tensors for layer %u\n",
+                    family_name, layer);
             ds4_expert_store_close(store);
             return false;
         }
-        gpu_layers[layer].data_offset =
+        gpu_layers[index].layer = layer;
+        gpu_layers[index].data_offset =
             ds4_expert_store_file_offset(store) + entry->data_offset;
-        gpu_layers[layer].data_size = entry->data_size;
-        gpu_layers[layer].record_bytes = entry->record_bytes;
+        gpu_layers[index].data_size = entry->data_size;
+        gpu_layers[index].record_bytes = entry->record_bytes;
         for (uint32_t role = 0; role < 3; role++) {
             const ds4_expert_store_component *component =
                 &entry->component[role];
@@ -48180,16 +48410,16 @@ static bool ds4_engine_install_expert_store_v2(ds4_engine *e) {
                 tensor[role]->bytes !=
                     component->expert_bytes * manifest->expert_count) {
                 fprintf(stderr,
-                        "ds4: native DeepSeek store geometry differs from logical layer %u role %u\n",
-                        layer, role);
+                        "ds4: native %s store geometry differs from logical layer %u role %u\n",
+                        family_name, layer, role);
                 ds4_expert_store_close(store);
                 return false;
             }
-            gpu_layers[layer].component_offset[role] =
+            gpu_layers[index].component_offset[role] =
                 component->record_offset;
-            gpu_layers[layer].component_bytes[role] =
+            gpu_layers[index].component_bytes[role] =
                 component->expert_bytes;
-            if (layer == 0) {
+            if (index == 0) {
                 first_component_bytes[role] = component->expert_bytes;
             } else if (e->ssd_streaming &&
                        first_component_bytes[role] !=
@@ -48199,8 +48429,8 @@ static bool ds4_engine_install_expert_store_v2(ds4_engine *e) {
                  * mixed native layer would address its interleaved bytes as a
                  * canonical matrix. Fail before backend initialization. */
                 fprintf(stderr,
-                        "ds4: native DeepSeek SSD mode currently requires one routed record size class (layer %u differs)\n",
-                        layer);
+                        "ds4: native %s SSD mode currently requires one routed record size class (layer %u differs)\n",
+                        family_name, layer);
                 ds4_expert_store_close(store);
                 return false;
             }
@@ -48210,11 +48440,20 @@ static bool ds4_engine_install_expert_store_v2(ds4_engine *e) {
             ds4_expert_store_fd(store), e->model.size,
             manifest->layer_count, manifest->expert_count, gpu_layers)) {
         fprintf(stderr,
-                "ds4: Metal rejected the native DeepSeek expert-store manifest\n");
+                "ds4: Metal rejected the native %s expert-store manifest\n",
+                family_name);
         ds4_expert_store_close(store);
         return false;
     }
-    for (uint32_t layer = 0; layer < manifest->layer_count; layer++) {
+    for (uint32_t index = 0; index < manifest->layer_count; index++) {
+        const ds4_expert_store_layer *entry =
+            ds4_expert_store_layer_at(store, index);
+        if (!entry || entry->layer >= DS4_N_LAYER) {
+            ds4_gpu_expert_store_v2_clear();
+            ds4_expert_store_close(store);
+            return false;
+        }
+        const uint32_t layer = entry->layer;
         const ds4_layer_weights *weights = &e->weights.layer[layer];
         if (!ds4_gpu_expert_store_v2_bind_layer(
                 layer, e->model.size,
@@ -48232,7 +48471,8 @@ static bool ds4_engine_install_expert_store_v2(ds4_engine *e) {
     if (!e->ssd_streaming &&
         !ds4_gpu_expert_store_v2_enable_resident()) {
         fprintf(stderr,
-                "ds4: Metal could not map native DeepSeek expert-major layers\n");
+                "ds4: Metal could not map native %s expert-major layers\n",
+                family_name);
         ds4_gpu_expert_store_v2_clear();
         ds4_expert_store_close(store);
         return false;
@@ -48240,8 +48480,9 @@ static bool ds4_engine_install_expert_store_v2(ds4_engine *e) {
     e->expert_store_v2 = store;
     e->expert_store_v2_ready = true;
     fprintf(stderr,
-            "ds4: DeepSeek embedded expert-major store active: v%u, %u layers x %u experts, %.2f GiB payload, %s mode\n",
-            manifest->version, manifest->layer_count, manifest->expert_count,
+            "ds4: %s embedded expert-major store active: v%u, %u routed layers x %u experts, %.2f GiB payload, %s mode\n",
+            family_name, manifest->version, manifest->layer_count,
+            manifest->expert_count,
             (double)manifest->data_size / 1073741824.0,
             e->ssd_streaming ? "SSD" : "resident");
     return true;
@@ -48790,6 +49031,30 @@ static bool ds4_engine_configure_qwen35_metal_resident(
 }
 #endif
 
+static const char *ds4_glm_router_ahead_mode_name(
+        ds4_glm_router_ahead_mode mode) {
+    switch (mode) {
+    case DS4_GLM_ROUTER_AHEAD_OFF: return "off";
+    case DS4_GLM_ROUTER_AHEAD_ADVISORY: return "advisory";
+    case DS4_GLM_ROUTER_AHEAD_INSTALL: return "install-experimental";
+    }
+    return "invalid";
+}
+
+static void ds4_engine_print_effective_metal_ssd_profile(
+        const ds4_engine *e) {
+    if (!e || e->backend != DS4_BACKEND_METAL || !e->ssd_streaming) return;
+    fprintf(stderr,
+            "ds4: effective profile=%s indexed-prefill-prepare=%s "
+            "router-ahead=%s lookahead=%u streaming-expert-readahead=%s\n",
+            e->metal_ssd_profile.name,
+            e->metal_ssd_profile.glm_indexed_prefill_prepare ? "on" : "off",
+            ds4_glm_router_ahead_mode_name(
+                    e->metal_ssd_profile.glm_router_ahead),
+            e->metal_ssd_profile.glm_router_ahead_lookahead,
+            e->metal_ssd_profile.streaming_expert_readahead ? "on" : "off");
+}
+
 int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
     if (!out || !opt || !opt->model_path || !opt->model_path[0]) {
         fprintf(stderr, "ds4: engine open needs a model path and output pointer\n");
@@ -48848,13 +49113,11 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
     e->quality = opt->quality;
     e->residency_requested = residency_requested;
     e->ssd_streaming_cold = opt->ssd_streaming_cold;
-    e->ssd_streaming_full_layers_set = opt->ssd_streaming_full_layers_set;
     e->distributed = opt->distributed;
     e->power_percent = opt->power_percent > 0 ? opt->power_percent : 100;
     e->prefill_chunk = opt->prefill_chunk;
     e->ssd_streaming_cache_experts = opt->ssd_streaming_cache_experts;
     e->ssd_streaming_cache_bytes = opt->ssd_streaming_cache_bytes;
-    e->ssd_streaming_full_layers = opt->ssd_streaming_full_layers;
     e->ssd_streaming_preload_experts = opt->ssd_streaming_preload_experts;
     e->qwen35_planned_context_tokens = opt->context_size != 0
         ? opt->context_size : 32768u;
@@ -49139,6 +49402,26 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
             model_warm_weights(&e->model);
         }
     }
+    ds4_metal_ssd_profile_resolve(
+            e->backend == DS4_BACKEND_METAL,
+            e->model.family == DS4_MODEL_FAMILY_GLM_DSA,
+            e->ssd_streaming,
+            &e->metal_ssd_profile);
+    e->ssd_streaming_prefill_headroom_bytes = 0;
+    if (e->backend == DS4_BACKEND_METAL &&
+        e->model.family == DS4_MODEL_FAMILY_GLM_DSA &&
+        e->ssd_streaming &&
+        e->metal_ssd_profile.glm_indexed_prefill_prepare &&
+        !ds4_streaming_prefill_headroom_bytes(
+                &e->weights,
+                &e->ssd_streaming_prefill_headroom_bytes)) {
+        fprintf(stderr,
+                "ds4: GLM Gold profile could not measure its two-layer "
+                "prefill prepare reserve\n");
+        ds4_engine_close(e);
+        return 1;
+    }
+    ds4_engine_print_effective_metal_ssd_profile(e);
     const char *expert_profile_path = opt->expert_profile_path;
     if (!expert_profile_path || !expert_profile_path[0]) {
         expert_profile_path = getenv("DS4_EXPERT_PROFILE");
@@ -49187,6 +49470,13 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
                 } else {
                     external_and_headroom += headroom_bytes;
                 }
+                if (external_and_headroom > UINT64_MAX -
+                                            e->ssd_streaming_prefill_headroom_bytes) {
+                    external_and_headroom = UINT64_MAX;
+                } else {
+                    external_and_headroom +=
+                        e->ssd_streaming_prefill_headroom_bytes;
+                }
                 uint64_t model_target_bytes = 0;
                 uint64_t reserved_bytes = 0;
                 uint64_t non_routed_bytes = 0;
@@ -49220,6 +49510,30 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
                 }
             }
         }
+        uint64_t per_expert_bytes = 0;
+        const uint32_t budget =
+            ds4_streaming_cache_experts_for_byte_budget(
+                    &e->weights,
+                    e->ssd_streaming_cache_bytes,
+                    &per_expert_bytes);
+        if (budget == 0 || per_expert_bytes == 0) {
+            fprintf(stderr,
+                    "ds4: --ssd-streaming-cache-experts byte budget is too "
+                    "small or invalid for this model\n");
+            ds4_engine_close(e);
+            *out = NULL;
+            return 1;
+        }
+        e->ssd_streaming_cache_experts = budget;
+        e->ssd_streaming_cache_bytes =
+            (uint64_t)budget * per_expert_bytes;
+        fprintf(stderr,
+                "ds4: %s SSD streaming cache budget %.2f GiB / %.2f MiB "
+                "per expert = %u experts\n",
+                ds4_backend_name(e->backend),
+                (double)e->ssd_streaming_cache_bytes / 1073741824.0,
+                (double)per_expert_bytes / 1048576.0,
+                budget);
     }
     if (opt->inspect_only) {
         *out = e;
@@ -49227,9 +49541,11 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
     }
     if (e->model.native_expert_store_v2 &&
         (e->backend != DS4_BACKEND_METAL || load_slice ||
-         opt->distributed.role != DS4_DISTRIBUTED_NONE)) {
+        opt->distributed.role != DS4_DISTRIBUTED_NONE)) {
         fprintf(stderr,
-                "ds4: DS4-native DeepSeek expert-major v2 currently requires one complete local Metal model; canonical GGUF remains available for CPU, CUDA, ROCm, and distributed slices\n");
+                "ds4: DS4-native expert-major v2 currently requires one "
+                "complete local Metal model; canonical GGUF remains available "
+                "for CPU, CUDA, ROCm, and distributed slices\n");
         ds4_engine_close(e);
         *out = NULL;
         return 1;
@@ -49261,12 +49577,14 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
         }
         ds4_gpu_set_quality(e->quality);
         ds4_gpu_set_glm_model(DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_GLM_DSA);
+        ds4_gpu_set_streaming_expert_readahead(
+                e->metal_ssd_profile.streaming_expert_readahead);
         ds4_gpu_set_ssd_streaming(e->ssd_streaming);
 #if defined(__APPLE__)
         if (e->model.native_expert_store_v2 &&
             !ds4_engine_install_expert_store_v2(e)) {
             fprintf(stderr,
-                    "ds4: failed to install mandatory native DeepSeek expert store\n");
+                    "ds4: failed to install mandatory native expert-major store\n");
             ds4_engine_close(e);
             *out = NULL;
             return 1;
@@ -49274,7 +49592,7 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
 #else
         if (e->model.native_expert_store_v2) {
             fprintf(stderr,
-                    "ds4: native DeepSeek expert-major v2 is not enabled on this backend\n");
+                    "ds4: native expert-major v2 is not enabled on this backend\n");
             ds4_engine_close(e);
             *out = NULL;
             return 1;
@@ -49445,7 +49763,7 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
             ds4_model_map_span_vec spans = {0};
             if (!weights_model_map_non_routed_spans(&e->weights, &spans)) {
                 fprintf(stderr,
-                        "ds4: native DeepSeek resident non-routed map is invalid\n");
+                        "ds4: native expert-major resident non-routed map is invalid\n");
                 ds4_engine_close(e);
                 *out = NULL;
                 return 1;
@@ -49467,7 +49785,8 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
                 e->model.map, e->model.size, load_offsets, load_sizes,
                 load_span_count, spans.max_tensor_bytes);
             fprintf(stderr,
-                    "ds4: native DeepSeek resident map: %.2f GiB non-routed plus expert-major layer buffers (%u spans)\n",
+                    "ds4: native expert-major resident map: %.2f GiB "
+                    "non-routed plus expert-major layer buffers (%u spans)\n",
                     (double)span_bytes / 1073741824.0, spans.len);
             free(spans.v);
         } else if (load_slice) {
@@ -49936,6 +50255,74 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
         return 1;
     }
 #endif
+    if (e->model.family == DS4_MODEL_FAMILY_GLM_DSA) {
+        const uint32_t normal_layers = glm_graph_normal_layer_count();
+        uint32_t layer_start = 0;
+        uint32_t layer_end = normal_layers ? normal_layers - 1u : 0;
+        bool require_token_embd = true;
+        bool require_output = true;
+        if (e->distributed.role != DS4_DISTRIBUTED_NONE &&
+            e->distributed.layers.set) {
+            layer_start = e->distributed.layers.start;
+            layer_end = e->distributed.layers.has_output ?
+                (normal_layers ? normal_layers - 1u : 0u) :
+                e->distributed.layers.end;
+            require_token_embd = layer_start == 0;
+            require_output = e->distributed.layers.has_output;
+        }
+        if (!normal_layers || layer_start > layer_end ||
+            layer_end >= normal_layers) {
+            fprintf(stderr,
+                    "ds4: invalid GLM layer slice %u:%u\n",
+                    layer_start,
+                    layer_end);
+            free(s);
+            return 1;
+        }
+        if (!glm_graph_alloc_slice(&s->glm_graph,
+                                   &e->model,
+                                   &e->weights,
+                                   ctx_size,
+                                   e->ssd_streaming,
+                                   e->ssd_streaming_cold,
+                                   layer_start,
+                                   layer_end,
+                                   require_token_embd,
+                                   require_output)) {
+            free(s);
+            return 1;
+        }
+        s->prefill_cap = s->glm_graph.ctx_cap;
+        s->glm_graph_ready = true;
+        s->glm_graph.quality = e->quality;
+        s->glm_graph.glm_indexed_prefill_prepare =
+            e->metal_ssd_profile.glm_indexed_prefill_prepare;
+        s->glm_graph.glm_router_ahead =
+            e->metal_ssd_profile.glm_router_ahead;
+        s->glm_graph.glm_router_ahead_lookahead =
+            e->metal_ssd_profile.glm_router_ahead_lookahead;
+        s->logits = xmalloc((size_t)DS4_N_VOCAB * sizeof(s->logits[0]));
+        if (e->distributed.role == DS4_DISTRIBUTED_COORDINATOR) {
+            char err[256];
+            if (ds4_dist_session_create(&s->distributed,
+                                        e,
+                                        &e->distributed,
+                                        s,
+                                        ctx_size,
+                                        err,
+                                        sizeof(err)) != 0) {
+                fprintf(stderr,
+                        "ds4: failed to create distributed coordinator session: %s\n",
+                        err[0] ? err : "unknown error");
+                glm_graph_free(&s->glm_graph);
+                free(s->logits);
+                free(s);
+                return 1;
+            }
+        }
+        *out = s;
+        return 0;
+    }
     s->prefill_cap = metal_graph_prefill_cap_for_prompt(ctx_size,
                                                         e->prefill_chunk);
     const uint32_t raw_cap = metal_graph_raw_cap_for_context(ctx_size, s->prefill_cap);
@@ -50016,6 +50403,8 @@ void ds4_session_free(ds4_session *s) {
         qwen35_gpu_spec_workspace_free(&s->qwen35_spec_workspace);
         qwen35_gpu_graph_free(&s->qwen35_gpu_graph);
 #endif
+    } else if (ds4_session_is_glm(s)) {
+        glm_graph_free(&s->glm_graph);
     } else {
         metal_graph_free(&s->graph);
     }

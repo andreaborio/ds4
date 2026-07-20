@@ -158,7 +158,6 @@ typedef struct {
     int power_percent;
     uint32_t ssd_streaming_cache_experts;
     uint64_t ssd_streaming_cache_bytes;
-    uint32_t ssd_streaming_full_layers;
     uint32_t ssd_streaming_preload_experts;
     uint64_t simulate_used_memory_bytes;
     bool warm_weights;
@@ -168,7 +167,6 @@ typedef struct {
      * DS4_RESIDENCY_SSD; true here is normalized to that mode by the core. */
     bool ssd_streaming;
     bool ssd_streaming_cold;
-    bool ssd_streaming_full_layers_set;
     bool inspect_only;
     bool first_token_test;
     bool metal_graph_test;

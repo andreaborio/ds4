@@ -43,7 +43,6 @@ typedef struct {
     uint32_t prefill_chunk;
     uint32_t ssd_streaming_cache_experts;
     uint64_t ssd_streaming_cache_bytes;
-    uint32_t ssd_streaming_full_layers;
     uint32_t ssd_streaming_preload_experts;
     uint64_t simulate_used_memory_bytes;
     double step_mul;
@@ -54,7 +53,6 @@ typedef struct {
     bool quality;
     ds4_residency_mode residency;
     bool ssd_streaming_cold;
-    bool ssd_streaming_full_layers_set;
 } bench_config;
 
 static double bench_now_sec(void) {
@@ -287,10 +285,6 @@ static bench_config parse_options(int argc, char **argv) {
             }
             c.ssd_streaming_cache_experts = experts;
             c.ssd_streaming_cache_bytes = bytes;
-        } else if (!strcmp(arg, "--ssd-streaming-full-layers")) {
-            int v = parse_nonnegative_int(need_arg(&i, argc, argv, arg), arg);
-            c.ssd_streaming_full_layers = (uint32_t)v;
-            c.ssd_streaming_full_layers_set = true;
         } else if (!strcmp(arg, "--ssd-streaming-preload-experts")) {
             int v = parse_int(need_arg(&i, argc, argv, arg), arg);
             if (v <= 0) {
@@ -673,7 +667,6 @@ int main(int argc, char **argv) {
         .prefill_chunk = cfg.prefill_chunk,
         .ssd_streaming_cache_experts = cfg.ssd_streaming_cache_experts,
         .ssd_streaming_cache_bytes = cfg.ssd_streaming_cache_bytes,
-        .ssd_streaming_full_layers = cfg.ssd_streaming_full_layers,
         .ssd_streaming_preload_experts = cfg.ssd_streaming_preload_experts,
         .simulate_used_memory_bytes = cfg.simulate_used_memory_bytes,
         .power_percent = cfg.power_percent,
@@ -681,7 +674,6 @@ int main(int argc, char **argv) {
         .quality = cfg.quality,
         .residency = cfg.residency,
         .ssd_streaming_cold = cfg.ssd_streaming_cold,
-        .ssd_streaming_full_layers_set = cfg.ssd_streaming_full_layers_set,
         .expert_profile_path = cfg.expert_profile_path,
         .distributed = cfg.dist,
     };

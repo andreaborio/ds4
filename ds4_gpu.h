@@ -62,15 +62,16 @@ int ds4_gpu_set_model_map(const void *model_map, uint64_t model_size);
 int ds4_gpu_set_model_fd(int fd);
 int ds4_gpu_set_model_fd_for_map(int fd, const void *model_map);
 typedef struct ds4_gpu_expert_store_layer_v2 {
+    uint32_t layer;
+    uint32_t reserved;
     uint64_t data_offset;
     uint64_t data_size;
     uint64_t record_bytes;
     uint64_t component_offset[3];
     uint64_t component_bytes[3];
 } ds4_gpu_expert_store_layer_v2;
-/* Install the validated, versioned expert-major store used by native
- * DeepSeek GGUFs. Physical offsets are explicit per layer so mixed quant
- * classes do not inherit Qwen v1's fixed record geometry. */
+/* Install a validated expert-major store embedded in the model GGUF. layer is
+ * the real model-layer id, so inventories may omit a dense prefix. */
 int ds4_gpu_expert_store_v2_install(
         int                                  fd,
         uint64_t                             file_size,
@@ -133,6 +134,7 @@ int ds4_gpu_should_use_managed_kv_cache(uint64_t kv_cache_bytes, uint64_t contex
 void ds4_gpu_set_quality(bool quality);
 void ds4_gpu_set_glm_model(bool enabled);
 void ds4_gpu_set_ssd_streaming(bool enabled);
+void ds4_gpu_set_streaming_expert_readahead(bool enabled);
 void ds4_gpu_set_glm_streaming_prefill_full_layer(bool enabled);
 void ds4_gpu_set_streaming_expert_cache_budget(uint32_t experts);
 /* Increase the live budget without discarding resident expert slots. */

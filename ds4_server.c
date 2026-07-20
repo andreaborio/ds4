@@ -746,6 +746,12 @@ typedef struct {
     tool_replay_stats tool_replay;
 } request;
 
+static bool request_uses_single_tool_call_dialect(const request *r) {
+    return r &&
+           (r->qwen_tool_dialect ||
+            r->model_syntax == SERVER_MODEL_SYNTAX_GLM);
+}
+
 static void tool_call_free(tool_call *tc) {
     free(tc->id);
     free(tc->name);
@@ -1050,8 +1056,21 @@ static const char *server_model_id_for_format(ds4_chat_format format,
 }
 
 static const char *server_model_id_from_engine(ds4_engine *engine) {
+    if (ds4_engine_is_glm_dsa(engine)) return "glm-5.2";
     return server_model_id_for_format(ds4_engine_chat_format(engine),
                                       ds4_engine_model_id(engine));
+}
+
+static bool server_glm_model_alias_known(const char *id) {
+    return id &&
+           (!strcmp(id, "glm-5.2") ||
+            !strcmp(id, "glm-5.2-chat") ||
+            !strcmp(id, "glm-5.2-no-think") ||
+            !strcmp(id, "glm-5.2-nothink") ||
+            !strcmp(id, "glm-5.2-reasoner") ||
+            !strcmp(id, "zai/glm-5.2") ||
+            !strcmp(id, "zai/glm-5.2-chat") ||
+            !strcmp(id, "zai/glm-5.2-reasoner"));
 }
 
 static bool server_model_alias_known_for_format(ds4_chat_format format,
@@ -1065,6 +1084,9 @@ static bool server_model_alias_known_for_format(ds4_chat_format format,
 }
 
 static bool server_model_alias_known(ds4_engine *engine, const char *id) {
+    if (ds4_engine_is_glm_dsa(engine)) {
+        return server_glm_model_alias_known(id);
+    }
     return server_model_alias_known_for_format(
         ds4_engine_chat_format(engine), id);
 }
@@ -5126,7 +5148,6 @@ static const char *find_any_tool_start(const char *s) {
         strstr(s, DS4_TOOL_CALLS_START),
         strstr(s, DS4_TOOL_CALLS_START_SHORT),
         strstr(s, "<tool_calls>"),
-        strstr(s, "<tool_call>"),
     };
     for (size_t i = 0; i < sizeof(candidates)/sizeof(candidates[0]); i++) {
         if (candidates[i] && (!best || candidates[i] < best)) best = candidates[i];
@@ -5140,7 +5161,6 @@ static const char *find_any_tool_end(const char *s) {
         strstr(s, DS4_TOOL_CALLS_END),
         strstr(s, DS4_TOOL_CALLS_END_SHORT),
         strstr(s, "</tool_calls>"),
-        strstr(s, "</tool_call>"),
     };
     for (size_t i = 0; i < sizeof(candidates)/sizeof(candidates[0]); i++) {
         if (candidates[i] && (!best || candidates[i] < best)) best = candidates[i];
@@ -5165,15 +5185,15 @@ static void observe_tool_markers(const char *scan, bool *saw_start,
 }
 
 static const char *find_tool_start_for_dialect(const char *s,
-                                               bool qwen_tool_dialect) {
-    return qwen_tool_dialect ? strstr(s, QWEN_TOOL_CALL_START)
-                             : find_any_tool_start(s);
+                                               bool single_tool_call_dialect) {
+    return single_tool_call_dialect ? strstr(s, QWEN_TOOL_CALL_START)
+                                    : find_any_tool_start(s);
 }
 
 static const char *find_tool_end_for_dialect(const char *s,
-                                             bool qwen_tool_dialect) {
-    return qwen_tool_dialect ? strstr(s, QWEN_TOOL_CALL_END)
-                             : find_any_tool_end(s);
+                                             bool single_tool_call_dialect) {
+    return single_tool_call_dialect ? strstr(s, QWEN_TOOL_CALL_END)
+                                    : find_any_tool_end(s);
 }
 
 static const char *find_tool_start_bounded(const char *text, size_t text_len) {
@@ -5198,9 +5218,9 @@ static const char *find_tool_start_bounded(const char *text, size_t text_len) {
 }
 
 static void observe_tool_markers_for_dialect(
-        const char *scan, bool qwen_tool_dialect,
+        const char *scan, bool single_tool_call_dialect,
         bool *saw_start, bool *saw_end, bool *orphan_end) {
-    if (!qwen_tool_dialect) {
+    if (!single_tool_call_dialect) {
         observe_tool_markers(scan, saw_start, saw_end, orphan_end);
         return;
     }
@@ -6528,7 +6548,7 @@ static size_t text_stream_safe_limit(const char *raw, size_t start,
                                      bool final);
 static size_t text_stream_safe_limit_for_dialect(
     const char *raw, size_t start, size_t raw_len, bool has_tools,
-    bool final, bool qwen_tool_dialect);
+    bool final, bool single_tool_call_dialect);
 
 static bool sse_chat_delta_n(int fd, const request *r, const char *id,
                              const char *field, const char *text, size_t len) {
@@ -7304,12 +7324,14 @@ static bool openai_sse_stream_update(int fd, server *s, const request *r, const 
     }
 
     if (st->mode == OPENAI_STREAM_TEXT) {
+        const bool single_tool_call_dialect =
+            request_uses_single_tool_call_dialect(r);
         const char *tool = r->has_tools ?
             find_tool_start_for_dialect(raw + st->emit_pos,
-                                        r->qwen_tool_dialect) : NULL;
+                                        single_tool_call_dialect) : NULL;
         size_t limit = text_stream_safe_limit_for_dialect(
             raw, st->emit_pos, raw_len, r->has_tools, final,
-            r->qwen_tool_dialect);
+            single_tool_call_dialect);
 
         if (limit > st->emit_pos) {
             if (!sse_chat_delta_n(fd, r, id, "content",
@@ -7321,9 +7343,9 @@ static bool openai_sse_stream_update(int fd, server *s, const request *r, const 
 
         if (tool) {
             st->emit_pos = (size_t)(tool - raw);
-            if (r->qwen_tool_dialect) {
-                /* Qwen's native syntax is parsed authoritatively at EOS. Hide
-                 * the markup once its marker is complete while still
+            if (single_tool_call_dialect) {
+                /* Qwen and GLM native syntax is parsed authoritatively after
+                 * decode. Hide markup once its marker is complete while still
                  * streaming ordinary reasoning and text before that point. */
                 st->mode = OPENAI_STREAM_SUPPRESS;
             } else if (openai_tool_stream_init(&st->tool, raw, raw_len,
@@ -8023,9 +8045,14 @@ static bool responses_sse_stream_update(int fd, const request *r,
     }
 
     if (st->mode == RESP_STREAM_TEXT) {
-        const char *tool = r->has_tools ? find_any_tool_start(raw + st->emit_pos) : NULL;
-        size_t limit = text_stream_safe_limit(raw, st->emit_pos, raw_len,
-                                              r->has_tools, final);
+        const bool single_tool_call_dialect =
+            request_uses_single_tool_call_dialect(r);
+        const char *tool = r->has_tools ?
+            find_tool_start_for_dialect(raw + st->emit_pos,
+                                        single_tool_call_dialect) : NULL;
+        size_t limit = text_stream_safe_limit_for_dialect(
+            raw, st->emit_pos, raw_len, r->has_tools, final,
+            single_tool_call_dialect);
 
         if (limit > st->emit_pos) {
             if (!st->message_item_opened) {
@@ -8838,8 +8865,8 @@ static size_t text_stream_safe_limit(const char *raw, size_t start,
 
 static size_t text_stream_safe_limit_for_dialect(
         const char *raw, size_t start, size_t raw_len, bool has_tools,
-        bool final, bool qwen_tool_dialect) {
-    if (!qwen_tool_dialect) {
+        bool final, bool single_tool_call_dialect) {
+    if (!single_tool_call_dialect) {
         return text_stream_safe_limit(raw, start, raw_len, has_tools, final);
     }
     if (raw_len <= start) return raw_len;
@@ -8924,9 +8951,14 @@ static bool anthropic_sse_stream_update(int fd, server *s, const request *r, con
     }
 
     if (st->mode == ANTH_STREAM_TEXT) {
-        const char *tool = r->has_tools ? find_any_tool_start(raw + st->emit_pos) : NULL;
-        size_t limit = text_stream_safe_limit(raw, st->emit_pos, raw_len,
-                                              r->has_tools, final);
+        const bool single_tool_call_dialect =
+            request_uses_single_tool_call_dialect(r);
+        const char *tool = r->has_tools ?
+            find_tool_start_for_dialect(raw + st->emit_pos,
+                                        single_tool_call_dialect) : NULL;
+        size_t limit = text_stream_safe_limit_for_dialect(
+            raw, st->emit_pos, raw_len, r->has_tools, final,
+            single_tool_call_dialect);
 
         if (limit > st->emit_pos) {
             if (!anthropic_sse_open_block(fd, st, ANTH_BLOCK_TEXT)) return false;
@@ -8944,7 +8976,7 @@ static bool anthropic_sse_stream_update(int fd, server *s, const request *r, con
              * live tool_use projection as soon as the DSML block starts.  On
              * final catch-up from plain text, leave the block for the existing
              * final emitter so old non-incremental behavior stays unchanged. */
-            if (!final &&
+            if (!single_tool_call_dialect && !final &&
                 anthropic_tool_stream_init(&st->tool, raw, raw_len, st->emit_pos)) {
                 st->mode = ANTH_STREAM_TOOL;
             } else {
@@ -11975,6 +12007,8 @@ decode_again:
     thinking_state thinking = thinking_state_from_prompt(&j->req);
     const bool thinking_gates_tool_markers = ds4_think_mode_enabled(j->req.think_mode);
     const bool qwen_tool_dialect = j->req.qwen_tool_dialect && j->req.has_tools;
+    const bool single_tool_call_dialect =
+        j->req.has_tools && request_uses_single_tool_call_dialect(&j->req);
     bool tool_scan_waiting_for_think_close =
         thinking_gates_tool_markers && thinking.inside;
     size_t think_recovery_scan_from = 0;
@@ -12133,7 +12167,7 @@ decode_again:
                         chat_think_tool_recovery(s, &text, &thinking,
                                                  &think_recovery_scan_from,
                                                  &completion, max_tokens,
-                                                 qwen_tool_dialect,
+                                                 single_tool_call_dialect,
                                                  err, sizeof(err)) : 0;
                     if (recovered < 0) {
                         finish = "error";
@@ -12170,7 +12204,7 @@ decode_again:
                     bool old_start = saw_tool_start;
                     bool old_end = saw_tool_end;
                     observe_tool_markers_for_dialect(
-                        tool_scan, qwen_tool_dialect,
+                        tool_scan, single_tool_call_dialect,
                         &saw_tool_start, &saw_tool_end, &orphan_end);
                     if (orphan_end && !saw_orphan_tool_end) {
                         saw_orphan_tool_end = true;
@@ -13283,10 +13317,6 @@ static server_config parse_options(int argc, char **argv) {
             }
             c.engine.ssd_streaming_cache_experts = experts;
             c.engine.ssd_streaming_cache_bytes = bytes;
-        } else if (!strcmp(arg, "--ssd-streaming-full-layers")) {
-            int v = parse_nonneg_int_arg(need_arg(&i, argc, argv, arg), arg);
-            c.engine.ssd_streaming_full_layers = (uint32_t)v;
-            c.engine.ssd_streaming_full_layers_set = true;
         } else if (!strcmp(arg, "--ssd-streaming-preload-experts")) {
             int v = parse_int_arg(need_arg(&i, argc, argv, arg), arg);
             if (v <= 0) {
@@ -15458,8 +15488,8 @@ static void test_model_alias_thinking_controls(void) {
     TEST_ASSERT(model_alias_enables_thinking("deepseek-reasoner"));
     TEST_ASSERT(model_alias_enables_thinking("glm-5.2-reasoner"));
     TEST_ASSERT(model_alias_enables_thinking("zai/glm-5.2-reasoner"));
-    TEST_ASSERT(server_model_alias_known("glm-5.2-chat"));
-    TEST_ASSERT(server_model_alias_known("glm-5.2-reasoner"));
+    TEST_ASSERT(server_glm_model_alias_known("glm-5.2-chat"));
+    TEST_ASSERT(server_glm_model_alias_known("glm-5.2-reasoner"));
 }
 
 static void test_api_thinking_controls_parse(void) {

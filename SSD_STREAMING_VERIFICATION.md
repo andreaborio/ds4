@@ -6,7 +6,7 @@ re-run from the documented repro on the same box, paired A/B back-to-back,
 per the speed-regression methodology in `CONTRIBUTING.md`.
 
 - Machine: MacBook M5 Pro 64 GB, macOS 26 (Darwin 25.5.0), Metal, SSD AP1024Z 1TB.
-- GLM model: GLM 5.2 `glm52-ds4-native-64g.gguf` (ds4-native layout), `--ssd-streaming --ssd-streaming-full-layers 0`.
+- GLM model: GLM 5.2 `glm52-ds4-native-64g.gguf` (ds4-native layout), `--ssd-streaming`.
 - DeepSeek model: DeepSeek-V4-Flash IQ2XXS (w2Q2K, AProj/SExp/Out Q8, chat-v2 imatrix), `--ssd-streaming`.
 - Fork binaries: worktree at `feat/streaming-staging-opt` e02cf53, `make ds4 ds4-bench` up to date.
 - All runners executed as `.sh` files via `sh` (zsh word-splitting trap).
@@ -136,7 +136,7 @@ prefill deltas are cache-warming noise.
 ## C6 — GLM MTP gate (nextn acceptance): CONFIRMED, NO-GO stands
 
 Branch `feat/glm-mtp-probe` (fbde3a0) rebuilt in place, then
-`DS4_GLM_NEXTN_PROBE=1 ./ds4 -m GLM --ssd-streaming --ssd-streaming-full-layers 0
+`DS4_GLM_NEXTN_PROBE=1 ./ds4 -m GLM --ssd-streaming
 --perplexity-file bench-logs/code-probe.txt`:
 
 - `acc_vs_main`: 0.5516 final over 640 tokens (running values 0.53-0.58);

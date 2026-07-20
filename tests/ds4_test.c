@@ -2040,7 +2040,7 @@ static bool test_metal_q4_selected_slots_case(
                 down_expert_bytes, down_row_bytes,
                 IN_DIM, MID_DIM, OUT_DIM,
                 selected, weights, TOTAL_EXPERT, n_expert,
-                0.0f, input, 0));
+                0.0f, input, 0, false));
             ds4_gpu_tensor_free(short_mid);
         }
     }
@@ -2054,7 +2054,7 @@ static bool test_metal_q4_selected_slots_case(
         down_expert_bytes, down_row_bytes,
         IN_DIM, MID_DIM, OUT_DIM,
         selected, weights, TOTAL_EXPERT, n_expert,
-        0.0f, input, 0) != 0;
+        0.0f, input, 0, false) != 0;
     TEST_ASSERT(ok);
     if (!ok) goto cleanup;
 

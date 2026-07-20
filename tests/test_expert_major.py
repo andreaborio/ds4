@@ -42,20 +42,37 @@ def fixture_byte(layer: int, role: int, expert: int, index: int) -> int:
     return (layer * 71 + role * 23 + expert * 7 + index) % 251
 
 
-def write_fixture(path: Path) -> None:
+def write_fixture(path: Path, architecture: str) -> None:
     tool = load_tool()
-    metadata = b"".join((
-        metadata_string("general.architecture", "deepseek4"),
-        metadata_u32("general.alignment", 32),
-        metadata_u32("deepseek4.block_count", 2),
-        metadata_u32("deepseek4.expert_count", 3),
-        metadata_u32("deepseek4.expert_used_count", 2),
-    ))
+    if architecture == "deepseek4":
+        metadata_items = (
+            metadata_string("general.architecture", architecture),
+            metadata_u32("general.alignment", 32),
+            metadata_u32("deepseek4.block_count", 2),
+            metadata_u32("deepseek4.expert_count", 3),
+            metadata_u32("deepseek4.expert_used_count", 2),
+        )
+        routed_layers = (0, 1)
+        types = ((16, 16, 10), (12, 12, 12))
+    elif architecture == "glm-dsa":
+        metadata_items = (
+            metadata_string("general.architecture", architecture),
+            metadata_u32("general.alignment", 32),
+            metadata_u32("glm-dsa.block_count", 5),
+            metadata_u32("glm-dsa.expert_count", 3),
+            metadata_u32("glm-dsa.expert_used_count", 2),
+            metadata_u32("glm-dsa.leading_dense_block_count", 3),
+            metadata_u32("glm-dsa.nextn_predict_layers", 1),
+        )
+        routed_layers = (3, 4)
+        types = ((10, 10, 10), (13, 13, 14))
+    else:
+        raise AssertionError(f"unsupported fixture architecture: {architecture}")
+    metadata = b"".join(metadata_items)
     tensors = [("token_embd.weight", (4,), 0, bytes(range(16)))]
-    types = ((16, 16, 10), (12, 12, 12))
-    for layer in range(2):
+    for layer_slot, layer in enumerate(routed_layers):
         for role, role_name in enumerate(tool.ROLE_NAME):
-            ggml_type = types[layer][role]
+            ggml_type = types[layer_slot][role]
             dims = (256, 256, 3)
             size = tool.tensor_nbytes(ggml_type, dims)
             expert_bytes = size // 3
@@ -79,7 +96,9 @@ def write_fixture(path: Path) -> None:
         directory += struct.pack("<" + "Q" * len(dims), *dims)
         directory += struct.pack("<IQ", ggml_type, relative)
         relative += len(payload)
-    header = b"GGUF" + struct.pack("<IQQ", 3, len(tensors), 5)
+    header = b"GGUF" + struct.pack(
+        "<IQQ", 3, len(tensors), len(metadata_items)
+    )
     data_offset = tool.align_up(len(header) + len(metadata) + len(directory), 32)
     with path.open("wb") as file:
         file.write(header)
@@ -110,12 +129,14 @@ def main() -> int:
     probe = os.environ.get("DS4_EXPERT_STORE_PROBE")
     with tempfile.TemporaryDirectory(prefix="ds4-expert-major-test-") as tmp:
         tmp_path = Path(tmp)
-        source = tmp_path / "source.gguf"
-        native = tmp_path / "native.gguf"
-        write_fixture(source)
+        source = tmp_path / "deepseek-source.gguf"
+        native = tmp_path / "deepseek-native.gguf"
+        write_fixture(source, "deepseek4")
 
         inspected = run("inspect", str(source))
         assert "layers: 2" in inspected.stdout
+        assert "family: 1" in inspected.stdout
+        assert "layer_ids: 0..1" in inspected.stdout
         assert "experts: 3" in inspected.stdout
         assert "IQ2_XXS" in inspected.stdout
         assert "Q4_K" in inspected.stdout
@@ -130,7 +151,8 @@ def main() -> int:
         store = next(t for t in native_gguf.tensors if t.name == tool.STORE_TENSOR)
         if probe:
             subprocess.run([probe, str(native), str(store.abs_offset),
-                            str(store.size)], check=True)
+                            str(store.size),
+                            str(tool.STORE_FAMILY_DEEPSEEK4)], check=True)
 
         bad_manifest = tmp_path / "bad-manifest.gguf"
         shutil.copyfile(native, bad_manifest)
@@ -143,7 +165,7 @@ def main() -> int:
         if probe:
             rejected = subprocess.run(
                 [probe, str(bad_manifest), str(store.abs_offset),
-                 str(store.size)],
+                 str(store.size), str(tool.STORE_FAMILY_DEEPSEEK4)],
                 stdout=subprocess.PIPE, stderr=subprocess.PIPE,
             )
             assert rejected.returncode != 0, "C reader accepted corrupt manifest"
@@ -157,7 +179,7 @@ def main() -> int:
         if probe:
             rejected = subprocess.run(
                 [probe, str(bad_reserved), str(store.abs_offset),
-                 str(store.size)],
+                 str(store.size), str(tool.STORE_FAMILY_DEEPSEEK4)],
                 stdout=subprocess.PIPE, stderr=subprocess.PIPE,
             )
             assert rejected.returncode != 0, "C reader accepted reserved header bits"
@@ -170,6 +192,35 @@ def main() -> int:
             file.seek(-1, os.SEEK_CUR)
             file.write(bytes([original[0] ^ 0x40]))
         run("verify", str(source), str(bad_payload), ok=False)
+
+        glm_source = tmp_path / "glm-source.gguf"
+        glm_native = tmp_path / "glm-native.gguf"
+        write_fixture(glm_source, "glm-dsa")
+        glm_inspected = run("inspect", str(glm_source))
+        assert "architecture: glm-dsa" in glm_inspected.stdout
+        assert "family: 2" in glm_inspected.stdout
+        assert "layers: 2" in glm_inspected.stdout
+        assert "layer_ids: 3..4" in glm_inspected.stdout
+        assert "Q2_K" in glm_inspected.stdout
+        assert "Q5_K" in glm_inspected.stdout
+        assert "Q6_K" in glm_inspected.stdout
+        run("build", "--reserve-bytes", "0", str(glm_source),
+            str(glm_native))
+        run("verify", str(glm_source), str(glm_native))
+        glm_gguf = tool.load_gguf(glm_native)
+        glm_store = next(
+            tensor for tensor in glm_gguf.tensors
+            if tensor.name == tool.STORE_TENSOR
+        )
+        glm_manifest, glm_layers = tool.parse_store(glm_gguf, glm_store)
+        assert glm_manifest["family"] == tool.STORE_FAMILY_GLM_DSA
+        assert [layer.index for layer in glm_layers] == [3, 4]
+        if probe:
+            subprocess.run(
+                [probe, str(glm_native), str(glm_store.abs_offset),
+                 str(glm_store.size), str(tool.STORE_FAMILY_GLM_DSA)],
+                check=True,
+            )
 
     print("expert-major v2 converter and verifier: OK")
     return 0
