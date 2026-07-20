@@ -163,7 +163,7 @@ model-backed promotion gate are in
 M5 Pro SSD tranche is recorded in
 [`docs/benchmarks/2026-07-17-deepseek-native-expert-major.md`](docs/benchmarks/2026-07-17-deepseek-native-expert-major.md).
 The distinctly named v2 artifact is
-[`DeepSeek-V4-Flash-DS4-ExpertMajor-v2-GGUF`](https://huggingface.co/andreaborio/DeepSeek-V4-Flash-DS4-ExpertMajor-v2-GGUF),
+[`DeepSeek-V4-Flash-DS4-GGUF`](https://huggingface.co/andreaborio/DeepSeek-V4-Flash-DS4-GGUF),
 with full conversion provenance and runtime limits in its model card.
 
 ### GLM 5.2 ExpertMajor v2
@@ -182,7 +182,7 @@ make -j8
 ```
 
 The artifact is
-[`andreaborio/GLM-5.2-DS4-ExpertMajor-v2-GGUF`](https://huggingface.co/andreaborio/GLM-5.2-DS4-ExpertMajor-v2-GGUF),
+[`andreaborio/GLM-5.2-DS4-GGUF`](https://huggingface.co/andreaborio/GLM-5.2-DS4-GGUF),
 SHA-256
 `7f5017e3076e706c78f2a5322b035a9e2f6519c65ff5b6be8b2d91aeff61505d`.
 The simple command automatically selects Metal, SSD residency, the GLM Gold
