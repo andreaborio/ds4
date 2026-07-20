@@ -48366,6 +48366,8 @@ static bool ds4_engine_install_expert_store_v2(ds4_engine *e) {
 
     ds4_gpu_expert_store_layer_v2 gpu_layers[DS4_MAX_LAYER];
     memset(gpu_layers, 0, sizeof(gpu_layers));
+    uint64_t logical_offsets[DS4_MAX_LAYER][3];
+    memset(logical_offsets, 0, sizeof(logical_offsets));
     uint64_t first_component_bytes[3] = {0, 0, 0};
     for (uint32_t index = 0; index < manifest->layer_count; index++) {
         const ds4_expert_store_layer *entry =
@@ -48381,11 +48383,16 @@ static bool ds4_engine_install_expert_store_v2(ds4_engine *e) {
             return false;
         }
         const uint32_t layer = entry->layer;
-        const ds4_layer_weights *weights = &e->weights.layer[layer];
+        /* Resolve the canonical identities from the expanded model instead
+         * of the executable weight table. GLM keeps its bundled NextN tail
+         * (layer 78) in the self-contained store, while the current graph
+         * intentionally binds only normal layers 0..77. The tail still needs
+         * a valid store binding so descriptor validation and future NextN
+         * execution do not depend on an intentionally unbound weight slot. */
         const ds4_tensor *tensor[3] = {
-            weights->ffn_gate_exps,
-            weights->ffn_up_exps,
-            weights->ffn_down_exps,
+            tensor_by_namef(&e->model, "blk.%u.ffn_gate_exps.weight", layer),
+            tensor_by_namef(&e->model, "blk.%u.ffn_up_exps.weight", layer),
+            tensor_by_namef(&e->model, "blk.%u.ffn_down_exps.weight", layer),
         };
         if (!tensor[0] || !tensor[1] || !tensor[2]) {
             fprintf(stderr,
@@ -48419,6 +48426,7 @@ static bool ds4_engine_install_expert_store_v2(ds4_engine *e) {
                 component->record_offset;
             gpu_layers[index].component_bytes[role] =
                 component->expert_bytes;
+            logical_offsets[index][role] = tensor[role]->abs_offset;
             if (index == 0) {
                 first_component_bytes[role] = component->expert_bytes;
             } else if (e->ssd_streaming &&
@@ -48454,12 +48462,11 @@ static bool ds4_engine_install_expert_store_v2(ds4_engine *e) {
             return false;
         }
         const uint32_t layer = entry->layer;
-        const ds4_layer_weights *weights = &e->weights.layer[layer];
         if (!ds4_gpu_expert_store_v2_bind_layer(
                 layer, e->model.size,
-                weights->ffn_gate_exps->abs_offset,
-                weights->ffn_up_exps->abs_offset,
-                weights->ffn_down_exps->abs_offset)) {
+                logical_offsets[index][0],
+                logical_offsets[index][1],
+                logical_offsets[index][2])) {
             fprintf(stderr,
                     "ds4: Metal rejected native expert-store binding for layer %u\n",
                     layer);
