@@ -105,8 +105,8 @@ decode. The final command after compatibility cleanup measured 1.79 t/s. A
 prior rested-storage qualification of the same ExpertMajor runtime had a 1.90
 t/s median. A same-condition comparison after repeated I/O measured 1.75 t/s
 on the old qualified commit and 1.74 t/s on the new port, showing runtime
-parity rather than a new decode regression. The final refactor candidate then
-measured 11.82 t/s prefill and 1.83 t/s decode after a clean `make premerge`,
+parity rather than a new decode regression. The clean refactor candidate then
+measured 11.89 t/s prefill and 1.84 t/s decode after `make premerge`,
 with the exact deterministic output and unchanged swap, requalifying the
 tracked 1.82 decode lane.
 

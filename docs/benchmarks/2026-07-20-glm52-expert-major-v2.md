@@ -108,9 +108,9 @@ collapsed by 42% between its two arms, that sequence demonstrates host-state
 contamination rather than a code delta. A later rested candidate measured
 10.54/1.75 and still did not pass the performance gate. After the final dead
 sidecar/distributed cleanup, a clean `make premerge`, and another cooldown, the
-actual merge candidate measured **11.82 t/s prefill and 1.83 t/s decode**. It
-used binary SHA-256
-`d2eb963f3fc117b5da723a483fdd12ec6106c3f1dd2bd767bb463e4b336f092e`,
+actual merge candidate measured **11.89 t/s prefill and 1.84 t/s decode**. It
+used clean-commit binary SHA-256
+`6c8eea9b3605dfe51f4db2a782ac236f139a87fc9776f6c4da3f3fb4127f0033`,
 produced the same exact output SHA-256, and left swap unchanged. This final
 observation requalifies the 1.82 lane.
 

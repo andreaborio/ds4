@@ -29,20 +29,20 @@ the large files were not rehashed during every speed run:
 
 ## Tested tree and commands
 
-The working tree is intentionally uncommitted during this gate. The final
-candidate was built by the last successful `make premerge`; no C, header,
-Metal, implementation-include, or Makefile input is newer than the binaries.
-The pre-report tracked diff SHA-256 recorded by the DeepSeek runner was
-`929ebbbe147fea084f51b64c2561c3878053224857a141b61c8f82f0c1763367`.
+The runtime candidate is clean commit
+`391987292b0be31d34def8a10d62d20dd8f2920f`. It was rebuilt by a successful
+`make premerge`; no C, header, Metal, implementation-include, or Makefile input
+is newer than the binaries. The DeepSeek runner recorded an empty tracked diff
+SHA-256, `e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855`.
 The model-tested Metal binaries are:
 
 | Binary | SHA-256 |
 | --- | --- |
-| `ds4`, GLM run | `d2eb963f3fc117b5da723a483fdd12ec6106c3f1dd2bd767bb463e4b336f092e` |
-| `ds4-bench`, Qwen and DeepSeek runs | `3bd4fb85117b676340d6130d89261c47c78cf242dd6390fc306cda90703e983f` |
+| `ds4`, GLM run | `6c8eea9b3605dfe51f4db2a782ac236f139a87fc9776f6c4da3f3fb4127f0033` |
+| `ds4-bench`, Qwen and DeepSeek runs | `fa9da053d2203244d9e5c5820b09bcf7684bfa6187958888c89fe63816c4635c` |
 
-Documentation-only corrections after the runs change the repository diff
-digest but not either tested binary. With `QWEN_V2`, `DEEPSEEK_V2`, and
+This evidence update is documentation-only and does not change either tested
+binary. With `QWEN_V2`, `DEEPSEEK_V2`, and
 `GLM_V2` resolved to the artifact identities above, the model commands were:
 
 ```sh
@@ -64,15 +64,15 @@ DS4_M5_MODEL="$DEEPSEEK_V2" DS4_M5_PREFIX="$DEEPSEEK_PREFIX" \
 
 | Family and lane | Prefill | Decode | Correctness and memory | Gate |
 | --- | ---: | ---: | --- | --- |
-| Qwen resident, exact 2,048+16 lane | **315.93 t/s** | **29.48 t/s** | Decode-evidence SHA-256 `399504c6ce3d4531ee0f2207702e96e2324c9b5c8dbf98adf47dfb9e64cae54d`; swap unchanged | Pass: decode is -0.20% and prefill -0.95% against the first 318.96/29.54 v2 reference arm |
-| DeepSeek AUTO, 128+256 cold | 20.13 t/s | 13.03 t/s | 4,387 records / 28.92 GiB; exact frontier-logit SHA-256 `71fd3be0732e0fe97b9f104112911dc937896257c604c64eae851e36fa142441`; zero swapout | Cold file-cache observation |
-| DeepSeek AUTO, immediate warm repeat | **23.22 t/s** | **13.91 t/s** | Same artifact, policy, evidence and binary; page-ins fell from 5,168,431 to 4,399,996 pages; zero swapout | Pass: above the earlier current/base/current cohort and -1.97% from the isolated 14.19 single-run peak |
-| GLM AUTO, exact 288+32 lane | **11.82 t/s** | **1.83 t/s** | Exact output SHA-256 `2803fda8b47acff3aedd24bd7609b0c649602ca1fa6d908368b57fe2a586a5c2`; 601-record / 6.93 GiB cache; 50.50 GiB reclaimable; swap unchanged | Pass: decode is above the 1.82 reference |
+| Qwen resident, exact 2,048+16 lane | **316.36 t/s** | **29.09 t/s** | Decode-evidence SHA-256 `399504c6ce3d4531ee0f2207702e96e2324c9b5c8dbf98adf47dfb9e64cae54d`; swap unchanged | Pass: decode is -1.52% and prefill -0.82% against the first 318.96/29.54 v2 reference arm |
+| DeepSeek AUTO, 128+256 cold | 20.93 t/s | 13.20 t/s | 4,387 records / 28.92 GiB; exact frontier-logit SHA-256 `71fd3be0732e0fe97b9f104112911dc937896257c604c64eae851e36fa142441`; zero swapout | Cold file-cache observation |
+| DeepSeek AUTO, immediate warm repeat | **23.78 t/s** | **13.95 t/s** | Same artifact, policy, evidence and binary; page-ins fell from 5,168,057 to 4,407,429 pages; zero swapout | Pass: above the earlier current/base/current cohort and -1.69% from the isolated 14.19 single-run peak |
+| GLM AUTO, exact 288+32 lane | **11.89 t/s** | **1.84 t/s** | Exact output SHA-256 `2803fda8b47acff3aedd24bd7609b0c649602ca1fa6d908368b57fe2a586a5c2`; 601-record / 6.93 GiB cache; 50.38 GiB reclaimable; swap unchanged | Pass: decode is above the 1.82 reference |
 
 The final candidate therefore preserves byte-identical evidence for all three
 families and requalifies every tracked performance lane. DeepSeek's 14.19 t/s
 value remains a single best observation rather than a same-condition median;
-the final 13.91 t/s result is compared primarily with the interleaved cohort
+the final 13.95 t/s result is compared primarily with the interleaved cohort
 below.
 
 ### Same-condition base comparison
@@ -86,14 +86,14 @@ for `ds4`.
 DeepSeek was interleaved current/base/current without changing the artifact,
 prompt, 4,387-record AUTO target, or evidence. Decode measured 13.41, 13.64,
 and 13.22 t/s; all three emitted the same frontier-logit SHA-256 and zero
-swapout. The final 13.91 warm result is above all three interleaved observations
+swapout. The final 13.95 warm result is above all three interleaved observations
 and passes the bounded regression gate while keeping exact evidence and zero
 swapout.
 
 The GLM base/current/base sequence measured 1.82, 1.28, and 1.06 t/s. All three
 produced byte-identical output and unchanged swap. The severe monotonic collapse
 across both binaries proves that this sequence became host-state contaminated;
-it cannot attribute the slower second arm to the refactor. The final 1.83 t/s
+it cannot attribute the slower second arm to the refactor. The final 1.84 t/s
 candidate result above supplies the required rested current-binary gate.
 
 ## Structural QA
@@ -156,10 +156,10 @@ published lanes; DeepSeek's warm result is within 2% of its isolated peak and
 above the prior same-condition interleaved cohort, with exact logits and zero
 swapout.
 
-This report removes the previous performance blocker to merge. It does not by
-itself authorize publication: the remaining manual release checks named above
-must still pass, and the committed tree must be rebuilt once to record clean
-non-`dirty` artifact hashes before binaries or model cards are published.
+This report removes the previous performance blocker to merge and records clean
+non-`dirty` artifact hashes. It does not by itself authorize publication: the
+remaining manual release checks named above must still pass before binaries or
+model cards are published.
 
 Related evidence:
 

@@ -266,8 +266,8 @@ each model uses a different artifact, context, and runtime path.
 | DeepSeek V4 Flash IQ2XXS, 86.72 GB | M5 Pro 64 GB, Metal SSD streaming, AUTO 4,387 records | **25.21 t/s** | **14.19 t/s** | Final post-isolation AUTO gate; exact frontier logits, zero swapout |
 | GLM 5.2 ExpertMajor v2 Q2_K, 244.14 GiB | M5 Pro 64 GB, rested internal storage, 288+32 tokens | **11.08 t/s** | **1.90 t/s** | Prior qualified median; current main port restores same-condition parity, final simple AUTO-601 gates measured 10.63-10.91/1.77-1.79 t/s, and the best profiled decode was 1.81 t/s |
 
-The final agent-friendly refactor candidate requalified GLM at 11.82 t/s
-prefill and 1.83 t/s decode after `make premerge`, with byte-identical output
+The clean agent-friendly refactor candidate requalified GLM at 11.89 t/s
+prefill and 1.84 t/s decode after `make premerge`, with byte-identical output
 and unchanged swap. Earlier 1.67-1.77 t/s observations remain in the validation
 record as host/file-cache history rather than release blockers; see the
 [`2026-07-20 validation record`](docs/benchmarks/2026-07-20-agent-friendly-refactor-validation.md).
