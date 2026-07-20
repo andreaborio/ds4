@@ -27,7 +27,12 @@ STORE_TENSOR = "ds4.expert_major.v2"
 STORE_VERSION = 2
 STORE_FAMILY_DEEPSEEK4 = 1
 STORE_FAMILY_GLM_DSA = 2
-STORE_FAMILIES = {STORE_FAMILY_DEEPSEEK4, STORE_FAMILY_GLM_DSA}
+STORE_FAMILY_QWEN35_MOE = 3
+STORE_FAMILIES = {
+    STORE_FAMILY_DEEPSEEK4,
+    STORE_FAMILY_GLM_DSA,
+    STORE_FAMILY_QWEN35_MOE,
+}
 STORE_MAX_ROUTED_LAYERS = 79
 STORE_MAX_MODEL_LAYER = 127
 STORE_HEADER_BYTES = 256
@@ -265,6 +270,8 @@ def load_gguf(path: Path) -> GGUF:
             "glm-dsa.expert_used_count",
             "glm-dsa.leading_dense_block_count",
             "glm-dsa.nextn_predict_layers",
+            "qwen35moe.block_count", "qwen35moe.expert_count",
+            "qwen35moe.expert_used_count",
         }
         for _ in range(n_kv):
             key = gguf_string(file)
@@ -343,9 +350,19 @@ def make_store_plan(source: GGUF) -> StorePlan:
             # store even when the current decode graph stops before it.
             expected_layers = set(range(leading_dense, model_layer_count))
             family_name = "GLM"
+        elif architecture == "qwen35moe":
+            family = STORE_FAMILY_QWEN35_MOE
+            model_layer_count = int(source.metadata["qwen35moe.block_count"])
+            expert_count = int(source.metadata["qwen35moe.expert_count"])
+            expert_used_count = int(
+                source.metadata["qwen35moe.expert_used_count"]
+            )
+            expected_layers = set(range(model_layer_count))
+            family_name = "Qwen"
         else:
             raise FormatError(
-                "expert-major v2 accepts deepseek4 and glm-dsa GGUFs only"
+                "expert-major v2 accepts deepseek4, glm-dsa, and "
+                "qwen35moe GGUFs only"
             )
     except (KeyError, TypeError, ValueError) as exc:
         raise FormatError(
@@ -725,7 +742,8 @@ def parse_store(native: GGUF, tensor: Tensor) -> tuple[dict[str, object], list[L
             record_cursor += expert_bytes
         if (layer_index <= previous_layer_index or
                 layer_index > STORE_MAX_MODEL_LAYER or
-                (family == STORE_FAMILY_DEEPSEEK4 and layer_index != il) or
+                (family in (STORE_FAMILY_DEEPSEEK4,
+                            STORE_FAMILY_QWEN35_MOE) and layer_index != il) or
                 entry_experts != expert_count or
                 record_bytes != record_cursor or layer_size != record_bytes * expert_count or
                 layer_offset < previous_end or layer_offset % STORE_ALIGNMENT or

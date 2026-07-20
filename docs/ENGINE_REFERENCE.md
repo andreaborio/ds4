@@ -6,6 +6,14 @@
 > [fork landing page](../README.md) for current fork scope, measured deltas,
 > model maturity, safety caveats, and the upstream co-development policy.
 
+> [!IMPORTANT]
+> The current inference contract for DeepSeek V4, GLM 5.2, and
+> Qwen3.6-35B-A3B is a validated embedded `ds4.expert_major.v2` GGUF on Apple
+> Metal. Canonical GGUFs are offline converter inputs only. ExpertMajor v1,
+> external sidecars, CPU, CUDA, ROCm, and distributed inference are not runtime
+> fallbacks. Historical benchmark and architecture sections below may describe
+> those retired paths, but they are not current startup instructions.
+
 ## Motivations
 
 * Very capable open weight models finally exist. DeepSeek v4 Flash feels quasi-frontier. The PRO is even better. Both resist 2 bit quantization very well.
@@ -71,17 +79,22 @@ next sections.
 
 ## Model Weights
 
-This implementation only works with the DeepSeek V4 Flash and PRO GGUFs published for
-this project. It is not a general GGUF loader, and arbitrary DeepSeek/GGUF files
-will not have the tensor layout, quantization mix, metadata, or optional MTP
-state expected by the engine. The 2 bit quantizations provided here are not
+This implementation only works with the ExpertMajor v2 GGUFs published for
+this project. It is not a general GGUF loader, and arbitrary Qwen, DeepSeek,
+GLM, or community GGUF files will not have the validated embedded store,
+tensor layout, quantization mix, or metadata expected by the engine. The 2 bit
+DeepSeek quantizations provided here are not
 a joke: they behave well, work under coding agents, call tools in a reliable way.
 The 2 bit quants use a very asymmetrical quantization: only the routed MoE
 experts are quantized, up/gate at `IQ2_XXS`, down at `Q2_K`. They are the
 majority of all the model space: the other components (shared experts,
 projections, routing) are left untouched to guarantee quality.
 
-Download one main model. **Prefer the imatrix versions.**
+Download one qualified ExpertMajor v2 release artifact. For DeepSeek,
+**prefer the imatrix versions**. The existing `download_model.sh` canonical and
+split targets are retained as offline source or historical tooling; their
+outputs must be converted and verified with
+`gguf-tools/ds4-expert-major.py` before inference.
 
 ```sh
 ./download_model.sh q2-imatrix   # 96/128 GB RAM machines, imatrix-tuned q2
@@ -97,9 +110,11 @@ For the full PRO Q4 distributed run, download one half on each machine:
 ./download_model.sh pro-q4-layers31-output  # second half of PRO Q4 split
 ```
 
-The script downloads from `https://huggingface.co/antirez/deepseek-v4-gguf`,
-stores files under `./gguf/`, resumes partial downloads with `curl -C -`, and
-updates `./ds4flash.gguf` to point at the selected main model.
+The script downloads canonical sources from
+`https://huggingface.co/antirez/deepseek-v4-gguf`, stores files under `./gguf/`,
+resumes partial downloads with `curl -C -`, and updates `./ds4flash.gguf` to
+point at the selected source. That symlink is not inference-ready until it
+points at a verified ExpertMajor v2 artifact.
 The `pro-q4-layers00-30`, `pro-q4-layers31-output`, and `pro-q4-split` targets
 download distributed PRO Q4 pieces and do not update `./ds4flash.gguf`.
 Authentication is optional for public downloads, but `--token TOKEN`,
@@ -132,9 +147,10 @@ On macOS, Metal and CPU objects/binaries live in separate build profiles.
 `build/cpu-$(uname -m)/bin/ds4` for the CPU-only binary and `./ds4 --build-info`
 to verify build provenance.
 
-`./ds4flash.gguf` is the default model path used by the runtime commands. Pass `-m` to
-select another supported GGUF from `./gguf/`. Run `./ds4 --help` and
-`./ds4-server --help` for the full flag list.
+`./ds4flash.gguf` is the default model path used by runtime commands only when
+it points at a qualified ExpertMajor v2 artifact. Pass `-m` to select another
+supported v2 GGUF. Run `./ds4 --help` and `./ds4-server --help` for the full
+flag list.
 
 ## Speed
 
@@ -187,15 +203,15 @@ Use `--ssd-streaming` to force streaming, or `--resident` to request the
 full-model mapped mode. Startup logs report the resolved mode and the
 memory-plan reason.
 
-The experimental `qwen35moe` branch narrows this contract to one normalized
-Qwen3.6-35B-A3B Q4_K_S layout.  `DS4_QWEN_EXPERIMENTAL_METAL=1` enables a Metal
-AUTO mode that first attempts a complete mapped-tensor path.  It requires both
-the normal working-set calculation and a live unified-memory pressure snapshot;
-if either cannot admit that mode, AUTO uses bounded SSD streaming.  Qwen's cache
+The supported `qwen35moe` contract is the normalized
+Qwen3.6-35B-A3B ExpertMajor v2 Q4_K_S artifact. It activates automatically and
+first attempts the complete mapped-tensor Metal path. AUTO requires both the
+normal working-set calculation and a live unified-memory pressure snapshot; if
+either cannot admit resident mode, it uses bounded SSD streaming. Qwen's cache
 planner charges its complete non-routed page set separately and grows cache
-storage in 321-expert (about 0.529 GiB) slabs.  The generic DeepSeek planner and
-4 GiB slab default are unchanged.  Exact artifact and validation details live
-in [`tests/qwen/README.md`](../tests/qwen/README.md).
+storage in 321-expert (about 0.529 GiB) slabs. The DeepSeek and GLM planners
+remain independent. Exact artifact and validation details live in
+[`qwen-expert-major-store.md`](qwen-expert-major-store.md).
 
 Qwen numerical inference is currently Metal-only.  The CPU performs tokenizer,
 sampling, selected-route readback, cache bookkeeping, and GGUF I/O in streamed
@@ -311,6 +327,12 @@ not sustained DSBox throughput; the repeatable short-server observation before
 pressure was about 0.5 t/s.
 
 ## Distributed Inference
+
+> [!CAUTION]
+> This section records the historical canonical/split DeepSeek implementation
+> and its measurements. The current Qwen, DeepSeek, and GLM runtime rejects
+> distributed inference: ExpertMajor v2 is presently qualified only for local
+> Apple Metal. Do not use the commands below as current startup instructions.
 
 Distributed inference lets DwarfStar **run a model that is too large for one machine** by
 splitting transformer layers across multiple machines. The main example is the
@@ -1224,11 +1246,13 @@ the kv cache files include the verbatim prompt cached.
 
 ## Backends
 
-The default graph backend is Metal on macOS and CUDA in CUDA builds:
+The source tree still provides CPU, CUDA, and ROCm build profiles for compile,
+kernel, and backend-development checks. They are not inference backends for the
+current Qwen, DeepSeek, or GLM ExpertMajor v2 artifacts. Production inference
+for those families is local Apple Metal:
 
 ```sh
-./ds4 -p "Hello" --metal
-./ds4 -p "Hello" --cuda
+./ds4 -m /absolute/path/to/MODEL-DS4-ExpertMajor-v2.gguf -p "Hello"
 ```
 
 On Linux, plain `make` prints the available build targets instead of selecting a
@@ -1242,19 +1266,16 @@ make cuda CUDA_ARCH=sm_120
 make cuda CUDA_ARCH=native
 ```
 
-There is also a CPU reference/debug path:
+CPU remains useful for build and model-free diagnostics:
 
 ```sh
-./ds4 -p "Hello" --cpu
 make cpu
-build/cpu-$(uname -m)/bin/ds4 -p "Hello"  # macOS CPU-only build
 ./ds4 --build-info                        # root command remains Metal
 ```
 
-Do not treat the CPU path as the production target. The CLI and `ds4-server`
-support the CPU backend for reference/debug use and share the same KV session
-and snapshot format as Metal and CUDA, but normal inference should use Metal or
-CUDA.
+Do not treat a successful non-Metal build as model admission. ExpertMajor v2
+inference fails closed on CPU, CUDA, and ROCm; there is no canonical, v1, or
+sidecar fallback.
 
 ## Steering
 

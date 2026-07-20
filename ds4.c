@@ -44,8 +44,6 @@
 #include "ds4_expert_store.h"
 #include "ds4_profile.h"
 #include "ds4_qwen.h"
-#include "ds4_qwen_expert_pack.h"
-#include "ds4_qwen_native_gguf.h"
 #include "ds4_qwen_unicode.h"
 
 #ifndef DS4_NO_GPU
@@ -1750,9 +1748,6 @@ typedef struct {
     bool native_expert_store_v2;
     uint64_t native_expert_store_offset;
     uint64_t native_expert_store_bytes;
-    bool qwen_native_expert_major;
-    uint64_t qwen_native_pack_offset;
-    uint64_t qwen_native_pack_bytes;
     char *owned_tensor_names;
 
     ds4_kv *kv;
@@ -2135,161 +2130,197 @@ static bool canonical_routed_name(
     return false;
 }
 
-/* Convert the physical DS4-native inventory into the canonical logical view
- * expected by every existing Qwen validator and graph call-site. The virtual
- * component ranges partition the embedded payload byte-for-byte, but they are
- * identity keys only: once this flag is set, Metal must install the embedded
- * store before any expert access can occur. */
-static void model_expand_qwen35_native_expert_store(ds4_model *m) {
+/* Expand an embedded Qwen ExpertMajor v2 store into the canonical logical
+ * tensor inventory consumed by the existing validator and graph. The three
+ * logical component ranges are identity keys only: Metal translates them to
+ * the interleaved per-expert records described by the validated manifest. */
+static void model_expand_qwen35_expert_store_v2(ds4_model *m) {
     if (!m || m->family != DS4_MODEL_FAMILY_QWEN35_MOE ||
         !m->tensors || m->n_tensors == 0) {
         return;
     }
-    ds4_tensor *store = NULL;
+
+    ds4_tensor *store_tensor = NULL;
     uint32_t store_count = 0;
-    uint32_t canonical_routed = 0;
+    uint32_t canonical_count = 0;
     for (uint64_t i = 0; i < m->n_tensors; i++) {
         ds4_tensor *tensor = &m->tensors[i];
-        if (ds4_streq(tensor->name, DS4_QWEN_NATIVE_EXPERT_TENSOR)) {
-            store = tensor;
+        if (ds4_streq(tensor->name, DS4_EXPERT_STORE_V2_TENSOR)) {
+            store_tensor = tensor;
             store_count++;
         }
         if (canonical_routed_name(tensor->name, NULL, NULL)) {
-            canonical_routed++;
+            canonical_count++;
         }
     }
     if (store_count == 0) return;
-
-    const uint64_t synthetic_count = (uint64_t)QWEN35_N_LAYER * 3u;
-    const uint64_t expected_physical =
-        QWEN35_N_TENSOR - synthetic_count + 1u;
-    if (store_count != 1 || canonical_routed != 0 ||
-        m->n_tensors != expected_physical || !store ||
-        store->ndim != 1 || store->type != 24 ||
-        store->dim[0] != store->bytes || store->bytes == 0) {
-        ds4_die("malformed DS4-native Qwen expert-major tensor inventory");
+    if (store_count != 1 || canonical_count != 0 || !store_tensor ||
+        store_tensor->ndim != 1 || store_tensor->type != DS4_TENSOR_I8 ||
+        store_tensor->dim[0] != store_tensor->bytes ||
+        store_tensor->bytes == 0) {
+        ds4_die("malformed DS4-native Qwen expert-major v2 tensor inventory");
     }
 
-    const ds4_qwen_expert_pack_geometry geometry =
-        ds4_qwen35_expert_pack_geometry();
-    ds4_qwen_expert_pack *pack = NULL;
+    ds4_expert_store *store = NULL;
     char error[256] = {0};
-    if (ds4_qwen_expert_pack_open_embedded(
-            &pack, m->fd, store->abs_offset, store->bytes,
-            &geometry, error,
-            sizeof(error)) != DS4_QWEN_EXPERT_PACK_OK) {
-        fprintf(stderr,
-                "ds4: DS4-native Qwen expert store is invalid: %s\n",
+    if (!ds4_expert_store_open_embedded(
+            &store, m->fd, store_tensor->abs_offset, store_tensor->bytes,
+            DS4_EXPERT_STORE_FAMILY_QWEN35_MOE, error, sizeof(error))) {
+        fprintf(stderr, "ds4: DS4-native Qwen expert store is invalid: %s\n",
                 error[0] ? error : "format or geometry mismatch");
         exit(1);
     }
-    const ds4_qwen_expert_pack_manifest *manifest =
-        ds4_qwen_expert_pack_manifest_get(pack);
-    if (!manifest || manifest->geometry.gguf_tensor_count != QWEN35_N_TENSOR) {
-        ds4_qwen_expert_pack_close(pack);
-        ds4_die("DS4-native Qwen store belongs to an incompatible GGUF inventory");
+
+    const ds4_expert_store_manifest *manifest =
+        ds4_expert_store_manifest_get(store);
+    uint32_t metadata_layers = 0;
+    uint32_t metadata_experts = 0;
+    uint32_t metadata_experts_used = 0;
+    const uint64_t routed_count = manifest ?
+        (uint64_t)manifest->layer_count * 3u : 0;
+    const uint64_t expected_physical = manifest &&
+        manifest->source_tensor_count >= routed_count ?
+        manifest->source_tensor_count - routed_count + 1u : 0;
+    if (!manifest ||
+        !model_get_u32(m, "qwen35moe.block_count", &metadata_layers) ||
+        !model_get_u32(m, "qwen35moe.expert_count", &metadata_experts) ||
+        !model_get_u32(m, "qwen35moe.expert_used_count",
+                       &metadata_experts_used) ||
+        manifest->layer_count != metadata_layers ||
+        manifest->expert_count != metadata_experts ||
+        manifest->expert_used_count != metadata_experts_used ||
+        m->n_tensors != expected_physical) {
+        ds4_expert_store_close(store);
+        ds4_die("DS4-native Qwen store does not match GGUF metadata or tensor inventory");
+    }
+    for (uint32_t index = 0; index < manifest->layer_count; index++) {
+        const ds4_expert_store_layer *entry =
+            ds4_expert_store_layer_at(store, index);
+        if (!entry || entry->layer != index) {
+            ds4_expert_store_close(store);
+            ds4_die("DS4-native Qwen routed layer inventory is incomplete");
+        }
     }
 
-    const uint64_t old_count = m->n_tensors;
-    ds4_tensor *logical = calloc(QWEN35_N_TENSOR, sizeof(logical[0]));
+    ds4_tensor *logical = calloc(
+        (size_t)manifest->source_tensor_count, sizeof(logical[0]));
     const size_t name_stride = 64;
-    char *names = calloc((size_t)synthetic_count, name_stride);
+    char *names = calloc((size_t)routed_count, name_stride);
     if (!logical || !names) {
         free(logical);
         free(names);
-        ds4_qwen_expert_pack_close(pack);
-        ds4_die("out of memory while expanding DS4-native Qwen tensors");
+        ds4_expert_store_close(store);
+        ds4_die("out of memory expanding DS4-native Qwen tensors");
     }
     uint64_t logical_count = 0;
-    for (uint64_t i = 0; i < old_count; i++) {
-        if (&m->tensors[i] == store) continue;
+    for (uint64_t i = 0; i < m->n_tensors; i++) {
+        if (&m->tensors[i] == store_tensor) continue;
         logical[logical_count++] = m->tensors[i];
     }
-    if (logical_count + synthetic_count != QWEN35_N_TENSOR) {
+    if (logical_count + routed_count != manifest->source_tensor_count) {
         free(logical);
         free(names);
-        ds4_qwen_expert_pack_close(pack);
+        ds4_expert_store_close(store);
         ds4_die("DS4-native Qwen logical tensor count mismatch");
     }
 
-    uint64_t virtual_offset =
-        store->abs_offset + manifest->data_offset;
-    uint64_t expected_end = virtual_offset + manifest->data_size;
-    if (virtual_offset < store->abs_offset ||
-        expected_end < virtual_offset ||
-        expected_end > store->abs_offset + store->bytes ||
-        store->abs_offset + store->bytes < store->abs_offset) {
+    const uint64_t store_end = store_tensor->abs_offset + store_tensor->bytes;
+    if (store_end < store_tensor->abs_offset) {
         free(logical);
         free(names);
-        ds4_qwen_expert_pack_close(pack);
-        ds4_die("DS4-native Qwen payload range overflows");
+        ds4_expert_store_close(store);
+        ds4_die("DS4-native Qwen expert-store range overflows");
     }
-    for (uint32_t layer = 0; layer < QWEN35_N_LAYER; layer++) {
-        const uint64_t matrix_bytes[3] = {
-            manifest->gate_bytes * QWEN35_N_EXPERT,
-            manifest->up_bytes * QWEN35_N_EXPERT,
-            manifest->down_bytes * QWEN35_N_EXPERT,
-        };
-        const uint64_t dims[3][3] = {
-            {QWEN35_N_EMBD, QWEN35_N_FF_EXP, QWEN35_N_EXPERT},
-            {QWEN35_N_EMBD, QWEN35_N_FF_EXP, QWEN35_N_EXPERT},
-            {QWEN35_N_FF_EXP, QWEN35_N_EMBD, QWEN35_N_EXPERT},
-        };
-        const char *kind_name[3] = {
-            "ffn_gate_exps", "ffn_up_exps", "ffn_down_exps",
-        };
-        for (uint32_t kind = 0; kind < 3; kind++) {
-            const uint64_t synthetic_index = (uint64_t)layer * 3 + kind;
+    const char *role_name[3] = {
+        "ffn_gate_exps", "ffn_up_exps", "ffn_down_exps",
+    };
+    for (uint32_t index = 0; index < manifest->layer_count; index++) {
+        const ds4_expert_store_layer *entry =
+            ds4_expert_store_layer_at(store, index);
+        if (!entry || entry->data_offset > store_tensor->bytes ||
+            store_tensor->abs_offset > UINT64_MAX - entry->data_offset) {
+            free(logical);
+            free(names);
+            ds4_expert_store_close(store);
+            ds4_die("DS4-native Qwen physical layer range overflows");
+        }
+        uint64_t virtual_offset =
+            store_tensor->abs_offset + entry->data_offset;
+        for (uint32_t role = 0; role < 3; role++) {
+            const ds4_expert_store_component *component =
+                &entry->component[role];
+            const uint64_t synthetic_index = (uint64_t)index * 3u + role;
             char *name = names + synthetic_index * name_stride;
             const int count = snprintf(
-                name, name_stride, "blk.%u.%s.weight",
-                layer, kind_name[kind]);
+                name, name_stride, "blk.%u.%s.weight", entry->layer,
+                role_name[role]);
             if (count <= 0 || (size_t)count >= name_stride ||
-                virtual_offset < m->tensor_data_pos ||
-                matrix_bytes[kind] > expected_end - virtual_offset) {
+                component->expert_bytes >
+                    UINT64_MAX / manifest->expert_count) {
                 free(logical);
                 free(names);
-                ds4_qwen_expert_pack_close(pack);
-                ds4_die("DS4-native Qwen virtual tensor geometry is invalid");
+                ds4_expert_store_close(store);
+                ds4_die("DS4-native Qwen virtual tensor geometry overflows");
+            }
+            const uint64_t matrix_bytes =
+                component->expert_bytes * manifest->expert_count;
+            if (virtual_offset < m->tensor_data_pos ||
+                virtual_offset > store_end ||
+                matrix_bytes > store_end - virtual_offset) {
+                free(logical);
+                free(names);
+                ds4_expert_store_close(store);
+                ds4_die("DS4-native Qwen virtual tensor range exceeds its store");
             }
             ds4_tensor *tensor = &logical[logical_count++];
             *tensor = (ds4_tensor){
                 .name = {.ptr = name, .len = (uint64_t)count},
                 .ndim = 3,
-                .dim = {dims[kind][0], dims[kind][1], dims[kind][2]},
-                .type = DS4_TENSOR_Q4_K,
+                .dim = {
+                    component->dim[0], component->dim[1], component->dim[2],
+                },
+                .type = component->ggml_type,
                 .rel_offset = virtual_offset - m->tensor_data_pos,
                 .abs_offset = virtual_offset,
-                .elements = dims[kind][0] * dims[kind][1] * dims[kind][2],
-                .bytes = matrix_bytes[kind],
+                .elements = component->dim[0] * component->dim[1] *
+                            component->dim[2],
+                .bytes = matrix_bytes,
             };
-            virtual_offset += matrix_bytes[kind];
+            virtual_offset += matrix_bytes;
+        }
+        if (virtual_offset != store_tensor->abs_offset + entry->data_offset +
+                                  entry->data_size) {
+            free(logical);
+            free(names);
+            ds4_expert_store_close(store);
+            ds4_die("DS4-native Qwen logical layer does not cover its physical record extent");
         }
     }
-    if (logical_count != QWEN35_N_TENSOR || virtual_offset != expected_end) {
+    if (logical_count != manifest->source_tensor_count) {
         free(logical);
         free(names);
-        ds4_qwen_expert_pack_close(pack);
-        ds4_die("DS4-native Qwen virtual ranges do not cover the payload");
+        ds4_expert_store_close(store);
+        ds4_die("DS4-native Qwen logical inventory is incomplete");
     }
 
-    const uint64_t store_offset = store->abs_offset;
-    const uint64_t store_bytes = store->bytes;
+    const uint64_t physical_count = m->n_tensors;
+    const uint64_t physical_offset = store_tensor->abs_offset;
+    const uint64_t physical_bytes = store_tensor->bytes;
     free(m->tensors);
     m->tensors = logical;
     m->owned_tensor_names = names;
-    m->gguf_n_tensors = old_count;
-    m->n_tensors = QWEN35_N_TENSOR;
-    m->qwen_native_expert_major = true;
-    m->qwen_native_pack_offset = store_offset;
-    m->qwen_native_pack_bytes = store_bytes;
+    m->gguf_n_tensors = physical_count;
+    m->n_tensors = manifest->source_tensor_count;
+    m->native_expert_store_v2 = true;
+    m->native_expert_store_offset = physical_offset;
+    m->native_expert_store_bytes = physical_bytes;
     m->max_tensor_bytes = 0;
     for (uint64_t i = 0; i < m->n_tensors; i++) {
         if (m->tensors[i].bytes > m->max_tensor_bytes) {
             m->max_tensor_bytes = m->tensors[i].bytes;
         }
     }
-    ds4_qwen_expert_pack_close(pack);
+    ds4_expert_store_close(store);
 }
 
 /* Expand the embedded GLM expert-major store into the canonical logical
@@ -2714,7 +2745,7 @@ static void model_open(ds4_model *m, const char *path, bool metal_mapping,
     parse_tensors(m, &c);
     model_expand_glm_native_expert_store(m);
     model_expand_deepseek4_native_expert_store(m);
-    model_expand_qwen35_native_expert_store(m);
+    model_expand_qwen35_expert_store_v2(m);
 
     if (!metal_mapping && prefetch_cpu &&
         m->family == DS4_MODEL_FAMILY_DEEPSEEK4) {
@@ -14979,15 +15010,15 @@ typedef struct {
 #define DS4_GPU_GLM_COMPACT_CACHE_F16 DS4_GPU_ATTN_COMP_CACHE_F16
 
 /* =========================================================================
- * Qwen3.6 Metal Graph State (experimental SSD runtime).
+ * Qwen3.6 Metal Graph State.
  * =========================================================================
  *
  * Qwen does not share DeepSeek's HC, compressed-cache, or MTP graph geometry.
  * Keep its persistent state and one-token scratch in a separate private graph
  * so bringing up the executor cannot silently inherit those assumptions.  The
- * The engine/session path constructs this graph only behind the exact
- * DS4_QWEN_EXPERIMENTAL_METAL=1 validation gate; model-free tests separately
- * exercise its shape, initialization, and lifetime.
+ * The engine/session path constructs this graph only for a validated embedded
+ * ExpertMajor v2 model; model-free tests separately exercise its shape,
+ * initialization, and lifetime.
  *
  * Routed MoE scratch is eight experts wide so resident inference can execute
  * the complete GPU route in one pass.  SSD streaming and trace/replay retain
@@ -30491,8 +30522,6 @@ struct ds4_engine {
     /* The Metal page-in workers borrow this descriptor.  Keep the reader (and
      * therefore its fd) alive until the final accelerator fence and generic
      * GPU teardown have both completed. */
-    ds4_qwen_expert_pack *qwen35_expert_pack;
-    bool qwen35_expert_pack_ready;
     ds4_expert_store *expert_store_v2;
     bool expert_store_v2_ready;
 #endif
@@ -30587,99 +30616,9 @@ static const ds4_qwen35_feature_name qwen35_feature_names[] = {
     {"layer_pin", QWEN35_FEATURE_LAYER_PIN},
     {"io_overlap", QWEN35_FEATURE_IO_OVERLAP},
     {"expert_group", QWEN35_FEATURE_EXPERT_GROUP},
-    {"expert_pack", QWEN35_FEATURE_EXPERT_PACK},
     {"gqa_reuse", QWEN35_FEATURE_GQA_REUSE},
     {"prompt_lookup", QWEN35_FEATURE_PROMPT_LOOKUP},
 };
-
-typedef struct {
-    const char *path;
-    uint8_t payload_sha256[DS4_QWEN_EXPERT_PACK_SHA256_BYTES];
-    uint8_t gguf_sha256[DS4_QWEN_EXPERT_PACK_SHA256_BYTES];
-} ds4_qwen35_expert_pack_env;
-
-static DS4_MAYBE_UNUSED int qwen35_hex_nibble(unsigned char c) {
-    if (c >= '0' && c <= '9') return (int)(c - '0');
-    if (c >= 'a' && c <= 'f') return (int)(c - 'a') + 10;
-    if (c >= 'A' && c <= 'F') return (int)(c - 'A') + 10;
-    return -1;
-}
-
-/* Campaign digests are trusted only as exact 32-byte hexadecimal values.  No
- * whitespace, 0x prefix, truncated hash, or permissive numeric conversion is
- * accepted: those would turn a stale sidecar into an ambiguous identity. */
-static DS4_MAYBE_UNUSED bool qwen35_sha256_hex_parse(
-        const char *text,
-        uint8_t     digest[DS4_QWEN_EXPERT_PACK_SHA256_BYTES]) {
-    if (!text || !digest ||
-        strlen(text) != DS4_QWEN_EXPERT_PACK_SHA256_BYTES * 2u) {
-        return false;
-    }
-    for (size_t i = 0; i < DS4_QWEN_EXPERT_PACK_SHA256_BYTES; i++) {
-        const int hi = qwen35_hex_nibble((unsigned char)text[i * 2u]);
-        const int lo = qwen35_hex_nibble((unsigned char)text[i * 2u + 1u]);
-        if (hi < 0 || lo < 0) return false;
-        digest[i] = (uint8_t)((hi << 4) | lo);
-    }
-    return true;
-}
-
-static DS4_MAYBE_UNUSED bool qwen35_expert_pack_env_parse_values(
-        const char                       *path,
-        const char                       *payload_sha256,
-        const char                       *version,
-        const char                       *gguf_sha256,
-        ds4_qwen35_expert_pack_env       *out,
-        char                             *err,
-        size_t                            errlen) {
-    if (out) memset(out, 0, sizeof(*out));
-    if (!out || !path || !path[0] || !payload_sha256 ||
-        !payload_sha256[0] || !version || !version[0] ||
-        !gguf_sha256 || !gguf_sha256[0]) {
-        if (err && errlen) {
-            snprintf(err, errlen,
-                     "expert pack requires PATH, SHA256, VERSION, and "
-                     "GGUF_SHA256 campaign variables");
-        }
-        return false;
-    }
-    if (strcmp(version, "1") != 0) {
-        if (err && errlen) {
-            snprintf(err, errlen,
-                     "DS4_QWEN_EXPERT_PACK_VERSION must be exactly 1");
-        }
-        return false;
-    }
-    if (!qwen35_sha256_hex_parse(payload_sha256, out->payload_sha256)) {
-        if (err && errlen) {
-            snprintf(err, errlen,
-                     "DS4_QWEN_EXPERT_PACK_SHA256 must be exactly 64 hex digits");
-        }
-        memset(out, 0, sizeof(*out));
-        return false;
-    }
-    if (!qwen35_sha256_hex_parse(gguf_sha256, out->gguf_sha256)) {
-        if (err && errlen) {
-            snprintf(err, errlen,
-                     "DS4_QWEN_GGUF_SHA256 must be exactly 64 hex digits");
-        }
-        memset(out, 0, sizeof(*out));
-        return false;
-    }
-    out->path = path;
-    return true;
-}
-
-static DS4_MAYBE_UNUSED bool qwen35_expert_pack_should_install(
-        ds4_residency_mode residency,
-        bool               ssd_streaming,
-        uint32_t           ablated) {
-    const bool supported_mode =
-        (residency == DS4_RESIDENCY_SSD && ssd_streaming) ||
-        (residency == DS4_RESIDENCY_RESIDENT && !ssd_streaming);
-    return supported_mode &&
-           (ablated & QWEN35_FEATURE_EXPERT_PACK) == 0;
-}
 
 static bool qwen35_feature_mask_parse(
         const char *text,
@@ -30897,6 +30836,16 @@ static void qwen35_telemetry_close(ds4_engine *e) {
     memset(t, 0, sizeof(*t));
 }
 
+static DS4_MAYBE_UNUSED bool ds4_engine_qwen35_expert_major_ready(
+        const ds4_engine *e) {
+#if defined(__APPLE__) && !defined(DS4_NO_GPU)
+    return e && e->expert_store_v2_ready;
+#else
+    (void)e;
+    return false;
+#endif
+}
+
 static bool qwen35_runtime_features_init(ds4_engine *e) {
     if (!e) return false;
     ds4_qwen35_runtime_features *f = &e->qwen35_features;
@@ -30953,10 +30902,9 @@ static bool qwen35_runtime_features_finalize(ds4_engine *e) {
             }
 #if defined(__APPLE__) && !defined(DS4_NO_GPU)
             if ((f->ablated & QWEN35_FEATURE_EXPERT_PACK) == 0 &&
-                !e->qwen35_expert_pack_ready) {
-                /* The code path exists, but this engine did not authorize and
-                 * install the campaign artifact.  Advertising it here would
-                 * let a strict first run silently benchmark GGUF fallback. */
+                !ds4_engine_qwen35_expert_major_ready(e)) {
+                /* The code path exists, but the required embedded v2 store
+                 * did not become active. Never advertise a partial runtime. */
                 f->implemented &= ~QWEN35_FEATURE_EXPERT_PACK;
             }
 #else
@@ -45522,7 +45470,7 @@ int ds4_engine_generate_argmax_with_evidence(
     }
     if (evidence) {
         fprintf(stderr,
-                "ds4: generation evidence is supported only by Qwen canonical argmax\n");
+                "ds4: generation evidence is supported only by Qwen argmax\n");
         return 1;
     }
     const ds4_model *model = &e->model;
@@ -48091,28 +48039,28 @@ static bool ds4_engine_qwen35_metal_options_valid(
     if (!e || !opt) return false;
     if (e->backend != DS4_BACKEND_METAL) {
         fprintf(stderr,
-                "ds4: experimental Qwen Metal inference requires --metal\n");
+                "ds4: Qwen ExpertMajor v2 inference requires the Metal runtime\n");
         return false;
     }
     if (e->quality) {
         fprintf(stderr,
-                "ds4: experimental Qwen Metal inference does not support --quality yet\n");
+                "ds4: Qwen Metal inference does not support --quality yet\n");
         return false;
     }
     if (opt->mtp_path && opt->mtp_path[0]) {
         fprintf(stderr,
-                "ds4: experimental Qwen Metal inference does not support MTP\n");
+                "ds4: Qwen Metal inference does not support MTP\n");
         return false;
     }
     if (load_slice || opt->distributed.role != DS4_DISTRIBUTED_NONE) {
         fprintf(stderr,
-                "ds4: experimental Qwen Metal inference does not support "
+                "ds4: Qwen Metal inference does not support "
                 "layer slices or distributed execution\n");
         return false;
     }
     if (e->directional_steering_file) {
         fprintf(stderr,
-                "ds4: experimental Qwen Metal inference does not support "
+                "ds4: Qwen Metal inference does not support "
                 "directional steering\n");
         return false;
     }
@@ -48131,13 +48079,13 @@ static bool ds4_engine_qwen35_metal_options_valid(
         (streaming_hotlist_profile && streaming_hotlist_profile[0]) ||
         (streaming_hotlist_priority && streaming_hotlist_priority[0])) {
         fprintf(stderr,
-                "ds4: experimental Qwen Metal inference does not support "
+                "ds4: Qwen Metal inference does not support "
                 "expert profiles or hotlists yet\n");
         return false;
     }
     if (e->ssd_streaming_preload_experts != 0) {
         fprintf(stderr,
-                "ds4: experimental Qwen Metal inference does not support "
+                "ds4: Qwen Metal inference does not support "
                 "expert preloading yet\n");
         return false;
     }
@@ -48145,13 +48093,13 @@ static bool ds4_engine_qwen35_metal_options_valid(
         getenv("DS4_METAL_STREAMING_PIN_NON_ROUTED");
     if (pin_non_routed && pin_non_routed[0]) {
         fprintf(stderr,
-                "ds4: experimental Qwen Metal inference does not support "
+                "ds4: Qwen Metal inference does not support "
                 "DS4_METAL_STREAMING_PIN_NON_ROUTED yet\n");
         return false;
     }
     if (e->power_percent != 100) {
         fprintf(stderr,
-                "ds4: experimental Qwen Metal inference requires --power 100\n");
+                "ds4: Qwen Metal inference requires --power 100\n");
         return false;
     }
     if (e->ssd_streaming_cache_experts != 0 &&
@@ -48267,13 +48215,22 @@ static bool ds4_engine_install_expert_store_v2(ds4_engine *e) {
     const bool is_deepseek =
         e->model.family == DS4_MODEL_FAMILY_DEEPSEEK4;
     const bool is_glm = e->model.family == DS4_MODEL_FAMILY_GLM_DSA;
-    if (!is_deepseek && !is_glm) return false;
+    const bool is_qwen =
+        e->model.family == DS4_MODEL_FAMILY_QWEN35_MOE;
+    if (!is_deepseek && !is_glm && !is_qwen) return false;
     const uint32_t expected_family = is_glm ?
-        DS4_EXPERT_STORE_FAMILY_GLM_DSA :
+        DS4_EXPERT_STORE_FAMILY_GLM_DSA : is_qwen ?
+        DS4_EXPERT_STORE_FAMILY_QWEN35_MOE :
         DS4_EXPERT_STORE_FAMILY_DEEPSEEK4;
-    const char *family_name = is_glm ? "GLM" : "DeepSeek";
+    const char *family_name = is_glm ? "GLM" :
+        is_qwen ? "Qwen" : "DeepSeek";
     const uint32_t expected_layers = is_glm ?
-        DS4_N_LAYER - DS4_N_LEADING_DENSE : DS4_N_LAYER;
+        DS4_N_LAYER - DS4_N_LEADING_DENSE : is_qwen ?
+        QWEN35_N_LAYER : DS4_N_LAYER;
+    const uint32_t expected_experts = is_qwen ?
+        QWEN35_N_EXPERT : DS4_N_EXPERT;
+    const uint32_t expected_experts_used = is_qwen ?
+        QWEN35_N_EXPERT_USED : DS4_N_EXPERT_USED;
 
     char error[256] = {0};
     ds4_expert_store *store = NULL;
@@ -48292,8 +48249,8 @@ static bool ds4_engine_install_expert_store_v2(ds4_engine *e) {
         ds4_expert_store_manifest_get(store);
     if (!manifest || manifest->family != expected_family ||
         manifest->layer_count != expected_layers ||
-        manifest->expert_count != DS4_N_EXPERT ||
-        manifest->expert_used_count != DS4_N_EXPERT_USED ||
+        manifest->expert_count != expected_experts ||
+        manifest->expert_used_count != expected_experts_used ||
         manifest->source_tensor_count != e->model.n_tensors) {
         fprintf(stderr,
                 "ds4: native %s expert store does not match the active shape profile\n",
@@ -48313,7 +48270,7 @@ static bool ds4_engine_install_expert_store_v2(ds4_engine *e) {
         const uint32_t expected_layer = is_glm ?
             DS4_N_LEADING_DENSE + index : index;
         if (!entry || entry->layer != expected_layer ||
-            entry->layer >= DS4_N_LAYER) {
+            entry->layer >= (is_qwen ? QWEN35_N_LAYER : DS4_N_LAYER)) {
             fprintf(stderr,
                     "ds4: native %s store is missing routed layer %u\n",
                     family_name, expected_layer);
@@ -48394,7 +48351,8 @@ static bool ds4_engine_install_expert_store_v2(ds4_engine *e) {
     for (uint32_t index = 0; index < manifest->layer_count; index++) {
         const ds4_expert_store_layer *entry =
             ds4_expert_store_layer_at(store, index);
-        if (!entry || entry->layer >= DS4_N_LAYER) {
+        if (!entry ||
+            entry->layer >= (is_qwen ? QWEN35_N_LAYER : DS4_N_LAYER)) {
             ds4_gpu_expert_store_v2_clear();
             ds4_expert_store_close(store);
             return false;
@@ -48431,187 +48389,6 @@ static bool ds4_engine_install_expert_store_v2(ds4_engine *e) {
             (double)manifest->data_size / 1073741824.0,
             e->ssd_streaming ? "SSD" : "resident");
     return true;
-}
-
-static void ds4_engine_try_install_qwen35_expert_pack(ds4_engine *e) {
-    if (!e) return;
-    e->qwen35_expert_pack_ready = false;
-
-    const bool embedded = e->model.qwen_native_expert_major;
-    if (embedded &&
-        !qwen35_expert_pack_should_install(
-            e->residency, e->ssd_streaming, 0)) {
-        ds4_die("DS4-native Qwen expert-major GGUF requires Metal resident or SSD streaming mode");
-    }
-    if (embedded &&
-        (e->qwen35_features.ablated & QWEN35_FEATURE_EXPERT_PACK) != 0) {
-        ds4_die("cannot ablate expert_pack with a DS4-native Qwen GGUF");
-    }
-
-    if (!qwen35_expert_pack_should_install(
-            e->residency, e->ssd_streaming, e->qwen35_features.ablated)) {
-        if ((e->qwen35_features.ablated & QWEN35_FEATURE_EXPERT_PACK) != 0) {
-            fprintf(stderr,
-                    "ds4: Qwen expert pack disabled by campaign ablation\n");
-        }
-        return;
-    }
-
-    char err[256] = {0};
-    const ds4_qwen_expert_pack_geometry geometry =
-        ds4_qwen35_expert_pack_geometry();
-    ds4_qwen_expert_pack *pack = NULL;
-    if (embedded) {
-        if (ds4_qwen_expert_pack_open_embedded(
-                &pack, e->model.fd,
-                e->model.qwen_native_pack_offset,
-                e->model.qwen_native_pack_bytes,
-                &geometry, err, sizeof(err)) !=
-            DS4_QWEN_EXPERT_PACK_OK) {
-            fprintf(stderr,
-                    "ds4: DS4-native Qwen expert store could not be reopened: %s\n",
-                    err[0] ? err : "format or geometry validation failed");
-            exit(1);
-        }
-    } else {
-        ds4_qwen35_expert_pack_env env = {0};
-        if (!qwen35_expert_pack_env_parse_values(
-                getenv("DS4_QWEN_EXPERT_PACK_PATH"),
-                getenv("DS4_QWEN_EXPERT_PACK_SHA256"),
-                getenv("DS4_QWEN_EXPERT_PACK_VERSION"),
-                getenv("DS4_QWEN_GGUF_SHA256"),
-                &env, err, sizeof(err))) {
-            fprintf(stderr,
-                    "ds4: Qwen expert pack unavailable: %s; using canonical GGUF experts\n",
-                    err[0] ? err : "invalid campaign identity");
-            return;
-        }
-        if (ds4_qwen_expert_pack_open(
-                &pack, env.path, &geometry, err, sizeof(err)) !=
-            DS4_QWEN_EXPERT_PACK_OK) {
-            fprintf(stderr,
-                    "ds4: Qwen expert pack unavailable: %s; using canonical GGUF experts\n",
-                    err[0] ? err : "pack open or geometry validation failed");
-            return;
-        }
-
-        /* Sidecars need an explicit two-file identity. Embedded stores are
-         * already structurally bound to the mapped GGUF and have the same
-         * integrity model as ordinary tensor bytes; the publication verifier
-         * hashes their payload offline. */
-        struct stat model_stat;
-        if (fstat(e->model.fd, &model_stat) != 0 ||
-            !S_ISREG(model_stat.st_mode) || model_stat.st_size < 0 ||
-            (uint64_t)model_stat.st_size != e->model.size) {
-            snprintf(err, sizeof(err),
-                     "loaded GGUF descriptor identity does not match its mapped size");
-            goto unavailable;
-        }
-        if (ds4_qwen_expert_pack_validate_source_digest(
-                pack, (uint64_t)model_stat.st_size, env.gguf_sha256,
-                err, sizeof(err)) != DS4_QWEN_EXPERT_PACK_OK ||
-            ds4_qwen_expert_pack_validate_payload_digest(
-                pack, env.payload_sha256,
-                err, sizeof(err)) != DS4_QWEN_EXPERT_PACK_OK) {
-            goto unavailable;
-        }
-    }
-
-    const ds4_qwen_expert_pack_manifest *manifest =
-        ds4_qwen_expert_pack_manifest_get(pack);
-    if (!manifest) {
-        snprintf(err, sizeof(err), "expert store manifest is unavailable");
-        goto unavailable;
-    }
-    const uint64_t physical_file_size =
-        embedded ? e->model.size : manifest->file_size;
-    const uint64_t physical_data_offset =
-        ds4_qwen_expert_pack_file_offset(pack) + manifest->data_offset;
-    if (!ds4_gpu_qwen35_expert_pack_install(
-            ds4_qwen_expert_pack_fd(pack),
-            physical_file_size,
-            physical_data_offset,
-            manifest->gate_bytes,
-            manifest->up_bytes,
-            manifest->down_bytes,
-            manifest->geometry.n_layer,
-            manifest->geometry.n_expert)) {
-        snprintf(err, sizeof(err),
-                 "Metal rejected the verified expert pack geometry");
-        ds4_gpu_qwen35_expert_pack_clear();
-        goto unavailable;
-    }
-
-    /* Cache entries keep their canonical GGUF offsets as identity keys.  Bind
-     * each layer once so Metal can translate only the eventual read source to
-     * the expert-major sidecar; changing the key itself would split cache
-     * accounting between synchronous, overlapped and decode loaders. */
-    for (uint32_t layer_index = 0;
-         layer_index < QWEN35_N_LAYER;
-         layer_index++) {
-        const ds4_qwen35_layer_weights *layer =
-            &e->qwen35_weights.layer[layer_index];
-        if (!layer->ffn_gate_exps ||
-            !layer->ffn_up_exps ||
-            !layer->ffn_down_exps ||
-            !ds4_gpu_qwen35_expert_pack_bind_layer(
-                layer_index,
-                e->model.size,
-                layer->ffn_gate_exps->abs_offset,
-                layer->ffn_up_exps->abs_offset,
-                layer->ffn_down_exps->abs_offset)) {
-            snprintf(err, sizeof(err),
-                     "Metal rejected expert pack binding for layer %u",
-                     layer_index);
-            ds4_gpu_qwen35_expert_pack_clear();
-            goto unavailable;
-        }
-    }
-
-    e->qwen35_expert_pack = pack;
-    e->qwen35_expert_pack_ready = true;
-    fprintf(stderr,
-            "ds4: Qwen %s expert-major store active: version %u, %u layers x %u experts, %.2f GiB payload\n",
-            embedded ? "embedded" : "sidecar",
-            DS4_QWEN_EXPERT_PACK_FORMAT_VERSION,
-            manifest->geometry.n_layer,
-            manifest->geometry.n_expert,
-            (double)manifest->data_size / 1073741824.0);
-    qwen35_telemetry_emit(
-        e, "expert_pack",
-        "\"active\":true,\"container\":\"%s\",\"version\":%u,\"layers\":%u,"
-        "\"experts\":%u,\"file_bytes\":%" PRIu64
-        ",\"data_offset\":%" PRIu64 ",\"payload_bytes\":%" PRIu64,
-        embedded ? "gguf" : "sidecar",
-        DS4_QWEN_EXPERT_PACK_FORMAT_VERSION,
-        manifest->geometry.n_layer,
-        manifest->geometry.n_expert,
-        manifest->file_size,
-        manifest->data_offset,
-        manifest->data_size);
-    return;
-
-unavailable:
-    if (embedded) {
-        fprintf(stderr,
-                "ds4: DS4-native Qwen expert store is mandatory but unavailable: %s\n",
-                err[0] ? err : "validation failed");
-        ds4_qwen_expert_pack_close(pack);
-        exit(1);
-    }
-    fprintf(stderr,
-            "ds4: Qwen expert pack unavailable: %s; using canonical GGUF experts\n",
-            err[0] ? err : "validation failed");
-    ds4_qwen_expert_pack_close(pack);
-}
-
-static void ds4_engine_disable_qwen35_expert_pack(ds4_engine *e) {
-    if (!e || !e->qwen35_expert_pack) return;
-    ds4_gpu_qwen35_expert_pack_clear();
-    ds4_qwen_expert_pack_close(e->qwen35_expert_pack);
-    e->qwen35_expert_pack = NULL;
-    e->qwen35_expert_pack_ready = false;
-    e->qwen35_features.enabled &= ~QWEN35_FEATURE_EXPERT_PACK;
 }
 
 static bool ds4_engine_configure_qwen35_metal_streaming(ds4_engine *e) {
@@ -48766,7 +48543,21 @@ static bool ds4_engine_configure_qwen35_metal_streaming(ds4_engine *e) {
                 "ds4: Qwen SSD streaming failed to install the GGUF file descriptor\n");
         return false;
     }
-    ds4_engine_try_install_qwen35_expert_pack(e);
+    if (!e->model.native_expert_store_v2) {
+        fprintf(stderr,
+                "ds4: Qwen SSD streaming requires an embedded ExpertMajor v2 store\n");
+        return false;
+    }
+    if ((e->qwen35_features.ablated & QWEN35_FEATURE_EXPERT_PACK) != 0) {
+        fprintf(stderr,
+                "ds4: cannot ablate expert_pack with a DS4-native Qwen ExpertMajor v2 GGUF\n");
+        return false;
+    }
+    if (!ds4_engine_install_expert_store_v2(e)) {
+        fprintf(stderr,
+                "ds4: Qwen SSD streaming could not install its mandatory ExpertMajor v2 store\n");
+        return false;
+    }
 
     ds4_model_map_span_vec exact_spans = {0};
     uint64_t exact_payload_bytes = 0;
@@ -48806,7 +48597,7 @@ static bool ds4_engine_configure_qwen35_metal_streaming(ds4_engine *e) {
     }
 
     fprintf(stderr,
-            "ds4: experimental Qwen Metal SSD runtime: static %.2f GiB "
+            "ds4: Qwen Metal SSD runtime: static %.2f GiB "
             "payload / %.2f GiB page reserve, %u exact spans, cache %u "
             "experts prefill / %u decode target (%.2f GiB target; safe "
             "decode cap %u), macro %u tokens / %.2f MiB total prefill "
@@ -48881,36 +48672,38 @@ static bool ds4_engine_configure_qwen35_metal_resident(
     ds4_gpu_set_streaming_expert_cache_slab_target_bytes(0);
     (void)ds4_gpu_set_model_fd(-1);
 
-    const char *pack_path = getenv("DS4_QWEN_EXPERT_PACK_PATH");
-    if (e->model.qwen_native_expert_major || (pack_path && pack_path[0])) {
-        ds4_engine_try_install_qwen35_expert_pack(e);
-        if (e->qwen35_expert_pack_ready &&
-            !ds4_gpu_qwen35_expert_pack_enable_resident()) {
-            /* A verified pack is still an optimization.  If this device
-             * cannot expose one layer as a no-copy Metal buffer, drop the
-             * alternate store and preserve the canonical resident path. */
-            if (e->model.qwen_native_expert_major) {
-                ds4_die("DS4-native Qwen resident expert-major mapping is unavailable on this device");
-            }
-            fprintf(stderr,
-                    "ds4: Qwen expert-major resident mapping unavailable; "
-                    "using canonical GGUF experts\n");
-            ds4_engine_disable_qwen35_expert_pack(e);
-        }
-    }
-    if (warm_weights && e->qwen35_expert_pack_ready) {
-        /* Touching the canonical routed tensors would make both 17 GiB
-         * copies resident.  The no-copy pack mappings are faulted in by
-         * Metal; a future pack-specific warm pass can prefetch only them. */
+    if (!e->model.native_expert_store_v2) {
         fprintf(stderr,
-                "ds4: --warm-weights skips canonical routed experts for "
-                "Qwen expert-major resident mode\n");
-    } else if (warm_weights) {
-        model_warm_weights(&e->model);
+                "ds4: Qwen resident mode requires an embedded ExpertMajor v2 store\n");
+        return false;
+    }
+    if ((e->qwen35_features.ablated & QWEN35_FEATURE_EXPERT_PACK) != 0) {
+        fprintf(stderr,
+                "ds4: cannot ablate expert_pack with a DS4-native Qwen ExpertMajor v2 GGUF\n");
+        return false;
+    }
+    if (!ds4_engine_install_expert_store_v2(e)) {
+        fprintf(stderr,
+                "ds4: Qwen resident mode could not install its mandatory ExpertMajor v2 store\n");
+        return false;
+    }
+    const bool expert_major_ready =
+        ds4_engine_qwen35_expert_major_ready(e);
+    if (!expert_major_ready) {
+        fprintf(stderr,
+                "ds4: Qwen ExpertMajor v2 store did not become active\n");
+        return false;
+    }
+    if (warm_weights) {
+        /* The routed payload is exposed through per-layer no-copy mappings;
+         * a future store-specific warm pass can prefetch those exact spans. */
+        fprintf(stderr,
+                "ds4: --warm-weights leaves Qwen ExpertMajor v2 routing to "
+                "its no-copy resident mappings\n");
     }
 
     uint64_t mapped_model_bytes = e->model.size - e->model.tensor_data_pos;
-    if (e->qwen35_expert_pack_ready) {
+    if (expert_major_ready) {
         ds4_model_map_span_vec spans = {0};
         const bool spans_ready =
             qwen35_weights_model_map_non_routed_spans(
@@ -48923,45 +48716,27 @@ static bool ds4_engine_configure_qwen35_metal_resident(
                 &e->model, &spans, "Qwen resident non-routed");
         free(spans.v);
         if (!mapped) {
-            if (e->model.qwen_native_expert_major) {
-                ds4_die("DS4-native Qwen non-routed Metal mapping is unavailable");
-            }
             fprintf(stderr,
-                    "ds4: Qwen expert-major non-routed mapping unavailable; "
-                    "using canonical GGUF experts\n");
-            ds4_engine_disable_qwen35_expert_pack(e);
-            if (warm_weights) model_warm_weights(&e->model);
-            mapped_model_bytes =
-                e->model.size - e->model.tensor_data_pos;
+                    "ds4: Qwen ExpertMajor v2 non-routed Metal mapping is unavailable\n");
+            return false;
         }
     }
-    if (!e->qwen35_expert_pack_ready &&
-        !ds4_gpu_set_model_map_range(
-                   e->model.map,
-                   e->model.size,
-                   e->model.tensor_data_pos,
-                   mapped_model_bytes,
-                   e->model.max_tensor_bytes)) {
-        fprintf(stderr,
-                "ds4: Qwen resident mode could not install the complete Metal model map\n");
-        return false;
-    }
-
     uint64_t resident_weight_bytes = mapped_model_bytes;
-    const ds4_qwen_expert_pack_manifest *pack_manifest =
-        e->qwen35_expert_pack_ready
-            ? ds4_qwen_expert_pack_manifest_get(e->qwen35_expert_pack)
+    const ds4_expert_store_manifest *store_manifest =
+        e->expert_store_v2_ready
+            ? ds4_expert_store_manifest_get(e->expert_store_v2)
             : NULL;
-    if (pack_manifest &&
-        pack_manifest->data_size <= UINT64_MAX - resident_weight_bytes) {
-        resident_weight_bytes += pack_manifest->data_size;
+    const uint64_t expert_major_bytes =
+        store_manifest ? store_manifest->data_size : 0;
+    if (expert_major_bytes <= UINT64_MAX - resident_weight_bytes) {
+        resident_weight_bytes += expert_major_bytes;
     }
     fprintf(stderr,
-            "ds4: experimental Qwen Metal resident runtime: mapped %.2f GiB "
+            "ds4: Qwen Metal resident runtime: mapped %.2f GiB "
             "of %s tensor data; SSD expert cache disabled; exact decode "
             "workspace %.2f MiB reserved\n",
             (double)resident_weight_bytes / 1073741824.0,
-            e->qwen35_expert_pack_ready ? "expert-major" : "canonical GGUF",
+            "ExpertMajor v2",
             (double)e->qwen35_decode_workspace_bytes / 1048576.0);
     qwen35_telemetry_emit(
         e, "memory_plan",
@@ -49115,7 +48890,47 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
 
     const bool graph_backend = ds4_backend_uses_graph(opt->backend);
     if (graph_backend) ds4_linux_graph_backend_set_oom_score(opt->backend);
-    model_open(&e->model, opt->model_path, graph_backend, !opt->inspect_only);
+    model_open(&e->model, opt->model_path, graph_backend, false);
+    const bool qwen_family =
+        e->model.family == DS4_MODEL_FAMILY_QWEN35_MOE;
+    const bool deepseek_family =
+        e->model.family == DS4_MODEL_FAMILY_DEEPSEEK4;
+    const bool glm_family =
+        e->model.family == DS4_MODEL_FAMILY_GLM_DSA;
+    if (!opt->inspect_only && qwen_family &&
+        !e->model.native_expert_store_v2) {
+        fprintf(stderr,
+                "ds4: Qwen inference requires a DS4 ExpertMajor v2 GGUF; "
+                "canonical and v1 execution are no longer supported\n");
+        ds4_engine_close(e);
+        return 1;
+    }
+    if (!opt->inspect_only && deepseek_family &&
+        !e->model.native_expert_store_v2) {
+        fprintf(stderr,
+                "ds4: DeepSeek inference requires a DS4 ExpertMajor v2 GGUF; "
+                "canonical execution is no longer supported\n");
+        ds4_engine_close(e);
+        return 1;
+    }
+    if (!opt->inspect_only && glm_family &&
+        !e->model.native_expert_store_v2) {
+        fprintf(stderr,
+                "ds4: GLM inference requires a DS4 ExpertMajor v2 GGUF; "
+                "canonical GLM execution is no longer supported\n");
+        ds4_engine_close(e);
+        return 1;
+    }
+    if (!opt->inspect_only &&
+        (qwen_family || deepseek_family || glm_family) &&
+        e->backend != DS4_BACKEND_METAL) {
+        fprintf(stderr,
+                "ds4: %s ExpertMajor v2 inference requires the Metal runtime\n",
+                qwen_family ? "Qwen" :
+                deepseek_family ? "DeepSeek" : "GLM");
+        ds4_engine_close(e);
+        return 1;
+    }
     /* Qwen has model-specific residency gates below. Every other executable
      * family needs its tokenizer before the engine is returned; the GLM port
      * used to load it in a dedicated branch that disappeared during the
@@ -49132,78 +48947,6 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
             return 0;
         }
         if (!qwen35_runtime_features_init(e)) {
-            ds4_engine_close(e);
-            return 1;
-        }
-
-        /* Both executors remain behind exact-value validation gates.  A value
-         * other than the literal string "1" is deliberately not accepted. */
-        if (e->backend == DS4_BACKEND_CPU) {
-            const char *experimental_cpu =
-                getenv("DS4_QWEN_EXPERIMENTAL_CPU");
-            if (!experimental_cpu || strcmp(experimental_cpu, "1") != 0) {
-                fprintf(stderr,
-                        "ds4: Qwen3.6-35B-A3B metadata is valid, but inference is "
-                        "disabled until the model-backed logits gate passes\n");
-                ds4_engine_close(e);
-                return 1;
-            }
-            if (residency_requested == DS4_RESIDENCY_SSD ||
-                e->ssd_streaming_cache_experts != 0 ||
-                e->ssd_streaming_cache_bytes != 0 ||
-                e->ssd_streaming_preload_experts != 0 ||
-                e->ssd_streaming_cold) {
-                fprintf(stderr,
-                        "ds4: experimental Qwen CPU inference does not support SSD options\n");
-                ds4_engine_close(e);
-                return 1;
-            }
-            if (opt->mtp_path && opt->mtp_path[0]) {
-                fprintf(stderr,
-                        "ds4: experimental Qwen CPU inference does not support MTP\n");
-                ds4_engine_close(e);
-                return 1;
-            }
-            if (load_slice || opt->distributed.role != DS4_DISTRIBUTED_NONE) {
-                fprintf(stderr,
-                        "ds4: experimental Qwen CPU inference does not support "
-                        "layer slices or distributed execution\n");
-                ds4_engine_close(e);
-                return 1;
-            }
-            const char *expert_profile_env = getenv("DS4_EXPERT_PROFILE");
-            const char *expert_hotlist_env = getenv("DS4_EXPERT_HOTLIST");
-            if (e->directional_steering_file ||
-                (opt->expert_profile_path && opt->expert_profile_path[0]) ||
-                (expert_profile_env && expert_profile_env[0]) ||
-                (expert_hotlist_env && expert_hotlist_env[0])) {
-                fprintf(stderr,
-                        "ds4: experimental Qwen CPU inference does not support "
-                        "directional steering or expert profiles\n");
-                ds4_engine_close(e);
-                return 1;
-            }
-
-            vocab_load(&e->vocab, &e->model);
-            if (opt->warm_weights) model_warm_weights(&e->model);
-            e->residency = DS4_RESIDENCY_RESIDENT;
-            e->qwen_raw_runtime = true;
-            fprintf(stderr,
-                    "ds4: experimental Qwen CPU runtime enabled for model-backed validation\n");
-            if (!qwen35_runtime_features_finalize(e)) {
-                ds4_engine_close(e);
-                return 1;
-            }
-            *out = e;
-            return 0;
-        }
-
-        const char *experimental_metal =
-            getenv("DS4_QWEN_EXPERIMENTAL_METAL");
-        if (!experimental_metal || strcmp(experimental_metal, "1") != 0) {
-            fprintf(stderr,
-                    "ds4: Qwen Metal inference requires "
-                    "DS4_QWEN_EXPERIMENTAL_METAL=1\n");
             ds4_engine_close(e);
             return 1;
         }
@@ -49243,7 +48986,7 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
         e->qwen_raw_runtime = true;
         e->qwen_metal_runtime = true;
         fprintf(stderr,
-                "ds4: experimental Qwen Metal %s runtime enabled\n",
+                "ds4: Qwen Metal %s runtime enabled\n",
                 ds4_residency_mode_name(e->residency));
         if (!qwen35_runtime_features_finalize(e)) {
             ds4_engine_close(e);
@@ -49253,7 +48996,7 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
         return 0;
 #else
         fprintf(stderr,
-                "ds4: experimental Qwen Metal inference is available only "
+                "ds4: Qwen ExpertMajor v2 inference is available only "
                 "in an Apple Metal build\n");
         ds4_engine_close(e);
         return 1;
@@ -49488,16 +49231,7 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
         return 0;
     }
     if (e->model.family == DS4_MODEL_FAMILY_GLM_DSA &&
-        !e->model.native_expert_store_v2) {
-        fprintf(stderr,
-                "ds4: GLM inference requires a DS4 ExpertMajor v2 GGUF; "
-                "canonical GLM execution is no longer supported\n");
-        ds4_engine_close(e);
-        *out = NULL;
-        return 1;
-    }
-    if (e->model.family == DS4_MODEL_FAMILY_GLM_DSA &&
-        (e->backend != DS4_BACKEND_METAL || !e->ssd_streaming || load_slice ||
+        (!e->ssd_streaming || load_slice ||
          opt->distributed.role != DS4_DISTRIBUTED_NONE)) {
         fprintf(stderr,
                 "ds4: GLM ExpertMajor v2 requires one complete local Metal "
@@ -50071,20 +49805,14 @@ void ds4_engine_close(ds4_engine *e) {
     if (e->expert_store_v2) {
         ds4_gpu_expert_store_v2_clear();
     }
-    if (e->qwen35_expert_pack) {
-        ds4_gpu_qwen35_expert_pack_clear();
-    }
 #endif
     ds4_gpu_cleanup();
 #if defined(__APPLE__)
     /* Generic GPU cleanup joins the page-in workers.  Only now is it safe to
-     * close the descriptor those workers borrowed from the sidecar reader. */
+     * close the descriptor those workers borrowed from the embedded store. */
     ds4_expert_store_close(e->expert_store_v2);
     e->expert_store_v2 = NULL;
     e->expert_store_v2_ready = false;
-    ds4_qwen_expert_pack_close(e->qwen35_expert_pack);
-    e->qwen35_expert_pack = NULL;
-    e->qwen35_expert_pack_ready = false;
 #endif
 #endif
     if (e->mtp_ready) model_close(&e->mtp_model);

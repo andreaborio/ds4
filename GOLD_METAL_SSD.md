@@ -9,11 +9,17 @@ select SSD streaming automatically.
 
 ```sh
 make                         # namespaced Metal build; publishes ./ds4*
-./ds4 -m MODEL.gguf          # Metal + AUTO residency
-./ds4 -m MODEL.gguf --resident
-./ds4 -m MODEL.gguf --ssd-streaming
+./ds4 -m MODEL-DS4-ExpertMajor-v2.gguf          # Metal + AUTO residency
+./ds4 -m MODEL-DS4-ExpertMajor-v2.gguf --resident
+./ds4 -m MODEL-DS4-ExpertMajor-v2.gguf --ssd-streaming
 ./ds4 --build-info
 ```
+
+DeepSeek V4, GLM 5.2, and Qwen3.6 inference accepts only a validated embedded
+`ds4.expert_major.v2` store on Apple Metal. Canonical GGUFs remain offline
+converter inputs; ExpertMajor v1, external sidecars, CPU, CUDA, ROCm, and
+distributed inference fail closed. Normal startup requires no ExpertMajor,
+sidecar, backend, cache, preload, or power flag.
 
 `--resident` (also `--no-ssd-streaming`) and `--ssd-streaming` are explicit
 overrides.  Cache, cold-streaming, or preload options imply SSD mode and are
@@ -69,21 +75,20 @@ equivalent backend-specific capacity planner is validated.
 If Metal cannot report a working-set recommendation, AUTO fails safely unless
 the user supplies an explicit SSD cache budget.  SSD + MTP remains unsupported.
 
-### Experimental Qwen3.6 policy
+### ExpertMajor v2 family policy
 
-The `feat/qwen-support` branch has a stricter family-specific contract for the
-single normalized Qwen3.6-35B-A3B Q4_K_S artifact.  With
-`DS4_QWEN_EXPERIMENTAL_METAL=1`, AUTO admits the complete mapped-tensor Metal
-path only when both the fixed working-set plan and a point-in-time live-memory
-pressure check pass.  Otherwise it selects SSD streaming.  Explicit
-`--resident` fails unless both checks pass; the snapshot is conservative
-admission, not a guarantee against later memory-pressure changes.
+Every supported MoE family uses the same self-describing ExpertMajor v2 storage
+contract and its own qualified Metal consumer. Qwen3.6-35B-A3B AUTO admits the
+complete mapped-tensor path only when both the fixed working-set plan and a
+point-in-time live-memory pressure check pass. Otherwise it selects SSD
+streaming. Explicit `--resident` fails unless both checks pass; the snapshot is
+conservative admission, not a guarantee against later memory-pressure changes.
 
 Qwen's SSD planner charges static page coverage, session/runtime memory,
 ordinary host headroom, pressure margin, and Metal headroom independently.  It
 then chooses a complete `1 + 320*k` expert tier and grows Metal storage in
-321-expert slabs (about 0.529 GiB) instead of the generic 4 GiB slab.  DeepSeek
-AUTO tuning and slab defaults are unchanged.
+321-expert slabs (about 0.529 GiB) instead of the generic 4 GiB slab. DeepSeek
+and GLM retain their independently qualified planners and schedules.
 
 For this path, `resident` means complete tensor mapping, full-tensor Metal
 kernels, and no DS4 expert-cache `pread`.  Metal residency requests are budget
@@ -121,8 +126,8 @@ make build-isolation-test
 make model-free-test
 ```
 
-`make test` additionally runs model-backed tests and therefore requires the
-supported DeepSeek GGUF at `ds4flash.gguf` or `DS4_TEST_MODEL`.
+`make test` additionally runs model-backed tests and therefore requires a
+qualified DeepSeek ExpertMajor v2 GGUF at `ds4flash.gguf` or `DS4_TEST_MODEL`.
 
 For performance A/Bs:
 

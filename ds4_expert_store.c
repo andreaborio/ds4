@@ -209,6 +209,17 @@ static bool all_zero(const uint8_t *data, size_t size) {
     return true;
 }
 
+static bool family_is_supported(uint32_t family) {
+    return family == DS4_EXPERT_STORE_FAMILY_DEEPSEEK4 ||
+           family == DS4_EXPERT_STORE_FAMILY_GLM_DSA ||
+           family == DS4_EXPERT_STORE_FAMILY_QWEN35_MOE;
+}
+
+static bool family_has_dense_routed_prefix(uint32_t family) {
+    return family == DS4_EXPERT_STORE_FAMILY_DEEPSEEK4 ||
+           family == DS4_EXPERT_STORE_FAMILY_QWEN35_MOE;
+}
+
 bool ds4_expert_store_open_embedded(
         ds4_expert_store **out,
         int                fd,
@@ -257,8 +268,7 @@ bool ds4_expert_store_open_embedded(
         version != DS4_EXPERT_STORE_V2_VERSION ||
         header_bytes != STORE_HEADER_BYTES ||
         family != expected_family ||
-        (family != DS4_EXPERT_STORE_FAMILY_DEEPSEEK4 &&
-         family != DS4_EXPERT_STORE_FAMILY_GLM_DSA) ||
+        !family_is_supported(family) ||
         layer_count == 0 || layer_count > DS4_EXPERT_STORE_V2_MAX_LAYERS ||
         expert_count == 0 || expert_count > DS4_EXPERT_STORE_V2_MAX_EXPERTS ||
         expert_used == 0 || expert_used > expert_count ||
@@ -370,8 +380,7 @@ bool ds4_expert_store_open_embedded(
         uint64_t layer_end = 0;
         if (layer->layer > DS4_EXPERT_STORE_V2_MAX_MODEL_LAYER ||
             (il != 0 && layer->layer <= previous_layer) ||
-            (family == DS4_EXPERT_STORE_FAMILY_DEEPSEEK4 &&
-             layer->layer != il) ||
+            (family_has_dense_routed_prefix(family) && layer->layer != il) ||
             layer->expert_count != expert_count ||
             layer->record_bytes != expected_record_offset ||
             !mul_u64(layer->record_bytes, expert_count,

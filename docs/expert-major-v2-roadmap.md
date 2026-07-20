@@ -1,88 +1,101 @@
-# Generic expert-major GGUF roadmap: DeepSeek and GLM
+# ExpertMajor v2 runtime and qualification roadmap
 
-`ds4.expert_major.v1` is deliberately fixed to the measured Qwen3.6-35B-A3B
-Q4_K_S geometry. DeepSeek and GLM must not reuse that identifier: their routed
-tensor types, shapes, layer participation, and quantization can vary.
+`ds4.expert_major.v2` is the single routed-expert storage contract for every
+MoE family supported by this fork: DeepSeek V4, GLM 5.2, and
+Qwen3.6-35B-A3B. The former Qwen fixed-geometry v1 layout, external sidecars,
+and canonical inference paths are retired. There is deliberately no backwards
+compatibility layer.
 
-The generic, versioned store is implemented for DeepSeek and the independently
-qualified GLM release behind `ds4.expert_major.v2`. It is discovered from the
-canonical GGUF rather than a second set of family-specific hard-coded offsets.
-Each family keeps its own runtime admission and performance gate.
+## Shared format contract
 
-## Format contract
+The offline converter replaces the physical canonical routed tensors with one
+opaque GGUF tensor and a checksummed manifest. For every routed layer it
+records:
 
-The converter emits one opaque GGUF tensor plus a checksummed manifest.
-For every routed layer the manifest records:
-
-- the canonical logical tensor identity and component role;
-- expert count, selected-expert count, dimensions, GGML type, and block size;
+- model-family identity and format version;
+- layer and expert counts, including selected-expert count;
+- gate, up, and down dimensions, GGML types, and quant block sizes;
 - record, component, layer, and payload offsets with explicit alignment;
-- source GGUF identity, payload digest, manifest digest, and format version.
+- source GGUF, payload, and manifest SHA-256 identities.
 
-DS4 reconstructs logical canonical descriptors for binding and diagnostics,
-but every physical read is translated through the manifest. Unknown versions,
-overlapping ranges, unsupported quant types, incomplete layers, and geometry
-mismatches fail before backend initialization. Native files never fall back to
-missing canonical routed weights.
+DS4 reconstructs canonical logical descriptors for graph binding and cache
+identity only. Resident mapping, prefill, decode, and SSD cache fills resolve
+physical bytes through the manifest. Unknown families or versions, canonical
+routed tensors beside a v2 store, incomplete inventories, unsupported types,
+overlapping ranges, and geometry mismatches fail before inference.
 
 ## Runtime boundary
 
-The store API owns validation and logical-to-physical translation. Model-family
-code supplies only the expected tensor roles and supported geometry. Local
-Apple Metal is the first consumer. Native CPU, CUDA, ROCm, and distributed
-execution fail early until their own translators are implemented.
+The release runtime accepts ExpertMajor v2 artifacts only on local Apple Metal.
+The normal CLI is the same for all three families:
 
-DeepSeek retains its independent canonical migration path. GLM does not: after
-qualification, DS4 deliberately admits GLM only from ExpertMajor v2 on local
-Metal SSD streaming. Existing external loaders that do not understand the
-extension must use a different canonical artifact and runtime.
+```sh
+./ds4 -m /absolute/path/to/MODEL-DS4-ExpertMajor-v2.gguf --ctx 8192
+```
 
-## DeepSeek tranche
+AUTO chooses the family-qualified resident or SSD consumer. No ExpertMajor,
+sidecar, backend, cache, preload, or power flag is required. Canonical GGUFs
+remain inputs to `inspect`, `build`, and `verify`, but are not executable by
+this runtime. CPU, CUDA, ROCm, distributed, v1, and sidecar paths fail closed.
 
-1. **Implemented:** discover the complete routed inventory and quant geometry
-   from the source GGUF.
-2. **Implemented:** manifest-driven converter instead of Qwen's fixed
-   gate/up/down sizes.
-3. **Implemented:** C/Python fixtures for mixed quant types, corrupt manifests,
-   corrupt payloads, structural bounds, and cross-family rejection.
-4. **In progress:** the first M5 Pro SSD parity tranche passes at 128 and 768
-   tokens; the 2K/8K/16K alternating gate and full-resident qualification on a
-   host where the model fits remain open.
-5. **Open:** promote only if throughput is neutral within the predeclared variance band
-   and memory/swap behavior does not regress on both low- and high-RAM Macs.
+ExpertMajor applies only to routed experts. Embeddings, attention, routers,
+shared experts, normalization, and output tensors keep their ordinary GGUF
+layout.
 
-DeepSeek keeps an independently qualified runtime policy: the native store
-enables its paired IQ2 grouped-prefill kernel, a phase-aware long-prefill cache
-floor, and a normal-pressure AUTO tier only on 64--96 GiB Macs. Canonical
-DeepSeek, Qwen's 16 GiB planner, other model families, explicit cache budgets,
-and larger-memory hosts retain their existing policy boundaries.
+## Family status
 
-## GLM tranche
+### Qwen3.6-35B-A3B
 
-1. **Implemented:** port the qualified GLM runtime onto fork `main` with strict
-   family checks instead of changing the DeepSeek/Qwen schedules.
-2. **Implemented:** keep canonical logical tensor identity distinct from the
-   physical expert-major container and fail closed on incomplete geometry.
-3. **Implemented:** direct record strides, full expert address tables for
-   grouped prefill, selected-expert SSD translation, in-flight-safe wrapper
-   lifetime, and a model-free canonical/native numeric regression.
-4. **Qualified:** the corrected 288+32 lane moved decode from 1.27 to
-   1.77-1.81 t/s with exact output and no new swap activity. The prior
-   rested-storage qualification remains 11.08/1.90 t/s median; an old/new
-   same-condition A/B measured 1.75/1.74 and proves mainline runtime parity.
-5. **Published:** the single-payload artifact and its exact SHA-256 live at
-   `andreaborio/GLM-5.2-DS4-ExpertMajor-v2-GGUF`.
+- **Implemented:** distinct `qwen35moe` family ID, 40-layer fail-closed
+  geometry, generic v2 conversion, logical reconstruction, resident mapping,
+  and SSD translation.
+- **Qualified on M5 Pro 64 GiB:** resident output matches the retired v1
+  control. The 2K v2/v1/v2 lane measured 318.96/29.54, 320.59/29.59, and
+  318.83/29.54 prefill/decode t/s.
+- **Correctness:** all three evidence files are byte-identical with SHA-256
+  `399504c6ce3d4531ee0f2207702e96e2324c9b5c8dbf98adf47dfb9e64cae54d`;
+  no new swapout was observed.
+- **Release artifact:** 20,808,566,880 bytes, SHA-256
+  `d7c43a6388ec20e6fe5530850350f96fdb0ac37c5ce36d3e5f92b172c447f56b`.
 
-GLM is an independently admitted, ExpertMajor-only Apple Metal SSD path. CPU,
-CUDA, ROCm, resident/distributed execution, canonical GLM artifacts, other
-model families, and Macs below 64 GiB do not inherit its policy or artifact
-compatibility.
+### DeepSeek V4
 
-## Release sequence
+- **Implemented:** manifest-driven mixed-quant conversion, resident and SSD
+  consumers, phase-aware prefill cache policy, paired IQ2 gate/up execution,
+  and selected-address grouped prefill.
+- **Validated:** C/Python corruption, bounds, payload, mixed-type, and
+  cross-family tests plus the recorded M5 Pro SSD parity tranches.
+- **Release rule:** each Flash or PRO artifact must pass byte verification,
+  model-backed output equality, alternating throughput, and swap/memory gates.
+  A canonical source is never a runtime fallback while an artifact is awaiting
+  qualification.
 
-1. Ship Qwen `v1` and its model as the narrow proven implementation.
-2. Land the generic manifest and converter behind a new identifier.
-3. Qualify and publish DeepSeek artifacts.
-4. **Complete:** qualify and publish the GLM artifact.
-5. Keep family-specific admission explicit; GLM has no sidecar or canonical
-   fallback in DS4 main.
+### GLM 5.2
+
+- **Qualified and published:** distinct family checks, non-zero routed-layer
+  prefix, full address tables, grouped prefill, contiguous selected-expert
+  decode reads, compact DSA KV, and the measured 601-expert 64 GiB policy.
+- **Performance:** the corrected 288+32 lane moved decode from 1.27 to
+  1.77-1.81 t/s with exact output and no new swap activity. The prior
+  rested-storage median remains 11.08/1.90 t/s.
+- **Release artifact:** 262,147,193,504 bytes, SHA-256
+  `7f5017e3076e706c78f2a5322b035a9e2f6519c65ff5b6be8b2d91aeff61505d`.
+
+## Next optimization tranches
+
+The common format removes layout fallbacks; performance remains
+family-specific. Every new optimization is measured alone and in combination
+with the current stack.
+
+1. Qwen: preserve paired gate/up and parallel decode while checking resident
+   first-token page behavior at 2K, 8K, and 16K.
+2. DeepSeek: qualify each published v2 artifact and retain the measured
+   three-task SSD decode schedule unless a storage-specific A/B wins.
+3. GLM: evaluate protected-hot/second-hit cache admission, then reduce host
+   synchronization without changing the one-record read path.
+4. Shared: keep prefill/decode schedules separate, overlap safe I/O with Metal
+   work, and reject any token-time repack or accidental canonical range read.
+
+The dated evidence belongs under `docs/benchmarks/`. A format conversion alone
+is not a speed claim; promotion requires correctness, throughput, and memory
+evidence on every advertised machine tier.

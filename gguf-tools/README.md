@@ -1,7 +1,7 @@
 # DS4 GGUF Tools
 
-This directory contains the offline tools used to build and evaluate DeepSeek
-V4 Flash GGUF files for `ds4`.
+This directory contains the offline tools used to build and evaluate the
+DeepSeek V4, GLM 5.2, and Qwen3.6 GGUF files supported by `ds4`.
 
 The important pieces are:
 
@@ -9,8 +9,9 @@ The important pieces are:
 - `quants.[ch]`: the deliberately small local quantization implementation used
   by the quantizer.  It implements the DS4 output formats we actually ship:
   `q8_0`, `q4_K`, `q2_K`, and `iq2_xxs`.
-- `ds4-expert-major.py`: deterministic DeepSeek canonical-to-native layout
-  converter and byte-level verifier for `ds4.expert_major.v2` GGUFs.
+- `ds4-expert-major.py`: deterministic canonical-to-native layout converter
+  and byte-level verifier for DeepSeek, GLM, and Qwen
+  `ds4.expert_major.v2` GGUFs.
 - `imatrix/`: dataset and instructions for collecting routed-MoE activation
   importance with `ds4`.
 - `quality-testing/`: prompts and scripts used to compare local GGUF variants
@@ -26,13 +27,14 @@ The quantizer is plain C and does not link GGML.  GGUF metadata handling,
 safetensors loading, FP4/FP8 dequantization, and the quantizers used by our Q2
 and Q4 recipes live in this directory.
 
-## Build A DS4-Native Expert-Major GGUF
+## Build a DS4-native ExpertMajor v2 GGUF
 
-Reorder an already qualified DeepSeek GGUF without changing quantization:
+Reorder an already qualified DeepSeek, GLM, or Qwen GGUF without changing
+quantization:
 
 ```sh
 python3 gguf-tools/ds4-expert-major.py inspect MODEL.gguf
-python3 gguf-tools/ds4-expert-major.py build --reserve-bytes 2GiB \
+python3 gguf-tools/ds4-expert-major.py build \
   MODEL.gguf MODEL-DS4-ExpertMajor-v2.gguf
 python3 gguf-tools/ds4-expert-major.py verify \
   MODEL.gguf MODEL-DS4-ExpertMajor-v2.gguf
@@ -40,10 +42,26 @@ python3 gguf-tools/ds4-expert-major.py verify \
 
 The build includes a full verification unless `--skip-verify` is explicitly
 used for disposable development output. Publication must never use that flag.
-The extension stores routed weights once and is executable only by a runtime
-that implements `ds4.expert_major.v2`. Format invariants, backend limits, and
-the promotion gate are documented in
-[`../docs/deepseek-expert-major-v2.md`](../docs/deepseek-expert-major-v2.md).
+The output stores routed weights once and is executable by this fork only on
+Apple Metal. Current inference deliberately rejects canonical routed layouts,
+ExpertMajor v1, external sidecars, CPU, CUDA, ROCm, and distributed execution.
+Canonical files remain offline converter inputs. Format invariants, runtime
+limits, and family qualification are documented in
+[`../docs/expert-major-v2-roadmap.md`](../docs/expert-major-v2-roadmap.md),
+[`../docs/deepseek-expert-major-v2.md`](../docs/deepseek-expert-major-v2.md),
+and [`../docs/qwen-expert-major-store.md`](../docs/qwen-expert-major-store.md).
+
+The supported routed quant types are Q2_K, Q4_K, Q5_K, Q6_K, and IQ2_XXS.
+Family identity, routed layer inventory, expert counts, component geometry,
+manifest digest, payload digest, source identity, and every copied tensor are
+verified fail-closed. Build outputs are installed atomically on the destination
+filesystem.
+
+Run a completed artifact without conversion flags:
+
+```sh
+./ds4 -m /absolute/path/to/MODEL-DS4-ExpertMajor-v2.gguf --ctx 8192
+```
 
 ## Generate An Imatrix
 

@@ -27,6 +27,12 @@ static bool parse_u64(const char *text, uint64_t *out) {
     return true;
 }
 
+static bool family_is_supported(uint64_t family) {
+    return family == DS4_EXPERT_STORE_FAMILY_DEEPSEEK4 ||
+           family == DS4_EXPERT_STORE_FAMILY_GLM_DSA ||
+           family == DS4_EXPERT_STORE_FAMILY_QWEN35_MOE;
+}
+
 int main(int argc, char **argv) {
     if (argc != 5) {
         fprintf(stderr,
@@ -38,8 +44,7 @@ int main(int argc, char **argv) {
     CHECK(parse_u64(argv[2], &offset));
     CHECK(parse_u64(argv[3], &bytes));
     CHECK(parse_u64(argv[4], &family64));
-    CHECK(family64 == DS4_EXPERT_STORE_FAMILY_DEEPSEEK4 ||
-          family64 == DS4_EXPERT_STORE_FAMILY_GLM_DSA);
+    CHECK(family_is_supported(family64));
     const uint32_t family = (uint32_t)family64;
     const int fd = open(argv[1], O_RDONLY);
     CHECK(fd >= 0);
@@ -87,10 +92,22 @@ int main(int argc, char **argv) {
     ds4_expert_store_close(store);
     store = NULL;
 
-    error[0] = '\0';
-    CHECK(!ds4_expert_store_open_embedded(
-        &store, fd, offset, bytes, 999, error, sizeof(error)));
-    CHECK(store == NULL);
+    const uint32_t families[] = {
+        DS4_EXPERT_STORE_FAMILY_DEEPSEEK4,
+        DS4_EXPERT_STORE_FAMILY_GLM_DSA,
+        DS4_EXPERT_STORE_FAMILY_QWEN35_MOE,
+        999,
+    };
+    for (size_t index = 0; index < sizeof(families) / sizeof(families[0]);
+         index++) {
+        if (families[index] == family) continue;
+        error[0] = '\0';
+        CHECK(!ds4_expert_store_open_embedded(
+            &store, fd, offset, bytes, families[index],
+            error, sizeof(error)));
+        CHECK(store == NULL);
+        CHECK(error[0] != '\0');
+    }
     CHECK(close(fd) == 0);
     puts("expert-store v2 C reader: OK");
     return 0;

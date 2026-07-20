@@ -10,6 +10,12 @@ Do not run multiple huge model processes at the same time.  Record the commit,
 hardware, GGUF file, context size, and any non-default flags for every manual
 run.
 
+DeepSeek V4, GLM 5.2, and Qwen3.6 release inference is ExpertMajor v2-only on
+local Apple Metal. Canonical files may be inspected or converted offline, but
+ExpertMajor v1, sidecars, CPU, CUDA, ROCm, and distributed inference must fail
+closed. No ExpertMajor or Qwen admission environment flag belongs in a release
+startup command.
+
 Preferred release test hosts:
 
 - CUDA / DGX Spark: `toor@192.168.0.180`.
@@ -62,10 +68,11 @@ in this system.
 
 ## 3. Metal Flash Path
 
-Use the normal Flash GGUF that 128 GB users run.
+Use the qualified DeepSeek Flash ExpertMajor v2 GGUF that users run. Set
+`DEEPSEEK_V2` to its absolute path; a canonical download is not equivalent.
 
 - One-shot CLI:
-  `./ds4 -m ds4flash.gguf --ctx 32768 --nothink -p "Explain C pointers in one paragraph."`
+  `./ds4 -m "$DEEPSEEK_V2" --ctx 32768 --nothink -p "Explain C pointers in one paragraph."`
 - Thinking and max-thinking prompts:
   run one short coding prompt with default thinking and one with max thinking.
 - Long-context recall:
@@ -95,12 +102,12 @@ PRO support is experimental, but release builds must not break it silently.
 SSD streaming is a capacity path, so test both correctness and user experience.
 
 - Flash q2/q2-q4 streaming:
-  `./ds4 -m ds4flash.gguf --ssd-streaming --ssd-streaming-cache-experts 32GB -p "..."`
+  `./ds4 -m "$DEEPSEEK_V2" --ssd-streaming --ssd-streaming-cache-experts 32GB -p "..."`
 - Regression test mixed-quant Flash SSD streaming. Use the mixed q2/q4 GGUF
   with boosted Q4 routed-expert layers and a prompt long enough to exercise the
   selected-address prefill path; it must not fail with "model range is not
   covered by mapped model views":
-  `./ds4 -m gguf/DeepSeek-V4-Flash-Layers37-42Q4KExperts-OtherExpertLayersIQ2XXSGateUp-Q2KDown-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix-fixed.gguf --ssd-streaming --ssd-streaming-cache-experts 16GB --ctx 4096 --tokens 1 --nothink --prompt-file /tmp/ds4_600tok_prompt.txt`.
+  `./ds4 -m "$DEEPSEEK_MIXED_V2" --ssd-streaming --ssd-streaming-cache-experts 16GB --ctx 4096 --tokens 1 --nothink --prompt-file /tmp/ds4_600tok_prompt.txt`.
 - Cold streaming measurement:
   run once with `--ssd-streaming-cold` and verify no deadlock, missing expert,
   or impossible slowdown.
@@ -111,16 +118,16 @@ SSD streaming is a capacity path, so test both correctness and user experience.
 
 ### Qwen3.6 Metal lane
 
-The opt-in Qwen path on `main` follows the same repository, build, core-test,
-and regression rules as the other model paths. When a compatible normalized
-Qwen3.6-35B-A3B Q4_K_S artifact is locally available, record its SHA-256 and
-run the relevant model-backed smoke; a raw community GGUF is not an equivalent
-input.
+The Qwen path on `main` follows the same repository, build, core-test, and
+regression rules as the other model paths. Use the normalized
+Qwen3.6-35B-A3B ExpertMajor v2 Q4_K_S artifact, record its SHA-256, and run the
+relevant model-backed smoke; canonical, v1, sidecar, and community GGUFs are
+not equivalent inputs.
 
 - Run `make model-free-test` and `./ds4_test --metal-kernels`. The latter must
   retain resident/SSD top-8 output equivalence, zero resident cache/`pread`
   accounting, malformed-route fail-closed behavior, and slab-growth checks.
-- Run AUTO with `DS4_QWEN_EXPERIMENTAL_METAL=1`; record both admission plans,
+- Run AUTO with the normal flag-free startup command; record both admission plans,
   their point-in-time inputs, resolved mode, cache tier, configured 321-expert
   slab target, cache `buffer_allocs`, task physical footprint, and system swap
   before/during/after. Exact slab count/capacity is asserted by the Metal
@@ -148,12 +155,12 @@ release-ready without this pass.
 - Fetch or push the exact release commit to the CUDA machine.
 - Build:
   `make clean && make cuda-spark`.
-- Run:
-  `make cuda-regression`.
-- Run a short CLI prompt with the Flash GGUF and record generation t/s.
-- Run a longer prompt that exercises routed experts past a few thousand tokens.
-- If CUDA Q4, distributed, streaming hooks, tensor span loading, or model cache
-  code changed, test the specific GGUF and split mode that uses that path.
+- Run `make cuda-regression` for model-free/backend coverage.
+- Verify a Qwen, DeepSeek, or GLM ExpertMajor v2 artifact is rejected before
+  inference. Do not publish generation throughput or present CUDA as a current
+  MoE runtime lane.
+- If CUDA kernels or build hooks changed, run their backend-specific synthetic
+  tests without weakening the ExpertMajor v2 admission boundary.
 - Verify that any CUDA-only warning fixes are also clean on macOS and do not
   change Metal behavior.
 
@@ -166,35 +173,18 @@ a substitute for CUDA or Metal release testing.
 - Fetch or push the exact release commit to the Strix Halo machine.
 - Build:
   `make clean && make strix-halo`.
-- Use the q2 Flash imatrix GGUF for release smoke tests:
-  `DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix.gguf`.
-- Do not use the mixed q2-q4 or Q4 Flash GGUFs for routine Strix Halo QA yet.
-  They are dangerous on this machine for now because the ROCm path can hit
-  system OOM instead of failing cleanly.
-- Run a short CLI prompt:
-  `./ds4 -m gguf/DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix.gguf --ctx 4096 --nothink -p "Reply with exactly: OK"`.
-- Run one longer prompt if ROCm kernels, backend hooks, tensor loading, model
-  cache, KV cache, or graph prefill code changed.
-- Record startup memory/cache messages, prefill speed, generation speed, and
-  whether the backend reports `ROCm backend initialized`.
+- Run model-free/backend tests only. Verify a Qwen, DeepSeek, or GLM
+  ExpertMajor v2 artifact is rejected before inference; do not attempt a
+  canonical fallback or publish ROCm model throughput.
+- Record build identity and backend initialization for synthetic tests. A
+  successful ROCm compile is not a supported-model inference claim.
 
 ## 8. Distributed Inference
 
-Distributed code has regressed around route setup, KV snapshots, request IDs,
-and split model loading.  Test it whenever distributed, KV, session, or model
-loading code changes.
-
-- Prefer `mac-m5max-it` and `mac-m5max-us` for Metal distributed tests.  Use the
-  TB5 point-to-point link when it is working; otherwise note that the run used
-  WiFi/VPN routing.
-- Start workers first, then the coordinator.
-- Test a small prompt and a longer prompt.
-- Verify the coordinator waits for a complete route and exits cleanly.
-- Verify `Ctrl+C` returns control after the current distributed token or chunk
-  drains.
-- Save and restore a distributed KV snapshot if that code changed.
-- If CUDA distributed is relevant, test across the CUDA hosts and record
-  generation speed, not just "it works".
+Distributed inference is outside the current ExpertMajor v2 runtime contract.
+For Qwen, DeepSeek, and GLM, verify coordinator/worker options reject the model
+before inference; do not use canonical or split files as a fallback. If shared
+protocol code changes, run model-free protocol tests and compile checks only.
 
 ## 9. Disk KV Cache
 
@@ -259,8 +249,12 @@ The agent is the most stateful component.  Test it manually, not only by build.
 
 - Test `download_model.sh` in a temporary directory so local weights are not
   overwritten.
-- Test one Flash target and one PRO target enough to verify URL, resume, Hugging
-  Face CLI/curl behavior, file naming, and symlink policy.
+- Treat its canonical Flash/PRO downloads as offline converter inputs, not
+  runnable artifacts. Verify URL, resume, file naming, and symlink policy
+  without launching inference from the downloaded source.
+- Verify each published runtime model has a distinct ExpertMajor v2 filename,
+  complete converter verification, recorded source/output hashes, and no
+  canonical routed-weight fallback.
 - Verify legacy removed targets fail clearly.
 - Verify README model names match the script and Hugging Face repository.
 

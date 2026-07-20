@@ -1,18 +1,17 @@
 <h1 align="center">DwarfStar</h1>
 
-<p align="center"><strong>Specialized local inference for models that do not fit in memory.</strong></p>
+<p align="center"><strong>ExpertMajor v2 inference for large MoE models on Apple Metal.</strong></p>
 
 <p align="center">
   A transparent research and co-development fork of
   <a href="https://github.com/antirez/ds4">antirez/ds4</a>, focused on Metal,
-  adaptive SSD streaming, common 16–64 GB Apple Silicon systems, and measured experimentation.
+  adaptive SSD streaming, Apple Silicon systems, and measured experimentation.
 </p>
 
 <p align="center">
   <a href="LICENSE"><img alt="MIT license" src="https://img.shields.io/badge/license-MIT-1b1b1b?style=flat-square"></a>
   <img alt="Apple Metal primary target" src="https://img.shields.io/badge/Metal-primary-1b1b1b?style=flat-square&logo=apple">
-  <img alt="CUDA backend" src="https://img.shields.io/badge/CUDA-supported-76B900?style=flat-square&logo=nvidia">
-  <img alt="ROCm backend" src="https://img.shields.io/badge/ROCm-supported-ED1C24?style=flat-square&logo=amd">
+  <img alt="ExpertMajor v2 model format" src="https://img.shields.io/badge/ExpertMajor-v2-1b1b1b?style=flat-square">
   <img alt="Project status beta" src="https://img.shields.io/badge/status-beta-orange?style=flat-square">
 </p>
 
@@ -43,8 +42,8 @@ runner; arbitrary GGUF files are not expected to work.
 Upstream DwarfStar provides the core engine and leads the high-memory and
 distributed paths. This fork asks a complementary question:
 
-**How far can the same specialized design be pushed on the 16–64 GB Macs many
-developers already own, when the SSD becomes an active model-memory tier?**
+**How far can the same specialized design be pushed on 64 GB and larger Macs,
+when the SSD becomes an active model-memory tier?**
 
 The current work concentrates on:
 
@@ -52,7 +51,7 @@ The current work concentrates on:
 - SSD streaming that accounts for page cache, wired memory, swap, I/O, and
   throughput together;
 - safer model-backed experiments near macOS memory limits;
-- measured GLM 5.2 work and Qwen3.6-35B-A3B bring-up;
+- one validated ExpertMajor v2 storage contract for DeepSeek, GLM, and Qwen;
 - GGUF calibration, incremental quantization, and expert-analysis tooling;
 - keeping useful changes small enough to validate and send upstream.
 
@@ -90,20 +89,18 @@ inspectable in GitHub's
 
 ## Quick start
 
-Requirements: Apple Silicon, Xcode Command Line Tools, and enough SSD space for
-the selected model. A 64 GB Mac is the practical reference tier for DeepSeek
-Flash streaming; the 16 GB path is an experimental low-memory tier, not a speed
-guarantee.
+Requirements: Apple Silicon, Xcode Command Line Tools, an ExpertMajor v2 GGUF,
+and enough SSD space for the selected model. The current release and benchmark
+baseline is a Mac with at least 64 GiB of unified memory.
 
 ```sh
 xcode-select --install
 git clone https://github.com/andreaborio/ds4.git
 cd ds4
 
-./download_model.sh q2-imatrix
-make
+make -j8
 ./ds4 --build-info
-./ds4 -m ./ds4flash.gguf --nothink
+./ds4 -m /absolute/path/to/MODEL-DS4-ExpertMajor-v2.gguf --ctx 8192
 ```
 
 On macOS, AUTO residency keeps the model resident when it safely fits.
@@ -112,13 +109,14 @@ model geometry and live host memory. Force the SSD path only when you need a
 controlled run:
 
 ```sh
-./ds4 -m ./ds4flash.gguf --ssd-streaming --ctx 32768 --nothink
+./ds4 -m /absolute/path/to/MODEL-DS4-ExpertMajor-v2.gguf \
+  --ssd-streaming --ctx 8192
 ```
 
 Start the local API with:
 
 ```sh
-./ds4-server -m ./ds4flash.gguf --ctx 32768
+./ds4-server -m /absolute/path/to/MODEL-DS4-ExpertMajor-v2.gguf --ctx 8192
 ```
 
 ## How SSD streaming uses memory
@@ -145,28 +143,28 @@ the runtime needs.
 
 | Model | Location | Status | Current focus |
 | --- | --- | --- | --- |
-| DeepSeek V4 Flash | `main` | Primary supported path | Metal, adaptive SSD streaming, 16–64 GB measurements |
-| DeepSeek V4 PRO | `main` | Supported upstream path | High-memory and distributed inference |
+| DeepSeek V4 Flash ExpertMajor v2 | `main` | Supported Apple Metal resident/SSD path | Adaptive SSD streaming and grouped prefill |
+| DeepSeek V4 PRO ExpertMajor v2 | `main` | High-memory Apple Metal path | Per-artifact qualification remains required |
 | GLM 5.2 ExpertMajor v2 | `main` | Qualified Apple Metal SSD path; 64 GB minimum | Embedded expert store, grouped prefill, compact DSA KV, adaptive decode cache |
-| Qwen3.6-35B-A3B (`qwen35moe`) | `main` | Supported opt-in Metal path, model-backed measured | Metal AUTO mapping, live-pressure fallback, strict SSD cache, resident prefill, and parallel resident decode |
+| Qwen3.6-35B-A3B ExpertMajor v2 | `main` | Supported Apple Metal resident/SSD path | AUTO mapping, resident prefill, and parallel resident decode |
 
 ### DeepSeek expert-major v2 format
 
-DS4 includes the experimental, self-describing `ds4.expert_major.v2` layout for
-DeepSeek V4. It stores each layer as adjacent gate/up/down expert records without
-requantizing and without keeping a second routed-weight copy. Canonical GGUFs
-remain byte-for-byte compatible with every existing backend; native v2 files
-currently require a complete local Apple Metal model and fail early elsewhere.
+DS4 uses the self-describing `ds4.expert_major.v2` layout for DeepSeek V4. It
+stores each layer as adjacent gate/up/down expert records without requantizing
+and without keeping a second routed-weight copy. The runtime accepts only the
+native v2 artifact on Apple Metal. Canonical GGUFs are converter inputs, not an
+inference fallback; CPU, CUDA, ROCm, distributed, v1, and sidecar paths fail
+closed.
 
-Conversion, full byte-level verification, compatibility limits, and the
+Conversion, full byte-level verification, admission limits, and the
 model-backed promotion gate are in
-[`docs/deepseek-expert-major-v2.md`](docs/deepseek-expert-major-v2.md). Until a
-dated canonical/native benchmark gate is complete, the canonical DeepSeek GGUF
-remains the release reference. The first M5 Pro SSD tranche is recorded in
+[`docs/deepseek-expert-major-v2.md`](docs/deepseek-expert-major-v2.md). The first
+M5 Pro SSD tranche is recorded in
 [`docs/benchmarks/2026-07-17-deepseek-native-expert-major.md`](docs/benchmarks/2026-07-17-deepseek-native-expert-major.md).
-The distinctly named experimental artifact is
+The distinctly named v2 artifact is
 [`DeepSeek-V4-Flash-DS4-ExpertMajor-v2-GGUF`](https://huggingface.co/andreaborio/DeepSeek-V4-Flash-DS4-ExpertMajor-v2-GGUF),
-with full conversion provenance and compatibility limits in its model card.
+with full conversion provenance and runtime limits in its model card.
 
 ### GLM 5.2 ExpertMajor v2
 
@@ -197,50 +195,40 @@ boundaries, and current limits are in
 Older GLM files, sidecars, layout revisions, and retired tuning modes have no
 backward-compatibility contract in this fork.
 
-### Qwen3.6 Metal AUTO path
+### Qwen3.6 ExpertMajor v2 AUTO path
 
-The main branch is qualified and measured with one normalized text-only
-artifact. The recommended release download is the single-layout
-`Qwen3.6-35B-A3B-DS4-ExpertMajor-v1-Q4_K_S.gguf` from
-[`andreaborio/Qwen3.6-35B-A3B-DS4-ExpertMajor-v1-GGUF`](https://huggingface.co/andreaborio/Qwen3.6-35B-A3B-DS4-ExpertMajor-v1-GGUF).
-It stores routed weights once in DS4's expert-major order and activates
-automatically; no sidecar variables are needed. The canonical
-`Qwen3.6-35B-A3B-ds4-Q4_K_S.gguf` remains supported during migration.
-The release artifact is 20,808,970,240 bytes (only 406,816 bytes larger than
-the canonical input) with SHA-256
-`fb2b344d49f0c3dfd854cfc11d92ffc873cc93a1d30bf4664e5aea6f1bfef839`.
-
-This is not generic Qwen or arbitrary community-GGUF support. The literal
-environment guard is the experimental opt-in; Metal, power 100, and AUTO
-residency are the Apple defaults, but are shown below for reproducibility:
+The supported artifact is the single-layout
+`Qwen3.6-35B-A3B-DS4-ExpertMajor-v2-Q4_K_S.gguf`. It stores the 40 layers of
+routed weights once, activates automatically, and is 20,808,566,880 bytes with
+SHA-256
+`d7c43a6388ec20e6fe5530850350f96fdb0ac37c5ce36d3e5f92b172c447f56b`.
+No environment guard, sidecar variable, backend flag, resident flag, or power
+flag is part of normal startup:
 
 ```sh
-DS4_QWEN_EXPERIMENTAL_METAL=1 ./ds4 \
-  -m /absolute/path/to/Qwen3.6-35B-A3B-DS4-ExpertMajor-v1-Q4_K_S.gguf \
-  --metal --power 100 --ctx 8192 --nothink
+./ds4 \
+  -m /absolute/path/to/Qwen3.6-35B-A3B-DS4-ExpertMajor-v2-Q4_K_S.gguf \
+  --ctx 8192
 ```
 
-`ds4.expert_major.v1` is an explicit DS4 GGUF extension. Other loaders must
-reject this artifact unless they implement the layout; use the canonical file
-for llama.cpp, MLX, or other runtimes. Format details, conversion commands,
-compatibility boundaries, and measured parity are in
-[`docs/qwen-expert-major-store.md`](docs/qwen-expert-major-store.md).
+This is a narrow Qwen3.6 artifact contract, not arbitrary Qwen or community
+GGUF support. Current inference rejects canonical Qwen, ExpertMajor v1,
+sidecars, CPU, CUDA, ROCm, and distributed execution. The canonical GGUF may be
+used offline with `gguf-tools/ds4-expert-major.py` to build and verify v2.
+Format details and the v2/v1 publication A/B are in
+[`docs/qwen-expert-major-store.md`](docs/qwen-expert-major-store.md) and
+[`docs/benchmarks/2026-07-20-qwen-expert-major-v2.md`](docs/benchmarks/2026-07-20-qwen-expert-major-v2.md).
 
 Qwen AUTO selects the full-model mapped Metal mode only when both the fixed Metal
 working-set budget and a point-in-time host-memory pressure check pass. Under
 pressure it falls back to SSD and lazily grows the routed-expert cache to the
 largest complete routing tier admitted by the current conservative snapshot.
-Above 16 GiB the planner independently reserves the 2.50 GiB static page set,
-context/runtime memory, and system headroom. On a 16 GiB Mac, AUTO keeps the
-complete static charge but lets those unpinned, pageable GGUF pages share system
-headroom. It selects the largest complete 320-expert cache cycle admitted by
-the remaining live and platform budgets rather than imposing a fixed low-RAM
-floor. Bounded file-backed inactive pages receive full credit only while macOS
-reports normal pressure; unknown or elevated pressure retains half-credit and
-fails closed near the boundary. `--resident` fails unless both admission checks
-pass; because pressure can change after the
-snapshot, this is a conservative admission policy rather than a future-memory
-guarantee. `--ssd-streaming` remains the reproducible forced-streaming override.
+The planner independently reserves static pages, context/runtime memory, and
+system headroom, then selects the largest complete expert-cache cycle admitted
+by the remaining live and platform budgets. Bounded file-backed inactive pages
+receive full credit only while macOS reports normal pressure; unknown or
+elevated pressure fails closed near the boundary. `--resident` fails unless the
+admission checks pass. `--ssd-streaming` remains a controlled-test override.
 In SSD mode Qwen grows its Metal expert cache in 321-expert slabs (about
 0.529 GiB) instead of taking the generic 4 GiB first slab.
 
@@ -257,22 +245,11 @@ The hard SSD cache floor is 321 complete routed experts (about 0.53 GiB); 640
 (about 1.06 GiB) is a useful controlled small-cache tier. Startup and the
 per-layer path fail closed if the effective locked cache falls below the floor.
 The runtime has completed model-backed resident and SSD generation on an M5 Pro
-with 64 GiB, plus bounded SSD generation on a physical M1 Pro with 16 GiB. On
-production main `bd62a0b`, AUTO started with 321 cached experts for prefill and
-grew toward 2,241 for decode. One cold request completed at 10.56/8.24
-prefill/generation t/s; four subsequent distinct short prompts had medians of
-15.04/9.77 t/s, with normal memory pressure and no new swapouts. This recheck
-used the canonical migration GGUF; the native ExpertMajor v1 artifact was not
-copied to the 16 GiB host because only 3.6 GB of disk space was free. The older
-4.06/7.03 result remains a conservative 321-expert compatibility floor, not the
-current production speed. See
-[`tests/qwen/README.md`](tests/qwen/README.md) for the exact artifact contract,
-reproducible evidence, and current limitations.
-
-Metal on Apple Silicon is the current proving ground for fork-specific
-optimization. The inherited CUDA/DGX Spark and ROCm/Strix Halo DeepSeek paths
-remain supported targets, but a Metal result is not advertised as a Blackwell
-or Strix Halo result until it is re-measured on that backend.
+with 64 GiB. The v2 resident smoke produced identical output, and its 2K
+v2/v1/v2 A/B measured 318.96/29.54, 320.59/29.59, and 318.83/29.54 prefill/decode
+t/s with byte-identical evidence and no new swapout. The 64 GiB Mac is the
+current release baseline; lower-memory results from retired canonical/v1 paths
+are historical and do not extend the v2 support contract.
 
 ## Measured results
 
@@ -281,13 +258,13 @@ each model uses a different artifact, context, and runtime path.
 
 | Model | Best measured setup | Prefill | Generation / decode | Status |
 | --- | --- | ---: | ---: | --- |
-| Qwen3.6-35B-A3B Q4_K_S, 20.81 GB | M5 Pro 64 GB, Metal resident | **258.08 t/s** | 57.81 t/s | Controlled DS4 prefill A/B, +23.3% over the previous dispatch; greedy output identical |
-| Qwen3.6-35B-A3B Q4_K_S, 20.81 GB | M5 Pro 64 GB, page-touched resident CLI | 218.30 t/s | **63.94 t/s** | Best retained real CLI generation number; same rendered prompt and visible continuation as the llama.cpp reference |
-| Qwen3.6-35B-A3B Q4_K_S, 20.81 GB | M1 Pro 16 GB, Metal AUTO to SSD, canonical migration GGUF | **15.04 t/s** | **9.77 t/s** | Warm median over four distinct short prompts after one cold run; normal pressure, no new swapouts |
+| Qwen3.6-35B-A3B ExpertMajor v2 Q4_K_S, 20.81 GB | M5 Pro 64 GB, Metal resident, 2K+16 | **318.96 t/s** | **29.54 t/s** | v2/v1/v2 A/B; both v2 arms byte-identical to the control, no new swapout |
 | DeepSeek V4 Flash IQ2XXS, 86.72 GB | M5 Pro 64 GB, Metal SSD streaming | 20.75 t/s | 12.58 t/s | Direct upstream/fork A/B showed parity, not a fork speedup |
 | GLM 5.2 ExpertMajor v2 Q2_K, 244.14 GiB | M5 Pro 64 GB, rested internal storage, 288+32 tokens | **11.08 t/s** | **1.90 t/s** | Prior qualified median; current main port restores same-condition parity, final simple AUTO-601 gates measured 10.63-10.91/1.77-1.79 t/s, and the best profiled decode was 1.81 t/s |
 
-DeepSeek hardware reference bests from the standard `speed-bench` sweep:
+Historical upstream DeepSeek hardware reference bests from the standard
+`speed-bench` sweep follow. They are context for comparison, not a statement
+that this v2-only fork runtime supports those non-Metal hosts:
 
 | Host | Model | Prefill | Generation |
 | --- | --- | ---: | ---: |
@@ -297,6 +274,7 @@ DeepSeek hardware reference bests from the standard `speed-bench` sweep:
 | DGX Spark GB10, 128 GB | Flash q2, 7,047-token context | 343.81 t/s | 13.75 t/s |
 
 Full commands, samples, and caveats are in
+[`docs/benchmarks/2026-07-20-qwen-expert-major-v2.md`](docs/benchmarks/2026-07-20-qwen-expert-major-v2.md),
 [`docs/benchmarks/2026-07-15-qwen-ds4-vs-llamacpp.md`](docs/benchmarks/2026-07-15-qwen-ds4-vs-llamacpp.md),
 [`docs/benchmarks/2026-07-20-glm52-expert-major-v2.md`](docs/benchmarks/2026-07-20-glm52-expert-major-v2.md),
 [`docs/benchmarks/2026-07-14-m5-pro.md`](docs/benchmarks/2026-07-14-m5-pro.md),
@@ -343,16 +321,13 @@ and still a work in progress.
 
 - [`docs/ENGINE_REFERENCE.md`](docs/ENGINE_REFERENCE.md): complete model,
   runtime, server, agent, KV-cache, distributed, backend, and debugging guide.
-- [`tests/qwen/README.md`](tests/qwen/README.md): experimental Qwen artifact
-  contract, oracle procedure, Metal + SSD commands, measurements, and limits.
 - [`docs/qwen-expert-major-store.md`](docs/qwen-expert-major-store.md):
-  DS4-native GGUF layout, transactional converter, compatibility, and parity
-  evidence.
+  Qwen v2 layout, converter, runtime contract, and parity evidence.
 - [`docs/glm52-expert-major-v2.md`](docs/glm52-expert-major-v2.md): embedded GLM
   artifact, one-command startup, prefill/decode memory flow, qualification, and
   supported memory tiers.
-- [`docs/expert-major-v2-roadmap.md`](docs/expert-major-v2-roadmap.md): generic
-  expert-major manifest and separate DeepSeek/GLM qualification plan.
+- [`docs/expert-major-v2-roadmap.md`](docs/expert-major-v2-roadmap.md): shared
+  ExpertMajor v2 contract and family-specific qualification status.
 - [`CONTRIBUTING.md`](CONTRIBUTING.md): upstream-first contribution policy and
   correctness/performance gates.
 - [`FORK_NOTES.md`](FORK_NOTES.md): fork delta and upstreamability ledger.
@@ -393,11 +368,11 @@ DSA KV, grouped Q2_K prefill, physical expert-record addressing, NextN metadata
 binding, tokenizer/prompt routing, and a pressure-sized cache policy for the
 64 GiB reference tier.
 
-The promotion does not make GLM code a generic fallback for DeepSeek, Qwen,
-CPU, CUDA, ROCm, or distributed execution. Family checks keep those paths on
-their existing schedules, and native artifacts fail closed on unsupported
-backends. The DeepSeek regression discovered on the historical upstream GLM
-line remains tracked in [#532](https://github.com/antirez/ds4/issues/532).
+All admitted families use ExpertMajor v2, but GLM does not become a compute or
+cache fallback for DeepSeek or Qwen. Family checks select their independent
+Metal schedules, while CPU, CUDA, ROCm, and distributed execution fail closed.
+The DeepSeek regression discovered on the historical upstream GLM line remains
+tracked in [#532](https://github.com/antirez/ds4/issues/532).
 
 Speculative streamed decode is still a measured no-go: the existing NextN
 probe reached about 55% acceptance, below the level needed to repay its extra
@@ -545,10 +520,9 @@ and only when the CPU router is active (streaming-IQ2 or PRO-Q4 paths). Details 
 
 The long-form guide now lives in
 [`docs/ENGINE_REFERENCE.md`](docs/ENGINE_REFERENCE.md). It covers model
-downloads, full-resident and SSD-streamed operation, distributed inference,
-power controls, the native agent, benchmarking, capability evaluation, CLI,
-server/tool calling, disk KV cache, backends, steering, test vectors, and
-debugging.
+downloads, full-resident and SSD-streamed operation, the native agent,
+benchmarking, capability evaluation, CLI, server/tool calling, disk KV cache,
+historical upstream backend controls, steering, test vectors, and debugging.
 
 Keeping the manual separate makes this README a reviewable landing page while
 preserving the full operational reference.

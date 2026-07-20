@@ -29,6 +29,16 @@ TENSOR_F16 = 1
 TENSOR_Q8_0 = 8
 TENSOR_Q4_K = 12
 TENSOR_Q5_K = 13
+TENSOR_I8 = 24
+
+EXPERT_STORE_TENSOR = "ds4.expert_major.v2"
+EXPERT_STORE_V1_TENSOR = "ds4.expert_major.v1"
+EXPERT_STORE_HEADER_BYTES = 256
+EXPERT_STORE_LAYER_BYTES = 224
+EXPERT_STORE_COMPONENT_BYTES = 56
+EXPERT_STORE_COMPONENT_OFFSET = 32
+EXPERT_STORE_ALIGNMENT = 4096
+EXPERT_STORE_MANIFEST_DIGEST_OFFSET = 168
 
 QWEN_CHAT_TEMPLATE_PATH = (
     Path(__file__).with_name("qwen") / "qwen36_chat_template.jinja"
@@ -228,14 +238,108 @@ def tensor_bytes(tensor: Tensor) -> int:
         TENSOR_Q8_0: (32, 34),
         TENSOR_Q4_K: (256, 144),
         TENSOR_Q5_K: (256, 176),
+        TENSOR_I8: (1, 1),
     }[tensor.value_type]
     return ((elements + block_elems - 1) // block_elems) * block_bytes
+
+
+def align_up(value: int, alignment: int) -> int:
+    return (value + alignment - 1) // alignment * alignment
+
+
+def qwen_v2_store() -> tuple[Tensor, bytes]:
+    layer_count = 40
+    expert_count = 256
+    expert_used_count = 8
+    source_tensor_count = len(qwen_tensors())
+    data_offset = align_up(
+        EXPERT_STORE_HEADER_BYTES + layer_count * EXPERT_STORE_LAYER_BYTES,
+        EXPERT_STORE_ALIGNMENT,
+    )
+    cursor = data_offset
+    descriptors = bytearray()
+    component_dims = (
+        (2048, 512, expert_count),
+        (2048, 512, expert_count),
+        (512, 2048, expert_count),
+    )
+    for layer in range(layer_count):
+        cursor = align_up(cursor, EXPERT_STORE_ALIGNMENT)
+        entry = bytearray(EXPERT_STORE_LAYER_BYTES)
+        record_bytes = 0
+        component_bytes: list[int] = []
+        for dims in component_dims:
+            one_expert = Tensor("", (dims[0], dims[1], 1), TENSOR_Q4_K)
+            component_bytes.append(tensor_bytes(one_expert))
+            record_bytes += component_bytes[-1]
+        layer_bytes = record_bytes * expert_count
+        struct.pack_into(
+            "<IIQQQ", entry, 0,
+            layer, expert_count, record_bytes, cursor, layer_bytes,
+        )
+        record_offset = 0
+        for role, (dims, expert_bytes) in enumerate(
+            zip(component_dims, component_bytes)
+        ):
+            struct.pack_into(
+                "<IIIIQQQQQ", entry,
+                EXPERT_STORE_COMPONENT_OFFSET +
+                role * EXPERT_STORE_COMPONENT_BYTES,
+                role, TENSOR_Q4_K, 3, 256,
+                dims[0], dims[1], dims[2], expert_bytes, record_offset,
+            )
+            record_offset += expert_bytes
+        descriptors += entry
+        cursor += layer_bytes
+
+    store_size = cursor
+    header = bytearray(EXPERT_STORE_HEADER_BYTES)
+    header[:8] = b"DS4EXPV2"
+    struct.pack_into(
+        "<IIIIIIQQQQQQQ", header, 8,
+        2, EXPERT_STORE_HEADER_BYTES, 3, expert_used_count,
+        layer_count, expert_count, source_tensor_count, layer_count,
+        len(descriptors), EXPERT_STORE_HEADER_BYTES, data_offset,
+        store_size - data_offset, store_size,
+    )
+    struct.pack_into("<Q", header, 88, 1)
+    manifest_header = bytearray(header)
+    manifest_header[
+        EXPERT_STORE_MANIFEST_DIGEST_OFFSET:
+        EXPERT_STORE_MANIFEST_DIGEST_OFFSET + 32
+    ] = bytes(32)
+    digest = hashlib.sha256(manifest_header + descriptors).digest()
+    header[
+        EXPERT_STORE_MANIFEST_DIGEST_OFFSET:
+        EXPERT_STORE_MANIFEST_DIGEST_OFFSET + 32
+    ] = digest
+    return Tensor(EXPERT_STORE_TENSOR, (store_size,), TENSOR_I8), \
+        bytes(header + descriptors)
+
+
+def qwen_native_tensors(version: int) -> tuple[list[Tensor], dict[str, bytes]]:
+    non_routed = [
+        tensor for tensor in qwen_tensors()
+        if not tensor.name.endswith((
+            ".ffn_gate_exps.weight",
+            ".ffn_up_exps.weight",
+            ".ffn_down_exps.weight",
+        ))
+    ]
+    if version == 2:
+        store, manifest = qwen_v2_store()
+        return non_routed + [store], {store.name: manifest}
+    if version == 1:
+        store = Tensor(EXPERT_STORE_V1_TENSOR, (1,), TENSOR_I8)
+        return non_routed + [store], {store.name: b"\x00"}
+    raise AssertionError(f"unsupported native fixture version: {version}")
 
 
 def write_gguf(
     path: Path,
     metadata: OrderedDict[str, tuple[int, object]],
     tensors: list[Tensor],
+    tensor_payloads: dict[str, bytes] | None = None,
 ) -> None:
     data = bytearray()
     data += struct.pack("<IIQQ", 0x46554747, 3, len(tensors), len(metadata))
@@ -259,16 +363,32 @@ def write_gguf(
     with path.open("wb") as model:
         model.write(data)
         model.truncate(len(data) + max_tensor_bytes)
+        for name, payload in (tensor_payloads or {}).items():
+            tensor = next((item for item in tensors if item.name == name), None)
+            if tensor is None or len(payload) > tensor_bytes(tensor):
+                raise AssertionError(f"invalid synthetic payload for {name}")
+            model.seek(len(data))
+            model.write(payload)
 
 
-def run_ds4(binary: Path, model: Path, lock: Path, inspect: bool = True) -> subprocess.CompletedProcess[str]:
-    command = [str(binary), "-m", str(model), "--cpu"]
+def run_ds4(
+    binary: Path,
+    model: Path,
+    lock: Path,
+    inspect: bool = True,
+    backend: str = "cpu",
+    extra_args: tuple[str, ...] = (),
+) -> subprocess.CompletedProcess[str]:
+    command = [str(binary), "-m", str(model), f"--{backend}"]
     if inspect:
         command.append("--inspect")
     else:
         command += ["-p", "metadata gate"]
+    command += extra_args
     env = os.environ.copy()
     env["DS4_LOCK_FILE"] = str(lock)
+    env.pop("DS4_QWEN_EXPERIMENTAL_CPU", None)
+    env.pop("DS4_QWEN_EXPERIMENTAL_METAL", None)
     return subprocess.run(command, env=env, text=True, capture_output=True, check=False)
 
 
@@ -581,11 +701,67 @@ def main() -> int:
             ),
         )
         check(
-            "runtime-closed",
+            "canonical-runtime-closed",
             None,
-            "inference is disabled until the model-backed logits gate passes",
+            "Qwen inference requires a DS4 ExpertMajor v2 GGUF; "
+            "canonical and v1 execution are no longer supported",
             inspect=False,
         )
+
+        v1_tensors, v1_payloads = qwen_native_tensors(1)
+        v1_model = tmp / "v1-runtime-closed.gguf"
+        write_gguf(v1_model, qwen_metadata(), v1_tensors, v1_payloads)
+        v1_result = run_ds4(
+            binary, v1_model, tmp / "v1-runtime-closed.lock", inspect=False
+        )
+        v1_model.unlink()
+        require(v1_result.returncode != 0,
+                "Qwen native v1 inference was accepted", v1_result)
+        require(
+            "Qwen inference requires a DS4 ExpertMajor v2 GGUF; "
+            "canonical and v1 execution are no longer supported" in
+            v1_result.stdout + v1_result.stderr,
+            "Qwen native v1 did not fail at the v2-only admission gate",
+            v1_result,
+        )
+
+        v2_tensors, v2_payloads = qwen_native_tensors(2)
+        v2_model = tmp / "v2-admission.gguf"
+        write_gguf(v2_model, qwen_metadata(), v2_tensors, v2_payloads)
+        v2_inspect = run_ds4(
+            binary, v2_model, tmp / "v2-inspect.lock", inspect=True
+        )
+        require(v2_inspect.returncode == 0,
+                "Qwen native v2 inspect failed", v2_inspect)
+        require("arch:  qwen35moe" in v2_inspect.stdout + v2_inspect.stderr,
+                "Qwen native v2 inspect summary is missing", v2_inspect)
+
+        v2_cpu = run_ds4(
+            binary, v2_model, tmp / "v2-cpu.lock", inspect=False
+        )
+        require(v2_cpu.returncode != 0,
+                "Qwen native v2 CPU inference was accepted", v2_cpu)
+        require(
+            "Qwen ExpertMajor v2 inference requires the Metal runtime" in
+            v2_cpu.stdout + v2_cpu.stderr,
+            "Qwen native v2 CPU did not fail at the Metal admission gate",
+            v2_cpu,
+        )
+
+        v2_metal = run_ds4(
+            binary, v2_model, tmp / "v2-metal.lock", inspect=False,
+            backend="metal", extra_args=("--quality",),
+        )
+        v2_metal_output = v2_metal.stdout + v2_metal.stderr
+        require(v2_metal.returncode != 0,
+                "Qwen native v2 quality guard was not enforced", v2_metal)
+        require("does not support --quality yet" in v2_metal_output,
+                "Qwen native v2 did not reach Metal option validation",
+                v2_metal)
+        require("DS4_QWEN_EXPERIMENTAL_METAL" not in v2_metal_output,
+                "Qwen native v2 still requires the experimental Metal flag",
+                v2_metal)
+        v2_model.unlink()
 
     print("qwen metadata tests: OK")
     return 0

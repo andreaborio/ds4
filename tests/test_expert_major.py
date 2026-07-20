@@ -42,11 +42,15 @@ def fixture_byte(layer: int, role: int, expert: int, index: int) -> int:
     return (layer * 71 + role * 23 + expert * 7 + index) % 251
 
 
-def write_fixture(path: Path, architecture: str) -> None:
+def write_fixture(path: Path, architecture: str, *,
+                  omit_metadata: frozenset[str] = frozenset(),
+                  bad_geometry: bool = False,
+                  reported_architecture: str | None = None) -> None:
     tool = load_tool()
+    reported_architecture = reported_architecture or architecture
     if architecture == "deepseek4":
         metadata_items = (
-            metadata_string("general.architecture", architecture),
+            metadata_string("general.architecture", reported_architecture),
             metadata_u32("general.alignment", 32),
             metadata_u32("deepseek4.block_count", 2),
             metadata_u32("deepseek4.expert_count", 3),
@@ -56,7 +60,7 @@ def write_fixture(path: Path, architecture: str) -> None:
         types = ((16, 16, 10), (12, 12, 12))
     elif architecture == "glm-dsa":
         metadata_items = (
-            metadata_string("general.architecture", architecture),
+            metadata_string("general.architecture", reported_architecture),
             metadata_u32("general.alignment", 32),
             metadata_u32("glm-dsa.block_count", 5),
             metadata_u32("glm-dsa.expert_count", 3),
@@ -66,14 +70,32 @@ def write_fixture(path: Path, architecture: str) -> None:
         )
         routed_layers = (3, 4)
         types = ((10, 10, 10), (13, 13, 14))
+    elif architecture == "qwen35moe":
+        metadata_items = (
+            metadata_string("general.architecture", reported_architecture),
+            metadata_u32("general.alignment", 32),
+            metadata_u32("qwen35moe.block_count", 2),
+            metadata_u32("qwen35moe.expert_count", 3),
+            metadata_u32("qwen35moe.expert_used_count", 2),
+        )
+        routed_layers = (0, 1)
+        types = ((12, 12, 12), (12, 12, 12))
     else:
         raise AssertionError(f"unsupported fixture architecture: {architecture}")
+    metadata_items = tuple(
+        item for item in metadata_items
+        if not any(pack_string(key) == item[:8 + len(key)]
+                   for key in omit_metadata)
+    )
     metadata = b"".join(metadata_items)
     tensors = [("token_embd.weight", (4,), 0, bytes(range(16)))]
     for layer_slot, layer in enumerate(routed_layers):
         for role, role_name in enumerate(tool.ROLE_NAME):
             ggml_type = types[layer_slot][role]
-            dims = (256, 256, 3)
+            dims = ((512, 128, 3)
+                    if bad_geometry and architecture == "qwen35moe" and
+                    layer_slot == 1 and role_name == "down"
+                    else (256, 256, 3))
             size = tool.tensor_nbytes(ggml_type, dims)
             expert_bytes = size // 3
             payload = bytearray(size)
@@ -219,6 +241,96 @@ def main() -> int:
             subprocess.run(
                 [probe, str(glm_native), str(glm_store.abs_offset),
                  str(glm_store.size), str(tool.STORE_FAMILY_GLM_DSA)],
+                check=True,
+            )
+
+        qwen_source = tmp_path / "qwen-source.gguf"
+        qwen_native = tmp_path / "qwen-native.gguf"
+        write_fixture(qwen_source, "qwen35moe")
+        qwen_inspected = run("inspect", str(qwen_source))
+        assert "architecture: qwen35moe" in qwen_inspected.stdout
+        assert "family: 3" in qwen_inspected.stdout
+        assert "layers: 2" in qwen_inspected.stdout
+        assert "layer_ids: 0..1" in qwen_inspected.stdout
+        assert "experts: 3" in qwen_inspected.stdout
+        assert "Q4_K" in qwen_inspected.stdout
+        run("build", "--reserve-bytes", "0", str(qwen_source),
+            str(qwen_native))
+        run("verify", str(qwen_source), str(qwen_native))
+        qwen_gguf = tool.load_gguf(qwen_native)
+        qwen_store = next(
+            tensor for tensor in qwen_gguf.tensors
+            if tensor.name == tool.STORE_TENSOR
+        )
+        qwen_manifest, qwen_layers = tool.parse_store(qwen_gguf, qwen_store)
+        assert qwen_manifest["family"] == tool.STORE_FAMILY_QWEN35_MOE
+        assert [layer.index for layer in qwen_layers] == [0, 1]
+        assert all(
+            [component.role for component in layer.components] == [0, 1, 2]
+            for layer in qwen_layers
+        )
+
+        qwen_bad_family = tmp_path / "qwen-bad-family.gguf"
+        shutil.copyfile(qwen_native, qwen_bad_family)
+        with qwen_bad_family.open("r+b") as file:
+            store_abs = qwen_store.abs_offset
+            file.seek(store_abs)
+            header = bytearray(file.read(tool.STORE_HEADER_BYTES))
+            struct.pack_into("<I", header, 16,
+                             tool.STORE_FAMILY_DEEPSEEK4)
+            descriptors = os.pread(
+                file.fileno(),
+                qwen_manifest["layer_count"] * tool.STORE_LAYER_BYTES,
+                store_abs + tool.STORE_HEADER_BYTES,
+            )
+            header[tool.MANIFEST_DIGEST_OFFSET:
+                   tool.MANIFEST_DIGEST_OFFSET + 32] = tool.manifest_digest(
+                       header, descriptors
+                   )
+            file.seek(store_abs)
+            file.write(header)
+        family_result = run("verify", str(qwen_source),
+                            str(qwen_bad_family), ok=False)
+        assert "identity does not match" in family_result.stderr
+
+        qwen_missing_metadata = tmp_path / "qwen-missing-metadata.gguf"
+        write_fixture(
+            qwen_missing_metadata, "qwen35moe",
+            omit_metadata=frozenset({"qwen35moe.expert_used_count"}),
+        )
+        metadata_result = run("inspect", str(qwen_missing_metadata), ok=False)
+        assert "metadata is incomplete" in metadata_result.stderr
+
+        qwen_bad_geometry = tmp_path / "qwen-bad-geometry.gguf"
+        write_fixture(qwen_bad_geometry, "qwen35moe", bad_geometry=True)
+        geometry_result = run("inspect", str(qwen_bad_geometry), ok=False)
+        assert "gate/down dimensions disagree" in geometry_result.stderr
+
+        qwen_bad_architecture = tmp_path / "qwen-bad-architecture.gguf"
+        write_fixture(
+            qwen_bad_architecture, "qwen35moe",
+            reported_architecture="badfamily",
+        )
+        architecture_result = run(
+            "inspect", str(qwen_bad_architecture), ok=False
+        )
+        assert "accepts deepseek4, glm-dsa, and qwen35moe" in \
+            architecture_result.stderr
+
+        qwen_bad_payload = tmp_path / "qwen-bad-payload.gguf"
+        shutil.copyfile(qwen_native, qwen_bad_payload)
+        with qwen_bad_payload.open("r+b") as file:
+            file.seek(qwen_store.abs_offset + qwen_layers[0].data_offset)
+            original = file.read(1)
+            file.seek(-1, os.SEEK_CUR)
+            file.write(bytes([original[0] ^ 0x20]))
+        payload_result = run("verify", str(qwen_source),
+                             str(qwen_bad_payload), ok=False)
+        assert "payload mismatch" in payload_result.stderr
+        if probe:
+            subprocess.run(
+                [probe, str(qwen_native), str(qwen_store.abs_offset),
+                 str(qwen_store.size), str(tool.STORE_FAMILY_QWEN35_MOE)],
                 check=True,
             )
 

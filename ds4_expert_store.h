@@ -19,6 +19,7 @@ enum {
 typedef enum {
     DS4_EXPERT_STORE_FAMILY_DEEPSEEK4 = 1,
     DS4_EXPERT_STORE_FAMILY_GLM_DSA = 2,
+    DS4_EXPERT_STORE_FAMILY_QWEN35_MOE = 3,
 } ds4_expert_store_family;
 
 typedef enum {

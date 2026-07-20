@@ -72,9 +72,10 @@ and variance per numeric column using Welford's online algorithm. The return sho
 | AUTO adaptive candidate | 1,801 | 10.53 t/s | 1.73 t/s | 9.424 s | 22% fewer misses, slower end to end |
 | Final simple command | 601 | **10.91 t/s** | 1.77 t/s | Profiling off | Exact output, AUTO selected every policy |
 | Final source gate after compatibility cleanup | 601 | 10.63 t/s | **1.79 t/s** | Profiling off | Exact output; removed code was unreachable |
+| Post-unification v2-only gate | 601 | **11.20 t/s** | **1.82 t/s** | Profiling off | Exact output after Qwen v2 migration and legacy-source removal |
 
 The first four rows were diagnostic runs and include detailed timing
-instrumentation. The last two rows use the public command with no cache,
+instrumentation. The last three rows use the public command with no cache,
 residency, profile, or ExpertMajor flags. Values are single controlled
 observations, not medians; storage/cache state was not reset between them.
 
