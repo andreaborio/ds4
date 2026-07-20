@@ -417,6 +417,10 @@ static void print_generated_token(void *ud, int token) {
 }
 
 static bool build_prompt(ds4_engine *engine, const cli_generation_options *gen, ds4_tokens *out) {
+    if (gen->raw_prompt) {
+        return ds4_tokenize_text_checked(
+            engine, gen->prompt ? gen->prompt : "", out);
+    }
     if (ds4_engine_prompt_is_rendered_chat(engine, gen->prompt)) {
         return ds4_tokenize_rendered_chat_checked(engine, gen->prompt, out);
     }

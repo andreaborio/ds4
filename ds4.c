@@ -49179,8 +49179,12 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
     const bool graph_backend = ds4_backend_uses_graph(opt->backend);
     if (graph_backend) ds4_linux_graph_backend_set_oom_score(opt->backend);
     model_open(&e->model, opt->model_path, graph_backend, !opt->inspect_only);
+    /* Qwen has model-specific residency gates below. Every other executable
+     * family needs its tokenizer before the engine is returned; the GLM port
+     * used to load it in a dedicated branch that disappeared during the
+     * mainline unification. */
     if (!opt->inspect_only &&
-        e->model.family == DS4_MODEL_FAMILY_DEEPSEEK4) {
+        e->model.family != DS4_MODEL_FAMILY_QWEN35_MOE) {
         vocab_load(&e->vocab, &e->model);
     }
     config_validate_model(&e->model);
@@ -49998,6 +50002,22 @@ bool ds4_engine_prompt_is_rendered_chat(
         prefix = "<|im_start|>";
     } else if (e->model.family == DS4_MODEL_FAMILY_DEEPSEEK4) {
         prefix = "<｜begin▁of▁sentence｜>";
+    } else if (e->model.family == DS4_MODEL_FAMILY_GLM_DSA) {
+        static const char *const glm_prefixes[] = {
+            "[gMASK]",
+            "<sop>",
+            "<|system|>",
+            "<|user|>",
+            "<|assistant|>",
+            "<|observation|>",
+        };
+        for (size_t i = 0;
+             i < sizeof(glm_prefixes) / sizeof(glm_prefixes[0]);
+             i++) {
+            const size_t len = strlen(glm_prefixes[i]);
+            if (strncmp(prompt, glm_prefixes[i], len) == 0) return true;
+        }
+        return false;
     } else {
         return false;
     }
