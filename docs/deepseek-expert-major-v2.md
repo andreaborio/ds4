@@ -26,6 +26,19 @@ manifest. The file therefore stores the routed weights once.
 > GGUFs are accepted by the offline converter, not by the inference runtime.
 > There is no v1, sidecar, canonical, CPU, CUDA, ROCm, or distributed fallback.
 
+## Qualified Flash artifact
+
+| Item | Value |
+| --- | --- |
+| Filename | `DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix-DS4-ExpertMajor-v2.gguf` |
+| Bytes | `86,720,114,272` |
+| Complete output SHA-256 | `8378080263eb9224f7228d72e2afa4ac3cf74a116023fdec2c596ff228a33e3f` |
+
+The full output identity was re-read from the local release artifact on
+2026-07-20. Publication and model-backed QA must use these exact bytes; the
+manifest payload and canonical source hashes below are complementary evidence,
+not substitutes for the complete output hash.
+
 ## Build, inspect, and verify
 
 The converter writes a same-filesystem temporary output, preflights the output

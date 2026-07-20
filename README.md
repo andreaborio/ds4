@@ -144,8 +144,8 @@ the runtime needs.
 | Model | Location | Status | Current focus |
 | --- | --- | --- | --- |
 | DeepSeek V4 Flash ExpertMajor v2 | `main` | Supported Apple Metal resident/SSD path | Adaptive SSD streaming and grouped prefill |
-| DeepSeek V4 PRO ExpertMajor v2 | `main` | High-memory Apple Metal path | Per-artifact qualification remains required |
-| GLM 5.2 ExpertMajor v2 | `main` | Qualified Apple Metal SSD path; 64 GB minimum | Embedded expert store, grouped prefill, compact DSA KV, adaptive decode cache |
+| DeepSeek V4 PRO ExpertMajor v2 | offline tooling only | Not runtime-qualified; no release artifact identity | Converter and future per-artifact qualification |
+| GLM 5.2 ExpertMajor v2 | `main` | Qualified Apple Metal SSD path; 64 GB minimum | Embedded expert store, grouped prefill, compact DSA KV, 601-record DS4 cache plus adaptive macOS file caching |
 | Qwen3.6-35B-A3B ExpertMajor v2 | `main` | Supported Apple Metal resident/SSD path | AUTO mapping, resident prefill, and parallel resident decode |
 
 ### DeepSeek expert-major v2 format
@@ -263,8 +263,14 @@ each model uses a different artifact, context, and runtime path.
 | Model | Best measured setup | Prefill | Generation / decode | Status |
 | --- | --- | ---: | ---: | --- |
 | Qwen3.6-35B-A3B ExpertMajor v2 Q4_K_S, 20.81 GB | M5 Pro 64 GB, Metal resident, 2K+16 | **318.96 t/s** | **29.54 t/s** | v2/v1/v2 A/B; both v2 arms byte-identical to the control, no new swapout |
-| DeepSeek V4 Flash IQ2XXS, 86.72 GB | M5 Pro 64 GB, Metal SSD streaming | 20.75 t/s | 12.58 t/s | Direct upstream/fork A/B showed parity, not a fork speedup |
+| DeepSeek V4 Flash IQ2XXS, 86.72 GB | M5 Pro 64 GB, Metal SSD streaming, AUTO 4,387 records | **25.21 t/s** | **14.19 t/s** | Final post-isolation AUTO gate; exact frontier logits, zero swapout |
 | GLM 5.2 ExpertMajor v2 Q2_K, 244.14 GiB | M5 Pro 64 GB, rested internal storage, 288+32 tokens | **11.08 t/s** | **1.90 t/s** | Prior qualified median; current main port restores same-condition parity, final simple AUTO-601 gates measured 10.63-10.91/1.77-1.79 t/s, and the best profiled decode was 1.81 t/s |
+
+The final agent-friendly refactor candidate requalified GLM at 11.82 t/s
+prefill and 1.83 t/s decode after `make premerge`, with byte-identical output
+and unchanged swap. Earlier 1.67-1.77 t/s observations remain in the validation
+record as host/file-cache history rather than release blockers; see the
+[`2026-07-20 validation record`](docs/benchmarks/2026-07-20-agent-friendly-refactor-validation.md).
 
 Historical upstream DeepSeek hardware reference bests from the standard
 `speed-bench` sweep follow. They are context for comparison, not a statement
@@ -278,7 +284,9 @@ that this v2-only fork runtime supports those non-Metal hosts:
 | DGX Spark GB10, 128 GB | Flash q2, 7,047-token context | 343.81 t/s | 13.75 t/s |
 
 Full commands, samples, and caveats are in
+[`docs/benchmarks/2026-07-20-agent-friendly-refactor-validation.md`](docs/benchmarks/2026-07-20-agent-friendly-refactor-validation.md),
 [`docs/benchmarks/2026-07-20-qwen-expert-major-v2.md`](docs/benchmarks/2026-07-20-qwen-expert-major-v2.md),
+[`docs/benchmarks/2026-07-17-deepseek-native-expert-major.md`](docs/benchmarks/2026-07-17-deepseek-native-expert-major.md),
 [`docs/benchmarks/2026-07-15-qwen-ds4-vs-llamacpp.md`](docs/benchmarks/2026-07-15-qwen-ds4-vs-llamacpp.md),
 [`docs/benchmarks/2026-07-20-glm52-expert-major-v2.md`](docs/benchmarks/2026-07-20-glm52-expert-major-v2.md),
 [`docs/benchmarks/2026-07-14-m5-pro.md`](docs/benchmarks/2026-07-14-m5-pro.md),
@@ -324,7 +332,8 @@ and still a work in progress.
 ## Documentation
 
 - [`docs/ENGINE_REFERENCE.md`](docs/ENGINE_REFERENCE.md): complete model,
-  runtime, server, agent, KV-cache, distributed, backend, and debugging guide.
+  runtime, server, agent, KV-cache, supported-backend, retired-feature, and
+  debugging reference.
 - [`docs/qwen-expert-major-store.md`](docs/qwen-expert-major-store.md):
   Qwen v2 layout, converter, runtime contract, and parity evidence.
 - [`docs/glm52-expert-major-v2.md`](docs/glm52-expert-major-v2.md): embedded GLM
@@ -338,12 +347,10 @@ and still a work in progress.
 - [`MERGE_LOG.md`](MERGE_LOG.md): upstream synchronization history.
 - [`GOLD_METAL_SSD.md`](GOLD_METAL_SSD.md): Metal build identity, AUTO residency,
   and benchmark promotion gates.
-- [`SSD_STREAMING_VERIFICATION.md`](SSD_STREAMING_VERIFICATION.md): independent
-  SSD-streaming verification campaign.
+- [`SSD_STREAMING_VERIFICATION.md`](SSD_STREAMING_VERIFICATION.md): superseded
+  July 2026 SSD-streaming campaign evidence; not a current runtime guide.
 - [`ONEDGE_IMATRIX.md`](ONEDGE_IMATRIX.md): live, privacy-preserving imatrix
   collection.
-- [`STREAMING_MIXED_PRECISION.md`](STREAMING_MIXED_PRECISION.md): mixed-precision
-  expert streaming design and validation.
 - [`EXPERT_PRUNE.md`](EXPERT_PRUNE.md): expert profiling and prune-mask research.
 - [`gguf-tools/README.md`](gguf-tools/README.md): GGUF, imatrix, quantization, and
   quality tooling.
@@ -470,7 +477,7 @@ adversarial 3-lens review that rejected the first cut (two stale-byte paths, one
 abort — all reachable, all fixed before this exercise: the no-imatrix gate, the coverage
 fingerprint, the I32 probe exclusion).
 
-### 4. Mixed-precision routed experts under SSD streaming
+### 4. Historical mixed-precision routed-expert work
 
 Upstream `--ssd-streaming` assumes routed-expert tensors are quantized uniformly across
 layers. A GGUF with a few layers boosted to Q4_K over an IQ2 base (the forgequant boost
@@ -482,11 +489,11 @@ single-size-class expert cache pre-seeds its slab size at startup and **rejects*
 layers (which use the mapped path) instead of silently adopting their size and corrupting
 the slot accounting.
 
-Uniform models are verified **byte-identical** under the change (3/3 builds), full-residency
-paths are untouched, and mixed models were validated with the canary benchmark plus entire
-eval suites. Full diagnosis, design and behavior guarantees in
-[`STREAMING_MIXED_PRECISION.md`](STREAMING_MIXED_PRECISION.md); reported upstream with
-diagnosis and workaround in [antirez/ds4#388](https://github.com/antirez/ds4/issues/388).
+Uniform models were verified **byte-identical** under the change (3/3 builds), and mixed
+models were validated with the canary benchmark plus the evaluation suites. This is
+historical research evidence, not an extension of the current ExpertMajor v2 admission
+contract. The original diagnosis and workaround were reported in
+[antirez/ds4#388](https://github.com/antirez/ds4/issues/388).
 
 **Update (upstream converged):** antirez has since implemented equivalent mixed-precision
 streaming upstream. After the latest sync this fork **takes upstream's implementation** of

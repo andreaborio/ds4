@@ -1,9 +1,16 @@
 # SSD-streaming campaign — independent verification (2026-07-10)
 
-Independent re-verification of the claims in the 2026-07-10 SSD-streaming
-campaign handoff (`~/Beep/HANDOFF-20260710.md`, not in-repo). Every claim was
-re-run from the documented repro on the same box, paired A/B back-to-back,
-per the speed-regression methodology in `CONTRIBUTING.md`.
+> [!IMPORTANT]
+> This is superseded historical campaign evidence, not a current runtime or
+> tuning guide. Its branches, environment switches, artifacts, and relative
+> `main` references describe the 2026-07-10 code only. Current support and
+> release commands are defined by `docs/contracts/RUNTIME_SUPPORT.md`,
+> `GOLD_METAL_SSD.md`, and `QA_BEFORE_RELEASES.md`.
+
+Independent re-verification of the claims in an external 2026-07-10 campaign
+handoff that was not retained in this repository. Every claim was re-run from
+the documented reproduction on the same box, paired A/B back-to-back, per the
+speed-regression methodology in `CONTRIBUTING.md`.
 
 - Machine: MacBook M5 Pro 64 GB, macOS 26 (Darwin 25.5.0), Metal, SSD AP1024Z 1TB.
 - GLM model: GLM 5.2 `glm52-ds4-native-64g.gguf` (ds4-native layout), `--ssd-streaming`.
@@ -172,7 +179,7 @@ the K=2 speculative decode NO-GO for GLM. Worktree restored to
   commit 3bcf775 modulo context offsets): body carries machine, backend,
   quant, correctness and speed evidence per CONTRIBUTING. Stacked on #520;
   rebase to a single commit if #520 lands first.
-- DS regression issue draft (`~/Beep/upstream-issue-ds-regression-draft.md`):
+- External DS regression issue draft from the campaign:
   no overlapping upstream issue found, and the fresh 80ebbc3 probe (6.49 gen
   t/s) confirms it is still current. Two edits before publishing: the draft
   cites main as 5b95fa1 (add the 80ebbc3 datapoint) and its per-commit

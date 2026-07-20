@@ -10,7 +10,6 @@
 /ds4_agent_test
 /tests/test_q4k_dot
 /tests/test_ssd_residency
-/tests/cuda_long_context_smoke
 /build/
 /ds4flash.gguf
 *.experts.pack
@@ -23,3 +22,8 @@ __pycache__/
 /misc/
 .*.swp
 .DS_Store
+gguf-tools/imatrix/dataset/manifest.json
+gguf-tools/imatrix/dataset/prompts.jsonl
+gguf-tools/imatrix/dataset/rendered_prompts.txt
+gguf-tools/imatrix/dataset/rendered_prompts_nothink.txt
+gguf-tools/imatrix/dataset/rendered_prompts_think.txt

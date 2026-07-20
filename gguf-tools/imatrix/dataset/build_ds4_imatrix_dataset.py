@@ -23,6 +23,7 @@ import hashlib
 import json
 import random
 import re
+import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable
@@ -305,7 +306,7 @@ def doc_prompt(path: str, chunk: str, task: str) -> list[dict]:
 def make_source_records(root: Path, records: list[Record]) -> None:
     files = [
         "ds4.c", "ds4_server.c", "ds4_cli.c", "ds4_metal.m", "ds4.h", "ds4_gpu.h",
-        "README.md", "AGENT.md", "gguf-tools/README.md",
+        "README.md", "AGENTS.md", "gguf-tools/README.md",
         "gguf-tools/imatrix/README.md", "gguf-tools/imatrix/dataset/README.md",
         "gguf-tools/quality-testing/README.md",
     ]
@@ -1034,7 +1035,7 @@ def make_long_context_records(root: Path, records: list[Record]) -> None:
 
     sources = [
         ("README.md", read_text(root / "README.md")),
-        ("AGENT.md", read_text(root / "AGENT.md")),
+        ("AGENTS.md", read_text(root / "AGENTS.md")),
         ("METAL.md", read_text(root / "METAL.md")),
         ("gguf-tools/imatrix/README.md", read_text(root / "gguf-tools/imatrix/README.md")),
         ("gguf-tools/imatrix/dataset/README.md", read_text(root / "gguf-tools/imatrix/dataset/README.md")),
@@ -1094,7 +1095,7 @@ def make_long_context_records(root: Path, records: list[Record]) -> None:
         block("README.md", 0),
         block("ds4_server.c", 0),
         block("ds4_server.c", 3),
-        block("AGENT.md", 0),
+        block("AGENTS.md", 0),
     ])
     add_long("codebase:eval-imatrix", (
         "Use the following excerpts to explain how the evaluation harness and the "
@@ -1127,24 +1128,23 @@ def make_long_context_records(root: Path, records: list[Record]) -> None:
     ), [transcript_a, block("ds4_server.c", 2), block("ds4_server.c", 5)])
 
     transcript_b = "\n".join([
-        "USER: Please test CUDA on the remote machine, then check whether Metal has the same bug.",
-        "ASSISTANT TOOL_CALL bash: ssh 0.180 'cd ds4.c && make clean && make cuda && ./tests/cuda_long_context_smoke'",
+        "USER: Verify that GLM AUTO uses the qualified SSD path and that resident mode is rejected.",
+        "ASSISTANT TOOL_CALL bash: ./ds4-bench -m GLM-5.2-DS4-ExpertMajor-v2-Q2_K.gguf --ctx 8192 --tokens 2",
         "TOOL_RESULT:",
-        "nvcc -O3 --use_fast_math -o ds4-server ...\nlong_context_smoke: PASS tokens=81920 prefill=412.5s gen=128\n",
-        "ASSISTANT TOOL_CALL read_file: ds4_cuda.c lines 500..680",
+        "ds4: residency AUTO resolved to SSD streaming for GLM 5.2\nprefill 11.2 t/s decode 1.82 t/s\n",
+        "ASSISTANT TOOL_CALL bash: ./ds4-bench -m GLM-5.2-DS4-ExpertMajor-v2-Q2_K.gguf --resident --ctx 8192 --tokens 1",
         "TOOL_RESULT:",
-        "cuda kernel uses kv_row_kind to branch raw/compressed writes; host path checks ctx rows before launch.\n",
-        "USER: Do not assume. Compare with Metal and tell me whether the issue exists there too.",
-        "ASSISTANT TOOL_CALL read_file: ds4_metal.m lines 900..1120",
+        "ds4: GLM 5.2 supports SSD streaming only; resident request rejected before inference\n",
+        "ASSISTANT TOOL_CALL read_file: docs/contracts/RUNTIME_SUPPORT.md",
         "TOOL_RESULT:",
-        "Metal path stores raw and compressed KV through distinct command encoders and asserts the row range before dispatch.\n",
-        "USER: Summarize the conclusion and what regression test would catch this later.",
+        "GLM AUTO resolves to SSD streaming only; explicit resident mode is rejected.\n",
+        "USER: Separate confirmed behavior from policy and name the model-free regression checks to keep.",
     ])
-    add_long("agent-transcript:cuda-metal", (
-        "Read the long tool transcript. Produce a conclusion that distinguishes "
-        "confirmed facts from inferences, and name the regression test that would "
-        "make the issue findable in the future."
-    ), [transcript_b, block("ds4_metal.m", 2), block("metal/dense.metal", 0)])
+    add_long("agent-transcript:glm-residency", (
+        "Read the long tool transcript. Distinguish observed behavior from the "
+        "runtime contract and name the AUTO and resident regression checks that "
+        "would make a future policy drift findable."
+    ), [transcript_b, block("ds4.c", 6), block("ds4_metal.m", 2)])
 
     transcript_c = "\n".join([
         "USER: The benchmark TUI flickers after I press arrows.",
@@ -1239,7 +1239,7 @@ def make_long_context_records(root: Path, records: list[Record]) -> None:
         block("README.md", 3),
         block("gguf-tools/imatrix/README.md", 0),
         block("gguf-tools/quality-testing/README.md", 0),
-        block("AGENT.md", 1),
+        block("AGENTS.md", 1),
     ])
 
     # Needle-in-haystack: keep one small slice. The useful signal is the long
@@ -2189,10 +2189,72 @@ def write_outputs(outdir: Path, records: list[Record]) -> None:
                                           encoding="utf-8")
 
 
+GENERATED_FILES = (
+    "manifest.json",
+    "prompts.jsonl",
+    "rendered_prompts.txt",
+    "rendered_prompts_nothink.txt",
+    "rendered_prompts_think.txt",
+)
+
+
+def file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as source:
+        for chunk in iter(lambda: source.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def check_outputs(records: list[Record]) -> None:
+    forbidden = (
+        b"AGENT.md",
+        b"agent-transcript:cuda-metal",
+        b"DS4_BACKEND_CUDA",
+        b"make cuda",
+        b"cuda_long_context_smoke",
+        b"ds4_cuda.cu",
+        b"make strix-halo",
+        b"make rocm",
+    )
+    with tempfile.TemporaryDirectory(prefix="ds4-imatrix-check-a-") as a_name, \
+         tempfile.TemporaryDirectory(prefix="ds4-imatrix-check-b-") as b_name:
+        a = Path(a_name)
+        b = Path(b_name)
+        write_outputs(a, records)
+        write_outputs(b, records)
+        for name in GENERATED_FILES:
+            first = a / name
+            second = b / name
+            if file_sha256(first) != file_sha256(second):
+                raise RuntimeError(f"generated output is not deterministic: {name}")
+            payload = first.read_bytes()
+            for stale in forbidden:
+                if stale in payload:
+                    raise RuntimeError(
+                        f"generated output contains retired context {stale!r}: {name}"
+                    )
+        manifest = json.loads((a / "manifest.json").read_text(encoding="utf-8"))
+        if manifest.get("record_count", 0) <= 0:
+            raise RuntimeError("generated manifest has no records")
+        print(
+            "imatrix dataset check passed "
+            f"({manifest['record_count']} deterministic prompts)"
+        )
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--out", default=None, help="Output directory. Defaults to this script's directory.")
+    parser.add_argument(
+        "--check",
+        action="store_true",
+        help="Generate twice in temporary directories and verify deterministic, current output.",
+    )
     args = parser.parse_args()
+
+    if args.check and args.out:
+        parser.error("--check cannot be combined with --out")
 
     script_dir = Path(__file__).resolve().parent
     root = find_repo_root(script_dir)
@@ -2208,6 +2270,9 @@ def main() -> None:
     make_translation_records(records)
     make_eval_reasoning_records(root, records)
     make_long_context_records(root, records)
+    if args.check:
+        check_outputs(records)
+        return
     write_outputs(outdir, records)
 
     manifest = json.loads((outdir / "manifest.json").read_text(encoding="utf-8"))

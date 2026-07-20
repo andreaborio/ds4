@@ -25,7 +25,7 @@ snapshot drifts.
 
 | change | what | upstream status |
 |---|---|---|
-| `gguf-tools/Makefile` quality-score link (`d2101a5`) | add `ds4_distributed.o ds4_ssd.o` to `QUALITY_OBJS`; the scorer stopped linking after the streaming refactor | **PR OPEN** — [antirez/ds4#434](https://github.com/antirez/ds4/pull/434). Pure build fix, no backend hot path. |
+| `gguf-tools/Makefile` quality-score link (`d2101a5`) | historical linkage fix for `ds4_distributed.o ds4_ssd.o` after the streaming refactor | **OBSOLETE IN THIS FORK** — distributed source and its object were retired; `ds4_ssd.o` remains linked. Upstream history: [antirez/ds4#434](https://github.com/antirez/ds4/pull/434). |
 | Live server imatrix (`ee7181f`) | allow `ds4-server --imatrix-out` to aggregate routed-MoE statistics from live traffic without storing prompts | **UPSTREAM PR REQUIRED after final privacy/API review** — default-off and broadly applicable; design and verification in `ONEDGE_IMATRIX.md`. |
 | `deepseek4-quantize --reuse` (`ef80754`, `f330c3b`) | incremental re-quantize: copy byte-identical tensors from a prior build and regenerate only changed tensors | **UPSTREAM PR REQUIRED after reuse-key hardening** — quantizer/tooling only. Blind the key with the quantizer implementation/version and lead with the byte-verifier. |
 | Re-calibration reuse (`db96c2b`, `69787f1`, `324cc5a`) | reuse imatrix-independent tensors when only the calibration matrix changes | **UPSTREAM PR REQUIRED after the same key hardening** — keep stacked with, or follow, the base `--reuse` proposal; measured byte checks are already documented. |

@@ -1,5 +1,4 @@
 #include "ds4.h"
-#include "ds4_distributed.h"
 #include "ds4_help.h"
 #include "ds4_kvstore.h"
 #include "ds4_web.h"
@@ -76,7 +75,6 @@ typedef enum {
     AGENT_WORKER_PREFILL,
     AGENT_WORKER_GENERATING,
     AGENT_WORKER_COMPACTING,
-    AGENT_WORKER_DRAINING,
     AGENT_WORKER_SAVING,
     AGENT_WORKER_ERROR,
     AGENT_WORKER_STOPPED,
@@ -512,28 +510,17 @@ static float parse_float_range(const char *s, const char *opt, float min, float 
 
 static ds4_backend parse_backend(const char *s) {
     if (!strcmp(s, "metal")) return DS4_BACKEND_METAL;
-#ifdef DS4_ROCM_BUILD
-    if (!strcmp(s, "rocm")) return DS4_BACKEND_CUDA;
-#else
-    if (!strcmp(s, "cuda")) return DS4_BACKEND_CUDA;
-#endif
     if (!strcmp(s, "cpu")) return DS4_BACKEND_CPU;
     fprintf(stderr, "ds4-agent: invalid backend: %s\n", s);
-#ifdef DS4_ROCM_BUILD
-    fprintf(stderr, "ds4-agent: valid backends are: metal, rocm, cpu\n");
-#else
-    fprintf(stderr, "ds4-agent: valid backends are: metal, cuda, cpu\n");
-#endif
+    fprintf(stderr, "ds4-agent: valid backends are: metal, cpu\n");
     exit(2);
 }
 
 static ds4_backend default_backend(void) {
 #ifdef DS4_NO_GPU
     return DS4_BACKEND_CPU;
-#elif defined(__APPLE__)
-    return DS4_BACKEND_METAL;
 #else
-    return DS4_BACKEND_CUDA;
+    return DS4_BACKEND_METAL;
 #endif
 }
 
@@ -583,22 +570,8 @@ static agent_config parse_options(int argc, char **argv) {
             usage(stdout, topic);
             exit(0);
         }
-        char dist_parse_err[256] = {0};
-        ds4_dist_cli_parse_result dist_parse =
-            ds4_dist_parse_cli_arg(arg,
-                                   &i,
-                                   argc,
-                                   argv,
-                                   &c.engine.distributed,
-                                   dist_parse_err,
-                                   sizeof(dist_parse_err));
-        if (dist_parse == DS4_DIST_CLI_ERROR) {
-            fprintf(stderr,
-                    "ds4-agent: %s\n",
-                    dist_parse_err[0] ? dist_parse_err : "invalid distributed option");
-            exit(2);
-        }
-        if (dist_parse == DS4_DIST_CLI_MATCHED) continue;
+        if (ds4_help_reject_retired_distributed_option(
+                stderr, DS4_HELP_AGENT, arg)) exit(2);
 
         if (!strcmp(arg, "-p") || !strcmp(arg, "--prompt")) {
             c.gen.prompt = need_arg(&i, argc, argv, arg);
@@ -643,13 +616,6 @@ static agent_config parse_options(int argc, char **argv) {
             c.engine.backend = parse_backend(need_arg(&i, argc, argv, arg));
         } else if (!strcmp(arg, "--metal")) {
             c.engine.backend = DS4_BACKEND_METAL;
-#ifdef DS4_ROCM_BUILD
-        } else if (!strcmp(arg, "--rocm")) {
-            c.engine.backend = DS4_BACKEND_CUDA;
-#else
-        } else if (!strcmp(arg, "--cuda")) {
-            c.engine.backend = DS4_BACKEND_CUDA;
-#endif
         } else if (!strcmp(arg, "--cpu")) {
             c.engine.backend = DS4_BACKEND_CPU;
         } else if (!strcmp(arg, "-t") || !strcmp(arg, "--threads")) {
@@ -723,18 +689,6 @@ static agent_config parse_options(int argc, char **argv) {
     if (c.engine.directional_steering_file && !steering_scale_set)
         c.engine.directional_steering_ffn = 1.0f;
     c.engine.context_size = (uint32_t)c.gen.ctx_size;
-    char dist_err[256];
-    if (ds4_dist_prepare_engine_options(&c.engine.distributed,
-                                        &c.engine,
-                                        dist_err,
-                                        sizeof(dist_err)) != 0) {
-        fprintf(stderr, "ds4-agent: %s\n", dist_err);
-        exit(2);
-    }
-    if (c.engine.distributed.role == DS4_DISTRIBUTED_WORKER) {
-        fprintf(stderr, "ds4-agent: --role worker is a serving mode; start workers with ./ds4\n");
-        exit(2);
-    }
     if (c.gen.raw_prompt && (!c.non_interactive || !c.gen.prompt)) {
         fprintf(stderr,
                 "ds4-agent: --raw-prompt is only supported with --non-interactive -p\n");
@@ -4703,55 +4657,6 @@ static bool agent_worker_reset_to_sysprompt(agent_worker *w, char *err, size_t e
     return true;
 }
 
-static bool agent_worker_should_stop(agent_worker *w) {
-    pthread_mutex_lock(&w->mu);
-    bool stop = w->stop;
-    pthread_mutex_unlock(&w->mu);
-    return stop;
-}
-
-static bool agent_worker_wait_distributed_route(agent_worker *w, char *err, size_t err_len) {
-    if (!w || !w->cfg ||
-        w->cfg->engine.distributed.role != DS4_DISTRIBUTED_COORDINATOR)
-        return true;
-
-    char last[160] = {0};
-    unsigned ticks = 0;
-    const struct timespec delay = {0, 250000000L};
-    for (;;) {
-        int ready = ds4_session_distributed_route_ready(w->session, err, err_len);
-        if (ready > 0) {
-            if (ticks != 0) {
-                if (w->cfg->non_interactive)
-                    fprintf(stderr, "ds4-agent: distributed route ready\n");
-                else
-                    agent_publish_system_status(w, "Distributed route ready.");
-            }
-            if (err_len) err[0] = '\0';
-            return true;
-        }
-        if (ready < 0) return false;
-
-        const char *why = err && err[0] ? err : "route incomplete";
-        if (strcmp(last, why) != 0 || (ticks % 20u) == 0) {
-            if (w->cfg->non_interactive) {
-                fprintf(stderr, "ds4-agent: waiting for distributed route: %s\n", why);
-            } else {
-                char msg[224];
-                snprintf(msg, sizeof(msg), "Waiting for distributed route: %s", why);
-                agent_publish_system_status(w, msg);
-            }
-            snprintf(last, sizeof(last), "%s", why);
-        }
-        if (agent_worker_should_stop(w)) {
-            snprintf(err, err_len, "agent stopped while waiting for distributed route");
-            return false;
-        }
-        nanosleep(&delay, NULL);
-        ticks++;
-    }
-}
-
 static bool agent_worker_has_user_session(agent_worker *w) {
     pthread_mutex_lock(&w->mu);
     bool yes = w->user_activity;
@@ -6601,92 +6506,8 @@ static bool agent_edit_find_old_span(const char *data, size_t len,
 }
 
 #ifdef DS4_AGENT_TEST
-static int agent_test_failures;
-
-static void agent_test_assert(bool cond, const char *expr,
-                              const char *file, int line) {
-    if (cond) return;
-    fprintf(stderr, "%s:%d: assertion failed: %s\n", file, line, expr);
-    agent_test_failures++;
-}
-
-#define AGENT_TEST_ASSERT(expr) \
-    agent_test_assert((expr), #expr, __FILE__, __LINE__)
-
-static void test_agent_edit_upto_tail_newline_is_not_part_of_anchor(void) {
-    const char *data =
-        "CFLAGS = -Wall -Wextra -g\n"
-        "LDFLAGS =\n"
-        "\n"
-        "all: bc\n"
-        "\n"
-        "bc: main.c\n"
-        "\t$(CC) $(CFLAGS) -o bc main.c $(LDFLAGS)\n"
-        "\n"
-        "clean:\n"
-        "\trm -f bc\n";
-    const char *old =
-        "CFLAGS = -Wall -Wextra -g\n"
-        "LDFLAGS =\n"
-        "\n"
-        "all: bc\n"
-        "\n"
-        "bc: main.c\n"
-        "\t$(CC) $(CFLAGS) -o bc main.c $(LDFLAGS)\n"
-        "\n"
-        "[upto]\n"
-        "clean:\n";
-
-    const char *match = NULL;
-    size_t match_len = 0;
-    bool anchored = false;
-    char err[128] = {0};
-    AGENT_TEST_ASSERT(agent_edit_find_old_span(data, strlen(data), old,
-                                              &match, &match_len, &anchored,
-                                              err, sizeof(err)));
-    AGENT_TEST_ASSERT(anchored);
-    AGENT_TEST_ASSERT(match == data);
-    AGENT_TEST_ASSERT(match_len == strlen(data) - strlen("\trm -f bc\n"));
-}
-
-static void test_agent_edit_upto_requires_tail_after_newline_strip(void) {
-    const char *data = "head\nbody\ntail\n";
-    const char *old = "head\n[upto]\n";
-    const char *match = NULL;
-    size_t match_len = 0;
-    bool anchored = false;
-    char err[128] = {0};
-
-    AGENT_TEST_ASSERT(!agent_edit_find_old_span(data, strlen(data), old,
-                                               &match, &match_len, &anchored,
-                                               err, sizeof(err)));
-    AGENT_TEST_ASSERT(strstr(err, "must include a unique tail anchor") != NULL);
-}
-
-static void test_agent_returned_user_text_preserves_ownership_and_order(void) {
-    agent_worker w = {0};
-    w.wake_fd[0] = -1;
-    w.wake_fd[1] = -1;
-    pthread_mutex_init(&w.mu, NULL);
-
-    worker_return_user_text(&w, xstrdup("first rejected message"));
-    worker_return_user_text(&w, xstrdup("second rejected message"));
-    char *returned = worker_take_returned_user_text(&w);
-    AGENT_TEST_ASSERT(returned != NULL);
-    AGENT_TEST_ASSERT(returned && !strcmp(
-        returned,
-        "first rejected message\n\nsecond rejected message"));
-    AGENT_TEST_ASSERT(worker_take_returned_user_text(&w) == NULL);
-
-    free(returned);
-    pthread_mutex_destroy(&w.mu);
-}
-
-static void ds4_agent_unit_tests_run(void) {
-    test_agent_edit_upto_tail_newline_is_not_part_of_anchor();
-    test_agent_edit_upto_requires_tail_after_newline_strip();
-    test_agent_returned_user_text_preserves_ownership_and_order();
-}
+#include "tests/internal/ds4_agent_unit.h"
+#include "tests/internal/ds4_agent_unit.inc"
 #endif
 
 static bool agent_preflight_edit_old(agent_worker *w, const agent_tool_call *call,
@@ -8842,9 +8663,8 @@ static void *worker_main(void *arg) {
                 w->cfg->engine.model_path ? w->cfg->engine.model_path : "",
                 w->cfg->gen.trace_path ? w->cfg->gen.trace_path : "");
     char init_err[160] = {0};
-    bool init_ok = agent_worker_wait_distributed_route(w, init_err, sizeof(init_err));
-    if (init_ok && !w->cfg->gen.raw_prompt)
-        init_ok = agent_worker_reset_to_sysprompt(w, init_err, sizeof(init_err));
+    bool init_ok = w->cfg->gen.raw_prompt ||
+        agent_worker_reset_to_sysprompt(w, init_err, sizeof(init_err));
     if (!init_ok) {
         agent_set_error(w, init_err[0] ? init_err : "failed to initialize system prompt");
     }
@@ -8971,17 +8791,6 @@ static int worker_status_power_locked(agent_worker *w) {
 static void worker_interrupt(agent_worker *w) {
     pthread_mutex_lock(&w->mu);
     w->interrupt = true;
-    if (w->cfg &&
-        w->cfg->engine.distributed.role == DS4_DISTRIBUTED_COORDINATOR &&
-        (w->status.state == AGENT_WORKER_PREFILL ||
-         w->status.state == AGENT_WORKER_GENERATING ||
-         w->status.state == AGENT_WORKER_COMPACTING))
-    {
-        w->status.state = AGENT_WORKER_DRAINING;
-        w->status.prefill_tps = 0.0;
-        w->status.greedy_sampling = false;
-        agent_wake_locked(w);
-    }
     pthread_mutex_unlock(&w->mu);
 }
 
@@ -9192,10 +9001,6 @@ static void build_status_text(const agent_status *st, char *buf, size_t len) {
     case AGENT_WORKER_COMPACTING:
         snprintf(buf, len, "ctx %s/%s | COMPACTING summary %d tokens %.1f t/s%s",
                  used, total_ctx, st->generated, st->gen_tps, power);
-        break;
-    case AGENT_WORKER_DRAINING:
-        snprintf(buf, len, "ctx %s/%s | stopping after distributed cluster drains%s",
-                 used, total_ctx, power);
         break;
     case AGENT_WORKER_SAVING:
         snprintf(buf, len, "ctx %s/%s | saving session%s", used, total_ctx, power);

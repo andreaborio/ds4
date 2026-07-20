@@ -79,6 +79,50 @@ instrumentation. The last three rows use the public command with no cache,
 residency, profile, or ExpertMajor flags. Values are single controlled
 observations, not medians; storage/cache state was not reset between them.
 
+### Agent-friendly refactor recheck
+
+The final 2026-07-20 refactor binary preserved the exact 288+32 continuation.
+On the same M5 Pro, normal AUTO runs measured 12.05/1.72, 11.10/1.67, and a
+post-`make premerge` 11.27/1.77 t/s prefill/decode. Prefill therefore remains
+above the recorded release lane, but these individual decode observations do
+not pass the 1.82 t/s performance reference. The post-rebuild run used binary
+SHA-256 `dcf10d6d8c0a27b4905c79584eeaf5bacf1b142fd66d1328d3302c2063955500`
+and produced the exact continuation with stdout SHA-256
+`2803fda8b47acff3aedd24bd7609b0c649602ca1fa6d908368b57fe2a586a5c2`.
+A one-change ablation that disabled GLM batched victim reuse fell further to
+1.60 t/s and was reverted. The 1,801-record plus reduced split threshold arm
+also regressed to 1.52 t/s and was reverted.
+
+Startup on the second run reported only 7.55 GiB free/speculative memory but
+42.99 GiB file-backed and 42.79 GiB inactive. The apparent process-RSS margin
+was therefore already being used as a reclaimable macOS file-cache tier. GLM's
+601-record cache remains the qualified DS4-managed pageable tier: forcing more
+records into it steals from that adaptive OS tier and has measured slower
+end-to-end decode.
+Those early observations did not promote the refactor by themselves.
+
+A later base/current/base check is deliberately excluded from the performance
+table. It measured 1.82, 1.28, and 1.06 t/s decode while preserving identical
+output and unchanged swap in every arm. Because the same clean base binary
+collapsed by 42% between its two arms, that sequence demonstrates host-state
+contamination rather than a code delta. A later rested candidate measured
+10.54/1.75 and still did not pass the performance gate. After the final dead
+sidecar/distributed cleanup, a clean `make premerge`, and another cooldown, the
+actual merge candidate measured **11.82 t/s prefill and 1.83 t/s decode**. It
+used binary SHA-256
+`d2eb963f3fc117b5da723a483fdd12ec6106c3f1dd2bd767bb463e4b336f092e`,
+produced the same exact output SHA-256, and left swap unchanged. This final
+observation requalifies the 1.82 lane.
+
+A diagnostic rerun enabled only the streaming-expert timing summary. It
+measured 10.50/1.73 t/s and recorded 2,325 selected-layer calls, 7,709.758 ms
+selected-read time, and 5,884.681 ms missing-bind time. Global victim scans
+cost 118.198 ms total and batched reuse preparation cost 124.119 ms total.
+Cache bookkeeping is therefore not large enough to explain or recover the
+remaining decode gap. The next useful optimization target is selected-ID/read/
+bind overlap or removal of a layer synchronization, not another blind cache
+increase.
+
 A prior qualification on rested internal storage recorded a median of 11.075
 t/s prefill and 1.900 t/s decode at 528 experts. To check whether main had lost
 that runtime performance, the old commit `08f3ebed` and the new port were built
@@ -162,6 +206,13 @@ at 1,801, fewer small miss sets serialize the same per-layer barrier. Larger
 cache metadata and memory pressure add cost as well. Hit rate is therefore not
 the optimization objective; end-to-end token latency is.
 
+This is still adaptive memory use. The explicit expert cache is a small
+DS4-managed pageable tier; the remaining RAM is automatically consumed and reclaimed by
+macOS as file-backed cache. AUTO recomputes the safe expert-cache ceiling from
+physical memory and live pressure, but the measured 64 GiB GLM policy does not
+grow merely because the ceiling is larger. On 96/128 GiB hosts the generic
+pressure-admitted candidate remains available for separate qualification.
+
 No 96 or 128 GiB number is inferred from the 64 GiB host. Those tiers retain
 the ordinary pressure-admitted adaptive candidate until measured physically.
 
@@ -174,7 +225,7 @@ The campaign reused earlier GLM evidence rather than rerunning known losers:
 | Predicted-expert install | About 75% accuracy, pool contention, 1.15 t/s | Removed from parser, backend API, and Metal implementation |
 | Advisory lookahead > 1 | Prediction accuracy falls as layer distance grows | Keep lookahead 1 |
 | More cache at 64 GiB | 1,801 experts: 1.73 t/s vs 1.81 at 601 | AUTO uses 601 |
-| `F_NOCACHE` / aggressive `DONTNEED` | Prior campaigns regressed throughput materially | Removed from release path |
+| `F_NOCACHE` / aggressive `DONTNEED` | Prior campaigns regressed throughput materially | Removed from the release implementation |
 | MTLIO, QoS, sub-chunking, alternate LRU families | No repeatable end-to-end win in recorded campaigns | Do not expose as startup choices |
 | MTP at about 55% acceptance | Extra expert I/O cost exceeds accepted-token gain | Off |
 

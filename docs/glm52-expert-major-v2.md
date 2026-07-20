@@ -41,8 +41,9 @@ The local API uses the same contract:
 
 Do not add `--metal`, `--ssd-streaming`, a cache size, a preload count, a
 full-layer count, or ExpertMajor environment variables. On Apple Silicon DS4
-selects Metal, detects that the file cannot be resident, activates the GLM Gold
-profile, validates the embedded store, and chooses the cache policy. The
+selects Metal and applies the GLM SSD-only model policy regardless of host
+capacity; an explicit resident request is rejected. It then activates the GLM
+Gold profile, validates the embedded store, and chooses the cache policy. The
 explicit 8K context is the predictable 64 GiB starting point; larger contexts
 should be admitted and measured independently.
 
@@ -104,12 +105,23 @@ decode. The final command after compatibility cleanup measured 1.79 t/s. A
 prior rested-storage qualification of the same ExpertMajor runtime had a 1.90
 t/s median. A same-condition comparison after repeated I/O measured 1.75 t/s
 on the old qualified commit and 1.74 t/s on the new port, showing runtime
-parity rather than a new decode regression.
+parity rather than a new decode regression. The final refactor candidate then
+measured 11.82 t/s prefill and 1.83 t/s decode after a clean `make premerge`,
+with the exact deterministic output and unchanged swap, requalifying the
+tracked 1.82 decode lane.
 
 The 64 GiB AUTO policy holds 601 experts: one complete 75 x 8 route plus an
 in-flight slot. A larger 1,801-expert cache cut misses by about 22% but slowed
 decode from 1.81 to 1.73 t/s. Fewer misses did not compensate for narrower
 per-layer I/O concurrency and the larger cache-management footprint.
+
+The remaining unified memory is not required to appear in process RSS to help
+inference. macOS uses it as a reclaimable file-backed cache for the GGUF. In a
+post-refactor run, startup reported about 43 GiB file-backed/inactive while the
+DS4-managed pageable expert-cache tier stayed at 601 records. This two-tier
+behavior is adaptive: AUTO constrains the DS4-managed cache allocation using
+current pressure, while the OS grows or reclaims its file-backed tier without a
+DS4 cache-size flag.
 
 The predicted-expert install prototype was also removed. It reached only about
 75% prediction accuracy, contended for the same pool, and measured 1.15 t/s.

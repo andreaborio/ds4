@@ -190,12 +190,6 @@ bool ds4_kvstore_store_live_prefix(ds4_kvstore *kc,
                                    const ds4_kvstore_trailer_hooks *hooks,
                                    char *err,
                                    size_t err_len);
-bool ds4_kvstore_maybe_store_continued(ds4_kvstore *kc,
-                                       ds4_engine *engine,
-                                       ds4_session *session,
-                                       const ds4_kvstore_trailer_hooks *hooks,
-                                       char *err,
-                                       size_t err_len);
 int ds4_kvstore_try_load_text(ds4_kvstore *kc,
                               ds4_engine *engine,
                               ds4_session *session,

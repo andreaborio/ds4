@@ -111,6 +111,39 @@ static const char *tool_name(ds4_help_tool tool) {
     return "ds4";
 }
 
+static const char *retired_distributed_option(const char *arg) {
+    static const char *const options[] = {
+        "--role",
+        "--layers",
+        "--listen",
+        "--coordinator",
+        "--dist-prefill-chunk",
+        "--dist-prefill-window",
+        "--dist-activation-bits",
+        "--dist-replay-check",
+        "--debug",
+    };
+    if (!arg) return NULL;
+    for (size_t i = 0; i < sizeof(options) / sizeof(options[0]); i++) {
+        const size_t len = strlen(options[i]);
+        if (!strncmp(arg, options[i], len) &&
+            (arg[len] == '\0' || arg[len] == '=')) {
+            return options[i];
+        }
+    }
+    return NULL;
+}
+
+bool ds4_help_reject_retired_distributed_option(
+        FILE *fp, ds4_help_tool tool, const char *arg) {
+    const char *option = retired_distributed_option(arg);
+    if (!option) return false;
+    fprintf(fp,
+            "%s: distributed option %s was retired; distributed inference is not supported\n",
+            tool_name(tool), option);
+    return true;
+}
+
 static const char *tool_usage(ds4_help_tool tool) {
     switch (tool) {
     case DS4_HELP_DS4:
@@ -130,7 +163,7 @@ static const char *tool_usage(ds4_help_tool tool) {
 static const char *tool_summary(ds4_help_tool tool) {
     switch (tool) {
     case DS4_HELP_DS4:
-        return "Chat with a local DwarfStar model, run one-shot prompts, inspect models, or coordinate distributed inference.";
+        return "Chat with a local DwarfStar model, run one-shot prompts, or inspect models.";
     case DS4_HELP_SERVER:
         return "Serve one loaded DwarfStar model through OpenAI, Responses, Anthropic, and completion-compatible HTTP APIs.";
     case DS4_HELP_AGENT:
@@ -147,13 +180,8 @@ static void print_model_runtime(FILE *fp, const help_colors *c,
                                 ds4_help_tool tool, bool full) {
     title(fp, c, "Model And Runtime");
     opt(fp, c, "-m, --model FILE", "GGUF model path. Default: ds4flash.gguf");
-#ifdef DS4_ROCM_BUILD
-    opt(fp, c, "--metal | --rocm | --cpu", "Select the backend explicitly.");
-    opt(fp, c, "--backend NAME", "Backend name: metal, rocm, or cpu.");
-#else
-    opt(fp, c, "--metal | --cuda | --cpu", "Select the backend explicitly.");
-    opt(fp, c, "--backend NAME", "Backend name: metal, cuda, or cpu.");
-#endif
+    opt(fp, c, "--metal | --cpu", "Select the backend explicitly.");
+    opt(fp, c, "--backend NAME", "Backend name: metal or cpu.");
     if (tool != DS4_HELP_BENCH) {
         opt(fp, c, "-c, --ctx N", "Allocated context tokens.");
     }
@@ -166,7 +194,7 @@ static void print_model_runtime(FILE *fp, const help_colors *c,
     opt(fp, c, "--ssd-streaming", "Force SSD-backed model streaming. Metal defaults to AUTO residency.");
     opt(fp, c, "--resident, --no-ssd-streaming", "Force full model residency instead of Metal AUTO selection.");
     opt(fp, c, "--ssd-streaming-cold", "SSD streaming: skip default popularity-based expert-cache preload.");
-    opt(fp, c, "--ssd-streaming-cache-experts N|NGB", "SSD streaming: routed expert cache as expert count or GiB, e.g. 32GB. Metal/ROCm auto reserves context and 20% headroom before subtracting non-routed weights; CUDA uses its backend cache.");
+    opt(fp, c, "--ssd-streaming-cache-experts N|NGB", "SSD streaming: routed expert cache as expert count or GiB, e.g. 32GB. Metal auto reserves context and 20% headroom before subtracting non-routed weights.");
     opt(fp, c, "--ssd-streaming-preload-experts N", "SSD streaming: upfront popularity preload count. Default: auto hot seed capped at 4096; use --ssd-streaming-cold to skip.");
     if (full) {
         opt(fp, c, "ENV DS4_METAL_STREAMING_EXPERT_HOTLIST_PRIORITY=adaptive|legacy|N", "Metal hotlist initial LFU priority. Default: adaptive (1). legacy restores built-in rank/file hit priorities; positive N fixes every seed priority.");
@@ -218,20 +246,9 @@ static void print_steering(FILE *fp, const help_colors *c) {
     fputc('\n', fp);
 }
 
-static void print_distributed(FILE *fp, const help_colors *c) {
-    title(fp, c, "Distributed Inference");
-    fputc('\n', fp);
-    para(fp, c, "Distributed mode runs one logical session across several machines by assigning contiguous model layer ranges to workers. Workers own their layer slice and KV-cache shard; the coordinator owns the prompt, sampling loop, and client/API flow. Start workers first, then start the coordinator. The coordinator waits for a complete route and streams hidden states through the workers.");
-    fputc('\n', fp);
-    opt(fp, c, "--role ROLE", "Distributed role: coordinator or worker.");
-    opt(fp, c, "--layers A:B", "Inclusive layer slice, e.g. 0:20 or 21:output.");
-    opt(fp, c, "--listen HOST PORT", "Coordinator listen address; workers may use it for their data listener.");
-    opt(fp, c, "--coordinator HOST PORT", "Coordinator address for --role worker.");
-    opt(fp, c, "--dist-prefill-chunk N", "Coordinator prefill pipeline chunk size. Default: session cap.");
-    opt(fp, c, "--dist-prefill-window N", "Max prefill chunks in flight. Default: workers+2, capped at 8.");
-    opt(fp, c, "--dist-activation-bits N", "Hidden-state transport width: 32, 16, or 8. Default: 32");
-    opt(fp, c, "--dist-replay-check", "Diagnostic: reset and replay prompt, then compare logits.");
-    opt(fp, c, "--debug", "Print coordinator route/debug logs.");
+static void print_distributed_tombstone(FILE *fp, const help_colors *c) {
+    title(fp, c, "Distributed Inference (Retired)");
+    para(fp, c, "Distributed inference is outside the supported ExpertMajor v2 runtime and its command-line options have been retired.");
     fputc('\n', fp);
 }
 
@@ -424,7 +441,6 @@ static void print_more_info(FILE *fp, const help_colors *c, ds4_help_tool tool) 
     more_line(fp, c, "Runtime full info:", "runtime");
     if (tool_has_topic(tool, "sampling"))
         more_line(fp, c, "Sampling full info:", "sampling");
-    more_line(fp, c, "Distributed inference:", "distributed");
     if (tool_has_topic(tool, "steering"))
         more_line(fp, c, "Steering full info:", "steering");
     if (tool == DS4_HELP_DS4) {
@@ -449,8 +465,7 @@ static void print_more_info(FILE *fp, const help_colors *c, ds4_help_tool tool) 
 static void print_examples(FILE *fp, const help_colors *c, ds4_help_tool tool, const char *topic) {
     title(fp, c, "Examples");
     if (topic_is(topic, "distributed")) {
-        opt(fp, c, "worker", "./ds4 --role worker --layers 21:output --coordinator 192.168.0.181 9000 -m ds4flash.gguf");
-        opt(fp, c, "coordinator", "./ds4 --role coordinator --layers 0:20 --listen 0.0.0.0 9000 -p \"Hello\" -m ds4flash.gguf");
+        para(fp, c, "There is no supported distributed startup command.");
     } else if (topic_is(topic, "runtime")) {
         if (tool == DS4_HELP_SERVER) {
             opt(fp, c, "Metal API", "./ds4-server -m ds4flash.gguf --metal --ctx 100000");
@@ -495,7 +510,6 @@ static void print_topic(FILE *fp, const help_colors *c, ds4_help_tool tool, cons
         print_model_runtime(fp, c, tool, true);
         if (tool_has_topic(tool, "sampling")) print_sampling(fp, c, true);
         if (tool_has_topic(tool, "steering")) print_steering(fp, c);
-        print_distributed(fp, c);
         if (tool == DS4_HELP_DS4) {
             print_cli_specific(fp, c, true);
             print_cli_commands(fp, c);
@@ -517,7 +531,7 @@ static void print_topic(FILE *fp, const help_colors *c, ds4_help_tool tool, cons
     if (streq(topic, "runtime")) print_model_runtime(fp, c, tool, true);
     else if (streq(topic, "sampling")) print_sampling(fp, c, true);
     else if (streq(topic, "steering")) print_steering(fp, c);
-    else if (streq(topic, "distributed")) print_distributed(fp, c);
+    else if (streq(topic, "distributed")) print_distributed_tombstone(fp, c);
     else if (tool == DS4_HELP_DS4 && streq(topic, "diagnostics")) print_cli_diagnostics(fp, c);
     else if (tool == DS4_HELP_DS4 && streq(topic, "commands")) print_cli_commands(fp, c);
     else if (tool == DS4_HELP_SERVER && streq(topic, "api")) print_server_api(fp, c);

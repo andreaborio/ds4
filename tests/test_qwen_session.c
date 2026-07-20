@@ -718,11 +718,8 @@ static void test_eval_transaction(ds4_session *session) {
     CHECK(ds4_session_eval_qwen35_with_forward(
               session, QWEN35_N_VALID_TOKEN,
               err, sizeof(err), stub_forward) != 0);
-    memset(err, 0, sizeof(err));
-    session->distributed = (ds4_dist_session *)(uintptr_t)1;
     CHECK(ds4_session_eval(session, QWEN35_N_VALID_TOKEN,
                            err, sizeof(err)) != 0);
-    session->distributed = NULL;
     CHECK(strstr(err, "Qwen token id") != NULL);
     CHECK(stub_calls == 1);
     CHECK(session->checkpoint.len == 1 &&
@@ -821,10 +818,7 @@ static void test_sync_transaction(ds4_session *session) {
     ds4_tokens invalid = {.v = invalid_values, .len = 2, .cap = 2};
     CHECK(ds4_session_sync_qwen35_with_forward(
               session, &invalid, err, sizeof(err), stub_forward) != 0);
-    memset(err, 0, sizeof(err));
-    session->distributed = (ds4_dist_session *)(uintptr_t)1;
     CHECK(ds4_session_sync(session, &invalid, err, sizeof(err)) != 0);
-    session->distributed = NULL;
     CHECK(strstr(err, "Qwen token id") != NULL);
     CHECK(stub_calls == 3);
     CHECK(session->checkpoint.len == 3 &&
@@ -867,7 +861,6 @@ static void test_fail_closed_surfaces(ds4_session *session) {
     CHECK(ds4_session_eval_qwen35_with_forward(
               session, 42, err, sizeof(err), stub_forward) == 0);
     CHECK(ds4_session_payload_bytes(session) == 0);
-    CHECK(ds4_session_layer_payload_bytes(session, 0, 0) == 0);
     CHECK(ds4_session_imatrix_enable(session) == 2);
 
     FILE *fp = tmpfile();
@@ -876,14 +869,6 @@ static void test_fail_closed_surfaces(ds4_session *session) {
         CHECK(ds4_session_save_payload(session, fp, err, sizeof(err)) != 0);
         rewind(fp);
         CHECK(ds4_session_load_payload(session, fp, 0, err, sizeof(err)) != 0);
-        rewind(fp);
-        CHECK(ds4_session_save_layer_payload(
-                  session, fp, 0, 0, err, sizeof(err)) != 0);
-        rewind(fp);
-        const int token = 42;
-        CHECK(ds4_session_load_layer_payload(
-                  session, fp, 0, &token, 1, 0, 0,
-                  err, sizeof(err)) != 0);
         fclose(fp);
     }
     ds4_session_payload_file staged = {0};
@@ -895,16 +880,6 @@ static void test_fail_closed_surfaces(ds4_session *session) {
     ds4_session_snapshot snapshot = {0};
     CHECK(ds4_session_save_snapshot(session, &snapshot, err, sizeof(err)) != 0);
     ds4_session_snapshot_free(&snapshot);
-    CHECK(ds4_session_layer_slice_reset(session, err, sizeof(err)) != 0);
-
-    float hidden[QWEN35_N_EMBD] = {0};
-    CHECK(ds4_session_eval_output_head_from_hc(
-              session, hidden, 1u, session->logits, err, sizeof(err)) != 0);
-    const int token = 42;
-    CHECK(ds4_session_eval_layer_slice(
-              session, &token, 1u, 0u, 0u, 0u, NULL, NULL,
-              false, NULL, err, sizeof(err)) != 0);
-
     ds4_tokens text_tokens = {0};
     ds4_tokenize_text(session->engine, "unsafe fallback", &text_tokens);
     ds4_tokenize_rendered_chat(session->engine, "unsafe fallback", &text_tokens);

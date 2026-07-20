@@ -1,5 +1,12 @@
 # Qwen3.6 DS4 versus llama.cpp on 16 and 64 GiB Macs — 2026-07-15
 
+> [!IMPORTANT]
+> This is historical benchmark evidence. ExpertMajor v1 and lower-memory
+> runtime claims in this document are superseded by the ExpertMajor v2-only
+> contract; they do not describe current support. Environment names and
+> commands retained below describe the retired test lane, not options accepted
+> or recommended by current `main`.
+
 This note records a same-artifact comparison between DS4 and the official
 llama.cpp macOS arm64 release. It separates a real, identical-prompt CLI run
 from `llama-bench`: the latter is useful as a llama.cpp microbenchmark, but its
@@ -203,7 +210,8 @@ exactly 2,209,613 before and after the run. The first two repeated reference
 prompts also preserved the output hashes produced by the earlier runtime.
 
 Only the canonical migration GGUF was tested on this host. The native
-ExpertMajor v1 artifact is published and runtime-supported, but was not copied
+ExpertMajor v1 artifact was published and runtime-supported in that historical
+cohort, but was not copied
 to this Mac because only 3.6 GB of disk space was free; these numbers therefore
 must not be represented as a direct native-v1 speed measurement. The historical
 4.06/7.03 smoke above remains useful as a deliberately constrained lower bound,

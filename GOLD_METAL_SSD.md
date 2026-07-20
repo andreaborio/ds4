@@ -1,17 +1,18 @@
 # Gold Metal + SSD contract
 
-This fork treats Apple Metal as the production default on macOS.  The default
-runtime policy is `AUTO` residency: use the faster full-model mapped path when
-the model and requested context fit a conservative Metal budget, otherwise
-select SSD streaming automatically.
+This fork treats Apple Metal as the production runtime. The normal policy is
+`AUTO`, interpreted by model family: DeepSeek and Qwen may resolve to the
+qualified full-model mapped path or SSD streaming, while GLM always resolves to
+its qualified SSD-streaming path.
 
 ## User-facing contract
 
 ```sh
 make                         # namespaced Metal build; publishes ./ds4*
-./ds4 -m MODEL-DS4-ExpertMajor-v2.gguf          # Metal + AUTO residency
-./ds4 -m MODEL-DS4-ExpertMajor-v2.gguf --resident
-./ds4 -m MODEL-DS4-ExpertMajor-v2.gguf --ssd-streaming
+./ds4 -m DEEPSEEK-OR-QWEN-DS4-ExpertMajor-v2.gguf  # AUTO
+./ds4 -m DEEPSEEK-OR-QWEN-DS4-ExpertMajor-v2.gguf --resident
+./ds4 -m DEEPSEEK-OR-QWEN-DS4-ExpertMajor-v2.gguf --ssd-streaming
+./ds4 -m GLM-5.2-DS4-ExpertMajor-v2-Q2_K.gguf --ctx 8192  # AUTO -> SSD
 ./ds4 --build-info
 ```
 
@@ -21,14 +22,17 @@ converter inputs; ExpertMajor v1, external sidecars, CPU, CUDA, ROCm, and
 distributed inference fail closed. Normal startup requires no ExpertMajor,
 sidecar, backend, cache, preload, or power flag.
 
-`--resident` (also `--no-ssd-streaming`) and `--ssd-streaming` are explicit
-overrides.  Cache, cold-streaming, or preload options imply SSD mode and are
-rejected when combined with `--resident`.
+For DeepSeek and Qwen, `--resident` (also `--no-ssd-streaming`) and
+`--ssd-streaming` are explicit qualification overrides. Cache, cold-streaming,
+or preload options imply SSD mode and are rejected when combined with
+`--resident`. GLM release startup is AUTO-only: AUTO selects SSD streaming and
+an explicit resident request is rejected. GLM SSD/cache controls remain
+diagnostic rather than alternate release commands.
 
-Alternative backends remain explicit.  On macOS, `make cpu` writes only to
-`build/cpu-<arch>/bin/` and never replaces the Metal root binaries.  Linux
-keeps the explicit `cuda-spark`, `cuda-generic`, `cuda CUDA_ARCH=...`, `rocm`,
-and `cpu` targets.
+On macOS, `make cpu` writes reference/debug binaries only to
+`build/cpu-<arch>/bin/` and never replaces the Metal root binaries. CUDA and
+ROCm source and build targets are frozen outside the active tree; their
+conditional reactivation gates are in `QA_BEFORE_RELEASES.md`.
 
 ## Build identity and isolation
 
@@ -67,10 +71,12 @@ required = model tensors
 budget   = recommended working set - explicitly simulated used memory
 ```
 
-`required <= budget` resolves to resident; otherwise it resolves to SSD.  The
-resolved mode, reason, components, and cache plan are printed at startup.
-Outside Metal, AUTO preserves the existing resident behavior until an
-equivalent backend-specific capacity planner is validated.
+For DeepSeek and Qwen, `required <= budget` may resolve to resident; otherwise
+AUTO resolves to SSD. Model-specific pressure and artifact gates may still
+reject resident mode. GLM applies its family override and resolves AUTO to SSD
+regardless of the generic resident calculation. The resolved mode, reason,
+components, and cache plan are printed at startup. There is no non-Metal AUTO
+inference fallback.
 
 If Metal cannot report a working-set recommendation, AUTO fails safely unless
 the user supplies an explicit SSD cache budget.  SSD + MTP remains unsupported.
@@ -78,23 +84,32 @@ the user supplies an explicit SSD cache budget.  SSD + MTP remains unsupported.
 ### ExpertMajor v2 family policy
 
 Every supported MoE family uses the same self-describing ExpertMajor v2 storage
-contract and its own qualified Metal consumer. Qwen3.6-35B-A3B AUTO admits the
-complete mapped-tensor path only when both the fixed working-set plan and a
-point-in-time live-memory pressure check pass. Otherwise it selects SSD
-streaming. Explicit `--resident` fails unless both checks pass; the snapshot is
-conservative admission, not a guarantee against later memory-pressure changes.
+contract and its own qualified Metal consumer:
+
+- DeepSeek AUTO may select its artifact-qualified resident or SSD path.
+- Qwen3.6-35B-A3B AUTO admits the complete mapped-tensor path only when both the
+  fixed working-set plan and a point-in-time live-memory pressure check pass;
+  otherwise it selects SSD streaming. Explicit `--resident` fails unless both
+  checks pass.
+- GLM 5.2 AUTO always selects the qualified SSD path. Resident mode is not a
+  capacity-dependent fallback and is rejected even on larger hosts.
+
+Admission snapshots are conservative checks, not guarantees against later
+memory-pressure changes.
 
 Qwen's SSD planner charges static page coverage, session/runtime memory,
 ordinary host headroom, pressure margin, and Metal headroom independently.  It
 then chooses a complete `1 + 320*k` expert tier and grows Metal storage in
 321-expert slabs (about 0.529 GiB) instead of the generic 4 GiB slab. DeepSeek
-and GLM retain their independently qualified planners and schedules.
+retains its independently qualified resident/SSD planners. GLM retains its
+independent SSD-only planner and schedule.
 
 For this path, `resident` means complete tensor mapping, full-tensor Metal
 kernels, and no DS4 expert-cache `pread`.  Metal residency requests are budget
 hints; they do not prove that all file pages remained physically resident.  See
-[`tests/qwen/README.md`](tests/qwen/README.md) for the exact hash, commands, and
-still-open physical 16 GiB and model-backed resident gates.
+[`tests/qwen/README.md`](tests/qwen/README.md) for current fixture checks, the
+exact v2 release identity, and model-backed resident/SSD qualification commands.
+The complete release requirements remain in `QA_BEFORE_RELEASES.md`.
 
 ## Reference lanes
 

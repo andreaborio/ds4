@@ -44,6 +44,8 @@ const char *ds4_residency_reason_name(ds4_residency_reason reason) {
         return "live-pressure budget cannot admit full-model mapped mode";
     case DS4_RESIDENCY_REASON_METAL_BUDGET_UNAVAILABLE:
         return "Metal recommended working-set budget is unavailable";
+    case DS4_RESIDENCY_REASON_MODEL_REQUIRES_SSD:
+        return "the model family is qualified only for SSD streaming";
     case DS4_RESIDENCY_REASON_INSPECT_ONLY:
         return "model inspection defers runtime residency selection";
     }
@@ -113,6 +115,25 @@ bool ds4_residency_plan_make(bool                metal_backend,
         out->resolved = DS4_RESIDENCY_SSD;
         out->reason = DS4_RESIDENCY_REASON_METAL_EXCEEDS;
     }
+    return true;
+}
+
+bool ds4_residency_plan_apply_ssd_only(ds4_residency_mode  requested,
+                                       ds4_residency_plan *plan) {
+    if (!plan || requested < DS4_RESIDENCY_AUTO ||
+        requested > DS4_RESIDENCY_SSD) {
+        return false;
+    }
+
+    plan->requested = requested;
+    plan->resolved = DS4_RESIDENCY_SSD;
+    if (requested == DS4_RESIDENCY_RESIDENT) {
+        plan->reason = DS4_RESIDENCY_REASON_MODEL_REQUIRES_SSD;
+        return false;
+    }
+    plan->reason = requested == DS4_RESIDENCY_AUTO ?
+        DS4_RESIDENCY_REASON_MODEL_REQUIRES_SSD :
+        DS4_RESIDENCY_REASON_EXPLICIT_SSD;
     return true;
 }
 
@@ -203,23 +224,6 @@ uint32_t ds4_ssd_cache_experts_for_byte_budget(uint64_t bytes,
     const uint64_t experts = bytes / per_expert_bytes;
     if (experts == 0 || experts > UINT32_MAX) return 0;
     return (uint32_t)experts;
-}
-
-bool ds4_ssd_auto_cache_plan(uint64_t            recommended_bytes,
-                             uint64_t            non_routed_bytes,
-                             uint64_t            per_expert_bytes,
-                             uint64_t            max_model_experts,
-                             ds4_ssd_cache_plan *out) {
-    if (recommended_bytes == 0 || per_expert_bytes == 0) return false;
-
-    const uint64_t model_target_bytes =
-        recommended_bytes > UINT64_MAX / 4ull ?
-            UINT64_MAX : (recommended_bytes * 4ull) / 5ull;
-    return ds4_ssd_cache_plan_for_model_target(model_target_bytes,
-                                                non_routed_bytes,
-                                                per_expert_bytes,
-                                                max_model_experts,
-                                                out);
 }
 
 bool ds4_ssd_cache_plan_for_model_target(uint64_t            model_target_bytes,
@@ -669,6 +673,53 @@ uint32_t ds4_ssd_glm_expert_major_auto_cache_target(
         memory->physical_bytes < 96u * DS4_GIB;
     return measured_64g_tier ?
         (uint32_t)plan->floor.minimum_cache_experts : plan->cache_experts;
+}
+
+uint32_t ds4_ssd_deepseek_expert_major_auto_cache_target(
+        const ds4_ssd_host_memory         *memory,
+        const ds4_ssd_adaptive_cache_plan *plan) {
+    if (!memory || !plan || plan->cache_experts == 0 ||
+        plan->floor.working_set_experts == 0 ||
+        plan->floor.minimum_cache_experts == 0 ||
+        plan->floor.minimum_cache_experts > plan->cache_experts) {
+        return 0;
+    }
+
+    const bool measured_64g_tier =
+        memory->physical_bytes >= 64u * DS4_GIB &&
+        memory->physical_bytes < 96u * DS4_GIB;
+    if (!measured_64g_tier) return plan->cache_experts;
+
+    /* Seventeen complete token working sets are the largest stable tier
+     * admitted by the 9/16 envelope on the measured 64 GiB M5 Pro.  After
+     * isolating GLM-only batch reuse this tier recovered decode throughput;
+     * the next practical tier crossed the runtime pressure guard.  Express
+     * the target in route cycles rather than one artifact-specific count and
+     * retain the generic point-in-time plan as the safety ceiling, so AUTO
+     * still contracts when the host has less reclaimable memory. */
+    const uint64_t measured_cycles = 17u;
+    if (plan->floor.working_set_experts >
+        (UINT64_MAX - 1u) / measured_cycles) {
+        return 0;
+    }
+    const uint64_t measured_target =
+        1u + measured_cycles * plan->floor.working_set_experts;
+    if (measured_target > UINT32_MAX) return 0;
+    return plan->cache_experts < measured_target ?
+        plan->cache_experts : (uint32_t)measured_target;
+}
+
+bool ds4_ssd_glm_streaming_batch_reuse_allowed(
+        bool     glm_model,
+        uint64_t gate_expert_bytes,
+        uint64_t down_expert_bytes) {
+    if (!glm_model || gate_expert_bytes == 0 || down_expert_bytes == 0 ||
+        gate_expert_bytes > (UINT64_MAX - down_expert_bytes) / 2u) {
+        return false;
+    }
+    const uint64_t slot_bytes =
+        gate_expert_bytes * 2u + down_expert_bytes;
+    return slot_bytes <= 16u * 1024u * 1024u;
 }
 
 bool ds4_ssd_working_set_after_reserve(uint64_t  recommended_bytes,

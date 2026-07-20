@@ -1,9 +1,11 @@
+#include "ds4.h"
 #include "ds4_ssd.h"
 #include "ds4_qwen.h"
 
 #include <assert.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <string.h>
 
 #define GIB (UINT64_C(1024) * 1024u * 1024u)
 #define MIB (UINT64_C(1024) * 1024u)
@@ -52,6 +54,46 @@ static ds4_residency_plan plan(bool metal,
 }
 
 int main(void) {
+    assert(DS4_BACKEND_METAL == 0);
+    assert(DS4_BACKEND_CPU == 2);
+    assert(strcmp(ds4_residency_reason_name(
+                      DS4_RESIDENCY_REASON_MODEL_REQUIRES_SSD),
+                  "the model family is qualified only for SSD streaming") == 0);
+
+    /* GLM ExpertMajor v2 applies this policy after the generic planner has
+     * populated its memory accounting. AUTO is deterministic even when a
+     * hypothetical resident plan fits a very large Metal budget. */
+    ds4_residency_plan glm = plan(true,
+                                  DS4_RESIDENCY_AUTO,
+                                  1 * GIB,
+                                  1 * GIB,
+                                  128 * GIB,
+                                  0);
+    assert(glm.resolved == DS4_RESIDENCY_RESIDENT);
+    const uint64_t glm_required = glm.required_bytes;
+    assert(ds4_residency_plan_apply_ssd_only(DS4_RESIDENCY_AUTO, &glm));
+    assert(glm.requested == DS4_RESIDENCY_AUTO);
+    assert(glm.resolved == DS4_RESIDENCY_SSD);
+    assert(glm.reason == DS4_RESIDENCY_REASON_MODEL_REQUIRES_SSD);
+    assert(glm.required_bytes == glm_required);
+
+    memset(&glm, 0, sizeof(glm));
+    assert(!ds4_residency_plan_apply_ssd_only(
+        DS4_RESIDENCY_RESIDENT, &glm));
+    assert(glm.requested == DS4_RESIDENCY_RESIDENT);
+    assert(glm.resolved == DS4_RESIDENCY_SSD);
+    assert(glm.reason == DS4_RESIDENCY_REASON_MODEL_REQUIRES_SSD);
+
+    memset(&glm, 0, sizeof(glm));
+    assert(ds4_residency_plan_apply_ssd_only(DS4_RESIDENCY_SSD, &glm));
+    assert(glm.requested == DS4_RESIDENCY_SSD);
+    assert(glm.resolved == DS4_RESIDENCY_SSD);
+    assert(glm.reason == DS4_RESIDENCY_REASON_EXPLICIT_SSD);
+    assert(!ds4_residency_plan_apply_ssd_only(
+        (ds4_residency_mode)99, &glm));
+    assert(!ds4_residency_plan_apply_ssd_only(
+        DS4_RESIDENCY_AUTO, NULL));
+
     ds4_streaming_hotlist_priority_policy hotlist_priority;
     assert(ds4_parse_streaming_hotlist_priority_policy(NULL,
                                                         &hotlist_priority));
@@ -110,8 +152,9 @@ int main(void) {
     assert(p.resolved == DS4_RESIDENCY_RESIDENT);
     assert(p.reason == DS4_RESIDENCY_REASON_NON_METAL_AUTO);
 
-    /* At 10 GiB the fixed minimum and 20% headroom are both 2 GiB.
-     * Model + runtime + headroom exactly equals the budget. */
+    /* DeepSeek/Qwen keep using the generic planner. At 10 GiB the fixed
+     * minimum and 20% headroom are both 2 GiB; model + runtime + headroom
+     * exactly equals the budget and remains resident. */
     p = plan(true, DS4_RESIDENCY_AUTO, 6 * GIB, 2 * GIB, 10 * GIB, 0);
     assert(p.required_bytes == 10 * GIB);
     assert(p.budget_bytes == 10 * GIB);
@@ -358,6 +401,9 @@ int main(void) {
     assert(ds4_ssd_glm_expert_major_auto_cache_target(
                &glm_memory, &glm_plan) == 601);
     glm_memory.physical_bytes = 96 * GIB;
+    assert(ds4_ssd_glm_expert_major_auto_cache_target(
+               &glm_memory, &glm_plan) == 1801);
+    glm_memory.physical_bytes = 128 * GIB;
     assert(ds4_ssd_glm_expert_major_auto_cache_target(
                &glm_memory, &glm_plan) == 1801);
     assert(ds4_ssd_glm_expert_major_auto_cache_target(NULL, &glm_plan) == 0);
@@ -713,6 +759,61 @@ int main(void) {
     assert(adaptive.pageable_static_reserve_bytes ==
            8 * GIB + GIB / 5u);
     assert(adaptive.cache_experts == 4387);
+    assert(ds4_ssd_deepseek_expert_major_auto_cache_target(
+               &memory, &adaptive) == 4387);
+
+    /* The 64 GiB DeepSeek target is a pressure-bounded route-cycle policy,
+     * not a fixed allocation: a smaller admitted candidate wins. Hosts above
+     * the measured tier retain the generic adaptive candidate. */
+    ds4_ssd_adaptive_cache_plan deepseek_tier = adaptive;
+    deepseek_tier.cache_experts = 5500;
+    assert(ds4_ssd_deepseek_expert_major_auto_cache_target(
+               &memory, &deepseek_tier) == 4387);
+    deepseek_tier.cache_experts = 2839;
+    assert(ds4_ssd_deepseek_expert_major_auto_cache_target(
+               &memory, &deepseek_tier) == 2839);
+    deepseek_tier.cache_experts = 5500;
+    memory.physical_bytes = 95 * GIB;
+    assert(ds4_ssd_deepseek_expert_major_auto_cache_target(
+               &memory, &deepseek_tier) == 4387);
+    memory.physical_bytes = 96 * GIB;
+    assert(ds4_ssd_deepseek_expert_major_auto_cache_target(
+               &memory, &deepseek_tier) == 5500);
+    memory.physical_bytes = 128 * GIB;
+    assert(ds4_ssd_deepseek_expert_major_auto_cache_target(
+               &memory, &deepseek_tier) == 5500);
+    memory.physical_bytes = 63 * GIB;
+    assert(ds4_ssd_deepseek_expert_major_auto_cache_target(
+               &memory, &deepseek_tier) == 5500);
+    memory.physical_bytes = 64 * GIB;
+    deepseek_tier.cache_experts = UINT32_MAX;
+    deepseek_tier.floor.working_set_experts = UINT32_MAX / 17u + 1u;
+    assert(ds4_ssd_deepseek_expert_major_auto_cache_target(
+               &memory, &deepseek_tier) == 0);
+    deepseek_tier.floor.working_set_experts = UINT64_MAX / 17u + 1u;
+    assert(ds4_ssd_deepseek_expert_major_auto_cache_target(
+               &memory, &deepseek_tier) == 0);
+    assert(ds4_ssd_deepseek_expert_major_auto_cache_target(NULL,
+                                                            &adaptive) == 0);
+    assert(ds4_ssd_deepseek_expert_major_auto_cache_target(&memory,
+                                                            NULL) == 0);
+
+    /* The buffer-reuse optimization introduced with GLM must never spill
+     * into DeepSeek merely because its record is below the byte threshold. */
+    assert(ds4_ssd_glm_streaming_batch_reuse_allowed(true,
+                                                       4 * MIB,
+                                                       4 * MIB));
+    assert(!ds4_ssd_glm_streaming_batch_reuse_allowed(false,
+                                                        4 * MIB,
+                                                        4 * MIB));
+    assert(!ds4_ssd_glm_streaming_batch_reuse_allowed(true,
+                                                        8 * MIB,
+                                                        1));
+    assert(!ds4_ssd_glm_streaming_batch_reuse_allowed(true,
+                                                        UINT64_MAX,
+                                                        1));
+    assert(!ds4_ssd_glm_streaming_batch_reuse_allowed(true, 0, 1));
+    assert(!ds4_ssd_glm_streaming_batch_reuse_allowed(true, 1, 0));
 
     /* A real 64 GiB post-pin snapshot can have little immediately free RAM but
      * a large bounded file-backed inactive set. Normal pressure makes those

@@ -88,7 +88,9 @@ What they cover:
   emission in both fast and exact paths.
 - `--metal-kernels`: isolated Metal kernel numeric checks.
 
-The runner defaults to `ds4flash.gguf`. Override paths when needed:
+The runner retains `ds4flash.gguf` only as a historical local convenience.
+Every model-backed regression or release gate must override it with the exact
+qualified ExpertMajor v2 artifact:
 
 ```sh
 DS4_TEST_MODEL=/path/to/model.gguf ./ds4_test --logprob-vectors
@@ -96,12 +98,16 @@ DS4_TEST_VECTOR_FILE=/path/to/official.vec ./ds4_test --logprob-vectors
 DS4_TEST_LONG_PROMPT=/path/to/prompt.txt ./ds4_test --long-context
 ```
 
-For CUDA-specific changes, test on a CUDA machine:
-
-```sh
-make
-make cuda-regression
-```
+CUDA and ROCm are frozen and their backend source and build targets are absent
+from the active tree. Ordinary changes must not restore them accidentally. A
+change that intentionally reactivates either backend must restore and pass the
+complete former backend lane before promotion: clean build on its designated
+hardware, model-free/backend regression suite, long-context and synthetic
+kernel coverage, ExpertMajor v2 admission or fail-closed checks, and a Metal
+cross-check proving that shared warning or runtime changes did not regress the
+production path. It also requires an accepted ADR, an updated runtime support
+contract, an owner, and current performance evidence. Do not infer backend
+support from compilation alone.
 
 For CPU portability, at least verify that the CPU target still builds:
 
@@ -156,7 +162,7 @@ Default linear sweep:
 
 ```sh
 ./ds4-bench \
-  -m ds4flash.gguf \
+  -m /absolute/path/to/QUALIFIED-DEEPSEEK-FLASH-DS4-ExpertMajor-v2.gguf \
   --prompt-file speed-bench/promessi_sposi.txt \
   --ctx-start 2048 \
   --ctx-max 65536 \

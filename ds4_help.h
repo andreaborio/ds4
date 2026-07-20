@@ -1,6 +1,7 @@
 #ifndef DS4_HELP_H
 #define DS4_HELP_H
 
+#include <stdbool.h>
 #include <stdio.h>
 
 typedef enum {
@@ -11,6 +12,10 @@ typedef enum {
     DS4_HELP_EVAL,
 } ds4_help_tool;
 
+/* Return true after printing the canonical error for a retired distributed
+ * option. Both the exact spelling and --option=value forms are recognized. */
+bool ds4_help_reject_retired_distributed_option(
+        FILE *fp, ds4_help_tool tool, const char *arg);
 void ds4_help_print(FILE *fp, ds4_help_tool tool, const char *topic);
 
 #endif

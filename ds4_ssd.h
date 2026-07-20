@@ -21,6 +21,7 @@ typedef enum {
     DS4_RESIDENCY_REASON_METAL_EXCEEDS,
     DS4_RESIDENCY_REASON_METAL_CURRENT_PRESSURE,
     DS4_RESIDENCY_REASON_METAL_BUDGET_UNAVAILABLE,
+    DS4_RESIDENCY_REASON_MODEL_REQUIRES_SSD,
     DS4_RESIDENCY_REASON_INSPECT_ONLY,
 } ds4_residency_reason;
 
@@ -148,11 +149,6 @@ bool ds4_parse_streaming_hotlist_priority_policy(
 
 uint32_t ds4_ssd_cache_experts_for_byte_budget(uint64_t bytes,
                                                uint64_t per_expert_bytes);
-bool ds4_ssd_auto_cache_plan(uint64_t            recommended_bytes,
-                             uint64_t            non_routed_bytes,
-                             uint64_t            per_expert_bytes,
-                             uint64_t            max_model_experts,
-                             ds4_ssd_cache_plan *out);
 bool ds4_ssd_cache_plan_for_model_target(uint64_t            model_target_bytes,
                                          uint64_t            non_routed_bytes,
                                          uint64_t            per_expert_bytes,
@@ -198,6 +194,20 @@ bool ds4_ssd_adaptive_cache_plan_make_strict_with_static_reserve(
 uint32_t ds4_ssd_glm_expert_major_auto_cache_target(
         const ds4_ssd_host_memory         *memory,
         const ds4_ssd_adaptive_cache_plan *plan);
+/* DeepSeek ExpertMajor keeps the generic pressure-derived plan as a hard
+ * ceiling. The measured 64 GiB tier starts from a bounded number of complete
+ * route cycles so pageable static weights and the macOS file cache retain
+ * useful headroom; genuine pressure may still select a smaller tier. */
+uint32_t ds4_ssd_deepseek_expert_major_auto_cache_target(
+        const ds4_ssd_host_memory         *memory,
+        const ds4_ssd_adaptive_cache_plan *plan);
+/* Batched victim-buffer reuse is a GLM scheduling policy. Keeping the family
+ * gate in this pure helper prevents another shared-backend optimization from
+ * silently changing DeepSeek decode. */
+bool ds4_ssd_glm_streaming_batch_reuse_allowed(
+        bool     glm_model,
+        uint64_t gate_expert_bytes,
+        uint64_t down_expert_bytes);
 bool ds4_ssd_resident_pressure_plan_make(
         const ds4_ssd_host_memory      *memory,
         uint64_t                        model_bytes,
@@ -220,6 +230,13 @@ bool ds4_residency_plan_make(bool                   metal_backend,
                              uint64_t               recommended_bytes,
                              uint64_t               external_reserved_bytes,
                              ds4_residency_plan    *out);
+
+/* Apply a model contract that permits SSD streaming only. The caller may pass
+ * an already-populated generic plan; accounting fields are preserved while
+ * requested/resolved/reason are made authoritative for the model. Explicit
+ * resident requests return false so inference and inspection fail closed. */
+bool ds4_residency_plan_apply_ssd_only(ds4_residency_mode  requested,
+                                       ds4_residency_plan *plan);
 
 bool ds4_ssd_memory_lock_acquire(ds4_ssd_memory_lock *lock,
                                  uint64_t             bytes);

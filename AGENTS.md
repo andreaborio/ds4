@@ -1,0 +1,107 @@
+# Coding Agent Guide
+
+This file is the entry point for coding agents working in this repository. It
+is deliberately short. Follow its links instead of loading every design note
+or historical benchmark into context.
+
+## Read First
+
+For every task, read these documents in order:
+
+1. [`docs/contracts/RUNTIME_SUPPORT.md`](docs/contracts/RUNTIME_SUPPORT.md) --
+   current product and model support boundary.
+2. [`docs/architecture/CODEMAP.md`](docs/architecture/CODEMAP.md) -- ownership and
+   navigation map; then read only the documents for the subsystem being changed.
+3. The sections of [`CONTRIBUTING.md`](CONTRIBUTING.md) and
+   [`QA_BEFORE_RELEASES.md`](QA_BEFORE_RELEASES.md) applicable to the realistic
+   failure modes of the task.
+4. An active task handoff under `docs/work/active/`, if one exists.
+
+Read the entire `QA_BEFORE_RELEASES.md` only when preparing or signing off a
+release. Non-release tasks still apply every relevant QA section; they do not
+load unrelated release lanes into context.
+
+`CONTRIBUTING.md` and `QA_BEFORE_RELEASES.md` are canonical. An agent note,
+handoff, plan, PR description, or convenience target may add evidence but may
+not weaken, replace, or silently skip their gates. If documents disagree, stop
+and resolve the contradiction in the same change.
+
+## Runtime Contract
+
+The production path is Apple Metal inference with an embedded ExpertMajor v2
+store. DeepSeek V4 and Qwen3.6 have qualified AUTO/resident/SSD modes. GLM 5.2
+is SSD-only: normal AUTO resolves to SSD streaming and a resident request is
+rejected. The minimum actively qualified host class is Apple Silicon with 64 GB
+unified memory. See the runtime support contract and accepted ADRs for exact
+boundaries.
+
+CUDA and ROCm are frozen and their backend source is intentionally absent from
+the active tree. Do not restore or extend it without a new accepted decision;
+recover it from Git if active work resumes. The canonical QA document remains
+authoritative: normal releases confirm the frozen sources remain absent, while
+any restoration triggers the complete reactivation gate. Distributed inference
+is likewise retired and its source is absent; the shared CLI policy keeps its
+former flags as explicit fail-closed tombstones. Recover retired backend code
+from Git only after a new accepted decision. CPU code is reference/debug code,
+not a production inference fallback.
+
+## Working Rules
+
+- Preserve correctness before speed. Do not retain unexplained logits,
+  attention, routing, KV, or generated-output drift.
+- Keep the release path singular. A successful experiment becomes the default
+  and loses its flag; a rejected experiment and its scaffolding are removed.
+- Do not add model backward compatibility, sidecars, canonical routed-weight
+  fallback, ExpertMajor v1 inference, or admission bypasses.
+- Do not add C++. Objective-C belongs only where Metal requires it.
+- Keep public APIs narrow. CLI and server layers must not depend on tensor or
+  kernel internals.
+- Keep model loading mmap-backed. SSD expert loading, cache ownership, and
+  overlap boundaries must remain explicit and measurable.
+- Do not run multiple huge model processes concurrently. Use an isolated
+  worktree/process lane when another agent or inference run may interfere.
+- Do not make a move-only refactor and a behavior change in the same commit.
+- Files under `runtime/*.inc` are textual implementation partitions owned by
+  their including translation unit. Do not compile them separately or turn
+  them into public headers; preserve lexical order and explicit build deps.
+- Never hide a warning with `MAYBE_UNUSED` or a test-only compiler suppression
+  without a documented, narrowly scoped reason.
+- Generated files need a reproducible generator, input provenance, and a check
+  mode. Do not commit local logs, binaries, model files, or benchmark scratch.
+
+## Knowledge Across Sessions
+
+Use the lifecycle in [`docs/work/README.md`](docs/work/README.md). An active
+handoff records operational state, not permanent truth. Promote durable facts
+before merge:
+
+- architecture or ownership changes -> `CODEMAP.md`;
+- support changes -> `RUNTIME_SUPPORT.md` and, when needed, an ADR;
+- user-visible behavior -> README/help/model documentation;
+- accepted or rejected optimizations -> a concise benchmark decision record;
+- fork/upstream boundary changes -> `FORK_NOTES.md`.
+
+Update documents in the same change as the code. Remove superseded text instead
+of adding a second explanation. Active handoffs, stale test hooks, debug flags,
+temporary logs, commented code, and obsolete fixtures must not survive merge.
+
+## Validation And Merge
+
+Choose tests by realistic impact using `CONTRIBUTING.md`; use the complete
+`QA_BEFORE_RELEASES.md` gate for releases. A structural change to common model,
+session, ExpertMajor, SSD, tokenizer, Metal graph, prefill, or decode code must
+rerun the qualified DeepSeek, GLM, and Qwen models before merge.
+
+Every merge candidate needs a review of the full diff from its merge base. The
+reviewer should be independent of the implementer when practical and must look
+for correctness/performance regressions, unsupported compatibility, unused
+code, experimental residue, test-only code in release builds, unregistered
+flags, generated artifacts, stale documentation, and personal absolute paths.
+
+A task is complete only when required tests and model runs are recorded, the
+documentation describes the resulting code, temporary handoffs are removed,
+the residue review passes, and `git diff --check` is clean.
+
+Run `make premerge` for the repository, documentation, build-isolation, and
+model-free gates. It does not replace the qualified DeepSeek, GLM, and Qwen
+model runs required above.

@@ -1,5 +1,4 @@
 #include "ds4.h"
-#include "ds4_distributed.h"
 #include "ds4_help.h"
 #include "ds4_kvstore.h"
 #include "rax.h"
@@ -2975,13 +2974,6 @@ static char *render_live_tool_tail_for_syntax(server_model_syntax syntax,
         return render_glm_live_tool_tail(msgs, start, tool_orders, think_mode);
     }
     return render_deepseek_live_tool_tail(msgs, start, think_mode);
-}
-
-static DS4_SERVER_MAYBE_UNUSED char *render_live_tool_tail(
-        const chat_msgs *msgs, int start,
-        ds4_think_mode think_mode) {
-    return render_live_tool_tail_for_syntax(SERVER_MODEL_SYNTAX_DEEPSEEK,
-                                            msgs, start, NULL, think_mode);
 }
 
 static bool chat_msg_has_call_id(const chat_msg *m, const char *id) {
@@ -13178,28 +13170,17 @@ static void usage(FILE *fp, const char *topic) {
 
 static ds4_backend parse_backend_arg(const char *s, const char *arg) {
     if (!strcmp(s, "metal")) return DS4_BACKEND_METAL;
-#ifdef DS4_ROCM_BUILD
-    if (!strcmp(s, "rocm")) return DS4_BACKEND_CUDA;
-#else
-    if (!strcmp(s, "cuda")) return DS4_BACKEND_CUDA;
-#endif
     if (!strcmp(s, "cpu")) return DS4_BACKEND_CPU;
     server_log(DS4_LOG_DEFAULT, "ds4-server: invalid %s value: %s", arg, s);
-#ifdef DS4_ROCM_BUILD
-    server_log(DS4_LOG_DEFAULT, "ds4-server: valid server backends are: metal, rocm, cpu");
-#else
-    server_log(DS4_LOG_DEFAULT, "ds4-server: valid server backends are: metal, cuda, cpu");
-#endif
+    server_log(DS4_LOG_DEFAULT, "ds4-server: valid server backends are: metal, cpu");
     exit(2);
 }
 
 static ds4_backend default_server_backend(void) {
 #ifdef DS4_NO_GPU
     return DS4_BACKEND_CPU;
-#elif defined(__APPLE__)
-    return DS4_BACKEND_METAL;
 #else
-    return DS4_BACKEND_CUDA;
+    return DS4_BACKEND_METAL;
 #endif
 }
 
@@ -13230,22 +13211,8 @@ static server_config parse_options(int argc, char **argv) {
             usage(stdout, topic);
             exit(0);
         }
-        char dist_parse_err[256] = {0};
-        ds4_dist_cli_parse_result dist_parse =
-            ds4_dist_parse_cli_arg(arg,
-                                   &i,
-                                   argc,
-                                   argv,
-                                   &c.engine.distributed,
-                                   dist_parse_err,
-                                   sizeof(dist_parse_err));
-        if (dist_parse == DS4_DIST_CLI_ERROR) {
-            server_log(DS4_LOG_DEFAULT,
-                       "ds4-server: %s",
-                       dist_parse_err[0] ? dist_parse_err : "invalid distributed option");
-            exit(2);
-        }
-        if (dist_parse == DS4_DIST_CLI_MATCHED) continue;
+        if (ds4_help_reject_retired_distributed_option(
+                stderr, DS4_HELP_SERVER, arg)) exit(2);
 
         if (!strcmp(arg, "-m") || !strcmp(arg, "--model")) {
             c.engine.model_path = need_arg(&i, argc, argv, arg);
@@ -13358,13 +13325,6 @@ static server_config parse_options(int argc, char **argv) {
             c.engine.warm_weights = true;
         } else if (!strcmp(arg, "--metal")) {
             c.engine.backend = DS4_BACKEND_METAL;
-#ifdef DS4_ROCM_BUILD
-        } else if (!strcmp(arg, "--rocm")) {
-            c.engine.backend = DS4_BACKEND_CUDA;
-#else
-        } else if (!strcmp(arg, "--cuda")) {
-            c.engine.backend = DS4_BACKEND_CUDA;
-#endif
         } else if (!strcmp(arg, "--backend")) {
             c.engine.backend = parse_backend_arg(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "--cpu")) {
@@ -13386,14 +13346,6 @@ static server_config parse_options(int argc, char **argv) {
         c.engine.directional_steering_ffn = 1.0f;
     }
     c.engine.context_size = (uint32_t)c.ctx_size;
-    char dist_err[256];
-    if (ds4_dist_prepare_engine_options(&c.engine.distributed,
-                                        &c.engine,
-                                        dist_err,
-                                        sizeof(dist_err)) != 0) {
-        server_log(DS4_LOG_DEFAULT, "ds4-server: %s", dist_err);
-        exit(2);
-    }
     return c;
 }
 
@@ -13426,14 +13378,6 @@ int main(int argc, char **argv) {
                        cfg.engine.backend,
                        cfg.ctx_size,
                        cfg.engine.prefill_chunk);
-    if (cfg.engine.distributed.role == DS4_DISTRIBUTED_WORKER) {
-        ds4_dist_generation_options gen = {
-            .ctx_size = cfg.ctx_size,
-        };
-        int rc = ds4_dist_run(engine, &cfg.engine.distributed, &gen);
-        ds4_engine_close(engine);
-        return rc;
-    }
 
     ds4_session *session = NULL;
     if (ds4_session_create(&session, engine, cfg.ctx_size) != 0) {

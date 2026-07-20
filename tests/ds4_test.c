@@ -103,7 +103,7 @@ static ds4_engine *test_open_engine(bool quality) {
 #ifdef __APPLE__
         .backend = DS4_BACKEND_METAL,
 #else
-        .backend = DS4_BACKEND_CUDA,
+        .backend = DS4_BACKEND_CPU,
 #endif
         /* Preserve the historical deterministic test lane. AUTO has its own
          * resolver coverage and must not silently switch this suite's path

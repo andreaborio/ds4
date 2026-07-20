@@ -9,12 +9,8 @@
 const char *ds4_build_backend(void) {
 #ifdef DS4_NO_GPU
     return "cpu";
-#elif defined(__APPLE__)
-    return "metal";
-#elif defined(DS4_ROCM_BUILD)
-    return "rocm";
 #else
-    return "cuda";
+    return "metal";
 #endif
 }
 

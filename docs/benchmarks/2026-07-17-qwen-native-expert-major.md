@@ -1,5 +1,11 @@
 # Qwen DS4-native expert-major publication gate
 
+> [!IMPORTANT]
+> This is historical ExpertMajor v1/sidecar benchmark evidence. It is
+> superseded by the ExpertMajor v2-only runtime contract and is not an
+> executable guide for current `main`. The former environment switches and
+> startup commands have been removed from this record deliberately.
+
 Date: 2026-07-17
 Host: Apple M5 Pro, 64 GiB unified memory, AC power
 Branch: `codex/qwen-expert-major-store`
@@ -20,31 +26,13 @@ stack. The only intended difference is where the expert-major extent lives.
 The native file is 406,816 bytes larger than the canonical GGUF. It does not
 contain a second copy of the routed weights.
 
-## Commands
+## Historical test shape
 
 The sweep used `speed-bench/promessi_sposi.txt`, 16 greedy decode tokens at
 every frontier, and an A/B/A order: native, canonical plus sidecar, native.
-
-```sh
-COMMON="--metal --resident --power 100 -t 8 \
-  --prompt-file speed-bench/promessi_sposi.txt \
-  --ctx-start 2048 --ctx-max 16384 --step-mul 2 --gen-tokens 16"
-
-DS4_QWEN_EXPERIMENTAL_METAL=1 ./ds4-bench \
-  -m Qwen3.6-35B-A3B-DS4-ExpertMajor-v1-Q4_K_S.gguf $COMMON \
-  --csv native.csv --dump-decode-evidence-dir native-evidence
-
-DS4_QWEN_EXPERIMENTAL_METAL=1 \
-DS4_QWEN_EXPERT_PACK_PATH=Qwen3.6-35B-A3B-ds4-Q4_K_S.experts.pack \
-DS4_QWEN_EXPERT_PACK_SHA256=d8bbe3731e4ac4f0117b24f8e8cb0ebaaf1a84cbfa7f264e4b297290946ee49f \
-DS4_QWEN_EXPERT_PACK_VERSION=1 \
-DS4_QWEN_GGUF_SHA256=c33efb67bde86c9ba1f9e79c2dc42627170963bef0e915ab9b91a55cfb6d0fcd \
-./ds4-bench -m Qwen3.6-35B-A3B-ds4-Q4_K_S.gguf $COMMON \
-  --csv sidecar.csv --dump-decode-evidence-dir sidecar-evidence
-```
-
-The second native command is identical to the first and writes separate CSV
-and evidence directories.
+The second native arm used separate CSV and evidence directories. The exact
+legacy invocation is recoverable from Git history if this result must be
+audited; it must not be copied into a current test lane.
 
 ## Correctness
 

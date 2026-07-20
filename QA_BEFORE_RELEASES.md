@@ -3,8 +3,10 @@
 This is the release gate for DwarfStar.  Run it before tagging or pushing a
 release build.  The goal is not to prove every code path exhaustively; it is to
 exercise the paths that have historically regressed: Metal graph inference,
-CUDA, ROCm, SSD streaming, distributed execution, disk KV cache, server APIs, and the
-agent TUI/tool state machine.
+model-family residency, SSD streaming, distributed rejection, disk KV cache,
+server APIs, and the agent TUI/tool state machine. CUDA and ROCm are frozen and
+absent; sections 6 and 7 prevent accidental restoration and preserve their full
+reactivation gates.
 
 Do not run multiple huge model processes at the same time.  Record the commit,
 hardware, GGUF file, context size, and any non-default flags for every manual
@@ -12,27 +14,27 @@ run.
 
 DeepSeek V4, GLM 5.2, and Qwen3.6 release inference is ExpertMajor v2-only on
 local Apple Metal. Canonical files may be inspected or converted offline, but
-ExpertMajor v1, sidecars, CPU, CUDA, ROCm, and distributed inference must fail
-closed. No ExpertMajor or Qwen admission environment flag belongs in a release
-startup command.
+ExpertMajor v1, sidecars, CPU, and distributed inference must fail closed. CUDA
+and ROCm source/build targets must remain absent unless a reactivation release
+passes the conditional gates below. No ExpertMajor or Qwen admission environment
+flag belongs in a release startup command.
 
-Preferred release test hosts:
+## Release Artifact Identity
 
-- CUDA / DGX Spark: `toor@192.168.0.180`.
-- Metal / distributed Mac testing: `mac-m5max-it` and `mac-m5max-us`.
-- ROCm: The Strix Halo system at antirez@strixhalo (Framework Desktop).
+Resolve these variables to absolute paths before any model-backed command. Never
+point them at a canonical converter input, sidecar, v1 file, symlink with unknown
+target, or an artifact whose complete output hash is missing.
 
-The Mac hosts have DNS entries and are reached through an internet VPN.  They
-are connected to each other over WiFi and also through a Thunderbolt 5
-point-to-point link.  The TB5 route is the preferred distributed-inference
-network when it is available, but it can be fragile and sometimes only works
-when `ds4` is executed in the foreground.  Prefer these machines for release
-testing, especially distributed inference.  Local fallback testing on this
-machine is acceptable when needed; it is an M3 Max with 128 GB RAM.
-The Strix Halo system is reachable via the VPN as well and has a local WiFi
-address in the same lan of the M5 Max systems. The CUDA hosts are in a
-different remote lan and are accessible via a different VPN active
-in this system.
+| Variable | Required identity |
+| --- | --- |
+| `DEEPSEEK_V2` | `DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix-DS4-ExpertMajor-v2.gguf`; 86,720,114,272 bytes; SHA-256 `8378080263eb9224f7228d72e2afa4ac3cf74a116023fdec2c596ff228a33e3f` |
+| `DEEPSEEK_MIXED_V2` | Non-applicable until a mixed-quant DeepSeek ExpertMajor v2 artifact has a publication record with exact filename, bytes, and complete output SHA-256; do not resolve or use this variable before qualification |
+| `GLM_V2` | `GLM-5.2-DS4-ExpertMajor-v2-Q2_K.gguf`; 262,147,193,504 bytes; SHA-256 `7f5017e3076e706c78f2a5322b035a9e2f6519c65ff5b6be8b2d91aeff61505d` |
+| `QWEN_V2` | `Qwen3.6-35B-A3B-DS4-ExpertMajor-v2-Q4_K_S.gguf`; 20,808,566,880 bytes; SHA-256 `d7c43a6388ec20e6fe5530850350f96fdb0ac37c5ce36d3e5f92b172c447f56b` |
+
+Record the test machine by hardware model, unified memory, OS build, and power
+state in the release evidence. Do not encode local hostnames, addresses, or
+network routes in this checklist.
 
 ## 1. Repository And Build Sanity
 
@@ -54,13 +56,13 @@ in this system.
 ## 2. Core Regression Tests
 
 - Run the default suite:
-  `make test`.
+  `DS4_TEST_MODEL="$DEEPSEEK_V2" make test`.
 - Without a local GGUF, run the complete model-free gate:
   `make model-free-test`.
 - Run the vector checks explicitly after any tokenizer, template, KV, kernel,
   quantization, or prompt-rendering change:
-  `./ds4_test --logprob-vectors`
-  and `./ds4_test --local-golden-vectors`.
+  `DS4_TEST_MODEL="$DEEPSEEK_V2" ./ds4_test --logprob-vectors`
+  and `DS4_TEST_MODEL="$DEEPSEEK_V2" ./ds4_test --local-golden-vectors`.
 - Run server tests when HTTP, SSE, prompt rendering, cache policy, or tool-call
   replay changed:
   `./ds4_test --server`.
@@ -79,23 +81,25 @@ Use the qualified DeepSeek Flash ExpertMajor v2 GGUF that users run. Set
   run the long name/number or archive recall test used for catching attention
   and MoE routing drift.
 - Logprob sanity:
-  `./ds4 --nothink --temp 0 --dump-logprobs /tmp/ds4-logprobs.json --logprobs-top-k 20 -p "..."`
+  `./ds4 -m "$DEEPSEEK_V2" --nothink --temp 0 --dump-logprobs /tmp/ds4-logprobs.json --logprobs-top-k 20 -p "..."`
   and inspect that the continuation is sane.
 - Speed sanity:
-  run `ds4-bench` with `speed-bench/promessi_sposi.txt` and compare prefill,
-  generation speed, and KV bytes with the last known good numbers for the same
-  machine.
+  run `ds4-bench -m "$DEEPSEEK_V2"` with
+  `speed-bench/promessi_sposi.txt` and compare prefill, generation speed, and KV
+  bytes with the last known good numbers for the same machine.
 
 ## 4. Metal PRO Path
 
-PRO support is experimental, but release builds must not break it silently.
+This checklist does not currently record a qualified PRO ExpertMajor v2
+filename, complete output SHA-256, and model-backed baseline. Therefore PRO is
+non-applicable for release inference: do not substitute a canonical or split
+PRO file and do not execute an old PRO command.
 
-- If a PRO-capable machine is available, run a short PRO q2 prompt and verify
-  the correct template, thinking behavior, and endpoint aliases.
-- For PRO Q4 distributed builds, test only on the intended high-memory machines.
-- If PRO cannot be run locally, at least build all binaries and review changes
-  touching model shape, tensor lookup, routed expert mapping, template logic,
-  and KV payload compatibility.
+- Verify canonical/split PRO and distributed requests fail closed.
+- Build all current binaries and review changes touching PRO model shape,
+  tensor lookup, routed expert mapping, template logic, and KV compatibility.
+- Re-enable model-backed PRO QA only after its release record supplies an exact
+  v2 artifact identity/hash and the runtime support contract admits it.
 
 ## 5. SSD Streaming
 
@@ -103,11 +107,12 @@ SSD streaming is a capacity path, so test both correctness and user experience.
 
 - Flash q2/q2-q4 streaming:
   `./ds4 -m "$DEEPSEEK_V2" --ssd-streaming --ssd-streaming-cache-experts 32GB -p "..."`
-- Regression test mixed-quant Flash SSD streaming. Use the mixed q2/q4 GGUF
-  with boosted Q4 routed-expert layers and a prompt long enough to exercise the
-  selected-address prefill path; it must not fail with "model range is not
-  covered by mapped model views":
-  `./ds4 -m "$DEEPSEEK_MIXED_V2" --ssd-streaming --ssd-streaming-cache-experts 16GB --ctx 4096 --tokens 1 --nothink --prompt-file /tmp/ds4_600tok_prompt.txt`.
+- Mixed-quant Flash SSD streaming is currently non-applicable because no
+  qualified mixed-quant ExpertMajor v2 artifact identity or model-backed
+  baseline is recorded. Do not substitute a canonical, v1, sidecar, or
+  unpublished file. Restore this regression lane only after its publication
+  record supplies the exact filename, bytes, complete output SHA-256, prompt,
+  and expected selected-address result.
 - Cold streaming measurement:
   run once with `--ssd-streaming-cold` and verify no deadlock, missing expert,
   or impossible slowdown.
@@ -116,17 +121,37 @@ SSD streaming is a capacity path, so test both correctness and user experience.
 - If streaming cache internals changed, test the same prompt twice and compare
   first-token/logprob sanity between runs.
 
+### GLM 5.2 Metal SSD lane
+
+Use the verified `GLM_V2` identity above and start it with AUTO and the qualified
+context. Do not add an explicit residency, cache, preload, or ExpertMajor flag.
+
+- Verify AUTO resolves to local Metal SSD streaming and selects the qualified
+  GLM Gold cache/prefill/decode policy.
+- Run `./ds4 -m "$GLM_V2" --ctx 8192` for the normal flag-free AUTO smoke.
+- Verify an explicit resident request fails closed; more host memory does not
+  turn resident GLM into a qualified path.
+- Run the deterministic GLM prompt and greedy continuation recorded in
+  `docs/benchmarks/2026-07-20-glm52-expert-major-v2.md` and compare prefill,
+  decode, output bytes, expert-read behavior, memory pressure, and swap with its
+  same-condition gold evidence.
+- Exercise both the indexed long-prefill path and multi-token decode. Confirm
+  the runtime does not probe canonical component views or the retired full-layer
+  decode resolver.
+- Reject canonical GLM, sidecars, old ExpertMajor revisions, CPU, and
+  distributed execution before inference.
+
 ### Qwen3.6 Metal lane
 
 The Qwen path on `main` follows the same repository, build, core-test, and
-regression rules as the other model paths. Use the normalized
-Qwen3.6-35B-A3B ExpertMajor v2 Q4_K_S artifact, record its SHA-256, and run the
-relevant model-backed smoke; canonical, v1, sidecar, and community GGUFs are
-not equivalent inputs.
+regression rules as the other model paths. Use the verified normalized
+`QWEN_V2` artifact above and run the relevant model-backed smoke;
+canonical, v1, sidecar, and community GGUFs are not equivalent inputs.
 
 - Run `make model-free-test` and `./ds4_test --metal-kernels`. The latter must
   retain resident/SSD top-8 output equivalence, zero resident cache/`pread`
   accounting, malformed-route fail-closed behavior, and slab-growth checks.
+- Run `./ds4 -m "$QWEN_V2" --ctx 8192` for the normal flag-free AUTO smoke.
 - Run AUTO with the normal flag-free startup command; record both admission plans,
   their point-in-time inputs, resolved mode, cache tier, configured 321-expert
   slab target, cache `buffer_allocs`, task physical footprint, and system swap
@@ -146,52 +171,87 @@ not equivalent inputs.
   release gates beyond the standard model/backend checks above. Do not claim
   measurements for hardware or artifacts that were not actually tested.
 
-## 6. CUDA / DGX Spark
+## 6. Frozen CUDA Reactivation Gate
 
-Before a release, ask the user for CUDA access if it is not already configured.
-Use the DGX Spark / GB10 host `toor@192.168.0.180`.  Do not claim CUDA is
-release-ready without this pass.
+For a normal release, confirm CUDA source, tests, and build targets remain
+absent from the release tree and record the lane as `frozen - source absent`.
+This is stronger and more precise than calling CUDA merely unvalidated.
+The recovery commit recorded in `docs/contracts/RUNTIME_SUPPORT.md` contains
+the former source and build/test recipes; restoring only part of that lane is
+not reactivation.
 
-- Fetch or push the exact release commit to the CUDA machine.
-- Build:
-  `make clean && make cuda-spark`.
-- Run `make cuda-regression` for model-free/backend coverage.
-- Verify a Qwen, DeepSeek, or GLM ExpertMajor v2 artifact is rejected before
-  inference. Do not publish generation throughput or present CUDA as a current
-  MoE runtime lane.
-- If CUDA kernels or build hooks changed, run their backend-specific synthetic
-  tests without weakening the ExpertMajor v2 admission boundary.
-- Verify that any CUDA-only warning fixes are also clean on macOS and do not
-  change Metal behavior.
+If any change restores CUDA source or build integration, the release is blocked
+until the complete reactivation lane passes:
 
-## 7. ROCm / Strix Halo
+- accept an ADR, update the runtime support contract, and identify an owner;
+- put the exact release commit on the current designated CUDA validation host;
+- complete a clean backend build and the restored model-free, backend,
+  long-context, and synthetic-kernel regression suites;
+- verify DeepSeek, GLM, and Qwen ExpertMajor v2 fail closed before inference
+  unless the new ADR separately qualifies those exact CUDA paths;
+- record build identity, hardware, compiler/architecture, commands, outputs,
+  failures, and before/after performance evidence;
+- verify shared and warning-cleanup changes are also clean on macOS and do not
+  alter Metal correctness or speed.
 
-Use the Strix Halo Framework Desktop via the VPN hostname `strixhalo`
-(`antirez@strixhalo`).  This host validates the ROCm backend; do not use it as
-a substitute for CUDA or Metal release testing.
+A successful compile alone is not reactivation and must not be published as a
+supported CUDA inference claim.
 
-- Fetch or push the exact release commit to the Strix Halo machine.
-- Build:
-  `make clean && make strix-halo`.
-- Run model-free/backend tests only. Verify a Qwen, DeepSeek, or GLM
-  ExpertMajor v2 artifact is rejected before inference; do not attempt a
-  canonical fallback or publish ROCm model throughput.
-- Record build identity and backend initialization for synthetic tests. A
-  successful ROCm compile is not a supported-model inference claim.
+## 7. Frozen ROCm Reactivation Gate
 
-## 8. Distributed Inference
+For a normal release, confirm ROCm source, tests, and build targets remain
+absent from the release tree and record the lane as `frozen - source absent`.
+Use the recovery commit in `docs/contracts/RUNTIME_SUPPORT.md` as the source and
+test-history boundary; a partial restore is not reactivation.
 
-Distributed inference is outside the current ExpertMajor v2 runtime contract.
-For Qwen, DeepSeek, and GLM, verify coordinator/worker options reject the model
-before inference; do not use canonical or split files as a fallback. If shared
-protocol code changes, run model-free protocol tests and compile checks only.
+If any change restores ROCm source or build integration, the release is blocked
+until the complete reactivation lane passes:
+
+- accept an ADR, update the runtime support contract, and identify an owner;
+- put the exact release commit on the current designated ROCm validation host;
+- complete a clean backend build and the restored model-free, backend,
+  long-context, and synthetic-kernel regression suites;
+- verify DeepSeek, GLM, and Qwen ExpertMajor v2 fail closed before inference
+  unless the new ADR separately qualifies those exact ROCm paths;
+- record build identity, backend initialization, commands, outputs, failures,
+  and before/after performance evidence;
+- verify shared changes remain correct and fast on Metal.
+
+A successful compile alone is not reactivation and must not be published as a
+supported ROCm inference claim.
+
+## 8. Retired Distributed Inference
+
+Distributed implementation source is absent from the release tree. Its former
+command-line surface remains only as a centralized fail-closed policy. Run the
+model-free retired-option gate and confirm every executable rejects the options
+before model loading:
+
+`sh tests/test_retired_distributed_flags.sh`
+
+The gate covers `ds4`, `ds4-server`, `ds4-agent`, `ds4-bench`, and `ds4-eval`,
+and all nine retired flags: `--role`, `--layers`, `--listen`, `--coordinator`,
+`--dist-prefill-chunk`, `--dist-prefill-window`,
+`--dist-activation-bits`, `--dist-replay-check`, and `--debug`. Also confirm:
+
+- normal and topic help do not advertise an active distributed setup;
+- `ds4_distributed.c`, `ds4_distributed.h`, `ds4_distributed.o`, `ds4_dist_*`,
+  `DS4_DISTRIBUTED_*`, layer-slice execution, and distributed layer-payload
+  APIs are absent from production source and build dependencies;
+- no canonical or split model is used as a compatibility fallback.
+
+Restoring any distributed implementation or build integration requires a new
+accepted ADR, an owner, updated support and security contracts, model-free
+protocol tests, full affected-model correctness/performance evidence, and the
+applicable release lanes. The recovery boundary is Git commit
+`d8d673858f90834522bbe878951a534d8c6508b4`; a partial restore is not support.
 
 ## 9. Disk KV Cache
 
 Disk KV cache bugs are high impact for server users.
 
 - Start the server with:
-  `./ds4-server --ctx 100000 --kv-disk-dir /tmp/ds4-kv --kv-disk-space-mb 8192`.
+  `./ds4-server -m "$DEEPSEEK_V2" --ctx 100000 --kv-disk-dir /tmp/ds4-kv --kv-disk-space-mb 8192`.
 - Run the same request twice and verify the second request hits cache.
 - Fill the cache enough to trigger eviction; verify the newly-written entry is
   not evicted and useful anchors are retained.
@@ -249,9 +309,12 @@ The agent is the most stateful component.  Test it manually, not only by build.
 
 - Test `download_model.sh` in a temporary directory so local weights are not
   overwritten.
-- Treat its canonical Flash/PRO downloads as offline converter inputs, not
-  runnable artifacts. Verify URL, resume, file naming, and symlink policy
-  without launching inference from the downloaded source.
+- Verify the `deepseek-v2`, `glm-v2`, and `qwen-v2` targets resolve to the exact
+  qualified repository and ExpertMajor v2 filename.
+- Treat every `offline-*` target as a converter input, not a runnable artifact.
+  Verify resume and file naming without launching inference from the source.
+- Verify the script never creates or changes `./ds4flash.gguf`, exposes no
+  distributed slice target, and contains none of the retired distributed flags.
 - Verify each published runtime model has a distinct ExpertMajor v2 filename,
   complete converter verification, recorded source/output hashes, and no
   canonical routed-weight fallback.
@@ -260,7 +323,8 @@ The agent is the most stateful component.  Test it manually, not only by build.
 
 ## 13. Performance And Power
 
-- Run `ds4-bench` on the release machine and compare with tracked CSV baselines.
+- Run `ds4-bench` separately with `-m "$DEEPSEEK_V2"`, `-m "$GLM_V2"`, and
+  `-m "$QWEN_V2"`, using each family's tracked workload and CSV baseline.
 - Test `--power 100` is not throttled.
 - Test `--power 50` visibly reduces duty cycle in CLI, server, agent, eval, and
   bench where practical.
@@ -272,10 +336,12 @@ The agent is the most stateful component.  Test it manually, not only by build.
 Do not sign off until:
 
 - macOS Metal Flash passed.
-- CUDA was tested on the CUDA machine or the release notes explicitly say CUDA
-  was not validated.
-- ROCm was tested on Strix Halo or the release notes explicitly say ROCm was
-  not validated.
+- The qualified DeepSeek, GLM, and Qwen artifacts passed their model-backed
+  lanes with the residency modes defined by `docs/contracts/RUNTIME_SUPPORT.md`.
+- CUDA source/tests/build targets were confirmed absent and recorded as frozen;
+  if any were restored, the complete section 6 reactivation gate passed.
+- ROCm source/tests/build targets were confirmed absent and recorded as frozen;
+  if any were restored, the complete section 7 reactivation gate passed.
 - Disk KV cache was exercised.
 - Server API streaming was exercised.
 - Agent interruption and tool loops were exercised manually.

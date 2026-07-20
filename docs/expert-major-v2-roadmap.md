@@ -65,6 +65,10 @@ layout.
   and selected-address grouped prefill.
 - **Validated:** C/Python corruption, bounds, payload, mixed-type, and
   cross-family tests plus the recorded M5 Pro SSD parity tranches.
+- **Adaptive 64 GiB lane:** after isolating GLM-only victim reuse, AUTO selects
+  up to 4,387 records (17 complete route cycles) under the live pressure
+  ceiling. The final 128+256 gate measured 25.21/14.19 t/s prefill/decode,
+  exact frontier logits, zero swapout, and 42,018 MiB peak wired memory.
 - **Release rule:** each Flash or PRO artifact must pass byte verification,
   model-backed output equality, alternating throughput, and swap/memory gates.
   A canonical source is never a runtime fallback while an artifact is awaiting
@@ -78,6 +82,11 @@ layout.
 - **Performance:** the corrected 288+32 lane moved decode from 1.27 to
   1.77-1.81 t/s with exact output and no new swap activity. The prior
   rested-storage median remains 11.08/1.90 t/s.
+- **Adaptive memory contract:** the qualified 64 GiB DS4-managed pageable tier
+  remains 601 records; unused process budget stays available to the macOS file
+  cache. Larger explicit tiers reduced misses but regressed end-to-end decode. Different
+  physical-memory tiers keep a pressure-derived ceiling and require their own
+  qualification.
 - **Release artifact:** 262,147,193,504 bytes, SHA-256
   `7f5017e3076e706c78f2a5322b035a9e2f6519c65ff5b6be8b2d91aeff61505d`.
 

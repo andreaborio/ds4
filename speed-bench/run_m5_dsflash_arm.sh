@@ -20,7 +20,7 @@ ctx_alloc=${DS4_M5_CTX_ALLOC:-32768}
 step_mul=${DS4_M5_STEP_MUL:-1}
 root=${0:A:h:h}
 bin=${DS4_M5_BIN:-$root/build/metal-arm64/bin/ds4-bench}
-model=${DS4_M5_MODEL:-/Users/chinaski/Desktop/ds4/DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix.gguf}
+model=${DS4_M5_MODEL:-}
 prompt=${DS4_M5_PROMPT:-$root/tests/long_context_security_prompt.txt}
 prefix=${DS4_M5_PREFIX:-${TMPDIR:-/tmp}/ds4-m5-${label}}
 preload=${DS4_M5_PRELOAD_EXPERTS:-4096}
@@ -45,6 +45,7 @@ case $gen_tokens in
 esac
 (( gen_tokens > 0 )) || { print -u2 -- "GEN_TOKENS must be positive"; exit 2; }
 
+[[ -n $model ]] || { print -u2 -- "set DS4_M5_MODEL to the ExpertMajor v2 GGUF path"; exit 2; }
 [[ -x $bin ]] || { print -u2 -- "missing executable: $bin"; exit 2; }
 [[ -f $model ]] || { print -u2 -- "missing model: $model"; exit 2; }
 [[ -f $prompt ]] || { print -u2 -- "missing prompt: $prompt"; exit 2; }

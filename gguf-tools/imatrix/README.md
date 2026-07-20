@@ -19,8 +19,9 @@ more heavily by the actual DS4 inference graph.
 
 ## 1. Build The Calibration Dataset
 
-The tracked dataset is in `gguf-tools/imatrix/dataset/`.  Regenerate it from
-the repository root with:
+The generated corpus is intentionally not tracked: it is large, derived from
+the current source tree, and becomes misleading after runtime refactors.
+Generate it from the repository root with:
 
 ```sh
 python3 gguf-tools/imatrix/dataset/build_ds4_imatrix_dataset.py
@@ -42,44 +43,35 @@ It contains DS4-rendered chat prompts, separated by visible
 - `ds4-eval` GPQA Diamond, SuperGPQA, and AIME2025 benchmark prompts.
 - Both thinking and non-thinking assistant prefixes.
 
-The current tracked dataset has 4682 rendered prompts and roughly 2.91M tokens
-by the coarse bytes/4 estimate.  Check
-`gguf-tools/imatrix/dataset/manifest.json` for the exact generated-file
-summary.
+Check the generated `gguf-tools/imatrix/dataset/manifest.json` for the exact
+record count and coarse token estimate of the current tree.
 
 ## 2. Collect The Imatrix
 
 Use the DS4 runtime itself to collect routed MoE activation statistics.  The
-collector uses the loaded GGUF metadata, so the same command shape works for
-Flash and Pro.
+collector uses the loaded GGUF metadata. Runtime admission still applies: the
+collector must use an admitted ExpertMajor v2 artifact, not a canonical
+converter input.
 
 Flash example:
 
 ```sh
 ./ds4 \
-  -m ../deepseek-v4-quants/gguf/DeepSeek-V4-Flash-Q4KExperts-F16HC-F16Compressor-F16Indexer-Q8Attn-Q8Shared-Q8Out-chat-v2.gguf \
+  -m DEEPSEEK-DS4-ExpertMajor-v2.gguf \
   --imatrix-dataset gguf-tools/imatrix/dataset/rendered_prompts.txt \
   --imatrix-out ../deepseek-v4-quants/imatrix/DeepSeek-V4-Flash-chat-v2-routed-moe-ds4-1p5m.dat \
   --ctx 32768
 ```
 
-Pro example with a smaller calibration budget:
-
-```sh
-./ds4 \
-  -m ../deepseek-v4-quants/gguf/DeepSeek-V4-Pro-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-Instruct.gguf \
-  --imatrix-dataset gguf-tools/imatrix/dataset/rendered_prompts.txt \
-  --imatrix-out ../deepseek-v4-quants/imatrix/DeepSeek-V4-Pro-Instruct-routed-moe-ds4-small.dat \
-  --imatrix-max-prompts 16 \
-  --imatrix-max-tokens 32768 \
-  --ctx 32768
-```
+PRO collection is not an active runtime lane. Do not use a canonical PRO GGUF
+as an inference fallback; qualify an ExpertMajor v2 PRO artifact before adding
+an executable collection recipe.
 
 Useful smoke-test limits:
 
 ```sh
 ./ds4 \
-  -m MODEL.gguf \
+  -m DEEPSEEK-DS4-ExpertMajor-v2.gguf \
   --imatrix-dataset gguf-tools/imatrix/dataset/rendered_prompts.txt \
   --imatrix-out /tmp/ds4-test.imatrix.dat \
   --imatrix-max-prompts 1 \

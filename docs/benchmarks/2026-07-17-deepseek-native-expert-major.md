@@ -21,6 +21,9 @@ The native file is 2,784 bytes larger. Routed weights occupy 77,913,391,104
 bytes in both files; v2 changes their order and adds only its aligned manifest
 container. It does not carry a canonical duplicate.
 
+Complete native output SHA-256:
+`8378080263eb9224f7228d72e2afa4ac3cf74a116023fdec2c596ff228a33e3f`.
+
 Manifest identities:
 
 - source SHA-256: `efc7ed607ff27076e3e501fc3fefefa33c0ed8cf1eff483a2b7fdc0c2e616668`
@@ -109,6 +112,35 @@ run selected the intended 4,387-record / 28.92 GiB cache tier despite the warm
 GGUF page cache. It completed with zero new swapout, 41,735 MiB peak wired
 memory, and normal memory pressure. The 9/16 Metal envelope, not the transient
 free-page count, is the upper bound.
+
+## Post-isolation adaptive-cache requalification
+
+The 2026-07-20 refactor review found that GLM's batched victim-buffer reuse had
+also activated for DeepSeek because its record happened to fit the same byte
+threshold. Family-gating that optimization recovered decode from 9.37-9.60
+t/s to 13.06 t/s at 3,097 records. The cache sweep therefore had to be repeated
+after the fix; the earlier large-cache results were causally contaminated.
+
+All successful rows below used the same 128-token prompt, 256 generated tokens,
+three-component production reads, exact frontier-logit SHA-256
+`71fd3be0732e0fe97b9f104112911dc937896257c604c64eae851e36fa142441`,
+and zero new swapout:
+
+| Cache policy | Records | Prefill | Decode | Peak wired | Result |
+| --- | ---: | ---: | ---: | ---: | --- |
+| Previous bounded AUTO | 3,097 | 26.80 t/s | 13.06 t/s | 36,492 MiB | Correct but left a safe admitted tier unused |
+| Fixed diagnostic | 4,342 | 21.05 t/s | 13.21 t/s | 41,600 MiB | Positive, but not a complete route-cycle boundary |
+| Fixed diagnostic | 4,387 | 24.51 t/s | 13.87 t/s | 41,900 MiB | Seventeen complete route cycles |
+| Fixed diagnostic | 4,645 | 25.44 t/s | **14.22 t/s** | 43,636 MiB | Fastest safe diagnostic; above the stable AUTO envelope |
+| Final AUTO | 4,387 | **25.21 t/s** | **14.19 t/s** | 42,018 MiB | Pressure-derived ceiling, normal pressure before/after |
+
+The next 4,903- and 5,500-record probes were terminated by the benchmark guard
+when a transient memory-pressure sample crossed the 20% free threshold. They
+caused no swapout and produced no throughput result. AUTO consequently targets
+seventeen complete route cycles on the qualified 64 GiB tier, capped by the
+fresh pressure-derived plan. It can select fewer records when the host is
+busy; the release command has no cache flag. Hosts with 96 GiB or more retain
+the generic pressure-admitted plan until their own physical qualification.
 
 ## Decode parity with the production schedule
 

@@ -1,5 +1,4 @@
 #include "ds4.h"
-#include "ds4_distributed.h"
 #include "ds4_help.h"
 
 /* ds4-eval: small built-in benchmark integration test.
@@ -1216,7 +1215,6 @@ typedef struct {
     int hard_limit_reply_budget;
     int soft_limit_think_close_rank;
     ds4_think_mode think_mode;
-    ds4_dist_options dist;
     bool plain;
     bool warm_weights;
     bool quality;
@@ -1470,28 +1468,17 @@ static const char *need_arg(int *i, int argc, char **argv, const char *opt) {
 
 static ds4_backend parse_backend(const char *s, const char *opt) {
     if (!strcmp(s, "metal")) return DS4_BACKEND_METAL;
-#ifdef DS4_ROCM_BUILD
-    if (!strcmp(s, "rocm")) return DS4_BACKEND_CUDA;
-#else
-    if (!strcmp(s, "cuda")) return DS4_BACKEND_CUDA;
-#endif
     if (!strcmp(s, "cpu")) return DS4_BACKEND_CPU;
     fprintf(stderr, "ds4-eval: invalid value for %s: %s\n", opt, s);
-#ifdef DS4_ROCM_BUILD
-    fprintf(stderr, "ds4-eval: valid backends are: metal, rocm, cpu\n");
-#else
-    fprintf(stderr, "ds4-eval: valid backends are: metal, cuda, cpu\n");
-#endif
+    fprintf(stderr, "ds4-eval: valid backends are: metal, cpu\n");
     exit(2);
 }
 
 static ds4_backend default_backend(void) {
 #ifdef DS4_NO_GPU
     return DS4_BACKEND_CPU;
-#elif defined(__APPLE__)
-    return DS4_BACKEND_METAL;
 #else
-    return DS4_BACKEND_CUDA;
+    return DS4_BACKEND_METAL;
 #endif
 }
 
@@ -1521,22 +1508,8 @@ static eval_config parse_options(int argc, char **argv) {
             usage(stdout, topic);
             exit(0);
         }
-        char dist_parse_err[256] = {0};
-        ds4_dist_cli_parse_result dist_parse =
-            ds4_dist_parse_cli_arg(arg,
-                                   &i,
-                                   argc,
-                                   argv,
-                                   &c.dist,
-                                   dist_parse_err,
-                                   sizeof(dist_parse_err));
-        if (dist_parse == DS4_DIST_CLI_ERROR) {
-            fprintf(stderr,
-                    "ds4-eval: %s\n",
-                    dist_parse_err[0] ? dist_parse_err : "invalid distributed option");
-            exit(2);
-        }
-        if (dist_parse == DS4_DIST_CLI_MATCHED) continue;
+        if (ds4_help_reject_retired_distributed_option(
+                stderr, DS4_HELP_EVAL, arg)) exit(2);
 
         if (!strcmp(arg, "-m") || !strcmp(arg, "--model")) {
             c.model_path = need_arg(&i, argc, argv, arg);
@@ -1576,13 +1549,6 @@ static eval_config parse_options(int argc, char **argv) {
             c.backend = parse_backend(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "--metal")) {
             c.backend = DS4_BACKEND_METAL;
-#ifdef DS4_ROCM_BUILD
-        } else if (!strcmp(arg, "--rocm")) {
-            c.backend = DS4_BACKEND_CUDA;
-#else
-        } else if (!strcmp(arg, "--cuda")) {
-            c.backend = DS4_BACKEND_CUDA;
-#endif
         } else if (!strcmp(arg, "--cpu")) {
             c.backend = DS4_BACKEND_CPU;
         } else if (!strcmp(arg, "--quality")) {
@@ -1651,16 +1617,6 @@ static eval_config parse_options(int argc, char **argv) {
         }
     }
     if (c.self_test_extractors || c.regrade_trace_path) return c;
-
-    char dist_err[256];
-    if (ds4_dist_prepare_engine_options(&c.dist, NULL, dist_err, sizeof(dist_err)) != 0) {
-        fprintf(stderr, "ds4-eval: %s\n", dist_err);
-        exit(2);
-    }
-    if (c.dist.role == DS4_DISTRIBUTED_WORKER) {
-        fprintf(stderr, "ds4-eval: --role worker is a serving mode; start workers with ./ds4\n");
-        exit(2);
-    }
 
     if (c.max_tokens > EVAL_MAX_CONTEXT) {
         fprintf(stderr,
@@ -4063,34 +4019,6 @@ static void log_context_memory(ds4_backend backend,
             m.comp_cap);
 }
 
-static int wait_distributed_route(ds4_session *session) {
-    char err[256] = {0};
-    char last[256] = {0};
-    unsigned ticks = 0;
-    const struct timespec delay = {0, 250000000L};
-
-    for (;;) {
-        int ready = ds4_session_distributed_route_ready(session, err, sizeof(err));
-        if (ready > 0) {
-            if (ticks) fprintf(stderr, "ds4-eval: distributed route ready\n");
-            return 0;
-        }
-        if (ready < 0) {
-            fprintf(stderr,
-                    "ds4-eval: distributed route readiness failed: %s\n",
-                    err[0] ? err : "unknown error");
-            return 1;
-        }
-        const char *why = err[0] ? err : "route incomplete";
-        if (strcmp(last, why) != 0 || (ticks % 20u) == 0) {
-            fprintf(stderr, "ds4-eval: waiting for distributed route: %s\n", why);
-            snprintf(last, sizeof(last), "%s", why);
-        }
-        nanosleep(&delay, NULL);
-        ticks++;
-    }
-}
-
 static const char *report_status_name(eval_status st) {
     switch (st) {
     case EVAL_PASSED: return "PASSED";
@@ -4205,15 +4133,7 @@ int main(int argc, char **argv) {
         .quality = cfg.quality,
         .residency = cfg.residency,
         .ssd_streaming_cold = cfg.ssd_streaming_cold,
-        .distributed = cfg.dist,
     };
-    char dist_err[256];
-    if (ds4_dist_prepare_engine_options(&cfg.dist, &opt, dist_err, sizeof(dist_err)) != 0) {
-        fprintf(stderr, "ds4-eval: %s\n", dist_err);
-        if (trace) fclose(trace);
-        free(case_sequence);
-        return 2;
-    }
 
     ds4_engine *engine = NULL;
     if (ds4_engine_open(&engine, &opt) != 0) {
@@ -4266,16 +4186,6 @@ int main(int argc, char **argv) {
         free(case_sequence);
         return 1;
     }
-    if (cfg.dist.role == DS4_DISTRIBUTED_COORDINATOR &&
-        wait_distributed_route(session) != 0)
-    {
-        ds4_session_free(session);
-        if (trace) fclose(trace);
-        ds4_engine_close(engine);
-        free(case_sequence);
-        return 1;
-    }
-
     eval_ui ui;
     bool split_ui = !cfg.plain && isatty(STDOUT_FILENO);
     tui_start(&ui, eval_cases, ncases, cfg.max_tokens, split_ui);

@@ -9,7 +9,15 @@ Run:
 python3 gguf-tools/imatrix/dataset/build_ds4_imatrix_dataset.py
 ```
 
-Generated files:
+Verify deterministic generation and retired-context exclusions without leaving
+artifacts in the tree:
+
+```sh
+python3 gguf-tools/imatrix/dataset/build_ds4_imatrix_dataset.py --check
+```
+
+Generated files are local build artifacts and are intentionally not tracked.
+The generator rebuilds them deterministically from the current repository:
 
 - `prompts.jsonl`: structured records with messages and rendered prompt text.
 - `rendered_prompts.txt`: all rendered prompts, separated by visible markers.
