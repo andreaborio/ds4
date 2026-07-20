@@ -4,10 +4,10 @@
 Q4_K_S geometry. DeepSeek and GLM must not reuse that identifier: their routed
 tensor types, shapes, layer participation, and quantization can vary.
 
-The generic, versioned store is now implemented for DeepSeek behind
-`ds4.expert_major.v2`. It is discovered from the canonical GGUF rather than a
-second set of family-specific hard-coded offsets. Model-backed publication
-qualification remains open; GLM adoption remains a separate tranche.
+The generic, versioned store is implemented for DeepSeek and the independently
+qualified GLM release behind `ds4.expert_major.v2`. It is discovered from the
+canonical GGUF rather than a second set of family-specific hard-coded offsets.
+Each family keeps its own runtime admission and performance gate.
 
 ## Format contract
 
@@ -28,16 +28,14 @@ missing canonical routed weights.
 ## Runtime boundary
 
 The store API owns validation and logical-to-physical translation. Model-family
-code supplies only the expected tensor roles and supported geometry. The first
-consumer is local Apple Metal: resident and SSD paths consume the same
-validated records without per-token repack. Native CPU, CUDA, ROCm, and
-distributed execution fail early until their own translators are implemented;
-their canonical GGUF paths are unchanged.
+code supplies only the expected tensor roles and supported geometry. Local
+Apple Metal is the first consumer. Native CPU, CUDA, ROCm, and distributed
+execution fail early until their own translators are implemented.
 
-Canonical GGUF loading remains unchanged. The native extension becomes the
-recommended artifact for a family only after its own correctness and
-performance gates pass. Existing loaders that do not understand the extension
-must use the canonical GGUF.
+DeepSeek retains its independent canonical migration path. GLM does not: after
+qualification, DS4 deliberately admits GLM only from ExpertMajor v2 on local
+Metal SSD streaming. Existing external loaders that do not understand the
+extension must use a different canonical artifact and runtime.
 
 ## DeepSeek tranche
 
@@ -61,24 +59,30 @@ and larger-memory hosts retain their existing policy boundaries.
 
 ## GLM tranche
 
-1. Rebase the generic store onto the qualified GLM branch rather than pulling
-   the experimental GLM runtime wholesale into `main`.
-2. Keep the existing GLM normalized/native model contract distinct from this
-   expert-major container version; similar names do not imply compatible
-   layouts.
-3. Validate all routed layers, indexed-prefill preparation, SSD eviction, and
-   long-context decode against the canonical artifact.
-4. Repeat the parity and performance matrix on the target 64 GiB Mac before
-   publishing a native model.
+1. **Implemented:** port the qualified GLM runtime onto fork `main` with strict
+   family checks instead of changing the DeepSeek/Qwen schedules.
+2. **Implemented:** keep canonical logical tensor identity distinct from the
+   physical expert-major container and fail closed on incomplete geometry.
+3. **Implemented:** direct record strides, full expert address tables for
+   grouped prefill, selected-expert SSD translation, in-flight-safe wrapper
+   lifetime, and a model-free canonical/native numeric regression.
+4. **Qualified:** the corrected 288+32 lane moved decode from 1.27 to
+   1.77-1.81 t/s with exact output and no new swap activity. The prior
+   rested-storage qualification remains 11.08/1.90 t/s median; an old/new
+   same-condition A/B measured 1.75/1.74 and proves mainline runtime parity.
+5. **Published:** the single-payload artifact and its exact SHA-256 live at
+   `andreaborio/GLM-5.2-DS4-ExpertMajor-v2-GGUF`.
 
-GLM support is promoted independently because its current runtime line is
-experimental and has separate DeepSeek regression constraints.
+GLM is an independently admitted, ExpertMajor-only Apple Metal SSD path. CPU,
+CUDA, ROCm, resident/distributed execution, canonical GLM artifacts, other
+model families, and Macs below 64 GiB do not inherit its policy or artifact
+compatibility.
 
 ## Release sequence
 
 1. Ship Qwen `v1` and its model as the narrow proven implementation.
 2. Land the generic manifest and converter behind a new identifier.
 3. Qualify and publish DeepSeek artifacts.
-4. Qualify and publish GLM artifacts.
-5. Deprecate sidecars only after every supported family has a native artifact
-   and the canonical migration path has been documented for other runtimes.
+4. **Complete:** qualify and publish the GLM artifact.
+5. Keep family-specific admission explicit; GLM has no sidecar or canonical
+   fallback in DS4 main.

@@ -147,7 +147,7 @@ the runtime needs.
 | --- | --- | --- | --- |
 | DeepSeek V4 Flash | `main` | Primary supported path | Metal, adaptive SSD streaming, 16–64 GB measurements |
 | DeepSeek V4 PRO | `main` | Supported upstream path | High-memory and distributed inference |
-| GLM 5.2 | `codex/glm52-upstream-clean-bench` | Experimental branch | Correct streamed prefill and Metal performance on 64 GB |
+| GLM 5.2 ExpertMajor v2 | `main` | Qualified Apple Metal SSD path; 64 GB minimum | Embedded expert store, grouped prefill, compact DSA KV, adaptive decode cache |
 | Qwen3.6-35B-A3B (`qwen35moe`) | `main` | Supported opt-in Metal path, model-backed measured | Metal AUTO mapping, live-pressure fallback, strict SSD cache, resident prefill, and parallel resident decode |
 
 ### DeepSeek expert-major v2 format
@@ -167,6 +167,35 @@ remains the release reference. The first M5 Pro SSD tranche is recorded in
 The distinctly named experimental artifact is
 [`DeepSeek-V4-Flash-DS4-ExpertMajor-v2-GGUF`](https://huggingface.co/andreaborio/DeepSeek-V4-Flash-DS4-ExpertMajor-v2-GGUF),
 with full conversion provenance and compatibility limits in its model card.
+
+### GLM 5.2 ExpertMajor v2
+
+The 262,147,193,504-byte GLM release stores its 76 × 256 routed experts once,
+inside the GGUF, in the physical order used by Metal prefill and decode. It
+does not need a sidecar or ExpertMajor environment variables. The qualified
+tier is an Apple Silicon Mac with at least 64 GiB of unified memory. GLM in
+this repo intentionally supports only the ExpertMajor v2 Metal SSD path:
+
+```sh
+make -j8
+./ds4 \
+  -m /absolute/path/to/GLM-5.2-DS4-ExpertMajor-v2-Q2_K.gguf \
+  --ctx 8192
+```
+
+The artifact is
+[`andreaborio/GLM-5.2-DS4-ExpertMajor-v2-GGUF`](https://huggingface.co/andreaborio/GLM-5.2-DS4-ExpertMajor-v2-GGUF),
+SHA-256
+`7f5017e3076e706c78f2a5322b035a9e2f6519c65ff5b6be8b2d91aeff61505d`.
+The simple command automatically selects Metal, SSD residency, the GLM Gold
+profile, the measured 601-expert cache on the 64 GiB tier, indexed preparation,
+grouped native prefill, contiguous-record decode reads, and compact DSA KV.
+Canonical GLM GGUFs and non-Metal/distributed execution fail closed. Do not add
+cache, preload, full-layer, or ExpertMajor flags. Format, memory flow, tier
+boundaries, and current limits are in
+[`docs/glm52-expert-major-v2.md`](docs/glm52-expert-major-v2.md).
+Older GLM files, sidecars, layout revisions, and retired tuning modes have no
+backward-compatibility contract in this fork.
 
 ### Qwen3.6 Metal AUTO path
 
@@ -256,7 +285,7 @@ each model uses a different artifact, context, and runtime path.
 | Qwen3.6-35B-A3B Q4_K_S, 20.81 GB | M5 Pro 64 GB, page-touched resident CLI | 218.30 t/s | **63.94 t/s** | Best retained real CLI generation number; same rendered prompt and visible continuation as the llama.cpp reference |
 | Qwen3.6-35B-A3B Q4_K_S, 20.81 GB | M1 Pro 16 GB, Metal AUTO to SSD, canonical migration GGUF | **15.04 t/s** | **9.77 t/s** | Warm median over four distinct short prompts after one cold run; normal pressure, no new swapouts |
 | DeepSeek V4 Flash IQ2XXS, 86.72 GB | M5 Pro 64 GB, Metal SSD streaming | 20.75 t/s | 12.58 t/s | Direct upstream/fork A/B showed parity, not a fork speedup |
-| GLM 5.2 ds4-native GGUF, 244.14 GiB | M5 Pro 64 GB, Metal SSD streaming | **9.15 t/s** | 0.91 t/s | Indexed-prefill prepare A/B; big prefill win, no decode win |
+| GLM 5.2 ExpertMajor v2 Q2_K, 244.14 GiB | M5 Pro 64 GB, rested internal storage, 288+32 tokens | **11.08 t/s** | **1.90 t/s** | Prior qualified median; current main port restores same-condition parity, final simple AUTO-601 gates measured 10.63-10.91/1.77-1.79 t/s, and the best profiled decode was 1.81 t/s |
 
 DeepSeek hardware reference bests from the standard `speed-bench` sweep:
 
@@ -269,6 +298,7 @@ DeepSeek hardware reference bests from the standard `speed-bench` sweep:
 
 Full commands, samples, and caveats are in
 [`docs/benchmarks/2026-07-15-qwen-ds4-vs-llamacpp.md`](docs/benchmarks/2026-07-15-qwen-ds4-vs-llamacpp.md),
+[`docs/benchmarks/2026-07-20-glm52-expert-major-v2.md`](docs/benchmarks/2026-07-20-glm52-expert-major-v2.md),
 [`docs/benchmarks/2026-07-14-m5-pro.md`](docs/benchmarks/2026-07-14-m5-pro.md),
 [`SSD_STREAMING_VERIFICATION.md`](SSD_STREAMING_VERIFICATION.md), and
 [`docs/ENGINE_REFERENCE.md`](docs/ENGINE_REFERENCE.md).
@@ -318,6 +348,9 @@ and still a work in progress.
 - [`docs/qwen-expert-major-store.md`](docs/qwen-expert-major-store.md):
   DS4-native GGUF layout, transactional converter, compatibility, and parity
   evidence.
+- [`docs/glm52-expert-major-v2.md`](docs/glm52-expert-major-v2.md): embedded GLM
+  artifact, one-command startup, prefill/decode memory flow, qualification, and
+  supported memory tiers.
 - [`docs/expert-major-v2-roadmap.md`](docs/expert-major-v2-roadmap.md): generic
   expert-major manifest and separate DeepSeek/GLM qualification plan.
 - [`CONTRIBUTING.md`](CONTRIBUTING.md): upstream-first contribution policy and
@@ -350,42 +383,26 @@ evolved since the original five-feature summary was written. The authoritative
 per-change ledger is [`FORK_NOTES.md`](FORK_NOTES.md); upstream syncs are recorded
 in [`MERGE_LOG.md`](MERGE_LOG.md).
 
-### The GLM 5.2 SSD-streaming line (not mainline)
+### The GLM 5.2 SSD-streaming path
 
-The fork also carries a GLM 5.2 line on
-[`codex/glm52-upstream-clean-bench`](https://github.com/andreaborio/ds4/tree/codex/glm52-upstream-clean-bench):
-upstream's `glm5.2` branch (`bd89932`) plus eleven commits — the streaming prefill
-correctness fixes proposed as
-[antirez/ds4#520](https://github.com/antirez/ds4/pull/520) (real-size prompts were
-failing under `--ssd-streaming`; independently validated by a third party on an M4 Max
-128 GB), the indexed-prefill layer-prepare overlap proposed as
-[antirez/ds4#528](https://github.com/antirez/ds4/pull/528) (measured prefill ×1.6-2.0
-across a 2048-8192 sweep in the PR, ×2.4-2.5 re-measured on short prompts, decode
-unchanged, greedy output byte-identical), the ds4-native GLM 5.2 GGUF layout support the
-line runs on, a copy of the RAM guard (upstreamed separately, see
-[`FORK_NOTES.md`](FORK_NOTES.md)), and a set of default-off streaming experiments
-(router-ahead prefetch, expert prune/profile hooks, virtual resident decode layers).
-The short-prompt speedup, the regression below and the MTP gate were re-verified
-independently with paired A/B runs
-([`SSD_STREAMING_VERIFICATION.md`](SSD_STREAMING_VERIFICATION.md)); the sweep figures
-are from [#528](https://github.com/antirez/ds4/pull/528)'s benchmark.
+GLM 5.2 is promoted as a narrow Apple Metal path for the published embedded
+ExpertMajor v2 artifact. It includes the streamed-prefill correctness and
+indexed-prepare work proposed as [#520](https://github.com/antirez/ds4/pull/520)
+and [#528](https://github.com/antirez/ds4/pull/528), plus model-specific compact
+DSA KV, grouped Q2_K prefill, physical expert-record addressing, NextN metadata
+binding, tokenizer/prompt routing, and a pressure-sized cache policy for the
+64 GiB reference tier.
 
-Two caveats, both measured:
+The promotion does not make GLM code a generic fallback for DeepSeek, Qwen,
+CPU, CUDA, ROCm, or distributed execution. Family checks keep those paths on
+their existing schedules, and native artifacts fail closed on unsupported
+backends. The DeepSeek regression discovered on the historical upstream GLM
+line remains tracked in [#532](https://github.com/antirez/ds4/issues/532).
 
-- **Upstream's whole `glm5.2` line decodes DeepSeek Flash ~2.8× slower than `main`**
-  (DeepSeek-V4-Flash IQ2XXS: 7-8 → ~2-3 tok/s on an M5 Pro 64 GB under
-  `--ssd-streaming`, first token ~5-7 s; bisected to the first commit of the line,
-  verified twice on separate days). Keep DeepSeek work on `main`; reported upstream as
-  [antirez/ds4#532](https://github.com/antirez/ds4/issues/532).
-- **Speculative decode (MTP) on streamed GLM is a measured NO-GO**: the `blk.78` nextn
-  acceptance probe (branch
-  [`feat/glm-mtp-probe`](https://github.com/andreaborio/ds4/tree/feat/glm-mtp-probe),
-  a reusable measurement tool; GLM 5.2 ds4-native build) reads ~55% acceptance against
-  the ~75% needed to pay for the extra I/O.
-
-The older bring-up branch
-[`wip/glm52-metal64-strict-probe`](https://github.com/andreaborio/ds4/tree/wip/glm52-metal64-strict-probe)
-predates this line and is kept as history.
+Speculative streamed decode is still a measured no-go: the existing NextN
+probe reached about 55% acceptance, below the level needed to repay its extra
+expert I/O. Current release evidence and the remaining decode targets are in
+[`docs/benchmarks/2026-07-20-glm52-expert-major-v2.md`](docs/benchmarks/2026-07-20-glm52-expert-major-v2.md).
 
 ### 1. On-edge / real-time imatrix collection: `ds4-server --imatrix-out`
 
