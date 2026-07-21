@@ -561,6 +561,20 @@
       "maximum": 4
     },
     {
+      "path": "docs/benchmarks/2026-07-21-qwen-pre-m5-exact-router-tile.md",
+      "location": "content",
+      "token": "ds4",
+      "classification": "historical-attribution",
+      "maximum": 6
+    },
+    {
+      "path": "docs/benchmarks/2026-07-21-qwen-pre-m5-exact-router-tile.md",
+      "location": "content",
+      "token": "DS4",
+      "classification": "historical-attribution",
+      "maximum": 3
+    },
+    {
       "path": "docs/benchmarks/2026-07-21-qwen-q4-paired-mmid-prefill.md",
       "location": "content",
       "token": "ds4",
@@ -985,7 +999,7 @@
       "location": "content",
       "token": "ds4",
       "classification": "migration-pending",
-      "maximum": 720
+      "maximum": 721
     },
     {
       "path": "ds4_gpu.h",
@@ -1090,14 +1104,14 @@
       "location": "content",
       "token": "ds4",
       "classification": "migration-pending",
-      "maximum": 6634
+      "maximum": 6648
     },
     {
       "path": "ds4_metal.m",
       "location": "content",
       "token": "DS4",
       "classification": "migration-pending",
-      "maximum": 1042
+      "maximum": 1044
     },
     {
       "path": "ds4_profile.c",
@@ -1685,7 +1699,7 @@
       "location": "content",
       "token": "ds4",
       "classification": "migration-pending",
-      "maximum": 28
+      "maximum": 29
     },
     {
       "path": "metal/dense.metal",
@@ -2056,14 +2070,14 @@
       "location": "content",
       "token": "ds4",
       "classification": "migration-pending",
-      "maximum": 716
+      "maximum": 741
     },
     {
       "path": "tests/ds4_test.c",
       "location": "content",
       "token": "DS4",
       "classification": "migration-pending",
-      "maximum": 143
+      "maximum": 146
     },
     {
       "path": "tests/gen_qwen_unicode.py",
@@ -2539,7 +2553,7 @@
       "location": "content",
       "token": "ds4",
       "classification": "compatibility",
-      "maximum": 4
+      "maximum": 3
     },
     {
       "path": "tests/test_server_alias_model.py",
