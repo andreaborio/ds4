@@ -85,8 +85,10 @@ planned `andreaborio/hebrus` identity over HTTPS or SSH. The existing fork is
 renamed in place; no history-less replacement is created and the old repository
 name must not be reused.
 
-DSBox remains the companion application's visible and persisted identity until
-its separate name is selected. The bridge application resolves
+The companion application's public name is **Hebrus Studio**. Its persisted
+DSBox identity remains a compatibility boundary for the bridge release:
+`com.dsbox.desktop`, `$HOME/.dsbox`, `DSBOX_*`, browser storage keys, and the
+legacy Electron user-data directory do not move. The bridge application resolves
 `hebrus-server` first, falls back to `ds4-server`, accepts both structured
 engine identities, and permits source/string fallback only for a legacy
 capability-less `ds4-server`. A capability-less `hebrus-server`, malformed JSON,
@@ -103,7 +105,7 @@ ExpertMajor fields fail closed.
 4. Run the complete model-free gates for identity-only work and the canonical
    model-backed release gates for any change that can affect code generation or
    inference behavior.
-5. Do not begin internal file/symbol migration until the DSBox bridge is
+5. Do not begin internal file/symbol migration until the Hebrus Studio bridge is
    published and the Qwen MLX-affine baseline is qualified.
 
 The architectural rationale and the acceptance conditions for the rename are

@@ -30,8 +30,11 @@ The release runtime accepts ExpertMajor v2 artifacts only on local Apple Metal.
 The normal CLI is the same for all three families:
 
 ```sh
-./ds4 -m /absolute/path/to/MODEL-DS4-ExpertMajor-v2.gguf --ctx 8192
+./hebrus -m /absolute/path/to/MODEL-DS4-ExpertMajor-v2.gguf --ctx 8192
 ```
+
+`./ds4` remains a byte-identical compatibility alias; it is no longer the
+primary command in new documentation.
 
 AUTO chooses the family-qualified resident or SSD consumer. No ExpertMajor,
 sidecar, backend, cache, preload, or power flag is required. Canonical GGUFs

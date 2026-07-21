@@ -18,8 +18,9 @@ the only capacity boundary.
 > [`andreaborio/ds4`](https://github.com/andreaborio/ds4), and
 > [ADR 0005](docs/adr/0005-hebrus-naming-and-compatibility-boundary.md) remains
 > **Proposed** while namespace and legal screening remain incomplete. The
-> companion-application bridge is implemented locally but not yet published,
-> and this repository has not been administratively renamed.
+> companion application is named **Hebrus Studio** and its bridge release is
+> implemented locally but not yet published. This repository has not been
+> administratively renamed.
 
 > [!IMPORTANT]
 > Hebrus began as a fork of
@@ -255,9 +256,12 @@ can create substantial memory pressure and I/O. Follow AUTO, use only exact
 qualified artifacts, monitor swap and memory pressure, and do not expose a
 local server to untrusted networks without an appropriate security boundary.
 
-The separate companion desktop application is currently still
-[DSBox](https://github.com/andreaborio/dsbox). Its name, persisted application
-identity, and migration are outside this engine bridge.
+The separate companion desktop application is **Hebrus Studio**, currently
+developed in the existing
+[`andreaborio/dsbox`](https://github.com/andreaborio/dsbox) fork until its
+administrative rename. Its bridge release preserves the DSBox bundle ID, data
+locations, environment namespace, storage keys, and rollback path so the public
+rename does not split existing installations.
 
 ## Contributing and security
 

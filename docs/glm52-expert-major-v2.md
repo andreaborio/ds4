@@ -1,6 +1,6 @@
-# GLM 5.2 DS4 ExpertMajor v2
+# GLM 5.2 ExpertMajor v2 on Hebrus
 
-DS4 runs the 244.14 GiB GLM-5.2 Q2_K artifact on Apple Metal while streaming
+Hebrus runs the 244.14 GiB GLM-5.2 Q2_K artifact on Apple Metal while streaming
 the routed experts from local storage. The qualified machine is an M5 Pro with
 64 GiB unified memory. No claim is made for Macs below 64 GiB.
 
@@ -17,7 +17,7 @@ revision may require a newly published GGUF.
 
 ```sh
 make -j8
-./ds4 \
+./hebrus \
   -m /absolute/path/to/GLM-5.2-DS4-ExpertMajor-v2-Q2_K.gguf \
   --ctx 8192
 ```
@@ -25,7 +25,7 @@ make -j8
 This starts the interactive CLI. A one-shot request only adds a prompt:
 
 ```sh
-./ds4 \
+./hebrus \
   -m /absolute/path/to/GLM-5.2-DS4-ExpertMajor-v2-Q2_K.gguf \
   --ctx 8192 \
   -p "Explain why locality matters in mixture-of-experts inference."
@@ -34,7 +34,7 @@ This starts the interactive CLI. A one-shot request only adds a prompt:
 The local API uses the same contract:
 
 ```sh
-./ds4-server \
+./hebrus-server \
   -m /absolute/path/to/GLM-5.2-DS4-ExpertMajor-v2-Q2_K.gguf \
   --ctx 8192
 ```

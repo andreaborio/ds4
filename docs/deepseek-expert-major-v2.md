@@ -1,4 +1,4 @@
-# DeepSeek DS4-native ExpertMajor v2 GGUF
+# DeepSeek ExpertMajor v2 GGUF on Hebrus
 
 `ds4.expert_major.v2` is the self-describing routed-expert container used by
 DeepSeek V4, GLM 5.2, and Qwen3.6 in this fork. For DeepSeek it changes storage
@@ -73,12 +73,13 @@ Native v2 activates automatically:
 
 ```sh
 make -j8
-./ds4 \
+./hebrus \
   -m /absolute/path/to/DEEPSEEK-DS4-EXPERT-MAJOR-V2.gguf \
   --ctx 32768
 ```
 
-For the API, replace `./ds4` with `./ds4-server`. AUTO chooses resident mapping
+For the API, replace `./hebrus` with `./hebrus-server`. The legacy command
+names remain aliases to the same binaries. AUTO chooses resident mapping
 when the complete model safely fits or SSD streaming otherwise. The release
 command does not need an ExpertMajor variable, sidecar path, explicit backend,
 cache budget, preload policy, or residency flag.

@@ -1,4 +1,4 @@
-# Qwen DS4-native ExpertMajor v2 GGUF
+# Qwen ExpertMajor v2 GGUF on Hebrus
 
 Qwen3.6-35B-A3B uses the same self-describing `ds4.expert_major.v2` container
 as DeepSeek and GLM. The optimized Mac artifact stores every routed weight
@@ -30,12 +30,13 @@ A valid Qwen v2 file activates automatically:
 
 ```sh
 make -j8
-./ds4 \
+./hebrus \
   -m /absolute/path/to/Qwen3.6-35B-A3B-DS4-ExpertMajor-v2-MLX-Affine4-G64.gguf \
   --ctx 8192
 ```
 
-Use the same model with `./ds4-server` for the local API. Normal startup does
+Use the same model with `./hebrus-server` for the local API. The legacy
+`./ds4` and `./ds4-server` names remain aliases to the same build. Normal startup does
 not need an experimental guard, explicit Metal selection, a sidecar path,
 payload hashes, cache geometry, `--resident`, or `--ssd-streaming`. AUTO chooses
 resident mapping when the full working set fits its Metal and host-memory

@@ -1,0 +1,26 @@
+name: Documentation
+description: Report missing, incorrect, or unclear Hebrus documentation
+title: "[Docs]: "
+labels: ["documentation"]
+body:
+  - type: input
+    id: location
+    attributes:
+      label: Page or section
+    validations:
+      required: true
+  - type: textarea
+    id: problem
+    attributes:
+      label: What is wrong or unclear?
+    validations:
+      required: true
+  - type: textarea
+    id: proposed
+    attributes:
+      label: Suggested correction
+      description: Paste-ready wording is welcome, but not required.
+  - type: input
+    id: version
+    attributes:
+      label: Hebrus version or commit

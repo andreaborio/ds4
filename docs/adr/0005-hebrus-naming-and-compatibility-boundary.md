@@ -16,7 +16,7 @@ ownership harder to explain.
 A textual rename is unsafe. Existing installations and automation depend on
 `ds4` commands, `DS4_*` environment variables, repository URLs, C names, model
 filenames, and application paths. Published GGUFs and disk-KV files also contain
-identifiers whose bytes are part of a durable format. The current DSBox release
+identifiers whose bytes are part of a durable format. The pre-rename DSBox release
 additionally probes exact source paths, C symbols, and diagnostic strings when
 admitting an ExpertMajor runtime.
 
@@ -61,8 +61,9 @@ both command brands. Model-format lifecycle remains governed by ADR 0003.
 
 ## Consequences
 
-- A bridge release must precede internal source renaming and the companion
-  application's visible rebrand.
+- A Hebrus Studio bridge release must precede internal source renaming; its
+  visible rebrand may ship in that same bridge release once persisted identity
+  and rollback tests are green.
 - Every remaining DS4 identifier must be classified as serialized, historical,
   compatibility-owned, or erroneous; unclassified additions fail a repository
   check.
@@ -73,5 +74,5 @@ both command brands. Model-format lifecycle remains governed by ADR 0003.
 - The GitHub repository rename happens only after the compatibility application
   recognizes both old and new remote identities.
 - This ADR becomes Accepted only after the Hebrus identity is reserved, the
-  machine-readable capability contract is merged, the DSBox bridge is proven,
+  machine-readable capability contract is merged, the Hebrus Studio bridge is proven,
   and the pre-rebrand release baseline is green.
