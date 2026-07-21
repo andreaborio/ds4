@@ -673,6 +673,20 @@
       "maximum": 13
     },
     {
+      "path": "docs/guides/MIGRATING_TO_HEBRUS.md",
+      "location": "content",
+      "token": "ds4",
+      "classification": "compatibility",
+      "maximum": 24
+    },
+    {
+      "path": "docs/guides/MIGRATING_TO_HEBRUS.md",
+      "location": "content",
+      "token": "DS4",
+      "classification": "compatibility",
+      "maximum": 6
+    },
+    {
       "path": "docs/qwen-expert-major-store.md",
       "location": "content",
       "token": "ds4",

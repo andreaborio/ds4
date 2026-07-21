@@ -197,6 +197,9 @@ A short-context best is not substituted for the long-context gate.
 
 ### Start and operate
 
+- [Migration guide](docs/guides/MIGRATING_TO_HEBRUS.md) — install the bridge,
+  validate both command identities, move integrations safely, and roll back
+  without rewriting models or user data.
 - [Runtime support contract](docs/contracts/RUNTIME_SUPPORT.md) — supported
   families, hardware floors, backends, and fail-closed boundaries.
 - [Brand compatibility contract](docs/contracts/BRAND_COMPATIBILITY.md) —
