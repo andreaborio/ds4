@@ -1694,6 +1694,7 @@ enum {
     DS4_TENSOR_IQ2_XXS  = 16,
     DS4_TENSOR_I8       = 24,
     DS4_TENSOR_I32      = 26,
+    DS4_TENSOR_MLX_AFFINE2 = DS4_EXPERT_STORE_TYPE_MLX_AFFINE2,
 };
 
 typedef struct {
@@ -1810,6 +1811,7 @@ static const gguf_type_info *tensor_type(uint32_t type) {
 }
 
 static const char *tensor_type_name(uint32_t type) {
+    if (type == DS4_TENSOR_MLX_AFFINE2) return "mlx_affine2";
     const gguf_type_info *info = tensor_type(type);
     return info ? info->name : "unknown";
 }
@@ -4082,7 +4084,8 @@ static bool tensor_is_routed_expert_type(uint32_t type) {
            type == DS4_TENSOR_Q2_K ||
            type == DS4_TENSOR_Q4_K ||
            type == DS4_TENSOR_Q5_K ||
-           type == DS4_TENSOR_Q6_K;
+           type == DS4_TENSOR_Q6_K ||
+           type == DS4_TENSOR_MLX_AFFINE2;
 }
 
 static DS4_MAYBE_UNUSED uint64_t routed_expert_block_bytes(uint32_t type) {
@@ -4098,6 +4101,17 @@ static DS4_MAYBE_UNUSED uint64_t routed_expert_block_bytes(uint32_t type) {
 }
 
 static DS4_MAYBE_UNUSED uint64_t routed_expert_row_bytes(const ds4_tensor *t) {
+    if (t->type == DS4_TENSOR_MLX_AFFINE2) {
+        /* Only embedded DeepSeek affine2 tensors can carry this virtual type.
+         * Gate/up have different physical grouping, so derive the role from
+         * the validated component extent instead of inventing a GGML block. */
+        if (t->dim[1] == 0 || t->dim[2] == 0 ||
+            t->dim[1] > UINT64_MAX / t->dim[2] ||
+            t->bytes % (t->dim[1] * t->dim[2]) != 0) {
+            ds4_die("invalid MLX affine2 routed tensor geometry");
+        }
+        return t->bytes / (t->dim[1] * t->dim[2]);
+    }
     if ((t->dim[0] % QK_K) != 0) ds4_die("routed expert row is not QK_K aligned");
     return (t->dim[0] / QK_K) * routed_expert_block_bytes(t->type);
 }
@@ -4516,6 +4530,14 @@ static ds4_gpu_stream_expert_table graph_stream_expert_table_make(
     table.up_offset = layer->ffn_up_exps ? layer->ffn_up_exps->abs_offset : 0;
     table.down_offset = layer->ffn_down_exps ? layer->ffn_down_exps->abs_offset : 0;
     table.gate_expert_bytes = gate_expert_bytes;
+    if (layer->ffn_up_exps && layer->ffn_up_exps->dim[1] != 0) {
+        const uint64_t up_row_bytes =
+            routed_expert_row_bytes(layer->ffn_up_exps);
+        if (layer->ffn_up_exps->dim[1] <= UINT64_MAX / up_row_bytes) {
+            table.up_expert_bytes =
+                layer->ffn_up_exps->dim[1] * up_row_bytes;
+        }
+    }
     table.down_expert_bytes = down_expert_bytes;
     return table;
 }
@@ -16490,6 +16512,7 @@ static bool qwen35_gpu_encode_ffn_one(
             .up_offset = layer->ffn_up_exps->abs_offset,
             .down_offset = layer->ffn_down_exps->abs_offset,
             .gate_expert_bytes = gate_expert_bytes,
+            .up_expert_bytes = gate_expert_bytes,
             .down_expert_bytes = down_expert_bytes,
         };
         ok = ds4_gpu_qwen35_stream_batch_route_ready(
@@ -17027,6 +17050,7 @@ static bool qwen35_gpu_encode_ffn_batch(
             .up_offset = layer->ffn_up_exps->abs_offset,
             .down_offset = layer->ffn_down_exps->abs_offset,
             .gate_expert_bytes = gate_expert_bytes,
+            .up_expert_bytes = gate_expert_bytes,
             .down_expert_bytes = down_expert_bytes,
         };
         ok = ds4_gpu_qwen35_stream_batch_route_ready_select(
@@ -17129,6 +17153,8 @@ static bool qwen35_gpu_encode_ffn_batch(
                  layer->ffn_down_exps->abs_offset,
                  layer->ffn_gate_exps->type,
                  layer->ffn_down_exps->type,
+                 gate_expert_bytes,
+                 gate_row_bytes,
                  gate_expert_bytes,
                  gate_row_bytes,
                  down_expert_bytes,
@@ -19590,20 +19616,23 @@ static bool metal_graph_stream_prefill_selected_profile_layer(
     free(selected);
 
     const uint64_t gate_row_bytes = routed_expert_row_bytes(layer->ffn_gate_exps);
+    const uint64_t up_row_bytes = routed_expert_row_bytes(layer->ffn_up_exps);
     const uint64_t down_row_bytes = routed_expert_row_bytes(layer->ffn_down_exps);
     if (layer->ffn_gate_exps->dim[1] > UINT64_MAX / gate_row_bytes ||
+        layer->ffn_up_exps->dim[1] > UINT64_MAX / up_row_bytes ||
         layer->ffn_down_exps->dim[1] > UINT64_MAX / down_row_bytes) {
         fprintf(stderr, "ds4: Metal streaming prefill selected profile byte size overflow at layer %u\n", il);
         return false;
     }
     const uint64_t gate_expert_bytes = layer->ffn_gate_exps->dim[1] * gate_row_bytes;
+    const uint64_t up_expert_bytes = layer->ffn_up_exps->dim[1] * up_row_bytes;
     const uint64_t down_expert_bytes = layer->ffn_down_exps->dim[1] * down_row_bytes;
-    if (gate_expert_bytes > UINT64_MAX - gate_expert_bytes ||
-        gate_expert_bytes + gate_expert_bytes > UINT64_MAX - down_expert_bytes) {
+    if (gate_expert_bytes > UINT64_MAX - up_expert_bytes ||
+        gate_expert_bytes + up_expert_bytes > UINT64_MAX - down_expert_bytes) {
         fprintf(stderr, "ds4: Metal streaming prefill selected profile byte size overflow at layer %u\n", il);
         return false;
     }
-    const uint64_t per_expert_bytes = gate_expert_bytes + gate_expert_bytes +
+    const uint64_t per_expert_bytes = gate_expert_bytes + up_expert_bytes +
                                       down_expert_bytes;
     const uint64_t selected_bytes =
         unique > UINT64_MAX / per_expert_bytes ?
@@ -22847,6 +22876,8 @@ static bool metal_graph_encode_decode_layer(
     }
     const uint64_t gate_row_bytes = routed_expert_row_bytes(layer->ffn_gate_exps);
     const uint64_t gate_expert_bytes = expert_mid_dim * gate_row_bytes;
+    const uint64_t up_row_bytes = routed_expert_row_bytes(layer->ffn_up_exps);
+    const uint64_t up_expert_bytes = expert_mid_dim * up_row_bytes;
     const uint64_t down_row_bytes = routed_expert_row_bytes(layer->ffn_down_exps);
     const uint64_t down_expert_bytes = routed_out_dim * down_row_bytes;
     if (ok && metal_graph_decode_cpu_router_applicable(g, layer)) {
@@ -23230,7 +23261,28 @@ static bool metal_graph_encode_decode_layer(
         }
         return ok;
     }
-    if (ok) ok = ds4_gpu_routed_moe_one_tensor(g->routed_out,
+    if (ok && layer->ffn_gate_exps->type == DS4_TENSOR_MLX_AFFINE2) {
+        bool affine2_mid_is_f16 = false;
+        int affine2_schedule_used = 0;
+        ok = ds4_gpu_routed_moe_batch_select_tensor(
+                 g->routed_out, g->routed_gate, g->routed_up,
+                 g->routed_mid, g->routed_down,
+                 model->map, model->size,
+                 layer->ffn_gate_exps->abs_offset,
+                 layer->ffn_up_exps->abs_offset,
+                 layer->ffn_down_exps->abs_offset,
+                 layer->ffn_gate_exps->type,
+                 layer->ffn_down_exps->type,
+                 gate_expert_bytes, gate_row_bytes,
+                 up_expert_bytes, up_row_bytes,
+                 down_expert_bytes, down_row_bytes,
+                 (uint32_t)expert_in_dim, (uint32_t)down_in_dim,
+                 (uint32_t)routed_out_dim,
+                 g->router_selected, g->router_weights,
+                 DS4_N_EXPERT, DS4_N_EXPERT_USED,
+                 DS4_SWIGLU_CLAMP_EXP, g->ffn_norm, il, 1u,
+                 &affine2_mid_is_f16, 0, &affine2_schedule_used) != 0;
+    } else if (ok) ok = ds4_gpu_routed_moe_one_tensor(g->routed_out,
                                                  g->routed_gate,
                                                  g->routed_up,
                                                  g->routed_mid,
@@ -26140,6 +26192,8 @@ static bool metal_graph_encode_layer_ffn_batch(
     const uint64_t routed_out_dim = layer->ffn_down_exps->dim[1];
     const uint64_t gate_row_bytes = routed_expert_row_bytes(layer->ffn_gate_exps);
     const uint64_t gate_expert_bytes = expert_mid_dim * gate_row_bytes;
+    const uint64_t up_row_bytes = routed_expert_row_bytes(layer->ffn_up_exps);
+    const uint64_t up_expert_bytes = expert_mid_dim * up_row_bytes;
     const uint64_t down_row_bytes = routed_expert_row_bytes(layer->ffn_down_exps);
     const uint64_t down_expert_bytes = routed_out_dim * down_row_bytes;
     const bool layer_stage_profile = metal_graph_layer_stage_profile_enabled(il);
@@ -26637,6 +26691,8 @@ static bool metal_graph_encode_layer_ffn_batch(
                                                layer->ffn_down_exps->type,
                                                gate_expert_bytes,
                                                gate_row_bytes,
+                                               up_expert_bytes,
+                                               up_row_bytes,
                                                down_expert_bytes,
                                                down_row_bytes,
                                                (uint32_t)expert_in_dim,
@@ -38915,6 +38971,34 @@ static bool ds4_engine_install_expert_store_v2(ds4_engine *e) {
         ds4_expert_store_close(store);
         return false;
     }
+    const bool is_deepseek_affine2 =
+        is_deepseek && manifest->storage_format ==
+            DS4_EXPERT_STORE_STORAGE_MLX_AFFINE2;
+    if (is_deepseek &&
+        manifest->storage_format != DS4_EXPERT_STORE_STORAGE_GGML &&
+        !is_deepseek_affine2) {
+        fprintf(stderr,
+                "ds4: DeepSeek native ExpertMajor requires the explicit MLX "
+                "affine2 gate-g32/up-down-g64 payload; IQ2/Q2 and other "
+                "layouts are not interchangeable\n");
+        ds4_expert_store_close(store);
+        return false;
+    }
+    if (is_deepseek_affine2 &&
+        manifest->group_size !=
+            DS4_EXPERT_STORE_GROUP_PROFILE_AFFINE2_G32_U64_D64) {
+        fprintf(stderr,
+                "ds4: DeepSeek MLX affine2 has an unsupported group profile\n");
+        ds4_expert_store_close(store);
+        return false;
+    }
+    if (is_deepseek_affine2 && !e->ssd_streaming) {
+        fprintf(stderr,
+                "ds4: DeepSeek MLX affine2 is admitted only through the SSD "
+                "streaming address path; resident fallback is disabled\n");
+        ds4_expert_store_close(store);
+        return false;
+    }
 
     ds4_gpu_expert_store_layer_v2 gpu_layers[DS4_MAX_LAYER];
     memset(gpu_layers, 0, sizeof(gpu_layers));
@@ -38935,6 +39019,29 @@ static bool ds4_engine_install_expert_store_v2(ds4_engine *e) {
             return false;
         }
         const uint32_t layer = entry->layer;
+        if (is_deepseek_affine2 &&
+            (entry->record_bytes != UINT64_C(8388608) ||
+             entry->component[0].ggml_type !=
+                 DS4_EXPERT_STORE_TYPE_MLX_AFFINE2 ||
+             entry->component[1].ggml_type !=
+                 DS4_EXPERT_STORE_TYPE_MLX_AFFINE2 ||
+             entry->component[2].ggml_type !=
+                 DS4_EXPERT_STORE_TYPE_MLX_AFFINE2 ||
+             entry->component[0].block_elements != 32u ||
+             entry->component[1].block_elements != 64u ||
+             entry->component[2].block_elements != 64u ||
+             entry->component[0].expert_bytes != UINT64_C(3145728) ||
+             entry->component[1].expert_bytes != UINT64_C(2621440) ||
+             entry->component[2].expert_bytes != UINT64_C(2621440) ||
+             entry->component[0].record_offset != 0u ||
+             entry->component[1].record_offset != UINT64_C(3145728) ||
+             entry->component[2].record_offset != UINT64_C(5767168))) {
+            fprintf(stderr,
+                    "ds4: native DeepSeek affine2 record geometry differs at layer %u\n",
+                    layer);
+            ds4_expert_store_close(store);
+            return false;
+        }
         /* Resolve the canonical identities from the expanded model instead
          * of the executable weight table. GLM keeps its bundled NextN tail
          * (layer 78) in the self-contained store, while the current graph
@@ -39043,6 +39150,8 @@ static bool ds4_engine_install_expert_store_v2(ds4_engine *e) {
     const char *storage_name =
         manifest->storage_format == DS4_EXPERT_STORE_STORAGE_MLX_AFFINE4
             ? "mlx-affine4-g64"
+        : manifest->storage_format == DS4_EXPERT_STORE_STORAGE_MLX_AFFINE2
+            ? "mlx-affine2-gate32-updown64"
             : "ggml-block";
     fprintf(stderr,
             "ds4: %s embedded expert-major store active: v%u/%s, %u routed layers x %u experts, %.2f GiB payload, %s mode\n",

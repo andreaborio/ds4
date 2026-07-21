@@ -18,6 +18,7 @@ import os
 import re
 import shutil
 import struct
+import subprocess
 import sys
 from pathlib import Path
 from typing import BinaryIO, Iterator, Protocol
@@ -32,6 +33,9 @@ STORE_FAMILY_GLM_DSA = 2
 STORE_FAMILY_QWEN35_MOE = 3
 STORE_STORAGE_GGML = 0
 STORE_STORAGE_MLX_AFFINE4 = 1
+STORE_STORAGE_MLX_AFFINE2 = 2
+STORE_TYPE_MLX_AFFINE2 = 31
+STORE_GROUP_PROFILE_AFFINE2_G32_U64_D64 = 0x00200040
 STORE_FAMILIES = {
     STORE_FAMILY_DEEPSEEK4,
     STORE_FAMILY_GLM_DSA,
@@ -782,7 +786,10 @@ def parse_store(native: GGUF, tensor: Tensor) -> tuple[dict[str, object], list[L
         storage_valid = (
             (storage_format == STORE_STORAGE_GGML and group_size == 0) or
             (storage_format == STORE_STORAGE_MLX_AFFINE4 and
-             group_size == 64 and family == STORE_FAMILY_QWEN35_MOE)
+             group_size == 64 and family == STORE_FAMILY_QWEN35_MOE) or
+            (storage_format == STORE_STORAGE_MLX_AFFINE2 and
+             group_size == STORE_GROUP_PROFILE_AFFINE2_G32_U64_D64 and
+             family == STORE_FAMILY_DEEPSEEK4)
         )
         if (version != STORE_VERSION or header_bytes != STORE_HEADER_BYTES or
                 family not in STORE_FAMILIES or
@@ -817,13 +824,25 @@ def parse_store(native: GGUF, tensor: Tensor) -> tuple[dict[str, object], list[L
              expert_bytes, record_offset) = struct.unpack_from(
                 "<IIIIQQQQQ", entry, offset
             )
-            if (entry_role != role or ndim != 3 or ggml_type not in ROUTED_TYPES or
+            affine2 = storage_format == STORE_STORAGE_MLX_AFFINE2
+            expected_block_elements = 32 if role == 0 else 64
+            expected_block_bytes = 12 if role == 0 else 20
+            if (entry_role != role or ndim != 3 or
+                    d0 == 0 or d1 == 0 or block_elements == 0 or
+                    d0 % block_elements != 0 or
+                    (affine2
+                     and ggml_type != STORE_TYPE_MLX_AFFINE2) or
+                    (not affine2 and ggml_type not in ROUTED_TYPES) or
                     (storage_format == STORE_STORAGE_MLX_AFFINE4 and
                      ggml_type != 12) or
-                    TYPE_LAYOUT[ggml_type][0] != block_elements or
+                    (affine2 and block_elements != expected_block_elements) or
+                    (not affine2 and
+                     TYPE_LAYOUT[ggml_type][0] != block_elements) or
                     d2 != expert_count or record_offset != record_cursor):
                 raise FormatError(f"invalid component descriptor at layer {il} role {role}")
-            expected = tensor_nbytes(ggml_type, (d0, d1, 1))
+            expected = ((d0 // expected_block_elements) *
+                        expected_block_bytes * d1) if affine2 else \
+                tensor_nbytes(ggml_type, (d0, d1, 1))
             if expert_bytes != expected:
                 raise FormatError(f"component byte size mismatch at layer {il} role {role}")
             synthetic = Tensor(
@@ -1019,6 +1038,239 @@ def mlx_affine_component(
     return packed.tobytes()
 
 
+def interleave_mlx_affine2(
+        weights: bytes,
+        scales: bytes,
+        biases: bytes,
+        rows: int,
+        input_dim: int,
+        source_group_size: int,
+        target_group_size: int) -> bytes:
+    """Create exact affine2 blocks; g64->g32 duplicates BF16 controls losslessly."""
+    if source_group_size not in (32, 64) or target_group_size not in (32, 64):
+        raise FormatError("affine2 group size must be 32 or 64")
+    if target_group_size > source_group_size or \
+            source_group_size % target_group_size or \
+            input_dim % source_group_size:
+        raise FormatError("unsupported affine2 group normalization")
+    source_groups = input_dim // source_group_size
+    code_bytes = source_group_size // 4
+    control_bytes = rows * source_groups * 2
+    if len(weights) != rows * source_groups * code_bytes or \
+            len(scales) != control_bytes or len(biases) != control_bytes:
+        raise FormatError("affine2 source byte geometry differs")
+
+    splits = source_group_size // target_group_size
+    target_code_bytes = target_group_size // 4
+    block_bytes = target_code_bytes + 4
+    result = bytearray(rows * source_groups * splits * block_bytes)
+    cursor = 0
+    for row in range(rows):
+        for group in range(source_groups):
+            source = (row * source_groups + group) * code_bytes
+            control = (row * source_groups + group) * 2
+            for split in range(splits):
+                begin = source + split * target_code_bytes
+                result[cursor:cursor + target_code_bytes] = \
+                    weights[begin:begin + target_code_bytes]
+                cursor += target_code_bytes
+                result[cursor:cursor + 2] = scales[control:control + 2]
+                cursor += 2
+                result[cursor:cursor + 2] = biases[control:control + 2]
+                cursor += 2
+    return bytes(result)
+
+
+def validate_deepseek_affine2_config(config: dict) -> tuple[int, ...]:
+    """Validate the observed donor contract and return gate source groups."""
+    if (config.get("torch_dtype") != "bfloat16" or
+            config.get("hidden_size") != 4096 or
+            config.get("moe_intermediate_size") != 2048 or
+            config.get("n_routed_experts") != 256 or
+            config.get("num_experts_per_tok") != 6 or
+            config.get("num_hidden_layers") != 43):
+        raise FormatError("DeepSeek affine2 donor shape/dtype differs")
+    first = config.get("quantization")
+    second = config.get("quantization_config")
+    if not isinstance(first, dict) or first != second:
+        raise FormatError("DeepSeek affine2 quantization maps differ")
+    gate_groups = []
+    for layer in range(43):
+        for role in ("gate_proj", "up_proj", "down_proj"):
+            key = f"model.layers.{layer}.ffn.switch_mlp.{role}"
+            spec = first.get(key)
+            expected_group = 64 if role != "gate_proj" else \
+                (64 if layer == 42 else 32)
+            if spec != {"group_size": expected_group,
+                        "bits": 2, "mode": "affine"}:
+                raise FormatError(
+                    f"unsupported affine2 donor pattern at layer {layer} {role}"
+                )
+        gate_groups.append(64 if layer == 42 else 32)
+    return tuple(gate_groups)
+
+
+def plan_deepseek_mlx_affine2(
+        model_dir: Path,
+        expected_revision: str) -> None:
+    """Fail-closed donor/provenance check for the not-yet-written payload path.
+
+    This command deliberately stops at a physical layout plan. It does not
+    claim to have produced an ExpertMajor store until the 86 GiB writer and
+    end-to-end digest verification are implemented.
+    """
+    model_dir = model_dir.resolve()
+    if not re.fullmatch(r"[0-9a-f]{40}", expected_revision):
+        raise FormatError("--expected-revision must be a full lowercase SHA-1")
+
+    def git(*args: str) -> str:
+        result = subprocess.run(
+            ["git", "-C", str(model_dir), *args],
+            text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        )
+        if result.returncode:
+            raise FormatError(
+                f"donor provenance check failed ({' '.join(args)}): "
+                f"{result.stderr.strip() or 'git returned an error'}"
+            )
+        return result.stdout.strip()
+
+    revision = git("rev-parse", "HEAD")
+    if revision != expected_revision:
+        raise FormatError(
+            f"donor revision differs: expected {expected_revision}, got {revision}"
+        )
+    origin = git("config", "--get", "remote.origin.url").removesuffix(".git")
+    expected_origin = (
+        "https://huggingface.co/mlx-community/DeepSeek-V4-Flash-2bit-DQ"
+    )
+    if origin != expected_origin:
+        raise FormatError(
+            f"donor origin differs: expected {expected_origin}, got {origin}"
+        )
+    if subprocess.run(
+            ["git", "-C", str(model_dir), "diff", "--quiet", "HEAD", "--",
+             "config.json", "model.safetensors.index.json"],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode:
+        raise FormatError("donor config/index differ from the pinned revision")
+
+    config_path = model_dir / "config.json"
+    index_path = model_dir / "model.safetensors.index.json"
+    try:
+        config_raw = config_path.read_bytes()
+        index_raw = index_path.read_bytes()
+        config = json.loads(config_raw)
+        index = json.loads(index_raw)
+    except (OSError, json.JSONDecodeError) as exc:
+        raise FormatError(f"invalid donor config/index: {exc}") from exc
+    gate_groups = validate_deepseek_affine2_config(config)
+    weight_map = index.get("weight_map")
+    metadata = index.get("metadata")
+    if not isinstance(weight_map, dict) or len(weight_map) != 2610 or \
+            not isinstance(metadata, dict) or \
+            metadata.get("total_size") != 96520315996 or \
+            metadata.get("total_parameters") != 284333146519:
+        raise FormatError("donor safetensor index identity differs")
+
+    expected_tensors: list[tuple[str, str, tuple[int, ...]]] = []
+    for layer, gate_group in enumerate(gate_groups):
+        role_shapes = (
+            ("gate_proj", 4096, 2048, gate_group),
+            ("up_proj", 4096, 2048, 64),
+            ("down_proj", 2048, 4096, 64),
+        )
+        for role, input_dim, rows, group in role_shapes:
+            prefix = f"model.layers.{layer}.ffn.switch_mlp.{role}"
+            expected_tensors.extend((
+                (prefix + ".weight", "U32",
+                 (256, rows, input_dim // 16)),
+                (prefix + ".scales", "BF16",
+                 (256, rows, input_dim // group)),
+                (prefix + ".biases", "BF16",
+                 (256, rows, input_dim // group)),
+            ))
+    missing = [name for name, _, _ in expected_tensors
+               if not isinstance(weight_map.get(name), str)]
+    if missing:
+        raise FormatError(f"donor index misses routed tensor {missing[0]}")
+
+    shard_pattern = re.compile(r"model-\d{5}-of-00019\.safetensors")
+    shard_names = sorted(set(weight_map.values()))
+    if len(shard_names) != 19 or any(
+            not isinstance(name, str) or not shard_pattern.fullmatch(name)
+            for name in shard_names):
+        raise FormatError("donor index shard inventory differs")
+    hydrated = 0
+    lfs_bytes = 0
+    for name in shard_names:
+        path = model_dir / name
+        try:
+            head = path.read_bytes()[:256]
+        except OSError as exc:
+            raise FormatError(f"donor shard is missing: {name}") from exc
+        if head.startswith(b"version https://git-lfs.github.com/spec/v1\n"):
+            match = re.search(rb"\nsize (\d+)\n?", head)
+            oid = re.search(rb"\noid sha256:([0-9a-f]{64})\n", head)
+            if not match or not oid:
+                raise FormatError(f"invalid Git LFS pointer: {name}")
+            lfs_bytes += int(match.group(1))
+        else:
+            hydrated += 1
+    if lfs_bytes and hydrated:
+        raise FormatError("partially hydrated donor is not a reproducible input")
+    if lfs_bytes and (lfs_bytes < int(metadata["total_size"]) or
+                      lfs_bytes - int(metadata["total_size"]) >
+                          len(shard_names) * (1 << 20)):
+        # Index total_size counts tensor data; LFS objects also include each
+        # safetensor JSON header and its 8-byte length prefix.
+        raise FormatError("Git LFS shard sizes differ from safetensor metadata")
+
+    # Once hydrated, verify every routed header entry, not just index names.
+    if hydrated == len(shard_names):
+        source = MLXAffineSource(model_dir)
+        try:
+            for name, dtype, shape in expected_tensors:
+                source.tensor(name, dtype, shape)
+        finally:
+            source.close()
+
+    gate_expert_bytes = 2048 * (4096 // 32) * 12
+    up_expert_bytes = 2048 * (4096 // 64) * 20
+    down_expert_bytes = 4096 * (2048 // 64) * 20
+    record_bytes = gate_expert_bytes + up_expert_bytes + down_expert_bytes
+    layer_bytes = record_bytes * 256
+    data_offset = align_up(
+        STORE_HEADER_BYTES + 43 * STORE_LAYER_BYTES, STORE_ALIGNMENT
+    )
+    payload_bytes = layer_bytes * 43
+    store_bytes = data_offset + payload_bytes
+    if (gate_expert_bytes, up_expert_bytes, down_expert_bytes,
+            record_bytes) != (3145728, 2621440, 2621440, 8388608):
+        raise FormatError("internal affine2 layout calculation differs")
+
+    print("mode: plan-only (payload writer not implemented in this slice)")
+    print(f"donor_origin: {origin}")
+    print(f"donor_revision: {revision}")
+    print(f"config_sha256: {hashlib.sha256(config_raw).hexdigest()}")
+    print(f"index_sha256: {hashlib.sha256(index_raw).hexdigest()}")
+    print(f"index_tensors: {len(weight_map)}")
+    print(f"routed_source_tensors: {len(expected_tensors)}")
+    print(f"shards: {len(shard_names)}")
+    print(f"hydrated_shards: {hydrated}")
+    print(f"source_model_bytes: {metadata['total_size']}")
+    if lfs_bytes:
+        print(f"source_shard_file_bytes: {lfs_bytes}")
+    print("layers: 43")
+    print("experts: 256")
+    print(f"gate_expert_bytes: {gate_expert_bytes}")
+    print(f"up_expert_bytes: {up_expert_bytes}")
+    print(f"down_expert_bytes: {down_expert_bytes}")
+    print(f"record_bytes: {record_bytes}")
+    print(f"layer_bytes: {layer_bytes}")
+    print(f"payload_bytes: {payload_bytes}")
+    print(f"store_bytes: {store_bytes}")
+
+
 def repack_mlx_affine(native_path: Path, mlx_dir: Path,
                       destination: Path, reserve: int) -> None:
     """Replace a Qwen v2 Q4_K payload with same-size MLX affine4 records."""
@@ -1202,6 +1454,20 @@ def main() -> int:
     affine_parser.add_argument("native", type=Path)
     affine_parser.add_argument("mlx_model", type=Path)
     affine_parser.add_argument("destination", type=Path)
+    deepseek_affine_parser = subparsers.add_parser(
+        "repack-deepseek-mlx-affine2",
+        help=("validate and print the pinned DeepSeek affine2 physical plan; "
+              "the payload writer is not implemented in this slice"),
+    )
+    deepseek_affine_parser.add_argument(
+        "--dry-run", action="store_true", required=True,
+        help="required: validate provenance/index and print the layout only",
+    )
+    deepseek_affine_parser.add_argument(
+        "--expected-revision", required=True,
+        help="full pinned donor Git revision",
+    )
+    deepseek_affine_parser.add_argument("mlx_model", type=Path)
     args = parser.parse_args()
     try:
         if args.command == "inspect":
@@ -1215,6 +1481,10 @@ def main() -> int:
             repack_mlx_affine(
                 args.native, args.mlx_model, args.destination,
                 args.reserve_bytes,
+            )
+        elif args.command == "repack-deepseek-mlx-affine2":
+            plan_deepseek_mlx_affine2(
+                args.mlx_model, args.expected_revision,
             )
         return 0
     except (FormatError, OSError) as exc:

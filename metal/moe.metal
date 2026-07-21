@@ -122,6 +122,21 @@ struct block_mlx_affine4_64 {
     ushort bias_bf16;
 };
 
+// DeepSeek MLX affine 2-bit controls are BF16, not F16. Codes are packed in
+// little-endian 2-bit lanes and each group is physically self-contained so
+// the SSD selected-address path can fetch one expert component verbatim.
+struct block_mlx_affine2_32 {
+    uchar qs[8];
+    ushort scale_bf16;
+    ushort bias_bf16;
+};
+
+struct block_mlx_affine2_64 {
+    uchar qs[16];
+    ushort scale_bf16;
+    ushort bias_bf16;
+};
+
 struct block_q5_K {
     half d;
     half dmin;
@@ -2842,6 +2857,38 @@ void dequantize_mlx_affine4_64(
             : (uint)(packed & 0x0fu);
         reg[i / 4u][i % 4u] = scale * (float)q + bias;
     }
+}
+
+template <typename block_type, typename type4x4>
+void dequantize_mlx_affine2(
+        device const block_type *xb,
+        short il,
+        thread type4x4 &reg) {
+    const float scale = as_type<float>((uint)xb->scale_bf16 << 16u);
+    const float bias = as_type<float>((uint)xb->bias_bf16 << 16u);
+    const uint value_base = (uint)il * 16u;
+    for (uint i = 0u; i < 16u; i++) {
+        const uint value = value_base + i;
+        const uchar packed = xb->qs[value >> 2u];
+        const uint q = ((uint)packed >> (2u * (value & 3u))) & 3u;
+        reg[i / 4u][i % 4u] = scale * (float)q + bias;
+    }
+}
+
+template <typename type4x4>
+void dequantize_mlx_affine2_32(
+        device const block_mlx_affine2_32 *xb,
+        short il,
+        thread type4x4 &reg) {
+    dequantize_mlx_affine2(xb, il, reg);
+}
+
+template <typename type4x4>
+void dequantize_mlx_affine2_64(
+        device const block_mlx_affine2_64 *xb,
+        short il,
+        thread type4x4 &reg) {
+    dequantize_mlx_affine2(xb, il, reg);
 }
 
 template <typename type4x4>
@@ -8923,6 +8970,8 @@ template [[host_name("kernel_mul_mm_id_q8_0_f32")]]         kernel mul_mm_id ker
 template [[host_name("kernel_mul_mm_id_q2_K_f32")]]         kernel mul_mm_id kernel_mul_mm_id<32, half, half4x4, simdgroup_half8x8, half, half2x4, simdgroup_half8x8, block_q2_K,    QK_NL, dequantize_q2_K,    float, float4x4, float, float2x4>;
 template [[host_name("kernel_mul_mm_id_q4_K_f32")]]         kernel mul_mm_id kernel_mul_mm_id<32, half, half4x4, simdgroup_half8x8, half, half2x4, simdgroup_half8x8, block_q4_K,    QK_NL, dequantize_q4_K,    float, float4x4, float, float2x4>;
 template [[host_name("kernel_mul_mm_id_mlx_affine4_64_f32")]] kernel mul_mm_id kernel_mul_mm_id<32, half, half4x4, simdgroup_half8x8, half, half2x4, simdgroup_half8x8, block_mlx_affine4_64, 4, dequantize_mlx_affine4_64, float, float4x4, float, float2x4>;
+template [[host_name("kernel_mul_mm_id_mlx_affine2_32_f32")]] kernel mul_mm_id kernel_mul_mm_id<32, half, half4x4, simdgroup_half8x8, half, half2x4, simdgroup_half8x8, block_mlx_affine2_32, 2, dequantize_mlx_affine2_32, float, float4x4, float, float2x4>;
+template [[host_name("kernel_mul_mm_id_mlx_affine2_64_f32")]] kernel mul_mm_id kernel_mul_mm_id<32, half, half4x4, simdgroup_half8x8, half, half2x4, simdgroup_half8x8, block_mlx_affine2_64, 4, dequantize_mlx_affine2_64, float, float4x4, float, float2x4>;
 template [[host_name("kernel_mul_mm_id_q5_K_f32")]]         kernel mul_mm_id kernel_mul_mm_id<32, half, half4x4, simdgroup_half8x8, half, half2x4, simdgroup_half8x8, block_q5_K,    QK_NL, dequantize_q5_K,    float, float4x4, float, float2x4>;
 template [[host_name("kernel_mul_mm_id_q6_K_f32")]]         kernel mul_mm_id kernel_mul_mm_id<32, half, half4x4, simdgroup_half8x8, half, half2x4, simdgroup_half8x8, block_q6_K,    QK_NL, dequantize_q6_K,    float, float4x4, float, float2x4>;
 template [[host_name("kernel_mul_mm_id_iq2_xxs_f32")]]      kernel mul_mm_id kernel_mul_mm_id<32, half, half4x4, simdgroup_half8x8, half, half2x4, simdgroup_half8x8, block_iq2_xxs, QK_NL, dequantize_iq2_xxs, float, float4x4, float, float2x4>;
@@ -8930,6 +8979,7 @@ template [[host_name("kernel_mul_mm_id_q8_0_f16")]]         kernel mul_mm_id_f16
 template [[host_name("kernel_mul_mm_id_q2_K_f16")]]         kernel mul_mm_id_f16_rhs kernel_mul_mm_id<32, half, half4x4, simdgroup_half8x8, half, half2x4, simdgroup_half8x8, block_q2_K,    QK_NL, dequantize_q2_K,    half, half4x4, half, half2x4>;
 template [[host_name("kernel_mul_mm_id_q4_K_f16")]]         kernel mul_mm_id_f16_rhs kernel_mul_mm_id<32, half, half4x4, simdgroup_half8x8, half, half2x4, simdgroup_half8x8, block_q4_K,    QK_NL, dequantize_q4_K,    half, half4x4, half, half2x4>;
 template [[host_name("kernel_mul_mm_id_mlx_affine4_64_f16")]] kernel mul_mm_id_f16_rhs kernel_mul_mm_id<32, half, half4x4, simdgroup_half8x8, half, half2x4, simdgroup_half8x8, block_mlx_affine4_64, 4, dequantize_mlx_affine4_64, half, half4x4, half, half2x4>;
+template [[host_name("kernel_mul_mm_id_mlx_affine2_64_f16")]] kernel mul_mm_id_f16_rhs kernel_mul_mm_id<32, half, half4x4, simdgroup_half8x8, half, half2x4, simdgroup_half8x8, block_mlx_affine2_64, 4, dequantize_mlx_affine2_64, half, half4x4, half, half2x4>;
 template [[host_name("kernel_mul_mm_id_q5_K_f16")]]         kernel mul_mm_id_f16_rhs kernel_mul_mm_id<32, half, half4x4, simdgroup_half8x8, half, half2x4, simdgroup_half8x8, block_q5_K,    QK_NL, dequantize_q5_K,    half, half4x4, half, half2x4>;
 template [[host_name("kernel_mul_mm_id_q6_K_f16")]]         kernel mul_mm_id_f16_rhs kernel_mul_mm_id<32, half, half4x4, simdgroup_half8x8, half, half2x4, simdgroup_half8x8, block_q6_K,    QK_NL, dequantize_q6_K,    half, half4x4, half, half2x4>;
 template [[host_name("kernel_mul_mm_id_iq2_xxs_f16")]]      kernel mul_mm_id_f16_rhs kernel_mul_mm_id<32, half, half4x4, simdgroup_half8x8, half, half2x4, simdgroup_half8x8, block_iq2_xxs, QK_NL, dequantize_iq2_xxs, half, half4x4, half, half2x4>;
@@ -8940,9 +8990,12 @@ template [[host_name("kernel_mul_mm_id_q6_K_ff32")]]        kernel mul_mm_id_ff3
 template [[host_name("kernel_mul_mm_id_addr_q2_K_f32")]]    kernel mul_mm_id_addr kernel_mul_mm_id_addr<32, half, half4x4, simdgroup_half8x8, half, half2x4, simdgroup_half8x8, block_q2_K, QK_NL, dequantize_q2_K, float, float4x4, float, float2x4>;
 template [[host_name("kernel_mul_mm_id_addr_q4_K_f32")]]    kernel mul_mm_id_addr kernel_mul_mm_id_addr<32, half, half4x4, simdgroup_half8x8, half, half2x4, simdgroup_half8x8, block_q4_K, QK_NL, dequantize_q4_K, float, float4x4, float, float2x4>;
 template [[host_name("kernel_mul_mm_id_addr_mlx_affine4_64_f32")]] kernel mul_mm_id_addr kernel_mul_mm_id_addr<32, half, half4x4, simdgroup_half8x8, half, half2x4, simdgroup_half8x8, block_mlx_affine4_64, 4, dequantize_mlx_affine4_64, float, float4x4, float, float2x4>;
+template [[host_name("kernel_mul_mm_id_addr_mlx_affine2_32_f32")]] kernel mul_mm_id_addr kernel_mul_mm_id_addr<32, half, half4x4, simdgroup_half8x8, half, half2x4, simdgroup_half8x8, block_mlx_affine2_32, 2, dequantize_mlx_affine2_32, float, float4x4, float, float2x4>;
+template [[host_name("kernel_mul_mm_id_addr_mlx_affine2_64_f32")]] kernel mul_mm_id_addr kernel_mul_mm_id_addr<32, half, half4x4, simdgroup_half8x8, half, half2x4, simdgroup_half8x8, block_mlx_affine2_64, 4, dequantize_mlx_affine2_64, float, float4x4, float, float2x4>;
 template [[host_name("kernel_mul_mm_id_addr_q2_K_f16")]]    kernel mul_mm_id_addr_f16_rhs kernel_mul_mm_id_addr<32, half, half4x4, simdgroup_half8x8, half, half2x4, simdgroup_half8x8, block_q2_K, QK_NL, dequantize_q2_K, half, half4x4, half, half2x4>;
 template [[host_name("kernel_mul_mm_id_addr_q4_K_f16")]]    kernel mul_mm_id_addr_f16_rhs kernel_mul_mm_id_addr<32, half, half4x4, simdgroup_half8x8, half, half2x4, simdgroup_half8x8, block_q4_K, QK_NL, dequantize_q4_K, half, half4x4, half, half2x4>;
 template [[host_name("kernel_mul_mm_id_addr_mlx_affine4_64_f16")]] kernel mul_mm_id_addr_f16_rhs kernel_mul_mm_id_addr<32, half, half4x4, simdgroup_half8x8, half, half2x4, simdgroup_half8x8, block_mlx_affine4_64, 4, dequantize_mlx_affine4_64, half, half4x4, half, half2x4>;
+template [[host_name("kernel_mul_mm_id_addr_mlx_affine2_64_f16")]] kernel mul_mm_id_addr_f16_rhs kernel_mul_mm_id_addr<32, half, half4x4, simdgroup_half8x8, half, half2x4, simdgroup_half8x8, block_mlx_affine2_64, 4, dequantize_mlx_affine2_64, half, half4x4, half, half2x4>;
 
 #ifdef DS4_METAL_HAS_TENSOR
 // Attention-output low-rank projection retained for Metal4 prefill.  It uses

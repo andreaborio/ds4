@@ -268,7 +268,11 @@ bool ds4_expert_store_open_embedded(
          group_size == 0u) ||
         (storage_format == DS4_EXPERT_STORE_STORAGE_MLX_AFFINE4 &&
          group_size == 64u &&
-         family == DS4_EXPERT_STORE_FAMILY_QWEN35_MOE);
+         family == DS4_EXPERT_STORE_FAMILY_QWEN35_MOE) ||
+        (storage_format == DS4_EXPERT_STORE_STORAGE_MLX_AFFINE2 &&
+         group_size ==
+             DS4_EXPERT_STORE_GROUP_PROFILE_AFFINE2_G32_U64_D64 &&
+         family == DS4_EXPERT_STORE_FAMILY_DEEPSEEK4);
 
     uint64_t want_descriptor_bytes = 0;
     uint64_t descriptors_end = 0;
@@ -359,10 +363,17 @@ bool ds4_expert_store_open_embedded(
             out_component->record_offset = load_u64_le(component + 48);
 
             uint32_t block_elements = 0, block_bytes = 0;
+            if (storage_format == DS4_EXPERT_STORE_STORAGE_MLX_AFFINE2) {
+                block_elements = role == DS4_EXPERT_STORE_GATE ? 32u : 64u;
+                block_bytes = role == DS4_EXPERT_STORE_GATE ? 12u : 20u;
+            }
             uint64_t row_blocks = 0, row_bytes = 0, expert_bytes = 0;
             if (out_component->role != role || ndim != 3 ||
-                !quant_layout(out_component->ggml_type,
-                              &block_elements, &block_bytes) ||
+                (storage_format == DS4_EXPERT_STORE_STORAGE_MLX_AFFINE2
+                    ? out_component->ggml_type !=
+                          DS4_EXPERT_STORE_TYPE_MLX_AFFINE2
+                    : !quant_layout(out_component->ggml_type,
+                                    &block_elements, &block_bytes)) ||
                 (storage_format ==
                      DS4_EXPERT_STORE_STORAGE_MLX_AFFINE4 &&
                  out_component->ggml_type != 12u) ||

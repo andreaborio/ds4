@@ -174,6 +174,7 @@ typedef struct ds4_gpu_stream_expert_table {
     uint64_t    up_offset;
     uint64_t    down_offset;
     uint64_t    gate_expert_bytes;
+    uint64_t    up_expert_bytes;
     uint64_t    down_expert_bytes;
 } ds4_gpu_stream_expert_table;
 /* Reset only the prompt-local eviction heuristic.  The resident SSD expert
@@ -1583,6 +1584,8 @@ int ds4_gpu_routed_moe_batch_select_tensor(
         uint32_t                down_type,
         uint64_t                gate_expert_bytes,
         uint64_t                gate_row_bytes,
+        uint64_t                up_expert_bytes,
+        uint64_t                up_row_bytes,
         uint64_t                down_expert_bytes,
         uint64_t                down_row_bytes,
         uint32_t                expert_in_dim,
@@ -1615,6 +1618,8 @@ int ds4_gpu_qwen35_routed_moe_batch_select_tensor(
         uint32_t                down_type,
         uint64_t                gate_expert_bytes,
         uint64_t                gate_row_bytes,
+        uint64_t                up_expert_bytes,
+        uint64_t                up_row_bytes,
         uint64_t                down_expert_bytes,
         uint64_t                down_row_bytes,
         uint32_t                expert_in_dim,
@@ -1639,6 +1644,8 @@ int ds4_gpu_internal_qwen35_expert_group_test(void);
 int ds4_gpu_internal_qwen35_expert_pack_test(void);
 /* Canonical-vs-embedded GLM Q2 regression for direct and grouped execution. */
 int ds4_gpu_internal_expert_store_v2_kernel_test(void);
+/* Exact MLX affine2 selected-address projections for decode and prefill. */
+int ds4_gpu_internal_deepseek_affine2_kernel_test(void);
 
 /* =========================================================================
  * Hyper-Connection Kernels.

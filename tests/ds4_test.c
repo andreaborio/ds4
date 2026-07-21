@@ -3215,6 +3215,7 @@ static void test_metal_kernel_group(void) {
 
 static void test_metal_qwen35_expert_pack(void) {
     TEST_ASSERT(ds4_gpu_internal_qwen35_expert_pack_test() != 0);
+    TEST_ASSERT(ds4_gpu_internal_deepseek_affine2_kernel_test() != 0);
     TEST_ASSERT(ds4_gpu_internal_expert_store_v2_kernel_test() != 0);
 }
 

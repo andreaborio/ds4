@@ -14,6 +14,13 @@ enum {
     DS4_EXPERT_STORE_V2_MAX_LAYERS = 79,
     DS4_EXPERT_STORE_V2_MAX_MODEL_LAYER = 127,
     DS4_EXPERT_STORE_V2_MAX_EXPERTS = 384,
+    /* Artifact-local logical type.  This value never appears in the physical
+     * GGUF tensor directory: it is used only by ExpertMajor descriptors and
+     * the virtual routed tensors reconstructed by DS4. */
+    DS4_EXPERT_STORE_TYPE_MLX_AFFINE2 = 31,
+    /* The v2 header has one group-size word.  Affine2 uses it as an exact
+     * profile tag: gate=32, up=64, down=64. */
+    DS4_EXPERT_STORE_GROUP_PROFILE_AFFINE2_G32_U64_D64 = 0x00200040u,
 };
 
 typedef enum {
@@ -24,6 +31,11 @@ typedef enum {
      * The logical component type remains Q4_K because the byte geometry is
      * identical (36 bytes per 64 values / 144 bytes per 256 values). */
     DS4_EXPERT_STORE_STORAGE_MLX_AFFINE4 = 1,
+    /* MLX affine 2-bit routed experts. Physical groups are interleaved as
+     * [8 packed bytes | BF16 scale | BF16 bias] for gate/group-32 and
+     * [16 packed bytes | BF16 scale | BF16 bias] for up/down/group-64.
+     * Dequantization is exactly scale * unsigned_q + bias. */
+    DS4_EXPERT_STORE_STORAGE_MLX_AFFINE2 = 2,
 } ds4_expert_store_storage;
 
 typedef enum {

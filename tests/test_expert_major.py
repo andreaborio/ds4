@@ -134,6 +134,62 @@ def write_fixture(path: Path, architecture: str, *,
             cursor = offset + len(payload)
 
 
+def affine2_values(block: bytes, group: int) -> list[float]:
+    code_bytes = group // 4
+    scale = struct.unpack("<f", b"\0\0" + block[code_bytes:code_bytes + 2])[0]
+    bias = struct.unpack("<f", b"\0\0" + block[code_bytes + 2:code_bytes + 4])[0]
+    return [scale * ((block[i // 4] >> (2 * (i & 3))) & 3) + bias
+            for i in range(group)]
+
+
+def test_affine2_contract(tool) -> None:
+    weights = bytes((i * 29 + 7) & 0xff for i in range(16))
+    scale = struct.pack("<H", 0x3f40)  # BF16 0.75
+    bias = struct.pack("<H", 0xbf00)   # BF16 -0.5
+    g64 = tool.interleave_mlx_affine2(
+        weights, scale, bias, 1, 64, 64, 64
+    )
+    g32 = tool.interleave_mlx_affine2(
+        weights, scale, bias, 1, 64, 64, 32
+    )
+    assert len(g64) == 20 and len(g32) == 24
+    assert g32[:8] == weights[:8] and g32[12:20] == weights[8:]
+    assert g32[8:12] == scale + bias == g32[20:24]
+    assert affine2_values(g64, 64) == (
+        affine2_values(g32[:12], 32) + affine2_values(g32[12:], 32)
+    )
+
+    quant = {"group_size": 64, "bits": 4, "mode": "affine"}
+    for layer in range(43):
+        for role in ("gate_proj", "up_proj", "down_proj"):
+            quant[f"model.layers.{layer}.ffn.switch_mlp.{role}"] = {
+                "group_size": 64 if role != "gate_proj" or layer == 42 else 32,
+                "bits": 2,
+                "mode": "affine",
+            }
+    config = {
+        "torch_dtype": "bfloat16", "hidden_size": 4096,
+        "moe_intermediate_size": 2048, "n_routed_experts": 256,
+        "num_experts_per_tok": 6, "num_hidden_layers": 43,
+        "quantization": quant, "quantization_config": dict(quant),
+    }
+    groups = tool.validate_deepseek_affine2_config(config)
+    assert groups == (32,) * 42 + (64,)
+    bad = dict(config)
+    bad_quant = dict(quant)
+    bad_quant["model.layers.17.ffn.switch_mlp.gate_proj"] = {
+        "group_size": 64, "bits": 2, "mode": "affine"
+    }
+    bad["quantization"] = bad_quant
+    bad["quantization_config"] = dict(bad_quant)
+    try:
+        tool.validate_deepseek_affine2_config(bad)
+    except tool.FormatError:
+        pass
+    else:
+        raise AssertionError("unexpected donor gate/g64 pattern was accepted")
+
+
 def run(*args: str, ok: bool = True) -> subprocess.CompletedProcess[str]:
     result = subprocess.run(
         [sys.executable, str(TOOL), *args], text=True,
@@ -148,6 +204,7 @@ def run(*args: str, ok: bool = True) -> subprocess.CompletedProcess[str]:
 
 def main() -> int:
     tool = load_tool()
+    test_affine2_contract(tool)
     probe = os.environ.get("DS4_EXPERT_STORE_PROBE")
     with tempfile.TemporaryDirectory(prefix="ds4-expert-major-test-") as tmp:
         tmp_path = Path(tmp)
