@@ -1,17 +1,20 @@
 # Contributing
 
-DwarfStar4 changes should be tested against the failure mode they can realistically
+Hebrus changes should be tested against the failure mode they can realistically
 affect. The project has two regression tracks: correctness and speed. Please
 include the commands you ran, the machine/backend, the model quant, and any
 notable failures in the PR or commit notes.
 
 ## Co-development with `antirez/ds4`
 
-This repository is a transparent research fork of
-[`antirez/ds4`](https://github.com/antirez/ds4), not a replacement for it. The
-goal is to co-develop DwarfStar: use the fork to investigate complementary
-hardware and model paths without blocking on review latency, then contribute
-general improvements back upstream.
+Hebrus is an increasingly independent inference engine that began as a
+transparent research fork of
+[`antirez/ds4`](https://github.com/antirez/ds4). It retains substantial upstream
+implementation and history while focusing on Apple Metal, embedded ExpertMajor
+storage, and SSD streaming across several model families. It is not a
+replacement for the upstream project. General improvements that remain
+applicable to upstream-supported paths continue to be contributed back after
+validation.
 
 Every change applicable to an upstream-supported path **must be opened as an
 upstream PR** once it is scoped and validated. This includes model- or

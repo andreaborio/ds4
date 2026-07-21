@@ -1,5 +1,6 @@
 #include "ds4.h"
 #include "ds4_help.h"
+#include "hebrus_identity.h"
 #ifndef DS4_NO_GPU
 #include "ds4_gpu.h"
 #endif
@@ -52,6 +53,8 @@ typedef struct {
     ds4_residency_mode residency;
     bool ssd_streaming_cold;
 } bench_config;
+
+static const char *bench_public_command = "ds4-bench";
 
 static double bench_now_sec(void) {
     struct timespec ts;
@@ -384,7 +387,7 @@ static int write_frontier_logits_json(
     }
 
     const int argmax = ds4_session_argmax(session);
-    fprintf(fp, "{\n  \"source\":\"ds4-bench\",\n  \"model\":");
+    fprintf(fp, "{\n  \"source\":\"%s\",\n  \"model\":", bench_public_command);
     json_write_string(fp, cfg->model_path);
     fprintf(fp,
             ",\n  \"backend\":\"%s\",\n  \"quality\":%s,\n"
@@ -561,6 +564,7 @@ static void log_context_memory(ds4_backend backend,
 }
 
 int main(int argc, char **argv) {
+    if (hebrus_is_canonical_invocation(argv[0])) bench_public_command = "hebrus-bench";
     hebrus_help_set_invocation(argv[0]);
     if (ds4_build_info_requested(argc, argv)) {
         ds4_build_info_print(stdout, argv[0]);

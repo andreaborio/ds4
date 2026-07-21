@@ -125,6 +125,7 @@ not be copied into new tests.
 | `CONTRIBUTING.md` | Contribution, regression, and upstream-coordination gates |
 | `QA_BEFORE_RELEASES.md` | Complete release checklist |
 | `docs/contracts/RUNTIME_SUPPORT.md` | Current supported runtime/model matrix |
+| `docs/contracts/BRAND_COMPATIBILITY.md` | Canonical Hebrus names, compatibility aliases, and permanently stable identifiers |
 | `docs/adr/` | Accepted architectural decisions and their consequences |
 | `GOLD_METAL_SSD.md` | Metal/SSD planner details and performance gates; support authority remains `RUNTIME_SUPPORT.md` |
 | `FORK_NOTES.md` | Time-stamped fork/upstream boundary ledger |

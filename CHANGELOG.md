@@ -36,6 +36,10 @@ not represent a published release.
 - Canonical commands report `engine_id: "hebrus"` and `hebrus build`; legacy
   aliases retain `engine_id: "ds4"` and `ds4 build`. Both identities use the
   same schema-1 capability fields and immutable ExpertMajor wire contract.
+- Current contributor, release, and engine-reference documentation now presents
+  Hebrus commands first and links an explicit brand compatibility contract.
+  Canonical CLI/agent/evaluation prompts and new benchmark evidence use the
+  invoked Hebrus identity; legacy aliases preserve their existing labels.
 
 ### Compatibility
 

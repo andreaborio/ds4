@@ -1,5 +1,6 @@
 #include "ds4.h"
 #include "ds4_help.h"
+#include "hebrus_identity.h"
 
 /* ds4-eval: small built-in benchmark integration test.
  *
@@ -1933,12 +1934,15 @@ static void tui_signal_restore(int sig) {
     raise(sig);
 }
 
+static const char *eval_public_command = "ds4-eval";
+
 static void tui_draw_title(eval_ui *ui) {
     term_move(1, 1);
     tui_clear_left_line(ui, 1);
     char elapsed[32];
     format_run_elapsed(elapsed, sizeof(elapsed), tui_run_clock_visible_sec(ui));
-    fputs("ds4-eval (" ANSI_BOLD "p" ANSI_RESET ")ause (" ANSI_BOLD "q" ANSI_RESET ")uit", stdout);
+    printf("%s (" ANSI_BOLD "p" ANSI_RESET ")ause (" ANSI_BOLD "q" ANSI_RESET ")uit",
+           eval_public_command);
     printf(" %s", elapsed);
     if (ui->paused) {
         fputs(" " ANSI_RED ANSI_BOLD "PAUSED" ANSI_RESET, stdout);
@@ -4077,6 +4081,7 @@ static uint32_t eval_residency_context_hint(const eval_config *cfg) {
 }
 
 int main(int argc, char **argv) {
+    if (hebrus_is_canonical_invocation(argv[0])) eval_public_command = "hebrus-eval";
     hebrus_help_set_invocation(argv[0]);
     if (ds4_build_info_requested(argc, argv)) {
         ds4_build_info_print(stdout, argv[0]);

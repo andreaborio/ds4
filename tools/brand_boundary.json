@@ -169,13 +169,6 @@
       "maximum": 8
     },
     {
-      "path": "CONTRIBUTING.md",
-      "location": "content",
-      "token": "DwarfStar",
-      "classification": "migration-pending",
-      "maximum": 2
-    },
-    {
       "path": "EXPERT_PRUNE.md",
       "location": "content",
       "token": "ds4",
@@ -295,13 +288,6 @@
       "maximum": 10
     },
     {
-      "path": "QA_BEFORE_RELEASES.md",
-      "location": "content",
-      "token": "DwarfStar",
-      "classification": "compatibility",
-      "maximum": 1
-    },
-    {
       "path": "README.md",
       "location": "content",
       "token": "ds4",
@@ -383,7 +369,7 @@
       "location": "content",
       "token": "ds4",
       "classification": "migration-pending",
-      "maximum": 82
+      "maximum": 48
     },
     {
       "path": "docs/ENGINE_REFERENCE.md",
@@ -391,13 +377,6 @@
       "token": "DS4",
       "classification": "migration-pending",
       "maximum": 41
-    },
-    {
-      "path": "docs/ENGINE_REFERENCE.md",
-      "location": "content",
-      "token": "DwarfStar",
-      "classification": "migration-pending",
-      "maximum": 7
     },
     {
       "path": "docs/adr/0001-expert-major-v2-only.md",
@@ -621,6 +600,20 @@
       "location": "content",
       "token": "ds4",
       "classification": "historical-attribution",
+      "maximum": 2
+    },
+    {
+      "path": "docs/contracts/BRAND_COMPATIBILITY.md",
+      "location": "content",
+      "token": "ds4",
+      "classification": "compatibility",
+      "maximum": 20
+    },
+    {
+      "path": "docs/contracts/BRAND_COMPATIBILITY.md",
+      "location": "content",
+      "token": "DS4",
+      "classification": "compatibility",
       "maximum": 2
     },
     {

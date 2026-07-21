@@ -17,8 +17,9 @@ the only capacity boundary.
 > namespace in the current bridge. The repository is still
 > [`andreaborio/ds4`](https://github.com/andreaborio/ds4), and
 > [ADR 0005](docs/adr/0005-hebrus-naming-and-compatibility-boundary.md) remains
-> **Proposed** while identity screening and the companion-application bridge are
-> incomplete. This repository has not been administratively renamed.
+> **Proposed** while namespace and legal screening remain incomplete. The
+> companion-application bridge is implemented locally but not yet published,
+> and this repository has not been administratively renamed.
 
 > [!IMPORTANT]
 > Hebrus began as a fork of
@@ -174,6 +175,8 @@ A short-context best is not substituted for the long-context gate.
 
 - [Runtime support contract](docs/contracts/RUNTIME_SUPPORT.md) — supported
   families, hardware floors, backends, and fail-closed boundaries.
+- [Brand compatibility contract](docs/contracts/BRAND_COMPATIBILITY.md) —
+  canonical commands, legacy aliases, stable formats, and migration rules.
 - [Engine reference](docs/ENGINE_REFERENCE.md) — CLI, server, agent, disk KV,
   tracing, evaluation, and operational details.
 - [Metal and SSD policy](GOLD_METAL_SSD.md) — build identity, AUTO residency,

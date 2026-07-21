@@ -1,6 +1,6 @@
 # QA Before Releases
 
-This is the release gate for DwarfStar.  Run it before tagging or pushing a
+This is the release gate for Hebrus. Run it before tagging or pushing a
 release build.  The goal is not to prove every code path exhaustively; it is to
 exercise the paths that have historically regressed: Metal graph inference,
 model-family residency, SSD streaming, distributed rejection, disk KV cache,

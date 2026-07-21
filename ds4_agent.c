@@ -2,6 +2,7 @@
 #include "ds4_help.h"
 #include "ds4_kvstore.h"
 #include "ds4_web.h"
+#include "hebrus_identity.h"
 #include "linenoise.h"
 
 #include <errno.h>
@@ -32,6 +33,9 @@
  * multiplexed editor implementation.  The agent uses it only to restore text
  * after Enter is pressed while the model is still busy. */
 int linenoiseEditInsert(struct linenoiseState *l, const char *c, size_t clen);
+
+static bool agent_hebrus_identity;
+static const char *agent_public_command = "ds4-agent";
 
 static int set_nonblock(int fd, bool on, int *old_flags);
 static bool agent_parse_bool_default(const char *s, bool def);
@@ -8903,7 +8907,7 @@ static void agent_progress_append(char *buf, size_t len, size_t *pos,
 
 static void build_prompt_text(const agent_status *st, char *buf, size_t len) {
     (void)st;
-    snprintf(buf, len, "ds4-agent> ");
+    snprintf(buf, len, "%s> ", agent_public_command);
 }
 
 static void agent_progress_bar(int done, int total, double tps,
@@ -9981,11 +9985,18 @@ static void agent_format_welcome_banner(const agent_config *cfg,
     char ctx[32];
     agent_format_ctx_size(cfg->gen.ctx_size, ctx, sizeof(ctx));
     if (stdout_is_tty()) {
-        snprintf(buf, len,
-                 "\x1b[1;97mDwarf\x1b[1;94mStar\x1b[0m 🐋 Agent, context %s tokens\n\n",
-                 ctx);
+        if (agent_hebrus_identity) {
+            snprintf(buf, len,
+                     "\x1b[1;97mHebrus\x1b[0m 🐋 Agent, context %s tokens\n\n",
+                     ctx);
+        } else {
+            snprintf(buf, len,
+                     "\x1b[1;97mDwarf\x1b[1;94mStar\x1b[0m 🐋 Agent, context %s tokens\n\n",
+                     ctx);
+        }
     } else {
-        snprintf(buf, len, "DwarfStar Agent, context %s tokens\n\n", ctx);
+        snprintf(buf, len, "%s Agent, context %s tokens\n\n",
+                 agent_hebrus_identity ? "Hebrus" : "DwarfStar", ctx);
     }
 }
 
@@ -10822,6 +10833,8 @@ static int run_agent(ds4_engine *engine, agent_config *cfg) {
 
 #ifndef DS4_AGENT_TEST_NO_MAIN
 int main(int argc, char **argv) {
+    agent_hebrus_identity = hebrus_is_canonical_invocation(argv[0]);
+    if (agent_hebrus_identity) agent_public_command = "hebrus-agent";
     hebrus_help_set_invocation(argv[0]);
     if (ds4_build_info_requested(argc, argv)) {
         ds4_build_info_print(stdout, argv[0]);

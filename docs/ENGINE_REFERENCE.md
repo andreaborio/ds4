@@ -1,4 +1,4 @@
-# DwarfStar engine reference
+# Hebrus engine reference
 
 > [!NOTE]
 > This is the long-form engine guide inherited and evolved from
@@ -26,8 +26,8 @@ That said, a few important things about this project:
 * The local inference landscape contains many excellent projects, but new models are released continuously, and the attention immediately gets captured by the next model to implement. This project takes a deliberately narrow bet: one model at a time, official-vector validation (logits obtained with the official implementation), long-context tests, and enough agent integration to know if it really works. The exact model may change as the landscape evolves, but the constraint remains: credible local Apple Metal inference, with family-specific memory limits. DeepSeek and GLM currently start at 64 GiB; Qwen's SSD-backed policy starts at 16 GiB.
 * This software is developed with **strong assistance from GPT 5.5** and with humans leading the ideas, testing, and debugging. We say this openly because it shaped how the project was built. If you are not happy with AI-developed code, this software is not for you. The acknowledgement below is equally important: this would not exist without `llama.cpp` and GGML, largely written by hand.
 * This implementation is based on the idea that compressed KV caches like the one of DeepSeek v4 and the fast SSD disks of modern MacBooks should change our idea that KV cache belongs to RAM. **The KV cache is actually a first-class disk citizen**. Fast SSD disks also changed the inference game from the point of view of "model needs to fit RAM": while having more RAM than the model size is still preferred, SSD streaming turns the available amount of RAM from a hard cutoff (can I run this model or not?) into a continuous spectrum of speed levels.
-* Our vision is that local inference should be a set of three things working well together, out of the box: A) inference engine with HTTP API + B) GGUF specially crafted to run well under a given engine and given assumptions + C) testing and validation with coding agents implementations. D) Purpose built agents for specific models and execution environments. DwarfStar only runs with the GGUF files provided. It gets tested against officially obtained logits at different context sizes. This project exists because we wanted to make one local model feel finished end to end, not just runnable. However this is beta quality code, so probably we are not still there, especially since SSD streaming and the additional model families are recent additions.
-* The production graph path targets **Metal on macOS**. The CPU path is only for correctness checks and model/tokenizer diagnostics. For CPU-only Linux builds, use `make cpu`; it builds the normal `./ds4` and `./ds4-server` binaries without a GPU backend. On macOS, **warning: current macOS versions have a bug in the virtual memory implementation that can crash the kernel** if you try to run very large CPU model inference. Do not use CPU as a production fallback.
+* Our vision is that local inference should be a set of three things working well together, out of the box: A) inference engine with HTTP API + B) GGUF specially crafted to run well under a given engine and given assumptions + C) testing and validation with coding agents implementations. D) Purpose built agents for specific models and execution environments. Hebrus only runs with the GGUF files provided. It gets tested against officially obtained logits at different context sizes. This project exists because we wanted to make one local model feel finished end to end, not just runnable. However this is beta quality code, so probably we are not still there, especially since SSD streaming and the additional model families are recent additions.
+* The production graph path targets **Metal on macOS**. The CPU path is only for correctness checks and model/tokenizer diagnostics. For CPU-only Linux builds, use `make cpu`; it builds canonical `hebrus` commands plus their `ds4*` compatibility aliases without a GPU backend. On macOS, **warning: current macOS versions have a bug in the virtual memory implementation that can crash the kernel** if you try to run very large CPU model inference. Do not use CPU as a production fallback.
 
 ## Acknowledgements to llama.cpp and GGML
 
@@ -50,7 +50,7 @@ backend receives the same validation at the same time. We try to keep tested
 paths usable. If you hit an issue, use `--trace` to log the session and include
 the full trace in the report.
 
-The `ds4-agent` was added later and remains alpha quality.
+The `hebrus-agent` was added later and remains alpha quality.
 
 ## More Documentation
 
@@ -233,7 +233,7 @@ routes through experts again.
 Start with AUTO residency and the automatic cache budget:
 
 ```sh
-./ds4 -m /absolute/path/to/QUALIFIED-DEEPSEEK-OR-QWEN-DS4-ExpertMajor-v2.gguf
+./hebrus -m /absolute/path/to/QUALIFIED-DEEPSEEK-OR-QWEN-DS4-ExpertMajor-v2.gguf
 ```
 
 For DeepSeek and Qwen qualification, use `--ssd-streaming` to force streaming
@@ -270,13 +270,13 @@ If startup reports that the expert cache is too large, or if you want to reserve
 more memory for context, set the routed expert cache explicitly:
 
 ```sh
-./ds4 \
+./hebrus \
   -m /absolute/path/to/QUALIFIED-DEEPSEEK-OR-QWEN-DS4-ExpertMajor-v2.gguf \
   --ssd-streaming --ssd-streaming-cache-experts 32GB
 ```
 
 The `32GB` value is a memory budget for complete routed experts, not a generic
-byte cache. DwarfStar converts it to the number of full experts that fit for the
+byte cache. Hebrus converts it to the number of full experts that fit for the
 current GGUF. Non-routed weights, KV cache, graph scratch, and activations need
 additional memory. Only the automatic cache budget does the full subtraction
 for you: it reserves context/KV/scratch, external pressure, and 20% backend
@@ -291,7 +291,7 @@ On a qualified 64 GB host, run the published DeepSeek Flash ExpertMajor v2
 artifact with its recorded complete output SHA-256 and a moderate expert cache:
 
 ```sh
-./ds4 \
+./hebrus \
   -m /absolute/path/to/QUALIFIED-DEEPSEEK-FLASH-DS4-ExpertMajor-v2.gguf \
   --ssd-streaming \
   --ssd-streaming-cache-experts 32GB \
@@ -374,9 +374,9 @@ Long local inference runs can keep the GPU busy for extended periods. If you
 care more about heat, fan noise, battery life on MacBooks, or reducing thermal
 stress on the hardware than about maximum throughput, use `--power N`.
 
-`--power 100` is the default and means full speed. Lower values ask DwarfStar to target
+`--power 100` is the default and means full speed. Lower values ask Hebrus to target
 that percentage of GPU usage: `--power 70` targets about 70%, `--power 50`
-targets about half usage, and so forth. DwarfStar does this by measuring GPU work time
+targets about half usage, and so forth. Hebrus does this by measuring GPU work time
 and inserting small sleeps between work units: during prefill it sleeps between
 layers, and during generation it sleeps between decoded tokens. This reduces
 sustained load without changing model output.
@@ -385,14 +385,14 @@ The option is available on the CLI, server, agent, eval, and benchmark tools,
 for example:
 
 ```sh
-./ds4 -m /absolute/path/to/QUALIFIED-DS4-ExpertMajor-v2.gguf --power 50
-./ds4-agent -m /absolute/path/to/QUALIFIED-DS4-ExpertMajor-v2.gguf --power 70
-./ds4-server -m /absolute/path/to/QUALIFIED-DS4-ExpertMajor-v2.gguf --power 40 --ctx 100000
+./hebrus -m /absolute/path/to/QUALIFIED-DS4-ExpertMajor-v2.gguf --power 50
+./hebrus-agent -m /absolute/path/to/QUALIFIED-DS4-ExpertMajor-v2.gguf --power 70
+./hebrus-server -m /absolute/path/to/QUALIFIED-DS4-ExpertMajor-v2.gguf --power 40 --ctx 100000
 ```
 
 ## Native agent
 
-DwarfStar features a native coding agent that works in a different way
+Hebrus features a native coding agent that works in a different way
 than most other systems: the inference is controlled from within the agent
 itself, without socket/API boundaries, so the session is represented
 by the on-disk KV cache itself. Moreover the tools and the system prompt
@@ -424,7 +424,7 @@ Private compaction instructions never enter the visible transcript or execute
 tools. `/compact` requests the same operation manually, and the terminal shows
 `COMPACTING` while the summary and rebuilt prefill are in progress.
 
-Use `--chdir /path/to/ds4` when launching `ds4-agent` from another directory,
+Use `--chdir /path/to/engine-checkout` when launching `hebrus-agent` from another directory,
 so relative runtime files such as `metal/*.metal` resolve from the project tree.
 
 However while the system already works, there is a lot of work to do
@@ -434,7 +434,7 @@ session-based protocol that can recreate all that in a client-server way.
 
 ## Benchmarking
 
-`ds4-bench` measures instantaneous prefill and generation throughput at context
+`hebrus-bench` measures instantaneous prefill and generation throughput at context
 frontiers instead of reporting one whole-run average. It loads the model once,
 walks a fixed token sequence to frontiers such as 2048, 4096, 6144, and uses
 incremental prefill so each row measures only the newly-added token interval.
@@ -442,7 +442,7 @@ After each frontier it saves the live KV state to memory, generates a fixed
 greedy non-EOS probe, restores the memory snapshot, and continues prefill.
 
 ```sh
-./ds4-bench \
+./hebrus-bench \
   -m /absolute/path/to/QUALIFIED-DEEPSEEK-FLASH-DS4-ExpertMajor-v2.gguf \
   --prompt-file speed-bench/promessi_sposi.txt \
   --ctx-start 2048 \
@@ -472,7 +472,7 @@ per-layer chunk dispatch path.
 
 ## Capability Evaluation
 
-`ds4-eval` is a small real-model integration benchmark. It is not a leaderboard
+`hebrus-eval` is a small real-model integration benchmark. It is not a leaderboard
 runner and should not be reported as an official GPQA, SuperGPQA, AIME, or
 security benchmark score: the questions are an embedded 92-item subset chosen
 to make local regression testing useful and visually inspectable. The program
@@ -481,14 +481,14 @@ the final answer, and prints a per-question report with prompt tokens,
 generated tokens, pass/fail state, the model answer, and the correct answer.
 
 ```sh
-./ds4-eval \
+./hebrus-eval \
   -m /absolute/path/to/QUALIFIED-DEEPSEEK-FLASH-DS4-ExpertMajor-v2.gguf \
   --trace /tmp/ds4-eval.txt
 ```
 
 The default run uses `--tokens 16000`, thinking mode enabled, and a soft/hard
 `</think>` budget cutoff so the model has room to produce a visible answer.
-`ds4-eval` sizes the context internally from the largest selected prompt plus
+`hebrus-eval` sizes the context internally from the largest selected prompt plus
 the generation budget, and refuses runs that would need more than 1M context
 tokens. Press `p` to pause, `q` to exit and print the report, Up/Down to
 inspect or select another question, and Enter to run the selected question next.
@@ -504,7 +504,7 @@ For inference changes that can affect generation drift, keep this deterministic
 q1..q4 token-count gate in the test plan:
 
 ```sh
-./ds4-eval \
+./hebrus-eval \
   -m /absolute/path/to/QUALIFIED-DEEPSEEK-FLASH-DS4-ExpertMajor-v2.gguf \
   --plain \
   --questions 4 \
@@ -556,7 +556,7 @@ a pass/fail unit test.
   to identify the best source line where the defensive code flaw is introduced,
   or return `0` for a safe function.
 
-In practice this means `ds4-eval` should not be expected to produce a perfect
+In practice this means `hebrus-eval` should not be expected to produce a perfect
 92/92 run. It is meant to answer a more useful engineering question: after a
 kernel, quantization, prompt-rendering, KV-cache, or tool-streaming change, does
 DeepSeek V4 Flash still solve a representative mix of hard science, broad
@@ -568,7 +568,7 @@ path users run?
 One-shot prompt:
 
 ```sh
-./ds4 \
+./hebrus \
   -m /absolute/path/to/QUALIFIED-DS4-ExpertMajor-v2.gguf \
   -p "Explain Redis streams in one paragraph."
 ```
@@ -576,8 +576,8 @@ One-shot prompt:
 No `-p` starts the interactive prompt:
 
 ```sh
-./ds4 -m /absolute/path/to/QUALIFIED-DS4-ExpertMajor-v2.gguf
-ds4>
+./hebrus -m /absolute/path/to/QUALIFIED-DS4-ExpertMajor-v2.gguf
+hebrus>
 ```
 
 The interactive CLI is a real multi-turn chat. It keeps the rendered chat
@@ -597,12 +597,12 @@ experimental slight-speedup path.
 Start a local OpenAI/Anthropic-compatible server:
 
 ```sh
-./ds4-server \
+./hebrus-server \
   -m /absolute/path/to/QUALIFIED-DS4-ExpertMajor-v2.gguf \
   --ctx 100000 --kv-disk-dir /tmp/ds4-kv --kv-disk-space-mb 8192
 ```
 
-Use `--chdir /path/to/ds4` when launching `ds4-server` from another directory,
+Use `--chdir /path/to/engine-checkout` when launching `hebrus-server` from another directory,
 so relative runtime files such as `metal/*.metal` resolve from the project tree.
 
 The server keeps one mutable backend/KV checkpoint in memory,
@@ -653,7 +653,7 @@ assistant `tool_use` blocks or it is rejected.
 
 Default sampled API generation uses `temperature=1`, `top_p=1`, and
 `min_p=0.05`, so the default filter is relative probability rather than
-nucleus mass. In thinking mode DwarfStar uses those fixed sampling defaults and
+nucleus mass. In thinking mode Hebrus uses those fixed sampling defaults and
 ignores client sampling knobs, matching DeepSeek's fixed-thinking API behavior.
 
 The chat, Responses, and Anthropic endpoints support SSE streaming. In thinking
@@ -727,12 +727,12 @@ curl http://127.0.0.1:8000/v1/chat/completions \
 
 ### Agent Client Usage
 
-`ds4-server` can be used by local coding agents that speak OpenAI-compatible
+`hebrus-server` can be used by local coding agents that speak OpenAI-compatible
 chat completions. Start the server first, and set the client context limit no
 higher than the `--ctx` value you started the server with:
 
 ```sh
-./ds4-server \
+./hebrus-server \
   -m /absolute/path/to/QUALIFIED-DS4-ExpertMajor-v2.gguf \
   --ctx 100000 --kv-disk-dir /tmp/ds4-kv --kv-disk-space-mb 8192
 ```
@@ -905,7 +905,7 @@ non-thinking model alias such as `deepseek-chat`.
 ## Disk KV Cache
 
 Chat/completion APIs are stateless: agent clients usually resend the whole
-conversation every request. `ds4-server` first tries the cheap exact token-prefix
+conversation every request. `hebrus-server` first tries the cheap exact token-prefix
 check, then falls back to comparing rendered prompt bytes with decoded
 checkpoint bytes. The live in-memory checkpoint covers the current session; the
 disk KV cache makes useful prefixes survive session switches and server
@@ -920,7 +920,7 @@ different sessions.
 Enable it with:
 
 ```sh
-./ds4-server \
+./hebrus-server \
   -m /absolute/path/to/QUALIFIED-DS4-ExpertMajor-v2.gguf \
   --kv-disk-dir /tmp/ds4-kv --kv-disk-space-mb 8192
 ```
@@ -1088,7 +1088,7 @@ Production inference for Qwen, DeepSeek, and GLM ExpertMajor v2 artifacts is
 local Apple Metal:
 
 ```sh
-./ds4 -m /absolute/path/to/MODEL-DS4-ExpertMajor-v2.gguf -p "Hello"
+./hebrus -m /absolute/path/to/MODEL-DS4-ExpertMajor-v2.gguf -p "Hello"
 ```
 
 CPU remains useful for build and model-free diagnostics:
@@ -1124,12 +1124,12 @@ willingness to provide dual-use or offensive security guidance.
 captured from the official DeepSeek V4 Flash API. The requests use
 `deepseek-v4-flash`, greedy decoding, thinking disabled, and the maximum
 `top_logprobs` slice exposed by the API. Local vectors are generated with
-`./ds4 --dump-logprobs` and compared by token bytes, so tokenizer/template or
+`./hebrus --dump-logprobs` and compared by token bytes, so tokenizer/template or
 attention regressions show up before they become long generation failures. The
 C runner pins `DS4_METAL_PREFILL_CHUNK=2048` for this strict API-vector
 comparison.
 
-All project tests are driven by the C runner, with a small `ds4-eval`
+All project tests are driven by the C runner, with a small `hebrus-eval`
 extractor self-test run first:
 
 ```sh
@@ -1144,10 +1144,10 @@ When a generation looks wrong, three small tools are usually enough to get a
 first answer:
 
 ```sh
-./ds4 -m /absolute/path/to/QUALIFIED-DS4-ExpertMajor-v2.gguf --dump-tokens -p "..."
-./ds4 -m /absolute/path/to/QUALIFIED-DS4-ExpertMajor-v2.gguf --dump-logprobs /tmp/out.json --logprobs-top-k 20 --temp 0 -p "..."
-./ds4 -m /absolute/path/to/QUALIFIED-DS4-ExpertMajor-v2.gguf --dump-logits /tmp/logits.json --nothink --prompt-file prompt.txt
-./ds4-server -m /absolute/path/to/QUALIFIED-DS4-ExpertMajor-v2.gguf --trace /tmp/ds4-trace.txt ...
+./hebrus -m /absolute/path/to/QUALIFIED-DS4-ExpertMajor-v2.gguf --dump-tokens -p "..."
+./hebrus -m /absolute/path/to/QUALIFIED-DS4-ExpertMajor-v2.gguf --dump-logprobs /tmp/out.json --logprobs-top-k 20 --temp 0 -p "..."
+./hebrus -m /absolute/path/to/QUALIFIED-DS4-ExpertMajor-v2.gguf --dump-logits /tmp/logits.json --nothink --prompt-file prompt.txt
+./hebrus-server -m /absolute/path/to/QUALIFIED-DS4-ExpertMajor-v2.gguf --trace /tmp/ds4-trace.txt ...
 ```
 
 - `--dump-tokens` tokenizes the `-p` or `--prompt-file` string exactly as
