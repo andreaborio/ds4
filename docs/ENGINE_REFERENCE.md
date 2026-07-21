@@ -141,8 +141,11 @@ Each build profile links one real executable per role under the canonical
 `hebrus*` name. The matching `ds4*` command is a relative symlink to that file;
 it is not a separately compiled or linked wrapper. On macOS both root command
 sets resolve to the same namespaced Metal binaries. The bridge deliberately
-keeps help, diagnostics, `--build-info`, and capability `engine_id` output
-identical under both names while downstream consumers migrate.
+keeps options, defaults, output streams, exit codes, and runtime behavior
+identical while presenting the invoked command identity. Canonical `hebrus*`
+commands use Hebrus in help and build metadata; compatibility `ds4*` aliases
+retain their legacy command identity. Existing runtime diagnostics remain in
+the compatibility namespace during this bridge.
 
 Every canonical and compatibility executable accepts `--capabilities=json`
 without loading a model.
@@ -155,7 +158,7 @@ product copy. The bare `--capabilities` spelling is intentionally invalid.
 ```json
 {
   "schema_version": 1,
-  "engine_id": "ds4",
+  "engine_id": "hebrus",
   "build_git_sha": "<same value reported by --build-info>",
   "backend": "metal",
   "executable_role": "server",
@@ -172,8 +175,11 @@ product copy. The bare `--capabilities` spelling is intentionally invalid.
 ```
 
 `backend` is `metal` or `cpu`; `executable_role` is `cli`, `server`, `agent`,
-`bench`, or `eval`. The normal build identity is the 12-character Git revision,
-optionally followed by `-dirty`; non-Git builds may report `unknown`.
+`bench`, or `eval`. Canonical commands report `engine_id: "hebrus"`; legacy
+aliases report `engine_id: "ds4"`. Consumers in the bridge window must accept
+both values and use the structured fields rather than visible product copy.
+The normal build identity is the 12-character Git revision, optionally followed
+by `-dirty`; non-Git builds may report `unknown`.
 
 Do not rely on the historical `./ds4flash.gguf` symlink for runtime identity.
 Pass `-m` with an absolute qualified ExpertMajor v2 path and verify its complete

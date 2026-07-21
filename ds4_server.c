@@ -13353,11 +13353,11 @@ static server_config parse_options(int argc, char **argv) {
 int main(int argc, char **argv) {
     hebrus_help_set_invocation(argv[0]);
     if (ds4_build_info_requested(argc, argv)) {
-        ds4_build_info_print(stdout);
+        ds4_build_info_print(stdout, argv[0]);
         return 0;
     }
     if (ds4_capabilities_requested(argc, argv)) {
-        ds4_capabilities_print(stdout, DS4_EXECUTABLE_ROLE_SERVER);
+        ds4_capabilities_print(stdout, DS4_EXECUTABLE_ROLE_SERVER, argv[0]);
         return 0;
     }
     signal(SIGPIPE, SIG_IGN);

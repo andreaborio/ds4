@@ -244,10 +244,11 @@ typedef enum {
 const char *ds4_build_backend(void);
 const char *ds4_build_arch(void);
 const char *ds4_build_git_sha(void);
-void ds4_build_info_print(FILE *fp);
+void ds4_build_info_print(FILE *fp, const char *argv0);
 bool ds4_build_info_requested(int argc, char **argv);
 bool ds4_capabilities_requested(int argc, char **argv);
-void ds4_capabilities_print(FILE *fp, ds4_executable_role role);
+void ds4_capabilities_print(FILE *fp, ds4_executable_role role,
+                            const char *argv0);
 bool ds4_think_mode_enabled(ds4_think_mode mode);
 const char *ds4_think_mode_name(ds4_think_mode mode);
 const char *ds4_think_max_prefix(void);

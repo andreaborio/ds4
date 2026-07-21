@@ -68,8 +68,9 @@ def validate(binary: pathlib.Path, backend: str, role: str) -> dict[str, object]
     if set(document) != ROOT_KEYS:
         fail(f"{binary}: unexpected root keys: {set(document) ^ ROOT_KEYS}")
     require_exact_int(document["schema_version"], 1, f"{binary}: schema_version")
-    if document["engine_id"] != "ds4" or type(document["engine_id"]) is not str:
-        fail(f"{binary}: invalid engine_id")
+    expected_engine_id = "hebrus" if binary.name.startswith("hebrus") else "ds4"
+    if document["engine_id"] != expected_engine_id or type(document["engine_id"]) is not str:
+        fail(f"{binary}: expected engine_id {expected_engine_id!r}")
     if type(document["build_git_sha"]) is not str or not document["build_git_sha"]:
         fail(f"{binary}: invalid build_git_sha")
     if document["backend"] != backend or type(document["backend"]) is not str:
@@ -142,7 +143,11 @@ def main() -> int:
         if not binary.is_file():
             fail(f"missing executable: {binary}")
         document = validate(binary, args.backend, role)
-        common = {key: value for key, value in document.items() if key != "executable_role"}
+        common = {
+            key: value
+            for key, value in document.items()
+            if key not in {"engine_id", "executable_role"}
+        }
         if shared is None:
             shared = common
         elif common != shared:

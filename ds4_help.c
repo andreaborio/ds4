@@ -1,4 +1,5 @@
 #include "ds4_help.h"
+#include "hebrus_identity.h"
 
 #include <stdbool.h>
 #include <stdio.h>
@@ -103,12 +104,7 @@ static bool topic_is(const char *topic, const char *name) {
 static bool help_hebrus_invocation;
 
 void hebrus_help_set_invocation(const char *argv0) {
-    const char *name = argv0 ? strrchr(argv0, '/') : NULL;
-    name = name ? name + 1 : argv0;
-    help_hebrus_invocation = name &&
-        (streq(name, "hebrus") || streq(name, "hebrus-server") ||
-         streq(name, "hebrus-agent") || streq(name, "hebrus-bench") ||
-         streq(name, "hebrus-eval"));
+    help_hebrus_invocation = hebrus_is_canonical_invocation(argv0);
 }
 
 static const char *tool_name(ds4_help_tool tool) {

@@ -33,6 +33,9 @@ not represent a published release.
   the Hebrus name, while the `ds4*` compatibility aliases preserve their
   legacy command identity and the same options, defaults, streams, and exit
   codes.
+- Canonical commands report `engine_id: "hebrus"` and `hebrus build`; legacy
+  aliases retain `engine_id: "ds4"` and `ds4 build`. Both identities use the
+  same schema-1 capability fields and immutable ExpertMajor wire contract.
 
 ### Compatibility
 

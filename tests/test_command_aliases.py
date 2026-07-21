@@ -78,8 +78,11 @@ def validate_pair(
     if capabilities.returncode != 0 or capabilities.stderr:
         fail(f"{canonical}: capability invocation failed")
     document = json.loads(capabilities.stdout)
-    if document.get("engine_id") != "ds4":
-        fail(f"{canonical}: compatibility engine_id changed before the brand contract")
+    if document.get("engine_id") != "hebrus":
+        fail(f"{canonical}: canonical engine_id is not hebrus")
+    legacy_document = json.loads(run(legacy, ("--capabilities=json",)).stdout)
+    if legacy_document.get("engine_id") != "ds4":
+        fail(f"{legacy}: compatibility engine_id is not ds4")
     if document.get("backend") != backend:
         fail(f"{canonical}: expected backend {backend}")
     if document.get("executable_role") != role:
@@ -92,7 +95,11 @@ def validate_pair(
         legacy_name = os.fsencode(legacy.name)
 
         def normalize(data: bytes) -> bytes:
-            return data.replace(canonical_name, legacy_name)
+            return (
+                data.replace(canonical_name, legacy_name)
+                .replace(b'"engine_id": "hebrus"', b'"engine_id": "ds4"')
+                .replace(b"hebrus build", b"ds4 build")
+            )
 
         canonical_record = (
             canonical_result.returncode,

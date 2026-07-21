@@ -1,5 +1,6 @@
 #include "ds4.h"
 #include "ds4_expert_store.h"
+#include "hebrus_identity.h"
 
 #include <string.h>
 
@@ -39,13 +40,14 @@ const char *ds4_build_git_sha(void) {
     return DS4_BUILD_GIT_SHA;
 }
 
-void ds4_build_info_print(FILE *fp) {
+void ds4_build_info_print(FILE *fp, const char *argv0) {
     if (!fp) fp = stdout;
     fprintf(fp,
-            "ds4 build\n"
+            "%s build\n"
             "git:     %s\n"
             "backend: %s\n"
             "arch:    %s\n",
+            hebrus_is_canonical_invocation(argv0) ? "hebrus" : "ds4",
             ds4_build_git_sha(),
             ds4_build_backend(),
             ds4_build_arch());
@@ -118,12 +120,15 @@ static void ds4_json_string_print(FILE *fp, const char *value) {
     fputc('"', fp);
 }
 
-void ds4_capabilities_print(FILE *fp, ds4_executable_role role) {
+void ds4_capabilities_print(FILE *fp, ds4_executable_role role,
+                            const char *argv0) {
     if (!fp) fp = stdout;
     fputs("{\n"
           "  \"schema_version\": 1,\n"
-          "  \"engine_id\": \"ds4\",\n"
-          "  \"build_git_sha\": ", fp);
+          "  \"engine_id\": ", fp);
+    ds4_json_string_print(fp,
+        hebrus_is_canonical_invocation(argv0) ? "hebrus" : "ds4");
+    fputs(",\n  \"build_git_sha\": ", fp);
     ds4_json_string_print(fp, ds4_build_git_sha());
     fputs(",\n  \"backend\": ", fp);
     ds4_json_string_print(fp, ds4_build_backend());
