@@ -3,12 +3,39 @@ set -eu
 
 ROOT=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 SCRIPT="$ROOT/download_model.sh"
+QWEN_CONTRACT="$ROOT/docs/contracts/qwen-release.json"
 TMP_ROOT=$(mktemp -d "${TMPDIR:-/tmp}/ds4-download-model.XXXXXX")
 trap 'rm -rf "$TMP_ROOT"' EXIT HUP INT TERM
 HOME="$TMP_ROOT/home"
 export HOME
 unset HF_TOKEN
 mkdir -p "$HOME"
+
+QWEN_EXPECTED="$TMP_ROOT/qwen-release-contract.sh"
+python3 - "$QWEN_CONTRACT" >"$QWEN_EXPECTED" <<'PY'
+import json
+import shlex
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as handle:
+    contract = json.load(handle)
+published = contract["publishedArtifact"]
+negative = contract["negativeArtifact"]
+values = {
+    "QWEN_STATUS": published["status"],
+    "QWEN_REPOSITORY": contract["repository"],
+    "QWEN_FILE": published["filename"],
+    "QWEN_BYTES": str(published["bytes"]),
+    "QWEN_SHA256": published["sha256"],
+    "QWEN_REVISION": published["revision"],
+    "QWEN_RUNTIME_COMMIT": published["runtimeCommit"],
+    "QWEN_NEGATIVE_FILE": negative["filename"],
+    "QWEN_NEGATIVE_SHA256": negative["sha256"],
+}
+for name, value in values.items():
+    print(f"{name}={shlex.quote(value)}")
+PY
+. "$QWEN_EXPECTED"
 
 fail() {
     echo "download-model: FAIL: $*" >&2
@@ -62,9 +89,18 @@ assert_exact_line 'RUNTIME_DEEPSEEK_BYTES=86720114272'
 assert_exact_line 'RUNTIME_DEEPSEEK_SHA256="8378080263eb9224f7228d72e2afa4ac3cf74a116023fdec2c596ff228a33e3f"'
 assert_exact_line 'RUNTIME_GLM_BYTES=262147193504'
 assert_exact_line 'RUNTIME_GLM_SHA256="7f5017e3076e706c78f2a5322b035a9e2f6519c65ff5b6be8b2d91aeff61505d"'
-assert_exact_line 'RUNTIME_QWEN_BYTES=20808566880'
-assert_exact_line 'RUNTIME_QWEN_SHA256="dd17266185833a9f05531ce366fd7284ddca1ed64aa3dcf06e321e8c72c9ea3d"'
-assert_exact_line 'RUNTIME_QWEN_REVISION="7bf9c3f7f6136aeb2599d75ee61c0cc2f18e2b02"'
+assert_exact_line "RUNTIME_QWEN_STATUS=\"$QWEN_STATUS\""
+assert_exact_line "RUNTIME_QWEN_REPO=\"$QWEN_REPOSITORY\""
+assert_exact_line "RUNTIME_QWEN_FILE=\"$QWEN_FILE\""
+assert_exact_line "RUNTIME_QWEN_BYTES=$QWEN_BYTES"
+assert_exact_line "RUNTIME_QWEN_SHA256=\"$QWEN_SHA256\""
+assert_exact_line "RUNTIME_QWEN_REVISION=\"$QWEN_REVISION\""
+assert_exact_line "RUNTIME_QWEN_MIN_RUNTIME_COMMIT=\"$QWEN_RUNTIME_COMMIT\""
+[ "$QWEN_STATUS" = published ] || fail "canonical Qwen artifact is not published"
+if grep -Fq -- "$QWEN_NEGATIVE_FILE" "$SCRIPT" ||
+        grep -Fq -- "$QWEN_NEGATIVE_SHA256" "$SCRIPT"; then
+    fail "negative-only Qwen artifact is exposed by the downloader"
+fi
 assert_case_assignment deepseek-v2 'MODEL_REPO=$RUNTIME_DEEPSEEK_REPO'
 assert_case_assignment deepseek-v2 'MODEL_FILE=$RUNTIME_DEEPSEEK_FILE'
 assert_case_assignment deepseek-v2 'MODEL_BYTES=$RUNTIME_DEEPSEEK_BYTES'
@@ -188,9 +224,9 @@ run_runtime_success \
     ds4-v0.2.0
 run_runtime_success \
     qwen-v2 \
-    andreaborio/Qwen3.6-35B-A3B-DS4-GGUF \
-    Qwen3.6-35B-A3B-DS4-ExpertMajor-v2-MLX-Affine4-G64.gguf \
-    7bf9c3f7f6136aeb2599d75ee61c0cc2f18e2b02
+    "$QWEN_REPOSITORY" \
+    "$QWEN_FILE" \
+    "$QWEN_REVISION"
 
 CORRUPT_DIR="$TMP_ROOT/corrupt-existing"
 CORRUPT_FILE="$CORRUPT_DIR/GLM-5.2-DS4-ExpertMajor-v2-Q2_K.gguf"

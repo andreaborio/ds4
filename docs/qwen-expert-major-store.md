@@ -86,14 +86,26 @@ used for publication.
 
 | Item | Value |
 |---|---|
-| Publication state | Published on Hugging Face; `dsbox.json` selects this exact byte identity |
+| Publication state | `published` |
+| Repository | `andreaborio/Qwen3.6-35B-A3B-DS4-GGUF` |
 | Artifact | `Qwen3.6-35B-A3B-DS4-ExpertMajor-v2-MLX-Affine4-G64.gguf` |
 | Artifact bytes | 20,808,566,880 |
 | Artifact SHA-256 | `dd17266185833a9f05531ce366fd7284ddca1ed64aa3dcf06e321e8c72c9ea3d` |
+| Immutable revision | `7bf9c3f7f6136aeb2599d75ee61c0cc2f18e2b02` |
 | Minimum compatible runtime commit | `73a332fef82a0bcdd567d17e0de17aa004cad85d` |
+| Storage | `mlx-affine4/group-64` |
+| Negative fixture state | `negative-only` |
+| Negative fixture | `Qwen3.6-35B-A3B-DS4-ExpertMajor-v2-Q4_K_S.gguf` |
+| Negative fixture bytes | 20,808,566,880 |
+| Negative fixture SHA-256 | `d7c43a6388ec20e6fe5530850350f96fdb0ac37c5ce36d3e5f92b172c447f56b` |
 | Canonical source bytes | 20,808,563,424 |
 | Canonical source SHA-256 | `c33efb67bde86c9ba1f9e79c2dc42627170963bef0e915ab9b91a55cfb6d0fcd` |
 | Storage marker | `MLX_AFFINE4`, group size 64 |
+
+The machine-readable
+[Qwen release contract](contracts/qwen-release.json) is canonical for the
+repository, publication states, artifact identities, revision, and runtime
+compatibility floor in this table.
 
 The v2 output is 3,456 bytes larger than its canonical converter input. It does
 not contain a second copy of the routed weights.

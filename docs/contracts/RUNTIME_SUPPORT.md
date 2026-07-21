@@ -38,12 +38,16 @@ the DeepSeek and GLM production contract. Do not infer support for another
 family from Qwen's successful admission.
 
 Runtime support and public artifact distribution are separate gates. The only
-runnable Qwen store is the published 20,808,566,880-byte MLX
-affine4/group-64 artifact with SHA-256
+runnable Qwen store is the `published`
+`Qwen3.6-35B-A3B-DS4-ExpertMajor-v2-MLX-Affine4-G64.gguf`, a
+20,808,566,880-byte MLX affine4/group-64 artifact with SHA-256
 `dd17266185833a9f05531ce366fd7284ddca1ed64aa3dcf06e321e8c72c9ea3d`.
 `download_model.sh qwen-v2` pins immutable repository revision
-`7bf9c3f7f6136aeb2599d75ee61c0cc2f18e2b02`. The older Q4_K_S store is a
-rejection fixture, not a downloadable runtime fallback.
+`7bf9c3f7f6136aeb2599d75ee61c0cc2f18e2b02`; its manifest requires runtime
+commit `73a332fef82a0bcdd567d17e0de17aa004cad85d` or a compatible descendant. The
+older `Qwen3.6-35B-A3B-DS4-ExpertMajor-v2-Q4_K_S.gguf` store is
+`negative-only`, not a downloadable runtime fallback. The machine-readable
+[Qwen release contract](qwen-release.json) is the canonical identity record.
 
 ## Model Artifact Admission
 

@@ -166,7 +166,7 @@
       "location": "content",
       "token": "DS4",
       "classification": "migration-pending",
-      "maximum": 8
+      "maximum": 9
     },
     {
       "path": "EXPERT_PRUNE.md",
@@ -299,7 +299,7 @@
       "location": "content",
       "token": "DS4",
       "classification": "migration-pending",
-      "maximum": 4
+      "maximum": 5
     },
     {
       "path": "SECURITY.md",
@@ -635,6 +635,13 @@
       "location": "content",
       "token": "DS4",
       "classification": "compatibility",
+      "maximum": 5
+    },
+    {
+      "path": "docs/contracts/qwen-release.json",
+      "location": "content",
+      "token": "DS4",
+      "classification": "serialized/permanent",
       "maximum": 3
     },
     {
@@ -705,7 +712,7 @@
       "location": "content",
       "token": "DS4",
       "classification": "migration-pending",
-      "maximum": 8
+      "maximum": 10
     },
     {
       "path": "docs/releases/hebrus-bridge-launch-candidate.md",
@@ -2350,7 +2357,7 @@
       "location": "content",
       "token": "DS4",
       "classification": "migration-pending",
-      "maximum": 14
+      "maximum": 12
     },
     {
       "path": "tests/test_expert_major.py",

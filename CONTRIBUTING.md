@@ -110,7 +110,10 @@ manifest contract, and compatible runtime commit. Until then, contributor QA
 may use an explicitly labelled local candidate, but release and download checks
 must report public distribution as unavailable.
 
-The current Qwen release is
+The machine-readable
+[Qwen release contract](docs/contracts/qwen-release.json) is the canonical
+source for every repeated identity below. The current Qwen release is
+`published` as
 `Qwen3.6-35B-A3B-DS4-ExpertMajor-v2-MLX-Affine4-G64.gguf`, 20,808,566,880
 bytes, SHA-256
 `dd17266185833a9f05531ce366fd7284ddca1ed64aa3dcf06e321e8c72c9ea3d`.
@@ -119,8 +122,12 @@ It is published at immutable repository revision
 its manifest requires runtime commit
 `73a332fef82a0bcdd567d17e0de17aa004cad85d` or a compatible descendant.
 `download_model.sh qwen-v2` must pin and validate that exact identity. The older
-Q4_K_S object is an incompatible negative fixture, not a runnable fallback. See
+`Qwen3.6-35B-A3B-DS4-ExpertMajor-v2-Q4_K_S.gguf` object is `negative-only`, not
+a runnable fallback. See
 [`docs/qwen-expert-major-store.md`](docs/qwen-expert-major-store.md).
+Change the JSON contract first, update every intentional human-readable mirror,
+then run `make release-contract release-contract-test`; do not update a mirror
+as an independent release authority.
 
 CUDA and ROCm are frozen and their backend source and build targets are absent
 from the active tree. Ordinary changes must not restore them accidentally. A

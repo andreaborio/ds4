@@ -38,6 +38,7 @@ INSTALL_SOURCE_PROGRAMS = $(addprefix $(INSTALL_SOURCE_BINDIR)/,$(HEBRUS_PROGRAM
 
 .PHONY: all help clean test model-free-test premerge context-audit doc-links \
 	brand-boundary-audit brand-boundary-test \
+	release-contract release-contract-test \
 	imatrix-dataset-check prompt-fixture-check cpu FORCE \
 	metal build-isolation-test q4k-dot-test qwen-metadata-test \
 	qwen-reference-test qwen-unicode-test qwen-tokenizer-test \
@@ -47,8 +48,20 @@ INSTALL_SOURCE_PROGRAMS = $(addprefix $(INSTALL_SOURCE_BINDIR)/,$(HEBRUS_PROGRAM
 	install uninstall install-test $(PROGRAMS) \
 	ds4_test ds4_agent_test
 
-download-model-test: tests/test_download_model.sh download_model.sh
+download-model-test: tests/test_download_model.sh download_model.sh \
+		docs/contracts/qwen-release.json
 	sh tests/test_download_model.sh
+
+release-contract: tools/qwen_release_contract.py \
+		docs/contracts/qwen-release.json README.md CONTRIBUTING.md \
+		QA_BEFORE_RELEASES.md docs/contracts/RUNTIME_SUPPORT.md \
+		docs/qwen-expert-major-store.md download_model.sh \
+		tests/test_download_model.sh
+	python3 tools/qwen_release_contract.py
+
+release-contract-test: release-contract tools/qwen_release_contract.py \
+		tests/test_qwen_release_contract.py
+	python3 tests/test_qwen_release_contract.py
 
 brand-boundary-audit: tools/brand_boundary_audit.py tools/brand_boundary.json
 	python3 tools/brand_boundary_audit.py --check
@@ -110,6 +123,8 @@ help:
 	@echo "  make install-test Verify staged install layout and capabilities"
 	@echo "  make brand-boundary-audit"
 	@echo "                    Reject unclassified or increased legacy brand tokens"
+	@echo "  make release-contract"
+	@echo "                    Reject Qwen release identity drift"
 	@echo "  make premerge     Run context/docs, isolation, and model-free gates"
 	@echo "  make clean        Remove build outputs and published root binaries"
 
@@ -576,6 +591,7 @@ prompt-fixture-check:
 # Build isolation removes and rebuilds BUILD_ROOT, so model-free-test must start
 # only after it completes even when an agent invokes `make -j premerge`.
 premerge: context-audit doc-links brand-boundary-audit brand-boundary-test \
+	release-contract release-contract-test \
 	imatrix-dataset-check prompt-fixture-check build-isolation-test
 	$(MAKE) model-free-test
 	$(MAKE) install-test
@@ -607,6 +623,7 @@ help:
 	@echo "  make install-test        Verify staged install layout and capabilities"
 	@echo "  make brand-boundary-audit"
 	@echo "                           Reject unclassified or increased legacy brand tokens"
+	@echo "  make release-contract    Reject Qwen release identity drift"
 	@echo "  make premerge            Run repository audits and Linux CPU/model-free gates"
 	@echo "  make clean               Remove build outputs"
 
@@ -795,6 +812,7 @@ prompt-fixture-check:
 	python3 speed-bench/build_long_context_prompt.py --check
 
 premerge: context-audit doc-links brand-boundary-audit brand-boundary-test \
+	release-contract release-contract-test \
 	imatrix-dataset-check prompt-fixture-check model-free-test
 	$(MAKE) install-test
 	git diff --check
