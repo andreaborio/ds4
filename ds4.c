@@ -15971,6 +15971,89 @@ static bool qwen35_gpu_matmul_dense_batch(
     }
 }
 
+typedef struct {
+    uint32_t magic;
+    uint32_t version;
+    uint32_t layer;
+    uint32_t n_token;
+    uint32_t width;
+    uint32_t reserved;
+} qwen35_batch_route_dump_header;
+
+static bool qwen35_gpu_dump_batch_routes(
+        uint32_t              layer,
+        uint32_t              n_token,
+        const ds4_gpu_tensor *selected,
+        const ds4_gpu_tensor *weights) {
+    const char *path = getenv("DS4_QWEN_BATCH_ROUTE_DUMP");
+    if (!path || !path[0]) return true;
+    if (!selected || !weights || n_token == 0u) return false;
+
+    const uint32_t width = QWEN35_N_EXPERT_USED;
+    const uint64_t count = (uint64_t)n_token * width;
+    if (count > SIZE_MAX / sizeof(int32_t) ||
+        count > SIZE_MAX / sizeof(float)) {
+        return false;
+    }
+    int32_t *ids = malloc((size_t)count * sizeof(*ids));
+    float *route_weights = malloc((size_t)count * sizeof(*route_weights));
+    if (!ids || !route_weights) {
+        free(ids);
+        free(route_weights);
+        return false;
+    }
+    const bool read_ok =
+        ds4_gpu_tensor_read(
+            selected, 0, ids, count * sizeof(*ids)) != 0 &&
+        ds4_gpu_tensor_read(
+            weights, 0, route_weights,
+            count * sizeof(*route_weights)) != 0;
+    if (!read_ok) {
+        free(ids);
+        free(route_weights);
+        return false;
+    }
+
+    static char active_path[PATH_MAX];
+    static bool initialized;
+    const bool reset = !initialized || strcmp(active_path, path) != 0;
+    FILE *out = fopen(path, reset ? "wb" : "ab");
+    if (!out) {
+        fprintf(stderr,
+                "ds4: failed to open Qwen batch route dump %s: %s\n",
+                path, strerror(errno));
+        free(ids);
+        free(route_weights);
+        return false;
+    }
+    const qwen35_batch_route_dump_header header = {
+        .magic = UINT32_C(0x51345254),
+        .version = 1u,
+        .layer = layer,
+        .n_token = n_token,
+        .width = width,
+        .reserved = 0u,
+    };
+    bool write_ok =
+        fwrite(&header, sizeof(header), 1, out) == 1 &&
+        fwrite(ids, sizeof(*ids), (size_t)count, out) == count &&
+        fwrite(route_weights, sizeof(*route_weights),
+               (size_t)count, out) == count;
+    if (fflush(out) != 0) write_ok = false;
+    if (fclose(out) != 0) write_ok = false;
+    if (reset && write_ok) {
+        snprintf(active_path, sizeof(active_path), "%s", path);
+        initialized = true;
+    }
+    free(ids);
+    free(route_weights);
+    if (!write_ok) {
+        fprintf(stderr,
+                "ds4: failed to write Qwen batch route dump %s\n", path);
+    }
+    return write_ok;
+}
+
 static bool qwen35_gpu_matmul_dense(
         ds4_gpu_tensor       *out,
         const ds4_model      *model,
@@ -17031,6 +17114,12 @@ static bool qwen35_gpu_encode_ffn_batch(
                  graph->batch_router_weight,
                  graph->batch_router_logits,
                  n_token) != 0;
+    }
+    if (ok) {
+        ok = qwen35_gpu_dump_batch_routes(
+                 layer_index, n_token,
+                 graph->batch_router_selected,
+                 graph->batch_router_weight);
     }
     QWEN35_PROFILE_FFN_BATCH_STAGE("router_top8");
     ds4_gpu_qwen35_stream_io_ticket io_ticket = {0};
