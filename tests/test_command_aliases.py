@@ -24,6 +24,7 @@ PARITY_CASES = (
     ("--capabilities=json",),
     ("--build-info",),
     ("--help",),
+    ("--help", "all"),
     ("--capabilities",),
     ("--role",),
     ("--command-alias-invalid-test",),
@@ -88,6 +89,8 @@ def validate_pair(
     if document.get("executable_role") != role:
         fail(f"{canonical}: expected executable role {role}")
 
+    canonical_help_size = 0
+    legacy_help_size = 0
     for args in PARITY_CASES:
         canonical_result = run(canonical, args)
         legacy_result = run(legacy, args)
@@ -114,11 +117,23 @@ def validate_pair(
         if canonical_record != legacy_record:
             fail(f"{canonical.name}/{legacy.name} differ for {' '.join(args)}")
 
-        if args == ("--help",):
+        if args[0] == "--help":
+            if canonical_result.returncode != 0 or canonical_result.stderr:
+                fail(f"{canonical.name}: help invocation failed")
+            if legacy_result.returncode != 0 or legacy_result.stderr:
+                fail(f"{legacy.name}: help invocation failed")
             if not canonical_result.stdout.startswith(canonical_name + b"\n"):
                 fail(f"{canonical.name}: help does not use canonical invocation name")
             if not legacy_result.stdout.startswith(legacy_name + b"\n"):
                 fail(f"{legacy.name}: help does not preserve legacy invocation name")
+            if args == ("--help",):
+                canonical_help_size = len(canonical_result.stdout)
+                legacy_help_size = len(legacy_result.stdout)
+            elif (
+                len(canonical_result.stdout) <= canonical_help_size
+                or len(legacy_result.stdout) <= legacy_help_size
+            ):
+                fail(f"{canonical.name}/{legacy.name}: --help all is not full help")
 
 
 def main() -> int:
