@@ -1,0 +1,20 @@
+cff-version: 1.2.0
+message: >-
+  If you use this software, please cite it using the metadata in this file and
+  preserve the upstream acknowledgements in the repository documentation.
+title: Hebrus
+type: software
+authors:
+  - name: The ds4.c authors
+abstract: >-
+  An open-source inference engine focused on Apple Metal, embedded ExpertMajor
+  model stores, and SSD streaming for large mixture-of-experts models.
+license: MIT
+repository-code: "https://github.com/andreaborio/ds4"
+url: "https://github.com/andreaborio/ds4"
+keywords:
+  - Apple Metal
+  - GGUF
+  - local inference
+  - mixture of experts
+  - SSD streaming

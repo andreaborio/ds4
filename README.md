@@ -195,6 +195,17 @@ A short-context best is not substituted for the long-context gate.
 - [Release checklist](QA_BEFORE_RELEASES.md)
 - [Fork/upstream ledger](FORK_NOTES.md)
 
+### Project and community
+
+- [Contribution guide](CONTRIBUTING.md)
+- [Security policy](SECURITY.md)
+- [Code of conduct](CODE_OF_CONDUCT.md)
+- [Governance](GOVERNANCE.md)
+- [Changelog](CHANGELOG.md)
+- [Citation metadata](CITATION.cff)
+- [Acknowledgments](ACKNOWLEDGMENTS.md) and
+  [third-party notices](THIRD_PARTY_NOTICES.md)
+
 ## Project status
 
 The engine is beta software; `hebrus-agent` remains alpha. Large-model inference
@@ -214,9 +225,9 @@ performance gates, and classify whether the work should also be proposed to
 `antirez/ds4`.
 
 Do not publish vulnerability details in an ordinary issue. Until a dedicated
-security policy is added, use the repository's
-[private GitHub Security Advisory flow](https://github.com/andreaborio/ds4/security/advisories/new)
-when available.
+private reporting channel is enabled, follow the zero-disclosure contact
+procedure in [SECURITY.md](SECURITY.md). Enabling GitHub private vulnerability
+reporting remains a pre-launch administrative gate.
 
 ## License and credit
 
