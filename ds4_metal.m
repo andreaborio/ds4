@@ -2543,6 +2543,56 @@ static int ds4_gpu_mpp_available(void) {
 }
 
 /*
+ * DeepSeek affine2 deliberately stays on the exact selected-address SIMD
+ * MM-ID kernels.  The official MLX Metal4 gather-QMM path is not a drop-in
+ * replacement: it assumes one contiguous codes plane plus separately
+ * strided scale and bias planes.  DS4 instead owns one independently mapped
+ * 8 MiB SSD record per selected expert and interleaves BF16 controls with the
+ * 2-bit codes.  Its 64-row TensorOps macro tile also spans sorted routes that
+ * may change expert inside a tile; DS4's current MM-ID map assigns one expert
+ * per threadgroup.  A per-expert NAX translation would average only six live
+ * rows at the 256-token, E=256/top-6 boundary and is neither the official
+ * algorithm nor a demonstrated speedup.
+ *
+ * Keep the admission gate explicit and fail closed on every geometry other
+ * than the pinned physical store.  This is the same selected-address grouped
+ * MM technique that becomes the strong Qwen SSD lane at >=32 tokens, but DS4
+ * does not pretend there are two DeepSeek schedules: affine2 currently uses
+ * the identical dispatch at every batch size because it has no exact matvec,
+ * GGML, or Q2 fallback.
+ */
+static int ds4_gpu_deepseek_affine2_stream_admitted(
+        uint32_t n_tokens,
+        uint32_t n_total_expert,
+        uint32_t n_expert,
+        uint32_t gate_type,
+        uint32_t down_type,
+        uint64_t gate_row_bytes,
+        uint64_t gate_expert_bytes,
+        uint64_t up_row_bytes,
+        uint64_t up_expert_bytes,
+        uint64_t down_row_bytes,
+        uint64_t down_expert_bytes,
+        uint32_t expert_in_dim,
+        uint32_t expert_mid_dim,
+        uint32_t out_dim,
+        bool     ssd_streaming,
+        bool     selected_address) {
+    if (!ssd_streaming || !selected_address || n_tokens == 0u ||
+        n_total_expert != 256u || n_expert != 6u ||
+        gate_type != DS4_METAL_TENSOR_MLX_AFFINE2 ||
+        down_type != DS4_METAL_TENSOR_MLX_AFFINE2 ||
+        expert_in_dim != 4096u || expert_mid_dim != 2048u ||
+        out_dim != 4096u ||
+        gate_row_bytes != 1536u || gate_expert_bytes != 3145728u ||
+        up_row_bytes != 1280u || up_expert_bytes != 2621440u ||
+        down_row_bytes != 640u || down_expert_bytes != 2621440u) {
+        return 0;
+    }
+    return 1;
+}
+
+/*
  * Retained Metal4 defaults live here instead of behind user-visible options.
  * The public runtime has one automatic accelerated path plus the global
  * DS4_METAL_DISABLE_METAL4 comparison switch.  Benchmark-only alternatives that
@@ -35813,6 +35863,27 @@ static float ds4_gpu_internal_bf16_to_f32(uint16_t value) {
     return converted.value;
 }
 
+static int ds4_gpu_internal_deepseek_affine2_stream_policy_test(void) {
+#define DS4_TEST_AFFINE2_PATH(tokens, ssd, addr, gate_row) \
+    ds4_gpu_deepseek_affine2_stream_admitted( \
+        (tokens), 256u, 6u, \
+        DS4_METAL_TENSOR_MLX_AFFINE2, DS4_METAL_TENSOR_MLX_AFFINE2, \
+        (gate_row), 3145728u, 1280u, 2621440u, 640u, 2621440u, \
+        4096u, 2048u, 4096u, (ssd), (addr))
+    const int ok =
+        DS4_TEST_AFFINE2_PATH(1u, true, true, 1536u) == 1 &&
+        DS4_TEST_AFFINE2_PATH(31u, true, true, 1536u) == 1 &&
+        DS4_TEST_AFFINE2_PATH(32u, true, true, 1536u) == 1 &&
+        DS4_TEST_AFFINE2_PATH(255u, true, true, 1536u) == 1 &&
+        DS4_TEST_AFFINE2_PATH(256u, true, true, 1536u) == 1 &&
+        DS4_TEST_AFFINE2_PATH(2048u, true, true, 1536u) == 1 &&
+        DS4_TEST_AFFINE2_PATH(256u, false, true, 1536u) == 0 &&
+        DS4_TEST_AFFINE2_PATH(256u, true, false, 1536u) == 0 &&
+        DS4_TEST_AFFINE2_PATH(256u, true, true, 1535u) == 0;
+#undef DS4_TEST_AFFINE2_PATH
+    return ok;
+}
+
 static int ds4_gpu_internal_affine2_projection_test(
         uint32_t group_size,
         bool rhs_f16,
@@ -35920,32 +35991,45 @@ static int ds4_gpu_internal_affine2_projection_test(
     }
 
     @autoreleasepool {
-        id<MTLBuffer> component_buffer = ok ?
-            [g_device newBufferWithBytes:component
-                                  length:(NSUInteger)component_bytes
-                                 options:MTLResourceStorageModeShared] : nil;
         id<MTLBuffer> address_table = ok ?
             [g_device newBufferWithLength:
                 N_TOTAL_EXPERT * sizeof(uint64_t)
                 options:MTLResourceStorageModeShared] : nil;
+        id<MTLBuffer> expert_buffers[N_TOTAL_EXPERT] = { nil };
         ds4_gpu_stream_expert_cache_entry resources[N_TOTAL_EXPERT];
         ds4_gpu_stream_expert_cache_entry *resource_ptrs[N_TOTAL_EXPERT];
         memset(resources, 0, sizeof(resources));
         memset(resource_ptrs, 0, sizeof(resource_ptrs));
         uint64_t *addresses = address_table ?
             (uint64_t *)address_table.contents : NULL;
-        if (!component_buffer || !address_table || !addresses ||
-            ![component_buffer respondsToSelector:@selector(gpuAddress)] ||
-            component_buffer.gpuAddress == 0u) {
+        if (!address_table || !addresses) {
             ok = 0;
         }
         for (uint32_t expert = 0; ok && expert < N_TOTAL_EXPERT; expert++) {
-            addresses[expert] = component_buffer.gpuAddress +
-                (uint64_t)expert * expert_bytes;
+            /* Each expert lives in a distinct buffer at a different aligned
+             * inner offset.  This catches accidental contiguous-base math in
+             * the selected-address kernels; routes deliberately visit these
+             * addresses in a non-monotonic order. */
+            const NSUInteger prefix = (NSUInteger)(expert + 1u) * 256u;
+            expert_buffers[expert] =
+                [g_device newBufferWithLength:
+                    prefix + (NSUInteger)expert_bytes + 256u
+                    options:MTLResourceStorageModeShared];
+            if (!expert_buffers[expert] ||
+                ![expert_buffers[expert]
+                    respondsToSelector:@selector(gpuAddress)] ||
+                expert_buffers[expert].gpuAddress == 0u) {
+                ok = 0;
+                break;
+            }
+            memcpy((uint8_t *)expert_buffers[expert].contents + prefix,
+                   component + (uint64_t)expert * expert_bytes,
+                   (size_t)expert_bytes);
+            addresses[expert] = expert_buffers[expert].gpuAddress + prefix;
             resources[expert].valid = 1;
-            resources[expert].gate_buffer = component_buffer;
-            resources[expert].up_buffer = component_buffer;
-            resources[expert].down_buffer = component_buffer;
+            resources[expert].gate_buffer = expert_buffers[expert];
+            resources[expert].up_buffer = expert_buffers[expert];
+            resources[expert].down_buffer = expert_buffers[expert];
             resource_ptrs[expert] = &resources[expert];
         }
         const char *map_name = ds4_gpu_mul_mm_id_map0_name(N_SELECTED);
@@ -36027,12 +36111,19 @@ static int ds4_gpu_internal_affine2_projection_test(
 int ds4_gpu_internal_deepseek_affine2_kernel_test(void) {
     if (!g_initialized && !ds4_gpu_init()) return 0;
     return
+        ds4_gpu_internal_deepseek_affine2_stream_policy_test() &&
         ds4_gpu_internal_affine2_projection_test(32u, false, 1u, 0u) &&
         ds4_gpu_internal_affine2_projection_test(64u, false, 1u, 1u) &&
         ds4_gpu_internal_affine2_projection_test(64u, true, 1u, 2u) &&
         ds4_gpu_internal_affine2_projection_test(32u, false, 33u, 0u) &&
         ds4_gpu_internal_affine2_projection_test(64u, false, 33u, 1u) &&
-        ds4_gpu_internal_affine2_projection_test(64u, true, 33u, 2u);
+        ds4_gpu_internal_affine2_projection_test(64u, true, 33u, 2u) &&
+        /* 256 is deliberately not a TensorOps transition: both sides remain
+         * on the exact selected-address SIMD kernel. */
+        ds4_gpu_internal_affine2_projection_test(32u, false, 255u, 0u) &&
+        ds4_gpu_internal_affine2_projection_test(32u, false, 256u, 0u) &&
+        ds4_gpu_internal_affine2_projection_test(64u, false, 256u, 1u) &&
+        ds4_gpu_internal_affine2_projection_test(64u, true, 256u, 2u);
 }
 
 int ds4_gpu_internal_expert_store_v2_kernel_test(void) {
@@ -36893,17 +36984,17 @@ int ds4_gpu_qwen35_routed_moe_batch_select_tensor(
             DS4_EXPERT_STORE_STORAGE_MLX_AFFINE2 &&
         g_qwen35_expert_pack.group_size ==
             DS4_EXPERT_STORE_GROUP_PROFILE_AFFINE2_G32_U64_D64;
+    const bool deepseek_affine2_stream_admitted = deepseek_affine2_store &&
+        ds4_gpu_deepseek_affine2_stream_admitted(
+            n_tokens, n_total_expert, n_expert, gate_type, down_type,
+            gate_row_bytes, gate_expert_bytes,
+            up_row_bytes, up_expert_bytes,
+            down_row_bytes, down_expert_bytes,
+            expert_in_dim, expert_mid_dim, out_dim,
+            g_ssd_streaming_mode, true);
     if (deepseek_affine2_store &&
-        (!g_ssd_streaming_mode ||
-         gate_type != DS4_METAL_TENSOR_MLX_AFFINE2 ||
-         down_type != DS4_METAL_TENSOR_MLX_AFFINE2 ||
-         n_total_expert != 256u || n_expert != 6u ||
-         expert_in_dim != 4096u || expert_mid_dim != 2048u ||
-         out_dim != 4096u ||
-         gate_row_bytes != 1536u || gate_expert_bytes != 3145728u ||
-         up_row_bytes != 1280u || up_expert_bytes != 2621440u ||
-         up_tensor_bytes != UINT64_C(671088640) ||
-         down_row_bytes != 640u || down_expert_bytes != 2621440u)) {
+        (!deepseek_affine2_stream_admitted ||
+         up_tensor_bytes != UINT64_C(671088640))) {
         fprintf(stderr,
                 "ds4: DeepSeek affine2 SSD dispatch rejected non-canonical geometry\n");
         return 0;
@@ -37443,6 +37534,14 @@ int ds4_gpu_qwen35_routed_moe_batch_select_tensor(
                             ? "kernel_mul_mm_id_addr_mlx_affine2_64_f16"
                             : "kernel_mul_mm_id_addr_mlx_affine2_64_f32",
                         false);
+                    static int logged_deepseek_affine2;
+                    if (!logged_deepseek_affine2) {
+                        fprintf(stderr,
+                                "ds4: DeepSeek affine2 SSD uses exact selected-address "
+                                "SIMD grouped MM-ID (N32 routes); TensorOps is not "
+                                "admitted for interleaved per-expert SSD records\n");
+                        logged_deepseek_affine2 = 1;
+                    }
                 } else {
                     gate_mm_pipeline = ds4_gpu_get_mul_mm_id_pipeline(
                         "kernel_mul_mm_id_addr_mlx_affine4_64_f32", false);
@@ -37932,7 +38031,7 @@ int ds4_gpu_qwen35_routed_moe_batch_select_tensor(
             use_qwen_stream_expert_group ?
                 "qwen_q4_expert_group_stream_addr" :
             use_mlx_affine_stream_mm_id && deepseek_affine2_store ?
-                "deepseek_affine2_mm_id_stream_addr" :
+                "deepseek_affine2_simd_grouped_mm_id_stream_addr" :
             use_mlx_affine_stream_mm_id ?
                 "mlx_affine_mm_id_stream_addr" :
             use_qwen_q4_batch_selected_addr ? "qwen_q4_batch_stream_addr" :
