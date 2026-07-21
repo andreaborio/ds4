@@ -52,6 +52,7 @@ helpers remain in the same translation unit while agents can load one family.
 | `ds4_qwen_unicode_data.inc` | Generated Unicode data; provenance lives under `tests/qwen/` |
 | `ds4_streaming_hotlist.inc` | DeepSeek streaming hotlist data included by `ds4.c` |
 | `ds4_streaming_hotlist_glm52.inc` | GLM 5.2 streaming hotlist data included by `ds4.c` |
+| `runtime/ds4_deepseek_cache_phase.inc` | DeepSeek adaptive ExpertMajor cache transitions around batched prefill; textually included by `ds4.c` |
 | `runtime/ds4_glm_graph.inc` | GLM Metal graph state, allocation, prefill/decode scheduling, routed MoE/SSD orchestration, and GLM generation; textually included by `ds4.c` |
 | `runtime/ds4_metal_glm.inc` | GLM-specific Metal encoders and tensor wrappers; textually included by `ds4_metal.m` |
 

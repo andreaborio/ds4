@@ -159,7 +159,11 @@ $(METAL_OBJDIR)/%.o: %.c
 # Textual implementation partitions stay in the ds4.c translation unit.  Keep
 # the dependency explicit as well as in the generated .d file so incremental
 # builds remain correct before dependency metadata exists.
-$(METAL_OBJDIR)/ds4.o: runtime/ds4_glm_graph.inc
+$(METAL_OBJDIR)/ds4.o: runtime/ds4_glm_graph.inc \
+		runtime/ds4_deepseek_cache_phase.inc
+
+$(CPU_OBJDIR)/ds4.o: runtime/ds4_glm_graph.inc \
+		runtime/ds4_deepseek_cache_phase.inc
 
 $(CPU_OBJDIR)/%.o: %.c
 	@mkdir -p "$(@D)"
@@ -239,7 +243,8 @@ $(METAL_OBJDIR)/test_q4k_top8.o: tests/test_q4k_top8.c \
 
 $(METAL_OBJDIR)/test_qwen_session.o: tests/test_qwen_session.c ds4.c ds4.h \
 		ds4_ssd.h ds4_profile.h ds4_gpu.h ds4_qwen.h \
-		ds4_qwen_unicode.h
+		ds4_qwen_unicode.h runtime/ds4_glm_graph.inc \
+		runtime/ds4_deepseek_cache_phase.inc
 	@mkdir -p "$(@D)"
 	$(CC) $(CFLAGS) $(QWEN_CFLAGS) $(DEPFLAGS) -DDS4_NO_GPU \
 		-Wno-unused-function -Wno-unused-parameter -I. -c -o $@ $<
@@ -677,7 +682,8 @@ tests/test_qwen_session: tests/test_qwen_session.c ds4.c ds4.h ds4_ssd.h ds4_pro
 		ds4_gpu.h ds4_qwen.h ds4_qwen_unicode.h \
 		ds4_build.c ds4_ssd.c ds4_profile.c ds4_qwen.c \
 		ds4_qwen_unicode.c ds4_qwen_unicode_data.inc \
-		ds4_streaming_hotlist.inc
+		ds4_streaming_hotlist.inc runtime/ds4_glm_graph.inc \
+		runtime/ds4_deepseek_cache_phase.inc
 	$(CC) $(CFLAGS) $(QWEN_CFLAGS) -DDS4_NO_GPU \
 		-Wno-unused-function -Wno-unused-parameter -I. -o $@ \
 		tests/test_qwen_session.c ds4_build.c ds4_ssd.c \
