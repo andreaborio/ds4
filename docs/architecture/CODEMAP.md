@@ -10,7 +10,9 @@ below that is relevant to the task. Historical benchmark notes are evidence,
 not architecture specifications. The production-backend boundary is recorded
 in [`ADR 0002`](../adr/0002-apple-metal-production-runtime.md). Qwen's
 RAM/working-set adaptation is isolated in
-[`ADR 0004`](../adr/0004-qwen-metal-hardware-memory-policy.md).
+[`ADR 0004`](../adr/0004-qwen-metal-hardware-memory-policy.md). The proposed
+Hebrus public-name migration and its immutable compatibility boundary are
+recorded in [`ADR 0005`](../adr/0005-hebrus-naming-and-compatibility-boundary.md).
 
 ## Runtime Entry Points
 
