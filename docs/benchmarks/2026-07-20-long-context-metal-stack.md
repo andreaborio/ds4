@@ -2,12 +2,13 @@
 
 Date: 2026-07-20
 
-Status: final-source performance and safety evidence is complete for the
-retained Metal paths. DeepSeek carries no promoted 32K speedup percentage
+Status: retained-path performance plus final-source startup and safety evidence
+is complete. DeepSeek carries no promoted 32K speedup percentage
 because the original AUTO controls can swap. Manual API, agent, and persistent
 disk-KV release gates passed on the frozen build. Revision-pinned packaging and
 normal startup also passed. Model-artifact tagging on Hugging Face is complete;
-DSBox, main, and the final Hugging Face cards/runtime revisions remain open.
+DSBox, main, and the final Hugging Face cards/runtime revisions are verified as
+separate publication operations rather than inferred from benchmark results.
 
 Decision: retain the DeepSeek long-context cache-phase policy and the GLM
 compact-indexer mapping correction. Reject and remove both the exact paired-Q8
@@ -41,14 +42,12 @@ records the expected identity, model byte count and mtime; it does not claim
 that `model_sha256_expected` is a fresh per-arm full-file hash.
 
 The retained runtime code is commit
-`5479c42e52116ee15766b6e0e00391f940d77215`. Its clean `ds4-bench` SHA-256 is
-`1decc95495f91b7d478d514cf508bc48f2db5cc50525f1c3557115dce260c69e`;
+`f9f654f9857e2132300b0dc5bf800e373160ffe1`. Its clean `ds4-bench` SHA-256 is
+`1a4b0d62bb0616d806582123de72195e4e8ccfa3ea85cd7ea6a64f77f656ade6`;
 the assembled Metal source SHA-256 is
-`f143a7e86f3b5e4b7a4b8c92ec3e7cee0a8e1164d5f0fa969dcb056eb1ae2e67`.
-The later hermetic-runner commit `25466e5f4a9c` changes build provenance and
-benchmark tooling only, not C/Metal runtime objects. Its clean diagnostic
-`ds4-bench` binary is
-`144f6be8550a7b754290d97b250dd964da1db126922d86f8d72213d36281a9c4`.
+`e57502f1ebab8dbb1b797a76dc50e7947537f4ea00910704c50bdefeb29b4c08`.
+Hermetic runner commit `25466e5f4a9c` remains in its ancestry; the only later
+runtime removal is the rejected Qwen paired-Q8 experiment.
 The instrumented original baseline binary is
 `d963d673f642d467206a5aff697322131babf9365f284f1013cf15a9ac3427d4`.
 
@@ -76,6 +75,13 @@ The paired path was neutral-to-worse in every decode measure, and each mean
 difference was smaller than the relevant cohort spread. It therefore has no
 measured production benefit. The paired kernel, dispatch implementation, and
 dedicated test were rejected and removed; Qwen retains the exact scalar path.
+
+The clean post-removal runtime then repeated the same 32K prose lane directly.
+It measured 65.76 t/s prefill, about 3.18 t/s decode, 40,215.768 ms decode
+wall, 315.193 ms p50, and 317.518 ms p95. Pressure remained normal with a 59%
+minimum, swapout stayed zero, and the logits/evidence content hashes remained
+the exact values above. This final-source run is the release Qwen result; the
+A/B/B/A means remain the experiment-rejection evidence.
 
 Earlier isolated 128, 2K, and 8K cohorts also preserved exact output but did
 not establish a durable win. They remain exploratory history rather than an
@@ -175,9 +181,10 @@ prompt SHA-256 values were respectively
 `b03c9d3458bf5fe4d5943d7a66a442df50adff7ef7403e44809e44f5a015193e`
 and
 `a433c538bedf7df589e3fbeeefee9f8867bd0639ddf58d2af30e4ef463034cb6`.
-Both used the final runtime binary
+Both used the retained-path qualification binary
 `1decc95495f91b7d478d514cf508bc48f2db5cc50525f1c3557115dce260c69e`,
-produced complete logits/evidence, and saw no competing inference process.
+produced complete logits/evidence, and saw no competing inference process. The
+later runtime delta removed only the rejected Qwen-specific paired-Q8 path.
 At 65K the logits/evidence content hashes were
 `2406b1dfd16989e652bacb3b0f2995e763824605551683c21ac79d99396846e3`
 and
@@ -219,12 +226,12 @@ raise the internal full-attention cap and mask this exact boundary.
 | 4K+1 boundary | 39.61 t/s | cold first token 0.23 t/s | 4,351.509 ms | 4,351.509 ms | n/a | exact transition passes; zero swap delta |
 | 8K+8 canary | 40.29 t/s | 0.95 t/s overall | 551.587 ms | 4,691.184 ms | n/a | indexed prefill passes; p50 is about 1.81 t/s steady decode |
 | Earlier 32K prose | 36.19 t/s | 1.62 t/s overall | 558.710 ms | 731.082 ms | 36.90% | corrected candidate; zero swap |
-| Final-source 32K prose | 44.73 t/s | 1.87 t/s overall | 472.624 ms | 621.302 ms | 36.90% | about 2.12 t/s p50 steady; zero swap |
-| Final-source 32K security/coding | 45.53 t/s | 1.33 t/s overall | 734.406 ms | 819.176 ms | 13.15% | adversarial routing lane; zero swap |
+| Retained-path 32K prose | 44.73 t/s | 1.87 t/s overall | 472.624 ms | 621.302 ms | 36.90% | about 2.12 t/s p50 steady; zero swap |
+| Retained-path 32K security/coding | 45.53 t/s | 1.33 t/s overall | 734.406 ms | 819.176 ms | 13.15% | adversarial routing lane; zero swap |
 
-The same-prompt final-source prose observation uses prompt SHA-256
+The same-prompt retained-path prose observation uses prompt SHA-256
 `f53e0d80cb2d4492d24ebd63c7000c397b16ae70f9bf09b3763e5d8323ec209f`
-and final runtime binary
+and qualification runtime binary
 `1decc95495f91b7d478d514cf508bc48f2db5cc50525f1c3557115dce260c69e`.
 Its logits and decode-evidence
 content hashes exactly match the earlier corrected arm:
@@ -244,7 +251,7 @@ time outside `pread` did not regress. Its logits/evidence content hashes were
 and
 `a11298a3bd91c2dd04d8d5dd90266acf596ea447046a2d4311940707136df7dc`.
 
-The same-prompt observation did not show a material final-source GLM decode
+The same-prompt observation did not show a material retained-path GLM decode
 regression and exceeds the earlier top. It did not use a matched warm-up or an
 A/B/B/A speed cohort, so this record does not publish a percentage gain. There
 is also no
@@ -260,7 +267,7 @@ cost is test duration, not a RAM-capacity failure.
   percentage crossed 20%. It had no swapout but the complete cohort is invalid.
   The runner now records transient pressure and aborts on swapout, wired-memory,
   timeout or process contamination.
-- The first final-source DeepSeek 128 cohort began with a cold 11.77 t/s A1 and
+- The first retained-path DeepSeek 128 cohort began with a cold 11.77 t/s A1 and
   ended with a 13.45 t/s A2, so it was discarded before the retained warm
   cohort.
 - In the first DeepSeek 32K comparison, A2 was stopped before inference after
@@ -283,10 +290,10 @@ cost is test duration, not a RAM-capacity failure.
   aborted it. Reducing the 65K+ tier to eight complete routing cycles (2,065
   experts) cut peak wired memory from 42,016 to 28,194 MiB and completed with
   zero swapout; the failed arm contributes no performance result.
-- A final-source 8,190-token decode canary exposed a 259-to-4,387-to-4,129
+- A retained-path 8,190-token decode canary exposed a 259-to-4,387-to-4,129
   grow/shrink cycle and 36 page-outs. The runner invalidated that arm. The
   128-token transition guard above removes that churn; its replacement canary
-  remains part of the final-source gate.
+  remains part of the retained-path gate.
 
 ## Functional release validation
 
@@ -324,11 +331,13 @@ rebuilt 1,987 tokens from rendered text. Ctrl+C interrupted a live prefill and
 the same process accepted and completed the next prompt. The temporary session
 was deleted after the gate.
 
-Normal flag-free AUTO CLI startup also passed on all three qualified artifacts
-at an 8,192-token allocation. Qwen resolved resident and emitted `QWEN_OK`;
-DeepSeek resolved SSD and emitted `DEEPSEEK_OK`; GLM resolved to its required
-SSD-only Gold profile and emitted `GLM_OK`. These tiny generations are startup
-and prompt-rendering checks, not performance evidence.
+After the rejected Qwen kernel was removed, clean runtime commit `f9f654f9857e`
+reran normal flag-free AUTO CLI startup on all three qualified artifacts at an
+8,192-token allocation. Qwen resolved resident and emitted `QWEN_FINAL_OK` at
+289.66/66.64 prefill/generation t/s; DeepSeek resolved SSD and emitted
+`DEEPSEEK_FINAL_OK` at 4.05/2.46 t/s; GLM resolved to its required SSD-only
+Gold profile and emitted `GLM_FINAL_OK` at 1.79/2.39 t/s. These tiny generations
+are final-source startup and prompt-rendering checks, not performance evidence.
 
 The exhaustive interactive web-approval, queued-message, long-running bash,
 and remote-terminal rendering matrix was not repeated because this release
@@ -337,20 +346,20 @@ manual gates above validate normal startup and the historically critical
 interruption/tool/session paths without presenting the untouched surfaces as
 newly qualified evidence.
 
-## Remaining release gates
+## Release closeout
 
 The retained runtime paths have passed `make premerge`, independent full-diff
 review, final-binary Qwen/DeepSeek/GLM short smokes, DeepSeek 8K-crossing and
-65K/100K gates, both 32K prompt domains, and final-source GLM 32K. DeepSeek is
+65K/100K gates, both 32K prompt domains, and retained-path GLM 32K. DeepSeek is
 promoted as a safety/correctness and long-tail fix, not with a 32K throughput
 percentage, because the original AUTO controls can swap.
 
-This record alone still does not authorize publication. Before merge/release:
-
-- rerun `make premerge` after the final documentation-only commit and complete
-  one last residue review;
-- validate the DSBox catalog/startup surface against the release commit;
-- publish/verify main and Hugging Face only after those functional gates pass.
+Publication additionally requires a clean `make premerge` on the release
+commit, DSBox catalog/startup validation against that commit, and direct remote
+verification of main and Hugging Face. Those are release operations and are not
+inferred from this performance record. The isolated DSBox candidate passed
+typecheck, build, theme checks, and all 301 tests before its runtime revision
+was pinned to the release commit.
 
 The GLM mapping correction does not alter attention, KV geometry, RoPE,
 context allocation or context scaling, so it does not create a new 65K/100K
