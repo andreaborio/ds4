@@ -4103,7 +4103,7 @@ static DS4_MAYBE_UNUSED uint64_t routed_expert_row_bytes(const ds4_tensor *t) {
 }
 
 /* Qwen's SSD path is intentionally tied to the single supported
- * Qwen3.6-35B-A3B Q4_K_S artifact.  Keep this contract separate from the
+ * Qwen3.6-35B-A3B ExpertMajor v2 affine4/group-64 artifact. Keep this contract separate from the
  * DeepSeek shape profile: the layer count, top-k, and expert byte class all
  * differ, and silently inheriting either model's cache geometry would make a
  * too-small cache look valid. */
@@ -14705,11 +14705,12 @@ typedef enum {
     QWEN35_FEATURE_EXPERT_GROUP | QWEN35_FEATURE_EXPERT_PACK | \
     QWEN35_FEATURE_GQA_REUSE | QWEN35_FEATURE_PROMPT_LOOKUP))
 
-/* Byte geometry for the exact Qwen Metal runtime.  The fixed graph constant
- * is checked against real tensor allocations by the private Metal lifecycle
- * test; the other terms are kept symbolic so changes in model geometry fail
- * visibly instead of silently shrinking host headroom. */
-#define QWEN35_METAL_GRAPH_FIXED_BYTES UINT64_C(83647812)
+/* Persistent graph storage excluding context rows.  The batch arena is linear
+ * in its row capacity: resident inference uses a wide MLX-style batch, while
+ * SSD streaming keeps a bounded micro arena so a low-memory host does not pay
+ * for resident-only throughput scratch. */
+#define QWEN35_METAL_GRAPH_NON_BATCH_BYTES UINT64_C(67160644)
+#define QWEN35_METAL_GRAPH_BATCH_BYTES_PER_TOKEN UINT64_C(257612)
 #define QWEN35_METAL_GRAPH_CONTEXT_BYTES_PER_TOKEN \
     ((uint64_t)QWEN35_FULL_ATTENTION_LAYER_COUNT * 2u * \
          QWEN35_N_HEAD_KV * QWEN35_N_HEAD_DIM * sizeof(float) + \
@@ -14731,8 +14732,9 @@ typedef enum {
 #define QWEN35_GQA_REUSE_MIN_CONTEXT 64u
 #define QWEN35_SSD_EXPERT_GROUP_MIN_TOKENS 8u
 #define QWEN35_RESIDENT_EXPERT_GROUP_MIN_TOKENS 32u
-#define QWEN35_MACRO_PREFILL_MAX 8192u
-#define QWEN35_PREFILL_MICRO_TOKENS 64u
+#define QWEN35_MACRO_PREFILL_MAX QWEN35_CONTEXT_LENGTH
+#define QWEN35_PREFILL_MICRO_TOKENS 2048u
+#define QWEN35_RESIDENT_PREFILL_TOKENS 8192u
 
 /* A suffix that fits one historical micro batch must stay on that path.  In
  * particular, shrinking a warm decode cache for a 2..64 token agent/tool
@@ -14757,8 +14759,13 @@ static bool qwen35_metal_persistent_runtime_bytes(
         uint32_t  context_tokens,
         uint64_t *bytes_out) {
     uint64_t context_bytes = 0;
-    uint64_t total = QWEN35_METAL_GRAPH_FIXED_BYTES;
+    uint64_t batch_bytes = 0;
+    uint64_t total = QWEN35_METAL_GRAPH_NON_BATCH_BYTES;
     return context_tokens != 0 && context_tokens <= QWEN35_CONTEXT_LENGTH &&
+           qwen35_u64_mul(QWEN35_RESIDENT_PREFILL_TOKENS,
+                          QWEN35_METAL_GRAPH_BATCH_BYTES_PER_TOKEN,
+                          &batch_bytes) &&
+           qwen35_u64_add(total, batch_bytes, &total) &&
            qwen35_u64_mul(context_tokens,
                           QWEN35_METAL_GRAPH_CONTEXT_BYTES_PER_TOKEN,
                           &context_bytes) &&
@@ -14785,7 +14792,7 @@ static bool qwen35_macro_workspace_bytes(
             * token/position tensors already included above. */
            qwen35_u64_mul(macro_tokens, 2u * sizeof(int32_t),
                           &host_inputs) &&
-           /* Four host pointer tables are live for every 64-row view.  The
+           /* Four host pointer tables are live for every bounded micro view. The
             * opaque view objects themselves are allocator noise covered by
             * the fixed request headroom, but these explicit arrays are part
             * of the deterministic phase peak. */
@@ -14886,11 +14893,13 @@ typedef struct {
 enum {
     QWEN35_GPU_MOE_SPLIT_COUNT = 2,
     QWEN35_GPU_MOE_SPLIT_WIDTH = QWEN35_N_EXPERT_USED / 2,
-    /* One 64-token resident chunk reaches the existing Q8/TensorOps and
-     * routed mm_id fast paths while adding only a small fixed scratch arena. */
-    QWEN35_GPU_PREFILL_CAP = QWEN35_PREFILL_MICRO_TOKENS,
+    /* Maximum compiled resident batch geometry.  This matches the macro
+     * scheduler frontier so resident Qwen can keep an 8K prompt in one
+     * layer-wide Metal batch.  SSD graphs still allocate the explicit
+     * bounded micro capacity selected by session construction. */
+    QWEN35_GPU_PREFILL_CAP = QWEN35_RESIDENT_PREFILL_TOKENS,
     /* The macro scheduler keeps only hidden rows at macro width; every other
-     * scratch tensor remains capped at 64 rows.  Eight thousand tokens need
+     * scratch tensor remains capped at the micro width. Eight thousand tokens need
      * 128 MiB for both F32 planes, small enough for the guarded 16 GiB plan. */
     QWEN35_GPU_MACRO_PREFILL_MAX = QWEN35_MACRO_PREFILL_MAX,
 };
@@ -14910,6 +14919,7 @@ DS4_STATIC_ASSERT(ds4_qwen35_macro_row_geometry,
 
 typedef struct {
     uint32_t ctx_capacity;
+    uint32_t prefill_cap;
     uint32_t n_tokens;
     bool state_valid;
 
@@ -15099,8 +15109,8 @@ static bool qwen35_gpu_macro_workspace_alloc(
     ds4_qwen35_macro_workspace next = {0};
     next.n_token = n_token;
     next.n_chunk =
-        (n_token + QWEN35_GPU_PREFILL_CAP - 1u) /
-        QWEN35_GPU_PREFILL_CAP;
+        (n_token + QWEN35_PREFILL_MICRO_TOKENS - 1u) /
+        QWEN35_PREFILL_MICRO_TOKENS;
     for (uint32_t il = 0; il < QWEN35_N_LAYER; il++) {
         next.conv_offset[il] = UINT64_MAX;
         next.recurrent_offset[il] = UINT64_MAX;
@@ -15150,10 +15160,10 @@ static bool qwen35_gpu_macro_workspace_alloc(
     }
 
     for (uint32_t chunk = 0; chunk < next.n_chunk; chunk++) {
-        const uint32_t first = chunk * QWEN35_GPU_PREFILL_CAP;
+        const uint32_t first = chunk * QWEN35_PREFILL_MICRO_TOKENS;
         const uint32_t remaining = n_token - first;
-        const uint32_t rows = remaining > QWEN35_GPU_PREFILL_CAP
-            ? QWEN35_GPU_PREFILL_CAP : remaining;
+        const uint32_t rows = remaining > QWEN35_PREFILL_MICRO_TOKENS
+            ? QWEN35_PREFILL_MICRO_TOKENS : remaining;
         const uint64_t scalar_offset =
             (uint64_t)first * sizeof(int32_t);
         const uint64_t scalar_bytes =
@@ -15438,7 +15448,8 @@ static bool qwen35_gpu_graph_allocated_bytes(
 
 static bool qwen35_gpu_graph_state_allocated(
         const ds4_qwen35_gpu_graph *g) {
-    if (!g || g->ctx_capacity == 0 ||
+    if (!g || g->ctx_capacity == 0 || g->prefill_cap == 0 ||
+        g->prefill_cap > QWEN35_GPU_PREFILL_CAP ||
         g->ctx_capacity > QWEN35_CONTEXT_LENGTH) {
         return false;
     }
@@ -15532,7 +15543,7 @@ static bool qwen35_gpu_graph_validate_range(
         const ds4_qwen35_gpu_graph *g,
         uint32_t                    position,
         uint32_t                    n_token) {
-    return n_token != 0 && n_token <= QWEN35_GPU_PREFILL_CAP &&
+    return g && n_token != 0 && n_token <= g->prefill_cap &&
            qwen35_gpu_graph_state_allocated(g) && g->state_valid &&
            position == g->n_tokens && position <= g->ctx_capacity &&
            n_token <= g->ctx_capacity - position;
@@ -15586,14 +15597,17 @@ static bool qwen35_gpu_graph_mark_state_invalid(
 
 static bool qwen35_gpu_graph_alloc(
         ds4_qwen35_gpu_graph *g,
-        uint32_t              ctx_capacity) {
+        uint32_t              ctx_capacity,
+        uint32_t              prefill_cap) {
     if (!g || g->ctx_capacity != 0 || ctx_capacity == 0 ||
-        ctx_capacity > QWEN35_CONTEXT_LENGTH) {
+        ctx_capacity > QWEN35_CONTEXT_LENGTH || prefill_cap == 0 ||
+        prefill_cap > QWEN35_GPU_PREFILL_CAP) {
         return false;
     }
 
     ds4_qwen35_gpu_graph next = {0};
     next.ctx_capacity = ctx_capacity;
+    next.prefill_cap = prefill_cap;
 
 #define QWEN35_GPU_ALLOC_F32(field, d0, d1, d2, d3) \
     next.field = qwen35_gpu_tensor_alloc_shape(       \
@@ -15633,62 +15647,62 @@ static bool qwen35_gpu_graph_alloc(
     QWEN35_GPU_ALLOC_F32(attn_out, QWEN35_N_EMBD, 1, 1, 1);
     QWEN35_GPU_ALLOC_F32(attn_score, ctx_capacity, 1, 1, 1);
 
-    QWEN35_GPU_ALLOC_I32(batch_token_ids, QWEN35_GPU_PREFILL_CAP, 1, 1, 1);
-    QWEN35_GPU_ALLOC_I32(batch_positions, QWEN35_GPU_PREFILL_CAP, 1, 1, 1);
-    QWEN35_GPU_ALLOC_F32(batch_hidden[0], QWEN35_GPU_PREFILL_CAP,
+    QWEN35_GPU_ALLOC_I32(batch_token_ids, prefill_cap, 1, 1, 1);
+    QWEN35_GPU_ALLOC_I32(batch_positions, prefill_cap, 1, 1, 1);
+    QWEN35_GPU_ALLOC_F32(batch_hidden[0], prefill_cap,
                          QWEN35_N_EMBD, 1, 1);
-    QWEN35_GPU_ALLOC_F32(batch_hidden[1], QWEN35_GPU_PREFILL_CAP,
+    QWEN35_GPU_ALLOC_F32(batch_hidden[1], prefill_cap,
                          QWEN35_N_EMBD, 1, 1);
-    QWEN35_GPU_ALLOC_F32(batch_norm, QWEN35_GPU_PREFILL_CAP,
+    QWEN35_GPU_ALLOC_F32(batch_norm, prefill_cap,
                          QWEN35_N_EMBD, 1, 1);
-    QWEN35_GPU_ALLOC_F32(batch_projection, QWEN35_GPU_PREFILL_CAP,
+    QWEN35_GPU_ALLOC_F32(batch_projection, prefill_cap,
                          QWEN35_SSM_CONV_CHANNEL, 1, 1);
-    QWEN35_GPU_ALLOC_F32(batch_gate, QWEN35_GPU_PREFILL_CAP,
+    QWEN35_GPU_ALLOC_F32(batch_gate, prefill_cap,
                          QWEN35_SSM_INNER, 1, 1);
-    QWEN35_GPU_ALLOC_F32(batch_query, QWEN35_GPU_PREFILL_CAP,
+    QWEN35_GPU_ALLOC_F32(batch_query, prefill_cap,
                          QWEN35_N_HEAD, QWEN35_N_HEAD_DIM, 1);
-    QWEN35_GPU_ALLOC_F32(batch_key, QWEN35_GPU_PREFILL_CAP,
+    QWEN35_GPU_ALLOC_F32(batch_key, prefill_cap,
                          QWEN35_N_HEAD_KV, QWEN35_N_HEAD_DIM, 1);
-    QWEN35_GPU_ALLOC_F32(batch_value, QWEN35_GPU_PREFILL_CAP,
+    QWEN35_GPU_ALLOC_F32(batch_value, prefill_cap,
                          QWEN35_N_HEAD_KV, QWEN35_N_HEAD_DIM, 1);
-    QWEN35_GPU_ALLOC_F32(batch_heads, QWEN35_GPU_PREFILL_CAP,
+    QWEN35_GPU_ALLOC_F32(batch_heads, prefill_cap,
                          QWEN35_SSM_INNER, 1, 1);
-    QWEN35_GPU_ALLOC_F32(batch_alpha_logit, QWEN35_GPU_PREFILL_CAP,
+    QWEN35_GPU_ALLOC_F32(batch_alpha_logit, prefill_cap,
                          QWEN35_SSM_VALUE_HEAD, 1, 1);
-    QWEN35_GPU_ALLOC_F32(batch_beta_logit, QWEN35_GPU_PREFILL_CAP,
+    QWEN35_GPU_ALLOC_F32(batch_beta_logit, prefill_cap,
                          QWEN35_SSM_VALUE_HEAD, 1, 1);
-    QWEN35_GPU_ALLOC_F32(batch_log_decay, QWEN35_GPU_PREFILL_CAP,
+    QWEN35_GPU_ALLOC_F32(batch_log_decay, prefill_cap,
                          QWEN35_SSM_VALUE_HEAD, 1, 1);
-    QWEN35_GPU_ALLOC_F32(batch_beta, QWEN35_GPU_PREFILL_CAP,
+    QWEN35_GPU_ALLOC_F32(batch_beta, prefill_cap,
                          QWEN35_SSM_VALUE_HEAD, 1, 1);
-    QWEN35_GPU_ALLOC_F32(batch_attn_out, QWEN35_GPU_PREFILL_CAP,
+    QWEN35_GPU_ALLOC_F32(batch_attn_out, prefill_cap,
                          QWEN35_N_EMBD, 1, 1);
-    QWEN35_GPU_ALLOC_F32(batch_router_logits, QWEN35_GPU_PREFILL_CAP,
+    QWEN35_GPU_ALLOC_F32(batch_router_logits, prefill_cap,
                          QWEN35_N_EXPERT, 1, 1);
-    QWEN35_GPU_ALLOC_I32(batch_router_selected, QWEN35_GPU_PREFILL_CAP,
+    QWEN35_GPU_ALLOC_I32(batch_router_selected, prefill_cap,
                          QWEN35_N_EXPERT_USED, 1, 1);
-    QWEN35_GPU_ALLOC_F32(batch_router_weight, QWEN35_GPU_PREFILL_CAP,
+    QWEN35_GPU_ALLOC_F32(batch_router_weight, prefill_cap,
                          QWEN35_N_EXPERT_USED, 1, 1);
-    QWEN35_GPU_ALLOC_F32(batch_routed_gate, QWEN35_GPU_PREFILL_CAP,
+    QWEN35_GPU_ALLOC_F32(batch_routed_gate, prefill_cap,
                          QWEN35_N_EXPERT_USED, QWEN35_N_FF_EXP, 1);
-    QWEN35_GPU_ALLOC_F32(batch_routed_up, QWEN35_GPU_PREFILL_CAP,
+    QWEN35_GPU_ALLOC_F32(batch_routed_up, prefill_cap,
                          QWEN35_N_EXPERT_USED, QWEN35_N_FF_EXP, 1);
-    QWEN35_GPU_ALLOC_F32(batch_routed_mid, QWEN35_GPU_PREFILL_CAP,
+    QWEN35_GPU_ALLOC_F32(batch_routed_mid, prefill_cap,
                          QWEN35_N_EXPERT_USED, QWEN35_N_FF_EXP, 1);
-    QWEN35_GPU_ALLOC_F32(batch_routed_down, QWEN35_GPU_PREFILL_CAP,
+    QWEN35_GPU_ALLOC_F32(batch_routed_down, prefill_cap,
                          QWEN35_N_EXPERT_USED, QWEN35_N_EMBD, 1);
-    QWEN35_GPU_ALLOC_F32(batch_moe_out, QWEN35_GPU_PREFILL_CAP,
+    QWEN35_GPU_ALLOC_F32(batch_moe_out, prefill_cap,
                          QWEN35_N_EMBD, 1, 1);
-    QWEN35_GPU_ALLOC_F32(batch_shared_gate, QWEN35_GPU_PREFILL_CAP,
+    QWEN35_GPU_ALLOC_F32(batch_shared_gate, prefill_cap,
                          QWEN35_N_FF_SHARED, 1, 1);
-    QWEN35_GPU_ALLOC_F32(batch_shared_up, QWEN35_GPU_PREFILL_CAP,
+    QWEN35_GPU_ALLOC_F32(batch_shared_up, prefill_cap,
                          QWEN35_N_FF_SHARED, 1, 1);
-    QWEN35_GPU_ALLOC_F32(batch_shared_mid, QWEN35_GPU_PREFILL_CAP,
+    QWEN35_GPU_ALLOC_F32(batch_shared_mid, prefill_cap,
                          QWEN35_N_FF_SHARED, 1, 1);
-    QWEN35_GPU_ALLOC_F32(batch_shared_out, QWEN35_GPU_PREFILL_CAP,
+    QWEN35_GPU_ALLOC_F32(batch_shared_out, prefill_cap,
                          QWEN35_N_EMBD, 1, 1);
     QWEN35_GPU_ALLOC_F32(batch_shared_gate_logit,
-                         QWEN35_GPU_PREFILL_CAP, 1, 1, 1);
+                         prefill_cap, 1, 1, 1);
 
     uint32_t n_full_attention = 0;
     uint32_t n_recurrent = 0;
@@ -15806,7 +15820,8 @@ bool ds4_internal_qwen35_gpu_graph_alloc(
         size_t    storage_bytes,
         uint32_t  ctx_capacity) {
     if (!storage || storage_bytes != sizeof(ds4_qwen35_gpu_graph)) return false;
-    return qwen35_gpu_graph_alloc(storage, ctx_capacity);
+    return qwen35_gpu_graph_alloc(
+        storage, ctx_capacity, QWEN35_GPU_PREFILL_CAP);
 }
 
 bool ds4_internal_qwen35_gpu_graph_allocated_bytes(
@@ -16053,6 +16068,32 @@ static bool qwen35_gpu_decode_output_profile_enabled(uint32_t position) {
     return getenv("DS4_QWEN_METAL_DECODE_STAGE_PROFILE") != NULL &&
            qwen35_gpu_decode_profile_env_match(
                "DS4_QWEN_METAL_DECODE_STAGE_PROFILE_POSITION", position);
+}
+
+static bool qwen35_gpu_prefill_stage_profile_enabled(
+        uint32_t layer_index) {
+    return getenv("DS4_QWEN_METAL_PREFILL_STAGE_PROFILE") != NULL &&
+           qwen35_gpu_decode_profile_env_match(
+               "DS4_QWEN_METAL_PREFILL_STAGE_PROFILE_LAYER", layer_index);
+}
+
+static bool qwen35_gpu_prefill_stage_profile_boundary(
+        const char *stage,
+        uint32_t    layer_index,
+        uint32_t    n_token,
+        double     *stage_t0) {
+    if (!stage || !stage_t0 || ds4_gpu_end_commands() == 0) {
+        return false;
+    }
+    const double now = now_sec();
+    fprintf(stderr,
+            "ds4: Metal Qwen prefill stage layer=%u tokens=%u %s=%.3f ms\n",
+            layer_index,
+            n_token,
+            stage,
+            (now - *stage_t0) * 1000.0);
+    *stage_t0 = now;
+    return ds4_gpu_begin_commands() != 0;
 }
 
 static bool qwen35_gpu_decode_stage_profile_boundary(
@@ -16635,10 +16676,22 @@ static bool qwen35_gpu_encode_gdn_batch(
         return false;
     }
 
+    const bool detail_profile =
+        getenv("DS4_QWEN_METAL_PREFILL_DETAIL_PROFILE") != NULL &&
+        qwen35_gpu_prefill_stage_profile_enabled(layer_index);
+    double detail_t0 = detail_profile ? now_sec() : 0.0;
+#define QWEN35_PROFILE_GDN_BATCH_STAGE(name) do { \
+        if (ok && detail_profile) { \
+            ok = qwen35_gpu_prefill_stage_profile_boundary( \
+                "gdn_" name, layer_index, n_token, &detail_t0); \
+        } \
+    } while (0)
+
     bool ok = ds4_gpu_rms_norm_weight_rows_tensor(
                   graph->batch_norm, input, model->map, model->size,
                   layer->attn_norm->abs_offset,
                   QWEN35_N_EMBD, n_token, 1.0e-6f) != 0;
+    QWEN35_PROFILE_GDN_BATCH_STAGE("norm");
     if (ok) {
         ok = qwen35_gpu_matmul_dense_pair_batch(
             graph->batch_projection, graph->batch_gate,
@@ -16646,6 +16699,7 @@ static bool qwen35_gpu_encode_gdn_batch(
             QWEN35_N_EMBD, QWEN35_SSM_CONV_CHANNEL,
             QWEN35_SSM_INNER, graph->batch_norm, n_token);
     }
+    QWEN35_PROFILE_GDN_BATCH_STAGE("qkv_gate");
     if (ok) {
         ok = qwen35_gpu_matmul_dense_pair_batch(
             graph->batch_alpha_logit, graph->batch_beta_logit,
@@ -16653,6 +16707,7 @@ static bool qwen35_gpu_encode_gdn_batch(
             QWEN35_N_EMBD, QWEN35_SSM_DT_RANK,
             QWEN35_SSM_DT_RANK, graph->batch_norm, n_token);
     }
+    QWEN35_PROFILE_GDN_BATCH_STAGE("alpha_beta");
 
     if (ok) {
         *state_mutated = true;
@@ -16667,6 +16722,7 @@ static bool qwen35_gpu_encode_gdn_batch(
                  QWEN35_SSM_CONV_CHANNEL,
                  QWEN35_SSM_CONV_KERNEL) != 0;
     }
+    QWEN35_PROFILE_GDN_BATCH_STAGE("causal_conv");
     if (ok) {
         ok = ds4_gpu_qwen35_gated_delta_controls_batch_tensor(
                  graph->batch_log_decay,
@@ -16680,6 +16736,7 @@ static bool qwen35_gpu_encode_gdn_batch(
                  n_token,
                  QWEN35_SSM_VALUE_HEAD) != 0;
     }
+    QWEN35_PROFILE_GDN_BATCH_STAGE("controls");
     if (ok) {
         ok = ds4_gpu_qwen35_gated_delta_sequence_128_tensor(
                  graph->batch_heads,
@@ -16691,6 +16748,7 @@ static bool qwen35_gpu_encode_gdn_batch(
                  QWEN35_SSM_GROUP,
                  QWEN35_SSM_VALUE_HEAD) != 0;
     }
+    QWEN35_PROFILE_GDN_BATCH_STAGE("recurrent");
     if (ok) {
         ok = ds4_gpu_qwen35_rmsnorm_gated_tensor(
                  graph->batch_heads,
@@ -16703,12 +16761,14 @@ static bool qwen35_gpu_encode_gdn_batch(
                  QWEN35_SSM_STATE,
                  1.0e-6f) != 0;
     }
+    QWEN35_PROFILE_GDN_BATCH_STAGE("gated_norm");
     if (ok) {
         ok = qwen35_gpu_matmul_dense_batch(
             attention_out, model, layer->ssm_out,
             QWEN35_SSM_INNER, QWEN35_N_EMBD,
             graph->batch_heads, n_token);
     }
+#undef QWEN35_PROFILE_GDN_BATCH_STAGE
     return ok;
 }
 
@@ -16925,16 +16985,29 @@ static bool qwen35_gpu_encode_ffn_batch(
     const bool request_expert_group =
         expert_group && n_token >= expert_group_min_tokens;
 
+    const bool detail_profile =
+        getenv("DS4_QWEN_METAL_PREFILL_DETAIL_PROFILE") != NULL &&
+        qwen35_gpu_prefill_stage_profile_enabled(layer_index);
+    double detail_t0 = detail_profile ? now_sec() : 0.0;
+#define QWEN35_PROFILE_FFN_BATCH_STAGE(name) do { \
+        if (ok && detail_profile) { \
+            ok = qwen35_gpu_prefill_stage_profile_boundary( \
+                "ffn_" name, layer_index, n_token, &detail_t0); \
+        } \
+    } while (0)
+
     bool ok = ds4_gpu_rms_norm_weight_rows_tensor(
                   graph->batch_norm, hidden, model->map, model->size,
                   layer->post_attention_norm->abs_offset,
                   QWEN35_N_EMBD, n_token, 1.0e-6f) != 0;
+    QWEN35_PROFILE_FFN_BATCH_STAGE("norm");
     if (ok) {
         ok = qwen35_gpu_matmul_dense_batch(
             graph->batch_router_logits, model, layer->ffn_gate_inp,
             QWEN35_N_EMBD, QWEN35_N_EXPERT,
             graph->batch_norm, n_token);
     }
+    QWEN35_PROFILE_FFN_BATCH_STAGE("router");
     if (ok) {
         ok = ds4_gpu_qwen35_router_softmax_top8_batch_tensor(
                  graph->batch_router_selected,
@@ -16942,7 +17015,7 @@ static bool qwen35_gpu_encode_ffn_batch(
                  graph->batch_router_logits,
                  n_token) != 0;
     }
-
+    QWEN35_PROFILE_FFN_BATCH_STAGE("router_top8");
     ds4_gpu_qwen35_stream_io_ticket io_ticket = {0};
     if (ok && io_overlap) {
         const ds4_gpu_stream_expert_table stream_table = {
@@ -16998,12 +17071,14 @@ static bool qwen35_gpu_encode_ffn_batch(
                  0.0f,
                  1.0f) != 0;
     }
+    QWEN35_PROFILE_FFN_BATCH_STAGE("shared_gate_up");
     if (ok) {
         ok = qwen35_gpu_matmul_dense_batch(
             graph->batch_shared_out, model, layer->ffn_down_shexp,
             QWEN35_N_FF_SHARED, QWEN35_N_EMBD,
             graph->batch_shared_mid, n_token);
     }
+    QWEN35_PROFILE_FFN_BATCH_STAGE("shared_down");
     if (ok) {
         ok = qwen35_gpu_matmul_dense_batch(
             graph->batch_shared_gate_logit,
@@ -17014,6 +17089,7 @@ static bool qwen35_gpu_encode_ffn_batch(
             graph->batch_norm,
             n_token);
     }
+    QWEN35_PROFILE_FFN_BATCH_STAGE("shared_gate_projection");
     if (ok) {
         ok = ds4_gpu_qwen35_sigmoid_mul_rows_tensor(
                  graph->batch_shared_out,
@@ -17022,6 +17098,7 @@ static bool qwen35_gpu_encode_ffn_batch(
                  n_token,
                  QWEN35_N_EMBD) != 0;
     }
+    QWEN35_PROFILE_FFN_BATCH_STAGE("shared_gate_apply");
     if (ok && io_ticket.generation != 0) {
         if (activity) {
             activity(activity_ud, "shared_done",
@@ -17088,6 +17165,7 @@ static bool qwen35_gpu_encode_ffn_batch(
             ds4_gpu_internal_qwen35_resident_route_stats_add(n_token);
         }
     }
+    QWEN35_PROFILE_FFN_BATCH_STAGE("routed_moe");
     if (io_ticket.generation != 0 && !ok) {
         (void)ds4_gpu_qwen35_stream_batch_abort(io_ticket.generation);
     }
@@ -17103,6 +17181,7 @@ static bool qwen35_gpu_encode_ffn_batch(
                  graph->batch_shared_out,
                  hidden_values) != 0;
     }
+    QWEN35_PROFILE_FFN_BATCH_STAGE("expert_sum");
     if (ok) {
         ok = ds4_gpu_add_tensor(
                  hidden,
@@ -17110,10 +17189,12 @@ static bool qwen35_gpu_encode_ffn_batch(
                  graph->batch_attn_out,
                  hidden_values) != 0;
     }
+    QWEN35_PROFILE_FFN_BATCH_STAGE("residual");
     if (ok && io_ticket.generation != 0 && activity) {
         activity(activity_ud, "reduce_done",
                  (int)layer_index + 1, QWEN35_N_LAYER);
     }
+#undef QWEN35_PROFILE_FFN_BATCH_STAGE
     return ok;
 }
 
@@ -17213,6 +17294,14 @@ static DS4_MAYBE_UNUSED bool qwen35_gpu_forward_prefill_chunk(
          layer_index++) {
         const ds4_qwen35_layer_weights *layer =
             &weights->layer[layer_index];
+        const bool stage_profile =
+            qwen35_gpu_prefill_stage_profile_enabled(layer_index);
+        double stage_t0 = stage_profile ? now_sec() : 0.0;
+        if (stage_profile) {
+            ok = qwen35_gpu_prefill_stage_profile_boundary(
+                "prior", layer_index, n_token, &stage_t0);
+            if (!ok) failed_stage = "prefill profile prior";
+        }
         if (ds4_qwen35_layer_is_full_attention(layer_index)) {
             ok = qwen35_gpu_encode_full_attention_batch(
                 graph, model, layer, current, graph->batch_positions,
@@ -17226,6 +17315,13 @@ static DS4_MAYBE_UNUSED bool qwen35_gpu_forward_prefill_chunk(
                 layer_index, n_token, &state_mutated);
             if (!ok) failed_stage = "batched Gated DeltaNet";
         }
+        if (ok && stage_profile) {
+            ok = qwen35_gpu_prefill_stage_profile_boundary(
+                ds4_qwen35_layer_is_full_attention(layer_index)
+                    ? "attention" : "gated_delta",
+                layer_index, n_token, &stage_t0);
+            if (!ok) failed_stage = "prefill profile attention";
+        }
         if (ok) {
             ok = ds4_gpu_add_tensor(
                      next,
@@ -17234,12 +17330,22 @@ static DS4_MAYBE_UNUSED bool qwen35_gpu_forward_prefill_chunk(
                      n_token * QWEN35_N_EMBD) != 0;
             if (!ok) failed_stage = "batched attention residual";
         }
+        if (ok && stage_profile) {
+            ok = qwen35_gpu_prefill_stage_profile_boundary(
+                "attention_residual", layer_index, n_token, &stage_t0);
+            if (!ok) failed_stage = "prefill profile attention residual";
+        }
         if (ok) {
             ok = qwen35_gpu_encode_ffn_batch(
                 graph, model, layer, next, layer_index, n_token,
                 io_overlap, expert_group, expert_group_min_tokens,
                 activity, activity_ud);
             if (!ok) failed_stage = "batched FFN";
+        }
+        if (ok && stage_profile) {
+            ok = qwen35_gpu_prefill_stage_profile_boundary(
+                "ffn", layer_index, n_token, &stage_t0);
+            if (!ok) failed_stage = "prefill profile FFN";
         }
         if (ok) {
             ds4_gpu_tensor *swap = current;
@@ -17338,8 +17444,8 @@ static bool qwen35_gpu_macro_restore(
 }
 
 /* Process a complete macro tile layer-by-layer while retaining the proven
- * 64-row causal kernels as micro-operations.  Only hidden rows scale with the
- * macro width; router/MoE/attention scratch remains fixed at 64 rows. */
+ * bounded causal kernels as micro-operations. Only hidden rows scale with the
+ * macro width; router/MoE/attention scratch remains fixed at micro width. */
 static DS4_MAYBE_UNUSED bool qwen35_gpu_forward_prefill_macro(
         float                     *logits,
         const ds4_model           *model,
@@ -17391,10 +17497,10 @@ static DS4_MAYBE_UNUSED bool qwen35_gpu_forward_prefill_macro(
         ok = ds4_gpu_begin_commands() != 0;
     }
     for (uint32_t chunk = 0; ok && chunk < workspace.n_chunk; chunk++) {
-        const uint32_t first = chunk * QWEN35_GPU_PREFILL_CAP;
+        const uint32_t first = chunk * QWEN35_PREFILL_MICRO_TOKENS;
         const uint32_t remaining = n_token - first;
-        const uint32_t rows = remaining > QWEN35_GPU_PREFILL_CAP
-            ? QWEN35_GPU_PREFILL_CAP : remaining;
+        const uint32_t rows = remaining > QWEN35_PREFILL_MICRO_TOKENS
+            ? QWEN35_PREFILL_MICRO_TOKENS : remaining;
         failed_stage = "batched embedding";
         ok = ds4_gpu_qwen35_dequant_embedding_q8_0_batch_tensor(
                  workspace.hidden_view[0][chunk],
@@ -17451,10 +17557,10 @@ static DS4_MAYBE_UNUSED bool qwen35_gpu_forward_prefill_macro(
                 ok = false;
                 break;
             }
-            const uint32_t first = chunk * QWEN35_GPU_PREFILL_CAP;
+            const uint32_t first = chunk * QWEN35_PREFILL_MICRO_TOKENS;
             const uint32_t remaining = n_token - first;
-            const uint32_t rows = remaining > QWEN35_GPU_PREFILL_CAP
-                ? QWEN35_GPU_PREFILL_CAP : remaining;
+            const uint32_t rows = remaining > QWEN35_PREFILL_MICRO_TOKENS
+                ? QWEN35_PREFILL_MICRO_TOKENS : remaining;
             ds4_gpu_tensor *current =
                 workspace.hidden_view[current_plane][chunk];
             ds4_gpu_tensor *next =
@@ -17665,7 +17771,7 @@ static bool qwen35_gpu_verify_prompt_suffix_exact(
             graph, &workspace.macro, false);
     }
     /* Build one-row hidden views.  They are deliberately local to the exact
-     * verifier: the macro scheduler's 64-row views have a different causal
+     * verifier: the macro scheduler's micro views have a different causal
      * contract and cannot be passed to one-token kernels. */
     ds4_gpu_tensor *hidden_row[2][QWEN35_PROMPT_LOOKUP_MAX_DRAFT] = {{0}};
     const uint64_t hidden_row_bytes =
@@ -29856,7 +29962,10 @@ static bool qwen35_runtime_features_finalize(ds4_engine *e) {
         if (e->residency == DS4_RESIDENCY_SSD && e->ssd_streaming) {
             f->expected = QWEN35_FEATURE_ALL_EXACT;
             if (e->qwen35_macro_tokens <= QWEN35_PREFILL_MICRO_TOKENS) {
-                f->implemented &= ~QWEN35_FEATURE_MACRO_PREFILL;
+                /* A request that fits the optimized SSD micro-batch has no
+                 * macro tile to schedule. Keep the implementation visible,
+                 * but do not make an inapplicable phase a strict-run gate. */
+                f->expected &= ~QWEN35_FEATURE_MACRO_PREFILL;
             }
 #if defined(__APPLE__) && !defined(DS4_NO_GPU)
             if ((f->ablated & QWEN35_FEATURE_EXPERT_PACK) == 0 &&
@@ -38078,7 +38187,7 @@ static bool ds4_engine_context_memory_estimate_private(
                  QWEN35_N_HEAD_KV * QWEN35_N_HEAD_DIM * sizeof(float) *
                  (uint32_t)ctx_size) - QWEN35_RECURRENT_SNAPSHOT_BYTES,
             .total_bytes = persistent_bytes,
-            .prefill_cap = QWEN35_PREFILL_MICRO_TOKENS,
+            .prefill_cap = QWEN35_RESIDENT_PREFILL_TOKENS,
             .raw_cap = (uint32_t)ctx_size,
         };
         return true;
@@ -38797,6 +38906,15 @@ static bool ds4_engine_install_expert_store_v2(ds4_engine *e) {
         ds4_expert_store_close(store);
         return false;
     }
+    if (is_qwen &&
+        (manifest->storage_format !=
+             DS4_EXPERT_STORE_STORAGE_MLX_AFFINE4 ||
+         manifest->group_size != 64u)) {
+        fprintf(stderr,
+                "ds4: Qwen requires ExpertMajor v2 MLX affine4/group-64 payload; legacy GGML expert payloads are not supported\n");
+        ds4_expert_store_close(store);
+        return false;
+    }
 
     ds4_gpu_expert_store_layer_v2 gpu_layers[DS4_MAX_LAYER];
     memset(gpu_layers, 0, sizeof(gpu_layers));
@@ -38880,7 +38998,8 @@ static bool ds4_engine_install_expert_store_v2(ds4_engine *e) {
     }
     if (!ds4_gpu_expert_store_v2_install(
             ds4_expert_store_fd(store), e->model.size,
-            manifest->layer_count, manifest->expert_count, gpu_layers)) {
+            manifest->layer_count, manifest->expert_count,
+            manifest->storage_format, manifest->group_size, gpu_layers)) {
         fprintf(stderr,
                 "ds4: Metal rejected the native %s expert-store manifest\n",
                 family_name);
@@ -38921,9 +39040,14 @@ static bool ds4_engine_install_expert_store_v2(ds4_engine *e) {
     }
     e->expert_store_v2 = store;
     e->expert_store_v2_ready = true;
+    const char *storage_name =
+        manifest->storage_format == DS4_EXPERT_STORE_STORAGE_MLX_AFFINE4
+            ? "mlx-affine4-g64"
+            : "ggml-block";
     fprintf(stderr,
-            "ds4: %s embedded expert-major store active: v%u, %u routed layers x %u experts, %.2f GiB payload, %s mode\n",
-            family_name, manifest->version, manifest->layer_count,
+            "ds4: %s embedded expert-major store active: v%u/%s, %u routed layers x %u experts, %.2f GiB payload, %s mode\n",
+            family_name, manifest->version, storage_name,
+            manifest->layer_count,
             manifest->expert_count,
             (double)manifest->data_size / 1073741824.0,
             e->ssd_streaming ? "SSD" : "resident");
@@ -39203,6 +39327,7 @@ static bool ds4_engine_configure_qwen35_metal_resident(
     e->metal_ready = true;
     e->ssd_streaming_cache_experts = 0;
     e->ssd_streaming_cache_bytes = 0;
+    e->qwen35_macro_tokens = 0;
     ds4_gpu_set_quality(false);
     ds4_gpu_set_glm_model(false);
     ds4_gpu_set_ssd_streaming(false);
@@ -39273,10 +39398,11 @@ static bool ds4_engine_configure_qwen35_metal_resident(
     fprintf(stderr,
             "ds4: Qwen Metal resident runtime: mapped %.2f GiB "
             "of %s tensor data; SSD expert cache disabled; exact decode "
-            "workspace %.2f MiB reserved\n",
+            "workspace %.2f MiB reserved; resident prefill cap %u tokens\n",
             (double)resident_weight_bytes / 1073741824.0,
             "ExpertMajor v2",
-            (double)e->qwen35_decode_workspace_bytes / 1048576.0);
+            (double)e->qwen35_decode_workspace_bytes / 1048576.0,
+            QWEN35_RESIDENT_PREFILL_TOKENS);
     qwen35_telemetry_emit(
         e, "memory_plan",
         "\"residency\":\"resident\",\"runtime_bytes\":%" PRIu64
@@ -40262,9 +40388,14 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
     s->ctx_size = ctx_size;
 #if defined(__APPLE__)
     if (qwen35) {
-        s->prefill_cap = 1u;
+        const uint32_t qwen_prefill_cap =
+            e->residency == DS4_RESIDENCY_SSD
+                ? QWEN35_PREFILL_MICRO_TOKENS
+                : QWEN35_RESIDENT_PREFILL_TOKENS;
+        s->prefill_cap = qwen_prefill_cap;
         if (!qwen35_gpu_graph_alloc(
-                &s->qwen35_gpu_graph, (uint32_t)ctx_size)) {
+                &s->qwen35_gpu_graph, (uint32_t)ctx_size,
+                qwen_prefill_cap)) {
             fprintf(stderr,
                     "ds4: failed to allocate Qwen Metal graph for context %d\n",
                     ctx_size);
@@ -40732,7 +40863,7 @@ static bool ds4_session_qwen35_metal_prefill_chunk_commit(
         uint32_t     n_token,
         float       *logits) {
     if (!ds4_session_is_qwen35_metal(s) || !tokens || n_token == 0 ||
-        n_token > QWEN35_GPU_PREFILL_CAP ||
+        n_token > s->qwen35_gpu_graph.prefill_cap ||
         !ds4_session_qwen35_timeline_valid(s)) {
         return false;
     }
@@ -40930,7 +41061,8 @@ bool ds4_internal_qwen35_macro_transaction_rollback_test(void) {
     session->ctx_size = 4;
     session->logits = malloc((size_t)logits_bytes);
     if (!session->logits ||
-        !qwen35_gpu_graph_alloc(&session->qwen35_gpu_graph, 4u) ||
+        !qwen35_gpu_graph_alloc(&session->qwen35_gpu_graph, 4u,
+                                QWEN35_PREFILL_MICRO_TOKENS) ||
         !qwen35_gpu_spec_workspace_alloc(
             &session->qwen35_spec_workspace, 1u)) {
         ok = false;
@@ -41244,7 +41376,7 @@ static int ds4_session_sync_qwen35_metal(
         return 1;
     }
     const bool macro_prefill =
-        s->engine->ssd_streaming && long_prefill &&
+        long_prefill &&
         (s->engine->qwen35_features.enabled &
          QWEN35_FEATURE_MACRO_PREFILL) != 0 &&
         s->engine->qwen35_macro_tokens > QWEN35_PREFILL_MICRO_TOKENS &&
@@ -41295,7 +41427,8 @@ static int ds4_session_sync_qwen35_metal(
                     ? s->engine->qwen35_macro_tokens : remaining;
             const bool final_tile = i + (int)n_token == prompt->len;
             bool cancelled = false;
-            const bool committed = n_token <= QWEN35_GPU_PREFILL_CAP
+            const bool committed =
+                n_token <= s->qwen35_gpu_graph.prefill_cap
                 ? ds4_session_qwen35_metal_prefill_chunk_commit(
                     s, &prompt->v[i], n_token,
                     final_tile ? s->logits : NULL)
@@ -41406,8 +41539,9 @@ static int ds4_session_sync_qwen35_metal(
             }
 
             const uint32_t remaining = (uint32_t)(prompt->len - i);
-            const uint32_t n_token = remaining > QWEN35_GPU_PREFILL_CAP ?
-                QWEN35_GPU_PREFILL_CAP : remaining;
+            const uint32_t n_token =
+                remaining > s->qwen35_gpu_graph.prefill_cap
+                    ? s->qwen35_gpu_graph.prefill_cap : remaining;
             const bool final_chunk = i + (int)n_token == prompt->len;
             const bool committed = n_token == 1u ?
                 ds4_session_qwen35_metal_forward_commit(
@@ -41451,7 +41585,7 @@ static int ds4_session_sync_qwen35_metal(
                     batch_ssd_prefill ? "SSD" : "resident",
                     batched_tokens,
                     chunks,
-                    QWEN35_GPU_PREFILL_CAP);
+                    s->qwen35_gpu_graph.prefill_cap);
         }
         const int finish = s->engine->ssd_streaming
             ? ds4_session_qwen35_metal_finish_prefill_cache(

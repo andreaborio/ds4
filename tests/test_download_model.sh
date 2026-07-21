@@ -62,8 +62,6 @@ assert_exact_line 'RUNTIME_DEEPSEEK_BYTES=86720114272'
 assert_exact_line 'RUNTIME_DEEPSEEK_SHA256="8378080263eb9224f7228d72e2afa4ac3cf74a116023fdec2c596ff228a33e3f"'
 assert_exact_line 'RUNTIME_GLM_BYTES=262147193504'
 assert_exact_line 'RUNTIME_GLM_SHA256="7f5017e3076e706c78f2a5322b035a9e2f6519c65ff5b6be8b2d91aeff61505d"'
-assert_exact_line 'RUNTIME_QWEN_BYTES=20808566880'
-assert_exact_line 'RUNTIME_QWEN_SHA256="d7c43a6388ec20e6fe5530850350f96fdb0ac37c5ce36d3e5f92b172c447f56b"'
 assert_case_assignment deepseek-v2 'MODEL_REPO=$RUNTIME_DEEPSEEK_REPO'
 assert_case_assignment deepseek-v2 'MODEL_FILE=$RUNTIME_DEEPSEEK_FILE'
 assert_case_assignment deepseek-v2 'MODEL_BYTES=$RUNTIME_DEEPSEEK_BYTES'
@@ -72,10 +70,6 @@ assert_case_assignment glm-v2 'MODEL_REPO=$RUNTIME_GLM_REPO'
 assert_case_assignment glm-v2 'MODEL_FILE=$RUNTIME_GLM_FILE'
 assert_case_assignment glm-v2 'MODEL_BYTES=$RUNTIME_GLM_BYTES'
 assert_case_assignment glm-v2 'MODEL_SHA256=$RUNTIME_GLM_SHA256'
-assert_case_assignment qwen-v2 'MODEL_REPO=$RUNTIME_QWEN_REPO'
-assert_case_assignment qwen-v2 'MODEL_FILE=$RUNTIME_QWEN_FILE'
-assert_case_assignment qwen-v2 'MODEL_BYTES=$RUNTIME_QWEN_BYTES'
-assert_case_assignment qwen-v2 'MODEL_SHA256=$RUNTIME_QWEN_SHA256'
 sh -n "$SCRIPT" || fail "download_model.sh has invalid shell syntax"
 
 # Exercise the real downloader logic without a production identity override.
@@ -90,8 +84,6 @@ sed \
     -e "s/^RUNTIME_DEEPSEEK_SHA256=.*/RUNTIME_DEEPSEEK_SHA256=\"$FIXTURE_SHA256\"/" \
     -e "s/^RUNTIME_GLM_BYTES=.*/RUNTIME_GLM_BYTES=$FIXTURE_BYTES/" \
     -e "s/^RUNTIME_GLM_SHA256=.*/RUNTIME_GLM_SHA256=\"$FIXTURE_SHA256\"/" \
-    -e "s/^RUNTIME_QWEN_BYTES=.*/RUNTIME_QWEN_BYTES=$FIXTURE_BYTES/" \
-    -e "s/^RUNTIME_QWEN_SHA256=.*/RUNTIME_QWEN_SHA256=\"$FIXTURE_SHA256\"/" \
     "$SCRIPT" >"$TEST_SCRIPT"
 chmod +x "$TEST_SCRIPT"
 
@@ -181,10 +173,11 @@ run_runtime_success \
     glm-v2 \
     andreaborio/GLM-5.2-DS4-GGUF \
     GLM-5.2-DS4-ExpertMajor-v2-Q2_K.gguf
-run_runtime_success \
-    qwen-v2 \
-    andreaborio/Qwen3.6-35B-A3B-DS4-GGUF \
-    Qwen3.6-35B-A3B-DS4-ExpertMajor-v2-Q4_K_S.gguf
+
+run_expect_failure "$TMP_ROOT/qwen-unpublished.stdout" "$TMP_ROOT/qwen-unpublished.stderr" \
+    "$TEST_SCRIPT" qwen-v2
+assert_contains "$TMP_ROOT/qwen-unpublished.stderr" \
+    'Qwen now requires the ExpertMajor v2 MLX affine4/group-64 artifact'
 
 CORRUPT_DIR="$TMP_ROOT/corrupt-existing"
 CORRUPT_FILE="$CORRUPT_DIR/GLM-5.2-DS4-ExpertMajor-v2-Q2_K.gguf"
@@ -199,7 +192,7 @@ assert_contains "$TMP_ROOT/corrupt.stderr" 'Runtime artifact byte size mismatch'
 [ ! -s "$FAKE_HF_LOG" ] || fail "corrupt existing file triggered a download"
 
 WRONG_HASH_DIR="$TMP_ROOT/wrong-hash-existing"
-WRONG_HASH_FILE="$WRONG_HASH_DIR/Qwen3.6-35B-A3B-DS4-ExpertMajor-v2-Q4_K_S.gguf"
+WRONG_HASH_FILE="$WRONG_HASH_DIR/DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix-DS4-ExpertMajor-v2.gguf"
 mkdir -p "$WRONG_HASH_DIR"
 printf '%s' 'qualified-runtime-fixturE' >"$WRONG_HASH_FILE"
 [ "$(wc -c <"$WRONG_HASH_FILE" | tr -d '[:space:]')" = "$FIXTURE_BYTES" ] ||
@@ -208,7 +201,7 @@ printf '%s' 'qualified-runtime-fixturE' >"$WRONG_HASH_FILE"
 run_expect_failure "$TMP_ROOT/wrong-hash.stdout" "$TMP_ROOT/wrong-hash.stderr" \
     env PATH="$FAKE_BIN:$PATH" FAKE_HF_LOG="$FAKE_HF_LOG" \
     FAKE_HF_FAIL_IF_CALLED=1 DS4_GGUF_DIR="$WRONG_HASH_DIR" \
-    "$TEST_SCRIPT" qwen-v2
+    "$TEST_SCRIPT" deepseek-v2
 assert_contains "$TMP_ROOT/wrong-hash.stderr" 'Runtime artifact SHA-256 mismatch'
 [ ! -s "$FAKE_HF_LOG" ] || fail "wrong-hash existing file triggered a download"
 

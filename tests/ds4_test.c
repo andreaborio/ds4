@@ -769,7 +769,7 @@ static void test_metal_qwen35_graph_state(void) {
     const uint32_t prefill_cap = ds4_internal_qwen35_gpu_prefill_cap();
     TEST_ASSERT(QWEN35_N_EXPERT_USED == 8);
     TEST_ASSERT(moe_split_width == 4);
-    TEST_ASSERT(prefill_cap == 64);
+    TEST_ASSERT(prefill_cap == 8192);
     const size_t graph_size = ds4_internal_qwen35_gpu_graph_size();
     TEST_ASSERT(graph_size > 0);
     if (graph_size == 0) return;

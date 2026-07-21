@@ -10,8 +10,10 @@ DS4 reconstructs the canonical logical tensor inventory at load time.
 from __future__ import annotations
 
 import argparse
+import ctypes
 import dataclasses
 import hashlib
+import json
 import os
 import re
 import shutil
@@ -28,6 +30,8 @@ STORE_VERSION = 2
 STORE_FAMILY_DEEPSEEK4 = 1
 STORE_FAMILY_GLM_DSA = 2
 STORE_FAMILY_QWEN35_MOE = 3
+STORE_STORAGE_GGML = 0
+STORE_STORAGE_MLX_AFFINE4 = 1
 STORE_FAMILIES = {
     STORE_FAMILY_DEEPSEEK4,
     STORE_FAMILY_GLM_DSA,
@@ -220,6 +224,8 @@ class Layer:
 class StorePlan:
     source: GGUF
     family: int
+    storage_format: int
+    group_size: int
     layer_count: int
     expert_count: int
     expert_used_count: int
@@ -229,6 +235,81 @@ class StorePlan:
     data_size: int
     store_size: int
     layers: list[Layer]
+
+
+@dataclasses.dataclass
+class SafeTensorShard:
+    path: Path
+    fd: int
+    data_offset: int
+    tensors: dict[str, dict[str, object]]
+
+
+class MLXAffineSource:
+    """Minimal mmap-free reader for the routed MLX safetensor slices."""
+
+    def __init__(self, model_dir: Path):
+        self.model_dir = model_dir.resolve()
+        index_path = self.model_dir / "model.safetensors.index.json"
+        try:
+            index = json.loads(index_path.read_text(encoding="utf-8"))
+            self.weight_map = dict(index["weight_map"])
+        except (OSError, KeyError, TypeError, json.JSONDecodeError) as exc:
+            raise FormatError(f"invalid MLX safetensor index: {exc}") from exc
+        self.shards: dict[str, SafeTensorShard] = {}
+
+    def close(self) -> None:
+        for shard in self.shards.values():
+            os.close(shard.fd)
+        self.shards.clear()
+
+    def _shard(self, name: str) -> SafeTensorShard:
+        cached = self.shards.get(name)
+        if cached is not None:
+            return cached
+        path = (self.model_dir / name).resolve()
+        fd = os.open(path, os.O_RDONLY)
+        try:
+            header_bytes = struct.unpack("<Q", pread_exact(fd, 8, 0))[0]
+            if header_bytes <= 0 or header_bytes > 1 << 30:
+                raise FormatError(f"invalid safetensor header size in {path}")
+            tensors = json.loads(
+                pread_exact(fd, header_bytes, 8).decode("utf-8")
+            )
+        except BaseException:
+            os.close(fd)
+            raise
+        shard = SafeTensorShard(path, fd, 8 + header_bytes, tensors)
+        self.shards[name] = shard
+        return shard
+
+    def tensor(self, key: str, dtype: str,
+               shape: tuple[int, ...]) -> tuple[SafeTensorShard, int, int]:
+        shard_name = self.weight_map.get(key)
+        if not isinstance(shard_name, str):
+            raise FormatError(f"MLX tensor is missing: {key}")
+        shard = self._shard(shard_name)
+        entry = shard.tensors.get(key)
+        if not isinstance(entry, dict) or entry.get("dtype") != dtype or \
+                tuple(entry.get("shape", ())) != shape:
+            raise FormatError(
+                f"MLX tensor geometry differs for {key}: {entry}"
+            )
+        offsets = entry.get("data_offsets")
+        if not isinstance(offsets, list) or len(offsets) != 2 or \
+                not all(isinstance(value, int) for value in offsets) or \
+                offsets[0] < 0 or offsets[1] < offsets[0]:
+            raise FormatError(f"invalid safetensor offsets for {key}")
+        return shard, shard.data_offset + offsets[0], offsets[1] - offsets[0]
+
+    def expert_bytes(self, key: str, dtype: str,
+                     shape: tuple[int, ...], expert: int) -> bytes:
+        shard, offset, size = self.tensor(key, dtype, shape)
+        experts = shape[0]
+        if expert < 0 or expert >= experts or size % experts:
+            raise FormatError(f"invalid expert slice for {key}")
+        stride = size // experts
+        return pread_exact(shard.fd, stride, offset + expert * stride)
 
 
 def tensor_nbytes(ggml_type: int, dims: tuple[int, ...]) -> int:
@@ -421,6 +502,8 @@ def make_store_plan(source: GGUF) -> StorePlan:
     return StorePlan(
         source=source,
         family=family,
+        storage_format=STORE_STORAGE_GGML,
+        group_size=0,
         layer_count=layer_count,
         expert_count=expert_count,
         expert_used_count=expert_used_count,
@@ -466,6 +549,8 @@ def make_header(plan: StorePlan, source_digest: bytes, payload_digest: bytes,
     struct.pack_into("<Q", header, 88, plan.source.size)
     header[96:128] = source_digest
     header[128:160] = payload_digest
+    struct.pack_into("<II", header, 160,
+                     plan.storage_format, plan.group_size)
     header[168:200] = manifest_digest
     return bytes(header)
 
@@ -693,6 +778,12 @@ def parse_store(native: GGUF, tensor: Tensor) -> tuple[dict[str, object], list[L
          expert_count, source_tensors, descriptor_count, descriptor_bytes,
          descriptor_offset, data_offset, data_size, store_size) = values
         source_size = struct.unpack_from("<Q", header, 88)[0]
+        storage_format, group_size = struct.unpack_from("<II", header, 160)
+        storage_valid = (
+            (storage_format == STORE_STORAGE_GGML and group_size == 0) or
+            (storage_format == STORE_STORAGE_MLX_AFFINE4 and
+             group_size == 64 and family == STORE_FAMILY_QWEN35_MOE)
+        )
         if (version != STORE_VERSION or header_bytes != STORE_HEADER_BYTES or
                 family not in STORE_FAMILIES or
                 not 1 <= layer_count <= STORE_MAX_ROUTED_LAYERS or
@@ -703,7 +794,7 @@ def parse_store(native: GGUF, tensor: Tensor) -> tuple[dict[str, object], list[L
                 descriptor_bytes != layer_count * STORE_LAYER_BYTES or
                 descriptor_offset != STORE_HEADER_BYTES or
                 data_offset % STORE_ALIGNMENT or data_offset + data_size != store_size or
-                store_size != tensor.size or any(header[160:168]) or
+                store_size != tensor.size or not storage_valid or
                 any(header[200:])):
             raise FormatError("invalid expert-store header")
         descriptors = pread_exact(file.fileno(), descriptor_bytes,
@@ -727,6 +818,8 @@ def parse_store(native: GGUF, tensor: Tensor) -> tuple[dict[str, object], list[L
                 "<IIIIQQQQQ", entry, offset
             )
             if (entry_role != role or ndim != 3 or ggml_type not in ROUTED_TYPES or
+                    (storage_format == STORE_STORAGE_MLX_AFFINE4 and
+                     ggml_type != 12) or
                     TYPE_LAYOUT[ggml_type][0] != block_elements or
                     d2 != expert_count or record_offset != record_cursor):
                 raise FormatError(f"invalid component descriptor at layer {il} role {role}")
@@ -757,6 +850,7 @@ def parse_store(native: GGUF, tensor: Tensor) -> tuple[dict[str, object], list[L
         raise FormatError("expert descriptors do not cover the complete payload")
     manifest = {
         "header": header, "version": version, "family": family,
+        "storage_format": storage_format, "group_size": group_size,
         "expert_used": expert_used, "layer_count": layer_count,
         "expert_count": expert_count, "source_tensors": source_tensors,
         "source_size": source_size, "data_offset": data_offset,
@@ -780,6 +874,8 @@ def verify(source_path: Path, native_path: Path) -> None:
     store = stores[0]
     manifest, layers = parse_store(native, store)
     if (manifest["family"] != plan.family or
+            manifest["storage_format"] != plan.storage_format or
+            manifest["group_size"] != plan.group_size or
             manifest["layer_count"] != plan.layer_count or
             manifest["expert_count"] != plan.expert_count or
             manifest["expert_used"] != plan.expert_used_count or
@@ -859,6 +955,198 @@ def verify(source_path: Path, native_path: Path) -> None:
     print(f"payload_sha256: {bytes(manifest['payload_sha256']).hex()}")
 
 
+def clone_file(source: Path, destination: Path) -> None:
+    """Create an APFS copy-on-write clone without temporarily duplicating 20GB."""
+    libc = ctypes.CDLL(None, use_errno=True)
+    clone = getattr(libc, "clonefile", None)
+    if clone is None:
+        raise FormatError("clonefile is unavailable; MLX repack requires macOS/APFS")
+    clone.argtypes = (ctypes.c_char_p, ctypes.c_char_p, ctypes.c_int)
+    clone.restype = ctypes.c_int
+    if clone(os.fsencode(source), os.fsencode(destination), 0) != 0:
+        error = ctypes.get_errno()
+        raise OSError(error, os.strerror(error), destination)
+
+
+def mlx_affine_component(
+        mlx: MLXAffineSource,
+        layer: int,
+        expert: int,
+        role: str,
+        input_dim: int,
+        output_dim: int) -> bytes:
+    """Interleave one MLX affine4 matrix into 36-byte group-64 blocks."""
+    try:
+        import numpy as np
+    except ImportError as exc:
+        raise FormatError("numpy is required for MLX affine repacking") from exc
+
+    if input_dim % 64:
+        raise FormatError(f"MLX affine input width is not group-64: {input_dim}")
+    groups = input_dim // 64
+    prefix = (
+        f"language_model.model.layers.{layer}.mlp.switch_mlp."
+        f"{role}"
+    )
+    weights = mlx.expert_bytes(
+        prefix + ".weight", "U32",
+        (256, output_dim, input_dim // 8), expert,
+    )
+    scales = mlx.expert_bytes(
+        prefix + ".scales", "BF16",
+        (256, output_dim, groups), expert,
+    )
+    biases = mlx.expert_bytes(
+        prefix + ".biases", "BF16",
+        (256, output_dim, groups), expert,
+    )
+    expected_weights = output_dim * groups * 32
+    expected_controls = output_dim * groups * 2
+    if len(weights) != expected_weights or len(scales) != expected_controls or \
+            len(biases) != expected_controls:
+        raise FormatError(f"MLX affine byte geometry differs for {prefix}")
+
+    packed = np.empty((output_dim, groups, 36), dtype=np.uint8)
+    packed[:, :, :32] = np.frombuffer(weights, dtype=np.uint8).reshape(
+        output_dim, groups, 32
+    )
+    packed[:, :, 32:34] = np.frombuffer(scales, dtype=np.uint8).reshape(
+        output_dim, groups, 2
+    )
+    packed[:, :, 34:36] = np.frombuffer(biases, dtype=np.uint8).reshape(
+        output_dim, groups, 2
+    )
+    return packed.tobytes()
+
+
+def repack_mlx_affine(native_path: Path, mlx_dir: Path,
+                      destination: Path, reserve: int) -> None:
+    """Replace a Qwen v2 Q4_K payload with same-size MLX affine4 records."""
+    native = load_gguf(native_path)
+    stores = [tensor for tensor in native.tensors if tensor.name == STORE_TENSOR]
+    if len(stores) != 1:
+        raise FormatError("input must contain exactly one ExpertMajor v2 store")
+    store_tensor = stores[0]
+    manifest, layers = parse_store(native, store_tensor)
+    if (manifest["family"] != STORE_FAMILY_QWEN35_MOE or
+            manifest["storage_format"] != STORE_STORAGE_GGML or
+            manifest["group_size"] != 0 or len(layers) != 40 or
+            manifest["expert_count"] != 256 or
+            any(component.tensor.ggml_type != 12
+                for layer in layers for component in layer.components)):
+        raise FormatError(
+            "MLX affine repack needs a 40x256 Qwen Q4_K ExpertMajor v2 input"
+        )
+
+    destination = destination.resolve()
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    if destination.exists():
+        raise FormatError(f"destination already exists: {destination}")
+    if shutil.disk_usage(destination.parent).free < reserve:
+        raise FormatError(f"insufficient reserve space: need {reserve} bytes")
+    temp = destination.with_name(f".{destination.name}.tmp.{os.getpid()}")
+    if temp.exists():
+        raise FormatError(f"temporary path already exists: {temp}")
+
+    mlx = MLXAffineSource(mlx_dir)
+    output_fd = -1
+    try:
+        clone_file(native.path, temp)
+        os.chmod(temp, 0o644)
+        output_fd = os.open(temp, os.O_RDWR)
+        store_abs = store_tensor.abs_offset
+        payload_hash = hashlib.sha256()
+        cursor = int(manifest["data_offset"])
+        role_specs = (
+            ("gate_proj", 2048, 512),
+            ("up_proj", 2048, 512),
+            ("down_proj", 512, 2048),
+        )
+        for ordinal, layer in enumerate(layers, 1):
+            if layer.data_offset > cursor:
+                gap = pread_exact(
+                    output_fd, layer.data_offset - cursor,
+                    store_abs + cursor,
+                )
+                if any(gap):
+                    raise FormatError(
+                        f"non-zero store padding before layer {layer.index}"
+                    )
+                payload_hash.update(gap)
+            for expert in range(256):
+                for component, (role, input_dim, output_dim) in zip(
+                        layer.components, role_specs):
+                    packed = mlx_affine_component(
+                        mlx, layer.index, expert, role,
+                        input_dim, output_dim,
+                    )
+                    if len(packed) != component.expert_bytes:
+                        raise FormatError(
+                            f"affine record size differs at layer {layer.index} "
+                            f"expert {expert} role {role}"
+                        )
+                    offset = (
+                        store_abs + layer.data_offset +
+                        expert * layer.record_bytes +
+                        component.record_offset
+                    )
+                    pwrite_all(output_fd, packed, offset)
+                    payload_hash.update(packed)
+            cursor = layer.data_offset + layer.data_size
+            print(
+                f"\rwrite MLX affine ExpertMajor layers {ordinal}/{len(layers)}",
+                end="", file=sys.stderr, flush=True,
+            )
+        print(file=sys.stderr)
+        if cursor != int(manifest["store_size"]):
+            raise FormatError("affine repack did not cover the complete store")
+
+        descriptors = pread_exact(
+            output_fd, int(manifest["layer_count"]) * STORE_LAYER_BYTES,
+            store_abs + STORE_HEADER_BYTES,
+        )
+        header = bytearray(manifest["header"])
+        header[128:160] = payload_hash.digest()
+        struct.pack_into(
+            "<II", header, 160,
+            STORE_STORAGE_MLX_AFFINE4, 64,
+        )
+        header[168:200] = bytes(32)
+        header[168:200] = manifest_digest(bytes(header), descriptors)
+        pwrite_all(output_fd, bytes(header), store_abs)
+        os.fsync(output_fd)
+        os.close(output_fd)
+        output_fd = -1
+
+        repacked = load_gguf(temp)
+        repacked_store = next(
+            tensor for tensor in repacked.tensors
+            if tensor.name == STORE_TENSOR
+        )
+        repacked_manifest, _ = parse_store(repacked, repacked_store)
+        if (repacked_manifest["storage_format"] !=
+                STORE_STORAGE_MLX_AFFINE4 or
+                repacked_manifest["group_size"] != 64 or
+                repacked_manifest["payload_sha256"] != payload_hash.digest()):
+            raise FormatError("repacked affine manifest did not validate")
+        os.replace(temp, destination)
+        directory_fd = os.open(destination.parent, os.O_RDONLY)
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+    except BaseException:
+        if output_fd >= 0:
+            os.close(output_fd)
+        temp.unlink(missing_ok=True)
+        raise
+    finally:
+        mlx.close()
+    print(f"installed atomically: {destination}")
+    print("storage: mlx-affine4-g64")
+    print(f"payload_sha256: {payload_hash.hexdigest()}")
+
+
 def inspect(path: Path) -> None:
     source = load_gguf(path)
     plan = make_store_plan(source)
@@ -905,6 +1193,15 @@ def main() -> int:
     verify_parser = subparsers.add_parser("verify")
     verify_parser.add_argument("source", type=Path)
     verify_parser.add_argument("native", type=Path)
+    affine_parser = subparsers.add_parser(
+        "repack-mlx-affine",
+        help="replace Qwen Q4_K expert records with local MLX affine4 groups",
+    )
+    affine_parser.add_argument("--reserve-bytes", type=parse_bytes,
+                               default=1 << 30)
+    affine_parser.add_argument("native", type=Path)
+    affine_parser.add_argument("mlx_model", type=Path)
+    affine_parser.add_argument("destination", type=Path)
     args = parser.parse_args()
     try:
         if args.command == "inspect":
@@ -914,6 +1211,11 @@ def main() -> int:
                   not args.skip_verify)
         elif args.command == "verify":
             verify(args.source, args.native)
+        elif args.command == "repack-mlx-affine":
+            repack_mlx_affine(
+                args.native, args.mlx_model, args.destination,
+                args.reserve_bytes,
+            )
         return 0
     except (FormatError, OSError) as exc:
         print(f"ds4-expert-major: {exc}", file=sys.stderr)

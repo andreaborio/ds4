@@ -60,6 +60,8 @@ int main(int argc, char **argv) {
     CHECK(manifest != NULL);
     CHECK(manifest->version == DS4_EXPERT_STORE_V2_VERSION);
     CHECK(manifest->family == family);
+    CHECK(manifest->storage_format == DS4_EXPERT_STORE_STORAGE_GGML);
+    CHECK(manifest->group_size == 0);
     CHECK(manifest->layer_count == 2);
     CHECK(manifest->expert_count == 3);
     CHECK(manifest->expert_used_count == 2);

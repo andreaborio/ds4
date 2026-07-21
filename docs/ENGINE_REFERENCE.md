@@ -194,16 +194,18 @@ resolved mode and memory-plan reason. GLM release startup remains flag-free
 AUTO; `--resident` is rejected and explicit SSD/cache controls are diagnostics,
 not alternate startup instructions.
 
-The supported `qwen35moe` contract is the normalized
-Qwen3.6-35B-A3B ExpertMajor v2 Q4_K_S artifact. It activates automatically and
-first attempts the complete mapped-tensor Metal path. AUTO requires both the
+The supported `qwen35moe` candidate contract is the normalized
+Qwen3.6-35B-A3B ExpertMajor v2 MLX affine4/group-64 artifact. It remains a
+single GGUF with the standard v2 container and activates automatically in both
+resident and SSD modes. The former v2 GGML/Q4 payload is rejected. AUTO requires both the
 normal working-set calculation and a live unified-memory pressure snapshot; if
 either cannot admit resident mode, it uses bounded SSD streaming. Qwen's cache
 planner charges its complete non-routed page set separately and grows cache
 storage in 321-expert (about 0.529 GiB) slabs. The DeepSeek resident/SSD planner
 and GLM SSD-only planner remain independent. Exact artifact and validation
 details live in
-[`qwen-expert-major-store.md`](qwen-expert-major-store.md).
+[`qwen-expert-major-store.md`](qwen-expert-major-store.md) and the consolidated
+[`affine AUTO/SSD gate`](benchmarks/2026-07-21-qwen-unified-affine-auto-ssd.md).
 
 Qwen numerical inference is currently Metal-only. AUTO exposes named
 16/24/32/36/48/64/96/128 GiB profiles but sizes resident headroom and SSD cache

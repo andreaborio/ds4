@@ -633,6 +633,7 @@ kernel void kernel_qwen35_dequant_embedding_q8_0_batch_f32(
 // Gated DeltaNet control transform.  GGUF stores ssm_a as -exp(A_log), so it
 // is multiplied directly by the positive softplus timestep.  A one-token
 // decode is the n_token=1 special case of the same packed-row contract.
+template<bool store_decay>
 kernel void kernel_qwen35_gated_delta_controls_f32(
         constant ds4_metal_args_qwen35_gated_delta_controls &args
             [[buffer(0)]],
@@ -660,17 +661,28 @@ kernel void kernel_qwen35_gated_delta_controls_f32(
         ssm_a, (uint64_t)head * args.ssm_a_head_stride);
     const float bias = qwen35_metal_load_f32(
         dt_bias, (uint64_t)head * args.dt_bias_head_stride);
+    const float log_decay_value =
+        a * qwen35_metal_softplus(alpha + bias);
     qwen35_metal_store_f32(
         log_decay,
         (uint64_t)token * args.log_decay_token_stride +
             (uint64_t)head * args.log_decay_head_stride,
-        a * qwen35_metal_softplus(alpha + bias));
+        store_decay ? exp(log_decay_value) : log_decay_value);
     qwen35_metal_store_f32(
         beta,
         (uint64_t)token * args.beta_token_stride +
             (uint64_t)head * args.beta_head_stride,
         beta_value);
 }
+
+typedef decltype(kernel_qwen35_gated_delta_controls_f32<false>)
+    qwen35_gated_delta_controls_f32_t;
+template [[host_name("kernel_qwen35_gated_delta_controls_f32")]]
+kernel qwen35_gated_delta_controls_f32_t
+kernel_qwen35_gated_delta_controls_f32<false>;
+template [[host_name("kernel_qwen35_gated_delta_controls_decay_f32")]]
+kernel qwen35_gated_delta_controls_f32_t
+kernel_qwen35_gated_delta_controls_f32<true>;
 
 // Projection layout is [token][head][Q then gate].  One grid thread copies one
 // element to each output.  Dispatch at least n_token*n_query_head*head_dim
@@ -1321,6 +1333,184 @@ kernel void kernel_qwen35_gated_delta_sequence_128_f32(
     }
 }
 
+// MLX-style prompt path: normalize the shared Q/K heads once per token before
+// launching the recurrent rows.  The legacy sequence kernel recomputes these
+// two reductions for every value row group (32 times for Qwen3.6), even though
+// all those rows consume the same normalized head vectors.
+kernel void kernel_qwen35_normalize_qk_sequence_128_f32(
+        constant ds4_metal_args_qwen35_gated_delta_sequence &args
+            [[buffer(0)]],
+        device char *projection [[buffer(1)]],
+        uint2 group [[threadgroup_position_in_grid]],
+        ushort lane [[thread_index_in_simdgroup]]) {
+    constexpr uint dims_per_lane = 4u;
+    const uint token = group.x;
+    const uint key_head = group.y;
+    if (token >= args.n_token || key_head >= args.n_key_head ||
+        args.key_dim != 128u) {
+        return;
+    }
+
+    const uint64_t projection_base =
+        (uint64_t)token * args.projection_token_stride;
+    const uint64_t query_base =
+        projection_base + args.query_offset +
+        (uint64_t)key_head * args.query_head_stride;
+    const uint64_t key_base =
+        projection_base + args.key_offset +
+        (uint64_t)key_head * args.key_head_stride;
+
+    float query[dims_per_lane];
+    float key[dims_per_lane];
+    float query_square = 0.0f;
+    float key_square = 0.0f;
+    for (uint j = 0u; j < dims_per_lane; j++) {
+        const uint dim = (uint)lane * dims_per_lane + j;
+        query[j] = qwen35_metal_load_f32(
+            projection,
+            query_base + (uint64_t)dim * args.query_dim_stride);
+        key[j] = qwen35_metal_load_f32(
+            projection,
+            key_base + (uint64_t)dim * args.key_dim_stride);
+        query_square += query[j] * query[j];
+        key_square += key[j] * key[j];
+    }
+    query_square = simd_sum(query_square);
+    key_square = simd_sum(key_square);
+    const float query_inverse =
+        (1.0f / sqrt((float)args.key_dim)) /
+        sqrt(query_square + 1.0e-6f);
+    const float key_inverse = 1.0f / sqrt(key_square + 1.0e-6f);
+    for (uint j = 0u; j < dims_per_lane; j++) {
+        const uint dim = (uint)lane * dims_per_lane + j;
+        qwen35_metal_store_f32(
+            projection,
+            query_base + (uint64_t)dim * args.query_dim_stride,
+            query[j] * query_inverse);
+        qwen35_metal_store_f32(
+            projection,
+            key_base + (uint64_t)dim * args.key_dim_stride,
+            key[j] * key_inverse);
+    }
+}
+
+// Recurrent half of the pre-normalized prompt path.  Each SIMD group owns one
+// value row exactly as before, but there is no cross-SIMD shared norm or pair
+// of threadgroup barriers in the serial token loop.
+template<bool decay_is_precomputed>
+kernel void kernel_qwen35_gated_delta_sequence_128_normalized_f32(
+        constant ds4_metal_args_qwen35_gated_delta_sequence &args
+            [[buffer(0)]],
+        device const char *projection [[buffer(1)]],
+        device const char *log_decay  [[buffer(2)]],
+        device const char *beta       [[buffer(3)]],
+        device       char *state      [[buffer(4)]],
+        device       char *output     [[buffer(5)]],
+        uint3 group [[threadgroup_position_in_grid]],
+        ushort3 thread_pos [[thread_position_in_threadgroup]],
+        ushort lane [[thread_index_in_simdgroup]]) {
+    constexpr uint dims_per_lane = 4u;
+    constexpr uint rows_per_group = 4u;
+    const uint value_head = group.y;
+    const uint value_dim = group.x * rows_per_group + thread_pos.y;
+    if (value_head >= args.n_value_head || value_dim >= args.value_dim ||
+        args.n_token == 0u || args.n_key_head == 0u ||
+        args.key_dim != 128u || args.value_dim != 128u ||
+        args.n_value_head % args.n_key_head != 0u) {
+        return;
+    }
+
+    const uint key_head = value_head % args.n_key_head;
+    const uint64_t state_row =
+        (uint64_t)value_head * args.state_head_stride +
+        (uint64_t)value_dim * args.state_value_stride;
+    float state_value[dims_per_lane];
+    for (uint j = 0u; j < dims_per_lane; j++) {
+        const uint dim = (uint)lane * dims_per_lane + j;
+        state_value[j] = qwen35_metal_load_f32(
+            state,
+            state_row + (uint64_t)dim * args.state_key_stride);
+    }
+
+    for (uint token = 0u; token < args.n_token; token++) {
+        const uint64_t projection_base =
+            (uint64_t)token * args.projection_token_stride;
+        const uint64_t query_base =
+            projection_base + args.query_offset +
+            (uint64_t)key_head * args.query_head_stride;
+        const uint64_t key_base =
+            projection_base + args.key_offset +
+            (uint64_t)key_head * args.key_head_stride;
+        const float decay_value = qwen35_metal_load_f32(
+            log_decay,
+            (uint64_t)token * args.log_decay_token_stride +
+                (uint64_t)value_head * args.log_decay_head_stride);
+        const float decay =
+            decay_is_precomputed ? decay_value : exp(decay_value);
+        const float step = qwen35_metal_load_f32(
+            beta,
+            (uint64_t)token * args.beta_token_stride +
+                (uint64_t)value_head * args.beta_head_stride);
+
+        float normalized_key[dims_per_lane];
+        float normalized_query[dims_per_lane];
+        float memory_partial = 0.0f;
+        for (uint j = 0u; j < dims_per_lane; j++) {
+            const uint dim = (uint)lane * dims_per_lane + j;
+            normalized_key[j] = qwen35_metal_load_f32(
+                projection,
+                key_base + (uint64_t)dim * args.key_dim_stride);
+            normalized_query[j] = qwen35_metal_load_f32(
+                projection,
+                query_base + (uint64_t)dim * args.query_dim_stride);
+            state_value[j] *= decay;
+            memory_partial += state_value[j] * normalized_key[j];
+        }
+
+        const float memory = simd_sum(memory_partial);
+        const float target = qwen35_metal_load_f32(
+            projection,
+            projection_base + args.value_offset +
+                (uint64_t)value_head * args.value_head_stride +
+                (uint64_t)value_dim * args.value_dim_stride);
+        const float delta = (target - memory) * step;
+        float result_partial = 0.0f;
+        for (uint j = 0u; j < dims_per_lane; j++) {
+            state_value[j] += normalized_key[j] * delta;
+            result_partial += state_value[j] * normalized_query[j];
+        }
+        const float result = simd_sum(result_partial);
+        if (lane == 0u) {
+            qwen35_metal_store_f32(
+                output,
+                (uint64_t)token * args.output_token_stride +
+                    (uint64_t)value_head * args.output_head_stride +
+                    (uint64_t)value_dim * args.output_dim_stride,
+                result);
+        }
+    }
+
+    for (uint j = 0u; j < dims_per_lane; j++) {
+        const uint dim = (uint)lane * dims_per_lane + j;
+        qwen35_metal_store_f32(
+            state,
+            state_row + (uint64_t)dim * args.state_key_stride,
+            state_value[j]);
+    }
+}
+
+typedef decltype(
+    kernel_qwen35_gated_delta_sequence_128_normalized_f32<false>)
+    qwen35_gated_delta_sequence_128_normalized_f32_t;
+template [[host_name(
+    "kernel_qwen35_gated_delta_sequence_128_normalized_f32")]]
+kernel qwen35_gated_delta_sequence_128_normalized_f32_t
+kernel_qwen35_gated_delta_sequence_128_normalized_f32<false>;
+template [[host_name(
+    "kernel_qwen35_gated_delta_sequence_128_normalized_decay_f32")]]
+kernel qwen35_gated_delta_sequence_128_normalized_f32_t
+kernel_qwen35_gated_delta_sequence_128_normalized_f32<true>;
+
 // One-token causal grouped-query attention over separate F32 K/V caches with
 // layout [token][kv_head][head_dim].  One threadgroup owns one query head.  A
 // stable online softmax avoids an O(context) score buffer while preserving the
@@ -1376,6 +1566,81 @@ kernel void kernel_qwen35_gqa_split_k_pad_f32(
                 dst_row[dim] = 0.0f;
             }
         }
+    }
+}
+
+// Packs the final partial 64-token block from Qwen's staged token-major F16
+// K/V cache into the head-major padding ABI consumed by non-vector
+// FlashAttention.  The deliberately sparse token stride matches the ordinary
+// cache arguments, so the shared FlashAttention kernel needs no Qwen-specific
+// indexing branch.
+kernel void kernel_qwen35_gqa_prefill_pad_kv_f16(
+        constant ds4_metal_args_qwen35_gqa_decode &args [[buffer(0)]],
+        device const half *key_cache [[buffer(1)]],
+        device const half *value_cache [[buffer(2)]],
+        device char *pad [[buffer(3)]],
+        uint3 tgpig [[threadgroup_position_in_grid]],
+        uint tiitg [[thread_index_in_threadgroup]],
+        uint3 ntg [[threads_per_threadgroup]]) {
+    constexpr uint C = 64;
+    const uint kv_head = tgpig.x;
+    const uint is_value = tgpig.y;
+    if (kv_head >= args.n_kv_head || is_value > 1u) return;
+
+    const uint valid = args.n_kv % C;
+    const uint first = args.n_kv - valid;
+    const ulong region_bytes =
+        args.key_token_stride * C * args.n_kv_head;
+    device const char *src = (device const char *)(
+        is_value ? value_cache : key_cache);
+    const ulong token_stride = is_value
+        ? args.value_token_stride : args.key_token_stride;
+    const ulong head_stride = is_value
+        ? args.value_head_stride : args.key_head_stride;
+    device char *dst = pad + (is_value ? region_bytes : 0u) +
+        (ulong)kv_head * token_stride * C;
+
+    for (uint row = 0; row < C; row++) {
+        device half *dst_row =
+            (device half *)(dst + (ulong)row * token_stride);
+        if (row < valid) {
+            device const half *src_row = (device const half *)(src +
+                (ulong)(first + row) * token_stride +
+                (ulong)kv_head * head_stride);
+            for (uint dim = tiitg; dim < args.head_dim; dim += ntg.x) {
+                dst_row[dim] = src_row[dim];
+            }
+        } else {
+            for (uint dim = tiitg; dim < args.head_dim; dim += ntg.x) {
+                dst_row[dim] = 0.0h;
+            }
+        }
+    }
+}
+
+// The mask tail follows both padded K/V regions and is dense [query][64].
+// Keeping this copy on the GPU lets the reusable Qwen pad allocation remain
+// private on M5-class devices.
+kernel void kernel_qwen35_gqa_prefill_pad_mask_f16(
+        constant ds4_metal_args_qwen35_gqa_prefill &args [[buffer(0)]],
+        device const half *mask [[buffer(1)]],
+        device char *pad [[buffer(2)]],
+        uint3 tgpig [[threadgroup_position_in_grid]],
+        uint tiitg [[thread_index_in_threadgroup]],
+        uint3 ntg [[threads_per_threadgroup]]) {
+    constexpr uint C = 64;
+    const uint q = tgpig.x;
+    if (q >= args.n_token) return;
+    const uint n_kv = args.position0 + args.n_token;
+    const uint valid = n_kv % C;
+    const uint first = n_kv - valid;
+    const ulong region_bytes =
+        args.key_token_stride * C * args.n_kv_head;
+    device half *dst = (device half *)(pad + 2u * region_bytes) +
+        (ulong)q * C;
+    device const half *src = mask + (ulong)q * n_kv + first;
+    for (uint i = tiitg; i < C; i += ntg.x) {
+        dst[i] = i < valid ? src[i] : -MAXHALF;
     }
 }
 

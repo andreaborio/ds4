@@ -17,6 +17,16 @@ enum {
 };
 
 typedef enum {
+    /* Existing GGML block payloads such as Q4_K, Q2_K, and IQ2_XXS. */
+    DS4_EXPERT_STORE_STORAGE_GGML = 0,
+    /* MLX affine 4-bit groups, physically interleaved as
+     * [32 packed bytes | BF16 scale | BF16 bias] for every 64 weights.
+     * The logical component type remains Q4_K because the byte geometry is
+     * identical (36 bytes per 64 values / 144 bytes per 256 values). */
+    DS4_EXPERT_STORE_STORAGE_MLX_AFFINE4 = 1,
+} ds4_expert_store_storage;
+
+typedef enum {
     DS4_EXPERT_STORE_FAMILY_DEEPSEEK4 = 1,
     DS4_EXPERT_STORE_FAMILY_GLM_DSA = 2,
     DS4_EXPERT_STORE_FAMILY_QWEN35_MOE = 3,
@@ -49,6 +59,8 @@ typedef struct {
 typedef struct {
     uint32_t version;
     uint32_t family;
+    uint32_t storage_format;
+    uint32_t group_size;
     uint32_t layer_count;
     uint32_t expert_count;
     uint32_t expert_used_count;

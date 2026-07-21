@@ -101,15 +101,14 @@ cd ds4
 
 make -j8
 ./ds4 --build-info
-./download_model.sh qwen-v2
 ./ds4 \
-  -m gguf/Qwen3.6-35B-A3B-DS4-ExpertMajor-v2-Q4_K_S.gguf \
+  -m /absolute/path/to/Qwen3.6-35B-A3B-DS4-ExpertMajor-v2-MLX-Affine4-G64.gguf \
   --ctx 8192
 ```
 
-Replace `qwen-v2` with `deepseek-v2` or `glm-v2` to select another qualified
-family. The downloader pins the release revision and verifies the complete
-file before printing the startup command.
+`download_model.sh deepseek-v2` and `download_model.sh glm-v2` install the
+published release artifacts for the other qualified families. The affine Qwen
+candidate must be supplied explicitly until its new byte identity is published.
 
 On macOS, AUTO residency keeps the model resident when it safely fits.
 Otherwise it selects SSD streaming and derives an expert-cache budget from the
@@ -154,7 +153,7 @@ the runtime needs.
 | DeepSeek V4 Flash ExpertMajor v2 | `main` | Supported Apple Metal resident/SSD path | Adaptive SSD streaming and grouped prefill |
 | DeepSeek V4 PRO ExpertMajor v2 | offline tooling only | Not runtime-qualified; no release artifact identity | Converter and future per-artifact qualification |
 | GLM 5.2 ExpertMajor v2 | `main` | Qualified Apple Metal SSD path; 64 GB minimum | Embedded expert store, grouped prefill, compact DSA KV, 601-record DS4 cache plus adaptive macOS file caching |
-| Qwen3.6-35B-A3B ExpertMajor v2 | `main` | Supported Apple Metal resident/SSD path; 16 GiB minimum | Hardware-aware AUTO mapping, resident prefill, and parallel resident decode |
+| Qwen3.6-35B-A3B ExpertMajor v2 affine4/group-64 | `main` | Supported Apple Metal resident/SSD path; 16 GiB minimum | One AUTO configuration, MLX-affine resident/SSD kernels, and read-once macro prefill |
 
 ### DeepSeek expert-major v2 format
 
@@ -205,21 +204,21 @@ backward-compatibility contract in this fork.
 
 ### Qwen3.6 ExpertMajor v2 AUTO path
 
-The supported artifact is the single-layout
-`Qwen3.6-35B-A3B-DS4-ExpertMajor-v2-Q4_K_S.gguf`. It stores the 40 layers of
-routed weights once, activates automatically, and is 20,808,566,880 bytes with
-SHA-256
-`d7c43a6388ec20e6fe5530850350f96fdb0ac37c5ce36d3e5f92b172c447f56b`.
-Download it from
-[`andreaborio/Qwen3.6-35B-A3B-DS4-GGUF`](https://huggingface.co/andreaborio/Qwen3.6-35B-A3B-DS4-GGUF),
-where v2 is the current DSBox-selected release and the older layouts remain
-available only as versioned historical artifacts.
+The supported candidate is the single-layout
+`Qwen3.6-35B-A3B-DS4-ExpertMajor-v2-MLX-Affine4-G64.gguf`. It stores the 40
+layers of routed weights once, activates automatically, and is 20,808,566,880
+bytes with SHA-256
+`dd17266185833a9f05531ce366fd7284ddca1ed64aa3dcf06e321e8c72c9ea3d`.
+It is still a GGUF with the shared `ds4.expert_major.v2` container; only the
+routed payload uses MLX affine 4-bit groups (`32 packed bytes + BF16 scale +
+BF16 bias` per group of 64). The previous v2 GGML/Q4 payload is deliberately
+rejected rather than retained as a slower compatibility mode.
 No environment guard, sidecar variable, backend flag, resident flag, or power
 flag is part of normal startup:
 
 ```sh
 ./ds4 \
-  -m /absolute/path/to/Qwen3.6-35B-A3B-DS4-ExpertMajor-v2-Q4_K_S.gguf \
+  -m /absolute/path/to/Qwen3.6-35B-A3B-DS4-ExpertMajor-v2-MLX-Affine4-G64.gguf \
   --ctx 8192
 ```
 
@@ -227,9 +226,9 @@ This is a narrow Qwen3.6 artifact contract, not arbitrary Qwen or community
 GGUF support. Current inference rejects canonical Qwen, ExpertMajor v1,
 sidecars, CPU, CUDA, ROCm, and distributed execution. The canonical GGUF may be
 used offline with `gguf-tools/ds4-expert-major.py` to build and verify v2.
-Format details and the v2/v1 publication A/B are in
+Format details and the current resident/SSD promotion gate are in
 [`docs/qwen-expert-major-store.md`](docs/qwen-expert-major-store.md) and
-[`docs/benchmarks/2026-07-20-qwen-expert-major-v2.md`](docs/benchmarks/2026-07-20-qwen-expert-major-v2.md).
+[`docs/benchmarks/2026-07-21-qwen-unified-affine-auto-ssd.md`](docs/benchmarks/2026-07-21-qwen-unified-affine-auto-ssd.md).
 
 Qwen AUTO reports a named 16/24/32/36/48/64/96/128 GiB profile, then computes
 from the exact physical RAM and `recommendedMaxWorkingSetSize`; the labels do
@@ -265,13 +264,11 @@ I/O; a CPU+GPU split of layers or experts is not implemented in this path.
 The hard SSD cache floor is 321 complete routed experts (about 0.53 GiB); 640
 (about 1.06 GiB) is a useful controlled small-cache tier. Startup and the
 per-layer path fail closed if the effective locked cache falls below the floor.
-The runtime has completed model-backed resident and SSD generation on an M5 Pro
-with 64 GiB. Hardware-policy selection also completes with zero swap as AUTO→SSD
-on an M1 Pro 16 GiB and AUTO→resident on an AC-powered M1 Pro 32 GiB. The v2 resident smoke produced identical output, and its 2K
-v2/v1/v2 A/B measured 318.96/29.54, 320.59/29.59, and 318.83/29.54 prefill/decode
-t/s with byte-identical evidence and no new swapout. Performance numbers remain
-tied to each exact host and workload; policy tests for an unmeasured RAM cut are
-not presented as a throughput claim.
+The affine runtime has completed model-backed resident and SSD generation on an
+M5 Pro with 64 GiB, including allocation at the model-declared 262,144-token
+maximum. A final 128+16 lane produced identical resident/SSD greedy tokens.
+Performance numbers remain tied to each exact host and workload; policy tests
+for an unmeasured RAM cut are not presented as a throughput claim.
 
 ## Measured results
 
@@ -281,7 +278,7 @@ a different artifact and runtime path.
 
 | Model | M5 Pro 64 GB setup | 32K prefill | 32K generation / decode | Status |
 | --- | --- | ---: | ---: | --- |
-| Qwen3.6-35B-A3B ExpertMajor v2 Q4_K_S, 20.81 GB | Metal resident, F32 split-K GQA | **61.89 t/s** | **37.42 t/s**, 26.562 ms p50, 27.834 ms p95 | 32K+128; 11.84x decode over the 3.16 t/s serial control, identical greedy token IDs, zero swap |
+| Qwen3.6-35B-A3B ExpertMajor v2 MLX affine4/group-64, 20.81 GB | Metal resident AUTO | **877.34 t/s** | **57.43 t/s** at the qualified 128+16 decode lane, 17.352 ms p50, 18.753 ms p95 | Same GGUF resident/SSD; forced SSD 32K is 83.69 t/s with 1.000x read amplification |
 | DeepSeek V4 Flash IQ2XXS, 86.72 GB | Metal SSD, phase-adaptive 259→4,129 through 32K, prose prompt | **164.43 t/s** | **7.27 t/s**, 105.410 ms p50, 149.943 ms p95 | Exact final-stack evidence and zero swap; old AUTO controls can swap, so no 32K speedup percentage |
 | GLM 5.2 ExpertMajor v2 Q2_K, 244.14 GiB | Metal AUTO→SSD, 601 records, fixed compact-indexer transition, prose prompt | **44.73 t/s** | **1.87 t/s** overall; about **2.12 t/s** at p50 | Same-prompt output matches the earlier corrected arm; zero swap; original baseline crashes before logits |
 

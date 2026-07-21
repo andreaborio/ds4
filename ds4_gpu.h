@@ -69,6 +69,8 @@ int ds4_gpu_expert_store_v2_install(
         uint64_t                             file_size,
         uint32_t                             n_layer,
         uint32_t                             n_expert,
+        uint32_t                             storage_format,
+        uint32_t                             group_size,
         const ds4_gpu_expert_store_layer_v2 *layers);
 int ds4_gpu_expert_store_v2_bind_layer(
         uint32_t layer,

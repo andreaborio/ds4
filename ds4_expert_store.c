@@ -261,6 +261,14 @@ bool ds4_expert_store_open_embedded(
     const uint64_t data_size = load_u64_le(header + 72);
     const uint64_t store_size = load_u64_le(header + 80);
     const uint64_t source_size = load_u64_le(header + 88);
+    const uint32_t storage_format = load_u32_le(header + 160);
+    const uint32_t group_size = load_u32_le(header + 164);
+    const bool storage_valid =
+        (storage_format == DS4_EXPERT_STORE_STORAGE_GGML &&
+         group_size == 0u) ||
+        (storage_format == DS4_EXPERT_STORE_STORAGE_MLX_AFFINE4 &&
+         group_size == 64u &&
+         family == DS4_EXPERT_STORE_FAMILY_QWEN35_MOE);
 
     uint64_t want_descriptor_bytes = 0;
     uint64_t descriptors_end = 0;
@@ -283,7 +291,7 @@ bool ds4_expert_store_open_embedded(
         !add_u64(data_offset, data_size, &descriptors_end) ||
         descriptors_end != store_size || store_size != bytes ||
         source_tensors <= (uint64_t)layer_count * 3u || source_size == 0 ||
-        !all_zero(header + 160, 8) ||
+        !storage_valid ||
         !all_zero(header + 200, STORE_HEADER_BYTES - 200)) {
         set_error(error, error_size,
                   "expert-store v2 header or family contract is invalid");
@@ -355,6 +363,9 @@ bool ds4_expert_store_open_embedded(
             if (out_component->role != role || ndim != 3 ||
                 !quant_layout(out_component->ggml_type,
                               &block_elements, &block_bytes) ||
+                (storage_format ==
+                     DS4_EXPERT_STORE_STORAGE_MLX_AFFINE4 &&
+                 out_component->ggml_type != 12u) ||
                 out_component->block_elements != block_elements ||
                 out_component->dim[0] == 0 ||
                 out_component->dim[0] % block_elements != 0 ||
@@ -435,6 +446,8 @@ bool ds4_expert_store_open_embedded(
     store->manifest = (ds4_expert_store_manifest){
         .version = version,
         .family = family,
+        .storage_format = storage_format,
+        .group_size = group_size,
         .layer_count = layer_count,
         .expert_count = expert_count,
         .expert_used_count = expert_used,

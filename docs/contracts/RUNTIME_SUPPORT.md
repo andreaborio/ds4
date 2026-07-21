@@ -26,11 +26,12 @@ rather than an additional qualified startup contract. Detailed planners and gate
 
 Qwen has named 16/24/32/36/48/64/96/128 GiB policy profiles, but selection uses
 the active device's exact physical RAM, `recommendedMaxWorkingSetSize`, context
-runtime, and live pressure. The current 20.81 GB Q4_K_S artifact necessarily
-uses SSD on 16 GiB. A 32 GiB host may use resident for shorter contexts when
-both gates pass and falls back to SSD otherwise. The named policy is unit-tested
-at every cut; performance claims remain limited to the physical hosts and exact
-workloads in the release evidence.
+runtime, and live pressure. The current 20.81 GB MLX affine4/group-64 artifact
+necessarily uses SSD on 16 GiB. A 32 GiB host may use resident for shorter
+contexts when both gates pass and falls back to SSD otherwise. The retired
+Q4_K_S payload is rejected rather than decoded through a compatibility path.
+The named policy is unit-tested at every cut; performance claims remain limited
+to the physical hosts and exact workloads in the release evidence.
 
 The lower-memory extension is Qwen-specific. Hosts below 64 GiB remain outside
 the DeepSeek and GLM production contract. Do not infer support for another
@@ -45,6 +46,7 @@ each supported family. It must fail closed for:
 - ExpertMajor v1;
 - external sidecars;
 - missing, malformed, or mismatched ExpertMajor v2 metadata;
+- Qwen ExpertMajor v2 stores whose routed payload is not MLX affine4/group-64;
 - artifact/model combinations that have not passed their family gates.
 
 Normal startup has no ExpertMajor admission bypass and needs no sidecar,
