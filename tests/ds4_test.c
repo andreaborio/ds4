@@ -404,6 +404,111 @@ static void test_metal_f16_prefill_matmul(void) {
     free(weights_raw);
 }
 
+static void test_metal_f32_router_prefill_matmul(void) {
+    const uint32_t in_dim = 2048;
+    const uint32_t out_dim = 256;
+    const uint32_t n_tok = 32;
+    const uint64_t weight_bytes =
+        (uint64_t)out_dim * in_dim * sizeof(float);
+    const uint64_t weight_alloc =
+        test_round_up_u64(weight_bytes, (uint64_t)getpagesize());
+    const uint64_t x_bytes =
+        (uint64_t)n_tok * in_dim * sizeof(float);
+    const uint64_t out_bytes =
+        (uint64_t)n_tok * out_dim * sizeof(float);
+
+    void *weights_raw = NULL;
+    TEST_ASSERT(posix_memalign(
+                    &weights_raw,
+                    (size_t)getpagesize(),
+                    (size_t)weight_alloc) == 0);
+    if (!weights_raw) return;
+
+    float *weights = weights_raw;
+    memset(weights, 0, (size_t)weight_alloc);
+    for (uint32_t o = 0; o < out_dim; o++) {
+        for (uint32_t i = 0; i < in_dim; i++) {
+            const int v =
+                (int)((o * 11u + i * 13u + (o ^ i) * 5u) % 61u) - 30;
+            weights[(uint64_t)o * in_dim + i] = (float)v / 96.0f;
+        }
+    }
+
+    ds4_gpu_tensor *x = ds4_gpu_tensor_alloc(x_bytes);
+    ds4_gpu_tensor *out = ds4_gpu_tensor_alloc(out_bytes);
+    TEST_ASSERT(x != NULL);
+    TEST_ASSERT(out != NULL);
+    if (!x || !out) {
+        ds4_gpu_tensor_free(x);
+        ds4_gpu_tensor_free(out);
+        free(weights_raw);
+        return;
+    }
+
+    float *x_host = malloc((size_t)x_bytes);
+    float *out_host = malloc((size_t)out_bytes);
+    TEST_ASSERT(x_host != NULL);
+    TEST_ASSERT(out_host != NULL);
+    if (!x_host || !out_host) {
+        free(x_host);
+        free(out_host);
+        ds4_gpu_tensor_free(x);
+        ds4_gpu_tensor_free(out);
+        free(weights_raw);
+        return;
+    }
+
+    for (uint32_t t = 0; t < n_tok; t++) {
+        for (uint32_t i = 0; i < in_dim; i++) {
+            const int v =
+                (int)((t * 7u + i * 17u + (t ^ i) * 3u) % 73u) - 36;
+            x_host[(uint64_t)t * in_dim + i] = (float)v / 80.0f;
+        }
+    }
+
+    TEST_ASSERT(ds4_gpu_tensor_write(x, 0, x_host, x_bytes) != 0);
+    TEST_ASSERT(ds4_gpu_set_model_map(weights_raw, weight_alloc) != 0);
+    ds4_gpu_set_quality(false);
+    char *saved_enable =
+        test_save_env("DS4_METAL_ENABLE_F32_SIMD_PREFILL");
+    char *saved_disable =
+        test_save_env("DS4_METAL_DISABLE_F32_SIMD_PREFILL");
+    setenv("DS4_METAL_ENABLE_F32_SIMD_PREFILL", "1", 1);
+    unsetenv("DS4_METAL_DISABLE_F32_SIMD_PREFILL");
+    TEST_ASSERT(ds4_gpu_matmul_f32_tensor(
+                    out, weights_raw, weight_alloc, 0,
+                    in_dim, out_dim, x, n_tok) != 0);
+    test_restore_env("DS4_METAL_ENABLE_F32_SIMD_PREFILL", saved_enable);
+    test_restore_env("DS4_METAL_DISABLE_F32_SIMD_PREFILL", saved_disable);
+    TEST_ASSERT(ds4_gpu_tensor_read(out, 0, out_host, out_bytes) != 0);
+
+    float max_abs = 0.0f;
+    float rms = 0.0f;
+    for (uint32_t t = 0; t < n_tok; t++) {
+        for (uint32_t o = 0; o < out_dim; o++) {
+            float ref = 0.0f;
+            for (uint32_t i = 0; i < in_dim; i++) {
+                ref += weights[(uint64_t)o * in_dim + i] *
+                       x_host[(uint64_t)t * in_dim + i];
+            }
+            const float got = out_host[(uint64_t)t * out_dim + o];
+            TEST_ASSERT(isfinite(got));
+            const float err = fabsf(got - ref);
+            if (err > max_abs) max_abs = err;
+            rms += err * err;
+        }
+    }
+    rms = sqrtf(rms / (float)(n_tok * out_dim));
+    TEST_ASSERT(max_abs < 0.20f);
+    TEST_ASSERT(rms < 0.05f);
+
+    free(x_host);
+    free(out_host);
+    ds4_gpu_tensor_free(x);
+    ds4_gpu_tensor_free(out);
+    free(weights_raw);
+}
+
 static void test_metal_q8_0_prefill_matmul(void) {
     const uint32_t in_dim = 128;
     const uint32_t out_dim = 64;
@@ -3085,6 +3190,7 @@ static void test_metal_kernel_group(void) {
     test_metal_qwen35_graph_state();
     test_metal_f16_matvec_fast_nr0_4();
     test_metal_f16_prefill_matmul();
+    test_metal_f32_router_prefill_matmul();
     test_metal_q8_0_prefill_matmul();
     test_metal_glm_compact_indexer_warmup_mapping();
     test_metal_qwen35_primitives();
