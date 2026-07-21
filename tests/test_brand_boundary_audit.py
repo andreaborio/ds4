@@ -21,6 +21,33 @@ CATEGORIES = (
 )
 LOCATION_ORDER = {"path": 0, "content": 1}
 TOKEN_ORDER = {"ds4": 0, "DS4": 1, "DwarfStar": 2}
+IDENTITY_CONTRACT = {
+    "brand": "Hebrus",
+    "canonical_commands": [
+        "hebrus",
+        "hebrus-server",
+        "hebrus-agent",
+        "hebrus-bench",
+        "hebrus-eval",
+    ],
+    "command_aliases": {
+        "ds4": "hebrus",
+        "ds4-server": "hebrus-server",
+        "ds4-agent": "hebrus-agent",
+        "ds4-bench": "hebrus-bench",
+        "ds4-eval": "hebrus-eval",
+    },
+    "accepted_engine_ids": ["hebrus", "ds4"],
+    "environment_prefixes": {
+        "preserved": ["DS4_"],
+        "deferred": ["HEBRUS_"],
+    },
+    "permanent_literals": ["ds4.expert_major.v1", "ds4.expert_major.v2"],
+    "repositories": {
+        "historical_origin": "antirez/ds4",
+        "pre_rename": "andreaborio/ds4",
+    },
+}
 
 
 def manifest_document(entries: list[dict[str, object]]) -> dict[str, object]:
@@ -34,6 +61,7 @@ def manifest_document(entries: list[dict[str, object]]) -> dict[str, object]:
     )
     return {
         "schema_version": 1,
+        "identity_contract": IDENTITY_CONTRACT,
         "scope": {
             "tokens": ["ds4", "DS4", "DwarfStar"],
             "locations": ["path", "content"],
@@ -213,6 +241,18 @@ class BrandBoundaryAuditTests(unittest.TestCase):
         checked = self.fixture.run("--check")
         self.assertEqual(checked.returncode, 2, checked.stderr)
         self.assertIn("must be an explicit normalized path", checked.stderr)
+
+    def test_identity_contract_is_exact(self) -> None:
+        self.seed_one_token()
+        document = json.loads(self.fixture.manifest.read_text(encoding="utf-8"))
+        document["identity_contract"]["command_aliases"]["ds4-server"] = "other"
+        self.fixture.manifest.write_text(
+            json.dumps(document, indent=2) + "\n", encoding="utf-8"
+        )
+
+        checked = self.fixture.run("--check")
+        self.assertEqual(checked.returncode, 2, checked.stderr)
+        self.assertIn("identity_contract must exactly match", checked.stderr)
 
     def test_unused_refresh_authorization_fails_closed(self) -> None:
         self.seed_one_token()

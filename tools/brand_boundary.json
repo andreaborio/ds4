@@ -1,5 +1,42 @@
 {
   "schema_version": 1,
+  "identity_contract": {
+    "brand": "Hebrus",
+    "canonical_commands": [
+      "hebrus",
+      "hebrus-server",
+      "hebrus-agent",
+      "hebrus-bench",
+      "hebrus-eval"
+    ],
+    "command_aliases": {
+      "ds4": "hebrus",
+      "ds4-server": "hebrus-server",
+      "ds4-agent": "hebrus-agent",
+      "ds4-bench": "hebrus-bench",
+      "ds4-eval": "hebrus-eval"
+    },
+    "accepted_engine_ids": [
+      "hebrus",
+      "ds4"
+    ],
+    "environment_prefixes": {
+      "preserved": [
+        "DS4_"
+      ],
+      "deferred": [
+        "HEBRUS_"
+      ]
+    },
+    "permanent_literals": [
+      "ds4.expert_major.v1",
+      "ds4.expert_major.v2"
+    ],
+    "repositories": {
+      "historical_origin": "antirez/ds4",
+      "pre_rename": "andreaborio/ds4"
+    }
+  },
   "scope": {
     "tokens": [
       "ds4",
@@ -2222,14 +2259,14 @@
       "location": "content",
       "token": "ds4",
       "classification": "migration-pending",
-      "maximum": 20
+      "maximum": 31
     },
     {
       "path": "tests/test_brand_boundary_audit.py",
       "location": "content",
       "token": "DS4",
       "classification": "migration-pending",
-      "maximum": 4
+      "maximum": 5
     },
     {
       "path": "tests/test_brand_boundary_audit.py",
@@ -2467,14 +2504,14 @@
       "location": "content",
       "token": "ds4",
       "classification": "migration-pending",
-      "maximum": 2
+      "maximum": 12
     },
     {
       "path": "tools/brand_boundary_audit.py",
       "location": "content",
       "token": "DS4",
       "classification": "migration-pending",
-      "maximum": 2
+      "maximum": 3
     },
     {
       "path": "tools/brand_boundary_audit.py",

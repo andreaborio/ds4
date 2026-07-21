@@ -24,8 +24,36 @@ CATEGORIES = (
     "historical-attribution",
     "migration-pending",
 )
+IDENTITY_CONTRACT = {
+    "brand": "Hebrus",
+    "canonical_commands": [
+        "hebrus",
+        "hebrus-server",
+        "hebrus-agent",
+        "hebrus-bench",
+        "hebrus-eval",
+    ],
+    "command_aliases": {
+        "ds4": "hebrus",
+        "ds4-server": "hebrus-server",
+        "ds4-agent": "hebrus-agent",
+        "ds4-bench": "hebrus-bench",
+        "ds4-eval": "hebrus-eval",
+    },
+    "accepted_engine_ids": ["hebrus", "ds4"],
+    "environment_prefixes": {
+        "preserved": ["DS4_"],
+        "deferred": ["HEBRUS_"],
+    },
+    "permanent_literals": ["ds4.expert_major.v1", "ds4.expert_major.v2"],
+    "repositories": {
+        "historical_origin": "antirez/ds4",
+        "pre_rename": "andreaborio/ds4",
+    },
+}
 TOP_LEVEL_KEYS = {
     "schema_version",
+    "identity_contract",
     "scope",
     "category_definitions",
     "refresh_policy",
@@ -107,6 +135,11 @@ def load_manifest(
         raise AuditError(
             f"manifest schema_version must be {SCHEMA_VERSION}, "
             f"got {document['schema_version']!r}"
+        )
+    if document["identity_contract"] != IDENTITY_CONTRACT:
+        raise AuditError(
+            "identity_contract must exactly match the canonical, bridged, and "
+            "permanently preserved identity contract"
         )
 
     scope = document["scope"]
