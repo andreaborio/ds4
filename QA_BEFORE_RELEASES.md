@@ -78,6 +78,11 @@ SHA-256, manifest contract, and compatible runtime commit are one release gate.
   `git diff --check`.
 - Confirm both names of the CLI, server, and agent render help cleanly, with
   readable section colors and no broken wrapping.
+- On a qualified Qwen host, run the two server names sequentially against the
+  exact published artifact and compare model discovery, one seeded greedy chat
+  completion, graceful shutdown, and exit status:
+  `python3 tests/test_server_alias_model.py --model "$QWEN_V2" --evidence-dir /tmp/hebrus-server-alias-evidence`.
+  This is model-backed correctness evidence, not a performance benchmark.
 
 ## 2. Core Regression Tests
 
