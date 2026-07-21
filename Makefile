@@ -635,22 +635,22 @@ ds4_qwen_unicode.o: ds4_qwen_unicode.c ds4_qwen_unicode.h \
 		ds4_qwen_unicode_data.inc
 	$(CC) $(CFLAGS) -c -o $@ ds4_qwen_unicode.c
 
-ds4_cli.o: ds4_cli.c ds4.h ds4_ssd.h ds4_help.h linenoise.h
+ds4_cli.o: ds4_cli.c ds4.h ds4_ssd.h ds4_help.h hebrus_identity.h linenoise.h
 	$(CC) $(CFLAGS) -c -o $@ ds4_cli.c
 
-ds4_help.o: ds4_help.c ds4_help.h
+ds4_help.o: ds4_help.c ds4_help.h hebrus_identity.h
 	$(CC) $(CFLAGS) -c -o $@ ds4_help.c
 
 ds4_server.o: ds4_server.c ds4.h ds4_ssd.h ds4_help.h ds4_kvstore.h rax.h
 	$(CC) $(CFLAGS) -c -o $@ ds4_server.c
 
-ds4_bench.o: ds4_bench.c ds4.h ds4_ssd.h ds4_help.h
+ds4_bench.o: ds4_bench.c ds4.h ds4_ssd.h ds4_help.h hebrus_identity.h
 	$(CC) $(CFLAGS) -c -o $@ ds4_bench.c
 
-ds4_eval.o: ds4_eval.c ds4.h ds4_ssd.h ds4_help.h
+ds4_eval.o: ds4_eval.c ds4.h ds4_ssd.h ds4_help.h hebrus_identity.h
 	$(CC) $(CFLAGS) -c -o $@ ds4_eval.c
 
-ds4_agent.o: ds4_agent.c ds4.h ds4_ssd.h ds4_help.h ds4_kvstore.h ds4_web.h linenoise.h
+ds4_agent.o: ds4_agent.c ds4.h ds4_ssd.h ds4_help.h hebrus_identity.h ds4_kvstore.h ds4_web.h linenoise.h
 	$(CC) $(CFLAGS) -c -o $@ ds4_agent.c
 
 ds4_web.o: ds4_web.c ds4_web.h
@@ -666,7 +666,7 @@ ds4_agent_test.o: tests/ds4_agent_test.c tests/internal/ds4_agent_unit.h
 	$(CC) $(CFLAGS) -DDS4_NO_GPU -c -o $@ tests/ds4_agent_test.c
 
 ds4_agent_test_impl.o: ds4_agent.c ds4.h ds4_ssd.h \
-		ds4_help.h ds4_kvstore.h ds4_web.h linenoise.h \
+		ds4_help.h hebrus_identity.h ds4_kvstore.h ds4_web.h linenoise.h \
 		tests/internal/ds4_agent_unit.h tests/internal/ds4_agent_unit.inc
 	$(CC) $(CFLAGS) -DDS4_NO_GPU -DDS4_AGENT_TEST \
 		-DDS4_AGENT_TEST_NO_MAIN -Wno-unused-function -c -o $@ ds4_agent.c
@@ -690,19 +690,19 @@ ds4_test_core.o: ds4.c ds4.h ds4_ssd.h ds4_profile.h \
 	$(CC) $(CFLAGS) $(QWEN_CFLAGS) -DDS4_NO_GPU -DDS4_TEST_HOOKS \
 		-Wno-unused-function -Wno-unused-parameter -c -o $@ ds4.c
 
-ds4_cli_cpu.o: ds4_cli.c ds4.h ds4_ssd.h ds4_help.h linenoise.h
+ds4_cli_cpu.o: ds4_cli.c ds4.h ds4_ssd.h ds4_help.h hebrus_identity.h linenoise.h
 	$(CC) $(CFLAGS) -DDS4_NO_GPU -c -o $@ ds4_cli.c
 
 ds4_server_cpu.o: ds4_server.c ds4.h ds4_ssd.h ds4_help.h ds4_kvstore.h rax.h
 	$(CC) $(CFLAGS) -DDS4_NO_GPU -c -o $@ ds4_server.c
 
-ds4_bench_cpu.o: ds4_bench.c ds4.h ds4_ssd.h ds4_help.h
+ds4_bench_cpu.o: ds4_bench.c ds4.h ds4_ssd.h ds4_help.h hebrus_identity.h
 	$(CC) $(CFLAGS) -DDS4_NO_GPU -c -o $@ ds4_bench.c
 
-ds4_eval_cpu.o: ds4_eval.c ds4.h ds4_ssd.h ds4_help.h
+ds4_eval_cpu.o: ds4_eval.c ds4.h ds4_ssd.h ds4_help.h hebrus_identity.h
 	$(CC) $(CFLAGS) -DDS4_NO_GPU -c -o $@ ds4_eval.c
 
-ds4_agent_cpu.o: ds4_agent.c ds4.h ds4_ssd.h ds4_help.h ds4_kvstore.h ds4_web.h linenoise.h
+ds4_agent_cpu.o: ds4_agent.c ds4.h ds4_ssd.h ds4_help.h hebrus_identity.h ds4_kvstore.h ds4_web.h linenoise.h
 	$(CC) $(CFLAGS) -DDS4_NO_GPU -c -o $@ ds4_agent.c
 
 ds4_test: ds4_test.o ds4_help.o ds4_kvstore.o rax.o $(CPU_CORE_OBJS)

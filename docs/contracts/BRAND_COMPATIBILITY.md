@@ -30,7 +30,8 @@ decision record, release notes, and a separately tested migration.
 Options, defaults, streams, exit codes, model admission, HTTP protocols,
 generated tokens, and runtime plans must remain equivalent across each pair.
 Only the invoked command identity may differ. `make command-alias-test` checks
-the model-free command surface in both Metal and CPU build profiles.
+the active build profile; macOS `make premerge` also exercises the CPU aliases
+through the build-isolation gate.
 
 ## Structured runtime identity
 
