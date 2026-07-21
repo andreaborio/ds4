@@ -421,6 +421,13 @@
       "maximum": 1
     },
     {
+      "path": "docs/architecture/hebrus-runtime-flow.svg",
+      "location": "content",
+      "token": "ds4",
+      "classification": "serialized/permanent",
+      "maximum": 1
+    },
+    {
       "path": "docs/benchmarks/2026-07-14-m5-pro.md",
       "location": "content",
       "token": "ds4",

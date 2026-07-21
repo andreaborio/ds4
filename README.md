@@ -155,6 +155,8 @@ variables, and serialized `DS4` identifiers are not renamed by this bridge.
 
 ## How the runtime fits together
 
+![Hebrus runtime flow from mmap GGUF through ExpertMajor validation and AUTO to resident Metal or SSD streaming](docs/architecture/hebrus-runtime-flow.svg)
+
 1. The engine mmaps the GGUF and validates the embedded
    `ds4.expert_major.v2` manifest, tensor inventory, geometry, ranges, and
    digest before inference.
@@ -219,6 +221,9 @@ A short-context best is not substituted for the long-context gate.
 
 ### Architecture and evidence
 
+- [Runtime flow diagram](docs/architecture/hebrus-runtime-flow.svg) — accessible,
+  versioned view of mmap GGUF, ExpertMajor validation, AUTO admission, and the
+  resident Metal or SSD-streaming paths.
 - [Code map](docs/architecture/CODEMAP.md)
 - [Hebrus naming and compatibility decision](docs/adr/0005-hebrus-naming-and-compatibility-boundary.md)
 - [Benchmark methodology and records](docs/benchmarks/README.md)

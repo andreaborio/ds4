@@ -13,6 +13,8 @@ RAM/working-set adaptation is isolated in
 [`ADR 0004`](../adr/0004-qwen-metal-hardware-memory-policy.md). The proposed
 Hebrus public-name migration and its immutable compatibility boundary are
 recorded in [`ADR 0005`](../adr/0005-hebrus-naming-and-compatibility-boundary.md).
+For the runtime data and admission path at a glance, see the accessible
+[`mmap → ExpertMajor → AUTO → Metal/SSD flow`](hebrus-runtime-flow.svg).
 
 ## Runtime Entry Points
 

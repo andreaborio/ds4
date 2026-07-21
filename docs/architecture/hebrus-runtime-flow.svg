@@ -1,0 +1,121 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg"
+     viewBox="0 0 1320 640"
+     role="img"
+     aria-labelledby="runtime-flow-title runtime-flow-description">
+  <title id="runtime-flow-title">Hebrus mmap, ExpertMajor, AUTO, Metal, and SSD runtime flow</title>
+  <desc id="runtime-flow-description">
+    A mapped GGUF container passes its embedded routed-weight store through
+    ExpertMajor version 2 validation and indexing. The AUTO planner combines
+    model geometry, context memory, the Metal working-set recommendation, and
+    live host pressure. It admits either a fully resident Metal path or a Metal
+    path with a bounded routed-expert cache filled from SSD. Non-routed tensors
+    remain mapped in the SSD-streaming path.
+  </desc>
+
+  <defs>
+    <marker id="arrow" viewBox="0 0 10 10" refX="8.5" refY="5"
+            markerWidth="8" markerHeight="8" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#344054"/>
+    </marker>
+    <filter id="shadow" x="-10%" y="-10%" width="120%" height="130%">
+      <feDropShadow dx="0" dy="3" stdDeviation="4" flood-color="#101828" flood-opacity="0.10"/>
+    </filter>
+    <style>
+      .canvas { fill: #f8fafc; }
+      .title { fill: #101828; font: 700 30px system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
+      .subtitle { fill: #475467; font: 400 16px system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
+      .stage { fill: #ffffff; stroke: #98a2b3; stroke-width: 1.5; filter: url(#shadow); }
+      .stage-input { stroke: #6172f3; }
+      .stage-contract { stroke: #7f56d9; }
+      .stage-policy { stroke: #1570ef; }
+      .stage-resident { fill: #ecfdf3; stroke: #039855; }
+      .stage-stream { fill: #fffaeb; stroke: #dc6803; }
+      .eyebrow { fill: #475467; font: 700 12px system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; letter-spacing: 1.2px; }
+      .heading { fill: #101828; font: 700 21px system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
+      .body { fill: #344054; font: 400 14px system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
+      .code { fill: #344054; font: 600 13px ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+      .route { fill: none; stroke: #344054; stroke-width: 2.5; marker-end: url(#arrow); }
+      .step { fill: #344054; }
+      .step-number { fill: #ffffff; font: 700 12px system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; text-anchor: middle; dominant-baseline: middle; }
+      .footer-rule { stroke: #d0d5dd; stroke-width: 1; }
+      .footer { fill: #667085; font: 400 12px system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
+    </style>
+  </defs>
+
+  <rect class="canvas" width="1320" height="640" rx="18"/>
+  <text class="title" x="48" y="58">One mapped model, two admitted execution paths</text>
+  <text class="subtitle" x="48" y="88">GGUF stays the container; ExpertMajor validates routed weights; AUTO chooses residency from live constraints.</text>
+
+  <path class="route" d="M 296 278 H 339"/>
+  <path class="route" d="M 596 278 H 639"/>
+  <path class="route" d="M 896 245 C 944 245 945 205 998 205"/>
+  <path class="route" d="M 896 311 C 944 311 945 456 998 456"/>
+
+  <rect class="stage stage-input" x="40" y="145" width="256" height="266" rx="16"/>
+  <circle class="step" cx="68" cy="172" r="14"/>
+  <text class="step-number" x="68" y="172">1</text>
+  <text class="eyebrow" x="92" y="176">CONTAINER</text>
+  <text class="heading" x="64" y="218">mmap GGUF v3</text>
+  <text class="body" x="64" y="254">
+    <tspan x="64" dy="0">• map the model once</tspan>
+    <tspan x="64" dy="29">• keep fixed and non-routed</tspan>
+    <tspan x="78" dy="20">tensors mapped</tspan>
+    <tspan x="64" dy="29">• expose one embedded</tspan>
+    <tspan x="78" dy="20">routed-weight store</tspan>
+  </text>
+  <text class="code" x="64" y="383">GGUF + mapped ranges</text>
+
+  <rect class="stage stage-contract" x="340" y="145" width="256" height="266" rx="16"/>
+  <circle class="step" cx="368" cy="172" r="14"/>
+  <text class="step-number" x="368" y="172">2</text>
+  <text class="eyebrow" x="392" y="176">DISK ABI</text>
+  <text class="heading" x="364" y="218">ExpertMajor v2</text>
+  <text class="body" x="364" y="254">
+    <tspan x="364" dy="0">• validate manifest and</tspan>
+    <tspan x="378" dy="20">model geometry</tspan>
+    <tspan x="364" dy="29">• verify ranges and digest</tspan>
+    <tspan x="364" dy="29">• index routed-expert</tspan>
+    <tspan x="378" dy="20">records before inference</tspan>
+  </text>
+  <text class="code" x="364" y="383">ds4.expert_major.v2</text>
+
+  <rect class="stage stage-policy" x="640" y="145" width="256" height="266" rx="16"/>
+  <circle class="step" cx="668" cy="172" r="14"/>
+  <text class="step-number" x="668" y="172">3</text>
+  <text class="eyebrow" x="692" y="176">ADMISSION</text>
+  <text class="heading" x="664" y="218">AUTO planner</text>
+  <text class="body" x="664" y="254">
+    <tspan x="664" dy="0">• model and context memory</tspan>
+    <tspan x="664" dy="29">• Metal recommended</tspan>
+    <tspan x="678" dy="20">working set</tspan>
+    <tspan x="664" dy="29">• live pressure and</tspan>
+    <tspan x="678" dy="20">required headroom</tspan>
+  </text>
+  <text class="code" x="664" y="383">one fail-closed plan</text>
+
+  <rect class="stage stage-resident" x="1000" y="110" width="280" height="190" rx="16"/>
+  <circle class="step" cx="1028" cy="137" r="14"/>
+  <text class="step-number" x="1028" y="137">4A</text>
+  <text class="eyebrow" x="1054" y="141">EXECUTION</text>
+  <text class="heading" x="1024" y="181">Metal resident</text>
+  <text class="body" x="1024" y="216">
+    <tspan x="1024" dy="0">• full admitted working set</tspan>
+    <tspan x="1024" dy="27">• mapped tensors + Metal buffers</tspan>
+    <tspan x="1024" dy="27">• no routed-expert cache fills</tspan>
+  </text>
+
+  <rect class="stage stage-stream" x="1000" y="360" width="280" height="190" rx="16"/>
+  <circle class="step" cx="1028" cy="387" r="14"/>
+  <text class="step-number" x="1028" y="387">4B</text>
+  <text class="eyebrow" x="1054" y="391">EXECUTION</text>
+  <text class="heading" x="1024" y="431">Metal + SSD streaming</text>
+  <text class="body" x="1024" y="466">
+    <tspan x="1024" dy="0">• non-routed tensors stay mapped</tspan>
+    <tspan x="1024" dy="27">• bounded routed-expert cache</tspan>
+    <tspan x="1024" dy="27">• SSD fills overlap Metal work</tspan>
+  </text>
+
+  <line class="footer-rule" x1="48" y1="586" x2="1272" y2="586"/>
+  <text class="footer" x="48" y="614">AUTO admits exactly one qualified plan or fails closed. The stable spelling above is a serialized disk identifier, not the product brand.</text>
+</svg>
