@@ -13,7 +13,7 @@ typedef enum {
 } ds4_help_tool;
 
 /* Select the public command family from argv[0]. Canonical Hebrus binaries and
- * legacy DS4 symlinks share one object graph, so help text must use the name
+ * legacy command symlinks share one object graph, so help text must use the name
  * through which that graph was invoked. */
 void hebrus_help_set_invocation(const char *argv0);
 

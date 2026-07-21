@@ -481,6 +481,13 @@ static const char *example_command(char *buf, size_t size, ds4_help_tool tool,
     return buf;
 }
 
+static const char *example_root_command(char *buf, size_t size,
+                                        const char *arguments) {
+    snprintf(buf, size, "./%s%s",
+             help_hebrus_invocation ? "hebrus" : "ds4", arguments);
+    return buf;
+}
+
 static void print_examples(FILE *fp, const help_colors *c, ds4_help_tool tool, const char *topic) {
     char command[256];
     title(fp, c, "Examples");
@@ -514,31 +521,31 @@ static void print_examples(FILE *fp, const help_colors *c, ds4_help_tool tool, c
                                                           " -p \"Summarize README\" --power 50"));
         }
     } else if (topic_is(topic, "steering")) {
-        opt(fp, c, "steer FFN", example_command(command, sizeof(command), DS4_HELP_DS4,
-                                                 " -p \"Write tersely\" --dir-steering-file dir.bin --dir-steering-ffn 0.8"));
+        opt(fp, c, "steer FFN", example_root_command(command, sizeof(command),
+                " -p \"Write tersely\" --dir-steering-file dir.bin --dir-steering-ffn 0.8"));
     } else if (tool == DS4_HELP_SERVER || topic_is(topic, "api") || topic_is(topic, "kv-cache")) {
-        opt(fp, c, "local API", example_command(command, sizeof(command), DS4_HELP_SERVER,
+        opt(fp, c, "local API", example_command(command, sizeof(command), tool,
                                                  " --ctx 100000 --kv-disk-dir ~/.ds4/server-kv --kv-disk-space-mb 8192"));
         opt(fp, c, "curl", "curl http://127.0.0.1:8000/v1/models");
     } else if (tool == DS4_HELP_AGENT || topic_is(topic, "sessions") || topic_is(topic, "tools")) {
-        opt(fp, c, "interactive", example_command(command, sizeof(command), DS4_HELP_AGENT, ""));
-        opt(fp, c, "one shot", example_command(command, sizeof(command), DS4_HELP_AGENT,
+        opt(fp, c, "interactive", example_command(command, sizeof(command), tool, ""));
+        opt(fp, c, "one shot", example_command(command, sizeof(command), tool,
                                                 " --non-interactive -p \"Create /tmp/hello.c\""));
     } else if (tool == DS4_HELP_BENCH || topic_is(topic, "benchmark")) {
-        opt(fp, c, "csv", example_command(command, sizeof(command), DS4_HELP_BENCH,
+        opt(fp, c, "csv", example_command(command, sizeof(command), tool,
                                            " --prompt-file long.txt --ctx-max 32768 --csv speed.csv"));
-        opt(fp, c, "prefill only", example_command(command, sizeof(command), DS4_HELP_BENCH,
+        opt(fp, c, "prefill only", example_command(command, sizeof(command), tool,
                                                     " --prompt-file long.txt --gen-tokens 0"));
     } else if (tool == DS4_HELP_EVAL || topic_is(topic, "evaluation")) {
-        opt(fp, c, "first 10", example_command(command, sizeof(command), DS4_HELP_EVAL,
+        opt(fp, c, "first 10", example_command(command, sizeof(command), tool,
                                                 " --questions 10 --trace eval.trace"));
-        opt(fp, c, "plain", example_command(command, sizeof(command), DS4_HELP_EVAL,
+        opt(fp, c, "plain", example_command(command, sizeof(command), tool,
                                              " --plain --nothink --tokens 512"));
     } else {
-        opt(fp, c, "chat", example_command(command, sizeof(command), DS4_HELP_DS4, ""));
-        opt(fp, c, "one shot", example_command(command, sizeof(command), DS4_HELP_DS4,
+        opt(fp, c, "chat", example_command(command, sizeof(command), tool, ""));
+        opt(fp, c, "one shot", example_command(command, sizeof(command), tool,
                                                 " -p \"Explain mmap in C\""));
-        opt(fp, c, "long prompt", example_command(command, sizeof(command), DS4_HELP_DS4,
+        opt(fp, c, "long prompt", example_command(command, sizeof(command), tool,
                                                    " --think-max --prompt-file prompt.txt --ctx 393216"));
     }
     fputc('\n', fp);

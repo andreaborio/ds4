@@ -27,6 +27,62 @@
   },
   "entries": [
     {
+      "path": ".github/ISSUE_TEMPLATE/bug_report.yml",
+      "location": "content",
+      "token": "ds4",
+      "classification": "compatibility",
+      "maximum": 3
+    },
+    {
+      "path": ".github/ISSUE_TEMPLATE/config.yml",
+      "location": "content",
+      "token": "ds4",
+      "classification": "compatibility",
+      "maximum": 2
+    },
+    {
+      "path": ".github/ISSUE_TEMPLATE/feature_request.yml",
+      "location": "content",
+      "token": "ds4",
+      "classification": "compatibility",
+      "maximum": 2
+    },
+    {
+      "path": ".github/ISSUE_TEMPLATE/feature_request.yml",
+      "location": "content",
+      "token": "DS4",
+      "classification": "compatibility",
+      "maximum": 1
+    },
+    {
+      "path": ".github/ISSUE_TEMPLATE/performance_report.yml",
+      "location": "content",
+      "token": "ds4",
+      "classification": "compatibility",
+      "maximum": 1
+    },
+    {
+      "path": ".github/ISSUE_TEMPLATE/performance_report.yml",
+      "location": "content",
+      "token": "DS4",
+      "classification": "compatibility",
+      "maximum": 1
+    },
+    {
+      "path": ".github/pull_request_template.md",
+      "location": "content",
+      "token": "ds4",
+      "classification": "compatibility",
+      "maximum": 1
+    },
+    {
+      "path": ".github/pull_request_template.md",
+      "location": "content",
+      "token": "DS4",
+      "classification": "compatibility",
+      "maximum": 1
+    },
+    {
       "path": ".gitignore",
       "location": "content",
       "token": "ds4",
@@ -45,7 +101,7 @@
       "location": "content",
       "token": "ds4",
       "classification": "compatibility",
-      "maximum": 3
+      "maximum": 6
     },
     {
       "path": "CHANGELOG.md",
@@ -290,7 +346,7 @@
       "location": "content",
       "token": "ds4",
       "classification": "migration-pending",
-      "maximum": 81
+      "maximum": 82
     },
     {
       "path": "docs/ENGINE_REFERENCE.md",
@@ -759,7 +815,7 @@
       "location": "content",
       "token": "ds4",
       "classification": "migration-pending",
-      "maximum": 25
+      "maximum": 26
     },
     {
       "path": "ds4_build.c",
@@ -885,7 +941,7 @@
       "location": "content",
       "token": "ds4",
       "classification": "migration-pending",
-      "maximum": 57
+      "maximum": 32
     },
     {
       "path": "ds4_help.c",
@@ -893,13 +949,6 @@
       "token": "DS4",
       "classification": "migration-pending",
       "maximum": 81
-    },
-    {
-      "path": "ds4_help.c",
-      "location": "content",
-      "token": "DwarfStar",
-      "classification": "migration-pending",
-      "maximum": 2
     },
     {
       "path": "ds4_help.h",
@@ -2208,7 +2257,7 @@
       "location": "content",
       "token": "ds4",
       "classification": "compatibility",
-      "maximum": 6
+      "maximum": 9
     },
     {
       "path": "tests/test_command_aliases.py",
@@ -2390,7 +2439,7 @@
       "location": "content",
       "token": "ds4",
       "classification": "compatibility",
-      "maximum": 10
+      "maximum": 5
     },
     {
       "path": "tests/test_retired_distributed_flags.sh",
