@@ -48,8 +48,9 @@ SHA-256, manifest contract, and compatible runtime commit are one release gate.
 
 ## 1. Repository And Build Sanity
 
-- Start from a clean tree except intentional release notes:
-  `git status --short`.
+- Start from the exact clean committed release tree. Release notes and every
+  other intentional change must be committed first; untracked files are not
+  allowed: `test -z "$(git status --porcelain)"`.
 - Build the normal local target:
   `make clean && make`.
 - Prove macOS Metal/CPU artifact isolation:
@@ -80,14 +81,25 @@ SHA-256, manifest contract, and compatible runtime commit are one release gate.
   readable section colors and no broken wrapping.
 - On a qualified Qwen host, run the two server names sequentially against the
   exact published artifact and compare model discovery, one seeded greedy chat
-  completion, graceful shutdown, and exit status:
-  `QWEN_V2="$QWEN_V2" SERVER_ALIAS_EVIDENCE_DIR="/tmp/hebrus-server-alias-$(git rev-parse --short=12 HEAD)" make server-alias-model-test`.
+  completion, graceful shutdown, and exit status. Set
+  `RELEASE_EVIDENCE_ROOT` explicitly to a persistent, release-owned absolute
+  directory outside the checkout, then run:
+  `QWEN_V2="$QWEN_V2" SERVER_ALIAS_EVIDENCE_DIR="$RELEASE_EVIDENCE_ROOT/hebrus-server-alias-$(git rev-parse --short=12 HEAD)" make server-alias-model-test`.
   The opt-in target rejects a dirty or wrong engine build, validates Metal
   capabilities before loading the model, selects an unused local port by
   default, and retains its JSON report and logs. The evidence directory must
-  not already exist. This is model-backed correctness evidence, not a
-  performance benchmark, and the target is intentionally excluded from
-  `premerge`.
+  not already exist. Archive the complete evidence directory only when the
+  report is final `PASS` and
+  `server-alias-evidence-manifest.json` is present; verify every artifact hash
+  and the manifest's deterministic `bundle_sha256`, defined as SHA-256 over
+  compact sorted-key JSON containing only `schema_version` and `artifacts`.
+  `RUNNING`, a missing or invalid manifest, and every `FAIL` report are invalid
+  release evidence. The report records non-sensitive architecture, memory,
+  OS/build, and available
+  power metadata, but the release record must still identify the hardware
+  model and explain unavailable fields. This is model-backed correctness
+  evidence, not a performance benchmark, and the target is intentionally
+  excluded from `premerge`.
 
 ## 2. Core Regression Tests
 

@@ -8,6 +8,7 @@ import hashlib
 import json
 import os
 import pathlib
+import platform
 import re
 import signal
 import socket
@@ -19,12 +20,16 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from dataclasses import dataclass
-from typing import Any, Mapping
+from typing import Any, Callable, Mapping, Sequence
 
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 MODEL_CONTRACT = ROOT / "docs" / "contracts" / "qwen-release.json"
 DEFAULT_LOCK_FILE = "/tmp/ds4.lock"
+CANONICAL_SERVER_NAME = "hebrus-server"
+LEGACY_SERVER_NAME = "ds4-server"
+EXPECTED_COMPLETION_MARKER = "HEBRUS ALIAS PARITY OK"
+EVIDENCE_MANIFEST_NAME = "server-alias-evidence-manifest.json"
 VOLATILE_COMPLETION_KEYS = frozenset({"id", "created"})
 LOCAL_HTTP_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 
@@ -51,6 +56,7 @@ def termination_signal_handler(signum: int, _frame: Any) -> None:
 
 
 def install_termination_signal_handlers() -> None:
+    signal.signal(signal.SIGINT, termination_signal_handler)
     signal.signal(signal.SIGTERM, termination_signal_handler)
     if hasattr(signal, "SIGHUP"):
         signal.signal(signal.SIGHUP, termination_signal_handler)
@@ -143,6 +149,141 @@ def normalize_completion(document: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def validate_completion_content(
+    document: dict[str, Any], binary_name: str
+) -> str:
+    choices = document.get("choices")
+    if not isinstance(choices, list) or len(choices) != 1:
+        raise AssertionError(
+            f"{binary_name}: completion must contain exactly one choice"
+        )
+    choice = choices[0]
+    if not isinstance(choice, dict):
+        raise AssertionError(f"{binary_name}: completion choice is not an object")
+    message = choice.get("message")
+    if not isinstance(message, dict):
+        raise AssertionError(f"{binary_name}: completion choice has no message object")
+    content = message.get("content")
+    if not isinstance(content, str) or not content.strip():
+        raise AssertionError(f"{binary_name}: completion content is empty or missing")
+    normalized = content.strip()
+    if normalized != EXPECTED_COMPLETION_MARKER:
+        raise AssertionError(
+            f"{binary_name}: completion content does not exactly match "
+            f"{EXPECTED_COMPLETION_MARKER!r}"
+        )
+    return normalized
+
+
+def command_output(argv: Sequence[str]) -> str | None:
+    try:
+        result = subprocess.run(
+            list(argv),
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if result.returncode != 0:
+        return None
+    output = result.stdout.strip()
+    return output or None
+
+
+def parse_battery_status(output: str | None) -> dict[str, Any]:
+    status: dict[str, Any] = {
+        "source": None,
+        "battery_percent": None,
+        "battery_state": None,
+    }
+    if not output:
+        return status
+    source_match = re.search(r"Now drawing from '([^']+)'", output)
+    if source_match is not None:
+        status["source"] = source_match.group(1)
+    percent_match = re.search(r"\b(\d{1,3})%;\s*([^;\n]+)", output)
+    if percent_match is not None:
+        percent = int(percent_match.group(1))
+        if 0 <= percent <= 100:
+            status["battery_percent"] = percent
+        state = percent_match.group(2).strip()
+        status["battery_state"] = state or None
+    return status
+
+
+def parse_powermode(output: str | None, power_source: object) -> int | None:
+    if not output:
+        return None
+    modes: dict[str, int] = {}
+    current_source: str | None = None
+    for line in output.splitlines():
+        stripped = line.strip()
+        if stripped.endswith("Power:"):
+            current_source = stripped[:-1]
+            continue
+        match = re.fullmatch(r"powermode\s+(\d+)", stripped)
+        if match is not None:
+            modes[current_source or ""] = int(match.group(1))
+    if isinstance(power_source, str) and power_source in modes:
+        return modes[power_source]
+    unique_modes = set(modes.values())
+    if len(unique_modes) == 1:
+        return unique_modes.pop()
+    return None
+
+
+def parse_positive_integer(value: str | None) -> int | None:
+    if value is None or re.fullmatch(r"[1-9][0-9]*", value) is None:
+        return None
+    return int(value)
+
+
+def collect_host_metadata(
+    reader: Callable[[Sequence[str]], str | None] = command_output,
+    *,
+    system_name: str | None = None,
+    architecture: str | None = None,
+) -> dict[str, Any]:
+    system = system_name if system_name is not None else platform.system()
+    machine = architecture if architecture is not None else platform.machine()
+    battery = parse_battery_status(reader(("pmset", "-g", "batt")))
+    power_source = battery["source"]
+    battery["powermode"] = parse_powermode(
+        reader(("pmset", "-g", "custom")), power_source
+    )
+    return {
+        "architecture": machine,
+        "hardware_model": reader(("sysctl", "-n", "hw.model")),
+        "chip": reader(("sysctl", "-n", "machdep.cpu.brand_string")),
+        "physical_memory_bytes": parse_positive_integer(
+            reader(("sysctl", "-n", "hw.memsize"))
+        ),
+        "os": {
+            "name": "macOS" if system == "Darwin" else system,
+            "version": reader(("sw_vers", "-productVersion")),
+            "build": reader(("sw_vers", "-buildVersion")),
+        },
+        "power": battery,
+    }
+
+
+def validate_qualified_host(host: Mapping[str, Any], expected_backend: str) -> None:
+    operating_system = host.get("os")
+    if expected_backend != "metal":
+        raise AssertionError("model-backed server parity requires the Metal backend")
+    if host.get("architecture") != "arm64":
+        raise AssertionError("model-backed server parity requires an arm64 host")
+    if not isinstance(operating_system, Mapping) or operating_system.get("name") != "macOS":
+        raise AssertionError("model-backed server parity requires macOS")
+    if not operating_system.get("version") or not operating_system.get("build"):
+        raise AssertionError("qualified host OS version/build metadata is unavailable")
+    memory = host.get("physical_memory_bytes")
+    if type(memory) is not int or memory <= 0:
+        raise AssertionError("qualified host physical memory metadata is unavailable")
+
+
 def build_environment(source: Mapping[str, str]) -> tuple[dict[str, str], list[str]]:
     environment: dict[str, str] = {}
     removed: list[str] = []
@@ -172,6 +313,41 @@ def write_report(path: pathlib.Path, report: dict[str, Any]) -> None:
         json.dumps(report, indent=2, sort_keys=True) + "\n", encoding="utf-8"
     )
     temporary.replace(path)
+
+
+def build_evidence_manifest(evidence_dir: pathlib.Path) -> dict[str, Any]:
+    artifacts: list[dict[str, Any]] = []
+    for path in sorted(evidence_dir.iterdir(), key=lambda candidate: candidate.name):
+        if (
+            not path.is_file()
+            or path.name == EVIDENCE_MANIFEST_NAME
+            or path.name.startswith(".")
+        ):
+            continue
+        artifacts.append(
+            {
+                "path": path.name,
+                "bytes": path.stat().st_size,
+                "sha256": sha256(path),
+            }
+        )
+    core: dict[str, Any] = {
+        "schema_version": 1,
+        "artifacts": artifacts,
+    }
+    canonical = json.dumps(
+        core, sort_keys=True, separators=(",", ":"), ensure_ascii=True
+    ).encode("utf-8")
+    return {
+        **core,
+        "bundle_sha256": hashlib.sha256(canonical).hexdigest(),
+    }
+
+
+def write_evidence_manifest(evidence_dir: pathlib.Path) -> pathlib.Path:
+    manifest_path = evidence_dir / EVIDENCE_MANIFEST_NAME
+    write_report(manifest_path, build_evidence_manifest(evidence_dir))
+    return manifest_path
 
 
 def validate_requested_port(port: int) -> None:
@@ -260,6 +436,25 @@ def repository_head(root: pathlib.Path = ROOT) -> str:
     if result.returncode != 0 or re.fullmatch(r"[0-9a-f]{40}", head) is None:
         raise AssertionError(f"cannot resolve candidate repository HEAD: {result.stderr.strip()}")
     return head
+
+
+def assert_clean_repository(root: pathlib.Path = ROOT) -> None:
+    result = subprocess.run(
+        ["git", "status", "--porcelain", "--untracked-files=normal"],
+        cwd=root,
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+    if result.returncode != 0:
+        raise AssertionError(
+            f"cannot inspect candidate repository state: {result.stderr.strip()}"
+        )
+    if result.stdout:
+        raise AssertionError(
+            "candidate repository must be an exact clean committed tree"
+        )
 
 
 def validate_capability_document(
@@ -503,6 +698,9 @@ def run_server(
                 },
                 timeout=request_timeout,
             )
+            completion_content = validate_completion_content(
+                completion, binary.name
+            )
         finally:
             exit_code = terminate_process(process, binary.name, shutdown_timeout)
     wait_for_port_closed(port)
@@ -523,6 +721,7 @@ def run_server(
         "models": models,
         "model": model_document,
         "completion": normalize_completion(completion),
+        "completion_content": completion_content,
         "log": str(log_path),
         "exit_code": exit_code,
     }
@@ -558,8 +757,9 @@ def main() -> int:
     evidence_dir = prepare_evidence_dir(args.evidence_dir)
     report_path = evidence_dir / "server-alias-parity.json"
     report: dict[str, Any] = {
-        "schema_version": 2,
+        "schema_version": 3,
         "status": "RUNNING",
+        "evidence_manifest": EVIDENCE_MANIFEST_NAME,
         "results": {},
     }
     write_report(report_path, report)
@@ -567,19 +767,26 @@ def main() -> int:
     install_termination_signal_handlers()
 
     try:
+        host = collect_host_metadata()
+        report["host"] = host
+        write_report(report_path, report)
+        validate_qualified_host(host, args.expected_backend)
+
         bin_dir = args.bin_dir.expanduser().resolve(strict=True)
-        canonical = bin_dir / "hebrus-server"
-        legacy = bin_dir / "ds4-server"
+        canonical = bin_dir / CANONICAL_SERVER_NAME
+        legacy = bin_dir / LEGACY_SERVER_NAME
         if (
             not canonical.is_file()
             or not legacy.is_file()
             or not os.path.samefile(canonical, legacy)
         ):
             raise AssertionError(
-                "hebrus-server and ds4-server are not one executable surface"
+                f"{CANONICAL_SERVER_NAME} and {LEGACY_SERVER_NAME} "
+                "are not one executable surface"
             )
 
         candidate_head = repository_head()
+        assert_clean_repository()
         if not build_sha_matches(candidate_head, args.expected_build_sha):
             raise AssertionError(
                 f"candidate repository HEAD {candidate_head!r} does not match "
@@ -593,6 +800,7 @@ def main() -> int:
                     "expected_backend": args.expected_backend,
                     "expected_build_sha": args.expected_build_sha,
                     "repository_head": candidate_head,
+                    "repository_clean": True,
                     "binary_sha256": binary_hash,
                 },
                 "environment": {
@@ -657,25 +865,42 @@ def main() -> int:
                 raise AssertionError("Qwen artifact changed during alias parity gate")
             write_report(report_path, report)
 
-        for field in ("models", "model", "completion", "exit_code"):
+        for field in (
+            "models",
+            "model",
+            "completion",
+            "completion_content",
+            "exit_code",
+        ):
             if results[canonical.name][field] != results[legacy.name][field]:
                 raise AssertionError(
                     f"server aliases differ for {field}; see {report_path}"
                 )
         if repository_head() != candidate_head:
             raise AssertionError("candidate repository HEAD changed during alias parity gate")
+        assert_clean_repository()
 
         report["status"] = "PASS"
         write_report(report_path, report)
+        manifest_path = write_evidence_manifest(evidence_dir)
         print(
             f"server-alias-model: PASS "
-            f"({canonical.name}/{legacy.name}, {report_path})"
+            f"({canonical.name}/{legacy.name}, {report_path}, {manifest_path})"
         )
         return 0
-    except Exception as exc:
+    except BaseException as exc:
         report["status"] = "FAIL"
-        report["error"] = f"{type(exc).__name__}: {exc}"
+        detail = str(exc) or "interrupted"
+        report["error"] = f"{type(exc).__name__}: {detail}"
         write_report(report_path, report)
+        try:
+            write_evidence_manifest(evidence_dir)
+        except Exception as manifest_exc:
+            print(
+                f"server-alias-model: failed to write evidence manifest: "
+                f"{manifest_exc}",
+                file=sys.stderr,
+            )
         print(f"server-alias-model: evidence retained at {report_path}", file=sys.stderr)
         raise
 
@@ -683,6 +908,9 @@ def main() -> int:
 if __name__ == "__main__":
     try:
         raise SystemExit(main())
+    except KeyboardInterrupt as exc:
+        print(f"server-alias-model: FAIL: {exc or 'interrupted'}", file=sys.stderr)
+        raise SystemExit(130)
     except (
         AssertionError,
         OSError,
