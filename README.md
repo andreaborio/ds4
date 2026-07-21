@@ -1,580 +1,228 @@
-<h1 align="center">DwarfStar</h1>
+# Hebrus
 
-<p align="center"><strong>ExpertMajor v2 inference for large MoE models on Apple Metal.</strong></p>
+**Local inference built first for Apple Metal and SSD streaming.**
 
-<p align="center">
-  A transparent research and co-development fork of
-  <a href="https://github.com/antirez/ds4">antirez/ds4</a>, focused on Metal,
-  adaptive SSD streaming, Apple Silicon systems, and measured experimentation.
-</p>
+Hebrus is a focused inference engine for running a small, explicitly qualified
+set of large mixture-of-experts models on Apple Silicon. It combines mmap-backed
+GGUF loading, an embedded ExpertMajor v2 routed-weight store, Metal execution,
+and adaptive SSD streaming so unified memory is a performance tier rather than
+the only capacity boundary.
 
-<p align="center">
-  <a href="LICENSE"><img alt="MIT license" src="https://img.shields.io/badge/license-MIT-1b1b1b?style=flat-square"></a>
-  <img alt="Apple Metal primary target" src="https://img.shields.io/badge/Metal-primary-1b1b1b?style=flat-square&logo=apple">
-  <img alt="ExpertMajor v2 model format" src="https://img.shields.io/badge/ExpertMajor-v2-1b1b1b?style=flat-square">
-  <img alt="Project status beta" src="https://img.shields.io/badge/status-beta-orange?style=flat-square">
-</p>
+[Quick start](#quick-start) · [Supported models](#supported-models) ·
+[Measured results](#measured-results) · [Documentation](#documentation) ·
+[Contributing](CONTRIBUTING.md)
 
-<p align="center">
-  <a href="#quick-start"><strong>Quick start</strong></a>
-  · <a href="#measured-results">Benchmarks</a>
-  · <a href="#model-status">Models</a>
-  · <a href="https://github.com/andreaborio/dsbox">DSBox</a>
-  · <a href="https://github.com/antirez/ds4/compare/main...andreaborio:ds4:main">Upstream diff</a>
-  · <a href="#documentation">Documentation</a>
-</p>
+> [!NOTE]
+> Hebrus is the working public engine name and the canonical executable
+> namespace in the current bridge. The repository is still
+> [`andreaborio/ds4`](https://github.com/andreaborio/ds4), and
+> [ADR 0005](docs/adr/0005-hebrus-naming-and-compatibility-boundary.md) remains
+> **Proposed** while identity screening and the companion-application bridge are
+> incomplete. This repository has not been administratively renamed.
 
 > [!IMPORTANT]
-> This is [`andreaborio/ds4`](https://github.com/andreaborio/ds4), a fork of
-> [`antirez/ds4`](https://github.com/antirez/ds4). It does **not** aim to replace
-> upstream. The goal is to co-develop DwarfStar: explore complementary hardware
-> and model paths here, then propose every general, reproducible improvement back
-> to upstream when it clears the correctness and performance bar.
+> Hebrus began as a fork of
+> [`antirez/ds4`](https://github.com/antirez/ds4) and retains substantial
+> core-engine implementation, Git history, and design work from that project.
+> The fork has since diverged toward Apple Metal, embedded ExpertMajor storage,
+> and SSD-first execution. This attribution does not imply endorsement by or an
+> official partnership with the upstream maintainer. See
+> [Acknowledgments](ACKNOWLEDGMENTS.md) and
+> [Third-party notices](THIRD_PARTY_NOTICES.md) for the precise source scopes.
 
-DwarfStar is a small, self-contained inference engine optimized around a narrow
-set of very large models. It includes native model loading, prompt rendering,
-tool calling, RAM/on-disk KV state, an HTTP server, a coding agent, GGUF tooling,
-and correctness and speed tests. It is intentionally **not** a generic GGUF
-runner; arbitrary GGUF files are not expected to work.
+## What Hebrus is for
 
-## Why this fork exists
+Hebrus is designed around one practical question: how effectively can large
+MoE models run locally when Metal and the SSD are treated as one coordinated
+memory system?
 
-Upstream DwarfStar provides the core engine and leads the high-memory and
-distributed paths. This fork asks a complementary question:
+- **Metal-first inference.** Production model execution targets Apple Metal.
+- **SSD streaming as a first-class path.** Routed experts can be cached and
+  streamed without keeping the complete model in unified memory.
+- **Hardware-aware AUTO policy.** Residency and cache plans use model geometry,
+  context memory, Metal's working-set recommendation, and live memory pressure.
+- **One validated routed-weight container.** Supported artifacts embed the
+  checksummed `ds4.expert_major.v2` store directly in GGUF.
+- **Narrow support, explicit failure.** Unsupported model families, old stores,
+  sidecars, and unqualified backend combinations fail closed instead of taking
+  an untested fallback.
+- **Evidence before claims.** Correctness and performance decisions are tied to
+  exact commits, model hashes, hardware, prompts, memory state, and context
+  frontiers.
 
-**How far can the same specialized design be pushed across Apple Silicon memory
-tiers, when the SSD becomes an active model-memory tier?**
+Hebrus is not a general GGUF runner. Arbitrary community GGUFs are not expected
+to load, even when their model family name looks compatible.
 
-The current work concentrates on:
+## Supported models
 
-- adaptive Metal residency and routed-expert cache policies across memory tiers;
-- SSD streaming that accounts for page cache, wired memory, swap, I/O, and
-  throughput together;
-- safer model-backed experiments near macOS memory limits;
-- one validated ExpertMajor v2 storage contract for DeepSeek, GLM, and Qwen;
-- GGUF calibration, incremental quantization, and expert-analysis tooling;
-- keeping useful changes small enough to validate and send upstream.
+The current production contract is Apple Silicon + Metal + embedded
+ExpertMajor v2. AUTO is the normal startup mode.
 
-This is primarily a learning and systems-research project. The fork lets work
-continue while upstream changes are under review; it is not a parallel rewrite
-or a competing inference ecosystem.
+| Model family | Minimum unified memory | Qualified execution | Artifact availability |
+| --- | ---: | --- | --- |
+| DeepSeek V4 Flash | 64 GiB | AUTO resolving to resident or SSD; explicit modes for qualification | Published ExpertMajor v2 artifact; `download_model.sh deepseek-v2` |
+| GLM 5.2 | 64 GiB | AUTO resolving to SSD streaming only; resident requests are rejected | Published ExpertMajor v2 artifact; `download_model.sh glm-v2` |
+| Qwen3.6-35B-A3B | 16 GiB | AUTO resolving to resident or SSD; 16 GiB necessarily uses SSD | Published MLX affine4/group-64 artifact; `download_model.sh qwen-v2` |
 
-## Co-development with upstream
+The Qwen release is exactly
+`Qwen3.6-35B-A3B-DS4-ExpertMajor-v2-MLX-Affine4-G64.gguf`,
+20,808,566,880 bytes, SHA-256
+`dd17266185833a9f05531ce366fd7284ddca1ed64aa3dcf06e321e8c72c9ea3d`.
+It is pinned to immutable repository revision
+`7bf9c3f7f6136aeb2599d75ee61c0cc2f18e2b02`. The older Q4_K_S store is
+incompatible with the current runtime and remains only a fail-closed negative
+case.
 
-The boundary is explicit and reviewable:
+DeepSeek V4 PRO has no qualified runtime artifact in the current contract.
+Canonical model files are converter inputs, not inference fallbacks. CPU is a
+reference and build-isolation path; CUDA and ROCm are frozen with source absent;
+distributed inference is retired.
 
-| Change type | Where it belongs |
-| --- | --- |
-| General, reproducible, backend-safe improvement | Open a PR against [`antirez/ds4`](https://github.com/antirez/ds4) |
-| Model- or hardware-specific experiment | Keep it isolated while evidence is incomplete; open an upstream PR too whenever it applies to an upstream-supported path |
-| Change that regresses an existing path | Do not promote it; isolate or revise it first |
-| Change already solved upstream | Take the upstream implementation and remove the fork delta |
-
-This is mandatory, not aspirational: every fork change applicable to an
-upstream-supported path will be opened upstream once its scope, correctness,
-and performance evidence are ready. Fork development can continue while that
-review is in progress.
-
-Current upstream work includes [#434](https://github.com/antirez/ds4/pull/434)
-(quality-score build fix), [#520](https://github.com/antirez/ds4/pull/520)
-(GLM streamed-prefill correctness), and
-[#528](https://github.com/antirez/ds4/pull/528) (GLM indexed-prefill prepare).
-The DeepSeek regression found on the GLM line is tracked in
-[#532](https://github.com/antirez/ds4/issues/532). See
-[`FORK_NOTES.md`](FORK_NOTES.md) for the status of each fork change and
-[`MERGE_LOG.md`](MERGE_LOG.md) for sync history. The same policy is part of
-[`CONTRIBUTING.md`](CONTRIBUTING.md). The current `main` delta is always
-inspectable in GitHub's
-[upstream/fork comparison](https://github.com/antirez/ds4/compare/main...andreaborio:ds4:main).
+The authoritative details are in the
+[runtime support contract](docs/contracts/RUNTIME_SUPPORT.md).
 
 ## Quick start
 
-Requirements: Apple Silicon, Xcode Command Line Tools, an ExpertMajor v2 GGUF,
-and enough SSD space for the selected model. DeepSeek and GLM currently require
-at least 64 GiB. Qwen's hardware-aware AUTO path starts at 16 GiB and chooses
-resident or SSD from the active Metal and live-memory budgets.
+Requirements:
+
+- Apple Silicon Mac;
+- Xcode Command Line Tools;
+- enough unified memory for the selected supported family;
+- enough SSD space for the exact ExpertMajor v2 artifact.
+
+Build and verify the engine without loading model weights:
 
 ```sh
 xcode-select --install
 git clone https://github.com/andreaborio/ds4.git
 cd ds4
 
-make -j8
+make -j
 ./hebrus --build-info
-./hebrus-server --capabilities=json
-./download_model.sh qwen-v2
+./hebrus --capabilities=json
+make model-free-test
+```
+
+For a published DeepSeek V4 Flash artifact on a qualified 64 GiB-or-larger
+host:
+
+```sh
+./download_model.sh deepseek-v2
+
 ./hebrus \
-  -m gguf/Qwen3.6-35B-A3B-DS4-ExpertMajor-v2-MLX-Affine4-G64.gguf \
+  -m gguf/DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix-DS4-ExpertMajor-v2.gguf \
+  --ctx 8192 \
+  -p "Explain why SSD streaming changes the memory limit for MoE inference."
+```
+
+Start the local HTTP server with the same artifact:
+
+```sh
+./hebrus-server \
+  -m gguf/DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix-DS4-ExpertMajor-v2.gguf \
   --ctx 8192
 ```
 
-`download_model.sh deepseek-v2`, `download_model.sh glm-v2`, and
-`download_model.sh qwen-v2` install revision-pinned release artifacts and
-verify their complete byte size and SHA-256 before returning success.
+The canonical commands are `hebrus`, `hebrus-server`, `hebrus-agent`,
+`hebrus-bench`, and `hebrus-eval`. Their `ds4*` counterparts remain symlinks to
+the same binaries for compatibility; formats, model filenames, environment
+variables, and serialized `DS4` identifiers are not renamed by this bridge.
 
-`hebrus`, `hebrus-server`, `hebrus-agent`, `hebrus-bench`, and `hebrus-eval`
-are the canonical command names. The corresponding `ds4*` names remain direct
-aliases to the same binaries for existing installations and automation. During
-this bridge tranche their help, diagnostics, build identity, and capability
-`engine_id` intentionally remain compatibility-identical.
+## How the runtime fits together
 
-On macOS, AUTO residency keeps the model resident when it safely fits.
-Otherwise it selects SSD streaming and derives an expert-cache budget from the
-model geometry and live host memory. Force the SSD path only when you need a
-controlled run:
+1. The engine mmaps the GGUF and validates the embedded
+   `ds4.expert_major.v2` manifest, tensor inventory, geometry, ranges, and
+   digest before inference.
+2. AUTO calculates fixed model and context memory, Metal headroom, live host
+   pressure, and the model-specific residency policy.
+3. When the complete admitted working set fits, Metal uses full mapped tensors.
+   Otherwise, the runtime keeps non-routed state mapped and streams routed
+   expert records through a bounded cache.
+4. CLI, HTTP server, agent, benchmark, and evaluation frontends share the same
+   engine and capability contract.
 
-```sh
-./hebrus -m /absolute/path/to/MODEL-DS4-ExpertMajor-v2.gguf \
-  --ssd-streaming --ctx 8192
-```
-
-Start the local API with:
-
-```sh
-./hebrus-server -m /absolute/path/to/MODEL-DS4-ExpertMajor-v2.gguf --ctx 8192
-```
-
-## How SSD streaming uses memory
-
-```mermaid
-flowchart LR
-    GGUF["Model GGUF on SSD"] --> AUTO["AUTO memory planner"]
-    AUTO -->|"safe fit"| RES["Resident model"]
-    AUTO -->|"model exceeds budget"| STREAM["SSD-streamed model"]
-    STREAM --> FIXED["Mapped fixed / non-routed state"]
-    STREAM --> CACHE["Adaptive routed-expert cache"]
-    GGUF -->|"cache miss"| CACHE
-    FIXED --> METAL["Metal graph"]
-    CACHE --> METAL
-    METAL --> TOKEN["Next token"]
-```
-
-The fixed model state, KV cache, graph scratch, and macOS file-backed cache all
-need headroom. The routed-expert cache is the variable tier; making it larger
-can help only until it starts displacing the pages and allocations the rest of
-the runtime needs.
-
-## Model status
-
-| Model | Location | Status | Current focus |
-| --- | --- | --- | --- |
-| DeepSeek V4 Flash ExpertMajor v2 | `main` | Supported Apple Metal resident/SSD path | Adaptive SSD streaming and grouped prefill |
-| DeepSeek V4 PRO ExpertMajor v2 | offline tooling only | Not runtime-qualified; no release artifact identity | Converter and future per-artifact qualification |
-| GLM 5.2 ExpertMajor v2 | `main` | Qualified Apple Metal SSD path; 64 GB minimum | Embedded expert store, grouped prefill, compact DSA KV, 601-record DS4 cache plus adaptive macOS file caching |
-| Qwen3.6-35B-A3B ExpertMajor v2 affine4/group-64 | `main` | Supported Apple Metal resident/SSD path; 16 GiB minimum | One AUTO configuration, MLX-affine resident/SSD kernels, and read-once macro prefill |
-
-### DeepSeek expert-major v2 format
-
-DS4 uses the self-describing `ds4.expert_major.v2` layout for DeepSeek V4. It
-stores each layer as adjacent gate/up/down expert records without requantizing
-and without keeping a second routed-weight copy. The runtime accepts only the
-native v2 artifact on Apple Metal. Canonical GGUFs are converter inputs, not an
-inference fallback; CPU, CUDA, ROCm, distributed, v1, and sidecar paths fail
-closed.
-
-Conversion, full byte-level verification, admission limits, and the
-model-backed promotion gate are in
-[`docs/deepseek-expert-major-v2.md`](docs/deepseek-expert-major-v2.md). The first
-M5 Pro SSD tranche is recorded in
-[`docs/benchmarks/2026-07-17-deepseek-native-expert-major.md`](docs/benchmarks/2026-07-17-deepseek-native-expert-major.md).
-The distinctly named v2 artifact is
-[`DeepSeek-V4-Flash-DS4-GGUF`](https://huggingface.co/andreaborio/DeepSeek-V4-Flash-DS4-GGUF),
-with full conversion provenance and runtime limits in its model card.
-
-### GLM 5.2 ExpertMajor v2
-
-The 262,147,193,504-byte GLM release stores its 76 × 256 routed experts once,
-inside the GGUF, in the physical order used by Metal prefill and decode. It
-does not need a sidecar or ExpertMajor environment variables. The qualified
-tier is an Apple Silicon Mac with at least 64 GiB of unified memory. GLM in
-this repo intentionally supports only the ExpertMajor v2 Metal SSD path:
-
-```sh
-make -j8
-./ds4 \
-  -m /absolute/path/to/GLM-5.2-DS4-ExpertMajor-v2-Q2_K.gguf \
-  --ctx 8192
-```
-
-The artifact is
-[`andreaborio/GLM-5.2-DS4-GGUF`](https://huggingface.co/andreaborio/GLM-5.2-DS4-GGUF),
-SHA-256
-`7f5017e3076e706c78f2a5322b035a9e2f6519c65ff5b6be8b2d91aeff61505d`.
-The simple command automatically selects Metal, SSD residency, the GLM Gold
-profile, the measured 601-expert cache on the 64 GiB tier, indexed preparation,
-grouped native prefill, contiguous-record decode reads, and compact DSA KV.
-Canonical GLM GGUFs and non-Metal/distributed execution fail closed. Do not add
-cache, preload, full-layer, or ExpertMajor flags. Format, memory flow, tier
-boundaries, and current limits are in
-[`docs/glm52-expert-major-v2.md`](docs/glm52-expert-major-v2.md).
-Older GLM files, sidecars, layout revisions, and retired tuning modes have no
-backward-compatibility contract in this fork.
-
-### Qwen3.6 ExpertMajor v2 AUTO path
-
-The supported release is the single-layout
-`Qwen3.6-35B-A3B-DS4-ExpertMajor-v2-MLX-Affine4-G64.gguf`. It stores the 40
-layers of routed weights once, activates automatically, and is 20,808,566,880
-bytes with SHA-256
-`dd17266185833a9f05531ce366fd7284ddca1ed64aa3dcf06e321e8c72c9ea3d`.
-It is still a GGUF with the shared `ds4.expert_major.v2` container; only the
-routed payload uses MLX affine 4-bit groups (`32 packed bytes + BF16 scale +
-BF16 bias` per group of 64). The previous v2 GGML/Q4 payload is deliberately
-rejected rather than retained as a slower compatibility mode.
-No environment guard, sidecar variable, backend flag, resident flag, or power
-flag is part of normal startup:
-
-```sh
-./ds4 \
-  -m /absolute/path/to/Qwen3.6-35B-A3B-DS4-ExpertMajor-v2-MLX-Affine4-G64.gguf \
-  --ctx 8192
-```
-
-This is a narrow Qwen3.6 artifact contract, not arbitrary Qwen or community
-GGUF support. Current inference rejects canonical Qwen, ExpertMajor v1,
-sidecars, CPU, CUDA, ROCm, and distributed execution. The canonical GGUF may be
-used offline with `gguf-tools/ds4-expert-major.py` to build and verify v2.
-Format details and the current resident/SSD promotion gate are in
-[`docs/qwen-expert-major-store.md`](docs/qwen-expert-major-store.md) and
-[`docs/benchmarks/2026-07-21-qwen-unified-affine-auto-ssd.md`](docs/benchmarks/2026-07-21-qwen-unified-affine-auto-ssd.md).
-
-Qwen AUTO reports a named 16/24/32/36/48/64/96/128 GiB profile, then computes
-from the exact physical RAM and `recommendedMaxWorkingSetSize`; the labels do
-not hardcode a cache count. Its resident reserve is
-`max(2 GiB, RAM/16) + max(0.25 GiB, RAM/64)`. Full-model mapped Metal mode is
-selected only when both that fixed Metal plan and a point-in-time host-memory
-pressure check pass. The 19.37 GiB tensor payload cannot be resident on 16 GiB,
-so AUTO uses SSD there. A 32 GiB Mac can select resident for shorter contexts
-when both gates pass and falls back to SSD when current pressure or context
-runtime no longer fits.
-
-In SSD mode the planner charges static pages, context/runtime memory, and system
-headroom, then selects the largest complete expert-cache cycle admitted by the
-remaining live and platform budgets. Under normal macOS pressure, equivalent
-free and bounded file-backed GGUF pages receive equal credit on every Qwen
-profile; warming the model file therefore cannot by itself reduce AUTO cache.
-Unknown or elevated pressure remains conservative, and the 16 GiB class
-requires an affirmative normal-pressure signal. Its measured AUTO ceiling is
-eleven complete routes plus the safety slot, or 3,521 experts for this 40x8
-model; the next tier produced swap and is not retained. `--resident` fails
-unless both admission checks pass. `--ssd-streaming` remains a controlled-test
-override. Cache storage grows in 321-expert slabs (about 0.529 GiB).
-
-Here `resident` means that DS4 maps the complete tensor payload, disables its
-explicit SSD expert cache, and executes full-tensor Metal kernels. Metal's
-residency request is a budgeting hint: it neither pre-faults every GGUF page nor
-proves that every page remains physically resident as later pressure changes.
-That stronger physical-residency claim requires separate runtime measurement.
-All neural math in the supported Qwen path is on Metal. The CPU still performs
-tokenization, sampling, route readback, cache bookkeeping, and streamed GGUF
-I/O; a CPU+GPU split of layers or experts is not implemented in this path.
-
-The hard SSD cache floor is 321 complete routed experts (about 0.53 GiB); 640
-(about 1.06 GiB) is a useful controlled small-cache tier. Startup and the
-per-layer path fail closed if the effective locked cache falls below the floor.
-The affine runtime has completed model-backed resident and SSD generation on an
-M5 Pro with 64 GiB, including allocation at the model-declared 262,144-token
-maximum. A final 128+16 lane produced identical resident/SSD greedy tokens.
-Performance numbers remain tied to each exact host and workload; policy tests
-for an unmeasured RAM cut are not presented as a throughput claim.
+ExpertMajor v2 is a disk ABI, not a brand label. The tensor identifier
+`ds4.expert_major.v2`, storage wire values, published filenames and hashes, and
+disk-KV format remain unchanged.
 
 ## Measured results
 
-The current table uses the mandatory 32K long-context lane rather than mixing
-short-context bests. These rows are not cross-model rankings: every model uses
-a different artifact and runtime path.
+These are current durable measurements from one Apple M5 Pro with 64 GiB of
+unified memory. They are not cross-model rankings: artifacts, prompts,
+residency modes, and decode lanes differ. Follow the evidence links for exact
+commands, hashes, invalidations, and memory telemetry.
 
-| Model | M5 Pro 64 GB setup | 32K prefill | 32K generation / decode | Status |
-| --- | --- | ---: | ---: | --- |
-| Qwen3.6-35B-A3B ExpertMajor v2 MLX affine4/group-64, 20.81 GB | Metal resident AUTO | **877.34 t/s** | **57.43 t/s** at the qualified 128+16 decode lane, 17.352 ms p50, 18.753 ms p95 | Same GGUF resident/SSD; forced SSD 32K is 83.69 t/s with 1.000x read amplification |
-| DeepSeek V4 Flash IQ2XXS, 86.72 GB | Metal SSD, phase-adaptive 259→4,129 through 32K, prose prompt | **164.43 t/s** | **7.27 t/s**, 105.410 ms p50, 149.943 ms p95 | Exact final-stack evidence and zero swap; old AUTO controls can swap, so no 32K speedup percentage |
-| GLM 5.2 ExpertMajor v2 Q2_K, 244.14 GiB | Metal AUTO→SSD, 601 records, fixed compact-indexer transition, prose prompt | **44.73 t/s** | **1.87 t/s** overall; about **2.12 t/s** at p50 | Same-prompt output matches the earlier corrected arm; zero swap; original baseline crashes before logits |
+| Path | Evidence lane | Measured result |
+| --- | --- | --- |
+| Qwen3.6 MLX affine4/group-64 | 32K pure prefill; separate 128+16 decode, resident and forced SSD | Resident: 877.34 prefill t/s and 57.43 decode t/s. Forced SSD: 83.69 prefill t/s and 23.94 decode t/s. |
+| DeepSeek V4 Flash ExpertMajor v2 | 32K prose + 128 decode, Metal SSD | 164.43 prefill t/s and 7.27 decode t/s, with zero swapout. |
+| GLM 5.2 ExpertMajor v2 | 32K prose + 128 decode, AUTO resolving to SSD | 44.73 prefill t/s and 1.87 overall decode t/s, with zero swapout. |
 
-Full identities, invalidations, control drift and remaining release gates are
-in the
-[`current Qwen split-K and hardware-policy record`](docs/benchmarks/2026-07-21-qwen-split-k-hardware-policy.md)
-and the earlier
-[`long-context Metal stack record`](docs/benchmarks/2026-07-20-long-context-metal-stack.md).
-DeepSeek also completes isolated 65K+128 and 100K+128 AUTO→SSD lanes with the
-2,065-expert extended-context tier at 137.29/6.59 and 145.11/6.44 prefill/decode
-t/s respectively, with zero swapout. GLM's separate 32K security/coding prompt
-lane completes at 45.53/1.33 t/s; its lower decode rate comes from a 13.15%
-expert-cache hit rate versus 36.90% for the prose lane and is not a
-same-condition regression.
-Earlier short-context bests remain historical evidence in the dated records;
-they are not substituted for the long-context promotion gate.
+Sources:
 
-Historical upstream DeepSeek hardware reference bests from the standard
-`speed-bench` sweep follow. They are context for comparison, not a statement
-that this v2-only fork runtime supports those non-Metal hosts:
+- [Qwen unified affine AUTO and SSD promotion](docs/benchmarks/2026-07-21-qwen-unified-affine-auto-ssd.md)
+- [DeepSeek and GLM long-context Metal stack](docs/benchmarks/2026-07-20-long-context-metal-stack.md)
+- [Benchmark evidence index](docs/benchmarks/README.md)
 
-| Host | Model | Prefill | Generation |
-| --- | --- | ---: | ---: |
-| MacBook Pro M5 Max, 128 GB | Flash q2, 11,707-token context | 463.44 t/s | 25.90 t/s |
-| Mac Studio M3 Ultra, 512 GB | Flash q2, 11,709-token context | 468.03 t/s | 27.39 t/s |
-| Mac Studio M3 Ultra, 512 GB | PRO q2, 32,768-token context | 138.82 t/s | 9.56 t/s |
-| DGX Spark GB10, 128 GB | Flash q2, 7,047-token context | 343.81 t/s | 13.75 t/s |
-
-The [`benchmark evidence index`](docs/benchmarks/README.md) classifies current,
-historical, and rejected records. Full commands and caveats live in those dated
-records; the latest pre-policy cross-model correctness/artifact baseline is the
-[`2026-07-20 validation record`](docs/benchmarks/2026-07-20-agent-friendly-refactor-validation.md).
-See also [`SSD_STREAMING_VERIFICATION.md`](SSD_STREAMING_VERIFICATION.md) and
-[`docs/ENGINE_REFERENCE.md`](docs/ENGINE_REFERENCE.md).
-
-## Memory safety is part of performance
-
-More expert-cache RAM is not automatically faster. On memory-constrained Macs,
-an oversized cache can evict the file-backed pages SSD streaming needs and make
-decode slower even when Activity Monitor appears to show free memory. AUTO
-therefore treats the routed-expert cache as variable and preserves headroom for
-fixed weights, KV, scratch, Metal allocations, and the macOS page cache.
-
-During development, a model-backed test bypassed SSD streaming and attempted to
-make an 80.76 GiB GGUF resident with a 100,000-token context on a 64 GiB Mac.
-Global wired memory reached roughly 61.36 GiB before a watchdog kernel panic.
-Crashing the host is not an acceptable test outcome.
-
-Current `main` includes hardware-aware AUTO residency, fail-closed cache
-admission, bounded benchmark guards, and GPU cleanup before model mappings are
-released (`1523b26`). A stricter guard that rejects resident mappings larger
-than 90% of physical RAM is tested and published on
-`fix/refuse-oversized-resident-maps` at `06fd005`, but is **not yet on `main`**.
-Until it is merged, it must not be described as a mainline guarantee.
-
-## Prefer a desktop interface?
-
-[DSBox](https://github.com/andreaborio/dsbox) is the companion desktop
-interface, inspired by Unsloth Studio: discover compatible models, manage ds4,
-chat locally, connect coding agents, and observe memory, swap, disk, and token
-throughput without hand-assembling every command. DSBox is a separate project
-and still a work in progress.
-
-<p align="center">
-  <a href="https://github.com/andreaborio/dsbox">
-    <img alt="DSBox local chat interface controlling a ds4 server" src="https://raw.githubusercontent.com/andreaborio/dsbox/main/docs/media/01-chat.jpg" width="900">
-  </a>
-  <br>
-  <sub>DSBox is an optional companion UI, maintained in a separate repository.</sub>
-</p>
+Performance acceptance requires isolated short, medium, large, and 32K
+long-context lanes; memory-sensitive changes may require 65K and 100K as well.
+A short-context best is not substituted for the long-context gate.
 
 ## Documentation
 
-- [`docs/releases/v0.2.0.md`](docs/releases/v0.2.0.md): current ExpertMajor
-  v2-only release boundary, startup, measured results, and upgrade notes.
-- [`docs/ENGINE_REFERENCE.md`](docs/ENGINE_REFERENCE.md): complete model,
-  runtime, server, agent, KV-cache, supported-backend, retired-feature, and
-  debugging reference.
-- [`docs/qwen-expert-major-store.md`](docs/qwen-expert-major-store.md):
-  Qwen v2 layout, converter, runtime contract, and parity evidence.
-- [`docs/glm52-expert-major-v2.md`](docs/glm52-expert-major-v2.md): embedded GLM
-  artifact, one-command startup, prefill/decode memory flow, qualification, and
-  supported memory tiers.
-- [`docs/expert-major-v2-roadmap.md`](docs/expert-major-v2-roadmap.md): shared
-  ExpertMajor v2 contract and family-specific qualification status.
-- [`CONTRIBUTING.md`](CONTRIBUTING.md): upstream-first contribution policy and
-  correctness/performance gates.
-- [`FORK_NOTES.md`](FORK_NOTES.md): fork delta and upstreamability ledger.
-- [`MERGE_LOG.md`](MERGE_LOG.md): upstream synchronization history.
-- [`GOLD_METAL_SSD.md`](GOLD_METAL_SSD.md): Metal build identity, AUTO residency,
-  and benchmark promotion gates.
-- [`SSD_STREAMING_VERIFICATION.md`](SSD_STREAMING_VERIFICATION.md): superseded
-  July 2026 SSD-streaming campaign evidence; not a current runtime guide.
-- [`ONEDGE_IMATRIX.md`](ONEDGE_IMATRIX.md): live, privacy-preserving imatrix
-  collection.
-- [`EXPERT_PRUNE.md`](EXPERT_PRUNE.md): expert profiling and prune-mask research.
-- [`gguf-tools/README.md`](gguf-tools/README.md): GGUF, imatrix, quantization, and
-  quality tooling.
+### Start and operate
 
----
+- [Runtime support contract](docs/contracts/RUNTIME_SUPPORT.md) — supported
+  families, hardware floors, backends, and fail-closed boundaries.
+- [Engine reference](docs/ENGINE_REFERENCE.md) — CLI, server, agent, disk KV,
+  tracing, evaluation, and operational details.
+- [Metal and SSD policy](GOLD_METAL_SSD.md) — build identity, AUTO residency,
+  cache planning, and benchmark gates.
 
-<details>
-<summary><strong>Detailed fork additions and research notes</strong></summary>
+### Models and formats
 
-## Fork feature details
+- [ExpertMajor v2 roadmap](docs/expert-major-v2-roadmap.md)
+- [DeepSeek ExpertMajor v2](docs/deepseek-expert-major-v2.md)
+- [GLM 5.2 ExpertMajor v2](docs/glm52-expert-major-v2.md)
+- [Qwen ExpertMajor v2 MLX-affine store](docs/qwen-expert-major-store.md)
+- [GGUF and quantization tools](gguf-tools/README.md)
 
-The sections below preserve the longer design notes for the fork's research
-features. They are not an exhaustive commit count: adaptive residency, cache
-hardening, benchmark guardrails, telemetry, and safe Metal teardown have also
-evolved since the original five-feature summary was written. The authoritative
-per-change ledger is [`FORK_NOTES.md`](FORK_NOTES.md); upstream syncs are recorded
-in [`MERGE_LOG.md`](MERGE_LOG.md).
+### Architecture and evidence
 
-### The GLM 5.2 SSD-streaming path
+- [Code map](docs/architecture/CODEMAP.md)
+- [Hebrus naming and compatibility decision](docs/adr/0005-hebrus-naming-and-compatibility-boundary.md)
+- [Benchmark methodology and records](docs/benchmarks/README.md)
+- [Release checklist](QA_BEFORE_RELEASES.md)
+- [Fork/upstream ledger](FORK_NOTES.md)
 
-GLM 5.2 is promoted as a narrow Apple Metal path for the published embedded
-ExpertMajor v2 artifact. It includes the streamed-prefill correctness and
-indexed-prepare work proposed as [#520](https://github.com/antirez/ds4/pull/520)
-and [#528](https://github.com/antirez/ds4/pull/528), plus model-specific compact
-DSA KV, grouped Q2_K prefill, physical expert-record addressing, NextN metadata
-binding, tokenizer/prompt routing, and a pressure-sized cache policy for the
-64 GiB reference tier.
+## Project status
 
-All admitted families use ExpertMajor v2, but GLM does not become a compute or
-cache fallback for DeepSeek or Qwen. Family checks select their independent
-Metal schedules, while CPU, CUDA, ROCm, and distributed execution fail closed.
-The DeepSeek regression discovered on the historical upstream GLM line remains
-tracked in [#532](https://github.com/antirez/ds4/issues/532).
+The engine is beta software; `hebrus-agent` remains alpha. Large-model inference
+can create substantial memory pressure and I/O. Follow AUTO, use only exact
+qualified artifacts, monitor swap and memory pressure, and do not expose a
+local server to untrusted networks without an appropriate security boundary.
 
-Speculative streamed decode is still a measured no-go: the existing NextN
-probe reached about 55% acceptance, below the level needed to repay its extra
-expert I/O. Current release evidence and the remaining decode targets are in
-[`docs/benchmarks/2026-07-20-glm52-expert-major-v2.md`](docs/benchmarks/2026-07-20-glm52-expert-major-v2.md).
+The separate companion desktop application is currently still
+[DSBox](https://github.com/andreaborio/dsbox). Its name, persisted application
+identity, and migration are outside this engine bridge.
 
-### 1. On-edge / real-time imatrix collection: `ds4-server --imatrix-out`
+## Contributing and security
 
-Upstream collects the routed-MoE importance matrix (imatrix) **offline** from a fixed corpus
-(`ds4 --imatrix-dataset … --imatrix-out …`). This fork lets **`ds4-server` collect it from the
-live prompt stream on the device**, so a quantized model can be **re-calibrated to its actual
-workload**, without ever storing a single user prompt. The only artifact is the imatrix:
-aggregate per-(layer, expert) activation statistics (squared activations + hit counts), a
-structure that cannot hold prompt text.
+Read [CONTRIBUTING.md](CONTRIBUTING.md) before opening a change. Contributions
+must identify realistic failure modes, run the applicable correctness and
+performance gates, and classify whether the work should also be proposed to
+`antirez/ds4`.
 
-```sh
-ds4-server -m model.gguf --imatrix-out edge.dat                  # collect from live traffic
-ds4-server -m model.gguf --imatrix-out edge.dat --imatrix-every 128 --imatrix-min-requests 32
-```
+Do not publish vulnerability details in an ordinary issue. Until a dedicated
+security policy is added, use the repository's
+[private GitHub Security Advisory flow](https://github.com/andreaborio/ds4/security/advisories/new)
+when available.
 
-Default **off** (zero behavioral change); opt-in via `--imatrix-out`, with periodic snapshots
-(`--imatrix-every`) and a minimum-requests guard (`--imatrix-min-requests`). Full design,
-wiring, limits and privacy verification in [`ONEDGE_IMATRIX.md`](ONEDGE_IMATRIX.md).
+## License and credit
 
-### 2. Incremental re-quantization: `deepseek4-quantize --reuse PRIOR.gguf`
+The project-level license is [MIT](LICENSE). Bundled or adapted third-party
+code retains its own notices and conditions; model weights and datasets are not
+granted rights by this repository's software license.
 
-Re-forging a *variant* (say, adding a per-layer Q4 "boost" on top of an IQ2 build that used the
-same imatrix) normally regenerates **every** routed-expert tensor from the FP weights, even the
-ones that don't change. But quantization is deterministic in (FP weights, target type, imatrix
-slice), so an unchanged tensor is **byte-identical** to the one already sitting in a prior
-build. Recomputing it is pure waste.
-
-`--reuse PRIOR.gguf` copies a planned output tensor straight from PRIOR when its **name, target
-type and shape** match, and quantizes only the tensors that actually changed (the boosted
-layers, at their new type).
-
-```sh
-# 1. build the 2-bit base once
-gguf-tools/deepseek4-quantize --hf FP --template base.gguf --imatrix coder.dat \
-  --out coder-iq2.gguf
-
-# 2. every boost variant reuses the base's unchanged layers, re-quantizing only the boosted ones
-gguf-tools/deepseek4-quantize --hf FP --template base.gguf --imatrix coder.dat \
-  --reuse coder-iq2.gguf \
-  --tensor-type blk.30.ffn_gate_exps.weight=q4_k …  --out coder-q4boost.gguf
-```
-
-**Measured** (DeepSeek-V4-Flash, a 6-of-43-layer Q4 boost over an IQ2 base): a full build is
-~80 minutes; the same variant via `--reuse` took **5.5 minutes** (1,310 of 1,328 tensors copied,
-18 regenerated), about a **14× speedup**. The output was verified **byte-for-byte identical** to
-a from-scratch build across all 1,328 tensors. The fast build is not an approximation, it is the
-same file.
-
-**Correctness.** Every build stamps a `quantize.reuse_key` GGUF KV: an fnv1a64 over the
-safetensors index, each weight shard's size and mtime, the imatrix content, and a template
-structural salt. `--reuse` copies a tensor only when PRIOR's key matches this build **and** the
-per-tensor type and shape match, so a boosted tensor (different target type) is regenerated, and
-a stale / foreign / keyless prior (changed weights, imatrix, or recipe) safely falls back to a
-full quantize. Copied bytes are size-checked against the plan (a hard error on any mismatch),
-and `--reuse` refuses to alias `--out`. This is **not** present in llama.cpp, which always
-requantizes from the source weights; the closest prior art is splicing GGUF tensors by hand.
-
-### 3. Re-calibration reuse: `quantize.reuse_key_weights`
-
-Changing the *imatrix* only changes the tensors the
-imatrix actually steers (the routed expert families: the importance vectors re-allocate bits
-inside those tensors). Everything else — attention, shared experts, norms, embeddings, output —
-is byte-identical across builds that share the same FP weights and template. So every build now
-also stamps `quantize.reuse_key_weights`: the same fnv1a64 **without** the imatrix folded in.
-When PRIOR matches the full key, behavior is unchanged; when it matches only the weights key
-(same weights, different imatrix — the re-calibration case), `--reuse` copies the
-imatrix-independent tensors and regenerates only the steered ones:
-
-```
-reuse: PRIOR.gguf shares the weights key (…) but not the imatrix — copying
-       imatrix-independent tensors, regenerating the steered ones
-```
-
-The dependence test is conservative and mirrors the generators' own imatrix lookups (routed
-`*_exps.*` families always count as steered; regular tensors are probed with the exact same
-name resolution `generate_regular()` uses), so over-approximation can only cost an unneeded
-regeneration, never a stale byte. Priors built before this change carry only the old key and
-keep the old all-or-nothing behavior.
-
-Measured (DeepSeek-V4-Flash, 1,328 tensors, M5 Pro): a full re-calibration — same recipe,
-`coder.dat` → `general.dat` — copied **1,199 of 1,328 tensors** and regenerated the 129
-routed-expert tensors with the new imatrix, in **~45 minutes vs ~80 for the full quantize**.
-Byte-level verification: 40/40 sampled imatrix-independent tensors identical to the prior,
-16/16 sampled expert tensors changed, tensor tables identical. The change went through an
-adversarial 3-lens review that rejected the first cut (two stale-byte paths, one strict-mode
-abort — all reachable, all fixed before this exercise: the no-imatrix gate, the coverage
-fingerprint, the I32 probe exclusion).
-
-### 4. Historical mixed-precision routed-expert work
-
-Upstream `--ssd-streaming` assumes routed-expert tensors are quantized uniformly across
-layers. A GGUF with a few layers boosted to Q4_K over an IQ2 base (the forgequant boost
-recipe) failed **every** request under streaming (`model range … is not covered by mapped
-model views`) while serving fine with full residency. Two compounding uniformity
-assumptions are fixed: the streaming prefill span set now also maps the exps tensors of
-off-class ("boosted") layers, so they are read through mmap'd no-copy views; and the
-single-size-class expert cache pre-seeds its slab size at startup and **rejects** off-size
-layers (which use the mapped path) instead of silently adopting their size and corrupting
-the slot accounting.
-
-Uniform models were verified **byte-identical** under the change (3/3 builds), and mixed
-models were validated with the canary benchmark plus the evaluation suites. This is
-historical research evidence, not an extension of the current ExpertMajor v2 admission
-contract. The original diagnosis and workaround were reported in
-[antirez/ds4#388](https://github.com/antirez/ds4/issues/388).
-
-**Update (upstream converged):** antirez has since implemented equivalent mixed-precision
-streaming upstream. After the latest sync this fork **takes upstream's implementation** of
-`weights_streaming_layer_experts_uniform` (the only merge conflict; the two designs converged) —
-see [`MERGE_LOG.md`](MERGE_LOG.md). This addition is effectively now upstream.
-
-### 5. Coding-eval expert tooling: prune mask + full expert profile
-
-Two small, opt-in hooks for studying *which* experts a domain actually needs, used by the
-forgequant layer/expert A/B work:
-
-- **`DS4_EXPERT_PROFILE_FULL`** — the expert profiler (`ds4_expert_profile_write_layer`) emits
-  the *full* per-expert ranking instead of the top-16, so a static prune/keep set can be chosen
-  per layer from real routing statistics.
-- **`DS4_EXPERT_PRUNE_MASK`** — point it at a `43 × N_EXPERT` grid of `'0'/'1'` (`'1'` = prune).
-  The mask is applied to the CPU router's `probs` **before top-k** (masked experts get a
-  large-negative sentinel so they never win), letting each token route to its next-best
-  surviving expert. This measures "how much of the domain lives in a few experts" without
-  re-quantizing anything.
-
-```sh
-# the mask lives in the CPU router, so enable it (streaming-IQ2 path), then prune:
-DS4_METAL_ENABLE_STREAMING_IQ2_CPU_ROUTER=1 DS4_EXPERT_PRUNE_MASK=mask.txt \
-  ds4 -m coder-iq2.gguf -p "…" --ssd-streaming
-# -> "ds4: expert prune mask ACTIVE (N experts pruned) from mask.txt"
-```
-
-Both default **off** (zero behavioral change). The mask affects only routed (non-hash) layers,
-and only when the CPU router is active (streaming-IQ2 or PRO-Q4 paths). Details in
-[`EXPERT_PRUNE.md`](EXPERT_PRUNE.md).
-
-</details>
-
-## Full engine reference
-
-The long-form guide now lives in
-[`docs/ENGINE_REFERENCE.md`](docs/ENGINE_REFERENCE.md). It covers model
-downloads, full-resident and SSD-streamed operation, the native agent,
-benchmarking, capability evaluation, CLI, server/tool calling, disk KV cache,
-historical upstream backend controls, steering, test vectors, and debugging.
-
-Keeping the manual separate makes this README a reviewable landing page while
-preserving the full operational reference.
-
-## Status, credit, and license
-
-DwarfStar is beta software and `ds4-agent` remains alpha. The core engine and
-upstream direction come from [`antirez/ds4`](https://github.com/antirez/ds4).
-The project also exists thanks to the kernels, formats, and engineering work
-of [`llama.cpp`](https://github.com/ggml-org/llama.cpp) and GGML.
-
-Released under the [MIT license](LICENSE). Contributions follow the
-[upstream-first policy](CONTRIBUTING.md).
+Read [ACKNOWLEDGMENTS.md](ACKNOWLEDGMENTS.md) for engineering provenance and
+[THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) for bundled-code notices.

@@ -25,5 +25,15 @@
   "implementation_includes": 3,
   "maybe_unused_markers": 50,
   "personal_absolute_path_hits": 0,
-  "root_markdown_files": 10
+  "root_markdown_files": {
+    "maximum": 12,
+    "baseline": 10,
+    "reason": "The open-source launch adds one provenance document and one exact bundled-code notice file; later root documentation still requires explicit classification.",
+    "accepted_additions": {
+      "oss_provenance": [
+        "ACKNOWLEDGMENTS.md",
+        "THIRD_PARTY_NOTICES.md"
+      ]
+    }
+  }
 }
