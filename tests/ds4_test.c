@@ -495,6 +495,9 @@ static void test_metal_f32_router_prefill_matmul(void) {
         }
     }
     rms = sqrtf(rms / (float)(n_tok * out_dim));
+    fprintf(stderr,
+            "ds4-test: F32 router prefill max_abs=%.9g rms=%.9g\n",
+            max_abs, rms);
     TEST_ASSERT(max_abs < 0.20f);
     TEST_ASSERT(rms < 0.05f);
 

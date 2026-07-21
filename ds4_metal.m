@@ -19675,9 +19675,10 @@ int ds4_gpu_matmul_f32_tensor(
          * Apple GPU generation.  DS4 historically fell back to one matvec per
          * prompt row when M5 TensorOps were unavailable, which makes Qwen's
          * 2048x256 F32 router a double-digit share of pre-M5 prefill.  M1-M4
-         * use the qualified SIMD-group tile automatically; M5 and newer keep
-         * the faster TensorOps path above.  Quality mode retains the original
-         * full-F32 matvec accumulation.
+         * use a compensated SIMD-group tile: each operand is represented by
+         * an F16 head plus an F16 residual and all four products accumulate in
+         * F32.  M5 and newer keep the faster TensorOps path above.  Quality
+         * mode retains the original full-F32 matvec accumulation.
          */
         const bool pre_m5_apple_family =
             ds4_gpu_device_name_contains("M1") ||
@@ -19696,14 +19697,14 @@ int ds4_gpu_matmul_f32_tensor(
             static int logged_f32_simd_prefill;
             if (!logged_f32_simd_prefill) {
                 fprintf(stderr,
-                        "ds4: Qwen pre-M5 router uses tiled F32 SIMD prefill\n");
+                        "ds4: Qwen pre-M5 router uses compensated tiled F32 SIMD prefill\n");
                 logged_f32_simd_prefill = 1;
             }
             const bool bc_inp = false;
             const bool bc_out = (n_tok % 32u) != 0;
             id<MTLComputePipelineState> simd_pipeline =
                 ds4_gpu_get_mul_mm_pipeline(
-                    "kernel_mul_mm_f32_f32", bc_inp, bc_out);
+                    "kernel_mul_mm_f32_f32_compensated", bc_inp, bc_out);
             if (!simd_pipeline) return 0;
 
             ds4_gpu_mul_mm_args args =
@@ -19714,8 +19715,7 @@ int ds4_gpu_matmul_f32_tensor(
             [enc setBuffer:wbuf offset:(NSUInteger)inner_offset atIndex:1];
             [enc setBuffer:xbuf offset:ds4_gpu_tensor_offset(x) atIndex:2];
             [enc setBuffer:outbuf offset:ds4_gpu_tensor_offset(out) atIndex:3];
-            [enc setThreadgroupMemoryLength:(bc_out ? 8192u : 6144u)
-                                    atIndex:0];
+            [enc setThreadgroupMemoryLength:12288u atIndex:0];
             [enc dispatchThreadgroups:MTLSizeMake(
                     ((NSUInteger)n_tok + 31u) / 32u,
                     ((NSUInteger)out_dim + 63u) / 64u,
