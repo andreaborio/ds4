@@ -36683,13 +36683,29 @@ int ds4_gpu_qwen35_routed_moe_batch_select_tensor(
             !use_q4_batch_expert_table &&
             (!use_stream_batch_selected_addr ||
              use_mlx_affine_stream_mm_id);
+        /*
+         * MLX keeps routed affine MoE work expert-major and fuses the paired
+         * gate/up projection with the activation when that saves a second
+         * activation read and the two large projection temporaries.  On M5
+         * TensorOps the separate N32 projections recover enough occupancy to
+         * win at the 2K prefill wall, but pre-M5 Apple GPUs do not have that
+         * accelerator path.  Keep the qualified M5 cutoff and extend the
+         * fused path automatically to M1-M4, including full 2K chunks used by
+         * long-context prefill.
+         */
+        const bool mlx_affine_pre_m5_pair =
+            mlx_affine_store &&
+            (ds4_gpu_device_name_contains("M1") ||
+             ds4_gpu_device_name_contains("M2") ||
+             ds4_gpu_device_name_contains("M3") ||
+             ds4_gpu_device_name_contains("M4"));
         const bool use_mm_id_pair_swiglu =
             use_mm_id &&
             request_mid_f16 &&
             ((mlx_affine_store &&
               n_total_expert == 256u &&
               n_expert == 8u &&
-              n_tokens < 2048u) ||
+              (n_tokens < 2048u || mlx_affine_pre_m5_pair)) ||
              (gate_type == DS4_METAL_TENSOR_IQ2_XXS &&
               down_type == DS4_METAL_TENSOR_Q2_K &&
               n_expert == 6) ||
@@ -36763,8 +36779,9 @@ int ds4_gpu_qwen35_routed_moe_batch_select_tensor(
                 static int logged_mlx_affine;
                 if (!logged_mlx_affine) {
                     fprintf(stderr,
-                            "ds4: Qwen routed prefill uses MLX affine4/group-64 ExpertMajor kernels%s\n",
-                            use_mlx_affine_nax ? " with Metal 4 TensorOps" : "");
+                            "ds4: Qwen routed prefill uses MLX affine4/group-64 ExpertMajor kernels%s%s\n",
+                            use_mlx_affine_nax ? " with Metal 4 TensorOps" : "",
+                            mlx_affine_pre_m5_pair ? " with pre-M5 paired gate/up+SwiGLU" : "");
                     logged_mlx_affine = 1;
                 }
             } else {
