@@ -495,9 +495,6 @@ static void test_metal_f32_router_prefill_matmul(void) {
         }
     }
     rms = sqrtf(rms / (float)(n_tok * out_dim));
-    fprintf(stderr,
-            "ds4-test: F32 router prefill max_abs=%.9g rms=%.9g\n",
-            max_abs, rms);
     TEST_ASSERT(max_abs < 0.20f);
     TEST_ASSERT(rms < 0.05f);
 
@@ -973,8 +970,7 @@ static void test_metal_qwen35_graph_state(void) {
             QWEN35_SSM_VALUE_HEAD * QWEN35_SSM_STATE * QWEN35_SSM_STATE;
     const uint64_t expected_i32_elements =
         QWEN35_N_EXPERT_USED +
-        (uint64_t)prefill_cap *
-            (2u + 32u + QWEN35_N_EXPERT_USED);
+        (uint64_t)prefill_cap * (2u + QWEN35_N_EXPERT_USED);
     const uint64_t expected_bytes = expected_f32_elements * f32 +
         expected_i32_elements * sizeof(int32_t);
 

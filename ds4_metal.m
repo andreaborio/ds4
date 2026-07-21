@@ -4651,16 +4651,6 @@ typedef struct {
     uint64_t selected_weight_stride;
 } ds4_gpu_qwen35_router_top8_args;
 
-typedef struct {
-    uint32_t n_token;
-    uint32_t reserved;
-    uint64_t logits_token_stride;
-    uint64_t input_token_stride;
-    uint64_t weight_row_stride;
-    uint64_t candidate_token_stride;
-    uint64_t candidate_stride;
-} ds4_gpu_qwen35_router_refine_args;
-
 typedef char ds4_gpu_qwen35_split_q_gate_args_size[
     sizeof(ds4_gpu_qwen35_split_q_gate_args) == 88 ? 1 : -1];
 typedef char ds4_gpu_qwen35_sigmoid_mul_args_size[
@@ -4691,8 +4681,6 @@ typedef char ds4_gpu_qwen35_gqa_prefill_args_size[
     sizeof(ds4_gpu_qwen35_gqa_prefill_args) == 120 ? 1 : -1];
 typedef char ds4_gpu_qwen35_router_top8_args_size[
     sizeof(ds4_gpu_qwen35_router_top8_args) == 56 ? 1 : -1];
-typedef char ds4_gpu_qwen35_router_refine_args_size[
-    sizeof(ds4_gpu_qwen35_router_refine_args) == 48 ? 1 : -1];
 
 static ds4_gpu_bin_args ds4_gpu_make_bin_rows_args(uint32_t n, uint32_t rows, uint32_t rhs_n) {
     const uint64_t row_bytes = (uint64_t)n * sizeof(float);
@@ -19569,7 +19557,7 @@ int ds4_gpu_matmul_f16_pair_tensor(
     return 1;
 }
 
-int ds4_gpu_matmul_f32_tensor(
+static int ds4_gpu_matmul_f32_tensor_impl(
         ds4_gpu_tensor       *out,
         const void             *model_map,
         uint64_t                model_size,
@@ -19577,10 +19565,12 @@ int ds4_gpu_matmul_f32_tensor(
         uint64_t                in_dim,
         uint64_t                out_dim,
         const ds4_gpu_tensor *x,
-        uint64_t                n_tok) {
+        uint64_t                n_tok,
+        uint64_t                policy_total_tokens) {
     if (!g_initialized && !ds4_gpu_init()) return 0;
     if (in_dim > UINT32_MAX || out_dim > UINT32_MAX ||
-        n_tok == 0 || n_tok > UINT32_MAX) {
+        n_tok == 0 || n_tok > UINT32_MAX ||
+        policy_total_tokens < n_tok) {
         return 0;
     }
 
@@ -19687,10 +19677,9 @@ int ds4_gpu_matmul_f32_tensor(
          * Apple GPU generation.  DS4 historically fell back to one matvec per
          * prompt row when M5 TensorOps were unavailable, which makes Qwen's
          * 2048x256 F32 router a double-digit share of pre-M5 prefill.  M1-M4
-         * use a compensated SIMD-group tile: each operand is represented by
-         * an F16 head plus an F16 residual and all four products accumulate in
-         * F32.  M5 and newer keep the faster TensorOps path above.  Quality
-         * mode retains the original full-F32 matvec accumulation.
+         * use the qualified SIMD-group tile automatically; M5 and newer keep
+         * the faster TensorOps path above.  Quality mode retains the original
+         * full-F32 matvec accumulation.
          */
         const bool pre_m5_apple_family =
             ds4_gpu_device_name_contains("M1") ||
@@ -19702,6 +19691,7 @@ int ds4_gpu_matmul_f32_tensor(
             pre_m5_apple_family &&
             !g_quality_mode &&
             n_tok >= 128u &&
+            policy_total_tokens <= 2048u &&
             (in_dim % 32u) == 0 &&
             (out_dim % 64u) == 0 &&
             getenv("DS4_METAL_DISABLE_F32_SIMD_PREFILL") == NULL;
@@ -19709,14 +19699,14 @@ int ds4_gpu_matmul_f32_tensor(
             static int logged_f32_simd_prefill;
             if (!logged_f32_simd_prefill) {
                 fprintf(stderr,
-                        "ds4: Qwen pre-M5 router uses compensated tiled F32 SIMD prefill with exact top-32 refinement\n");
+                        "ds4: Qwen pre-M5 router uses tiled F32 SIMD prefill\n");
                 logged_f32_simd_prefill = 1;
             }
             const bool bc_inp = false;
             const bool bc_out = (n_tok % 32u) != 0;
             id<MTLComputePipelineState> simd_pipeline =
                 ds4_gpu_get_mul_mm_pipeline(
-                    "kernel_mul_mm_f32_f32_compensated", bc_inp, bc_out);
+                    "kernel_mul_mm_f32_f32", bc_inp, bc_out);
             if (!simd_pipeline) return 0;
 
             ds4_gpu_mul_mm_args args =
@@ -19727,7 +19717,8 @@ int ds4_gpu_matmul_f32_tensor(
             [enc setBuffer:wbuf offset:(NSUInteger)inner_offset atIndex:1];
             [enc setBuffer:xbuf offset:ds4_gpu_tensor_offset(x) atIndex:2];
             [enc setBuffer:outbuf offset:ds4_gpu_tensor_offset(out) atIndex:3];
-            [enc setThreadgroupMemoryLength:12288u atIndex:0];
+            [enc setThreadgroupMemoryLength:(bc_out ? 8192u : 6144u)
+                                    atIndex:0];
             [enc dispatchThreadgroups:MTLSizeMake(
                     ((NSUInteger)n_tok + 31u) / 32u,
                     ((NSUInteger)out_dim + 63u) / 64u,
@@ -19769,6 +19760,39 @@ int ds4_gpu_matmul_f32_tensor(
     }
 
     return 1;
+}
+
+int ds4_gpu_matmul_f32_tensor(
+        ds4_gpu_tensor       *out,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                weight_offset,
+        uint64_t                in_dim,
+        uint64_t                out_dim,
+        const ds4_gpu_tensor *x,
+        uint64_t                n_tok) {
+    return ds4_gpu_matmul_f32_tensor_impl(
+        out, model_map, model_size, weight_offset,
+        in_dim, out_dim, x, n_tok, n_tok);
+}
+
+int ds4_gpu_qwen35_router_matmul_f32_tensor(
+        ds4_gpu_tensor       *out,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                weight_offset,
+        uint64_t                in_dim,
+        uint64_t                out_dim,
+        const ds4_gpu_tensor *x,
+        uint64_t                n_tok,
+        uint64_t                total_context_tokens) {
+    if (in_dim != 2048u || out_dim != 256u ||
+        total_context_tokens < n_tok) {
+        return 0;
+    }
+    return ds4_gpu_matmul_f32_tensor_impl(
+        out, model_map, model_size, weight_offset,
+        in_dim, out_dim, x, n_tok, total_context_tokens);
 }
 
 int ds4_gpu_repeat_hc_tensor(
@@ -28507,139 +28531,6 @@ int ds4_gpu_qwen35_gqa_prefill_select_tensor(
         }
     }
     if (reuse_used) *reuse_used = 1;
-    return 1;
-}
-
-int ds4_gpu_qwen35_router_refine_top32_batch_tensor(
-        ds4_gpu_tensor       *logits,
-        ds4_gpu_tensor       *candidates,
-        const void             *model_map,
-        uint64_t                model_size,
-        uint64_t                weight_offset,
-        const ds4_gpu_tensor *input,
-        uint32_t                n_token) {
-    enum {
-        QWEN35_ROUTER_IN_DIM = 2048,
-        QWEN35_ROUTER_EXPERTS = 256,
-        QWEN35_ROUTER_CANDIDATES = 32,
-        QWEN35_ROUTER_CANDIDATE_PAIRS = 16,
-        QWEN35_ROUTER_REFINE_THREADS = 256,
-    };
-    if (!g_initialized && !ds4_gpu_init()) return 0;
-
-    const bool pre_m5_apple_family =
-        ds4_gpu_device_name_contains("M1") ||
-        ds4_gpu_device_name_contains("M2") ||
-        ds4_gpu_device_name_contains("M3") ||
-        ds4_gpu_device_name_contains("M4");
-    const bool enabled =
-        pre_m5_apple_family &&
-        !g_quality_mode &&
-        n_token >= 128u &&
-        getenv("DS4_METAL_DISABLE_F32_SIMD_PREFILL") == NULL;
-    if (!enabled) return 1;
-    if (!logits || !candidates || !model_map || !input || n_token == 0u) {
-        return 0;
-    }
-
-    const uint64_t weight_row_bytes =
-        (uint64_t)QWEN35_ROUTER_IN_DIM * sizeof(float);
-    const uint64_t weight_bytes =
-        (uint64_t)QWEN35_ROUTER_EXPERTS * weight_row_bytes;
-    const uint64_t input_token_bytes = weight_row_bytes;
-    const uint64_t logits_token_bytes =
-        (uint64_t)QWEN35_ROUTER_EXPERTS * sizeof(float);
-    const uint64_t candidate_token_bytes =
-        (uint64_t)QWEN35_ROUTER_CANDIDATES * sizeof(int32_t);
-    if (weight_offset > model_size ||
-        weight_bytes > model_size - weight_offset ||
-        ds4_gpu_tensor_bytes(input) <
-            (uint64_t)n_token * input_token_bytes ||
-        ds4_gpu_tensor_bytes(logits) <
-            (uint64_t)n_token * logits_token_bytes ||
-        ds4_gpu_tensor_bytes(candidates) <
-            (uint64_t)n_token * candidate_token_bytes) {
-        fprintf(stderr,
-                "ds4: Qwen F32 router refinement received undersized buffers\n");
-        return 0;
-    }
-
-    @autoreleasepool {
-        id<MTLComputePipelineState> select_pipeline = ds4_gpu_get_pipeline(
-            "kernel_qwen35_router_top32_candidates_f32");
-        id<MTLComputePipelineState> refine_pipeline = ds4_gpu_get_pipeline(
-            "kernel_qwen35_router_refine_top32_f32");
-        id<MTLBuffer> logits_buf = ds4_gpu_tensor_buffer(logits);
-        id<MTLBuffer> candidates_buf = ds4_gpu_tensor_buffer(candidates);
-        id<MTLBuffer> input_buf = ds4_gpu_tensor_buffer(input);
-        uint64_t weight_inner_offset = 0;
-        id<MTLBuffer> weight_buf = ds4_gpu_wrap_model_range(
-            model_map, model_size, weight_offset, weight_bytes,
-            &weight_inner_offset);
-        if (!select_pipeline || !refine_pipeline || !logits_buf ||
-            !candidates_buf || !input_buf || !weight_buf ||
-            refine_pipeline.maxTotalThreadsPerThreadgroup <
-                QWEN35_ROUTER_REFINE_THREADS) {
-            return 0;
-        }
-
-        const ds4_gpu_qwen35_router_refine_args args = {
-            .n_token = n_token,
-            .reserved = 0,
-            .logits_token_stride = logits_token_bytes,
-            .input_token_stride = input_token_bytes,
-            .weight_row_stride = weight_row_bytes,
-            .candidate_token_stride = candidate_token_bytes,
-            .candidate_stride = sizeof(int32_t),
-        };
-        int owned = 0;
-        id<MTLCommandBuffer> cb = ds4_gpu_command_buffer(&owned);
-        if (!cb) return 0;
-
-        id<MTLComputeCommandEncoder> select = ds4_gpu_compute_encoder(cb);
-        if (!select) return 0;
-        [select setComputePipelineState:select_pipeline];
-        [select setBytes:&args length:sizeof(args) atIndex:0];
-        [select setBuffer:logits_buf
-                  offset:ds4_gpu_tensor_offset(logits)
-                 atIndex:1];
-        [select setBuffer:candidates_buf
-                  offset:ds4_gpu_tensor_offset(candidates)
-                 atIndex:2];
-        [select dispatchThreadgroups:MTLSizeMake(n_token, 1, 1)
-                 threadsPerThreadgroup:MTLSizeMake(1, 1, 1)];
-        ds4_gpu_end_compute_encoder(cb, select);
-
-        id<MTLComputeCommandEncoder> refine = ds4_gpu_compute_encoder(cb);
-        if (!refine) return 0;
-        [refine setComputePipelineState:refine_pipeline];
-        [refine setBytes:&args length:sizeof(args) atIndex:0];
-        [refine setBuffer:weight_buf
-                  offset:(NSUInteger)weight_inner_offset
-                 atIndex:1];
-        [refine setBuffer:input_buf
-                  offset:ds4_gpu_tensor_offset(input)
-                 atIndex:2];
-        [refine setBuffer:logits_buf
-                  offset:ds4_gpu_tensor_offset(logits)
-                 atIndex:3];
-        [refine setBuffer:candidates_buf
-                  offset:ds4_gpu_tensor_offset(candidates)
-                 atIndex:4];
-        [refine setThreadgroupMemoryLength:
-                    2u * 32u * sizeof(float)
-                                     atIndex:0];
-        [refine dispatchThreadgroups:MTLSizeMake(
-                    QWEN35_ROUTER_CANDIDATE_PAIRS, n_token, 1)
-                 threadsPerThreadgroup:MTLSizeMake(
-                    QWEN35_ROUTER_REFINE_THREADS, 1, 1)];
-        ds4_gpu_end_compute_encoder(cb, refine);
-
-        if (!ds4_gpu_finish_command_buffer(
-                cb, owned, "Qwen F32 router top-32 refinement")) {
-            return 0;
-        }
-    }
     return 1;
 }
 
