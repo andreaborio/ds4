@@ -1330,6 +1330,55 @@ kernel void kernel_qwen35_gated_delta_sequence_128_f32(
 //   grid = n_query_head threadgroups
 //   threads_per_threadgroup >= head_dim
 //   scratch = n_simdgroup + 4 floats
+// Packs only the final partial 32-token block into the head-major pad ABI used
+// by the shared vector FlashAttention kernel. Qwen's cache itself remains
+// token-major, so the generic row-width pad kernel cannot be used here.
+kernel void kernel_qwen35_gqa_split_k_pad_f32(
+        constant ds4_metal_args_qwen35_gqa_decode &args [[buffer(0)]],
+        device const char *key_cache [[buffer(1)]],
+        device const char *value_cache [[buffer(2)]],
+        device char *pad [[buffer(3)]],
+        uint3 tgpig [[threadgroup_position_in_grid]],
+        uint tiitg [[thread_index_in_threadgroup]],
+        uint3 ntg [[threads_per_threadgroup]]) {
+    constexpr uint C = 32;
+    const uint kv_head = tgpig.x;
+    const uint is_value = tgpig.y;
+    if (kv_head >= args.n_kv_head || is_value > 1u) return;
+
+    const uint valid = args.n_kv % C;
+    const uint first = args.n_kv - valid;
+    const ulong region_bytes =
+        args.key_token_stride * C * args.n_kv_head;
+    device const char *src = is_value ? value_cache : key_cache;
+    const ulong token_stride = is_value
+        ? args.value_token_stride : args.key_token_stride;
+    const ulong head_stride = is_value
+        ? args.value_head_stride : args.key_head_stride;
+    const ulong dim_stride = is_value
+        ? args.value_dim_stride : args.key_dim_stride;
+    device char *dst = pad + (is_value ? region_bytes : 0u) +
+        (ulong)kv_head * token_stride * C;
+
+    for (uint row = 0; row < C; row++) {
+        device float *dst_row =
+            (device float *)(dst + (ulong)row * token_stride);
+        if (row < valid) {
+            device const char *src_row = src +
+                (ulong)(first + row) * token_stride +
+                (ulong)kv_head * head_stride;
+            for (uint dim = tiitg; dim < args.head_dim; dim += ntg.x) {
+                dst_row[dim] = *(device const float *)(
+                    src_row + (ulong)dim * dim_stride);
+            }
+        } else {
+            for (uint dim = tiitg; dim < args.head_dim; dim += ntg.x) {
+                dst_row[dim] = 0.0f;
+            }
+        }
+    }
+}
+
 kernel void kernel_qwen35_gqa_decode_f32(
         constant ds4_metal_args_qwen35_gqa_decode &args [[buffer(0)]],
         device const char *query       [[buffer(1)]],

@@ -1580,6 +1580,78 @@ static void test_metal_qwen35_primitives(void) {
         ds4_gpu_tensor_free(out_gpu);
     }
 
+    /* Production Qwen geometry exercises the F32 split-K path at a cache
+     * frontier that requires the token-major zero-padding path. */
+    {
+        enum {
+            N_KV = 2051,
+            N_QUERY_HEAD = 16,
+            N_KV_HEAD = 2,
+            HEAD_DIM = 256,
+            QUERY_N = N_QUERY_HEAD * HEAD_DIM,
+            CACHE_N = N_KV * N_KV_HEAD * HEAD_DIM,
+        };
+        float *query = malloc((size_t)QUERY_N * sizeof(*query));
+        float *key = malloc((size_t)CACHE_N * sizeof(*key));
+        float *value = malloc((size_t)CACHE_N * sizeof(*value));
+        float *expected = malloc((size_t)QUERY_N * sizeof(*expected));
+        float *actual = malloc((size_t)QUERY_N * sizeof(*actual));
+        float *zero = calloc((size_t)QUERY_N, sizeof(*zero));
+        float *score = malloc((size_t)N_KV * sizeof(*score));
+        TEST_ASSERT(query && key && value && expected && actual && zero && score);
+        if (query && key && value && expected && actual && zero && score) {
+            for (size_t i = 0; i < QUERY_N; i++) {
+                query[i] = 0.23f * sinf((float)(i + 1u) * 0.013f) -
+                           0.07f * cosf((float)(i + 5u) * 0.021f);
+            }
+            for (size_t i = 0; i < CACHE_N; i++) {
+                key[i] = 0.19f * cosf((float)(i + 2u) * 0.0017f) +
+                         0.05f * sinf((float)(i + 7u) * 0.0023f);
+                value[i] = 0.41f * sinf((float)(i + 3u) * 0.0011f) -
+                           0.09f * cosf((float)(i + 11u) * 0.0019f);
+            }
+            TEST_ASSERT(ds4_qwen35_cpu_gqa_decode_f32(
+                expected, score, N_KV, query, key, value, N_KV,
+                N_QUERY_HEAD, N_KV_HEAD, HEAD_DIM));
+            ds4_gpu_tensor *query_gpu =
+                test_metal_tensor_from_f32(query, QUERY_N);
+            ds4_gpu_tensor *key_gpu =
+                test_metal_tensor_from_f32(key, CACHE_N);
+            ds4_gpu_tensor *value_gpu =
+                test_metal_tensor_from_f32(value, CACHE_N);
+            ds4_gpu_tensor *out_gpu =
+                test_metal_tensor_from_f32(zero, QUERY_N);
+            if (query_gpu && key_gpu && value_gpu && out_gpu) {
+                char *saved = test_save_env(
+                    "DS4_QWEN_DISABLE_SPLIT_K_GQA_DECODE");
+                unsetenv("DS4_QWEN_DISABLE_SPLIT_K_GQA_DECODE");
+                int reuse_used = -1;
+                TEST_ASSERT(ds4_gpu_qwen35_gqa_decode_select_tensor(
+                    out_gpu, query_gpu, key_gpu, value_gpu, N_KV,
+                    N_QUERY_HEAD, N_KV_HEAD, HEAD_DIM, 1, &reuse_used));
+                TEST_ASSERT(reuse_used == 1);
+                test_restore_env("DS4_QWEN_DISABLE_SPLIT_K_GQA_DECODE", saved);
+                if (test_metal_read_f32(out_gpu, actual, QUERY_N)) {
+                    test_metal_qwen35_close(
+                        "Qwen split-K F32 GQA decode", actual, expected,
+                        QUERY_N, 5.0e-4f, 5.0e-4f);
+                }
+
+            }
+            ds4_gpu_tensor_free(query_gpu);
+            ds4_gpu_tensor_free(key_gpu);
+            ds4_gpu_tensor_free(value_gpu);
+            ds4_gpu_tensor_free(out_gpu);
+        }
+        free(query);
+        free(key);
+        free(value);
+        free(expected);
+        free(actual);
+        free(zero);
+        free(score);
+    }
+
     /* Layer-major GQA must apply the causal boundary independently to every
      * query row in the prompt chunk, including a non-zero cache prefix. */
     {

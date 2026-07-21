@@ -999,6 +999,7 @@ kernel void kernel_flash_attn_ext_vec(
     constexpr short PK4 = PK/4;
     constexpr short PV  = PAD2(DV, 128);
     constexpr short PV4 = PV/4;
+    constexpr short QSH = sizeof(q4_t)/sizeof(half4);
     constexpr short NW  = N_SIMDWIDTH;
     constexpr short NL  = NW/NE;
     constexpr short SH  = 4*C;
@@ -1006,11 +1007,11 @@ kernel void kernel_flash_attn_ext_vec(
     static_assert(DK4 % NL == 0, "DK4 must be divisible by NL");
     static_assert(DV4 % NL == 0, "DV4 must be divisible by NL");
 
-    threadgroup q4_t  * sq4 = (threadgroup q4_t  *) (shmem_f16 +                      0*PK);
-    threadgroup s_t   * ss  = (threadgroup s_t   *) (shmem_f16 +   sgitg*SH       + NSG*PK);
-    threadgroup s4_t  * ss4 = (threadgroup s4_t  *) (shmem_f16 +   sgitg*SH       + NSG*PK);
-    threadgroup half  * sm  = (threadgroup half  *) (shmem_f16 +   sgitg*SH + 2*C + NSG*PK);
-    threadgroup o4_t  * so4 = (threadgroup o4_t  *) (shmem_f16 + 2*sgitg*PV       + NSG*PK + NSG*SH);
+    threadgroup q4_t  * sq4 = (threadgroup q4_t  *) (shmem_f16 +                            0*PK);
+    threadgroup s_t   * ss  = (threadgroup s_t   *) (shmem_f16 +   sgitg*SH       + QSH*NSG*PK);
+    threadgroup s4_t  * ss4 = (threadgroup s4_t  *) (shmem_f16 +   sgitg*SH       + QSH*NSG*PK);
+    threadgroup half  * sm  = (threadgroup half  *) (shmem_f16 +   sgitg*SH + 2*C + QSH*NSG*PK);
+    threadgroup o4_t  * so4 = (threadgroup o4_t  *) (shmem_f16 + 2*sgitg*PV       + QSH*NSG*PK + NSG*SH);
 
     so4 += tiisg;
 
@@ -1371,7 +1372,7 @@ kernel void kernel_flash_attn_ext_vec(
            float4
 
 #define FA_TYPES_F32 \
-           half4,  \
+          float4,  \
            float4, \
            float4, \
     float,         \
@@ -1379,6 +1380,11 @@ kernel void kernel_flash_attn_ext_vec(
            float4
 
 typedef decltype(kernel_flash_attn_ext_vec<FA_TYPES, half4, 1, dequantize_f16_t4, half4, 1, dequantize_f16_t4, 128, 128, 4>) flash_attn_ext_vec_t;
+
+// Qwen decode keeps query, K/V, dot products, online softmax and output
+// accumulation in F32 for this first split-K step. Precision changes to the
+// cache remain a separate experiment.
+template [[host_name("kernel_flash_attn_ext_vec_f32_dk256_dv256")]] kernel flash_attn_ext_vec_t kernel_flash_attn_ext_vec<FA_TYPES_F32, float4, 1, dequantize_f32_t4, float4, 1, dequantize_f32_t4, 256, 256, 1>;
 
 // Host-visible decode FlashAttention variant for DS4's 512-wide F16 K/V rows.
 template [[host_name("kernel_flash_attn_ext_vec_f16_dk512_dv512")]]  kernel flash_attn_ext_vec_t kernel_flash_attn_ext_vec<FA_TYPES,     half4,  1, dequantize_f16_t4, half4,  1, dequantize_f16_t4, 512, 512, 1>;
