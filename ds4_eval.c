@@ -4081,6 +4081,10 @@ int main(int argc, char **argv) {
         ds4_build_info_print(stdout);
         return 0;
     }
+    if (ds4_capabilities_requested(argc, argv)) {
+        ds4_capabilities_print(stdout, DS4_EXECUTABLE_ROLE_EVAL);
+        return 0;
+    }
     eval_config cfg = parse_options(argc, argv);
     if (cfg.self_test_extractors) return run_extractor_self_tests();
     if (cfg.regrade_trace_path) return regrade_trace_file(cfg.regrade_trace_path);

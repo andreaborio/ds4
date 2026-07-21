@@ -13355,6 +13355,10 @@ int main(int argc, char **argv) {
         ds4_build_info_print(stdout);
         return 0;
     }
+    if (ds4_capabilities_requested(argc, argv)) {
+        ds4_capabilities_print(stdout, DS4_EXECUTABLE_ROLE_SERVER);
+        return 0;
+    }
     signal(SIGPIPE, SIG_IGN);
     struct sigaction sa;
     memset(&sa, 0, sizeof(sa));

@@ -101,6 +101,7 @@ cd ds4
 
 make -j8
 ./ds4 --build-info
+./ds4-server --capabilities=json
 ./download_model.sh qwen-v2
 ./ds4 \
   -m gguf/Qwen3.6-35B-A3B-DS4-ExpertMajor-v2-MLX-Affine4-G64.gguf \

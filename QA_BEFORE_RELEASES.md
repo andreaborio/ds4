@@ -53,6 +53,10 @@ SHA-256, manifest contract, and compatible runtime commit are one release gate.
   `build/cpu-$(uname -m)/bin` and must not replace the root Metal commands:
   `make cpu`.
 - Record `./ds4 --build-info` and the CPU binary's `--build-info` output.
+- Run `--capabilities=json` on all five Metal executables and the CPU profile;
+  validate schema version 1, executable roles, backend identity, model-family
+  claims, and ExpertMajor wire values with `make capabilities-test` and
+  `python3 tests/test_capabilities.py --bin-dir build/cpu-$(uname -m)/bin --backend cpu`.
 - Run whitespace checks before committing:
   `git diff --check`.
 - Confirm `./ds4 --help`, `./ds4-server --help`, and `./ds4-agent --help` render

@@ -32,7 +32,7 @@ PROGRAMS := ds4 ds4-server ds4-bench ds4-eval ds4-agent
 	metal build-isolation-test q4k-dot-test qwen-metadata-test \
 	qwen-reference-test qwen-unicode-test qwen-tokenizer-test \
 	qwen-expert-group-test expert-store-test metal-ssd-profile-test \
-	download-model-test $(PROGRAMS) ds4_test ds4_agent_test
+	download-model-test capabilities-test $(PROGRAMS) ds4_test ds4_agent_test
 
 download-model-test: tests/test_download_model.sh download_model.sh
 	sh tests/test_download_model.sh
@@ -176,11 +176,11 @@ $(CPU_OBJDIR)/%.o: %.c
 # Build provenance is intentionally refreshed on every invocation.  Keeping it
 # in this tiny object prevents a clean/dirty transition from forcing the giant
 # engine translation unit to rebuild while ensuring --build-info is truthful.
-$(METAL_OBJDIR)/ds4_build.o: ds4_build.c ds4.h FORCE
+$(METAL_OBJDIR)/ds4_build.o: ds4_build.c ds4.h ds4_expert_store.h FORCE
 	@mkdir -p "$(@D)"
 	$(CC) $(CFLAGS) $(DEPFLAGS) -c -o $@ $<
 
-$(CPU_OBJDIR)/ds4_build.o: ds4_build.c ds4.h FORCE
+$(CPU_OBJDIR)/ds4_build.o: ds4_build.c ds4.h ds4_expert_store.h FORCE
 	@mkdir -p "$(@D)"
 	$(CC) $(CFLAGS) -DDS4_NO_GPU $(DEPFLAGS) -c -o $@ $<
 
@@ -439,6 +439,9 @@ qwen-unicode-test: $(METAL_BINDIR)/test_qwen_unicode
 qwen-tokenizer-test: $(METAL_BINDIR)/test_qwen_tokenizer
 	$(METAL_BINDIR)/test_qwen_tokenizer
 
+capabilities-test: metal tests/test_capabilities.py
+	python3 tests/test_capabilities.py --bin-dir $(METAL_BINDIR) --backend metal
+
 model-free-test: metal ds4_test ds4_agent_test $(METAL_BINDIR)/test_q4k_dot \
 		$(METAL_BINDIR)/test_q4k_top8 \
 		$(METAL_BINDIR)/test_qwen_session \
@@ -450,7 +453,9 @@ model-free-test: metal ds4_test ds4_agent_test $(METAL_BINDIR)/test_q4k_dot \
 		$(METAL_BINDIR)/test_qwen_expert_group \
 		$(METAL_BINDIR)/test_expert_store \
 		$(METAL_BINDIR)/test_metal_ssd_profile \
-		$(METAL_BINDIR)/test_ssd_residency download-model-test
+		$(METAL_BINDIR)/test_ssd_residency download-model-test \
+		tests/test_capabilities.py
+	python3 tests/test_capabilities.py --bin-dir $(METAL_BINDIR) --backend metal
 	DS4_BIN_DIR=$(METAL_BINDIR) sh tests/test_retired_distributed_flags.sh
 	sh tests/test_benchmark_env_guard.sh
 	$(METAL_BINDIR)/ds4-eval --self-test-extractors
@@ -499,7 +504,7 @@ premerge: context-audit doc-links imatrix-dataset-check prompt-fixture-check bui
 	$(MAKE) model-free-test
 	git diff --check
 
-build-isolation-test: tests/test_build_isolation.sh
+build-isolation-test: tests/test_build_isolation.sh tests/test_capabilities.py
 	MAKE="$(MAKE)" sh tests/test_build_isolation.sh
 
 -include $(wildcard $(METAL_OBJDIR)/*.d $(CPU_OBJDIR)/*.d)
@@ -536,7 +541,7 @@ ds4-eval: ds4_eval_cpu.o ds4_help.o $(CPU_CORE_OBJS)
 ds4-agent: ds4_agent_cpu.o ds4_help.o ds4_web.o ds4_kvstore.o linenoise.o $(CPU_CORE_OBJS)
 	$(CC) $(CFLAGS) -o $@ $^ $(LDLIBS)
 
-ds4_build_cpu.o: ds4_build.c ds4.h FORCE
+ds4_build_cpu.o: ds4_build.c ds4.h ds4_expert_store.h FORCE
 	$(CC) $(CFLAGS) -DDS4_NO_GPU -c -o $@ ds4_build.c
 
 ds4_ssd.o: ds4_ssd.c ds4_ssd.h
@@ -638,7 +643,8 @@ model-free-test: ds4 ds4_test ds4_agent_test ds4-eval q4k-dot-test \
 		tests/test_qwen_expert_group \
 		tests/test_expert_store \
 		tests/test_metal_ssd_profile \
-		tests/test_ssd_residency download-model-test
+		tests/test_ssd_residency download-model-test tests/test_capabilities.py
+	python3 tests/test_capabilities.py --bin-dir . --backend cpu
 	sh tests/test_retired_distributed_flags.sh
 	sh tests/test_benchmark_env_guard.sh
 	./ds4-eval --self-test-extractors
@@ -661,6 +667,9 @@ model-free-test: ds4 ds4_test ds4_agent_test ds4-eval q4k-dot-test \
 	python3 tests/gen_qwen_unicode.py --check
 	./tests/test_ssd_residency
 	python3 tests/test_qwen_metadata.py ./ds4
+
+capabilities-test: $(PROGRAMS) tests/test_capabilities.py
+	python3 tests/test_capabilities.py --bin-dir . --backend cpu
 
 test: model-free-test
 	./ds4_test
@@ -696,7 +705,7 @@ tests/test_q4k_top8: test_q4k_top8.o ds4_test_core.o ds4_build_cpu.o \
 
 tests/test_qwen_session: tests/test_qwen_session.c ds4.c ds4.h ds4_ssd.h ds4_profile.h \
 		ds4_gpu.h ds4_qwen.h ds4_qwen_unicode.h \
-		ds4_build.c ds4_ssd.c ds4_profile.c ds4_qwen.c \
+		ds4_build.c ds4_expert_store.h ds4_ssd.c ds4_profile.c ds4_qwen.c \
 		ds4_qwen_unicode.c ds4_qwen_unicode_data.inc \
 		ds4_streaming_hotlist.inc runtime/ds4_glm_graph.inc \
 		runtime/ds4_deepseek_cache_phase.inc
@@ -707,7 +716,7 @@ tests/test_qwen_session: tests/test_qwen_session.c ds4.c ds4.h ds4_ssd.h ds4_pro
 
 tests/test_qwen_tokenizer: tests/test_qwen_tokenizer.c ds4.c ds4.h \
 		ds4_kvstore.c ds4_kvstore.h ds4_ssd.h ds4_profile.c ds4_profile.h ds4_gpu.h ds4_qwen.h \
-		ds4_qwen_unicode.h ds4_build.c ds4_ssd.c \
+		ds4_qwen_unicode.h ds4_build.c ds4_expert_store.h ds4_ssd.c \
 		ds4_qwen.c ds4_qwen_unicode.c ds4_qwen_unicode_data.inc \
 		ds4_streaming_hotlist.inc tests/qwen/qwen36_tokenizer_fixture.inc
 	$(CC) $(CFLAGS) $(QWEN_CFLAGS) -DDS4_NO_GPU \

@@ -53,6 +53,8 @@ for name in $PROGRAMS; do
     root_state="$root_state $name:$(stat -f '%i:%m' "$name")"
 done
 
+python3 tests/test_capabilities.py --bin-dir "$METAL_REL" --backend metal
+
 [ -f "build/metal-${ARCH}/obj/ds4.o" ] || fail "missing Metal core object"
 [ -f "build/metal-${ARCH}/obj/ds4_metal.o" ] || fail "missing Metal backend object"
 
@@ -69,6 +71,8 @@ for name in $PROGRAMS; do
     assert_metal_binary "$name"
     after_cpu_state="$after_cpu_state $name:$(stat -f '%i:%m' "$name")"
 done
+
+python3 tests/test_capabilities.py --bin-dir "$CPU_REL" --backend cpu
 
 [ "$root_state" = "$after_cpu_state" ] || \
     fail "make cpu modified one or more published Metal root links"

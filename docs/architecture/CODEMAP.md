@@ -21,7 +21,7 @@ RAM/working-set adaptation is isolated in
 | `ds4_agent.c` | Stateful coding-agent TUI, tools, session commands, and interruption state |
 | `ds4_bench.c` | Context-frontier prefill/decode benchmark driver |
 | `ds4_eval.c` | Evaluation driver and extractor checks |
-| `ds4_build.c` | Build identity reported by executables |
+| `ds4_build.c` | Build identity and the versioned machine-readable capability contract reported by executables |
 
 These programs should use the public engine/session API in `ds4.h`. They should
 not acquire tensor, ExpertMajor, or Metal-kernel ownership.
@@ -98,6 +98,7 @@ not validated.
 | Path | Primary responsibility |
 | --- | --- |
 | `tests/` | Model-free, model-backed, kernel, tokenizer, server, and build-isolation regressions |
+| `tests/test_capabilities.py` | Exact schema and cross-executable checks for the model-free build/capability contract |
 | `tests/qwen/` | Qwen fixtures, provenance, reference collectors, and model-specific gates |
 | `tests/test-vectors/` | Official and local continuation vectors plus provenance |
 | `gguf-tools/` | Quantization, ExpertMajor conversion, imatrix, and quality-scoring tools |

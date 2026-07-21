@@ -234,11 +234,20 @@ uint64_t ds4_engine_hidden_f32_values(ds4_engine *e);
 int ds4_engine_model_id(ds4_engine *e);
 bool ds4_engine_is_glm_dsa(ds4_engine *e);
 const char *ds4_backend_name(ds4_backend backend);
+typedef enum {
+    DS4_EXECUTABLE_ROLE_CLI,
+    DS4_EXECUTABLE_ROLE_SERVER,
+    DS4_EXECUTABLE_ROLE_AGENT,
+    DS4_EXECUTABLE_ROLE_BENCH,
+    DS4_EXECUTABLE_ROLE_EVAL,
+} ds4_executable_role;
 const char *ds4_build_backend(void);
 const char *ds4_build_arch(void);
 const char *ds4_build_git_sha(void);
 void ds4_build_info_print(FILE *fp);
 bool ds4_build_info_requested(int argc, char **argv);
+bool ds4_capabilities_requested(int argc, char **argv);
+void ds4_capabilities_print(FILE *fp, ds4_executable_role role);
 bool ds4_think_mode_enabled(ds4_think_mode mode);
 const char *ds4_think_mode_name(ds4_think_mode mode);
 const char *ds4_think_max_prefix(void);

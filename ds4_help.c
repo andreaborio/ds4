@@ -191,6 +191,7 @@ static void print_model_runtime(FILE *fp, const help_colors *c,
     opt(fp, c, "-t, --threads N", "CPU helper threads for host-side/reference work.");
     opt(fp, c, "--power N", "GPU duty-cycle target, 1..100. Default: 100");
     opt(fp, c, "--build-info", "Print compiled backend, architecture, and git revision, then exit.");
+    opt(fp, c, "--capabilities=json", "Print the versioned machine-readable runtime contract, then exit.");
     opt(fp, c, "--ssd-streaming", "Force SSD-backed model streaming. Metal defaults to AUTO residency.");
     opt(fp, c, "--resident, --no-ssd-streaming", "Force full model residency instead of Metal AUTO selection.");
     opt(fp, c, "--ssd-streaming-cold", "SSD streaming: skip default popularity-based expert-cache preload.");

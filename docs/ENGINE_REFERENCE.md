@@ -137,6 +137,36 @@ On macOS, Metal and CPU objects/binaries live in separate build profiles.
 `build/cpu-$(uname -m)/bin/ds4` for the CPU-only binary and `./ds4 --build-info`
 to verify build provenance.
 
+Every executable also accepts `--capabilities=json` without loading a model.
+The deterministic schema reports the build revision, compiled backend,
+executable role, supported model families, and the ExpertMajor v2 tensor and
+storage wire contract. Consumers should reject unknown `schema_version` values
+instead of inferring support from source files, binary strings, or visible
+product copy. The bare `--capabilities` spelling is intentionally invalid.
+
+```json
+{
+  "schema_version": 1,
+  "engine_id": "ds4",
+  "build_git_sha": "<same value reported by --build-info>",
+  "backend": "metal",
+  "executable_role": "server",
+  "model_families": ["deepseek4", "glm-dsa", "qwen35moe"],
+  "expert_major": {
+    "version": 2,
+    "tensor": "ds4.expert_major.v2",
+    "storage_formats": [
+      {"id": "ggml", "wire_value": 0, "group_sizes": []},
+      {"id": "mlx-affine4", "wire_value": 1, "group_sizes": [64]}
+    ]
+  }
+}
+```
+
+`backend` is `metal` or `cpu`; `executable_role` is `cli`, `server`, `agent`,
+`bench`, or `eval`. The normal build identity is the 12-character Git revision,
+optionally followed by `-dirty`; non-Git builds may report `unknown`.
+
 Do not rely on the historical `./ds4flash.gguf` symlink for runtime identity.
 Pass `-m` with an absolute qualified ExpertMajor v2 path and verify its complete
 published output SHA-256 before inference. Run `./ds4 --help` and

@@ -1895,6 +1895,10 @@ int main(int argc, char **argv) {
         ds4_build_info_print(stdout);
         return 0;
     }
+    if (ds4_capabilities_requested(argc, argv)) {
+        ds4_capabilities_print(stdout, DS4_EXECUTABLE_ROLE_CLI);
+        return 0;
+    }
     cli_config cfg = parse_options(argc, argv);
     if (cfg.gen.dump_tokens) {
         if (cfg.gen.prompt == NULL) {

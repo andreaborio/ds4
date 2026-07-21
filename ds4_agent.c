@@ -10826,6 +10826,10 @@ int main(int argc, char **argv) {
         ds4_build_info_print(stdout);
         return 0;
     }
+    if (ds4_capabilities_requested(argc, argv)) {
+        ds4_capabilities_print(stdout, DS4_EXECUTABLE_ROLE_AGENT);
+        return 0;
+    }
     agent_config cfg = parse_options(argc, argv);
     if (cfg.chdir_path && chdir(cfg.chdir_path) != 0) {
         fprintf(stderr, "ds4-agent: failed to chdir to %s: %s\n",
