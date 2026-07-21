@@ -19670,6 +19670,55 @@ int ds4_gpu_matmul_f32_tensor(
             ds4_gpu_warn_mpp_fallback();
         }
 
+        /*
+         * MLX routes matrix-shaped F32 work through a tiled QMM on every
+         * Apple GPU generation.  DS4 historically fell back to one matvec per
+         * prompt row when M5 TensorOps were unavailable, which makes Qwen's
+         * 2048x256 F32 router a double-digit share of M1 prefill.  Keep this
+         * first port opt-in until route/logit parity and the complete context
+         * matrix qualify it; the surviving path will become automatic and
+         * lose this experiment flag.
+         */
+        const bool use_f32_simd_prefill =
+            qwen36_router_shape &&
+            !ds4_gpu_mpp_available() &&
+            n_tok >= 32u &&
+            (in_dim % 32u) == 0 &&
+            (out_dim % 64u) == 0 &&
+            getenv("DS4_METAL_ENABLE_F32_SIMD_PREFILL") != NULL &&
+            getenv("DS4_METAL_DISABLE_F32_SIMD_PREFILL") == NULL;
+        if (use_f32_simd_prefill) {
+            const bool bc_inp = false;
+            const bool bc_out = (n_tok % 32u) != 0;
+            id<MTLComputePipelineState> simd_pipeline =
+                ds4_gpu_get_mul_mm_pipeline(
+                    "kernel_mul_mm_f32_f32", bc_inp, bc_out);
+            if (!simd_pipeline) return 0;
+
+            ds4_gpu_mul_mm_args args =
+                ds4_gpu_make_mm_args(in_dim, out_dim, n_tok, row_bytes);
+            id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
+            [enc setComputePipelineState:simd_pipeline];
+            [enc setBytes:&args length:sizeof(args) atIndex:0];
+            [enc setBuffer:wbuf offset:(NSUInteger)inner_offset atIndex:1];
+            [enc setBuffer:xbuf offset:ds4_gpu_tensor_offset(x) atIndex:2];
+            [enc setBuffer:outbuf offset:ds4_gpu_tensor_offset(out) atIndex:3];
+            [enc setThreadgroupMemoryLength:(bc_out ? 8192u : 6144u)
+                                    atIndex:0];
+            [enc dispatchThreadgroups:MTLSizeMake(
+                    ((NSUInteger)n_tok + 31u) / 32u,
+                    ((NSUInteger)out_dim + 63u) / 64u,
+                    1u)
+                 threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+            ds4_gpu_end_compute_encoder(cb, enc);
+
+            if (!ds4_gpu_finish_command_buffer(
+                    cb, owned, "F32 SIMD tensor matmul")) {
+                return 0;
+            }
+            return 1;
+        }
+
         ds4_gpu_q8_0_matvec_args mv_args =
             ds4_gpu_make_f32_mv_args(in_dim, out_dim, n_tok);
         ds4_gpu_mv_dispatch mv_dispatch = ds4_gpu_make_plain_mv_dispatch(in_dim, 1);
