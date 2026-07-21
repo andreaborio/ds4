@@ -407,7 +407,7 @@ static void test_metal_f16_prefill_matmul(void) {
 static void test_metal_f32_router_prefill_matmul(void) {
     const uint32_t in_dim = 2048;
     const uint32_t out_dim = 256;
-    const uint32_t n_tok = 32;
+    const uint32_t n_tok = 128;
     const uint64_t weight_bytes =
         (uint64_t)out_dim * in_dim * sizeof(float);
     const uint64_t weight_alloc =
