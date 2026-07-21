@@ -250,7 +250,7 @@
       "location": "content",
       "token": "ds4",
       "classification": "compatibility",
-      "maximum": 494
+      "maximum": 495
     },
     {
       "path": "Makefile",
@@ -2539,14 +2539,28 @@
       "location": "content",
       "token": "ds4",
       "classification": "compatibility",
-      "maximum": 2
+      "maximum": 4
     },
     {
       "path": "tests/test_server_alias_model.py",
       "location": "content",
       "token": "DS4",
       "classification": "compatibility",
-      "maximum": 2
+      "maximum": 6
+    },
+    {
+      "path": "tests/test_server_alias_model_unit.py",
+      "location": "content",
+      "token": "ds4",
+      "classification": "compatibility",
+      "maximum": 4
+    },
+    {
+      "path": "tests/test_server_alias_model_unit.py",
+      "location": "content",
+      "token": "DS4",
+      "classification": "compatibility",
+      "maximum": 6
     },
     {
       "path": "tests/test_ssd_residency.c",

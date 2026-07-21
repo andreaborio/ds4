@@ -35,6 +35,9 @@ INSTALL ?= install
 INSTALL_MODE ?= 0755
 INSTALL_DEST_BINDIR = $(DESTDIR)$(BINDIR)
 INSTALL_SOURCE_PROGRAMS = $(addprefix $(INSTALL_SOURCE_BINDIR)/,$(HEBRUS_PROGRAMS))
+SERVER_ALIAS_EXPECTED_BACKEND ?= metal
+SERVER_ALIAS_EXPECTED_BUILD_SHA ?= $(BUILD_GIT_SHA)
+SERVER_ALIAS_PORT ?= 0
 
 .PHONY: all help clean test model-free-test premerge context-audit doc-links \
 	brand-boundary-audit brand-boundary-test brand-asset-test \
@@ -44,7 +47,8 @@ INSTALL_SOURCE_PROGRAMS = $(addprefix $(INSTALL_SOURCE_BINDIR)/,$(HEBRUS_PROGRAM
 	qwen-reference-test qwen-unicode-test qwen-tokenizer-test \
 	qwen-expert-group-test expert-store-test metal-ssd-profile-test \
 	download-model-test capabilities-test command-alias-test \
-	visible-identity-test \
+	visible-identity-test server-alias-model-unit-test \
+	server-alias-model-test \
 	install uninstall install-test $(PROGRAMS) \
 	ds4_test ds4_agent_test
 
@@ -128,6 +132,8 @@ help:
 	@echo "                    Reject unclassified or increased legacy brand tokens"
 	@echo "  make release-contract"
 	@echo "                    Reject Qwen release identity drift"
+	@echo "  make server-alias-model-test QWEN_V2=/absolute/model.gguf"
+	@echo "                    Run the opt-in model-backed server alias release gate"
 	@echo "  make premerge     Run context/docs, isolation, and model-free gates"
 	@echo "  make clean        Remove build outputs and published root binaries"
 
@@ -545,6 +551,7 @@ model-free-test: metal ds4_test ds4_agent_test $(METAL_BINDIR)/test_q4k_dot \
 		$(METAL_BINDIR)/test_metal_ssd_profile \
 		$(METAL_BINDIR)/test_ssd_residency download-model-test \
 		visible-identity-test \
+		server-alias-model-unit-test \
 		tests/test_capabilities.py tests/test_command_aliases.py
 	python3 tests/test_capabilities.py --bin-dir $(METAL_BINDIR) --backend metal
 	python3 tests/test_command_aliases.py --bin-dir $(METAL_BINDIR) \
@@ -627,6 +634,8 @@ help:
 	@echo "  make brand-boundary-audit"
 	@echo "                           Reject unclassified or increased legacy brand tokens"
 	@echo "  make release-contract    Reject Qwen release identity drift"
+	@echo "  make server-alias-model-test QWEN_V2=/absolute/model.gguf"
+	@echo "                           Run the opt-in model-backed server alias gate"
 	@echo "  make premerge            Run repository audits and Linux CPU/model-free gates"
 	@echo "  make clean               Remove build outputs"
 
@@ -760,6 +769,7 @@ model-free-test: $(PROGRAMS) ds4_test ds4_agent_test q4k-dot-test \
 		tests/test_expert_store \
 		tests/test_metal_ssd_profile \
 		tests/test_ssd_residency download-model-test visible-identity-test \
+		server-alias-model-unit-test \
 		tests/test_capabilities.py \
 		tests/test_command_aliases.py
 	python3 tests/test_capabilities.py --bin-dir . --backend cpu
@@ -920,6 +930,31 @@ metal-ssd-profile-test: tests/test_metal_ssd_profile
 	./tests/test_metal_ssd_profile
 
 endif
+
+server-alias-model-unit-test: tests/test_server_alias_model.py \
+		tests/test_server_alias_model_unit.py docs/contracts/qwen-release.json
+	python3 tests/test_server_alias_model_unit.py
+
+# Deliberately opt-in and excluded from premerge: this loads the complete
+# published Qwen artifact twice and must run only on an isolated qualified host.
+server-alias-model-test: $(INSTALL_SOURCE_BINDIR)/hebrus-server \
+		$(INSTALL_SOURCE_BINDIR)/ds4-server \
+		tests/test_server_alias_model.py docs/contracts/qwen-release.json
+	@test -n "$(QWEN_V2)" || { \
+		echo "server-alias-model-test: set QWEN_V2 to the absolute published artifact path" >&2; \
+		exit 2; \
+	}
+	@set -eu; \
+		set --; \
+		if test -n "$(SERVER_ALIAS_EVIDENCE_DIR)"; then \
+			set -- --evidence-dir "$(SERVER_ALIAS_EVIDENCE_DIR)"; \
+		fi; \
+		python3 tests/test_server_alias_model.py \
+			--model "$(QWEN_V2)" \
+			--bin-dir "$(INSTALL_SOURCE_BINDIR)" \
+			--expected-backend "$(SERVER_ALIAS_EXPECTED_BACKEND)" \
+			--expected-build-sha "$(SERVER_ALIAS_EXPECTED_BUILD_SHA)" \
+			--port "$(SERVER_ALIAS_PORT)" "$$@"
 
 install: $(INSTALL_SOURCE_PROGRAMS)
 	@set -eu; \

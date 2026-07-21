@@ -81,8 +81,13 @@ SHA-256, manifest contract, and compatible runtime commit are one release gate.
 - On a qualified Qwen host, run the two server names sequentially against the
   exact published artifact and compare model discovery, one seeded greedy chat
   completion, graceful shutdown, and exit status:
-  `python3 tests/test_server_alias_model.py --model "$QWEN_V2" --evidence-dir /tmp/hebrus-server-alias-evidence`.
-  This is model-backed correctness evidence, not a performance benchmark.
+  `QWEN_V2="$QWEN_V2" SERVER_ALIAS_EVIDENCE_DIR="/tmp/hebrus-server-alias-$(git rev-parse --short=12 HEAD)" make server-alias-model-test`.
+  The opt-in target rejects a dirty or wrong engine build, validates Metal
+  capabilities before loading the model, selects an unused local port by
+  default, and retains its JSON report and logs. The evidence directory must
+  not already exist. This is model-backed correctness evidence, not a
+  performance benchmark, and the target is intentionally excluded from
+  `premerge`.
 
 ## 2. Core Regression Tests
 
