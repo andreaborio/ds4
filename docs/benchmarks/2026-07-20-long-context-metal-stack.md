@@ -6,9 +6,9 @@ Status: release-candidate evidence from the preceding candidate binary; the
 final-source reruns and repository/DSBox release gates remain open.
 
 Decision: retain the exact paired-Q8 decode kernel, the DeepSeek long-context
-cache-phase policy, and the GLM compact-indexer mapping correction. The
-DeepSeek SIMD router remains provisional until the final combined-stack cohort;
-this record does not assign it an isolated percentage gain.
+cache-phase policy, and the GLM compact-indexer mapping correction. Reject and
+remove the experimental DeepSeek SIMD router because its short A/B/B/A did not
+show a win.
 
 Supersedes: current performance interpretation in
 `2026-07-20-agent-friendly-refactor-validation.md` and the short-only release
@@ -112,6 +112,13 @@ An explicit safe 4,129-record 8K reference measured 161.36/8.24 t/s with
 matched observation, but it is not a retained A/B/B/A cohort. This record
 therefore treats the change primarily as a memory-safety and phase-correctness
 fix and does not publish a standalone speedup percentage.
+
+The experimental SIMD top-6 finalize/weights fusion was rejected before the
+long matrix. Its warm 128-token A/B/B/A decode results were 12.95, 13.12,
+13.01, and 13.49 t/s, where A is the existing two-dispatch fast path and B the
+SIMD candidate. The A controls differed by more than 3%, and the B mean was not
+faster than the A mean. A short lane may reject a candidate under the campaign
+rules, so the kernel, dispatch and dedicated test scaffolding were removed.
 
 The isolated 65K and 100K arms used runtime AUTO, which resolved to SSD, a
 131,072-token allocation, and deterministic extensions of the checked-in

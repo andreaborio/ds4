@@ -198,7 +198,6 @@ static id<MTLComputePipelineState> g_dsv4_indexed_attention_heads8_pipeline;
 static id<MTLComputePipelineState> g_dsv4_indexed_attention_heads8_rb16_pipeline;
 static id<MTLComputePipelineState> g_dsv4_softplus_sqrt_pipeline;
 static id<MTLComputePipelineState> g_dsv4_router_finalize_one_pipeline;
-static id<MTLComputePipelineState> g_dsv4_router_finalize_weights_one_simd_pipeline;
 static id<MTLComputePipelineState> g_dsv4_router_weights_one_pipeline;
 static id<MTLComputePipelineState> g_glm_router_select_one_pipeline;
 static id<MTLComputePipelineState> g_glm_kv_lora_rms_norm_pipeline;
@@ -7930,8 +7929,6 @@ int ds4_gpu_init(void) {
             ds4_gpu_get_pipeline("kernel_dsv4_softplus_sqrt_f32_4");
         g_dsv4_router_finalize_one_pipeline =
             ds4_gpu_get_pipeline("kernel_dsv4_router_finalize_one");
-        g_dsv4_router_finalize_weights_one_simd_pipeline =
-            ds4_gpu_get_pipeline("kernel_dsv4_router_finalize_weights_one_simd");
         g_dsv4_router_weights_one_pipeline =
             ds4_gpu_get_pipeline("kernel_dsv4_router_weights_one");
         g_glm_router_select_one_pipeline =
@@ -8059,7 +8056,6 @@ int ds4_gpu_init(void) {
             !g_dsv4_indexed_attention_heads8_rb16_pipeline ||
             !g_dsv4_softplus_sqrt_pipeline ||
             !g_dsv4_router_finalize_one_pipeline ||
-            !g_dsv4_router_finalize_weights_one_simd_pipeline ||
             !g_dsv4_router_weights_one_pipeline ||
             !g_glm_router_select_one_pipeline ||
             !g_glm_kv_lora_rms_norm_pipeline ||
@@ -8786,7 +8782,6 @@ void ds4_gpu_cleanup(void) {
         g_dsv4_indexed_attention_heads8_rb16_pipeline = nil;
         g_dsv4_softplus_sqrt_pipeline = nil;
         g_dsv4_router_finalize_one_pipeline = nil;
-        g_dsv4_router_finalize_weights_one_simd_pipeline = nil;
         g_dsv4_router_weights_one_pipeline = nil;
         g_glm_router_select_one_pipeline = nil;
         g_glm_kv_lora_rms_norm_pipeline = nil;
@@ -30672,31 +30667,16 @@ static int ds4_gpu_encode_router_select(
     if (flash_router_fast_path &&
         !g_quality_mode && n_tokens == 1 &&
         getenv("DS4_METAL_DISABLE_ROUTER_SELECT_FUSION") == NULL) {
-        const bool use_simd_weights_fusion =
-            !hash_mode &&
-            g_dsv4_router_finalize_weights_one_simd_pipeline != nil &&
-            g_dsv4_router_finalize_weights_one_simd_pipeline.threadExecutionWidth == 32u &&
-            g_dsv4_router_finalize_weights_one_simd_pipeline.maxTotalThreadsPerThreadgroup >= 256u &&
-            ds4_gpu_device_name_contains("M5");
         id<MTLComputePipelineState> softplus_sqrt_pipeline =
             ds4_gpu_hot_pipeline(g_dsv4_softplus_sqrt_pipeline,
                                     "kernel_dsv4_softplus_sqrt_f32_4");
         id<MTLComputePipelineState> router_finalize_pipeline =
-            ds4_gpu_hot_pipeline(
-                use_simd_weights_fusion
-                    ? g_dsv4_router_finalize_weights_one_simd_pipeline
-                    : g_dsv4_router_finalize_one_pipeline,
-                use_simd_weights_fusion
-                    ? "kernel_dsv4_router_finalize_weights_one_simd"
-                    : "kernel_dsv4_router_finalize_one");
-        id<MTLComputePipelineState> router_weights_pipeline = use_simd_weights_fusion
-            ? nil
-            : ds4_gpu_hot_pipeline(g_dsv4_router_weights_one_pipeline,
-                                      "kernel_dsv4_router_weights_one");
-        if (!softplus_sqrt_pipeline || !router_finalize_pipeline ||
-            (!use_simd_weights_fusion && !router_weights_pipeline)) {
-            return 0;
-        }
+            ds4_gpu_hot_pipeline(g_dsv4_router_finalize_one_pipeline,
+                                    "kernel_dsv4_router_finalize_one");
+        id<MTLComputePipelineState> router_weights_pipeline =
+            ds4_gpu_hot_pipeline(g_dsv4_router_weights_one_pipeline,
+                                    "kernel_dsv4_router_weights_one");
+        if (!softplus_sqrt_pipeline || !router_finalize_pipeline || !router_weights_pipeline) return 0;
 
         ok = ds4_gpu_encode_unary_f32_rows(cb,
                                              softplus_sqrt_pipeline,
@@ -30748,18 +30728,10 @@ static int ds4_gpu_encode_router_select(
             [enc setBytes:&zero_i32 length:sizeof(zero_i32) atIndex:4];
         }
         [enc setBuffer:selectedbuf offset:selected_off atIndex:5];
-        if (use_simd_weights_fusion) {
-            [enc setBuffer:weightsbuf offset:weights_off atIndex:6];
-        }
-        const NSUInteger router_finalize_scratch_bytes = use_simd_weights_fusion
-            ? 2u * (256u * sizeof(float) + 256u * sizeof(int32_t))
-            : 256u * sizeof(float) + 256u * sizeof(int32_t);
-        [enc setThreadgroupMemoryLength:router_finalize_scratch_bytes atIndex:0];
+        [enc setThreadgroupMemoryLength:256u * sizeof(float) + 256u * sizeof(int32_t) atIndex:0];
         [enc dispatchThreadgroups:MTLSizeMake(1, 1, 1)
              threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
         ds4_gpu_end_compute_encoder(cb, enc);
-
-        if (use_simd_weights_fusion) return 1;
 
         enc = ds4_gpu_compute_encoder(cb);
         [enc setComputePipelineState:router_weights_pipeline];
