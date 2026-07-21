@@ -72,10 +72,17 @@ capability-less `ds4-server`.
 
 The visible name is separate from persisted compatibility identity. The bridge
 release keeps the existing `com.dsbox.desktop` bundle identifier, `$HOME/.dsbox`
-data root, and `DSBOX_*` configuration namespace so installed models,
+data root, legacy `$HOME/Library/Application Support/DSBox` Electron `userData`
+directory, and `DSBOX_*` configuration namespace so installed models,
 configuration, downloads, and local conversations are not moved. The desktop
 application is delivered separately from the engine and is not embedded in
 this repository's command package.
+
+`DSBox.app` and `Hebrus Studio.app` have different Finder names, so installing
+the latter does not replace the former. They still share the app
+identifier, state, and control port and must never run simultaneously. The
+verified upgrade quits DSBox first, installs and validates Hebrus Studio, and
+then removes the old bundle or retains it only in an offline rollback archive.
 
 ### Open-source project surface
 
@@ -116,7 +123,10 @@ owner must attach evidence for the exact commit being published:
   memory pressure, swap deltas, and SSD telemetry;
 - exact source archive, engine package, model manifest, and companion-package
   checksums;
-- a clean-install and no-data-loss upgrade/rollback exercise for Hebrus Studio;
+- a clean-install and no-data-loss upgrade/rollback exercise for Hebrus Studio
+  that proves the legacy Electron `userData` and `$HOME/.dsbox` state are
+  reused, only one app owns the control port, and Finder's two bundle names do
+  not permit concurrent launch;
 - an updated support matrix and benchmark evidence index that cite the same
   immutable commit and artifacts.
 

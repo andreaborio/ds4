@@ -50,7 +50,8 @@ migration:
   values that contain `DS4`;
 - disk-KV magic, version, or payload ABI;
 - current `DS4_*` engine environment variables;
-- current Hebrus Studio `DSBOX_*` variables, `$HOME/.dsbox` data root, or
+- current Hebrus Studio `DSBOX_*` variables, `$HOME/.dsbox` data root,
+  `$HOME/Library/Application Support/DSBox` Electron `userData` directory, or
   `com.dsbox.desktop` macOS bundle identifier;
 - existing checkouts, model files, caches, conversations, downloads, Git
   history, tags, authorship, or historical links.
@@ -173,7 +174,45 @@ continues to use `com.dsbox.desktop`, `$HOME/.dsbox`, and the existing `DSBOX_*`
 configuration names. Reusing those identities keeps installed models,
 configuration, downloads, and local conversations in place.
 
-## 6. Handle the repository rename only after an announcement
+### Replace `DSBox.app` with `Hebrus Studio.app`
+
+The macOS upgrade is not an in-place Finder replacement. Because
+`DSBox.app` and `Hebrus Studio.app` have different bundle filenames, dragging
+the new application into `/Applications` does not replace `DSBox.app`; both
+applications remain present until the old bundle is removed.
+They nevertheless share the `com.dsbox.desktop` app identifier, legacy state,
+and configured local control port (`4242` by default). Never run them at the
+same time, including for a side-by-side comparison.
+
+Use this order after obtaining a verified Hebrus Studio package:
+
+1. Quit DSBox from its application menu and wait for its managed engine to
+   stop. Confirm neither DSBox nor its server remains active and that the
+   configured control port is no longer listening.
+2. Confirm the existing state is present at both
+   `$HOME/Library/Application Support/DSBox` and `$HOME/.dsbox`. Back up any
+   irreplaceable configuration or conversation data according to the normal
+   host backup policy; do not rename either directory.
+3. Copy `Hebrus Studio.app` into `/Applications`. Finder leaves
+   `/Applications/DSBox.app` beside it because the names differ; this is
+   expected and is not permission to launch both.
+4. Launch only Hebrus Studio. The bridge must keep Electron `userData` at the
+   legacy `$HOME/Library/Application Support/DSBox` path and engine/application
+   state at `$HOME/.dsbox`; it must not create a parallel fresh profile merely
+   because the visible name changed.
+5. Verify that existing settings, installed models, downloads, and local
+   conversations are visible, then start and stop one model to confirm the
+   expected control port and engine capability contract.
+6. After verification, remove `/Applications/DSBox.app` or retain one old copy
+   only in an offline rollback archive outside `/Applications`. Do not leave a
+   routinely launchable old copy alongside Hebrus Studio.
+
+If either state directory changes, an empty profile appears, or the old process
+still owns the control port, quit Hebrus Studio and stop the upgrade. Do not
+merge two profile directories or launch DSBox to “repair” state while Hebrus
+Studio is running.
+
+## 7. Handle the repository rename only after an announcement
 
 No repository rename is implied by this guide. Existing clones continue to use
 their current remote. After maintainers announce and verify an administrative
@@ -191,9 +230,10 @@ unreserved guessed namespace.
 
 ## Rollback
 
-The compatibility bridge is designed to make rollback mechanical:
+The engine compatibility bridge is designed to make rollback mechanical:
 
-1. stop the running engine or Hebrus Studio process;
+1. stop the running engine or Hebrus Studio process and confirm its port has
+   been released;
 2. restore the previously recorded executable package or checkout;
 3. continue invoking `ds4*` with the unchanged model and data paths;
 4. verify the restored `--build-info` and capability document;
@@ -204,6 +244,22 @@ published model. If the new package installed into a private staging root, use
 `make uninstall` with the same `DESTDIR` and `PREFIX`; it removes only the ten
 explicit command paths.
 
+For an application rollback, keep the old app offline until it is needed, then:
+
+1. quit Hebrus Studio and its managed engine completely;
+2. remove or archive `/Applications/Hebrus Studio.app` so only one application
+   can be launched;
+3. restore the archived `DSBox.app` to `/Applications` without moving or
+   rewriting either legacy state directory;
+4. launch only DSBox and verify its settings, model catalog, conversations,
+   control port, and engine build identity;
+5. keep Hebrus Studio offline until the rollback issue is resolved.
+
+The bridge release does not require a state-schema migration, so both app
+identities use the same legacy Electron `userData` and `$HOME/.dsbox` state.
+If a later release explicitly introduces a schema migration, its own release
+notes and backup procedure take precedence over this bridge rollback.
+
 ## Completion checklist
 
 - [ ] The installed build matches the announced tag or commit.
@@ -213,6 +269,11 @@ explicit command paths.
 - [ ] The exact qualified model artifact still passes size and SHA-256 checks.
 - [ ] Existing `DS4_*`, `DSBOX_*`, `$HOME/.dsbox`, and serialized identifiers are
       unchanged.
+- [ ] Electron `userData` remains at
+      `$HOME/Library/Application Support/DSBox`; no second empty profile was
+      created for the visible name.
+- [ ] DSBox and Hebrus Studio were never active simultaneously, and only one
+      application owns the configured control port.
 - [ ] Hebrus Studio can admit the canonical server and fall back to the legacy
       server without weakening validation.
 - [ ] Rollback has been tested without copying or deleting user data.
