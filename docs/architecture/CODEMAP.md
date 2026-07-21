@@ -16,6 +16,10 @@ recorded in [`ADR 0005`](../adr/0005-hebrus-naming-and-compatibility-boundary.md
 
 ## Runtime Entry Points
 
+The Makefile links one canonical `hebrus*` executable per role from these
+entrypoints and publishes the corresponding `ds4*` name as a symlink to the
+same file. There are no alias-specific wrappers or object graphs.
+
 | Path | Primary responsibility |
 | --- | --- |
 | `ds4_cli.c` | One-shot CLI, interactive transcript, and command-line orchestration |
@@ -101,6 +105,7 @@ not validated.
 | --- | --- |
 | `tests/` | Model-free, model-backed, kernel, tokenizer, server, and build-isolation regressions |
 | `tests/test_capabilities.py` | Exact schema and cross-executable checks for the model-free build/capability contract |
+| `tests/test_command_aliases.py` | Canonical/legacy symlink layout, binary identity, and CLI-output parity checks |
 | `tests/qwen/` | Qwen fixtures, provenance, reference collectors, and model-specific gates |
 | `tests/test-vectors/` | Official and local continuation vectors plus provenance |
 | `gguf-tools/` | Quantization, ExpertMajor conversion, imatrix, and quality-scoring tools |

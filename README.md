@@ -100,10 +100,10 @@ git clone https://github.com/andreaborio/ds4.git
 cd ds4
 
 make -j8
-./ds4 --build-info
-./ds4-server --capabilities=json
+./hebrus --build-info
+./hebrus-server --capabilities=json
 ./download_model.sh qwen-v2
-./ds4 \
+./hebrus \
   -m gguf/Qwen3.6-35B-A3B-DS4-ExpertMajor-v2-MLX-Affine4-G64.gguf \
   --ctx 8192
 ```
@@ -112,20 +112,26 @@ make -j8
 `download_model.sh qwen-v2` install revision-pinned release artifacts and
 verify their complete byte size and SHA-256 before returning success.
 
+`hebrus`, `hebrus-server`, `hebrus-agent`, `hebrus-bench`, and `hebrus-eval`
+are the canonical command names. The corresponding `ds4*` names remain direct
+aliases to the same binaries for existing installations and automation. During
+this bridge tranche their help, diagnostics, build identity, and capability
+`engine_id` intentionally remain compatibility-identical.
+
 On macOS, AUTO residency keeps the model resident when it safely fits.
 Otherwise it selects SSD streaming and derives an expert-cache budget from the
 model geometry and live host memory. Force the SSD path only when you need a
 controlled run:
 
 ```sh
-./ds4 -m /absolute/path/to/MODEL-DS4-ExpertMajor-v2.gguf \
+./hebrus -m /absolute/path/to/MODEL-DS4-ExpertMajor-v2.gguf \
   --ssd-streaming --ctx 8192
 ```
 
 Start the local API with:
 
 ```sh
-./ds4-server -m /absolute/path/to/MODEL-DS4-ExpertMajor-v2.gguf --ctx 8192
+./hebrus-server -m /absolute/path/to/MODEL-DS4-ExpertMajor-v2.gguf --ctx 8192
 ```
 
 ## How SSD streaming uses memory

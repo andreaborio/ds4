@@ -133,11 +133,19 @@ make cpu              # CPU-only diagnostics in build/cpu-<arch>/bin on macOS
 ```
 
 On macOS, Metal and CPU objects/binaries live in separate build profiles.
-`make cpu` never replaces the root Metal commands.  Use
-`build/cpu-$(uname -m)/bin/ds4` for the CPU-only binary and `./ds4 --build-info`
-to verify build provenance.
+`make cpu` never replaces the root Metal commands. Use
+`build/cpu-$(uname -m)/bin/hebrus` for the canonical CPU-only binary and
+`./hebrus --build-info` to verify build provenance.
 
-Every executable also accepts `--capabilities=json` without loading a model.
+Each build profile links one real executable per role under the canonical
+`hebrus*` name. The matching `ds4*` command is a relative symlink to that file;
+it is not a separately compiled or linked wrapper. On macOS both root command
+sets resolve to the same namespaced Metal binaries. The bridge deliberately
+keeps help, diagnostics, `--build-info`, and capability `engine_id` output
+identical under both names while downstream consumers migrate.
+
+Every canonical and compatibility executable accepts `--capabilities=json`
+without loading a model.
 The deterministic schema reports the build revision, compiled backend,
 executable role, supported model families, and the ExpertMajor v2 tensor and
 storage wire contract. Consumers should reject unknown `schema_version` values
@@ -169,8 +177,8 @@ optionally followed by `-dirty`; non-Git builds may report `unknown`.
 
 Do not rely on the historical `./ds4flash.gguf` symlink for runtime identity.
 Pass `-m` with an absolute qualified ExpertMajor v2 path and verify its complete
-published output SHA-256 before inference. Run `./ds4 --help` and
-`./ds4-server --help` for the full flag list.
+published output SHA-256 before inference. Run `./hebrus --help` and
+`./hebrus-server --help` for the full flag list.
 
 ## Speed
 

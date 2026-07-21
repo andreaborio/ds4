@@ -3,6 +3,11 @@
 /ds4-bench
 /ds4-eval
 /ds4-agent
+/hebrus
+/hebrus-server
+/hebrus-bench
+/hebrus-eval
+/hebrus-agent
 /ds4-qwen-pack
 /ds4_native
 /ds4_server_test

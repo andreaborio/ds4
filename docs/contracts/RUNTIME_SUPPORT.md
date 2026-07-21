@@ -14,9 +14,9 @@ and Qwen's lower-memory extension in
 
 | Model family | Minimum unified memory | Qualified Metal modes | Release startup |
 | --- | ---: | --- | --- |
-| DeepSeek V4 Flash | 64 GiB | AUTO resolving to resident or SSD; explicit resident and SSD according to the artifact gate | `./ds4 -m DEEPSEEK-DS4-ExpertMajor-v2.gguf` |
-| Qwen3.6-35B-A3B | 16 GiB | AUTO resolving to resident or SSD; explicit resident and SSD according to the Qwen admission gates | `./ds4 -m Qwen3.6-35B-A3B-DS4-ExpertMajor-v2-MLX-Affine4-G64.gguf` |
-| GLM 5.2 | 64 GiB | AUTO resolving to SSD streaming only; resident is rejected | `./ds4 -m GLM-DS4-ExpertMajor-v2.gguf --ctx 8192` |
+| DeepSeek V4 Flash | 64 GiB | AUTO resolving to resident or SSD; explicit resident and SSD according to the artifact gate | `./hebrus -m DEEPSEEK-DS4-ExpertMajor-v2.gguf` |
+| Qwen3.6-35B-A3B | 16 GiB | AUTO resolving to resident or SSD; explicit resident and SSD according to the Qwen admission gates | `./hebrus -m Qwen3.6-35B-A3B-DS4-ExpertMajor-v2-MLX-Affine4-G64.gguf` |
+| GLM 5.2 | 64 GiB | AUTO resolving to SSD streaming only; resident is rejected | `./hebrus -m GLM-DS4-ExpertMajor-v2.gguf --ctx 8192` |
 
 All rows require Apple Metal and a validated embedded `ds4.expert_major.v2`
 store. Explicit residency options are controlled qualification tools; normal

@@ -25,14 +25,17 @@ LDLIBS ?= -lm -pthread
 METAL_SRCS := $(wildcard metal/*.metal)
 
 BUILD_ROOT ?= build
-PROGRAMS := ds4 ds4-server ds4-bench ds4-eval ds4-agent
+HEBRUS_PROGRAMS := hebrus hebrus-server hebrus-bench hebrus-eval hebrus-agent
+DS4_PROGRAMS := ds4 ds4-server ds4-bench ds4-eval ds4-agent
+PROGRAMS := $(HEBRUS_PROGRAMS) $(DS4_PROGRAMS)
 
 .PHONY: all help clean test model-free-test premerge context-audit doc-links \
 	imatrix-dataset-check prompt-fixture-check cpu FORCE \
 	metal build-isolation-test q4k-dot-test qwen-metadata-test \
 	qwen-reference-test qwen-unicode-test qwen-tokenizer-test \
 	qwen-expert-group-test expert-store-test metal-ssd-profile-test \
-	download-model-test capabilities-test $(PROGRAMS) ds4_test ds4_agent_test
+	download-model-test capabilities-test command-alias-test $(PROGRAMS) \
+	ds4_test ds4_agent_test
 
 download-model-test: tests/test_download_model.sh download_model.sh
 	sh tests/test_download_model.sh
@@ -75,9 +78,9 @@ METAL_TEST_BINS := \
 all: metal
 
 help:
-	@echo "DS4 build targets:"
-	@echo "  make / make metal Build Metal and publish ./ds4* -> $(METAL_BINDIR)"
-	@echo "  make cpu          Build CPU-only binaries in $(CPU_BINDIR) (never changes ./ds4*)"
+	@echo "Hebrus build targets:"
+	@echo "  make / make metal Build Metal and publish ./hebrus* plus ./ds4* aliases"
+	@echo "  make cpu          Build CPU-only commands in $(CPU_BINDIR); keep root Metal links"
 	@echo "  make test         Build and run the Metal test suite"
 	@echo "  make model-free-test"
 	@echo "                    Run all Metal gates that do not require a GGUF"
@@ -89,72 +92,98 @@ help:
 # Root binaries are a Metal-only compatibility surface on macOS.  These targets
 # are phony so an old regular CPU binary is replaced even when its timestamp is
 # newer than the namespaced Metal binary.
-metal: $(PROGRAMS)
+metal: $(PROGRAMS) $(METAL_BINS)
 
-$(PROGRAMS): %: $(METAL_BINDIR)/%
+hebrus ds4: $(METAL_BINDIR)/hebrus
+hebrus-server ds4-server: $(METAL_BINDIR)/hebrus-server
+hebrus-bench ds4-bench: $(METAL_BINDIR)/hebrus-bench
+hebrus-eval ds4-eval: $(METAL_BINDIR)/hebrus-eval
+hebrus-agent ds4-agent: $(METAL_BINDIR)/hebrus-agent
+
+$(PROGRAMS):
 	@rm -f "$@"
 	@ln -s "$<" "$@"
 
 cpu: $(CPU_BINS)
 	@echo "CPU-only binaries: $(CPU_BINDIR)"
 
-$(METAL_BINDIR)/ds4: \
+$(METAL_BINDIR)/hebrus: \
 	$(METAL_OBJDIR)/ds4_cli.o $(METAL_OBJDIR)/ds4_help.o \
 	$(METAL_OBJDIR)/linenoise.o $(METAL_CORE_OBJS)
 	@mkdir -p "$(@D)"
 	$(CC) $(CFLAGS) -o $@ $^ $(METAL_LDLIBS)
 
-$(METAL_BINDIR)/ds4-server: \
+$(METAL_BINDIR)/hebrus-server: \
 	$(METAL_OBJDIR)/ds4_server.o $(METAL_OBJDIR)/ds4_help.o \
 	$(METAL_OBJDIR)/ds4_kvstore.o $(METAL_OBJDIR)/rax.o $(METAL_CORE_OBJS)
 	@mkdir -p "$(@D)"
 	$(CC) $(CFLAGS) -o $@ $^ $(METAL_LDLIBS)
 
-$(METAL_BINDIR)/ds4-bench: \
+$(METAL_BINDIR)/hebrus-bench: \
 	$(METAL_OBJDIR)/ds4_bench.o $(METAL_OBJDIR)/ds4_help.o $(METAL_CORE_OBJS)
 	@mkdir -p "$(@D)"
 	$(CC) $(CFLAGS) -o $@ $^ $(METAL_LDLIBS)
 
-$(METAL_BINDIR)/ds4-eval: \
+$(METAL_BINDIR)/hebrus-eval: \
 	$(METAL_OBJDIR)/ds4_eval.o $(METAL_OBJDIR)/ds4_help.o $(METAL_CORE_OBJS)
 	@mkdir -p "$(@D)"
 	$(CC) $(CFLAGS) -o $@ $^ $(METAL_LDLIBS)
 
-$(METAL_BINDIR)/ds4-agent: \
+$(METAL_BINDIR)/hebrus-agent: \
 	$(METAL_OBJDIR)/ds4_agent.o $(METAL_OBJDIR)/ds4_help.o \
 	$(METAL_OBJDIR)/ds4_web.o $(METAL_OBJDIR)/ds4_kvstore.o \
 	$(METAL_OBJDIR)/linenoise.o $(METAL_CORE_OBJS)
 	@mkdir -p "$(@D)"
 	$(CC) $(CFLAGS) -o $@ $^ $(METAL_LDLIBS)
 
-$(CPU_BINDIR)/ds4: \
+$(METAL_BINDIR)/ds4: $(METAL_BINDIR)/hebrus
+$(METAL_BINDIR)/ds4-server: $(METAL_BINDIR)/hebrus-server
+$(METAL_BINDIR)/ds4-bench: $(METAL_BINDIR)/hebrus-bench
+$(METAL_BINDIR)/ds4-eval: $(METAL_BINDIR)/hebrus-eval
+$(METAL_BINDIR)/ds4-agent: $(METAL_BINDIR)/hebrus-agent
+
+$(addprefix $(METAL_BINDIR)/,$(DS4_PROGRAMS)):
+	@rm -f "$@"
+	@ln -s "$(notdir $<)" "$@"
+
+$(CPU_BINDIR)/hebrus: \
 	$(CPU_OBJDIR)/ds4_cli.o $(CPU_OBJDIR)/ds4_help.o \
 	$(CPU_OBJDIR)/linenoise.o $(CPU_CORE_OBJS)
 	@mkdir -p "$(@D)"
 	$(CC) $(CFLAGS) -o $@ $^ $(LDLIBS)
 
-$(CPU_BINDIR)/ds4-server: \
+$(CPU_BINDIR)/hebrus-server: \
 	$(CPU_OBJDIR)/ds4_server.o $(CPU_OBJDIR)/ds4_help.o \
 	$(CPU_OBJDIR)/ds4_kvstore.o $(CPU_OBJDIR)/rax.o $(CPU_CORE_OBJS)
 	@mkdir -p "$(@D)"
 	$(CC) $(CFLAGS) -o $@ $^ $(LDLIBS)
 
-$(CPU_BINDIR)/ds4-bench: \
+$(CPU_BINDIR)/hebrus-bench: \
 	$(CPU_OBJDIR)/ds4_bench.o $(CPU_OBJDIR)/ds4_help.o $(CPU_CORE_OBJS)
 	@mkdir -p "$(@D)"
 	$(CC) $(CFLAGS) -o $@ $^ $(LDLIBS)
 
-$(CPU_BINDIR)/ds4-eval: \
+$(CPU_BINDIR)/hebrus-eval: \
 	$(CPU_OBJDIR)/ds4_eval.o $(CPU_OBJDIR)/ds4_help.o $(CPU_CORE_OBJS)
 	@mkdir -p "$(@D)"
 	$(CC) $(CFLAGS) -o $@ $^ $(LDLIBS)
 
-$(CPU_BINDIR)/ds4-agent: \
+$(CPU_BINDIR)/hebrus-agent: \
 	$(CPU_OBJDIR)/ds4_agent.o $(CPU_OBJDIR)/ds4_help.o \
 	$(CPU_OBJDIR)/ds4_web.o $(CPU_OBJDIR)/ds4_kvstore.o \
 	$(CPU_OBJDIR)/linenoise.o $(CPU_CORE_OBJS)
 	@mkdir -p "$(@D)"
 	$(CC) $(CFLAGS) -o $@ $^ $(LDLIBS)
+
+$(CPU_BINDIR)/ds4: $(CPU_BINDIR)/hebrus
+$(CPU_BINDIR)/ds4-server: $(CPU_BINDIR)/hebrus-server
+$(CPU_BINDIR)/ds4-bench: $(CPU_BINDIR)/hebrus-bench
+$(CPU_BINDIR)/ds4-eval: $(CPU_BINDIR)/hebrus-eval
+$(CPU_BINDIR)/ds4-agent: $(CPU_BINDIR)/hebrus-agent
+
+$(addprefix $(CPU_BINDIR)/,$(DS4_PROGRAMS)):
+	@rm -f "$@"
+	@ln -s "$(notdir $<)" "$@"
 
 $(METAL_OBJDIR)/%.o: %.c
 	@mkdir -p "$(@D)"
@@ -442,6 +471,10 @@ qwen-tokenizer-test: $(METAL_BINDIR)/test_qwen_tokenizer
 capabilities-test: metal tests/test_capabilities.py
 	python3 tests/test_capabilities.py --bin-dir $(METAL_BINDIR) --backend metal
 
+command-alias-test: metal tests/test_command_aliases.py
+	python3 tests/test_command_aliases.py --bin-dir $(METAL_BINDIR) \
+		--backend metal --layout profile
+
 model-free-test: metal ds4_test ds4_agent_test $(METAL_BINDIR)/test_q4k_dot \
 		$(METAL_BINDIR)/test_q4k_top8 \
 		$(METAL_BINDIR)/test_qwen_session \
@@ -454,8 +487,10 @@ model-free-test: metal ds4_test ds4_agent_test $(METAL_BINDIR)/test_q4k_dot \
 		$(METAL_BINDIR)/test_expert_store \
 		$(METAL_BINDIR)/test_metal_ssd_profile \
 		$(METAL_BINDIR)/test_ssd_residency download-model-test \
-		tests/test_capabilities.py
+		tests/test_capabilities.py tests/test_command_aliases.py
 	python3 tests/test_capabilities.py --bin-dir $(METAL_BINDIR) --backend metal
+	python3 tests/test_command_aliases.py --bin-dir $(METAL_BINDIR) \
+		--backend metal --layout profile
 	DS4_BIN_DIR=$(METAL_BINDIR) sh tests/test_retired_distributed_flags.sh
 	sh tests/test_benchmark_env_guard.sh
 	$(METAL_BINDIR)/ds4-eval --self-test-extractors
@@ -504,7 +539,8 @@ premerge: context-audit doc-links imatrix-dataset-check prompt-fixture-check bui
 	$(MAKE) model-free-test
 	git diff --check
 
-build-isolation-test: tests/test_build_isolation.sh tests/test_capabilities.py
+build-isolation-test: tests/test_build_isolation.sh tests/test_capabilities.py \
+		tests/test_command_aliases.py
 	MAKE="$(MAKE)" sh tests/test_build_isolation.sh
 
 -include $(wildcard $(METAL_OBJDIR)/*.d $(CPU_OBJDIR)/*.d)
@@ -518,28 +554,38 @@ CPU_CORE_OBJS := ds4_cpu.o ds4_build_cpu.o ds4_ssd.o \
 all: cpu
 
 help:
-	@echo "DS4 build targets:"
-	@echo "  make / make cpu          Build CPU-only ./ds4* binaries"
+	@echo "Hebrus build targets:"
+	@echo "  make / make cpu          Build ./hebrus* plus ./ds4* aliases"
 	@echo "  make test                Build and run tests"
 	@echo "  make model-free-test     Run all tests that do not require a GGUF"
 	@echo "  make clean               Remove build outputs"
 
 cpu: $(PROGRAMS)
 
-ds4: ds4_cli_cpu.o ds4_help.o linenoise.o $(CPU_CORE_OBJS)
+hebrus: ds4_cli_cpu.o ds4_help.o linenoise.o $(CPU_CORE_OBJS)
 	$(CC) $(CFLAGS) -o $@ $^ $(LDLIBS)
 
-ds4-server: ds4_server_cpu.o ds4_help.o ds4_kvstore.o rax.o $(CPU_CORE_OBJS)
+hebrus-server: ds4_server_cpu.o ds4_help.o ds4_kvstore.o rax.o $(CPU_CORE_OBJS)
 	$(CC) $(CFLAGS) -o $@ $^ $(LDLIBS)
 
-ds4-bench: ds4_bench_cpu.o ds4_help.o $(CPU_CORE_OBJS)
+hebrus-bench: ds4_bench_cpu.o ds4_help.o $(CPU_CORE_OBJS)
 	$(CC) $(CFLAGS) -o $@ $^ $(LDLIBS)
 
-ds4-eval: ds4_eval_cpu.o ds4_help.o $(CPU_CORE_OBJS)
+hebrus-eval: ds4_eval_cpu.o ds4_help.o $(CPU_CORE_OBJS)
 	$(CC) $(CFLAGS) -o $@ $^ $(LDLIBS)
 
-ds4-agent: ds4_agent_cpu.o ds4_help.o ds4_web.o ds4_kvstore.o linenoise.o $(CPU_CORE_OBJS)
+hebrus-agent: ds4_agent_cpu.o ds4_help.o ds4_web.o ds4_kvstore.o linenoise.o $(CPU_CORE_OBJS)
 	$(CC) $(CFLAGS) -o $@ $^ $(LDLIBS)
+
+ds4: hebrus
+ds4-server: hebrus-server
+ds4-bench: hebrus-bench
+ds4-eval: hebrus-eval
+ds4-agent: hebrus-agent
+
+$(DS4_PROGRAMS):
+	@rm -f "$@"
+	@ln -s "$(notdir $<)" "$@"
 
 ds4_build_cpu.o: ds4_build.c ds4.h ds4_expert_store.h FORCE
 	$(CC) $(CFLAGS) -DDS4_NO_GPU -c -o $@ ds4_build.c
@@ -643,8 +689,10 @@ model-free-test: ds4 ds4_test ds4_agent_test ds4-eval q4k-dot-test \
 		tests/test_qwen_expert_group \
 		tests/test_expert_store \
 		tests/test_metal_ssd_profile \
-		tests/test_ssd_residency download-model-test tests/test_capabilities.py
+		tests/test_ssd_residency download-model-test tests/test_capabilities.py \
+		tests/test_command_aliases.py
 	python3 tests/test_capabilities.py --bin-dir . --backend cpu
+	python3 tests/test_command_aliases.py --bin-dir . --backend cpu --layout profile
 	sh tests/test_retired_distributed_flags.sh
 	sh tests/test_benchmark_env_guard.sh
 	./ds4-eval --self-test-extractors
@@ -670,6 +718,9 @@ model-free-test: ds4 ds4_test ds4_agent_test ds4-eval q4k-dot-test \
 
 capabilities-test: $(PROGRAMS) tests/test_capabilities.py
 	python3 tests/test_capabilities.py --bin-dir . --backend cpu
+
+command-alias-test: $(PROGRAMS) tests/test_command_aliases.py
+	python3 tests/test_command_aliases.py --bin-dir . --backend cpu --layout profile
 
 test: model-free-test
 	./ds4_test
@@ -793,7 +844,8 @@ endif
 
 clean:
 	rm -rf "$(BUILD_ROOT)"
-	rm -f ds4 ds4-server ds4-bench ds4-eval ds4-agent ds4_cpu ds4_native \
+	rm -f hebrus hebrus-server hebrus-bench hebrus-eval hebrus-agent \
+		ds4 ds4-server ds4-bench ds4-eval ds4-agent ds4_cpu ds4_native \
 		ds4_server_test ds4_test ds4_agent_test tests/test_q4k_dot \
 		tests/test_q4k_top8 \
 		tests/test_qwen_session \

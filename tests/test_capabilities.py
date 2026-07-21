@@ -11,6 +11,11 @@ import sys
 
 
 ROLES = {
+    "hebrus": "cli",
+    "hebrus-server": "server",
+    "hebrus-agent": "agent",
+    "hebrus-bench": "bench",
+    "hebrus-eval": "eval",
     "ds4": "cli",
     "ds4-server": "server",
     "ds4-agent": "agent",
@@ -133,7 +138,7 @@ def main() -> int:
 
     shared: dict[str, object] | None = None
     for program, role in ROLES.items():
-        binary = (args.bin_dir / program).resolve()
+        binary = (args.bin_dir / program).absolute()
         if not binary.is_file():
             fail(f"missing executable: {binary}")
         document = validate(binary, args.backend, role)
