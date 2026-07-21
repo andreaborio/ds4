@@ -973,7 +973,8 @@ static void test_metal_qwen35_graph_state(void) {
             QWEN35_SSM_VALUE_HEAD * QWEN35_SSM_STATE * QWEN35_SSM_STATE;
     const uint64_t expected_i32_elements =
         QWEN35_N_EXPERT_USED +
-        (uint64_t)prefill_cap * (2u + QWEN35_N_EXPERT_USED);
+        (uint64_t)prefill_cap *
+            (2u + 32u + QWEN35_N_EXPERT_USED);
     const uint64_t expected_bytes = expected_f32_elements * f32 +
         expected_i32_elements * sizeof(int32_t);
 

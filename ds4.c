@@ -14961,6 +14961,7 @@ typedef struct {
     ds4_gpu_tensor *batch_beta;
     ds4_gpu_tensor *batch_attn_out;
     ds4_gpu_tensor *batch_router_logits;
+    ds4_gpu_tensor *batch_router_candidates;
     ds4_gpu_tensor *batch_router_selected;
     ds4_gpu_tensor *batch_router_weight;
     ds4_gpu_tensor *batch_routed_gate;
@@ -15326,6 +15327,7 @@ static void qwen35_gpu_graph_free(ds4_qwen35_gpu_graph *g) {
     ds4_gpu_tensor_free(g->batch_routed_gate);
     ds4_gpu_tensor_free(g->batch_router_weight);
     ds4_gpu_tensor_free(g->batch_router_selected);
+    ds4_gpu_tensor_free(g->batch_router_candidates);
     ds4_gpu_tensor_free(g->batch_router_logits);
     ds4_gpu_tensor_free(g->batch_attn_out);
     ds4_gpu_tensor_free(g->batch_beta);
@@ -15419,7 +15421,8 @@ static bool qwen35_gpu_graph_allocated_bytes(
         g->batch_key, g->batch_value, g->batch_heads,
         g->batch_alpha_logit, g->batch_beta_logit,
         g->batch_log_decay, g->batch_beta, g->batch_attn_out,
-        g->batch_router_logits, g->batch_router_selected,
+        g->batch_router_logits, g->batch_router_candidates,
+        g->batch_router_selected,
         g->batch_router_weight, g->batch_routed_gate,
         g->batch_routed_up, g->batch_routed_mid, g->batch_routed_down,
         g->batch_moe_out, g->batch_shared_gate, g->batch_shared_up,
@@ -15679,6 +15682,8 @@ static bool qwen35_gpu_graph_alloc(
                          QWEN35_N_EMBD, 1, 1);
     QWEN35_GPU_ALLOC_F32(batch_router_logits, prefill_cap,
                          QWEN35_N_EXPERT, 1, 1);
+    QWEN35_GPU_ALLOC_I32(batch_router_candidates, prefill_cap,
+                         32, 1, 1);
     QWEN35_GPU_ALLOC_I32(batch_router_selected, prefill_cap,
                          QWEN35_N_EXPERT_USED, 1, 1);
     QWEN35_GPU_ALLOC_F32(batch_router_weight, prefill_cap,
@@ -15778,7 +15783,9 @@ static bool qwen35_gpu_graph_alloc(
                     next.batch_heads && next.batch_alpha_logit &&
                     next.batch_beta_logit && next.batch_log_decay &&
                     next.batch_beta && next.batch_attn_out &&
-                    next.batch_router_logits && next.batch_router_selected &&
+                    next.batch_router_logits &&
+                    next.batch_router_candidates &&
+                    next.batch_router_selected &&
                     next.batch_router_weight && next.batch_routed_gate &&
                     next.batch_routed_up && next.batch_routed_mid &&
                     next.batch_routed_down && next.batch_moe_out &&
@@ -17006,6 +17013,16 @@ static bool qwen35_gpu_encode_ffn_batch(
             graph->batch_router_logits, model, layer->ffn_gate_inp,
             QWEN35_N_EMBD, QWEN35_N_EXPERT,
             graph->batch_norm, n_token);
+    }
+    if (ok) {
+        ok = ds4_gpu_qwen35_router_refine_top32_batch_tensor(
+                 graph->batch_router_logits,
+                 graph->batch_router_candidates,
+                 model->map,
+                 model->size,
+                 layer->ffn_gate_inp->abs_offset,
+                 graph->batch_norm,
+                 n_token) != 0;
     }
     QWEN35_PROFILE_FFN_BATCH_STAGE("router");
     if (ok) {
