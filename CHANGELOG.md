@@ -25,6 +25,9 @@ not represent a published release.
 - Added Proposed ADR 0005 to document the intended Hebrus naming and
   compatibility boundary without changing durable model, cache, or historical
   identifiers.
+- Added the maintainer-supplied Hebrus logo as a hash-frozen, unchanged RGBA
+  master shared with Hebrus Studio. Repository tests reject pixel or encoding
+  drift; web presentation effects remain CSS-only.
 
 ### Changed
 

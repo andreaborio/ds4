@@ -84,6 +84,15 @@ identifier, state, and control port and must never run simultaneously. The
 verified upgrade quits DSBox first, installs and validates Hebrus Studio, and
 then removes the old bundle or retains it only in an offline rollback archive.
 
+### Canonical visual identity
+
+Both repositories use the same maintainer-supplied 1254 x 1254 RGBA Hebrus
+master without pixel, crop, color, or encoding edits. Its SHA-256 is
+`4be8949c73bd52e7abef58396dcd57f636165a8bb6cd6d536a600bcbf880594c`.
+Hebrus Studio derives its macOS icon from that exact file during packaging and
+adds a drop shadow only through CSS on web surfaces. The engine and application
+release gates reject a modified master or a mismatched packaged copy.
+
 ### Open-source project surface
 
 The candidate includes contribution, security, governance, conduct,
