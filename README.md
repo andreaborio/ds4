@@ -42,8 +42,8 @@ runner; arbitrary GGUF files are not expected to work.
 Upstream DwarfStar provides the core engine and leads the high-memory and
 distributed paths. This fork asks a complementary question:
 
-**How far can the same specialized design be pushed on 64 GB and larger Macs,
-when the SSD becomes an active model-memory tier?**
+**How far can the same specialized design be pushed across Apple Silicon memory
+tiers, when the SSD becomes an active model-memory tier?**
 
 The current work concentrates on:
 
@@ -90,8 +90,9 @@ inspectable in GitHub's
 ## Quick start
 
 Requirements: Apple Silicon, Xcode Command Line Tools, an ExpertMajor v2 GGUF,
-and enough SSD space for the selected model. The current release and benchmark
-baseline is a Mac with at least 64 GiB of unified memory.
+and enough SSD space for the selected model. DeepSeek and GLM currently require
+at least 64 GiB. Qwen's hardware-aware AUTO path starts at 16 GiB and chooses
+resident or SSD from the active Metal and live-memory budgets.
 
 ```sh
 xcode-select --install
@@ -153,7 +154,7 @@ the runtime needs.
 | DeepSeek V4 Flash ExpertMajor v2 | `main` | Supported Apple Metal resident/SSD path | Adaptive SSD streaming and grouped prefill |
 | DeepSeek V4 PRO ExpertMajor v2 | offline tooling only | Not runtime-qualified; no release artifact identity | Converter and future per-artifact qualification |
 | GLM 5.2 ExpertMajor v2 | `main` | Qualified Apple Metal SSD path; 64 GB minimum | Embedded expert store, grouped prefill, compact DSA KV, 601-record DS4 cache plus adaptive macOS file caching |
-| Qwen3.6-35B-A3B ExpertMajor v2 | `main` | Supported Apple Metal resident/SSD path | AUTO mapping, resident prefill, and parallel resident decode |
+| Qwen3.6-35B-A3B ExpertMajor v2 | `main` | Supported Apple Metal resident/SSD path; 16 GiB minimum | Hardware-aware AUTO mapping, resident prefill, and parallel resident decode |
 
 ### DeepSeek expert-major v2 format
 
@@ -230,18 +231,27 @@ Format details and the v2/v1 publication A/B are in
 [`docs/qwen-expert-major-store.md`](docs/qwen-expert-major-store.md) and
 [`docs/benchmarks/2026-07-20-qwen-expert-major-v2.md`](docs/benchmarks/2026-07-20-qwen-expert-major-v2.md).
 
-Qwen AUTO selects the full-model mapped Metal mode only when both the fixed Metal
-working-set budget and a point-in-time host-memory pressure check pass. Under
-pressure it falls back to SSD and lazily grows the routed-expert cache to the
-largest complete routing tier admitted by the current conservative snapshot.
-The planner independently reserves static pages, context/runtime memory, and
-system headroom, then selects the largest complete expert-cache cycle admitted
-by the remaining live and platform budgets. Bounded file-backed inactive pages
-receive full credit only while macOS reports normal pressure; unknown or
-elevated pressure fails closed near the boundary. `--resident` fails unless the
-admission checks pass. `--ssd-streaming` remains a controlled-test override.
-In SSD mode Qwen grows its Metal expert cache in 321-expert slabs (about
-0.529 GiB) instead of taking the generic 4 GiB first slab.
+Qwen AUTO reports a named 16/24/32/36/48/64/96/128 GiB profile, then computes
+from the exact physical RAM and `recommendedMaxWorkingSetSize`; the labels do
+not hardcode a cache count. Its resident reserve is
+`max(2 GiB, RAM/16) + max(0.25 GiB, RAM/64)`. Full-model mapped Metal mode is
+selected only when both that fixed Metal plan and a point-in-time host-memory
+pressure check pass. The 19.37 GiB tensor payload cannot be resident on 16 GiB,
+so AUTO uses SSD there. A 32 GiB Mac can select resident for shorter contexts
+when both gates pass and falls back to SSD when current pressure or context
+runtime no longer fits.
+
+In SSD mode the planner charges static pages, context/runtime memory, and system
+headroom, then selects the largest complete expert-cache cycle admitted by the
+remaining live and platform budgets. Under normal macOS pressure, equivalent
+free and bounded file-backed GGUF pages receive equal credit on every Qwen
+profile; warming the model file therefore cannot by itself reduce AUTO cache.
+Unknown or elevated pressure remains conservative, and the 16 GiB class
+requires an affirmative normal-pressure signal. Its measured AUTO ceiling is
+eleven complete routes plus the safety slot, or 3,521 experts for this 40x8
+model; the next tier produced swap and is not retained. `--resident` fails
+unless both admission checks pass. `--ssd-streaming` remains a controlled-test
+override. Cache storage grows in 321-expert slabs (about 0.529 GiB).
 
 Here `resident` means that DS4 maps the complete tensor payload, disables its
 explicit SSD expert cache, and executes full-tensor Metal kernels. Metal's
@@ -256,11 +266,12 @@ The hard SSD cache floor is 321 complete routed experts (about 0.53 GiB); 640
 (about 1.06 GiB) is a useful controlled small-cache tier. Startup and the
 per-layer path fail closed if the effective locked cache falls below the floor.
 The runtime has completed model-backed resident and SSD generation on an M5 Pro
-with 64 GiB. The v2 resident smoke produced identical output, and its 2K
+with 64 GiB. Hardware-policy selection also completes with zero swap as AUTO→SSD
+on an M1 Pro 16 GiB and AUTO→resident on an AC-powered M1 Pro 32 GiB. The v2 resident smoke produced identical output, and its 2K
 v2/v1/v2 A/B measured 318.96/29.54, 320.59/29.59, and 318.83/29.54 prefill/decode
-t/s with byte-identical evidence and no new swapout. The 64 GiB Mac is the
-current release baseline; lower-memory results from retired canonical/v1 paths
-are historical and do not extend the v2 support contract.
+t/s with byte-identical evidence and no new swapout. Performance numbers remain
+tied to each exact host and workload; policy tests for an unmeasured RAM cut are
+not presented as a throughput claim.
 
 ## Measured results
 
@@ -270,12 +281,14 @@ a different artifact and runtime path.
 
 | Model | M5 Pro 64 GB setup | 32K prefill | 32K generation / decode | Status |
 | --- | --- | ---: | ---: | --- |
-| Qwen3.6-35B-A3B ExpertMajor v2 Q4_K_S, 20.81 GB | Metal resident, final scalar source | **65.76 t/s** | about **3.18 t/s**, 315.193 ms p50, 317.518 ms p95 | Exact final-source evidence and zero swap; paired-Q8 experiment rejected and removed |
+| Qwen3.6-35B-A3B ExpertMajor v2 Q4_K_S, 20.81 GB | Metal resident, F32 split-K GQA | **61.89 t/s** | **37.42 t/s**, 26.562 ms p50, 27.834 ms p95 | 32K+128; 11.84x decode over the 3.16 t/s serial control, identical greedy token IDs, zero swap |
 | DeepSeek V4 Flash IQ2XXS, 86.72 GB | Metal SSD, phase-adaptive 259→4,129 through 32K, prose prompt | **164.43 t/s** | **7.27 t/s**, 105.410 ms p50, 149.943 ms p95 | Exact final-stack evidence and zero swap; old AUTO controls can swap, so no 32K speedup percentage |
 | GLM 5.2 ExpertMajor v2 Q2_K, 244.14 GiB | Metal AUTO→SSD, 601 records, fixed compact-indexer transition, prose prompt | **44.73 t/s** | **1.87 t/s** overall; about **2.12 t/s** at p50 | Same-prompt output matches the earlier corrected arm; zero swap; original baseline crashes before logits |
 
 Full identities, invalidations, control drift and remaining release gates are
 in the
+[`current Qwen split-K and hardware-policy record`](docs/benchmarks/2026-07-21-qwen-split-k-hardware-policy.md)
+and the earlier
 [`long-context Metal stack record`](docs/benchmarks/2026-07-20-long-context-metal-stack.md).
 DeepSeek also completes isolated 65K+128 and 100K+128 AUTO→SSD lanes with the
 2,065-expert extended-context tier at 137.29/6.59 and 145.11/6.44 prefill/decode

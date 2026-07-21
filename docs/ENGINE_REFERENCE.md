@@ -23,7 +23,7 @@
 
 That said, a few important things about this project:
 
-* The local inference landscape contains many excellent projects, but new models are released continuously, and the attention immediately gets captured by the next model to implement. This project takes a deliberately narrow bet: one model at a time, official-vector validation (logits obtained with the official implementation), long-context tests, and enough agent integration to know if it really works. The exact model may change as the landscape evolves, but the constraint remains: local inference credible on high-end Apple Silicon machines with at least 64 GB unified memory.
+* The local inference landscape contains many excellent projects, but new models are released continuously, and the attention immediately gets captured by the next model to implement. This project takes a deliberately narrow bet: one model at a time, official-vector validation (logits obtained with the official implementation), long-context tests, and enough agent integration to know if it really works. The exact model may change as the landscape evolves, but the constraint remains: credible local Apple Metal inference, with family-specific memory limits. DeepSeek and GLM currently start at 64 GiB; Qwen's SSD-backed policy starts at 16 GiB.
 * This software is developed with **strong assistance from GPT 5.5** and with humans leading the ideas, testing, and debugging. We say this openly because it shaped how the project was built. If you are not happy with AI-developed code, this software is not for you. The acknowledgement below is equally important: this would not exist without `llama.cpp` and GGML, largely written by hand.
 * This implementation is based on the idea that compressed KV caches like the one of DeepSeek v4 and the fast SSD disks of modern MacBooks should change our idea that KV cache belongs to RAM. **The KV cache is actually a first-class disk citizen**. Fast SSD disks also changed the inference game from the point of view of "model needs to fit RAM": while having more RAM than the model size is still preferred, SSD streaming turns the available amount of RAM from a hard cutoff (can I run this model or not?) into a continuous spectrum of speed levels.
 * Our vision is that local inference should be a set of three things working well together, out of the box: A) inference engine with HTTP API + B) GGUF specially crafted to run well under a given engine and given assumptions + C) testing and validation with coding agents implementations. D) Purpose built agents for specific models and execution environments. DwarfStar only runs with the GGUF files provided. It gets tested against officially obtained logits at different context sizes. This project exists because we wanted to make one local model feel finished end to end, not just runnable. However this is beta quality code, so probably we are not still there, especially since SSD streaming and the additional model families are recent additions.
@@ -205,7 +205,12 @@ and GLM SSD-only planner remain independent. Exact artifact and validation
 details live in
 [`qwen-expert-major-store.md`](qwen-expert-major-store.md).
 
-Qwen numerical inference is currently Metal-only.  The CPU performs tokenizer,
+Qwen numerical inference is currently Metal-only. AUTO exposes named
+16/24/32/36/48/64/96/128 GiB profiles but sizes resident headroom and SSD cache
+from exact physical RAM, Metal's reported working-set limit, context runtime,
+and current pressure. The 16 GiB profile is necessarily SSD for the current
+19.37 GiB tensor payload; 32 GiB can be resident for shorter contexts when both
+admission gates pass. The CPU performs tokenizer,
 sampling, selected-route readback, cache bookkeeping, and GGUF I/O in streamed
 mode; there is no CPU/GPU split of neural layers or routed experts.  Resident
 mode disables DS4's expert-cache `pread`, but Metal's residency request remains

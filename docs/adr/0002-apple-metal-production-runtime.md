@@ -2,6 +2,7 @@
 
 - Status: Accepted
 - Date: 2026-07-20
+- Amendment: ADR 0004 changes only Qwen's minimum-memory policy.
 
 ## Context
 

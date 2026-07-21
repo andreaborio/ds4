@@ -118,6 +118,72 @@ bool ds4_residency_plan_make(bool                metal_backend,
     return true;
 }
 
+bool ds4_qwen_metal_hardware_policy_make(
+        uint64_t                         physical_bytes,
+        uint64_t                         recommended_bytes,
+        ds4_qwen_metal_hardware_policy *out) {
+    if (!out) return false;
+    memset(out, 0, sizeof(*out));
+    if (physical_bytes == 0 || recommended_bytes == 0) return false;
+
+    static const uint32_t profile_gib[] = {
+        16u, 24u, 32u, 36u, 48u, 64u, 96u, 128u,
+    };
+    out->profile_gib = profile_gib[sizeof(profile_gib) /
+                                   sizeof(profile_gib[0]) - 1u];
+    for (size_t i = 0; i < sizeof(profile_gib) / sizeof(profile_gib[0]); i++) {
+        if (physical_bytes <= (uint64_t)profile_gib[i] * DS4_GIB) {
+            out->profile_gib = profile_gib[i];
+            break;
+        }
+    }
+    out->physical_bytes = physical_bytes;
+    out->recommended_bytes = recommended_bytes;
+
+    /* One reserve protects the current host and the next request.  It grows
+     * continuously instead of jumping at a profile boundary: max(2 GiB,
+     * physical/16) is ordinary headroom and max(0.25 GiB, physical/64) is the
+     * pressure allowance.  The live-pressure gate uses the same arithmetic,
+     * so fixed Metal admission and current-memory admission cannot disagree
+     * merely because two different constants were used. */
+    uint64_t ordinary = physical_bytes / 16u;
+    if (ordinary < 2u * DS4_GIB) ordinary = 2u * DS4_GIB;
+    uint64_t pressure = physical_bytes / 64u;
+    if (pressure < DS4_GIB / 4u) pressure = DS4_GIB / 4u;
+    out->resident_headroom_bytes = saturating_add_u64(ordinary, pressure);
+    return out->resident_headroom_bytes != UINT64_MAX;
+}
+
+bool ds4_residency_plan_apply_qwen_metal_hardware_policy(
+        const ds4_qwen_metal_hardware_policy *policy,
+        ds4_residency_plan                   *plan) {
+    if (!policy || !plan || policy->physical_bytes == 0 ||
+        policy->recommended_bytes == 0 ||
+        plan->requested < DS4_RESIDENCY_AUTO ||
+        plan->requested > DS4_RESIDENCY_SSD) {
+        return false;
+    }
+
+    plan->headroom_bytes = policy->resident_headroom_bytes;
+    plan->required_bytes = saturating_add_u64(plan->model_bytes,
+                                               plan->runtime_bytes);
+    plan->required_bytes = saturating_add_u64(plan->required_bytes,
+                                               plan->headroom_bytes);
+    if (plan->requested != DS4_RESIDENCY_AUTO) return true;
+
+    if (plan->recommended_bytes == 0) {
+        plan->resolved = DS4_RESIDENCY_SSD;
+        plan->reason = DS4_RESIDENCY_REASON_METAL_BUDGET_UNAVAILABLE;
+    } else if (plan->required_bytes <= plan->budget_bytes) {
+        plan->resolved = DS4_RESIDENCY_RESIDENT;
+        plan->reason = DS4_RESIDENCY_REASON_METAL_FITS;
+    } else {
+        plan->resolved = DS4_RESIDENCY_SSD;
+        plan->reason = DS4_RESIDENCY_REASON_METAL_EXCEEDS;
+    }
+    return true;
+}
+
 bool ds4_residency_plan_apply_ssd_only(ds4_residency_mode  requested,
                                        ds4_residency_plan *plan) {
     if (!plan || requested < DS4_RESIDENCY_AUTO ||
@@ -308,9 +374,8 @@ bool ds4_ssd_resident_pressure_plan_make(
      * normal; elevated or unavailable pressure keeps the previous half-credit
      * fail-closed policy. Purgeable pages may overlap inactive queues, so take
      * the larger pool instead of adding both. The SSD cache planner below
-     * normally stays on half-credit because it wires new cache pages; its
-     * bounded Qwen low-RAM path may take full credit only while pressure is
-     * explicitly normal and AUTO remains capped at the safe expert floor. */
+     * uses full bounded file credit for Qwen only while pressure is explicitly
+     * normal; the independent live and Metal limits still cap wired pages. */
     out->inactive_credit_bytes = out->pressure_normal ?
         bounded_inactive_bytes : bounded_inactive_bytes / 2u;
     const uint64_t reclaimable_working_set =
@@ -375,16 +440,16 @@ static bool ds4_ssd_adaptive_cache_plan_make_policy(
     }
     const bool low_ram_host =
         ds4_ssd_low_ram_cache_policy(memory->physical_bytes);
+    const bool qwen_policy = !apply_deepseek_tuning;
     const bool qwen_low_ram_policy =
-        !apply_deepseek_tuning && low_ram_host;
+        qwen_policy && low_ram_host;
     out->low_ram_shared_static_headroom_active = qwen_low_ram_policy;
     out->low_ram_floor_ceiling_active =
         apply_deepseek_tuning && low_ram_host;
     /* DeepSeek Flash's measured <=16 GiB policy leaves its complete static set
-     * pageable and later caps AUTO at the minimum expert tier. Strict Qwen
-     * retains the static charge on the same host class; the overlap with
-     * ordinary headroom is accounted for separately below. Larger hosts keep
-     * the strict static reserve independent of headroom. */
+     * pageable and later caps AUTO at the minimum expert tier. Qwen retains
+     * its complete static charge on every tier, but because those pages remain
+     * pageable the charge may share the larger ordinary-headroom envelope. */
     const uint64_t static_reserve_bytes =
         apply_deepseek_tuning && low_ram_host ? 0 :
                                                 static_working_set_bytes;
@@ -400,21 +465,23 @@ static bool ds4_ssd_adaptive_cache_plan_make_policy(
         memory->physical_bytes >= 64u * DS4_GIB &&
         memory->physical_bytes < 96u * DS4_GIB &&
         memory->pressure_status_available && memory->pressure_normal;
+    const bool qwen_normal_credit =
+        qwen_policy && memory->pressure_status_available &&
+        memory->pressure_normal;
     out->normal_pressure_full_file_credit_active =
-        deepseek_64g_normal_credit;
+        qwen_normal_credit || deepseek_64g_normal_credit;
     uint64_t reclaimable = 0;
-    if ((qwen_low_ram_policy || deepseek_64g_normal_credit) &&
-        memory->pressure_status_available && memory->pressure_normal) {
+    if (qwen_normal_credit || deepseek_64g_normal_credit) {
         /* Under a qualified normal-pressure policy, give the bounded
          * file-backed inactive set full credit so warm GGUF pages are not
          * mistaken for irreversibly used RAM. Purgeable pages may overlap that
          * set, so take max(), not a sum.
          *
-         * Qwen uses this only for its bounded <=16 GiB floor. DeepSeek uses it
-         * only on the measured [64,96) GiB tier, where the independent 9/16
-         * cache envelope still caps wired growth at the retained M5 sweet
-         * spot. Missing/elevated pressure, smaller Macs, and >=96 GiB hosts
-         * preserve the half-credit policy below. */
+         * Qwen uses it on every hardware profile so moving a GGUF from cold to
+         * warm file cache cannot reduce AUTO capacity on a larger Mac. Its
+         * independent Metal and live-pressure budgets still cap wired growth.
+         * DeepSeek uses it only on the measured [64,96) GiB tier, where the
+         * independent 9/16 cache envelope remains authoritative. */
         const uint64_t reclaimable_working_set =
             memory->purgeable_bytes > file_inactive_bytes ?
                 memory->purgeable_bytes : file_inactive_bytes;
@@ -437,12 +504,12 @@ static bool ds4_ssd_adaptive_cache_plan_make_policy(
     if (out->current_headroom_bytes < two_gib) {
         out->current_headroom_bytes = two_gib;
     }
-    /* DeepSeek's pageable static set already shares ordinary headroom.  The
-     * Qwen strict policy keeps the static charge independent on larger hosts,
-     * but on a 16 GiB host it must share headroom: the pages are not pinned and
-     * can be reclaimed by macOS while DS4 streams them again from the GGUF. */
+    /* Pageable static pages share ordinary system headroom for both streaming
+     * families: they are not wired and macOS may reclaim and fault them again.
+     * The reserve below is still at least as large as the complete Qwen static
+     * page coverage, so sharing never means dropping the charge. */
     const bool pageable_static_overlaps_headroom =
-        apply_deepseek_tuning || qwen_low_ram_policy;
+        apply_deepseek_tuning || qwen_policy;
     if (pageable_static_overlaps_headroom && static_already_pinned) {
         /* The live snapshot has already fallen by the pinned bytes.  Preserve
          * the same pre-pin max(base, static) policy by charging only the
@@ -450,7 +517,7 @@ static bool ds4_ssd_adaptive_cache_plan_make_policy(
         out->current_headroom_bytes =
             out->current_headroom_bytes > static_reserve_bytes ?
                 out->current_headroom_bytes - static_reserve_bytes : 0;
-    } else if (pageable_static_overlaps_headroom && !qwen_low_ram_policy &&
+    } else if (pageable_static_overlaps_headroom && !qwen_policy &&
                !deepseek_64g_normal_credit &&
                out->current_headroom_bytes <
                out->pageable_static_reserve_bytes) {
@@ -472,15 +539,20 @@ static bool ds4_ssd_adaptive_cache_plan_make_policy(
             two_gib > out->pressure_margin_bytes
                 ? two_gib - out->pressure_margin_bytes : 0;
     }
-    if (qwen_low_ram_policy) {
-        /* Qwen's bounded <=16 GiB policy freezes one 2 GiB request reserve,
-         * including the pressure allowance.  The pageable static mapping may
-         * occupy that reserve and be reclaimed; charging max(static, 2 GiB)
-         * and then another pressure margin left useful RAM idle and violated
-         * the policy's single-headroom contract. */
-        out->current_headroom_bytes =
-            two_gib > out->pressure_margin_bytes
-                ? two_gib - out->pressure_margin_bytes : 0;
+    if (qwen_policy) {
+        /* The Qwen reserve is max(ordinary + pressure, static coverage), not a
+         * sum: static pages are pageable, but the full mapping must fit inside
+         * the same protected request envelope. */
+        const uint64_t request_reserve = saturating_add_u64(
+            out->current_headroom_bytes, out->pressure_margin_bytes);
+        if (request_reserve < out->pageable_static_reserve_bytes) {
+            out->current_headroom_bytes =
+                out->pageable_static_reserve_bytes >
+                        out->pressure_margin_bytes
+                    ? out->pageable_static_reserve_bytes -
+                          out->pressure_margin_bytes
+                    : 0;
+        }
     }
     out->platform_headroom_bytes = memory->physical_bytes / 8u;
     if (out->platform_headroom_bytes < two_gib) {
@@ -493,7 +565,7 @@ static bool ds4_ssd_adaptive_cache_plan_make_policy(
         out->platform_headroom_bytes = saturating_add_u64(
             out->platform_headroom_bytes,
             out->platform_static_reserve_bytes);
-    } else if (pageable_static_overlaps_headroom && !qwen_low_ram_policy &&
+    } else if (pageable_static_overlaps_headroom &&
                out->platform_headroom_bytes <
                out->platform_static_reserve_bytes) {
         out->platform_headroom_bytes = out->platform_static_reserve_bytes;
@@ -503,9 +575,6 @@ static bool ds4_ssd_adaptive_cache_plan_make_policy(
         saturating_add_u64(out->current_headroom_bytes,
                            out->pressure_margin_bytes);
     if (!pageable_static_overlaps_headroom) {
-        /* Qwen's strict bounded mode treats the mapped static page set as an
-         * independent charge.  It is not allowed to consume the ordinary
-         * host-pressure headroom that protects the rest of the system. */
         current_reserve = saturating_add_u64(
             current_reserve,
             out->pageable_static_reserve_bytes);
@@ -562,6 +631,21 @@ static bool ds4_ssd_adaptive_cache_plan_make_policy(
     if (out->low_ram_floor_ceiling_active &&
         raw_experts > out->floor.minimum_cache_experts) {
         raw_experts = out->floor.minimum_cache_experts;
+    }
+
+    if (qwen_low_ram_policy) {
+        /* The 16 GiB Qwen lane is performance-tuned, not allowed to consume
+         * every byte that a warm file-cache snapshot appears to expose. Eleven
+         * complete routes plus the in-flight slot (3521 experts for 40x8)
+         * retained the previous zero-swap win; the next route tier introduced
+         * swap even though macOS still reported normal pressure. The cap is in
+         * routing cycles, so byte safety remains quantization-aware through
+         * per_expert_bytes above. */
+        const uint64_t qwen_low_ram_cache_ceiling =
+            1u + 11u * out->floor.working_set_experts;
+        if (raw_experts > qwen_low_ram_cache_ceiling) {
+            raw_experts = qwen_low_ram_cache_ceiling;
+        }
     }
 
     /* Grow only by complete per-token working sets.  Besides leaving useful

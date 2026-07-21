@@ -38,6 +38,17 @@ typedef struct {
     uint64_t required_bytes;
 } ds4_residency_plan;
 
+/* Qwen Metal memory policy is continuous in the measured host budgets, while
+ * the profile label makes the finite Apple unified-memory cuts observable and
+ * independently testable.  Values between named cuts use the next containing
+ * profile without changing the byte-based safety arithmetic. */
+typedef struct {
+    uint32_t profile_gib;
+    uint64_t physical_bytes;
+    uint64_t recommended_bytes;
+    uint64_t resident_headroom_bytes;
+} ds4_qwen_metal_hardware_policy;
+
 typedef struct {
     void *ptr;
     uint64_t bytes;
@@ -100,9 +111,9 @@ typedef struct {
     uint64_t purgeable_bytes;
     uint64_t inactive_bytes;
     uint64_t file_backed_bytes;
-    /* Darwin's current system pressure state. The resident planner and the
-     * bounded Qwen low-RAM policy may use a larger inactive working-set credit
-     * while pressure is normal. */
+    /* Darwin's current system pressure state. The resident planner and Qwen
+     * SSD policy may use a larger inactive working-set credit while pressure
+     * is normal. */
     bool pressure_status_available;
     bool pressure_normal;
 } ds4_ssd_host_memory;
@@ -133,8 +144,8 @@ typedef struct {
     bool low_ram_shared_static_headroom_active;
     /* DeepSeek <=16 GiB: measured performance policy caps AUTO at its floor. */
     bool low_ram_floor_ceiling_active;
-    /* DeepSeek 64 GiB tier: normal pressure allows full credit for the bounded
-     * file-backed inactive set; the stable cache envelope remains authoritative. */
+    /* Qwen on all profiles, and DeepSeek on its measured 64 GiB tier: normal
+     * pressure allows full bounded file-backed inactive credit. */
     bool normal_pressure_full_file_credit_active;
     uint32_t cache_experts;
 } ds4_ssd_adaptive_cache_plan;
@@ -245,6 +256,13 @@ bool ds4_ssd_resident_pressure_plan_make(
         uint64_t                        model_bytes,
         uint64_t                        runtime_bytes,
         ds4_ssd_resident_pressure_plan *out);
+bool ds4_qwen_metal_hardware_policy_make(
+        uint64_t                         physical_bytes,
+        uint64_t                         recommended_bytes,
+        ds4_qwen_metal_hardware_policy *out);
+bool ds4_residency_plan_apply_qwen_metal_hardware_policy(
+        const ds4_qwen_metal_hardware_policy *policy,
+        ds4_residency_plan                   *plan);
 bool ds4_ssd_low_ram_cache_policy(uint64_t physical_bytes);
 bool ds4_ssd_static_pin_host_supported(uint64_t physical_bytes);
 bool ds4_ssd_working_set_after_reserve(uint64_t  recommended_bytes,

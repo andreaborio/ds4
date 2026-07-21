@@ -7,6 +7,7 @@ because their numbers remain useful.
 
 | Record | Status | Scope |
 | --- | --- | --- |
+| [`2026-07-21-qwen-split-k-hardware-policy.md`](2026-07-21-qwen-split-k-hardware-policy.md) | Current Qwen qualification evidence | F32 split-K A/B at 8K/32K on 64 GiB, transfer validation on 16 GiB, and hardware-aware AUTO validation on 16/32/64 GiB |
 | [`2026-07-21-upstream-metal-transfer-audit.md`](2026-07-21-upstream-metal-transfer-audit.md) | Research/rejected | Post-release audit of upstream PR #555/`427e281`; isolated M5 dense NAX GLM tests through 32K and removal decision |
 | [`2026-07-20-long-context-metal-stack.md`](2026-07-20-long-context-metal-stack.md) | Current release qualification evidence | Qwen 32K A/B/B/A, DeepSeek adaptive dual-prompt 32K plus 65K/100K safety gates, GLM compact-indexer fix through dual-prompt 32K, invalidations and remaining publication gates |
 | [`2026-07-20-agent-friendly-refactor-validation.md`](2026-07-20-agent-friendly-refactor-validation.md) | Pre-policy correctness/artifact baseline | Qualified v2 artifacts and post-refactor Qwen, DeepSeek, and GLM smoke/gold lanes; not a current performance-acceptance matrix |

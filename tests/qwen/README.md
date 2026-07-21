@@ -148,6 +148,17 @@ Record the admission inputs, resolved residency, cache tier, physical footprint,
 and system swap before, during, and after the run. AUTO may choose resident or
 SSD according to the current memory and pressure gates.
 
+The policy suite covers named 16/24/32/36/48/64/96/128 GiB profiles. Model-backed
+release evidence must additionally identify the real Metal device and its
+`recommendedMaxWorkingSetSize`; a simulated profile is not hardware throughput
+evidence. At minimum, validate the available lower-memory lanes as follows:
+
+- 16 GiB: AUTO resolves to SSD, pressure is explicitly normal, and swap does
+  not increase;
+- 32 GiB: AUTO resolves to resident when both logged budgets pass, and falls
+  back to SSD rather than forcing residency when either gate fails;
+- 64 GiB reference: preserve the existing resident/SSD correctness lanes.
+
 Explicit modes are qualification controls, not the release startup command. On
 a host where resident admission succeeds, run the same deterministic prompt in
 both modes:

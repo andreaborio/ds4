@@ -5,28 +5,36 @@ admission and maintenance contract, not a list of code that happens to compile.
 Testing and release evidence remain governed by
 [`CONTRIBUTING.md`](../../CONTRIBUTING.md) and
 [`QA_BEFORE_RELEASES.md`](../../QA_BEFORE_RELEASES.md).
-The architectural decision behind this boundary is
-[`ADR 0002: Apple Metal Is The Production Runtime`](../adr/0002-apple-metal-production-runtime.md).
+The architectural decisions behind this boundary are
+[`ADR 0002: Apple Metal Is The Production Runtime`](../adr/0002-apple-metal-production-runtime.md)
+and Qwen's lower-memory extension in
+[`ADR 0004: Qwen Metal Uses Hardware-Aware Memory Profiles`](../adr/0004-qwen-metal-hardware-memory-policy.md).
 
 ## Supported Matrix
 
-| Model family | Qualified Metal modes | Release startup |
-| --- | --- | --- |
-| DeepSeek V4 Flash | AUTO resolving to resident or SSD; explicit resident and SSD according to the artifact gate | `./ds4 -m DEEPSEEK-DS4-ExpertMajor-v2.gguf` |
-| Qwen3.6-35B-A3B | AUTO resolving to resident or SSD; explicit resident and SSD according to the Qwen admission gates | `./ds4 -m QWEN-DS4-ExpertMajor-v2.gguf` |
-| GLM 5.2 | AUTO resolving to SSD streaming only; resident is rejected | `./ds4 -m GLM-DS4-ExpertMajor-v2.gguf --ctx 8192` |
+| Model family | Minimum unified memory | Qualified Metal modes | Release startup |
+| --- | ---: | --- | --- |
+| DeepSeek V4 Flash | 64 GiB | AUTO resolving to resident or SSD; explicit resident and SSD according to the artifact gate | `./ds4 -m DEEPSEEK-DS4-ExpertMajor-v2.gguf` |
+| Qwen3.6-35B-A3B | 16 GiB | AUTO resolving to resident or SSD; explicit resident and SSD according to the Qwen admission gates | `./ds4 -m QWEN-DS4-ExpertMajor-v2.gguf` |
+| GLM 5.2 | 64 GiB | AUTO resolving to SSD streaming only; resident is rejected | `./ds4 -m GLM-DS4-ExpertMajor-v2.gguf --ctx 8192` |
 
-All rows require Apple Metal, a validated embedded `ds4.expert_major.v2` store,
-and an Apple Silicon Mac with at least 64 GB unified memory. Explicit residency
-options are controlled qualification tools; normal release startup uses AUTO.
-GLM's explicit SSD/cache controls are diagnostic rather than an additional
-qualified startup contract. Detailed planners and gates are in
+All rows require Apple Metal and a validated embedded `ds4.expert_major.v2`
+store. Explicit residency options are controlled qualification tools; normal
+release startup uses AUTO. GLM's explicit SSD/cache controls are diagnostic
+rather than an additional qualified startup contract. Detailed planners and gates are in
 [`GOLD_METAL_SSD.md`](../../GOLD_METAL_SSD.md) and the family documents.
 
-Hosts below 64 GB are not an active optimization, qualification, or release
-target. Do not weaken admission or memory safety to manufacture support for
-them. Measurements on other hosts are research evidence only unless this
-contract is deliberately changed.
+Qwen has named 16/24/32/36/48/64/96/128 GiB policy profiles, but selection uses
+the active device's exact physical RAM, `recommendedMaxWorkingSetSize`, context
+runtime, and live pressure. The current 20.81 GB Q4_K_S artifact necessarily
+uses SSD on 16 GiB. A 32 GiB host may use resident for shorter contexts when
+both gates pass and falls back to SSD otherwise. The named policy is unit-tested
+at every cut; performance claims remain limited to the physical hosts and exact
+workloads in the release evidence.
+
+The lower-memory extension is Qwen-specific. Hosts below 64 GiB remain outside
+the DeepSeek and GLM production contract. Do not infer support for another
+family from Qwen's successful admission.
 
 ## Model Artifact Admission
 

@@ -38104,21 +38104,7 @@ static bool ds4_engine_context_memory_estimate_private(
     return true;
 }
 
-/* A Qwen Metal engine's SSD cache and host headroom are sized once, during
- * engine open.  Sessions must not silently allocate a larger context runtime
- * than that residency plan reserved. */
-static bool ds4_qwen35_metal_session_context_fits_runtime_plan(
-        const ds4_engine   *e,
-        int                 ctx_size,
-        ds4_context_memory *requested) {
-    if (requested) memset(requested, 0, sizeof(*requested));
-    if (!e || !requested ||
-        !ds4_engine_context_memory_estimate_private(
-            e, ctx_size, e->prefill_chunk, requested)) {
-        return false;
-    }
-    return requested->total_bytes <= e->residency_plan.runtime_bytes;
-}
+#include "runtime/ds4_qwen_memory_policy.inc"
 
 static bool ds4_engine_resolve_residency(ds4_engine               *e,
                                          const ds4_engine_options *opt) {
@@ -38224,6 +38210,8 @@ static bool ds4_engine_resolve_residency(ds4_engine               *e,
     }
     uint64_t recommended = 0;
 #ifndef DS4_NO_GPU
+    ds4_ssd_host_memory qwen_residency_memory = {0};
+    bool qwen_hardware_policy_available = false;
     if (e->backend == DS4_BACKEND_METAL &&
         (e->residency_requested != DS4_RESIDENCY_RESIDENT ||
          e->model.family == DS4_MODEL_FAMILY_QWEN35_MOE)) {
@@ -38242,6 +38230,12 @@ static bool ds4_engine_resolve_residency(ds4_engine               *e,
         return false;
     }
 
+#ifndef DS4_NO_GPU
+    qwen_hardware_policy_available =
+        ds4_engine_apply_qwen35_metal_hardware_policy(
+            e, &qwen_residency_memory);
+#endif
+
     if (glm_expert_major_v2_ssd_only &&
         !ds4_residency_plan_apply_ssd_only(
             e->residency_requested, &e->residency_plan)) {
@@ -38258,12 +38252,11 @@ static bool ds4_engine_resolve_residency(ds4_engine               *e,
             e->residency_plan.recommended_bytes != 0 &&
             e->residency_plan.required_bytes <=
                 e->residency_plan.budget_bytes;
-        ds4_ssd_host_memory memory = {0};
         ds4_ssd_resident_pressure_plan pressure = {0};
         const bool pressure_available =
-            ds4_gpu_host_memory_snapshot(&memory) &&
+            qwen_hardware_policy_available &&
             ds4_ssd_resident_pressure_plan_make(
-                &memory,
+                &qwen_residency_memory,
                 e->residency_plan.model_bytes,
                 e->residency_plan.runtime_bytes,
                 &pressure);

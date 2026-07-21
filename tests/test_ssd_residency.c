@@ -187,6 +187,72 @@ int main(void) {
                                     (ds4_residency_mode)99,
                                     0, 0, 0, 0, &p));
 
+    /* Qwen's Metal reserve follows physical memory continuously, while every
+     * Apple unified-memory cut has an observable profile label.  The 24, 36,
+     * and 48 GiB cuts are first-class policies rather than aliases of 32/64. */
+    static const uint32_t qwen_profile_gib[] = {
+        16u, 24u, 32u, 36u, 48u, 64u, 96u, 128u,
+    };
+    /* Recommended budgets here are monotonic synthetic fixtures. Production
+     * always consumes the value reported by the active Metal device. */
+    static const uint64_t qwen_recommended_gib[] = {
+        12u, 18u, 25u, 28u, 38u, 52u, 78u, 104u,
+    };
+    static const uint64_t qwen_reserve_sixteenths[] = {
+        36u, 38u, 40u, 45u, 60u, 80u, 120u, 160u,
+    };
+    ds4_qwen_metal_hardware_policy qwen_hw = {0};
+    uint64_t previous_reserve = 0;
+    for (size_t i = 0;
+         i < sizeof(qwen_profile_gib) / sizeof(qwen_profile_gib[0]); i++) {
+        assert(ds4_qwen_metal_hardware_policy_make(
+            (uint64_t)qwen_profile_gib[i] * GIB,
+            qwen_recommended_gib[i] * GIB,
+            &qwen_hw));
+        assert(qwen_hw.profile_gib == qwen_profile_gib[i]);
+        const uint64_t expected_reserve =
+            qwen_reserve_sixteenths[i] * GIB / 16u;
+        assert(qwen_hw.resident_headroom_bytes == expected_reserve);
+        assert(qwen_hw.resident_headroom_bytes > previous_reserve);
+        previous_reserve = qwen_hw.resident_headroom_bytes;
+    }
+    assert(ds4_qwen_metal_hardware_policy_make(
+        20 * GIB, 15 * GIB, &qwen_hw));
+    assert(qwen_hw.profile_gib == 24u);
+    assert(!ds4_qwen_metal_hardware_policy_make(0, 1, &qwen_hw));
+    assert(!ds4_qwen_metal_hardware_policy_make(1, 0, &qwen_hw));
+    assert(!ds4_qwen_metal_hardware_policy_make(1, 1, NULL));
+
+    /* A conservative synthetic 24 GiB working-set fixture rejects the current
+     * Qwen-sized payload. A 32 GiB M1-class fixture admits the shorter runtime
+     * but rejects the next context tier using the same 2.5 GiB reserve as the
+     * live-pressure gate. Production uses each device's reported limit. */
+    assert(ds4_qwen_metal_hardware_policy_make(
+        24 * GIB, 18 * GIB, &qwen_hw));
+    ds4_residency_plan qwen_residency = plan(
+        true, DS4_RESIDENCY_AUTO, 20 * GIB, 0, 18 * GIB, 0);
+    assert(ds4_residency_plan_apply_qwen_metal_hardware_policy(
+        &qwen_hw, &qwen_residency));
+    assert(qwen_residency.resolved == DS4_RESIDENCY_SSD);
+    assert(ds4_qwen_metal_hardware_policy_make(
+        32 * GIB, 25 * GIB, &qwen_hw));
+    qwen_residency = plan(
+        true, DS4_RESIDENCY_AUTO, 20 * GIB, 2 * GIB, 25 * GIB, 0);
+    assert(ds4_residency_plan_apply_qwen_metal_hardware_policy(
+        &qwen_hw, &qwen_residency));
+    assert(qwen_residency.headroom_bytes == 5 * GIB / 2u);
+    assert(qwen_residency.required_bytes == 49 * GIB / 2u);
+    assert(qwen_residency.resolved == DS4_RESIDENCY_RESIDENT);
+    qwen_residency.runtime_bytes = 3 * GIB;
+    assert(ds4_residency_plan_apply_qwen_metal_hardware_policy(
+        &qwen_hw, &qwen_residency));
+    assert(qwen_residency.required_bytes == 51 * GIB / 2u);
+    assert(qwen_residency.resolved == DS4_RESIDENCY_SSD);
+    assert(!ds4_residency_plan_apply_qwen_metal_hardware_policy(
+        NULL, &qwen_residency));
+    assert(!ds4_residency_plan_apply_qwen_metal_hardware_policy(
+        &qwen_hw, NULL));
+
     ds4_ssd_resident_pressure_plan pressure = {0};
     ds4_ssd_host_memory pressure_memory = {
         .physical_bytes = 64 * GIB,
@@ -410,6 +476,47 @@ int main(void) {
     assert(ds4_ssd_glm_expert_major_auto_cache_target(
                &glm_memory, NULL) == 0);
 
+    /* Under normal pressure, equivalent cold and warm GGUF page states must
+     * yield the same Qwen cache on every named memory profile.  Capacity is
+     * monotonic with the hardware budget and never falls at a tier boundary. */
+    uint32_t previous_cache_experts = 0;
+    for (size_t i = 0;
+         i < sizeof(qwen_profile_gib) / sizeof(qwen_profile_gib[0]); i++) {
+        const uint64_t physical = (uint64_t)qwen_profile_gib[i] * GIB;
+        ds4_ssd_host_memory cold = {
+            .physical_bytes = physical,
+            .recommended_bytes = qwen_recommended_gib[i] * GIB,
+            .free_bytes = physical * 3u / 4u,
+            .pressure_status_available = true,
+            .pressure_normal = true,
+        };
+        ds4_ssd_host_memory warm = {
+            .physical_bytes = physical,
+            .recommended_bytes = qwen_recommended_gib[i] * GIB,
+            .free_bytes = physical / 8u,
+            .inactive_bytes = physical * 5u / 8u,
+            .file_backed_bytes = physical * 5u / 8u,
+            .pressure_status_available = true,
+            .pressure_normal = true,
+        };
+        ds4_ssd_adaptive_cache_plan cold_plan = {0};
+        ds4_ssd_adaptive_cache_plan warm_plan = {0};
+        assert(ds4_ssd_adaptive_cache_plan_make_strict_with_static_reserve(
+            &cold, 512 * MIB, 5 * GIB / 2u, false,
+            QWEN35_N_LAYER, QWEN35_N_EXPERT_USED,
+            qwen_expert_bytes, qwen_max_cacheable, &cold_plan));
+        assert(ds4_ssd_adaptive_cache_plan_make_strict_with_static_reserve(
+            &warm, 512 * MIB, 5 * GIB / 2u, false,
+            QWEN35_N_LAYER, QWEN35_N_EXPERT_USED,
+            qwen_expert_bytes, qwen_max_cacheable, &warm_plan));
+        assert(cold_plan.normal_pressure_full_file_credit_active);
+        assert(warm_plan.normal_pressure_full_file_credit_active);
+        assert(cold_plan.reclaimable_bytes == warm_plan.reclaimable_bytes);
+        assert(cold_plan.cache_experts == warm_plan.cache_experts);
+        assert(cold_plan.cache_experts >= previous_cache_experts);
+        previous_cache_experts = cold_plan.cache_experts;
+    }
+
     /* Qwen keeps the complete static mapping charged on 16 GiB, but those
      * unpinned pages share ordinary headroom because macOS can reclaim and
      * stream them again. Unlike DeepSeek's measured low-RAM performance cap,
@@ -436,24 +543,24 @@ int main(void) {
     assert(!qwen_adaptive.low_ram_floor_ceiling_active);
     assert(qwen_adaptive.pageable_static_reserve_bytes == 5 * GIB / 2u);
     assert(qwen_adaptive.platform_static_reserve_bytes == 5 * GIB / 2u);
-    /* The 1.75 GiB field plus the separately recorded 0.25 GiB pressure
-     * margin is the policy's single 2 GiB request reserve.  Pageable static
-     * pages may occupy that reserve, so they are not charged a second time. */
-    assert(qwen_adaptive.current_headroom_bytes == 7 * GIB / 4u);
+    /* The 2.25 GiB field plus the separately recorded 0.25 GiB pressure
+     * margin is the 2.5 GiB static/request reserve. Pageable static pages are
+     * not charged a second time. */
+    assert(qwen_adaptive.current_headroom_bytes == 9 * GIB / 4u);
     assert(qwen_adaptive.pressure_margin_bytes == GIB / 4u);
-    assert(qwen_adaptive.platform_headroom_bytes == 2 * GIB);
-    assert(qwen_adaptive.platform_wire_budget_bytes == 19 * GIB / 2u);
+    assert(qwen_adaptive.platform_headroom_bytes == 5 * GIB / 2u);
+    assert(qwen_adaptive.platform_wire_budget_bytes == 9 * GIB);
     assert(qwen_adaptive.cache_envelope_bytes ==
            qwen_adaptive.safety_wire_budget_bytes);
-    assert(qwen_adaptive.cache_experts == 5761);
+    assert(qwen_adaptive.cache_experts == 3521);
     assert(qwen_adaptive.cache_bytes ==
-           UINT64_C(5761) * qwen_expert_bytes);
+           UINT64_C(3521) * qwen_expert_bytes);
     assert(qwen_adaptive.cache_bytes <=
            qwen_adaptive.safety_wire_budget_bytes);
 
     /* Physical M1 Pro 16 GiB snapshot captured after the original Qwen AUTO
      * launch was rejected despite green pressure. With normal pressure, full
-     * bounded file-backed credit admits four complete working-set cycles plus
+     * bounded file-backed credit admits three complete working-set cycles plus
      * the safety slot. The same page counts must still fail closed when the
      * pressure signal is elevated or unavailable, even if the arithmetic
      * budget alone could hold the minimum tier. */
@@ -481,15 +588,15 @@ int main(void) {
         &qwen_m1_normal));
     assert(qwen_m1_normal.reclaimable_bytes ==
            qwen_memory.free_bytes + qwen_memory.file_backed_bytes);
-    assert(qwen_m1_normal.current_headroom_bytes == 7 * GIB / 4u);
+    assert(qwen_m1_normal.current_headroom_bytes == 9 * GIB / 4u);
     assert(qwen_m1_normal.pressure_margin_bytes == GIB / 4u);
     assert(qwen_m1_normal.current_wire_budget_bytes >=
            floor.minimum_cache_bytes);
     assert(qwen_m1_normal.low_ram_shared_static_headroom_active);
     assert(!qwen_m1_normal.low_ram_floor_ceiling_active);
-    assert(qwen_m1_normal.cache_experts == 1281);
+    assert(qwen_m1_normal.cache_experts == 961);
     assert(qwen_m1_normal.cache_bytes ==
-           UINT64_C(1281) * qwen_expert_bytes);
+           UINT64_C(961) * qwen_expert_bytes);
 
     qwen_memory.pressure_normal = false;
     ds4_ssd_adaptive_cache_plan qwen_m1_elevated = {0};
@@ -507,7 +614,7 @@ int main(void) {
            qwen_memory.free_bytes + qwen_memory.purgeable_bytes +
                qwen_memory.file_backed_bytes / 2u);
     assert(qwen_m1_elevated.wire_budget_bytes >= floor.minimum_cache_bytes);
-    assert(qwen_m1_elevated.cache_experts == 641);
+    assert(qwen_m1_elevated.cache_experts == 321);
 
     qwen_memory.pressure_status_available = false;
     qwen_memory.pressure_normal = true;
@@ -525,7 +632,7 @@ int main(void) {
     assert(qwen_m1_unknown.reclaimable_bytes ==
            qwen_m1_elevated.reclaimable_bytes);
     assert(qwen_m1_unknown.wire_budget_bytes >= floor.minimum_cache_bytes);
-    assert(qwen_m1_unknown.cache_experts == 641);
+    assert(qwen_m1_unknown.cache_experts == 321);
 
     qwen_memory = (ds4_ssd_host_memory){
         .physical_bytes = 64 * GIB,

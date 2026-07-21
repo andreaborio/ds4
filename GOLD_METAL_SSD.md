@@ -60,7 +60,7 @@ all five root links, and verifies each binary's provenance.
 ## AUTO residency planner
 
 For Metal, AUTO compares a conservative required-memory plan with
-`recommendedMaxWorkingSetSize`:
+`recommendedMaxWorkingSetSize`. The generic DeepSeek calculation is:
 
 ```text
 required = model tensors
@@ -70,6 +70,21 @@ required = model tensors
 
 budget   = recommended working set - explicitly simulated used memory
 ```
+
+Qwen uses the device's physical RAM and recommended Metal working set through
+the hardware policy in
+[`ADR 0004`](docs/adr/0004-qwen-metal-hardware-memory-policy.md):
+
+```text
+qwen reserve  = max(2 GiB, physical RAM / 16)
+              + max(0.25 GiB, physical RAM / 64)
+qwen required = model tensors + context / KV / scratch + qwen reserve
+```
+
+The named 16/24/32/36/48/64/96/128 GiB profiles make the selected hardware
+class visible, but the byte calculation is continuous and always uses the live
+Metal device values. The Qwen live-pressure gate uses the same reserve as the
+fixed gate.
 
 For DeepSeek and Qwen, `required <= budget` may resolve to resident; otherwise
 AUTO resolves to SSD. Model-specific pressure and artifact gates may still
@@ -98,11 +113,14 @@ Admission snapshots are conservative checks, not guarantees against later
 memory-pressure changes.
 
 Qwen's SSD planner charges static page coverage, session/runtime memory,
-ordinary host headroom, pressure margin, and Metal headroom independently.  It
-then chooses a complete `1 + 320*k` expert tier and grows Metal storage in
-321-expert slabs (about 0.529 GiB) instead of the generic 4 GiB slab. DeepSeek
-retains its independently qualified resident/SSD planners. GLM retains its
-independent SSD-only planner and schedule.
+ordinary host headroom, pressure margin, and Metal headroom. Pageable static
+pages may share the larger ordinary reserve but are never omitted. Under normal
+macOS pressure, equivalent free and bounded file-backed pages receive equal
+credit on every Qwen profile, so warming the GGUF cannot by itself shrink AUTO.
+The planner then chooses a complete `1 + 320*k` expert tier and grows Metal
+storage in 321-expert slabs (about 0.529 GiB) instead of the generic 4 GiB slab.
+DeepSeek retains its independently qualified resident/SSD planners. GLM retains
+its independent SSD-only planner and schedule.
 
 For this path, `resident` means complete tensor mapping, full-tensor Metal
 kernels, and no DS4 expert-cache `pread`.  Metal residency requests are budget

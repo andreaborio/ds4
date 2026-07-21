@@ -194,7 +194,7 @@ static void print_model_runtime(FILE *fp, const help_colors *c,
     opt(fp, c, "--ssd-streaming", "Force SSD-backed model streaming. Metal defaults to AUTO residency.");
     opt(fp, c, "--resident, --no-ssd-streaming", "Force full model residency instead of Metal AUTO selection.");
     opt(fp, c, "--ssd-streaming-cold", "SSD streaming: skip default popularity-based expert-cache preload.");
-    opt(fp, c, "--ssd-streaming-cache-experts N|NGB", "SSD streaming: routed expert cache as expert count or GiB, e.g. 32GB. Metal auto reserves context and 20% headroom before subtracting non-routed weights.");
+    opt(fp, c, "--ssd-streaming-cache-experts N|NGB", "SSD streaming: routed expert cache as expert count or GiB, e.g. 32GB. Metal AUTO reserves model-specific context, static pages, and hardware-scaled headroom.");
     opt(fp, c, "--ssd-streaming-preload-experts N", "SSD streaming: upfront popularity preload count. Default: auto hot seed capped at 4096; use --ssd-streaming-cold to skip.");
     if (full) {
         opt(fp, c, "ENV DS4_METAL_STREAMING_EXPERT_HOTLIST_PRIORITY=adaptive|legacy|N", "Metal hotlist initial LFU priority. Default: adaptive (1). legacy restores built-in rank/file hit priorities; positive N fixes every seed priority.");

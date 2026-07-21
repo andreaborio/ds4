@@ -8,7 +8,9 @@ Start with [`AGENTS.md`](../../AGENTS.md), the
 [`runtime contract`](../contracts/RUNTIME_SUPPORT.md), and only the subsystem
 below that is relevant to the task. Historical benchmark notes are evidence,
 not architecture specifications. The production-backend boundary is recorded
-in [`ADR 0002`](../adr/0002-apple-metal-production-runtime.md).
+in [`ADR 0002`](../adr/0002-apple-metal-production-runtime.md). Qwen's
+RAM/working-set adaptation is isolated in
+[`ADR 0004`](../adr/0004-qwen-metal-hardware-memory-policy.md).
 
 ## Runtime Entry Points
 
