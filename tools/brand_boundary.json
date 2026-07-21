@@ -208,7 +208,7 @@
       "location": "content",
       "token": "ds4",
       "classification": "migration-pending",
-      "maximum": 8
+      "maximum": 5
     },
     {
       "path": "GOLD_METAL_SSD.md",
@@ -649,14 +649,14 @@
       "location": "content",
       "token": "ds4",
       "classification": "migration-pending",
-      "maximum": 7
+      "maximum": 4
     },
     {
       "path": "docs/deepseek-expert-major-v2.md",
       "location": "content",
       "token": "DS4",
       "classification": "migration-pending",
-      "maximum": 7
+      "maximum": 6
     },
     {
       "path": "docs/expert-major-v2-roadmap.md",
@@ -677,14 +677,14 @@
       "location": "content",
       "token": "ds4",
       "classification": "migration-pending",
-      "maximum": 4
+      "maximum": 1
     },
     {
       "path": "docs/glm52-expert-major-v2.md",
       "location": "content",
       "token": "DS4",
       "classification": "migration-pending",
-      "maximum": 13
+      "maximum": 11
     },
     {
       "path": "docs/guides/MIGRATING_TO_HEBRUS.md",
@@ -712,7 +712,7 @@
       "location": "content",
       "token": "DS4",
       "classification": "migration-pending",
-      "maximum": 10
+      "maximum": 9
     },
     {
       "path": "docs/releases/hebrus-bridge-launch-candidate.md",
@@ -2533,6 +2533,20 @@
       "token": "DS4",
       "classification": "compatibility",
       "maximum": 1
+    },
+    {
+      "path": "tests/test_server_alias_model.py",
+      "location": "content",
+      "token": "ds4",
+      "classification": "compatibility",
+      "maximum": 2
+    },
+    {
+      "path": "tests/test_server_alias_model.py",
+      "location": "content",
+      "token": "DS4",
+      "classification": "compatibility",
+      "maximum": 2
     },
     {
       "path": "tests/test_ssd_residency.c",
