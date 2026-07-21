@@ -9,10 +9,10 @@ disk-KV release gates passed on the frozen build. Revision-pinned packaging and
 normal startup also passed. Model-artifact tagging on Hugging Face is complete;
 DSBox, main, and the final Hugging Face cards/runtime revisions remain open.
 
-Decision: retain the exact paired-Q8 decode kernel, the DeepSeek long-context
-cache-phase policy, and the GLM compact-indexer mapping correction. Reject and
-remove the experimental DeepSeek SIMD router because its short A/B/B/A did not
-show a win.
+Decision: retain the DeepSeek long-context cache-phase policy and the GLM
+compact-indexer mapping correction. Reject and remove both the exact paired-Q8
+decode experiment and the experimental DeepSeek SIMD router because their
+A/B/B/A cohorts did not show a win.
 
 Supersedes: current performance interpretation in
 `2026-07-20-agent-friendly-refactor-validation.md` and the short-only release
@@ -52,33 +52,34 @@ benchmark tooling only, not C/Metal runtime objects. Its clean diagnostic
 The instrumented original baseline binary is
 `d963d673f642d467206a5aff697322131babf9365f284f1013cf15a9ac3427d4`.
 
-## Qwen paired-Q8 result
+## Qwen paired-Q8 rejection
 
-The Qwen arm compares the original scalar Q8 decode calls with one exact
-paired call. Separate discarded warm-ups preceded a warm A/B/B/A cohort.
-All four retained 32K arms had zero swapout, identical resolved resident plans,
-no competing inference process, and identical logits/evidence content hashes:
+The final Qwen arm compared the original scalar Q8 decode calls with one exact
+paired call. Separate discarded warm-ups preceded a warm A/B/B/A cohort. All
+four retained 32K arms had zero swapout, identical resolved resident plans, no
+competing inference process, and identical logits/evidence content hashes:
 
 - logits: `2d383f416ae85249b6ff91e04e92bf05d61e1b35c6b864b6a1bcf78a80f0d4c8`;
 - decode evidence: `d73b694d169cf2a5ce1e7563bb844e6b2714cede5d9ba69213cf4aebb4fd3c9e`.
 
-| 32K arm | Binary | Prefill | Decode wall | TPOT p50 | TPOT p95 |
+| 32K arm | Path | Prefill | Decode wall | TPOT p50 | TPOT p95 |
 | --- | --- | ---: | ---: | ---: | ---: |
-| A1 baseline | `d963d673…` | 60.44 t/s | 42,579.471 ms | 333.207 ms | 337.661 ms |
-| B1 paired | `7ef6e565…` | 60.88 t/s | 42,480.777 ms | 332.998 ms | 334.233 ms |
-| B2 paired | `7ef6e565…` | 60.21 t/s | 42,583.592 ms | 333.251 ms | 334.227 ms |
-| A2 baseline | `d963d673…` | 59.92 t/s | 42,533.631 ms | 333.060 ms | 336.997 ms |
+| A1 | scalar | 67.03 t/s | 40,179.787 ms | 314.468 ms | 317.460 ms |
+| B1 | paired | 67.06 t/s | 40,291.136 ms | 315.576 ms | 317.506 ms |
+| B2 | paired | 67.04 t/s | 40,255.507 ms | 315.213 ms | 317.824 ms |
+| A2 | scalar | 67.03 t/s | 40,255.622 ms | 315.168 ms | 317.666 ms |
 
-Mean decode throughput changed by only +0.057%, less than within-arm spread,
-so throughput is neutral. Mean p95 fell from 337.329 to 334.230 ms (-0.92%).
-That 3.099 ms effect exceeds both the 0.664 ms baseline p95 spread and the
-0.006 ms candidate spread. The production decision is therefore a measured
-long-tail reduction, not a general tokens-per-second claim.
+The scalar means were 67.03 prefill t/s, 40,217.705 ms decode wall (about
+3.18 t/s), 314.818 ms p50, and 317.563 ms p95. The paired means were 67.05
+prefill t/s, 40,273.322 ms decode wall, 315.395 ms p50, and 317.665 ms p95.
+The paired path was neutral-to-worse in every decode measure, and each mean
+difference was smaller than the relevant cohort spread. It therefore has no
+measured production benefit. The paired kernel, dispatch implementation, and
+dedicated test were rejected and removed; Qwen retains the exact scalar path.
 
-The earlier isolated 128, 2K and 8K A/B/B/A tiers also preserved exact output.
-Their decode means were 43.97/44.35, 21.90/21.93 and 10.12/10.18 t/s for
-baseline/candidate. These are neutral-to-small observations; the 32K p95 result
-is the acceptance reason.
+Earlier isolated 128, 2K, and 8K cohorts also preserved exact output but did
+not establish a durable win. They remain exploratory history rather than an
+acceptance basis.
 
 ## DeepSeek phase-adaptive cache result
 
@@ -253,7 +254,7 @@ cost is test duration, not a RAM-capacity failure.
 
 ## Invalid and discarded runs
 
-- Qwen candidate and baseline warm-ups were discarded symmetrically before the
+- Qwen paired and scalar warm-ups were discarded symmetrically before the
   retained A/B/B/A cohort.
 - A DeepSeek 8K arm was aborted by the earlier runner when transient free
   percentage crossed 20%. It had no swapout but the complete cohort is invalid.

@@ -270,7 +270,7 @@ a different artifact and runtime path.
 
 | Model | M5 Pro 64 GB setup | 32K prefill | 32K generation / decode | Status |
 | --- | --- | ---: | ---: | --- |
-| Qwen3.6-35B-A3B ExpertMajor v2 Q4_K_S, 20.81 GB | Metal resident, paired Q8 candidate, warm A/B/B/A | **60.55 t/s** candidate mean | **3.01 t/s**, 334.230 ms mean p95 | Exact evidence; throughput neutral, p95 -0.92% against baseline |
+| Qwen3.6-35B-A3B ExpertMajor v2 Q4_K_S, 20.81 GB | Metal resident, scalar decode, warm 32K A/B/B/A controls | **67.03 t/s** scalar mean | about **3.18 t/s**, 314.818 ms p50, 317.563 ms p95 | Exact evidence and zero swap; paired-Q8 experiment rejected and removed |
 | DeepSeek V4 Flash IQ2XXS, 86.72 GB | Metal SSD, phase-adaptive 259→4,129 through 32K, prose prompt | **164.43 t/s** | **7.27 t/s**, 105.410 ms p50, 149.943 ms p95 | Exact final-stack evidence and zero swap; old AUTO controls can swap, so no 32K speedup percentage |
 | GLM 5.2 ExpertMajor v2 Q2_K, 244.14 GiB | Metal AUTO→SSD, 601 records, fixed compact-indexer transition, prose prompt | **44.73 t/s** | **1.87 t/s** overall; about **2.12 t/s** at p50 | Same-prompt output matches the earlier corrected arm; zero swap; original baseline crashes before logits |
 
