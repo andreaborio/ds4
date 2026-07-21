@@ -250,7 +250,7 @@
       "location": "content",
       "token": "ds4",
       "classification": "compatibility",
-      "maximum": 504
+      "maximum": 493
     },
     {
       "path": "Makefile",

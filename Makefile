@@ -570,6 +570,7 @@ help:
 	@echo "  make model-free-test     Run all tests that do not require a GGUF"
 	@echo "  make brand-boundary-audit"
 	@echo "                           Reject unclassified or increased legacy brand tokens"
+	@echo "  make premerge            Run repository audits and Linux CPU/model-free gates"
 	@echo "  make clean               Remove build outputs"
 
 cpu: $(PROGRAMS)
@@ -692,7 +693,7 @@ ds4_agent_test: ds4_agent_test.o ds4_agent_test_impl.o ds4_help.o \
 		ds4_web.o ds4_kvstore.o linenoise.o $(CPU_CORE_OBJS)
 	$(CC) $(CFLAGS) -o $@ $^ $(LDLIBS)
 
-model-free-test: ds4 ds4_test ds4_agent_test ds4-eval q4k-dot-test \
+model-free-test: $(PROGRAMS) ds4_test ds4_agent_test q4k-dot-test \
 		tests/test_q4k_top8 \
 		tests/test_qwen_session \
 		tests/test_qwen_tokenizer \
@@ -769,24 +770,23 @@ tests/test_q4k_top8: test_q4k_top8.o ds4_test_core.o ds4_build_cpu.o \
 
 tests/test_qwen_session: tests/test_qwen_session.c ds4.c ds4.h ds4_ssd.h ds4_profile.h \
 		ds4_gpu.h ds4_qwen.h ds4_qwen_unicode.h \
-		ds4_build.c ds4_expert_store.h ds4_ssd.c ds4_profile.c ds4_qwen.c \
+		ds4_build.c ds4_expert_store.o ds4_ssd.c \
+		ds4_profile.c ds4_qwen.c \
 		ds4_qwen_unicode.c ds4_qwen_unicode_data.inc \
 		ds4_streaming_hotlist.inc runtime/ds4_glm_graph.inc \
 		runtime/ds4_deepseek_cache_phase.inc
 	$(CC) $(CFLAGS) $(QWEN_CFLAGS) -DDS4_NO_GPU \
 		-Wno-unused-function -Wno-unused-parameter -I. -o $@ \
-		tests/test_qwen_session.c ds4_build.c ds4_ssd.c \
-		ds4_profile.c ds4_qwen.c ds4_qwen_unicode.c $(LDLIBS)
+		$(filter-out ds4.c,$(filter %.c %.o,$^)) $(LDLIBS)
 
 tests/test_qwen_tokenizer: tests/test_qwen_tokenizer.c ds4.c ds4.h \
 		ds4_kvstore.c ds4_kvstore.h ds4_ssd.h ds4_profile.c ds4_profile.h ds4_gpu.h ds4_qwen.h \
-		ds4_qwen_unicode.h ds4_build.c ds4_expert_store.h ds4_ssd.c \
+		ds4_qwen_unicode.h ds4_build.c ds4_expert_store.o ds4_ssd.c \
 		ds4_qwen.c ds4_qwen_unicode.c ds4_qwen_unicode_data.inc \
 		ds4_streaming_hotlist.inc tests/qwen/qwen36_tokenizer_fixture.inc
 	$(CC) $(CFLAGS) $(QWEN_CFLAGS) -DDS4_NO_GPU \
 		-Wno-unused-function -Wno-unused-parameter -I. -o $@ \
-		tests/test_qwen_tokenizer.c ds4_kvstore.c ds4_build.c ds4_ssd.c \
-		ds4_profile.c ds4_qwen.c ds4_qwen_unicode.c $(LDLIBS)
+		$(filter-out ds4.c,$(filter %.c %.o,$^)) $(LDLIBS)
 
 qwen-metadata-test: ds4 tests/test_qwen_metadata.py
 	python3 tests/test_qwen_metadata.py ./ds4
@@ -867,4 +867,5 @@ clean:
 		tests/test_qwen_state tests/test_qwen_unicode \
 		tests/test_qwen_expert_group \
 		tests/test_expert_store \
+		tests/test_metal_ssd_profile \
 		tests/test_ssd_residency *.o
