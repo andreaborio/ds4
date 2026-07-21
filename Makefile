@@ -1,4 +1,5 @@
 CC ?= cc
+.DEFAULT_GOAL := all
 UNAME_S := $(shell uname -s)
 UNAME_M := $(shell uname -m)
 
@@ -31,7 +32,10 @@ PROGRAMS := ds4 ds4-server ds4-bench ds4-eval ds4-agent
 	metal build-isolation-test q4k-dot-test qwen-metadata-test \
 	qwen-reference-test qwen-unicode-test qwen-tokenizer-test \
 	qwen-expert-group-test expert-store-test metal-ssd-profile-test \
-	$(PROGRAMS) ds4_test ds4_agent_test
+	download-model-test $(PROGRAMS) ds4_test ds4_agent_test
+
+download-model-test: tests/test_download_model.sh download_model.sh
+	sh tests/test_download_model.sh
 
 ifeq ($(UNAME_S),Darwin)
 
@@ -446,7 +450,7 @@ model-free-test: metal ds4_test ds4_agent_test $(METAL_BINDIR)/test_q4k_dot \
 		$(METAL_BINDIR)/test_qwen_expert_group \
 		$(METAL_BINDIR)/test_expert_store \
 		$(METAL_BINDIR)/test_metal_ssd_profile \
-		$(METAL_BINDIR)/test_ssd_residency
+		$(METAL_BINDIR)/test_ssd_residency download-model-test
 	DS4_BIN_DIR=$(METAL_BINDIR) sh tests/test_retired_distributed_flags.sh
 	sh tests/test_benchmark_env_guard.sh
 	$(METAL_BINDIR)/ds4-eval --self-test-extractors
@@ -634,7 +638,7 @@ model-free-test: ds4 ds4_test ds4_agent_test ds4-eval q4k-dot-test \
 		tests/test_qwen_expert_group \
 		tests/test_expert_store \
 		tests/test_metal_ssd_profile \
-		tests/test_ssd_residency
+		tests/test_ssd_residency download-model-test
 	sh tests/test_retired_distributed_flags.sh
 	sh tests/test_benchmark_env_guard.sh
 	./ds4-eval --self-test-extractors

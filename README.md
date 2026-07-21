@@ -100,8 +100,15 @@ cd ds4
 
 make -j8
 ./ds4 --build-info
-./ds4 -m /absolute/path/to/MODEL-DS4-ExpertMajor-v2.gguf --ctx 8192
+./download_model.sh qwen-v2
+./ds4 \
+  -m gguf/Qwen3.6-35B-A3B-DS4-ExpertMajor-v2-Q4_K_S.gguf \
+  --ctx 8192
 ```
+
+Replace `qwen-v2` with `deepseek-v2` or `glm-v2` to select another qualified
+family. The downloader pins the release revision and verifies the complete
+file before printing the startup command.
 
 On macOS, AUTO residency keeps the model resident when it safely fits.
 Otherwise it selects SSD streaming and derives an expert-cache budget from the
@@ -264,15 +271,18 @@ a different artifact and runtime path.
 | Model | M5 Pro 64 GB setup | 32K prefill | 32K generation / decode | Status |
 | --- | --- | ---: | ---: | --- |
 | Qwen3.6-35B-A3B ExpertMajor v2 Q4_K_S, 20.81 GB | Metal resident, paired Q8 candidate, warm A/B/B/A | **60.55 t/s** candidate mean | **3.01 t/s**, 334.230 ms mean p95 | Exact evidence; throughput neutral, p95 -0.92% against baseline |
-| DeepSeek V4 Flash IQ2XXS, 86.72 GB | Metal SSD, phase-adaptive 259→4,129 through 32K | **137.04 t/s** | **7.46 t/s**, 102.211 ms p50 | Exact evidence, zero swap; safety/correctness decision, not a standalone A/B percentage |
-| GLM 5.2 ExpertMajor v2 Q2_K, 244.14 GiB | Metal AUTO→SSD, 601 records, fixed compact-indexer transition | **36.19 t/s** | **1.62 t/s** overall; about **1.79 t/s** at p50 | 32K+128 complete, zero swap; baseline crashes before logits |
+| DeepSeek V4 Flash IQ2XXS, 86.72 GB | Metal SSD, phase-adaptive 259→4,129 through 32K, prose prompt | **164.43 t/s** | **7.27 t/s**, 105.410 ms p50, 149.943 ms p95 | Exact final-stack evidence and zero swap; old AUTO controls can swap, so no 32K speedup percentage |
+| GLM 5.2 ExpertMajor v2 Q2_K, 244.14 GiB | Metal AUTO→SSD, 601 records, fixed compact-indexer transition, prose prompt | **44.73 t/s** | **1.87 t/s** overall; about **2.12 t/s** at p50 | Same-prompt output matches the earlier corrected arm; zero swap; original baseline crashes before logits |
 
 Full identities, invalidations, control drift and remaining release gates are
 in the
 [`long-context Metal stack record`](docs/benchmarks/2026-07-20-long-context-metal-stack.md).
 DeepSeek also completes isolated 65K+128 and 100K+128 AUTO→SSD lanes with the
-2,065-expert extended-context tier at 141.61/5.72 and 126.72/5.58 prefill/decode
-t/s respectively, with zero swapout.
+2,065-expert extended-context tier at 137.29/6.59 and 145.11/6.44 prefill/decode
+t/s respectively, with zero swapout. GLM's separate 32K security/coding prompt
+lane completes at 45.53/1.33 t/s; its lower decode rate comes from a 13.15%
+expert-cache hit rate versus 36.90% for the prose lane and is not a
+same-condition regression.
 Earlier short-context bests remain historical evidence in the dated records;
 they are not substituted for the long-context promotion gate.
 
@@ -332,6 +342,8 @@ and still a work in progress.
 
 ## Documentation
 
+- [`docs/releases/v0.2.0.md`](docs/releases/v0.2.0.md): current ExpertMajor
+  v2-only release boundary, startup, measured results, and upgrade notes.
 - [`docs/ENGINE_REFERENCE.md`](docs/ENGINE_REFERENCE.md): complete model,
   runtime, server, agent, KV-cache, supported-backend, retired-feature, and
   debugging reference.

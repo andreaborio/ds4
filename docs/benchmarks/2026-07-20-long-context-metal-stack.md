@@ -2,8 +2,12 @@
 
 Date: 2026-07-20
 
-Status: release-candidate evidence from the preceding candidate binary; the
-final-source reruns and repository/DSBox release gates remain open.
+Status: final-source performance and safety evidence is complete for the
+retained Metal paths. DeepSeek carries no promoted 32K speedup percentage
+because the original AUTO controls can swap. Manual API, agent, and persistent
+disk-KV release gates passed on the frozen build. Revision-pinned packaging and
+normal startup also passed. Model-artifact tagging on Hugging Face is complete;
+DSBox, main, and the final Hugging Face cards/runtime revisions remain open.
 
 Decision: retain the exact paired-Q8 decode kernel, the DeepSeek long-context
 cache-phase policy, and the GLM compact-indexer mapping correction. Reject and
@@ -36,10 +40,17 @@ the identities above. They were not rehashed inside every arm. The runner
 records the expected identity, model byte count and mtime; it does not claim
 that `model_sha256_expected` is a fresh per-arm full-file hash.
 
-The retained candidate Metal source identity was
-`1c2413b76fa34300c5f473b87288540c6d71e2d975b53d48d86ecf87df60e02d`.
-Qwen's clean baseline used
-`e57502f1ebab8dbb1b797a76dc50e7947537f4ea00910704c50bdefeb29b4c08`.
+The retained runtime code is commit
+`5479c42e52116ee15766b6e0e00391f940d77215`. Its clean `ds4-bench` SHA-256 is
+`1decc95495f91b7d478d514cf508bc48f2db5cc50525f1c3557115dce260c69e`;
+the assembled Metal source SHA-256 is
+`f143a7e86f3b5e4b7a4b8c92ec3e7cee0a8e1164d5f0fa969dcb056eb1ae2e67`.
+The later hermetic-runner commit `25466e5f4a9c` changes build provenance and
+benchmark tooling only, not C/Metal runtime objects. Its clean diagnostic
+`ds4-bench` binary is
+`144f6be8550a7b754290d97b250dd964da1db126922d86f8d72213d36281a9c4`.
+The instrumented original baseline binary is
+`d963d673f642d467206a5aff697322131babf9365f284f1013cf15a9ac3427d4`.
 
 ## Qwen paired-Q8 result
 
@@ -91,27 +102,61 @@ cycles. A live macOS pressure check also blocks post-prefill growth whenever
 pressure is unavailable or non-normal. Tiny resume suffixes use total context
 for memory policy and suffix length only for the work schedule.
 
-| Warm candidate lane | Prefill | Decode | TPOT p50 | TPOT p95 | Pressure min | Swapout |
-| --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| 8K+128 | 161.68 t/s | 8.46 t/s | 91.425 ms | 125.570 ms | 18% | 0 |
-| 32K+128 | 137.04 t/s | 7.46 t/s | 102.211 ms | 140.538 ms | 19% | 0 |
-| 65K+128 | 141.61 t/s | 5.72 t/s | 157.035 ms | 183.723 ms | 39% | 0 |
-| 100K+128 | 126.72 t/s | 5.58 t/s | 158.477 ms | 192.283 ms | 35% | 0 |
+The primary security/coding prompt used SHA-256
+`e7c1a2cadf781d274cc26bd251d532fe1b9e632080da97e3eb4684741e7cc308`.
+Each comparison used the same prompt, model, 128-token decode, allocation,
+warm-state label and sequential host lane. The 128/2K/8K A/B/B/A cohorts had
+zero swapout, no process contamination and exact output parity between the
+original baseline and complete stack. The 32K candidate arms also preserved
+exact output, but both attempted original-baseline cohorts were invalidated by
+an A2 swap abort; no 32K speedup percentage is promoted.
 
-The 8K content hashes were
-`0af1ae94765dc97e722cb426b58749ae2d2f14e47a50dd9ec682d22903e1c9ec`
-for logits and
-`82ee4a713c50589a81ddd69cb7184281aade7f283570e084a4db2b05648ef24a`
-for decode evidence. The 32K hashes were
-`c95c0928f92fd6538894ad81ea218a03c03fdb9b7dc71c3cb38bd4fc917e83b5`
-and
-`5693ea1becef5be76f19370125b5e70b0dd54a146b743a3b4b7fdd5c69af42ba`.
+| Security/coding lane | Baseline prefill/decode | Stack prefill/decode | Baseline/stack TPOT p95 | Interpretation |
+| --- | ---: | ---: | ---: | --- |
+| 128+128 | 24.64 / 13.06 t/s | 24.72 / 12.97 t/s | 83.95 / 84.84 ms | Neutral; candidate spread dominates |
+| 2K+128 | 196.85 / 10.02 t/s | 156.22 / 10.99 t/s | 188.53 / 88.05 ms | p95 -53.3%; throughput controls drifted, so no t/s percentage |
+| 8K+128 | 211.80 / 8.57 t/s | 195.07 / 8.68 t/s | 239.01 / 138.26 ms | p95 -42.2%; throughput controls drifted, so no t/s percentage |
+| 32K+128 | 187.34 / 7.58 t/s | 177.85 / 7.78 t/s | 288.25 / 145.47 ms | Directional only; A2 swap invalidated the cohort |
 
-An explicit safe 4,129-record 8K reference measured 161.36/8.24 t/s with
-93.364/128.168 ms p50/p95. The combined candidate is better in that single
-matched observation, but it is not a retained A/B/B/A cohort. This record
-therefore treats the change primarily as a memory-safety and phase-correctness
-fix and does not publish a standalone speedup percentage.
+The valid 2K/8K p95 control drifts were 2.03% and 1.23%; the 53.3% and 42.2%
+tail reductions exceed control drift and candidate spread. Decode throughput
+is neutral or inconclusive under the stricter rule. At 32K two separate
+attempts again showed roughly half the candidate p95, but both ended with an
+unsafe original A2 and are retained only as directional/safety evidence. The
+stack also pays an honest prefill cost to seed 4,096 hotlist records instead of
+the baseline's 259-record floor: about 20.6%, 7.9%, and 5.1% at 2K, 8K, and
+32K in the first attempt. The production decision retains that cost because the
+old AUTO policy can swap at 32K, while the corrected candidate completes 32K,
+65K, and 100K with exact output and zero swap.
+
+The logits/decode-evidence content hashes for 128, 2K, 8K, and 32K were:
+
+| Frontier | Logits content SHA-256 | Decode evidence content SHA-256 |
+| --- | --- | --- |
+| 128 | `20753418e04ef834524319d2d5fc48fdc5d6886a2ed905cc21b91b325d4e587f` | `a6e232d06f43e280b8dba70b1053e74136839cd14ee0c254be1e8024c2969c2b` |
+| 2K | `b428054a77166c234f69cfa5a5828ef194198561483761ba7d67aaf859d2c8c3` | `ebd2378a1f4eb41de71b5b1b2be6cc29e6d7fb3c241efb3b5d57d765a315ae3b` |
+| 8K | `d05af5406613ff2a93223720ae5ad96f64d2365a0c10ce36b24a41db2e84e6b2` | `705014d39271c41722e3b301d7bc9c081671700d9d8b3230cb2cbd05c90e68ea` |
+| 32K | `56a6592cdad1ab94c072d1406a1d4872922802b1254ae59c929fa9aaee14923c` | `a4d3324620bba4ba3f9e47a2d1248322dc1460ef14476710b097dca7c4aa0f3d` |
+
+The final 8,190+128 canary crossed the 8K boundary directly from the 259-record
+prefill floor to 4,129 records. It measured 162.49 t/s prefill, 8.36 t/s
+decode, 93.559/145.948 ms p50/p95, 16% minimum pressure, and zero swapout.
+
+A later hermetic 32K A/B/B/A retry gave every arm an identical 128+128
+discarded warm-up. A1 completed at 151.42/6.48 t/s with 341.226 ms p95 and zero
+swap. B1/B2 completed at 147.79/6.75 and 148.46/6.57 t/s with 166.359 and
+173.808 ms p95, exact content and zero swap. A2 completed prefill but the guard
+stopped it before decode after 6,376 swapout pages and 13% minimum pressure.
+The complete cohort is invalid for speed claims; it independently confirms that
+the original AUTO plan is unsafe in a sequential 32K lane while the combined
+stack remains bounded.
+
+A second 32K diagnostic used the prose/locality prompt
+`f53e0d80cb2d4492d24ebd63c7000c397b16ae70f9bf09b3763e5d8323ec209f`
+on clean runner commit `25466e5`. It measured 164.43/7.27 t/s,
+105.410/149.943 ms p50/p95, an 86.73% decode hit rate, 15% minimum pressure,
+and zero swapout. This is a separate final-stack workload check, not a speed
+comparison with the security cohort or an earlier differently warmed arm.
 
 The experimental SIMD top-6 finalize/weights fusion was rejected before the
 long matrix. Its warm 128-token A/B/B/A decode results were 12.95, 13.12,
@@ -120,14 +165,17 @@ SIMD candidate. The A controls differed by more than 3%, and the B mean was not
 faster than the A mean. A short lane may reject a candidate under the campaign
 rules, so the kernel, dispatch and dedicated test scaffolding were removed.
 
-The isolated 65K and 100K arms used runtime AUTO, which resolved to SSD, a
-131,072-token allocation, and deterministic extensions of the checked-in
-security prompt. Their prompt SHA-256 values were respectively
+The final isolated 65K and 100K arms used runtime AUTO, which resolved to SSD,
+a 131,072-token allocation, and deterministic extensions of the checked-in
+security prompt. They measured 137.29/6.59 and 145.11/6.44 prefill/decode t/s,
+with 133.411/169.059 and 133.580/174.592 ms p50/p95. Pressure minima were 35%
+and 34%, wired peaks 27,727 and 27,860 MiB, and both had zero swapout. Their
+prompt SHA-256 values were respectively
 `b03c9d3458bf5fe4d5943d7a66a442df50adff7ef7403e44809e44f5a015193e`
 and
 `a433c538bedf7df589e3fbeeefee9f8867bd0639ddf58d2af30e4ef463034cb6`.
-Both used binary
-`5ea1e65fb42adbe81661740ab056841df3ea82c996fd108ecee241dd76f8bdec`,
+Both used the final runtime binary
+`1decc95495f91b7d478d514cf508bc48f2db5cc50525f1c3557115dce260c69e`,
 produced complete logits/evidence, and saw no competing inference process.
 At 65K the logits/evidence content hashes were
 `2406b1dfd16989e652bacb3b0f2995e763824605551683c21ac79d99396846e3`
@@ -165,25 +213,43 @@ view to two disjoint norm views followed by an indexer store at position 4096.
 Incremental real-model gates used `ctx_alloc=65536`; a smaller allocation would
 raise the internal full-attention cap and mask this exact boundary.
 
-| Candidate lane | Prefill | Decode | TPOT p50 | TPOT p95 | Result |
-| --- | ---: | ---: | ---: | ---: | --- |
-| 4K+1 boundary | 39.61 t/s | cold first token 0.23 t/s | 4,351.509 ms | 4,351.509 ms | exact transition passes; zero swap delta |
-| 8K+8 canary | 40.29 t/s | 0.95 t/s overall | 551.587 ms | 4,691.184 ms | indexed prefill passes; p50 is about 1.81 t/s steady decode |
-| 32K+128 acceptance | 36.19 t/s | 1.62 t/s overall | 558.710 ms | 731.082 ms | `rc=0`; p50 is about 1.79 t/s steady decode |
+| GLM lane | Prefill | Decode | TPOT p50 | TPOT p95 | Decode cache hit | Result |
+| --- | ---: | ---: | ---: | ---: | ---: | --- |
+| 4K+1 boundary | 39.61 t/s | cold first token 0.23 t/s | 4,351.509 ms | 4,351.509 ms | n/a | exact transition passes; zero swap delta |
+| 8K+8 canary | 40.29 t/s | 0.95 t/s overall | 551.587 ms | 4,691.184 ms | n/a | indexed prefill passes; p50 is about 1.81 t/s steady decode |
+| Earlier 32K prose | 36.19 t/s | 1.62 t/s overall | 558.710 ms | 731.082 ms | 36.90% | corrected candidate; zero swap |
+| Final-source 32K prose | 44.73 t/s | 1.87 t/s overall | 472.624 ms | 621.302 ms | 36.90% | about 2.12 t/s p50 steady; zero swap |
+| Final-source 32K security/coding | 45.53 t/s | 1.33 t/s overall | 734.406 ms | 819.176 ms | 13.15% | adversarial routing lane; zero swap |
 
-The final 32K binary SHA-256 was
-`f3e68d9e8c69b6a33d67e03ad976941b6149205557e8dab14be51a7c94d79c81`.
-The arm recorded pressure 83% before, 23% minimum and 84% after; wired memory
-peaked at 37,871 MiB; swapout delta was zero; no competing inference process
-appeared. Logits/evidence content hashes were
+The same-prompt final-source prose observation uses prompt SHA-256
+`f53e0d80cb2d4492d24ebd63c7000c397b16ae70f9bf09b3763e5d8323ec209f`
+and final runtime binary
+`1decc95495f91b7d478d514cf508bc48f2db5cc50525f1c3557115dce260c69e`.
+Its logits and decode-evidence
+content hashes exactly match the earlier corrected arm:
 `fc048bce4865b2c6a0df8951fef892d64e2058fa1980876895a46f300c91cc0e`
 and
 `fd41083cb825ef9e754052398f79c82d2141dfd12d388e04e03cc8ad50a99320`.
+Pressure fell from 84% to a 22% minimum, wired memory peaked at 37,389 MiB,
+swapout stayed zero, and no competing inference process appeared.
 
-There is no meaningful 32K speedup percentage: the baseline fails the
-correctness transition and produces no logits. Performance acceptance is that
-the fixed path preserves the established roughly 1.8 t/s steady GLM decode
-while making the long-context lane complete successfully.
+The security/coding prompt has SHA-256
+`e7c1a2cadf781d274cc26bd251d532fe1b9e632080da97e3eb4684741e7cc308`.
+It routed through 14,309 unique records instead of 11,698, reduced the 601-slot
+cache hit rate from 36.90% to 13.15%, and increased decode expert reads from
+559.92 to 769.44 GiB. The additional I/O explains the lower throughput; compute
+time outside `pread` did not regress. Its logits/evidence content hashes were
+`c9fcbda2fe8c6353a0eaf32d803b74112ad8d5fa0bf63825a1a2b0ebb55ccc26`
+and
+`a11298a3bd91c2dd04d8d5dd90266acf596ea447046a2d4311940707136df7dc`.
+
+The same-prompt observation did not show a material final-source GLM decode
+regression and exceeds the earlier top. It did not use a matched warm-up or an
+A/B/B/A speed cohort, so this record does not publish a percentage gain. There
+is also no
+correctness-baseline speedup percentage: the original baseline fails the 32K
+transition and produces no logits. GLM 32K is feasible on the 64 GiB host; the
+cost is test duration, not a RAM-capacity failure.
 
 ## Invalid and discarded runs
 
@@ -193,6 +259,14 @@ while making the long-context lane complete successfully.
   percentage crossed 20%. It had no swapout but the complete cohort is invalid.
   The runner now records transient pressure and aborts on swapout, wired-memory,
   timeout or process contamination.
+- The first final-source DeepSeek 128 cohort began with a cold 11.77 t/s A1 and
+  ended with a 13.45 t/s A2, so it was discarded before the retained warm
+  cohort.
+- In the first DeepSeek 32K comparison, A2 was stopped before inference after
+  20 system swapout pages. A later zero-swap A2 retry is useful diagnostic data
+  but cannot repair an interrupted cohort. The fully restarted hermetic cohort
+  above was also invalidated when the original A2 added 6,376 swapout pages.
+  Neither cohort supports a 32K speedup percentage.
 - The original GLM 32K arm is invalid because the compact-indexer warmup failed
   and produced no evidence.
 - A fixed GLM boundary invocation passed the warmup but then failed because its
@@ -213,27 +287,75 @@ while making the long-context lane complete successfully.
   128-token transition guard above removes that churn; its replacement canary
   remains part of the final-source gate.
 
+## Functional release validation
+
+The functional gate used a clean detached worktree at runner commit
+`25466e5f4a9c`, whose runtime code is commit `5479c42e5211`. Binary SHA-256
+values were `a24a0d96f8451be6ae74c6dc4b6a4e79d003a165fa2c2d14ce9a8127300eea5b`
+for `ds4`, `bd061c0dd8aa6368f9c0e1183350feb80247e3fa00cbebb4a26c8809a50ec1f1`
+for `ds4-server`, and
+`967427b29cf98b14914074645a05241a419173832a969ef9340f1693deb8638e`
+for `ds4-agent`. The assembled Metal source identity remained
+`f143a7e86f3b5e4b7a4b8c92ec3e7cee0a8e1164d5f0fa969dcb056eb1ae2e67`.
+
+With the qualified DeepSeek v2 artifact and normal AUTO startup,
+`ds4-server` resolved to SSD streaming and passed:
+
+- both `deepseek-v4-flash` and `deepseek-v4-pro` model aliases;
+- OpenAI Chat, OpenAI Responses, Anthropic Messages, and SSE streaming;
+- trace creation and a clean, draining shutdown;
+- disk-KV writes followed by a fresh-process restart hit from the same cache
+  directory (`tokens=1`, `load=1.2 ms`), then a new shutdown checkpoint.
+
+The model downloader pins `ds4-v0.2.0` and verifies the qualified byte count
+and complete SHA-256. The annotated tag was created and peeled back to the
+qualified model-repository commit for DeepSeek, GLM, and Qwen. Public
+`hf download --dry-run` checks resolved exactly one 86.7, 262.1, and 20.8 GB
+v2 file respectively, without downloading another model copy.
+
+The native DeepSeek agent passed a non-interactive one-turn smoke and a real
+two-turn tool loop in a temporary project: `write` plus `bash` created, built,
+and ran a C program; the next turn used the anchored `edit` tool rather than a
+full rewrite, rebuilt it, and produced the changed output. A separate live TUI
+gate exercised `/help`, `/power 50`, `/power 100`, `/save`, `/list`,
+`/history`, `/strip`, `/new`, `/switch`, and `/del`. Stripped-session switch
+rebuilt 1,987 tokens from rendered text. Ctrl+C interrupted a live prefill and
+the same process accepted and completed the next prompt. The temporary session
+was deleted after the gate.
+
+Normal flag-free AUTO CLI startup also passed on all three qualified artifacts
+at an 8,192-token allocation. Qwen resolved resident and emitted `QWEN_OK`;
+DeepSeek resolved SSD and emitted `DEEPSEEK_OK`; GLM resolved to its required
+SSD-only Gold profile and emitted `GLM_OK`. These tiny generations are startup
+and prompt-rendering checks, not performance evidence.
+
+The exhaustive interactive web-approval, queued-message, long-running bash,
+and remote-terminal rendering matrix was not repeated because this release
+delta does not change agent tools, TUI, server protocols, or disk-KV code. The
+manual gates above validate normal startup and the historically critical
+interruption/tool/session paths without presenting the untouched surfaces as
+newly qualified evidence.
+
 ## Remaining release gates
 
-The measured code paths are retained, but this record alone does not authorize
-release. Before merge:
+The retained runtime paths have passed `make premerge`, independent full-diff
+review, final-binary Qwen/DeepSeek/GLM short smokes, DeepSeek 8K-crossing and
+65K/100K gates, both 32K prompt domains, and final-source GLM 32K. DeepSeek is
+promoted as a safety/correctness and long-tail fix, not with a 32K throughput
+percentage, because the original AUTO controls can swap.
 
-- run `make premerge` on the frozen source tree and complete a final full-diff
-  and residue review;
-- run fresh final-binary short smokes for Qwen, DeepSeek and GLM;
-- rerun DeepSeek 65K/100K and a decode canary that crosses 8K on the final
-  source, then complete the required combined-stack comparison;
-- keep manual API, agent, disk-KV, packaging, DSBox and Hugging Face publication
-  checks separate from performance acceptance.
+This record alone still does not authorize publication. Before merge/release:
+
+- rerun `make premerge` after the final documentation-only commit and complete
+  one last residue review;
+- validate the DSBox catalog/startup surface against the release commit;
+- publish/verify main and Hugging Face only after those functional gates pass.
 
 The GLM mapping correction does not alter attention, KV geometry, RoPE,
 context allocation or context scaling, so it does not create a new 65K/100K
 performance claim. The 4K boundary and 8K/32K indexed lanes exercise the
 changed transition directly.
 
-Raw local campaign artifacts are under
-`/tmp/ds4-q8-final-matrix.MquCV1` and
-`/tmp/ds4-long-adaptive.VnKgWS`, with final extended-context evidence under
-`/tmp/ds4-release-validation.zZvXI7`, for the release session. This record
-carries the durable metrics and content hashes; temporary paths are not
-artifact identity.
+This record carries the durable metrics, prompt identities, binary identities,
+and content hashes. Session-local scratch paths are intentionally omitted
+because they are not durable artifact identity.
