@@ -701,6 +701,20 @@
       "maximum": 8
     },
     {
+      "path": "docs/releases/hebrus-bridge-launch-candidate.md",
+      "location": "content",
+      "token": "ds4",
+      "classification": "compatibility",
+      "maximum": 8
+    },
+    {
+      "path": "docs/releases/hebrus-bridge-launch-candidate.md",
+      "location": "content",
+      "token": "DS4",
+      "classification": "compatibility",
+      "maximum": 2
+    },
+    {
       "path": "docs/releases/v0.1.0.md",
       "location": "content",
       "token": "ds4",

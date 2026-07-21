@@ -227,6 +227,9 @@ A short-context best is not substituted for the long-context gate.
 
 ### Project and community
 
+- [Hebrus bridge launch-candidate notes](docs/releases/hebrus-bridge-launch-candidate.md) —
+  implemented scope, preserved compatibility, release evidence, and external
+  gates that remain pending.
 - [Contribution guide](CONTRIBUTING.md)
 - [Security policy](SECURITY.md)
 - [Code of conduct](CODE_OF_CONDUCT.md)
