@@ -36431,8 +36431,17 @@ int ds4_gpu_qwen35_routed_moe_batch_select_tensor(
             ds4_gpu_routed_mv_nr0(gate_type);
         const uint32_t down_nr0 = mlx_affine_store ? 4u :
             ds4_gpu_routed_mv_nr0(down_type);
-        id<MTLComputePipelineState> gate_mv_pipeline = ds4_gpu_routed_mv_pipeline(gate_type);
-        id<MTLComputePipelineState> down_mv_pipeline = ds4_gpu_routed_mv_pipeline(down_type);
+        /* Resident MLX-affine batches below the routed-MM threshold still
+         * need the affine selected-expert matvec path.  The tensor metadata
+         * intentionally remains Q4_K for GGUF compatibility, so selecting a
+         * pipeline from gate_type/down_type here would decode the affine
+         * payload with the legacy Q4_K kernel. */
+        id<MTLComputePipelineState> gate_mv_pipeline =
+            mlx_affine_store ? g_moe_mul_mv_id_mlx_affine4_pipeline :
+            ds4_gpu_routed_mv_pipeline(gate_type);
+        id<MTLComputePipelineState> down_mv_pipeline =
+            mlx_affine_store ? g_moe_mul_mv_id_mlx_affine4_pipeline :
+            ds4_gpu_routed_mv_pipeline(down_type);
         id<MTLComputePipelineState> gate_mm_pipeline = nil;
         id<MTLComputePipelineState> up_mm_pipeline = nil;
         id<MTLComputePipelineState> down_mm_pipeline = nil;
@@ -36796,13 +36805,6 @@ int ds4_gpu_qwen35_routed_moe_batch_select_tensor(
                 return 0;
             }
         }
-        if (mlx_affine_store && !use_mm_id &&
-            !use_stream_batch_selected_addr) {
-            fprintf(stderr,
-                    "ds4: MLX-affine ExpertMajor requires either selected-address SSD execution or a routed prefill batch of at least 32 tokens\n");
-            return 0;
-        }
-
         if (use_stream_batch_selected_addr) {
             const int had_batch = g_batch_cb != nil;
             const ds4_gpu_stream_expert_table overlap_table = {
