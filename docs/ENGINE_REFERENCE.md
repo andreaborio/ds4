@@ -147,6 +147,25 @@ commands use Hebrus in help and build metadata; compatibility `ds4*` aliases
 retain their legacy command identity. Existing runtime diagnostics remain in
 the compatibility namespace during this bridge.
 
+The Makefile can install that same single-binary-per-role layout locally or
+into a package staging root. `PREFIX` defaults to `/usr/local`, `BINDIR`
+defaults to `$(PREFIX)/bin`, and `DESTDIR` prepends a packaging root without
+being embedded in the executables. For example:
+
+```sh
+make install PREFIX="$HOME/.local"
+make install DESTDIR="$PWD/package-root" PREFIX=/usr/local
+make uninstall DESTDIR="$PWD/package-root" PREFIX=/usr/local
+make install-test
+```
+
+Installation copies only the five canonical executables and creates each
+legacy command as a relative symlink to its canonical peer. Uninstall removes
+only those ten named paths; it does not remove the containing directory or any
+other file. The test uses a temporary `DESTDIR`, validates all capability
+documents and aliases without loading a model, exercises `BINDIR` overriding,
+and proves the explicit uninstall boundary.
+
 Every canonical and compatibility executable accepts `--capabilities=json`
 without loading a model.
 The deterministic schema reports the build revision, compiled backend,

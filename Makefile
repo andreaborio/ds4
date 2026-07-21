@@ -29,13 +29,21 @@ HEBRUS_PROGRAMS := hebrus hebrus-server hebrus-bench hebrus-eval hebrus-agent
 DS4_PROGRAMS := ds4 ds4-server ds4-bench ds4-eval ds4-agent
 PROGRAMS := $(HEBRUS_PROGRAMS) $(DS4_PROGRAMS)
 
+PREFIX ?= /usr/local
+BINDIR ?= $(PREFIX)/bin
+INSTALL ?= install
+INSTALL_MODE ?= 0755
+INSTALL_DEST_BINDIR = $(DESTDIR)$(BINDIR)
+INSTALL_SOURCE_PROGRAMS = $(addprefix $(INSTALL_SOURCE_BINDIR)/,$(HEBRUS_PROGRAMS))
+
 .PHONY: all help clean test model-free-test premerge context-audit doc-links \
 	brand-boundary-audit brand-boundary-test \
 	imatrix-dataset-check prompt-fixture-check cpu FORCE \
 	metal build-isolation-test q4k-dot-test qwen-metadata-test \
 	qwen-reference-test qwen-unicode-test qwen-tokenizer-test \
 	qwen-expert-group-test expert-store-test metal-ssd-profile-test \
-	download-model-test capabilities-test command-alias-test $(PROGRAMS) \
+	download-model-test capabilities-test command-alias-test \
+	install uninstall install-test $(PROGRAMS) \
 	ds4_test ds4_agent_test
 
 download-model-test: tests/test_download_model.sh download_model.sh
@@ -57,6 +65,8 @@ METAL_OBJDIR := $(BUILD_ROOT)/$(METAL_PROFILE)/obj
 METAL_BINDIR := $(BUILD_ROOT)/$(METAL_PROFILE)/bin
 CPU_OBJDIR := $(BUILD_ROOT)/$(CPU_PROFILE)/obj
 CPU_BINDIR := $(BUILD_ROOT)/$(CPU_PROFILE)/bin
+INSTALL_SOURCE_BINDIR := $(METAL_BINDIR)
+INSTALL_BACKEND := metal
 
 METAL_LDLIBS := $(LDLIBS) -framework Foundation -framework Metal
 
@@ -93,6 +103,9 @@ help:
 	@echo "                    Run all Metal gates that do not require a GGUF"
 	@echo "  make build-isolation-test"
 	@echo "                    Prove Metal -> CPU -> Metal cannot mix artifacts"
+	@echo "  make install      Install commands under DESTDIR+$(BINDIR)"
+	@echo "  make uninstall    Remove only the ten installed command paths"
+	@echo "  make install-test Verify staged install layout and capabilities"
 	@echo "  make brand-boundary-audit"
 	@echo "                    Reject unclassified or increased legacy brand tokens"
 	@echo "  make premerge     Run context/docs, isolation, and model-free gates"
@@ -547,6 +560,7 @@ prompt-fixture-check:
 premerge: context-audit doc-links brand-boundary-audit brand-boundary-test \
 	imatrix-dataset-check prompt-fixture-check build-isolation-test
 	$(MAKE) model-free-test
+	$(MAKE) install-test
 	git diff --check
 
 build-isolation-test: tests/test_build_isolation.sh tests/test_capabilities.py \
@@ -560,6 +574,8 @@ else
 CFLAGS += -D_GNU_SOURCE -fno-finite-math-only
 CPU_CORE_OBJS := ds4_cpu.o ds4_build_cpu.o ds4_ssd.o \
 	ds4_profile.o ds4_expert_store.o ds4_qwen.o ds4_qwen_unicode.o
+INSTALL_SOURCE_BINDIR := .
+INSTALL_BACKEND := cpu
 
 all: cpu
 
@@ -568,6 +584,9 @@ help:
 	@echo "  make / make cpu          Build ./hebrus* plus ./ds4* aliases"
 	@echo "  make test                Build and run tests"
 	@echo "  make model-free-test     Run all tests that do not require a GGUF"
+	@echo "  make install             Install commands under DESTDIR+$(BINDIR)"
+	@echo "  make uninstall           Remove only the ten installed command paths"
+	@echo "  make install-test        Verify staged install layout and capabilities"
 	@echo "  make brand-boundary-audit"
 	@echo "                           Reject unclassified or increased legacy brand tokens"
 	@echo "  make premerge            Run repository audits and Linux CPU/model-free gates"
@@ -752,6 +771,7 @@ prompt-fixture-check:
 
 premerge: context-audit doc-links brand-boundary-audit brand-boundary-test \
 	imatrix-dataset-check prompt-fixture-check model-free-test
+	$(MAKE) install-test
 	git diff --check
 
 q4k-dot-test: tests/test_q4k_dot.c
@@ -854,6 +874,65 @@ metal-ssd-profile-test: tests/test_metal_ssd_profile
 	./tests/test_metal_ssd_profile
 
 endif
+
+install: $(INSTALL_SOURCE_PROGRAMS)
+	@set -eu; \
+		case "$(BINDIR)" in \
+			/*) ;; \
+			*) echo "install: BINDIR must be absolute: $(BINDIR)" >&2; exit 2 ;; \
+		esac; \
+		dest="$(INSTALL_DEST_BINDIR)"; \
+		mkdir -p "$$dest"; \
+		for name in $(PROGRAMS); do \
+			path="$$dest/$$name"; \
+			if [ -d "$$path" ] && [ ! -L "$$path" ]; then \
+				echo "install: refusing to replace directory $$path" >&2; \
+				exit 2; \
+			fi; \
+		done; \
+		tmp=; \
+		trap 'test -z "$$tmp" || rm -f "$$tmp"' 0 1 2 3 15; \
+		for name in $(HEBRUS_PROGRAMS); do \
+			tmp="$$dest/.$$name.install.$$$$"; \
+			rm -f "$$tmp"; \
+			$(INSTALL) -m "$(INSTALL_MODE)" \
+				"$(INSTALL_SOURCE_BINDIR)/$$name" "$$tmp"; \
+			rm -f "$$dest/$$name"; \
+			mv "$$tmp" "$$dest/$$name"; \
+			tmp=; \
+		done; \
+		for canonical in $(HEBRUS_PROGRAMS); do \
+			legacy=ds4$${canonical#hebrus}; \
+			tmp="$$dest/.$$legacy.install.$$$$"; \
+			rm -f "$$tmp"; \
+			ln -s "$$canonical" "$$tmp"; \
+			rm -f "$$dest/$$legacy"; \
+			mv "$$tmp" "$$dest/$$legacy"; \
+			tmp=; \
+		done
+
+uninstall:
+	@set -eu; \
+		case "$(BINDIR)" in \
+			/*) ;; \
+			*) echo "uninstall: BINDIR must be absolute: $(BINDIR)" >&2; exit 2 ;; \
+		esac; \
+		dest="$(INSTALL_DEST_BINDIR)"; \
+		for name in $(PROGRAMS); do \
+			path="$$dest/$$name"; \
+			if [ -d "$$path" ] && [ ! -L "$$path" ]; then \
+				echo "uninstall: refusing to remove directory $$path" >&2; \
+				exit 2; \
+			fi; \
+		done; \
+		for name in $(PROGRAMS); do \
+			rm -f "$$dest/$$name"; \
+		done
+
+install-test: $(INSTALL_SOURCE_PROGRAMS) tests/test_install.sh \
+		tests/test_capabilities.py tests/test_command_aliases.py
+	HEBRUS_INSTALL_BACKEND="$(INSTALL_BACKEND)" MAKE="$(MAKE)" \
+		sh tests/test_install.sh
 
 clean:
 	rm -rf "$(BUILD_ROOT)"

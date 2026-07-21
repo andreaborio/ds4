@@ -62,6 +62,10 @@ SHA-256, manifest contract, and compatible runtime commit are one release gate.
 - Run `make command-alias-test` and confirm each `ds4*` profile command is a
   symlink to its single real `hebrus*` binary, with exact build-info, help,
   capability, invalid-option, and retired-option parity.
+- Run `make install-test` and confirm a temporary `DESTDIR` receives five real
+  canonical executables, five relative compatibility aliases, valid capability
+  documents, no embedded checkout/staging paths, and an explicit-only,
+  idempotent uninstall.
 - Run whitespace checks before committing:
   `git diff --check`.
 - Confirm both names of the CLI, server, and agent render help cleanly, with

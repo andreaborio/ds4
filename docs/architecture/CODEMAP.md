@@ -18,7 +18,10 @@ recorded in [`ADR 0005`](../adr/0005-hebrus-naming-and-compatibility-boundary.md
 
 The Makefile links one canonical `hebrus*` executable per role from these
 entrypoints and publishes the corresponding `ds4*` name as a symlink to the
-same file. There are no alias-specific wrappers or object graphs.
+same file. It also owns the `DESTDIR`/`PREFIX`/`BINDIR` install boundary:
+canonical executables are copied, compatibility aliases stay relative, and
+uninstall names every removable path explicitly. There are no alias-specific
+wrappers or object graphs.
 
 | Path | Primary responsibility |
 | --- | --- |
@@ -106,6 +109,7 @@ not validated.
 | `tests/` | Model-free, model-backed, kernel, tokenizer, server, and build-isolation regressions |
 | `tests/test_capabilities.py` | Exact schema and cross-executable checks for the model-free build/capability contract |
 | `tests/test_command_aliases.py` | Canonical/legacy symlink layout, binary identity, and CLI-output parity checks |
+| `tests/test_install.sh` | Temporary-root install/uninstall layout, path portability, capability, and explicit-removal checks |
 | `tools/brand_boundary.json` + `tools/brand_boundary_audit.py` | Exact canonical, bridged, and permanently preserved identity contract plus explicit per-file legacy `ds4`/`DS4`/`DwarfStar` classification and monotonic count ceilings; `--check` rejects contract drift, new groups, and increases, while `--refresh` requires exact authorizations before widening a ceiling |
 | `tests/test_brand_boundary_audit.py` | Fail-closed fixtures for new files and tokens, increases, reductions, deterministic refresh, and invalid manifests |
 | `tests/qwen/` | Qwen fixtures, provenance, reference collectors, and model-specific gates |

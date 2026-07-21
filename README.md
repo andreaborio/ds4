@@ -104,6 +104,30 @@ make -j
 make model-free-test
 ```
 
+For a user-local installation that does not require `sudo`:
+
+```sh
+make install PREFIX="$HOME/.local"
+export PATH="$HOME/.local/bin:$PATH"
+
+hebrus --build-info
+```
+
+`make install` copies the five canonical `hebrus*` executables and creates the
+five `ds4*` compatibility names as relative symlinks to those files. Package
+builders can stage the same layout without touching the host filesystem:
+
+```sh
+make install DESTDIR="$PWD/package-root" PREFIX=/usr/local
+make uninstall DESTDIR="$PWD/package-root" PREFIX=/usr/local
+```
+
+`PREFIX` defaults to `/usr/local`; `BINDIR` may override its `bin` directory.
+Uninstall removes only the ten explicit command paths and leaves the directory
+and every unrelated file intact. `make install-test` verifies the staged
+layout, aliases, capabilities, and uninstall boundary without a model or
+privileged access.
+
 For a published DeepSeek V4 Flash artifact on a qualified 64 GiB-or-larger
 host:
 

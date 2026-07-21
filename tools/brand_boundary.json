@@ -250,7 +250,7 @@
       "location": "content",
       "token": "ds4",
       "classification": "compatibility",
-      "maximum": 493
+      "maximum": 494
     },
     {
       "path": "Makefile",
@@ -292,7 +292,7 @@
       "location": "content",
       "token": "ds4",
       "classification": "migration-pending",
-      "maximum": 11
+      "maximum": 12
     },
     {
       "path": "README.md",
@@ -2337,6 +2337,13 @@
       "token": "DS4",
       "classification": "migration-pending",
       "maximum": 9
+    },
+    {
+      "path": "tests/test_install.sh",
+      "location": "content",
+      "token": "ds4",
+      "classification": "compatibility",
+      "maximum": 10
     },
     {
       "path": "tests/test_metal_ssd_profile.c",
