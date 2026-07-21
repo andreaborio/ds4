@@ -568,20 +568,6 @@ int ds4_gpu_matmul_f32_tensor(
         const ds4_gpu_tensor *x,
         uint64_t                n_tok);
 
-/* Qwen3.5/3.6 F32 router entrypoint.  n_tok is the current execution tile;
- * total_context_tokens is the stable final prompt length and is used only by
- * backend policy selection, never by buffer geometry or dispatch sizing. */
-int ds4_gpu_qwen35_router_matmul_f32_tensor(
-        ds4_gpu_tensor       *out,
-        const void             *model_map,
-        uint64_t                model_size,
-        uint64_t                weight_offset,
-        uint64_t                in_dim,
-        uint64_t                out_dim,
-        const ds4_gpu_tensor *x,
-        uint64_t                n_tok,
-        uint64_t                total_context_tokens);
-
 int ds4_gpu_repeat_hc_tensor(
         ds4_gpu_tensor       *out,
         const ds4_gpu_tensor *row,

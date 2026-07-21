@@ -15975,24 +15975,6 @@ static bool qwen35_gpu_matmul_dense(
         out, model, weight, in_dim, out_dim, input, 1u);
 }
 
-static bool qwen35_gpu_matmul_router_batch(
-        ds4_gpu_tensor       *out,
-        const ds4_model      *model,
-        const ds4_tensor     *weight,
-        const ds4_gpu_tensor *input,
-        uint32_t              n_token,
-        uint32_t              total_context_tokens) {
-    return out && model && model->map && weight && input &&
-           n_token != 0u && total_context_tokens >= n_token &&
-           weight->type == DS4_TENSOR_F32 &&
-           qwen35_gpu_dense_weight_layout_matches(
-               weight, QWEN35_N_EMBD, QWEN35_N_EXPERT) &&
-           ds4_gpu_qwen35_router_matmul_f32_tensor(
-               out, model->map, model->size, weight->abs_offset,
-               QWEN35_N_EMBD, QWEN35_N_EXPERT, input, n_token,
-               total_context_tokens) != 0;
-}
-
 /* Reuse the paired Q8 projection whenever both supported-model tensors permit
  * it.  A zero return is an optional-fusion miss, so the required scalar
  * projections remain the correctness fallback, as in the DeepSeek driver. */
@@ -16960,14 +16942,12 @@ static bool qwen35_gpu_encode_ffn_batch(
         ds4_gpu_tensor                 *hidden,
         uint32_t                        layer_index,
         uint32_t                        n_token,
-        uint32_t                        total_context_tokens,
         bool                            io_overlap,
         bool                            expert_group,
         uint32_t                        expert_group_min_tokens,
         ds4_session_progress_fn         activity,
         void                           *activity_ud) {
     if (!graph || !model || !layer || !hidden || n_token == 0 ||
-        total_context_tokens < n_token ||
         n_token > QWEN35_GPU_PREFILL_CAP ||
         layer_index >= QWEN35_N_LAYER) {
         return false;
@@ -17022,9 +17002,10 @@ static bool qwen35_gpu_encode_ffn_batch(
                   QWEN35_N_EMBD, n_token, 1.0e-6f) != 0;
     QWEN35_PROFILE_FFN_BATCH_STAGE("norm");
     if (ok) {
-        ok = qwen35_gpu_matmul_router_batch(
+        ok = qwen35_gpu_matmul_dense_batch(
             graph->batch_router_logits, model, layer->ffn_gate_inp,
-            graph->batch_norm, n_token, total_context_tokens);
+            QWEN35_N_EMBD, QWEN35_N_EXPERT,
+            graph->batch_norm, n_token);
     }
     QWEN35_PROFILE_FFN_BATCH_STAGE("router");
     if (ok) {
@@ -17251,7 +17232,6 @@ static DS4_MAYBE_UNUSED bool qwen35_gpu_forward_prefill_chunk(
         const int                 *tokens,
         uint32_t                   n_token,
         uint32_t                   position,
-        uint32_t                   total_context_tokens,
         bool                       gqa_reuse,
         bool                       io_overlap,
         bool                       expert_group,
@@ -17259,7 +17239,6 @@ static DS4_MAYBE_UNUSED bool qwen35_gpu_forward_prefill_chunk(
         ds4_session_progress_fn    activity,
         void                      *activity_ud) {
     if (!model || !weights || !graph || !tokens || n_token == 0 ||
-        (uint64_t)position + n_token > total_context_tokens ||
         n_token > QWEN35_GPU_PREFILL_CAP ||
         model->family != DS4_MODEL_FAMILY_QWEN35_MOE ||
         !model->map || model->size == 0 ||
@@ -17359,7 +17338,6 @@ static DS4_MAYBE_UNUSED bool qwen35_gpu_forward_prefill_chunk(
         if (ok) {
             ok = qwen35_gpu_encode_ffn_batch(
                 graph, model, layer, next, layer_index, n_token,
-                total_context_tokens,
                 io_overlap, expert_group, expert_group_min_tokens,
                 activity, activity_ud);
             if (!ok) failed_stage = "batched FFN";
@@ -17476,7 +17454,6 @@ static DS4_MAYBE_UNUSED bool qwen35_gpu_forward_prefill_macro(
         const int                 *tokens,
         uint32_t                   n_token,
         uint32_t                   position,
-        uint32_t                   total_context_tokens,
         ds4_session_progress_fn    activity,
         void                      *activity_ud,
         ds4_session_cancel_fn      cancel,
@@ -17489,7 +17466,6 @@ static DS4_MAYBE_UNUSED bool qwen35_gpu_forward_prefill_macro(
         bool                      *cancelled) {
     if (cancelled) *cancelled = false;
     if (!model || !weights || !graph || !tokens || n_token == 0 ||
-        (uint64_t)position + n_token > total_context_tokens ||
         n_token > QWEN35_GPU_MACRO_PREFILL_MAX ||
         model->family != DS4_MODEL_FAMILY_QWEN35_MOE ||
         !model->map || model->size == 0 ||
@@ -17618,7 +17594,6 @@ static DS4_MAYBE_UNUSED bool qwen35_gpu_forward_prefill_macro(
                 failed_stage = "batched FFN";
                 ok = qwen35_gpu_encode_ffn_batch(
                     graph, model, layer, next, layer_index, rows,
-                    total_context_tokens,
                     io_overlap, expert_group, expert_group_min_tokens,
                     activity, activity_ud);
             }
@@ -40886,10 +40861,8 @@ static bool ds4_session_qwen35_metal_prefill_chunk_commit(
         ds4_session *s,
         const int   *tokens,
         uint32_t     n_token,
-        uint32_t     total_context_tokens,
         float       *logits) {
     if (!ds4_session_is_qwen35_metal(s) || !tokens || n_token == 0 ||
-        (uint64_t)s->checkpoint.len + n_token > total_context_tokens ||
         n_token > s->qwen35_gpu_graph.prefill_cap ||
         !ds4_session_qwen35_timeline_valid(s)) {
         return false;
@@ -40904,7 +40877,6 @@ static bool ds4_session_qwen35_metal_prefill_chunk_commit(
             tokens,
             n_token,
             position,
-            total_context_tokens,
             (s->engine->qwen35_features.enabled &
              QWEN35_FEATURE_GQA_REUSE) != 0,
             (s->engine->qwen35_features.enabled &
@@ -40947,12 +40919,10 @@ static bool ds4_session_qwen35_metal_prefill_macro_commit(
         ds4_session *s,
         const int   *tokens,
         uint32_t     n_token,
-        uint32_t     total_context_tokens,
         float       *logits,
         bool        *cancelled) {
     if (cancelled) *cancelled = false;
     if (!ds4_session_is_qwen35_metal(s) || !tokens || n_token == 0 ||
-        (uint64_t)s->checkpoint.len + n_token > total_context_tokens ||
         n_token > QWEN35_GPU_MACRO_PREFILL_MAX ||
         !ds4_session_qwen35_timeline_valid(s)) {
         return false;
@@ -40976,7 +40946,6 @@ static bool ds4_session_qwen35_metal_prefill_macro_commit(
         tokens,
         n_token,
         position,
-        total_context_tokens,
         ds4_session_qwen35_metal_activity,
         s,
         ds4_session_cancelled_cb,
@@ -41461,10 +41430,10 @@ static int ds4_session_sync_qwen35_metal(
             const bool committed =
                 n_token <= s->qwen35_gpu_graph.prefill_cap
                 ? ds4_session_qwen35_metal_prefill_chunk_commit(
-                    s, &prompt->v[i], n_token, (uint32_t)prompt->len,
+                    s, &prompt->v[i], n_token,
                     final_tile ? s->logits : NULL)
                 : ds4_session_qwen35_metal_prefill_macro_commit(
-                    s, &prompt->v[i], n_token, (uint32_t)prompt->len,
+                    s, &prompt->v[i], n_token,
                     final_tile ? s->logits : NULL, &cancelled);
             if (!committed) {
                 const int attempted_frontier = s->checkpoint.len;
@@ -41583,7 +41552,6 @@ static int ds4_session_sync_qwen35_metal(
                     s,
                     &prompt->v[i],
                     n_token,
-                    (uint32_t)prompt->len,
                     final_chunk ? s->logits : NULL);
             if (!committed) {
                 const bool reset = ds4_session_qwen35_reset_timeline(s);

@@ -19557,7 +19557,7 @@ int ds4_gpu_matmul_f16_pair_tensor(
     return 1;
 }
 
-static int ds4_gpu_matmul_f32_tensor_impl(
+int ds4_gpu_matmul_f32_tensor(
         ds4_gpu_tensor       *out,
         const void             *model_map,
         uint64_t                model_size,
@@ -19565,12 +19565,10 @@ static int ds4_gpu_matmul_f32_tensor_impl(
         uint64_t                in_dim,
         uint64_t                out_dim,
         const ds4_gpu_tensor *x,
-        uint64_t                n_tok,
-        uint64_t                policy_total_tokens) {
+        uint64_t                n_tok) {
     if (!g_initialized && !ds4_gpu_init()) return 0;
     if (in_dim > UINT32_MAX || out_dim > UINT32_MAX ||
-        n_tok == 0 || n_tok > UINT32_MAX ||
-        policy_total_tokens < n_tok) {
+        n_tok == 0 || n_tok > UINT32_MAX) {
         return 0;
     }
 
@@ -19677,57 +19675,60 @@ static int ds4_gpu_matmul_f32_tensor_impl(
          * Apple GPU generation.  DS4 historically fell back to one matvec per
          * prompt row when M5 TensorOps were unavailable, which makes Qwen's
          * 2048x256 F32 router a double-digit share of pre-M5 prefill.  M1-M4
-         * use the qualified SIMD-group tile automatically; M5 and newer keep
-         * the faster TensorOps path above.  Quality mode retains the original
-         * full-F32 matvec accumulation.
+         * use an exact token-tiled F32 kernel: two expert rows are staged once
+         * and reused across eight tokens while preserving the scalar lane and
+         * reduction order.  M5 and newer keep the faster TensorOps path above.
+         * Quality mode retains the original full-F32 matvec dispatch.
          */
         const bool pre_m5_apple_family =
             ds4_gpu_device_name_contains("M1") ||
             ds4_gpu_device_name_contains("M2") ||
             ds4_gpu_device_name_contains("M3") ||
             ds4_gpu_device_name_contains("M4");
-        const bool use_f32_simd_prefill =
+        const bool use_f32_exact_token_tile =
             qwen36_router_shape &&
-            pre_m5_apple_family &&
+            (pre_m5_apple_family ||
+             getenv("DS4_METAL_TEST_F32_EXACT_TOKEN_TILE") != NULL) &&
             !g_quality_mode &&
             n_tok >= 128u &&
-            policy_total_tokens <= 2048u &&
             (in_dim % 32u) == 0 &&
             (out_dim % 64u) == 0 &&
             getenv("DS4_METAL_DISABLE_F32_SIMD_PREFILL") == NULL;
-        if (use_f32_simd_prefill) {
-            static int logged_f32_simd_prefill;
-            if (!logged_f32_simd_prefill) {
+        if (use_f32_exact_token_tile) {
+            static int logged_f32_exact_token_tile;
+            if (!logged_f32_exact_token_tile) {
                 fprintf(stderr,
-                        "ds4: Qwen pre-M5 router uses tiled F32 SIMD prefill\n");
-                logged_f32_simd_prefill = 1;
+                        "ds4: Qwen pre-M5 router uses exact token-tiled F32 prefill\n");
+                logged_f32_exact_token_tile = 1;
             }
-            const bool bc_inp = false;
-            const bool bc_out = (n_tok % 32u) != 0;
-            id<MTLComputePipelineState> simd_pipeline =
-                ds4_gpu_get_mul_mm_pipeline(
-                    "kernel_mul_mm_f32_f32", bc_inp, bc_out);
-            if (!simd_pipeline) return 0;
+            enum { QWEN35_ROUTER_TOKEN_TILE = 8 };
+            ds4_gpu_q8_0_matvec_args args =
+                ds4_gpu_make_f32_mv_args(in_dim, out_dim, n_tok);
+            id<MTLComputePipelineState> exact_pipeline =
+                ds4_gpu_get_mul_mv_pipeline(
+                    "kernel_qwen35_router_f32_exact_t8", 8);
+            if (!exact_pipeline) return 0;
 
-            ds4_gpu_mul_mm_args args =
-                ds4_gpu_make_mm_args(in_dim, out_dim, n_tok, row_bytes);
             id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
-            [enc setComputePipelineState:simd_pipeline];
+            [enc setComputePipelineState:exact_pipeline];
             [enc setBytes:&args length:sizeof(args) atIndex:0];
             [enc setBuffer:wbuf offset:(NSUInteger)inner_offset atIndex:1];
             [enc setBuffer:xbuf offset:ds4_gpu_tensor_offset(x) atIndex:2];
             [enc setBuffer:outbuf offset:ds4_gpu_tensor_offset(out) atIndex:3];
-            [enc setThreadgroupMemoryLength:(bc_out ? 8192u : 6144u)
+            [enc setThreadgroupMemoryLength:
+                    2u * 2048u * sizeof(float) +
+                    2u * 32u * sizeof(float)
                                     atIndex:0];
             [enc dispatchThreadgroups:MTLSizeMake(
-                    ((NSUInteger)n_tok + 31u) / 32u,
-                    ((NSUInteger)out_dim + 63u) / 64u,
+                    ((NSUInteger)out_dim + 1u) / 2u,
+                    ((NSUInteger)n_tok + QWEN35_ROUTER_TOKEN_TILE - 1u) /
+                        QWEN35_ROUTER_TOKEN_TILE,
                     1u)
-                 threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+                 threadsPerThreadgroup:MTLSizeMake(32, 8, 1)];
             ds4_gpu_end_compute_encoder(cb, enc);
 
             if (!ds4_gpu_finish_command_buffer(
-                    cb, owned, "F32 SIMD tensor matmul")) {
+                    cb, owned, "exact token-tiled F32 tensor matmul")) {
                 return 0;
             }
             return 1;
@@ -19760,39 +19761,6 @@ static int ds4_gpu_matmul_f32_tensor_impl(
     }
 
     return 1;
-}
-
-int ds4_gpu_matmul_f32_tensor(
-        ds4_gpu_tensor       *out,
-        const void             *model_map,
-        uint64_t                model_size,
-        uint64_t                weight_offset,
-        uint64_t                in_dim,
-        uint64_t                out_dim,
-        const ds4_gpu_tensor *x,
-        uint64_t                n_tok) {
-    return ds4_gpu_matmul_f32_tensor_impl(
-        out, model_map, model_size, weight_offset,
-        in_dim, out_dim, x, n_tok, n_tok);
-}
-
-int ds4_gpu_qwen35_router_matmul_f32_tensor(
-        ds4_gpu_tensor       *out,
-        const void             *model_map,
-        uint64_t                model_size,
-        uint64_t                weight_offset,
-        uint64_t                in_dim,
-        uint64_t                out_dim,
-        const ds4_gpu_tensor *x,
-        uint64_t                n_tok,
-        uint64_t                total_context_tokens) {
-    if (in_dim != 2048u || out_dim != 256u ||
-        total_context_tokens < n_tok) {
-        return 0;
-    }
-    return ds4_gpu_matmul_f32_tensor_impl(
-        out, model_map, model_size, weight_offset,
-        in_dim, out_dim, x, n_tok, total_context_tokens);
 }
 
 int ds4_gpu_repeat_hc_tensor(
