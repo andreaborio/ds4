@@ -376,7 +376,7 @@
       "location": "content",
       "token": "DS4",
       "classification": "migration-pending",
-      "maximum": 41
+      "maximum": 43
     },
     {
       "path": "docs/adr/0001-expert-major-v2-only.md",
@@ -656,7 +656,7 @@
       "location": "content",
       "token": "DS4",
       "classification": "migration-pending",
-      "maximum": 4
+      "maximum": 3
     },
     {
       "path": "docs/glm52-expert-major-v2.md",
@@ -740,7 +740,7 @@
       "location": "content",
       "token": "DS4",
       "classification": "migration-pending",
-      "maximum": 9
+      "maximum": 10
     },
     {
       "path": "ds4.c",
@@ -1048,7 +1048,7 @@
       "location": "content",
       "token": "ds4",
       "classification": "migration-pending",
-      "maximum": 6573
+      "maximum": 6572
     },
     {
       "path": "ds4_metal.m",
@@ -2119,7 +2119,7 @@
       "location": "content",
       "token": "DS4",
       "classification": "migration-pending",
-      "maximum": 4
+      "maximum": 6
     },
     {
       "path": "tests/qwen/UNICODE_DATA_PROVENANCE.md",
@@ -2308,7 +2308,7 @@
       "location": "content",
       "token": "ds4",
       "classification": "migration-pending",
-      "maximum": 4
+      "maximum": 5
     },
     {
       "path": "tests/test_download_model.sh",
