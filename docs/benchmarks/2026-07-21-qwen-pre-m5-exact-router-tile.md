@@ -5,7 +5,8 @@
 - Status: directional evidence; the current timing cohort is contaminated.
 - Decision: correctness-qualified through 8K. Do not use these timings as the
   clean promotion cohort.
-- Candidate commit: `d612c0c`.
+- Implementation commit: `d612c0c`; flag-free cleanup and final test commit:
+  `f3d3ee2`.
 - Control: `DS4_METAL_DISABLE_F32_NAX_PREFILL=1`.
 - Host: M1 Pro, 16 GiB, AC power, automatic SSD residency.
 - Model: Qwen3.6-35B-A3B DS4 ExpertMajor v2 MLX affine4/group-64 GGUF,
@@ -16,6 +17,10 @@ The candidate stages two `2048`-element F32 router rows once per threadgroup
 and evaluates an eight-token tile. It preserves the scalar backend's float4
 dot order, lane assignment, SIMD reduction, and cross-SIMD reduction. The
 isolated scalar/candidate comparison is byte-identical on M5 and M1.
+The final `f3d3ee2` model-free run also passed on the M1 Pro with no `DS4_*`
+environment overrides, Metal source SHA-256
+`c9a1aee9f5fc3fd9b8fd4ef4bf033e7f5567255eb5c0101f7a167c2efdccfa3c`,
+and zero additional swapouts.
 
 ## Directional performance
 
@@ -77,5 +82,7 @@ retained as an opt-in path.
   `ds4-router-exact-tiled-d612c0c-20260721/directional-table.csv`
 - Exact-tile raw evidence:
   `ds4-router-exact-tiled-d612c0c-20260721/results/`
+- Final flag-free M1 Metal-kernel log:
+  `ds4-router-final-cleanup-f3d3ee2-20260722/metal-kernels.log`
 
 All evidence directories above are retained on the qualified M1 Pro host.
