@@ -19674,20 +19674,31 @@ int ds4_gpu_matmul_f32_tensor(
          * MLX routes matrix-shaped F32 work through a tiled QMM on every
          * Apple GPU generation.  DS4 historically fell back to one matvec per
          * prompt row when M5 TensorOps were unavailable, which makes Qwen's
-         * 2048x256 F32 router a double-digit share of M1 prefill.  Keep this
-         * first port opt-in until route/logit parity and the complete context
-         * matrix qualify it; the surviving path will become automatic and
-         * lose this experiment flag.
+         * 2048x256 F32 router a double-digit share of pre-M5 prefill.  M1-M4
+         * use the qualified SIMD-group tile automatically; M5 and newer keep
+         * the faster TensorOps path above.  Quality mode retains the original
+         * full-F32 matvec accumulation.
          */
+        const bool pre_m5_apple_family =
+            ds4_gpu_device_name_contains("M1") ||
+            ds4_gpu_device_name_contains("M2") ||
+            ds4_gpu_device_name_contains("M3") ||
+            ds4_gpu_device_name_contains("M4");
         const bool use_f32_simd_prefill =
             qwen36_router_shape &&
-            !ds4_gpu_mpp_available() &&
-            n_tok >= 32u &&
+            pre_m5_apple_family &&
+            !g_quality_mode &&
+            n_tok >= 128u &&
             (in_dim % 32u) == 0 &&
             (out_dim % 64u) == 0 &&
-            getenv("DS4_METAL_ENABLE_F32_SIMD_PREFILL") != NULL &&
             getenv("DS4_METAL_DISABLE_F32_SIMD_PREFILL") == NULL;
         if (use_f32_simd_prefill) {
+            static int logged_f32_simd_prefill;
+            if (!logged_f32_simd_prefill) {
+                fprintf(stderr,
+                        "ds4: Qwen pre-M5 router uses tiled F32 SIMD prefill\n");
+                logged_f32_simd_prefill = 1;
+            }
             const bool bc_inp = false;
             const bool bc_out = (n_tok % 32u) != 0;
             id<MTLComputePipelineState> simd_pipeline =
