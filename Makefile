@@ -30,6 +30,7 @@ DS4_PROGRAMS := ds4 ds4-server ds4-bench ds4-eval ds4-agent
 PROGRAMS := $(HEBRUS_PROGRAMS) $(DS4_PROGRAMS)
 
 .PHONY: all help clean test model-free-test premerge context-audit doc-links \
+	brand-boundary-audit brand-boundary-test \
 	imatrix-dataset-check prompt-fixture-check cpu FORCE \
 	metal build-isolation-test q4k-dot-test qwen-metadata-test \
 	qwen-reference-test qwen-unicode-test qwen-tokenizer-test \
@@ -39,6 +40,12 @@ PROGRAMS := $(HEBRUS_PROGRAMS) $(DS4_PROGRAMS)
 
 download-model-test: tests/test_download_model.sh download_model.sh
 	sh tests/test_download_model.sh
+
+brand-boundary-audit: tools/brand_boundary_audit.py tools/brand_boundary.json
+	python3 tools/brand_boundary_audit.py --check
+
+brand-boundary-test: tools/brand_boundary_audit.py tests/test_brand_boundary_audit.py
+	python3 tests/test_brand_boundary_audit.py
 
 ifeq ($(UNAME_S),Darwin)
 
@@ -86,6 +93,8 @@ help:
 	@echo "                    Run all Metal gates that do not require a GGUF"
 	@echo "  make build-isolation-test"
 	@echo "                    Prove Metal -> CPU -> Metal cannot mix artifacts"
+	@echo "  make brand-boundary-audit"
+	@echo "                    Reject unclassified or increased legacy brand tokens"
 	@echo "  make premerge     Run context/docs, isolation, and model-free gates"
 	@echo "  make clean        Remove build outputs and published root binaries"
 
@@ -535,7 +544,8 @@ prompt-fixture-check:
 
 # Build isolation removes and rebuilds BUILD_ROOT, so model-free-test must start
 # only after it completes even when an agent invokes `make -j premerge`.
-premerge: context-audit doc-links imatrix-dataset-check prompt-fixture-check build-isolation-test
+premerge: context-audit doc-links brand-boundary-audit brand-boundary-test \
+	imatrix-dataset-check prompt-fixture-check build-isolation-test
 	$(MAKE) model-free-test
 	git diff --check
 
@@ -558,6 +568,8 @@ help:
 	@echo "  make / make cpu          Build ./hebrus* plus ./ds4* aliases"
 	@echo "  make test                Build and run tests"
 	@echo "  make model-free-test     Run all tests that do not require a GGUF"
+	@echo "  make brand-boundary-audit"
+	@echo "                           Reject unclassified or increased legacy brand tokens"
 	@echo "  make clean               Remove build outputs"
 
 cpu: $(PROGRAMS)
@@ -737,7 +749,8 @@ imatrix-dataset-check:
 prompt-fixture-check:
 	python3 speed-bench/build_long_context_prompt.py --check
 
-premerge: context-audit doc-links imatrix-dataset-check prompt-fixture-check model-free-test
+premerge: context-audit doc-links brand-boundary-audit brand-boundary-test \
+	imatrix-dataset-check prompt-fixture-check model-free-test
 	git diff --check
 
 q4k-dot-test: tests/test_q4k_dot.c

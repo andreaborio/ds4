@@ -106,6 +106,8 @@ not validated.
 | `tests/` | Model-free, model-backed, kernel, tokenizer, server, and build-isolation regressions |
 | `tests/test_capabilities.py` | Exact schema and cross-executable checks for the model-free build/capability contract |
 | `tests/test_command_aliases.py` | Canonical/legacy symlink layout, binary identity, and CLI-output parity checks |
+| `tools/brand_boundary.json` + `tools/brand_boundary_audit.py` | Explicit per-file legacy `ds4`/`DS4`/`DwarfStar` classification and monotonic count ceilings; `--check` rejects new groups and increases, while `--refresh` requires exact authorizations before widening a ceiling |
+| `tests/test_brand_boundary_audit.py` | Fail-closed fixtures for new files and tokens, increases, reductions, deterministic refresh, and invalid manifests |
 | `tests/qwen/` | Qwen fixtures, provenance, reference collectors, and model-specific gates |
 | `tests/test-vectors/` | Official and local continuation vectors plus provenance |
 | `gguf-tools/` | Quantization, ExpertMajor conversion, imatrix, and quality-scoring tools |
