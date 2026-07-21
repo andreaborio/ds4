@@ -943,7 +943,7 @@
       "location": "content",
       "token": "ds4",
       "classification": "migration-pending",
-      "maximum": 719
+      "maximum": 720
     },
     {
       "path": "ds4_gpu.h",
@@ -1048,14 +1048,14 @@
       "location": "content",
       "token": "ds4",
       "classification": "migration-pending",
-      "maximum": 6572
+      "maximum": 6634
     },
     {
       "path": "ds4_metal.m",
       "location": "content",
       "token": "DS4",
       "classification": "migration-pending",
-      "maximum": 1041
+      "maximum": 1042
     },
     {
       "path": "ds4_profile.c",
@@ -2014,7 +2014,7 @@
       "location": "content",
       "token": "ds4",
       "classification": "migration-pending",
-      "maximum": 715
+      "maximum": 716
     },
     {
       "path": "tests/ds4_test.c",
