@@ -7,6 +7,15 @@ remain accepted, and which identifiers must never be rewritten merely for
 branding. Runtime and model support remain governed by
 [`RUNTIME_SUPPORT.md`](RUNTIME_SUPPORT.md).
 
+## Canonical logo asset
+
+The public Hebrus mark is the maintainer-supplied
+[`docs/media/hebrus-logo.png`](../media/hebrus-logo.png). Its source pixels stay
+unchanged: the repository freezes the 1254 x 1254 RGBA PNG at SHA-256
+`4be8949c73bd52e7abef58396dcd57f636165a8bb6cd6d536a600bcbf880594c`.
+Presentation surfaces may add a CSS `drop-shadow()` at render time; they must
+not bake shadows, text, color changes, crops, or other edits into this master.
+
 ## Command names
 
 Every command pair resolves to one real executable and one object graph. The

@@ -37,7 +37,7 @@ INSTALL_DEST_BINDIR = $(DESTDIR)$(BINDIR)
 INSTALL_SOURCE_PROGRAMS = $(addprefix $(INSTALL_SOURCE_BINDIR)/,$(HEBRUS_PROGRAMS))
 
 .PHONY: all help clean test model-free-test premerge context-audit doc-links \
-	brand-boundary-audit brand-boundary-test \
+	brand-boundary-audit brand-boundary-test brand-asset-test \
 	release-contract release-contract-test \
 	imatrix-dataset-check prompt-fixture-check cpu FORCE \
 	metal build-isolation-test q4k-dot-test qwen-metadata-test \
@@ -68,6 +68,9 @@ brand-boundary-audit: tools/brand_boundary_audit.py tools/brand_boundary.json
 
 brand-boundary-test: tools/brand_boundary_audit.py tests/test_brand_boundary_audit.py
 	python3 tests/test_brand_boundary_audit.py
+
+brand-asset-test: tests/test_brand_asset.py docs/media/hebrus-logo.png README.md
+	python3 tests/test_brand_asset.py
 
 ifeq ($(UNAME_S),Darwin)
 
@@ -590,7 +593,7 @@ prompt-fixture-check:
 
 # Build isolation removes and rebuilds BUILD_ROOT, so model-free-test must start
 # only after it completes even when an agent invokes `make -j premerge`.
-premerge: context-audit doc-links brand-boundary-audit brand-boundary-test \
+premerge: context-audit doc-links brand-boundary-audit brand-boundary-test brand-asset-test \
 	release-contract release-contract-test \
 	imatrix-dataset-check prompt-fixture-check build-isolation-test
 	$(MAKE) model-free-test
@@ -811,7 +814,7 @@ imatrix-dataset-check:
 prompt-fixture-check:
 	python3 speed-bench/build_long_context_prompt.py --check
 
-premerge: context-audit doc-links brand-boundary-audit brand-boundary-test \
+premerge: context-audit doc-links brand-boundary-audit brand-boundary-test brand-asset-test \
 	release-contract release-contract-test \
 	imatrix-dataset-check prompt-fixture-check model-free-test
 	$(MAKE) install-test

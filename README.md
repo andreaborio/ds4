@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="docs/media/hebrus-logo.png" width="320" alt="Hebrus logo">
+</p>
+
 # Hebrus
 
 **Local inference built first for Apple Metal and SSD streaming.**
