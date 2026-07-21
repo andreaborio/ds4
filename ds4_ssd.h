@@ -212,8 +212,9 @@ uint32_t ds4_ssd_deepseek_long_context_cache_target(
         uint32_t                           n_tokens);
 /* Pure transition policy used by cold and resumed sessions. The work size
  * selects the prefill schedule; the resulting total context selects the
- * bounded long-context decode tier. A zero prefill target means no transition
- * is required before evaluating the supplied work. */
+ * bounded long-context decode tier, with a 128-token guard before each hard
+ * frontier to avoid grow-then-shrink churn. A zero prefill target means no
+ * transition is required before evaluating the supplied work. */
 uint32_t ds4_ssd_deepseek_prefill_phase_cache_target(
         uint32_t prefill_tokens,
         uint32_t resulting_context_tokens,

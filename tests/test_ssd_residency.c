@@ -854,10 +854,22 @@ int main(void) {
                32, 32, 0, 259, 4129, 2065) == 259);
     assert(ds4_ssd_deepseek_prefill_phase_cache_target(
                31, 8192, 0, 259, 4129, 2065) == 4129);
+    assert(ds4_ssd_deepseek_prefill_phase_cache_target(
+               31, 8063, 0, 259, 4129, 2065) == 0);
+    assert(ds4_ssd_deepseek_prefill_phase_cache_target(
+               31, 8064, 0, 259, 4129, 2065) == 4129);
     assert(ds4_ssd_deepseek_post_prefill_cache_target(
-               8191, 4129, 2065, 4387) == 4387);
+               8063, 4129, 2065, 4387) == 4387);
+    assert(ds4_ssd_deepseek_post_prefill_cache_target(
+               8064, 4129, 2065, 4387) == 4129);
+    assert(ds4_ssd_deepseek_post_prefill_cache_target(
+               8191, 4129, 2065, 4387) == 4129);
     assert(ds4_ssd_deepseek_post_prefill_cache_target(
                8192, 4129, 2065, 4387) == 4129);
+    assert(ds4_ssd_deepseek_post_prefill_cache_target(
+               65407, 4129, 2065, 4387) == 4129);
+    assert(ds4_ssd_deepseek_post_prefill_cache_target(
+               65408, 4129, 2065, 4387) == 2065);
     assert(ds4_ssd_deepseek_post_prefill_cache_target(
                65536, 4129, 2065, 4387) == 2065);
     assert(ds4_ssd_deepseek_post_prefill_cache_target(

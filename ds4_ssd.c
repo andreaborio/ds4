@@ -742,6 +742,8 @@ uint32_t ds4_ssd_deepseek_long_context_cache_target(
     return target == 0 || target > UINT32_MAX ? 0 : (uint32_t)target;
 }
 
+enum { DS4_DEEPSEEK_CONTEXT_TIER_GUARD_TOKENS = 128 };
+
 uint32_t ds4_ssd_deepseek_prefill_phase_cache_target(
         uint32_t prefill_tokens,
         uint32_t resulting_context_tokens,
@@ -753,11 +755,21 @@ uint32_t ds4_ssd_deepseek_prefill_phase_cache_target(
     const bool batched_prefill = batched_prefill_max_tokens == 0 ?
         prefill_tokens >= 32u : prefill_tokens > batched_prefill_max_tokens;
     if (batched_prefill) return prefill_target;
-    if (resulting_context_tokens >= 65536u &&
+    /* Enter the lower-memory tier one standard 128-token acceptance window
+     * before its hard frontier. This prevents a near-boundary prefill from
+     * growing a large cache only to drain and shrink it a few decode tokens
+     * later. The target is smaller, so early admission is always the safe
+     * direction and also covers resumed sessions with no generation hint. */
+    const uint32_t guarded_long_context =
+        8192u - DS4_DEEPSEEK_CONTEXT_TIER_GUARD_TOKENS;
+    const uint32_t guarded_extended_context =
+        65536u - DS4_DEEPSEEK_CONTEXT_TIER_GUARD_TOKENS;
+    if (resulting_context_tokens >= guarded_extended_context &&
         extended_context_target != 0) {
         return extended_context_target;
     }
-    return resulting_context_tokens >= 8192u ? long_context_target : 0u;
+    return resulting_context_tokens >= guarded_long_context ?
+        long_context_target : 0u;
 }
 
 uint32_t ds4_ssd_deepseek_post_prefill_cache_target(
@@ -766,11 +778,16 @@ uint32_t ds4_ssd_deepseek_post_prefill_cache_target(
         uint32_t extended_context_target,
         uint32_t decode_target) {
     if (decode_target == 0) return 0;
-    if (resulting_context_tokens >= 65536u &&
+    const uint32_t guarded_long_context =
+        8192u - DS4_DEEPSEEK_CONTEXT_TIER_GUARD_TOKENS;
+    const uint32_t guarded_extended_context =
+        65536u - DS4_DEEPSEEK_CONTEXT_TIER_GUARD_TOKENS;
+    if (resulting_context_tokens >= guarded_extended_context &&
         extended_context_target != 0) {
         return extended_context_target;
     }
-    return resulting_context_tokens >= 8192u && long_context_target != 0 ?
+    return resulting_context_tokens >= guarded_long_context &&
+        long_context_target != 0 ?
         long_context_target : decode_target;
 }
 

@@ -82,6 +82,10 @@ context from suffix work:
    after successful prefill;
 4. seed the hotlist once; cancellation/error restores capacity without seeding.
 
+The lower-memory tier is admitted 128 tokens before each hard frontier. This
+bounded guard avoids a near-8K or near-65K session growing a larger cache only
+to drain and shrink it again during the same decode window.
+
 Both targets are bounded by the live plan and complete per-token working-set
 cycles. A live macOS pressure check also blocks post-prefill growth whenever
 pressure is unavailable or non-normal. Tiny resume suffixes use total context
@@ -197,6 +201,10 @@ while making the long-context lane complete successfully.
   aborted it. Reducing the 65K+ tier to eight complete routing cycles (2,065
   experts) cut peak wired memory from 42,016 to 28,194 MiB and completed with
   zero swapout; the failed arm contributes no performance result.
+- A final-source 8,190-token decode canary exposed a 259-to-4,387-to-4,129
+  grow/shrink cycle and 36 page-outs. The runner invalidated that arm. The
+  128-token transition guard above removes that churn; its replacement canary
+  remains part of the final-source gate.
 
 ## Remaining release gates
 
