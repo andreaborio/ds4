@@ -798,6 +798,85 @@ int main(void) {
     assert(ds4_ssd_deepseek_expert_major_auto_cache_target(&memory,
                                                             NULL) == 0);
 
+    /* At 8K and above, the measured 64 GiB tier keeps sixteen complete
+     * DeepSeek route cycles hot across prefill and decode. The target remains
+     * pressure bounded and does not silently affect unmeasured host tiers. */
+    deepseek_tier = adaptive;
+    assert(ds4_ssd_deepseek_long_context_cache_target(
+               &memory, &deepseek_tier, 4387, 8191) == 0);
+    assert(ds4_ssd_deepseek_long_context_cache_target(
+               &memory, &deepseek_tier, 4387, 8192) == 4129);
+    assert(ds4_ssd_deepseek_long_context_cache_target(
+               &memory, &deepseek_tier, 2839, 32768) == 2839);
+    assert(ds4_ssd_deepseek_long_context_cache_target(
+               &memory, &deepseek_tier, 4387, 65535) == 4129);
+    assert(ds4_ssd_deepseek_long_context_cache_target(
+               &memory, &deepseek_tier, 4387, 65536) == 2065);
+    assert(ds4_ssd_deepseek_long_context_cache_target(
+               &memory, &deepseek_tier, 4387, 100000) == 2065);
+    deepseek_tier.cache_experts = 2065;
+    assert(ds4_ssd_deepseek_long_context_cache_target(
+               &memory, &deepseek_tier, 4387, 32768) == 2065);
+    deepseek_tier.cache_experts = adaptive.cache_experts;
+    memory.physical_bytes = 95 * GIB;
+    assert(ds4_ssd_deepseek_long_context_cache_target(
+               &memory, &deepseek_tier, 4387, 32768) == 4129);
+    memory.physical_bytes = 96 * GIB;
+    assert(ds4_ssd_deepseek_long_context_cache_target(
+               &memory, &deepseek_tier, 4387, 32768) == 0);
+    memory.physical_bytes = 63 * GIB;
+    assert(ds4_ssd_deepseek_long_context_cache_target(
+               &memory, &deepseek_tier, 4387, 32768) == 0);
+    memory.physical_bytes = 64 * GIB;
+    deepseek_tier.floor.working_set_experts = UINT64_MAX / 16u + 1u;
+    assert(ds4_ssd_deepseek_long_context_cache_target(
+               &memory, &deepseek_tier, UINT32_MAX, 8192) == 0);
+    assert(ds4_ssd_deepseek_long_context_cache_target(
+               NULL, &deepseek_tier, 4387, 8192) == 0);
+    assert(ds4_ssd_deepseek_long_context_cache_target(
+               &memory, NULL, 4387, 8192) == 0);
+
+    /* Resume decisions use the work size for the batching floor and the total
+     * resulting context for the post-prefill cap. */
+    assert(ds4_ssd_deepseek_prefill_phase_cache_target(
+               8192, 8192, 760, 259, 4129, 2065) == 259);
+    assert(ds4_ssd_deepseek_prefill_phase_cache_target(
+               2048, 9000, 760, 259, 4129, 2065) == 259);
+    assert(ds4_ssd_deepseek_prefill_phase_cache_target(
+               4096, 8192, 760, 259, 4129, 2065) == 259);
+    assert(ds4_ssd_deepseek_prefill_phase_cache_target(
+               292, 8192, 760, 259, 4129, 2065) == 4129);
+    assert(ds4_ssd_deepseek_prefill_phase_cache_target(
+               292, 65536, 760, 259, 4129, 2065) == 2065);
+    assert(ds4_ssd_deepseek_prefill_phase_cache_target(
+               128, 128, 760, 259, 4129, 2065) == 0);
+    assert(ds4_ssd_deepseek_prefill_phase_cache_target(
+               32, 32, 0, 259, 4129, 2065) == 259);
+    assert(ds4_ssd_deepseek_prefill_phase_cache_target(
+               31, 8192, 0, 259, 4129, 2065) == 4129);
+    assert(ds4_ssd_deepseek_post_prefill_cache_target(
+               8191, 4129, 2065, 4387) == 4387);
+    assert(ds4_ssd_deepseek_post_prefill_cache_target(
+               8192, 4129, 2065, 4387) == 4129);
+    assert(ds4_ssd_deepseek_post_prefill_cache_target(
+               65536, 4129, 2065, 4387) == 2065);
+    assert(ds4_ssd_deepseek_post_prefill_cache_target(
+               32768, 0, 0, 4387) == 4387);
+    assert(ds4_ssd_deepseek_post_prefill_seed_allowed(
+               true, true, true, 2065, 2065));
+    assert(ds4_ssd_deepseek_post_prefill_seed_allowed(
+               true, true, true, 2065, 4129));
+    assert(!ds4_ssd_deepseek_post_prefill_seed_allowed(
+               true, false, true, 259, 259));
+    assert(!ds4_ssd_deepseek_post_prefill_seed_allowed(
+               false, true, true, 2065, 2065));
+    assert(!ds4_ssd_deepseek_post_prefill_seed_allowed(
+               true, true, false, 2065, 2065));
+    assert(!ds4_ssd_deepseek_post_prefill_seed_allowed(
+               true, true, true, 2065, 259));
+    assert(!ds4_ssd_deepseek_post_prefill_seed_allowed(
+               true, true, true, 0, 2065));
+
     /* The buffer-reuse optimization introduced with GLM must never spill
      * into DeepSeek merely because its record is below the byte threshold. */
     assert(ds4_ssd_glm_streaming_batch_reuse_allowed(true,

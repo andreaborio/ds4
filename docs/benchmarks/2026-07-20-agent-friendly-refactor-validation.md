@@ -2,6 +2,13 @@
 
 Date: 2026-07-20
 
+Status: historical pre-policy correctness and artifact baseline. This is not a
+current performance-acceptance matrix.
+
+Decision: retain its artifact identities and refactor verification. Current
+performance interpretation is superseded by
+`2026-07-20-long-context-metal-stack.md`.
+
 Branch: `codex/agent-friendly-refactor`
 
 Base: `d8d673858f90834522bbe878951a534d8c6508b4`
@@ -69,8 +76,9 @@ DS4_M5_MODEL="$DEEPSEEK_V2" DS4_M5_PREFIX="$DEEPSEEK_PREFIX" \
 | DeepSeek AUTO, immediate warm repeat | **23.78 t/s** | **13.95 t/s** | Same artifact, policy, evidence and binary; page-ins fell from 5,168,057 to 4,407,429 pages; zero swapout | Pass: above the earlier current/base/current cohort and -1.69% from the isolated 14.19 single-run peak |
 | GLM AUTO, exact 288+32 lane | **11.89 t/s** | **1.84 t/s** | Exact output SHA-256 `2803fda8b47acff3aedd24bd7609b0c649602ca1fa6d908368b57fe2a586a5c2`; 601-record / 6.93 GiB cache; 50.38 GiB reclaimable; swap unchanged | Pass: decode is above the 1.82 reference |
 
-The final candidate therefore preserves byte-identical evidence for all three
-families and requalifies every tracked performance lane. DeepSeek's 14.19 t/s
+The candidate preserved byte-identical evidence for all three families and
+requalified the short lanes tracked at that time. It predates the mandatory
+short/medium/large/long matrix and is not current release sign-off. DeepSeek's 14.19 t/s
 value remains a single best observation rather than a same-condition median;
 the final 13.95 t/s result is compared primarily with the interleaved cohort
 below.
@@ -156,10 +164,10 @@ published lanes; DeepSeek's warm result is within 2% of its isolated peak and
 above the prior same-condition interleaved cohort, with exact logits and zero
 swapout.
 
-This report removes the previous performance blocker to merge and records clean
-non-`dirty` artifact hashes. It does not by itself authorize publication: the
-remaining manual release checks named above must still pass before binaries or
-model cards are published.
+At the time, this report removed the previous short-lane performance blocker
+and recorded clean non-`dirty` artifact hashes. The later long-context policy
+supersedes that merge decision; current evidence and remaining gates are in
+`2026-07-20-long-context-metal-stack.md`.
 
 Related evidence:
 

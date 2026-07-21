@@ -1066,6 +1066,14 @@ static bool glm_graph_warm_compact_indexer_store(
     if (!g->indexer_k) return false;
     if (warm_pos >= g->compact_cache_cap) warm_pos = g->compact_cache_cap - 1u;
 
+    if (g->ssd_streaming) {
+        g->streaming_static_decode_map_current = false;
+        if (!metal_graph_stream_map_glm_indexer_norms(
+                model, weights, g->layer_start, g->layer_end)) {
+            return false;
+        }
+    }
+
     if (ds4_gpu_tensor_fill_f32(g->indexer_k,
                                 0.0f,
                                 DS4_N_INDEXER_HEAD_DIM) == 0) {

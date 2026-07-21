@@ -68,6 +68,40 @@ network routes in this checklist.
   `./ds4_test --server`.
 - Run `./ds4-eval --self-test-extractors`.
 
+## Performance Promotion Gate
+
+Apply the complete performance acceptance matrix in
+[`CONTRIBUTING.md`](CONTRIBUTING.md#performance-acceptance-matrix) to every
+release change intended to alter inference speed. Short-context results are
+smoke evidence only: they may reject a candidate for correctness, safety, or a
+clear regression, but they cannot promote it or generalize a speed claim. A
+release performance claim is blocked until the affected qualified models and
+modes have retained isolated 128-token short, 2,048-token medium, 8,192-token
+large, and mandatory 32,768-token long-context arms, including exact decode
+evidence, TPOT p50/p95, memory pressure, zero new swapout, and at least 128
+greedy decode tokens per frontier. Attention, KV, cache, RoPE, allocation, and
+context-scaling changes also require isolated 65,536- and 100,000-token arms.
+
+- Use interleaved A/B/B/A comparisons and keep cold and warm cohorts separate.
+  Use identical discarded warm-ups for retained warm cohorts. An abort, new
+  swapout, changed resolved plan, or competing inference process invalidates the
+  entire cohort; restart from its first arm after recovery or correction.
+- Bind every arm to its executable, repository/diff, Metal runtime source, and
+  GGUF hashes. A copied binary beside another checkout's `metal/*.metal` files
+  is not the same benchmark artifact.
+- Report tiers independently; do not use a cross-context average to hide a
+  regression. The measured effect must exceed control drift, within-arm spread,
+  and known measurement noise. If adaptivity selects different paths, invalidate
+  the cohort and qualify each resolved hardware/context lane separately.
+- For a stack of optimizations, retain both the incremental evidence and a final
+  original-baseline versus complete-stack comparison. Only the measured stack,
+  not the sum of isolated percentage gains, is a release result.
+- A shared Metal graph, prefill, decode, cache, or tensor change requires the
+  qualified DeepSeek, GLM, and Qwen short/medium/large/long matrices before
+  merge.
+- Record accepted and informative rejected results in a dated file under
+  `docs/benchmarks/`; remove rejected implementation and experimental residue.
+
 ## 3. Metal Flash Path
 
 Use the qualified DeepSeek Flash ExpertMajor v2 GGUF that users run. Set
@@ -86,7 +120,9 @@ Use the qualified DeepSeek Flash ExpertMajor v2 GGUF that users run. Set
 - Speed sanity:
   run `ds4-bench -m "$DEEPSEEK_V2"` with
   `speed-bench/promessi_sposi.txt` and compare prefill, generation speed, and KV
-  bytes with the last known good numbers for the same machine.
+  bytes with the last known good numbers for the same machine. This run must
+  include the mandatory long-context frontier from the performance promotion
+  gate; a short prompt does not sign off the lane.
 
 ## 4. Metal PRO Path
 

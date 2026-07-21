@@ -1,6 +1,14 @@
-# GLM 5.2 ExpertMajor v2 release qualification
+# GLM 5.2 ExpertMajor v2 research baseline
 
 Date: 2026-07-20
+
+Status: historical pre-policy GLM optimization record. Its artifact provenance
+and rejected experiments remain current; its short prompt is not the current
+release-performance gate.
+
+Decision: retain the 601-record policy and rejected-arm evidence. The current
+4K/8K/32K compact-indexer transition and performance acceptance are superseded
+by `2026-07-20-long-context-metal-stack.md`.
 
 Host: Apple M5 Pro, 64 GiB unified memory
 

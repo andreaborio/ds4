@@ -92,6 +92,15 @@ Choose tests by realistic impact using `CONTRIBUTING.md`; use the complete
 session, ExpertMajor, SSD, tokenizer, Metal graph, prefill, or decode code must
 rerun the qualified DeepSeek, GLM, and Qwen models before merge.
 
+A short-context run may reject an inference optimization for correctness,
+safety, or a clear regression, but it may never promote the change or
+generalize a speed claim. Apply the canonical short/medium/large/long matrix in
+`CONTRIBUTING.md`, keep its frontiers separate, and require the 32K long-context
+lane for every surviving promotion candidate. Include the final
+baseline-versus-combined-stack comparison in the durable benchmark record; an
+abort, swapout, changed resolved plan, or competing inference process
+invalidates the complete comparison cohort.
+
 Every merge candidate needs a review of the full diff from its merge base. The
 reviewer should be independent of the implementer when practical and must look
 for correctness/performance regressions, unsupported compatibility, unused

@@ -100,7 +100,7 @@ not validated.
 | `tests/test-vectors/` | Official and local continuation vectors plus provenance |
 | `gguf-tools/` | Quantization, ExpertMajor conversion, imatrix, and quality-scoring tools |
 | `speed-bench/` | Benchmark prompt, driver helpers, plots, and historical results |
-| `docs/benchmarks/` | Dated, reproducible benchmark decisions and measurements |
+| [`docs/benchmarks/`](../benchmarks/README.md) | Indexed dated benchmark decisions and measurements |
 
 Tests must link production objects through public or narrow internal APIs. Tests
 that include a complete production `.c` file are known coupling debt and must

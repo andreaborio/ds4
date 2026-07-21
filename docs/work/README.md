@@ -28,7 +28,13 @@ promote durable facts to their canonical destination and delete the handoff.
   of appending a diary.
 - Label statements as verified fact, inference, failed attempt, or pending work.
 - Record exact commits, model hashes, commands, host/backend, cache/page state,
-  thermals when relevant, output identity, and result paths.
+  thermals when relevant, output identity, and result paths. Performance work
+  also records which canonical short/medium/large/long tiers are complete,
+  whether a cohort is cold or warm, and every invalidation or restart. It may
+  reject a candidate early for correctness, safety, or a clear regression, but
+  may not mark a promotion decision complete while the 32K long-context tier is
+  pending. Record the additional 64K/100K tiers when the changed path touches
+  attention, KV, cache, RoPE, allocation, or context scaling.
 - Record failed experiments only when the conclusion prevents useful repetition:
   hypothesis, controlled comparison, result, and rejection reason.
 - Update canonical documentation in the same tranche as the code it describes.

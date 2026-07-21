@@ -6227,6 +6227,42 @@ static bool model_map_span_vec_finish(ds4_model_map_span_vec *spans) {
     return spans->len != 0;
 }
 
+/* The compact-indexer frontier warmup runs once after full-attention prefill.
+ * SSD streaming normally maps one layer at a time, so the final layer mapping
+ * cannot cover the normalization pair for every indexer layer touched by the
+ * batched warmup command. Build the exact, tiny cross-layer set explicitly. */
+#ifndef DS4_NO_GPU
+static bool weights_model_map_glm_indexer_norm_spans(
+        const ds4_weights       *weights,
+        uint32_t                 layer_start,
+        uint32_t                 layer_end,
+        ds4_model_map_span_vec  *spans) {
+    if (!weights || !spans ||
+        DS4_MODEL_FAMILY != DS4_MODEL_FAMILY_GLM_DSA ||
+        layer_start >= DS4_N_LAYER ||
+        layer_end >= DS4_N_LAYER ||
+        layer_end < layer_start) {
+        return false;
+    }
+
+    memset(spans, 0, sizeof(*spans));
+    for (uint32_t il = layer_start; il <= layer_end; il++) {
+        if (!glm_dsa_layer_has_indexer(il)) continue;
+        const ds4_layer_weights *layer = &weights->layer[il];
+        if (!layer->indexer_k_norm || !layer->indexer_k_norm_b) goto fail;
+        model_map_span_vec_include_one(spans, layer->indexer_k_norm);
+        model_map_span_vec_include_one(spans, layer->indexer_k_norm_b);
+    }
+    if (!model_map_span_vec_finish(spans)) goto fail;
+    return true;
+
+fail:
+    free(spans->v);
+    memset(spans, 0, sizeof(*spans));
+    return false;
+}
+#endif
+
 static DS4_MAYBE_UNUSED bool weights_model_map_spans(
         const ds4_weights *w,
         uint32_t layer_start,
@@ -29416,6 +29452,8 @@ struct ds4_engine {
     uint64_t startup_model_span_bytes;
     uint32_t ssd_streaming_preload_experts;
     uint32_t deepseek_prefill_cache_experts;
+    uint32_t deepseek_long_context_cache_experts;
+    uint32_t deepseek_extended_context_cache_experts;
     uint32_t deepseek_decode_cache_experts;
     bool non_routed_weights_pinned;
     ds4_ssd_memory_lock simulated_memory;
@@ -32941,6 +32979,24 @@ static int generate_raw_swa_cpu(
 }
 
 #ifndef DS4_NO_GPU
+static bool metal_graph_stream_map_glm_indexer_norms(
+        const ds4_model   *model,
+        const ds4_weights *weights,
+        uint32_t           layer_start,
+        uint32_t           layer_end) {
+    ds4_model_map_span_vec spans;
+    if (!weights_model_map_glm_indexer_norm_spans(
+            weights, layer_start, layer_end, &spans)) {
+        fprintf(stderr,
+                "ds4: Metal SSD streaming could not build GLM compact indexer norm spans\n");
+        return false;
+    }
+    const bool ok = metal_graph_install_model_spans(
+        model, &spans, "GLM compact indexer norms");
+    free(spans.v);
+    return ok;
+}
+
 #include "runtime/ds4_glm_graph.inc"
 
 /* Metal generation entry point.  The model runs as one local whole-graph
@@ -37819,15 +37875,17 @@ static bool ds4_engine_configure_streaming_auto_cache(ds4_engine *e) {
                 plan.floor.minimum_cache_experts);
         return false;
     }
-
     uint32_t cache_experts = plan.cache_experts;
     const bool glm_expert_major =
         e->model.family == DS4_MODEL_FAMILY_GLM_DSA &&
         e->model.native_expert_store_v2;
-    const bool deepseek_expert_major =
-        e->model.family == DS4_MODEL_FAMILY_DEEPSEEK4 && DS4_MODEL_VARIANT == DS4_VARIANT_FLASH &&
-        e->model.native_expert_store_v2;
-    const char *cache_policy_family = glm_expert_major ? "GLM" : (deepseek_expert_major ? "DeepSeek" : NULL);
+    const bool deepseek_expert_major = e->model.family == DS4_MODEL_FAMILY_DEEPSEEK4 &&
+        DS4_MODEL_VARIANT == DS4_VARIANT_FLASH && e->model.native_expert_store_v2;
+    const bool deepseek_m5_expert_major =
+        deepseek_expert_major && ds4_gpu_is_m5_family();
+    const char *cache_policy_family =
+        glm_expert_major ? "GLM" :
+        (deepseek_m5_expert_major ? "DeepSeek" : NULL);
     if (cache_policy_family) {
         cache_experts = glm_expert_major ?
             ds4_ssd_glm_expert_major_auto_cache_target(&memory, &plan) :
@@ -37840,13 +37898,21 @@ static bool ds4_engine_configure_streaming_auto_cache(ds4_engine *e) {
     e->ssd_streaming_cache_experts = cache_experts;
     e->ssd_streaming_cache_bytes =
         (uint64_t)cache_experts * geometry.per_expert_bytes;
-    if (deepseek_expert_major &&
+    if (deepseek_m5_expert_major &&
         plan.floor.minimum_cache_experts <= UINT32_MAX) {
         /* Grouped native prefill reads one physical expert-major layer and
          * does not consult the per-expert decode cache. Keep only the
-         * correctness floor during that phase, then grow lazily for decode. */
+         * correctness floor during that phase. Long contexts then grow to a
+         * bounded target and install the hot seed once, immediately before
+         * decode; short contexts retain the larger measured decode target. */
         e->deepseek_prefill_cache_experts =
             (uint32_t)plan.floor.minimum_cache_experts;
+        e->deepseek_long_context_cache_experts =
+            ds4_ssd_deepseek_long_context_cache_target(
+                &memory, &plan, cache_experts, 8192u);
+        e->deepseek_extended_context_cache_experts =
+            ds4_ssd_deepseek_long_context_cache_target(&memory, &plan,
+                                                        cache_experts, 65536u);
         e->deepseek_decode_cache_experts = cache_experts;
     }
     fprintf(stderr,
@@ -37909,9 +37975,13 @@ static bool ds4_engine_configure_streaming_auto_cache(ds4_engine *e) {
     }
     if (e->deepseek_prefill_cache_experts != 0) {
         fprintf(stderr,
-                "ds4:   native long-prefill cache phase: %u experts, "
-                "decode target: %u experts\n",
+                "ds4:   native prefill cache phase: %u experts, "
+                "long-context post-prefill target: %u experts, "
+                "65K+ target: %u experts, "
+                "short-context decode target: %u experts\n",
                 e->deepseek_prefill_cache_experts,
+                e->deepseek_long_context_cache_experts,
+                e->deepseek_extended_context_cache_experts,
                 e->deepseek_decode_cache_experts);
     }
     if (plan.low_ram_floor_ceiling_active) {
@@ -42169,7 +42239,8 @@ int ds4_session_sync(ds4_session *s, const ds4_tokens *prompt, char *err, size_t
                 .user_ud = s->progress_ud,
             };
             if (ds4_session_deepseek_prepare_prefill_cache(
-                    s, (uint32_t)suffix, &phase_changed,
+                    s, (uint32_t)suffix, (uint32_t)prompt->len,
+                    &phase_changed,
                     err, errlen) != 0) {
                 return 1;
             }
@@ -42190,7 +42261,9 @@ int ds4_session_sync(ds4_session *s, const ds4_tokens *prompt, char *err, size_t
                                                         s,
                                                         &cancelled);
             if (ds4_session_deepseek_finish_prefill_cache(
-                    s, phase_changed, err, errlen) != 0) {
+                    s, (uint32_t)prompt->len, phase_changed,
+                    ok && !cancelled,
+                    err, errlen) != 0) {
                 s->checkpoint_valid = false;
                 return 1;
             }
@@ -42209,13 +42282,17 @@ int ds4_session_sync(ds4_session *s, const ds4_tokens *prompt, char *err, size_t
             s->checkpoint_valid = true;
             return 0;
         }
-
         for (int i = s->checkpoint.len; i < prompt->len; i++) {
             if (ds4_session_cancelled(s)) {
                 snprintf(err, errlen, "interrupted");
                 s->checkpoint_valid = true;
                 s->mtp_draft_valid = false;
                 return DS4_SESSION_SYNC_INTERRUPTED;
+            }
+            if (ds4_session_deepseek_apply_context_cache_tier(
+                    s, (uint32_t)s->checkpoint.len + 1u, err, errlen) != 0) {
+                s->checkpoint_valid = false;
+                return 1;
             }
             if (!metal_graph_eval_token_raw_swa(&s->graph, &e->model, &e->weights,
                                                 (uint32_t)prompt->v[i],
@@ -42241,7 +42318,8 @@ int ds4_session_sync(ds4_session *s, const ds4_tokens *prompt, char *err, size_t
     }
     bool phase_changed = false;
     if (ds4_session_deepseek_prepare_prefill_cache(
-            s, (uint32_t)prompt->len, &phase_changed,
+            s, (uint32_t)prompt->len, (uint32_t)prompt->len,
+            &phase_changed,
             err, errlen) != 0) {
         return 1;
     }
@@ -42264,7 +42342,9 @@ int ds4_session_sync(ds4_session *s, const ds4_tokens *prompt, char *err, size_t
             s->checkpoint_valid = s->checkpoint.len > 0;
             s->mtp_draft_valid = false;
             if (ds4_session_deepseek_finish_prefill_cache(
-                    s, phase_changed, err, errlen) != 0) {
+                    s, (uint32_t)prompt->len, phase_changed,
+                    false,
+                    err, errlen) != 0) {
                 s->checkpoint_valid = false;
                 return 1;
             }
@@ -42282,7 +42362,9 @@ int ds4_session_sync(ds4_session *s, const ds4_tokens *prompt, char *err, size_t
         if (cancelled) {
             snprintf(err, errlen, "interrupted");
             if (ds4_session_deepseek_finish_prefill_cache(
-                    s, phase_changed, err, errlen) != 0) {
+                    s, (uint32_t)prompt->len, phase_changed,
+                    false,
+                    err, errlen) != 0) {
                 s->checkpoint_valid = false;
                 return 1;
             }
@@ -42300,7 +42382,9 @@ int ds4_session_sync(ds4_session *s, const ds4_tokens *prompt, char *err, size_t
         if (cancelled) {
             snprintf(err, errlen, "interrupted");
             if (ds4_session_deepseek_finish_prefill_cache(
-                    s, phase_changed, err, errlen) != 0) {
+                    s, (uint32_t)prompt->len, phase_changed,
+                    false,
+                    err, errlen) != 0) {
                 s->checkpoint_valid = false;
                 return 1;
             }
@@ -42308,7 +42392,9 @@ int ds4_session_sync(ds4_session *s, const ds4_tokens *prompt, char *err, size_t
         }
     }
     if (ds4_session_deepseek_finish_prefill_cache(
-            s, phase_changed, err, errlen) != 0) {
+            s, (uint32_t)prompt->len, phase_changed,
+            ok,
+            err, errlen) != 0) {
         s->checkpoint_valid = false;
         return 1;
     }
@@ -42940,6 +43026,11 @@ static int ds4_session_eval_internal(ds4_session *s, int token, bool probe_mtp,
         }
         s->mtp_draft_valid = false;
     }
+    if (ds4_session_deepseek_apply_context_cache_tier(
+            s, (uint32_t)s->checkpoint.len + 1u, err, errlen) != 0) {
+        s->checkpoint_valid = false;
+        return 1;
+    }
     if (!metal_graph_eval_token_raw_swa(&s->graph, &e->model, &e->weights,
                                         (uint32_t)token,
                                         (uint32_t)s->checkpoint.len,
@@ -43023,7 +43114,6 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
     return -1;
 #else
     ds4_engine *e = s->engine;
-
     /*
      * MTP in DeepSeek V4 is a speculative drafter, not a replacement sampler.
      * The target model still defines the exact output stream.  A cycle starts
@@ -43036,7 +43126,6 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
     int n_accept = 0;
     accepted[n_accept++] = first_token;
     if (first_token == eos_token || max_tokens == 1 || n_accept >= accepted_cap) return n_accept;
-
     if (!e->mtp_ready || !s->mtp_draft_valid || e->mtp_draft_tokens <= 1) return n_accept;
 
     int draft_cap = e->mtp_draft_tokens;
@@ -43045,6 +43134,18 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
     int room = s->ctx_size - s->checkpoint.len;
     if (draft_cap > room - 1) draft_cap = room - 1;
     if (draft_cap <= 0) return n_accept;
+    char tier_err[192] = {0};
+    if (ds4_session_deepseek_apply_context_cache_tier(s,
+            (uint32_t)s->checkpoint.len + (uint32_t)draft_cap,
+            tier_err, sizeof(tier_err)) != 0) {
+        if (getenv("DS4_METAL_MEMORY_REPORT") != NULL) {
+            fprintf(stderr,
+                    "ds4: DeepSeek speculative decode stopped before cache "
+                    "tier transition: %s\n",
+                    tier_err[0] ? tier_err : "unknown error");
+        }
+        return n_accept;
+    }
 
     int drafts[16];
     int draft_n = 1;

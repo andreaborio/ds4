@@ -201,6 +201,37 @@ uint32_t ds4_ssd_glm_expert_major_auto_cache_target(
 uint32_t ds4_ssd_deepseek_expert_major_auto_cache_target(
         const ds4_ssd_host_memory         *memory,
         const ds4_ssd_adaptive_cache_plan *plan);
+/* Long prompts need a resident hot set before decode starts. On the measured
+ * 64 GiB tier, retain sixteen complete route cycles through 32K and eight at
+ * 65K+ instead of restoring an empty decode cache. The generic pressure plan
+ * remains the ceiling. Returning zero means that no measured override applies. */
+uint32_t ds4_ssd_deepseek_long_context_cache_target(
+        const ds4_ssd_host_memory         *memory,
+        const ds4_ssd_adaptive_cache_plan *plan,
+        uint32_t                           decode_target,
+        uint32_t                           n_tokens);
+/* Pure transition policy used by cold and resumed sessions. The work size
+ * selects the prefill schedule; the resulting total context selects the
+ * bounded long-context decode tier. A zero prefill target means no transition
+ * is required before evaluating the supplied work. */
+uint32_t ds4_ssd_deepseek_prefill_phase_cache_target(
+        uint32_t prefill_tokens,
+        uint32_t resulting_context_tokens,
+        uint32_t batched_prefill_max_tokens,
+        uint32_t prefill_target,
+        uint32_t long_context_target,
+        uint32_t extended_context_target);
+uint32_t ds4_ssd_deepseek_post_prefill_cache_target(
+        uint32_t resulting_context_tokens,
+        uint32_t long_context_target,
+        uint32_t extended_context_target,
+        uint32_t decode_target);
+bool ds4_ssd_deepseek_post_prefill_seed_allowed(
+        bool     prefill_succeeded,
+        bool     pressure_allows_seed,
+        bool     cache_changed,
+        uint32_t target,
+        uint32_t cache_after);
 /* Batched victim-buffer reuse is a GLM scheduling policy. Keeping the family
  * gate in this pure helper prevents another shared-backend optimization from
  * silently changing DeepSeek decode. */

@@ -2,17 +2,33 @@
 
 Here we collect prefill and generation speed obtained with different hardware.
 
-Run `ds4-bench` as:
+The canonical acceptance method is the
+[`CONTRIBUTING.md` performance matrix](../CONTRIBUTING.md#performance-acceptance-matrix).
+Run each retained frontier in a separate process. For example:
 
 ```
-./ds4-bench \
-  -m ds4flash.gguf \
-  --prompt-file speed-bench/promessi_sposi.txt \
-  --ctx-start 2048 \
-  --ctx-max 65536 \
-  --step-incr 2048 \
-  --gen-tokens 128
+for frontier in 128 2048 8192 32768; do
+  ./ds4-bench \
+    -m /absolute/path/to/QUALIFIED-DS4-ExpertMajor-v2.gguf \
+    --prompt-file speed-bench/promessi_sposi.txt \
+    --ctx-start "$frontier" --ctx-max "$frontier" \
+    --ctx-alloc 65536 --gen-tokens 128 \
+    --csv "/tmp/ds4-$frontier.csv" \
+    --dump-decode-evidence-dir "/tmp/ds4-$frontier-evidence"
+done
 ```
+
+Multi-frontier sweeps are useful for exploratory curves, but their later rows
+process incremental suffixes and inherit session/cache state. They are not the
+final short/medium/large/long acceptance comparison. Changes to attention, KV,
+cache, RoPE, allocation, or context scaling also require the isolated 65,536-
+and 100,000-token lanes defined in `CONTRIBUTING.md`.
+
+On the qualified M5 lane, `run_m5_dsflash_arm.sh` extends an undersized prompt
+deterministically for frontiers above 32,768 tokens. The generated prompt, its
+source, both SHA-256 values, and whether extension occurred are recorded beside
+the run. `ds4-bench` still verifies the actual model-specific token count and
+fails closed if the prompt is too short.
 
 Provide PR including your numbers if your hardware was not already tested.
 Call the benchmark csv file something like `m3_max.csv` or alike, so that

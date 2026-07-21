@@ -257,20 +257,24 @@ are historical and do not extend the v2 support contract.
 
 ## Measured results
 
-Best retained local results so far. These rows are not cross-model rankings:
-each model uses a different artifact, context, and runtime path.
+The current table uses the mandatory 32K long-context lane rather than mixing
+short-context bests. These rows are not cross-model rankings: every model uses
+a different artifact and runtime path.
 
-| Model | Best measured setup | Prefill | Generation / decode | Status |
+| Model | M5 Pro 64 GB setup | 32K prefill | 32K generation / decode | Status |
 | --- | --- | ---: | ---: | --- |
-| Qwen3.6-35B-A3B ExpertMajor v2 Q4_K_S, 20.81 GB | M5 Pro 64 GB, Metal resident, 2K+16 | **318.96 t/s** | **29.54 t/s** | v2/v1/v2 A/B; both v2 arms byte-identical to the control, no new swapout |
-| DeepSeek V4 Flash IQ2XXS, 86.72 GB | M5 Pro 64 GB, Metal SSD streaming, AUTO 4,387 records | **25.21 t/s** | **14.19 t/s** | Final post-isolation AUTO gate; exact frontier logits, zero swapout |
-| GLM 5.2 ExpertMajor v2 Q2_K, 244.14 GiB | M5 Pro 64 GB, rested internal storage, 288+32 tokens | **11.08 t/s** | **1.90 t/s** | Prior qualified median; current main port restores same-condition parity, final simple AUTO-601 gates measured 10.63-10.91/1.77-1.79 t/s, and the best profiled decode was 1.81 t/s |
+| Qwen3.6-35B-A3B ExpertMajor v2 Q4_K_S, 20.81 GB | Metal resident, paired Q8 candidate, warm A/B/B/A | **60.55 t/s** candidate mean | **3.01 t/s**, 334.230 ms mean p95 | Exact evidence; throughput neutral, p95 -0.92% against baseline |
+| DeepSeek V4 Flash IQ2XXS, 86.72 GB | Metal SSD, phase-adaptive 259→4,129 through 32K | **137.04 t/s** | **7.46 t/s**, 102.211 ms p50 | Exact evidence, zero swap; safety/correctness decision, not a standalone A/B percentage |
+| GLM 5.2 ExpertMajor v2 Q2_K, 244.14 GiB | Metal AUTO→SSD, 601 records, fixed compact-indexer transition | **36.19 t/s** | **1.62 t/s** overall; about **1.79 t/s** at p50 | 32K+128 complete, zero swap; baseline crashes before logits |
 
-The clean agent-friendly refactor candidate requalified GLM at 11.89 t/s
-prefill and 1.84 t/s decode after `make premerge`, with byte-identical output
-and unchanged swap. Earlier 1.67-1.77 t/s observations remain in the validation
-record as host/file-cache history rather than release blockers; see the
-[`2026-07-20 validation record`](docs/benchmarks/2026-07-20-agent-friendly-refactor-validation.md).
+Full identities, invalidations, control drift and remaining release gates are
+in the
+[`long-context Metal stack record`](docs/benchmarks/2026-07-20-long-context-metal-stack.md).
+DeepSeek also completes isolated 65K+128 and 100K+128 AUTO→SSD lanes with the
+2,065-expert extended-context tier at 141.61/5.72 and 126.72/5.58 prefill/decode
+t/s respectively, with zero swapout.
+Earlier short-context bests remain historical evidence in the dated records;
+they are not substituted for the long-context promotion gate.
 
 Historical upstream DeepSeek hardware reference bests from the standard
 `speed-bench` sweep follow. They are context for comparison, not a statement
@@ -283,14 +287,11 @@ that this v2-only fork runtime supports those non-Metal hosts:
 | Mac Studio M3 Ultra, 512 GB | PRO q2, 32,768-token context | 138.82 t/s | 9.56 t/s |
 | DGX Spark GB10, 128 GB | Flash q2, 7,047-token context | 343.81 t/s | 13.75 t/s |
 
-Full commands, samples, and caveats are in
-[`docs/benchmarks/2026-07-20-agent-friendly-refactor-validation.md`](docs/benchmarks/2026-07-20-agent-friendly-refactor-validation.md),
-[`docs/benchmarks/2026-07-20-qwen-expert-major-v2.md`](docs/benchmarks/2026-07-20-qwen-expert-major-v2.md),
-[`docs/benchmarks/2026-07-17-deepseek-native-expert-major.md`](docs/benchmarks/2026-07-17-deepseek-native-expert-major.md),
-[`docs/benchmarks/2026-07-15-qwen-ds4-vs-llamacpp.md`](docs/benchmarks/2026-07-15-qwen-ds4-vs-llamacpp.md),
-[`docs/benchmarks/2026-07-20-glm52-expert-major-v2.md`](docs/benchmarks/2026-07-20-glm52-expert-major-v2.md),
-[`docs/benchmarks/2026-07-14-m5-pro.md`](docs/benchmarks/2026-07-14-m5-pro.md),
-[`SSD_STREAMING_VERIFICATION.md`](SSD_STREAMING_VERIFICATION.md), and
+The [`benchmark evidence index`](docs/benchmarks/README.md) classifies current,
+historical, and rejected records. Full commands and caveats live in those dated
+records; the latest pre-policy cross-model correctness/artifact baseline is the
+[`2026-07-20 validation record`](docs/benchmarks/2026-07-20-agent-friendly-refactor-validation.md).
+See also [`SSD_STREAMING_VERIFICATION.md`](SSD_STREAMING_VERIFICATION.md) and
 [`docs/ENGINE_REFERENCE.md`](docs/ENGINE_REFERENCE.md).
 
 ## Memory safety is part of performance

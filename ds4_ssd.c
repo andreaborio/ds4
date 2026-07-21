@@ -709,6 +709,81 @@ uint32_t ds4_ssd_deepseek_expert_major_auto_cache_target(
         plan->cache_experts : (uint32_t)measured_target;
 }
 
+uint32_t ds4_ssd_deepseek_long_context_cache_target(
+        const ds4_ssd_host_memory         *memory,
+        const ds4_ssd_adaptive_cache_plan *plan,
+        uint32_t                           decode_target,
+        uint32_t                           n_tokens) {
+    if (!memory || !plan || decode_target == 0 ||
+        plan->floor.working_set_experts == 0 || n_tokens < 8192u) {
+        return 0;
+    }
+
+    const bool measured_64g_tier =
+        memory->physical_bytes >= 64u * DS4_GIB &&
+        memory->physical_bytes < 96u * DS4_GIB;
+    if (!measured_64g_tier) return 0;
+
+    /* Sixteen complete route cycles preserve the measured 8K/32K decode win.
+     * At 65K, growing back to that tier after prefill caused swap before the
+     * first decode token. Keep eight cycles for extended contexts; the generic
+     * adaptive target remains the hard ceiling in both lanes. */
+    const uint64_t retained_cycles = n_tokens >= 65536u ? 8u : 16u;
+    if (plan->floor.working_set_experts >
+        (UINT64_MAX - 1u) / retained_cycles) {
+        return 0;
+    }
+    const uint64_t measured_target =
+        1u + retained_cycles * plan->floor.working_set_experts;
+    if (measured_target > UINT32_MAX) return 0;
+    uint64_t target = measured_target;
+    if (target > decode_target) target = decode_target;
+    if (target > plan->cache_experts) target = plan->cache_experts;
+    return target == 0 || target > UINT32_MAX ? 0 : (uint32_t)target;
+}
+
+uint32_t ds4_ssd_deepseek_prefill_phase_cache_target(
+        uint32_t prefill_tokens,
+        uint32_t resulting_context_tokens,
+        uint32_t batched_prefill_max_tokens,
+        uint32_t prefill_target,
+        uint32_t long_context_target,
+        uint32_t extended_context_target) {
+    if (prefill_tokens == 0 || prefill_target == 0) return 0;
+    const bool batched_prefill = batched_prefill_max_tokens == 0 ?
+        prefill_tokens >= 32u : prefill_tokens > batched_prefill_max_tokens;
+    if (batched_prefill) return prefill_target;
+    if (resulting_context_tokens >= 65536u &&
+        extended_context_target != 0) {
+        return extended_context_target;
+    }
+    return resulting_context_tokens >= 8192u ? long_context_target : 0u;
+}
+
+uint32_t ds4_ssd_deepseek_post_prefill_cache_target(
+        uint32_t resulting_context_tokens,
+        uint32_t long_context_target,
+        uint32_t extended_context_target,
+        uint32_t decode_target) {
+    if (decode_target == 0) return 0;
+    if (resulting_context_tokens >= 65536u &&
+        extended_context_target != 0) {
+        return extended_context_target;
+    }
+    return resulting_context_tokens >= 8192u && long_context_target != 0 ?
+        long_context_target : decode_target;
+}
+
+bool ds4_ssd_deepseek_post_prefill_seed_allowed(
+        bool     prefill_succeeded,
+        bool     pressure_allows_seed,
+        bool     cache_changed,
+        uint32_t target,
+        uint32_t cache_after) {
+    return prefill_succeeded && pressure_allows_seed && target != 0 &&
+        cache_changed && cache_after >= target;
+}
+
 bool ds4_ssd_glm_streaming_batch_reuse_allowed(
         bool     glm_model,
         uint64_t gate_expert_bytes,

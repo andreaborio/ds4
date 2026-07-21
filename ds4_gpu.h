@@ -445,6 +445,7 @@ int ds4_gpu_matmul_q8_0_rows_scalar_tensor(
  * Backends that return nonzero from a fused half-output operation must also
  * implement the matching half-input HC expansion helpers below.
  */
+int ds4_gpu_is_m5_family(void);
 int ds4_gpu_matmul_q8_0_pair_tensor(
         ds4_gpu_tensor       *out0,
         ds4_gpu_tensor       *out1,

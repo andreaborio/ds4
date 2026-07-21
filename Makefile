@@ -27,7 +27,7 @@ BUILD_ROOT ?= build
 PROGRAMS := ds4 ds4-server ds4-bench ds4-eval ds4-agent
 
 .PHONY: all help clean test model-free-test premerge context-audit doc-links \
-	imatrix-dataset-check cpu FORCE \
+	imatrix-dataset-check prompt-fixture-check cpu FORCE \
 	metal build-isolation-test q4k-dot-test qwen-metadata-test \
 	qwen-reference-test qwen-unicode-test qwen-tokenizer-test \
 	qwen-expert-group-test expert-store-test metal-ssd-profile-test \
@@ -484,7 +484,14 @@ doc-links:
 imatrix-dataset-check:
 	python3 gguf-tools/imatrix/dataset/build_ds4_imatrix_dataset.py --check
 
-premerge: context-audit doc-links imatrix-dataset-check build-isolation-test model-free-test
+prompt-fixture-check:
+	python3 speed-bench/build_long_context_prompt.py --check
+
+
+# Build isolation removes and rebuilds BUILD_ROOT, so model-free-test must start
+# only after it completes even when an agent invokes `make -j premerge`.
+premerge: context-audit doc-links imatrix-dataset-check prompt-fixture-check build-isolation-test
+	$(MAKE) model-free-test
 	git diff --check
 
 build-isolation-test: tests/test_build_isolation.sh
@@ -661,7 +668,10 @@ doc-links:
 imatrix-dataset-check:
 	python3 gguf-tools/imatrix/dataset/build_ds4_imatrix_dataset.py --check
 
-premerge: context-audit doc-links imatrix-dataset-check model-free-test
+prompt-fixture-check:
+	python3 speed-bench/build_long_context_prompt.py --check
+
+premerge: context-audit doc-links imatrix-dataset-check prompt-fixture-check model-free-test
 	git diff --check
 
 q4k-dot-test: tests/test_q4k_dot.c

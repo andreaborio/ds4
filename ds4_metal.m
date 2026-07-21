@@ -1,5 +1,6 @@
 #import <Foundation/Foundation.h>
 #import <Metal/Metal.h>
+#import <CommonCrypto/CommonDigest.h>
 
 #include <stdint.h>
 #include <inttypes.h>
@@ -197,6 +198,7 @@ static id<MTLComputePipelineState> g_dsv4_indexed_attention_heads8_pipeline;
 static id<MTLComputePipelineState> g_dsv4_indexed_attention_heads8_rb16_pipeline;
 static id<MTLComputePipelineState> g_dsv4_softplus_sqrt_pipeline;
 static id<MTLComputePipelineState> g_dsv4_router_finalize_one_pipeline;
+static id<MTLComputePipelineState> g_dsv4_router_finalize_weights_one_simd_pipeline;
 static id<MTLComputePipelineState> g_dsv4_router_weights_one_pipeline;
 static id<MTLComputePipelineState> g_glm_router_select_one_pipeline;
 static id<MTLComputePipelineState> g_glm_kv_lora_rms_norm_pipeline;
@@ -2500,6 +2502,11 @@ static int ds4_gpu_device_name_contains(const char *needle) {
     return g_metal_device_name[0] != '\0' && strstr(g_metal_device_name, needle) != NULL;
 }
 
+int ds4_gpu_is_m5_family(void) {
+    if (!g_initialized && !ds4_gpu_init()) return 0;
+    return ds4_gpu_device_name_contains("M5");
+}
+
 static int ds4_gpu_compile_tensor_probe(void) {
 #if defined(__MAC_OS_X_VERSION_MAX_ALLOWED) && __MAC_OS_X_VERSION_MAX_ALLOWED >= 260000
     if (!g_device) return 0;
@@ -3991,9 +3998,12 @@ static const char *ds4_gpu_source =
 "\n"
 "\n";
 
+static uint32_t g_metal_source_override_count;
+
 static NSString *ds4_gpu_full_source(void) {
     NSString *base = [NSString stringWithUTF8String:ds4_gpu_source];
     NSFileManager *fm = [NSFileManager defaultManager];
+    g_metal_source_override_count = 0;
     /*
      * Kernels are kept as separate files for review, then concatenated into one
      * Metal library.  Environment overrides are still honored so a diagnostic
@@ -4028,6 +4038,7 @@ static NSString *ds4_gpu_full_source(void) {
         NSMutableArray<NSString *> *paths = [NSMutableArray array];
         if (override_path && override_path[0]) {
             [paths addObject:[NSString stringWithUTF8String:override_path]];
+            g_metal_source_override_count++;
         }
         [paths addObject:spec[1]];
         [paths addObject:[@"./" stringByAppendingString:spec[1]]];
@@ -4059,6 +4070,15 @@ static NSString *ds4_gpu_full_source(void) {
         [source appendFormat:@"\n// appended %@\n%@\n", loaded_path, loaded];
     }
     return source;
+}
+
+static void ds4_gpu_sha256_hex(NSData *data, char hex[CC_SHA256_DIGEST_LENGTH * 2 + 1]) {
+    unsigned char digest[CC_SHA256_DIGEST_LENGTH];
+    CC_SHA256([data bytes], (CC_LONG)[data length], digest);
+    for (size_t i = 0; i < CC_SHA256_DIGEST_LENGTH; i++) {
+        snprintf(hex + i * 2, 3, "%02x", digest[i]);
+    }
+    hex[CC_SHA256_DIGEST_LENGTH * 2] = '\0';
 }
 
 typedef struct {
@@ -6186,6 +6206,25 @@ int ds4_gpu_init(void) {
                 drift_math_safe      ? "on"  : "off",
                 g_metal4_tensor_api_enabled ? "on" : "off");
         options.preprocessorMacros = macros;
+        NSData *source_data = [source dataUsingEncoding:NSUTF8StringEncoding];
+        if (!source_data || [source_data length] > UINT32_MAX) {
+            fprintf(stderr, "ds4: Metal shader source cannot be fingerprinted\n");
+            g_queue = nil;
+            g_device = nil;
+            return 0;
+        }
+        char source_sha256[CC_SHA256_DIGEST_LENGTH * 2 + 1];
+        ds4_gpu_sha256_hex(source_data, source_sha256);
+        fprintf(stderr,
+                "ds4: metal_library source_sha256=%s overrides=%u tensor=%s hc_stable=%s norm_unify=%s kv_raw_f32=%s rope_exp2_log2=%s math=%s\n",
+                source_sha256,
+                g_metal_source_override_count,
+                g_metal4_tensor_api_enabled ? "on" : "off",
+                drift_hc_stable ? "on" : "off",
+                drift_norm_unify ? "on" : "off",
+                drift_kv_raw_f32 ? "on" : "off",
+                drift_rope_exp2_log2 ? "on" : "off",
+                drift_math_safe ? "safe" : "fast");
         id<MTLLibrary> library = [g_device newLibraryWithSource:source options:options error:&error];
         if (!library) {
             fprintf(stderr, "ds4: Metal shader compilation failed: %s\n",
@@ -7891,6 +7930,8 @@ int ds4_gpu_init(void) {
             ds4_gpu_get_pipeline("kernel_dsv4_softplus_sqrt_f32_4");
         g_dsv4_router_finalize_one_pipeline =
             ds4_gpu_get_pipeline("kernel_dsv4_router_finalize_one");
+        g_dsv4_router_finalize_weights_one_simd_pipeline =
+            ds4_gpu_get_pipeline("kernel_dsv4_router_finalize_weights_one_simd");
         g_dsv4_router_weights_one_pipeline =
             ds4_gpu_get_pipeline("kernel_dsv4_router_weights_one");
         g_glm_router_select_one_pipeline =
@@ -8018,6 +8059,7 @@ int ds4_gpu_init(void) {
             !g_dsv4_indexed_attention_heads8_rb16_pipeline ||
             !g_dsv4_softplus_sqrt_pipeline ||
             !g_dsv4_router_finalize_one_pipeline ||
+            !g_dsv4_router_finalize_weights_one_simd_pipeline ||
             !g_dsv4_router_weights_one_pipeline ||
             !g_glm_router_select_one_pipeline ||
             !g_glm_kv_lora_rms_norm_pipeline ||
@@ -8744,6 +8786,7 @@ void ds4_gpu_cleanup(void) {
         g_dsv4_indexed_attention_heads8_rb16_pipeline = nil;
         g_dsv4_softplus_sqrt_pipeline = nil;
         g_dsv4_router_finalize_one_pipeline = nil;
+        g_dsv4_router_finalize_weights_one_simd_pipeline = nil;
         g_dsv4_router_weights_one_pipeline = nil;
         g_glm_router_select_one_pipeline = nil;
         g_glm_kv_lora_rms_norm_pipeline = nil;
@@ -18618,10 +18661,110 @@ int ds4_gpu_matmul_q8_0_pair_tensor(
         uint64_t                out1_dim,
         const ds4_gpu_tensor *x,
         uint64_t                n_tok) {
-    (void)out0; (void)out1; (void)model_map; (void)model_size;
-    (void)weight0_offset; (void)weight1_offset;
-    (void)in_dim; (void)out0_dim; (void)out1_dim; (void)x; (void)n_tok;
-    return 0;
+    if (!g_initialized && !ds4_gpu_init()) return 0;
+    /* The exact scalar fallback remains the default on unqualified Apple GPU
+     * families. The paired schedule is currently promoted only on M5. */
+    if (!ds4_gpu_device_name_contains("M5")) return 0;
+    if (!out0 || !out1 || !model_map || !x || n_tok != 1 ||
+        out0 == out1 ||
+        out0_dim == 0 || out1_dim == 0 || (in_dim & 31u) != 0 ||
+        in_dim > UINT32_MAX || out0_dim > UINT32_MAX || out1_dim > UINT32_MAX) {
+        return 0;
+    }
+
+    @autoreleasepool {
+        id<MTLBuffer> xbuf = ds4_gpu_tensor_buffer(x);
+        id<MTLBuffer> out0buf = ds4_gpu_tensor_buffer(out0);
+        id<MTLBuffer> out1buf = ds4_gpu_tensor_buffer(out1);
+        const uint64_t x_bytes = in_dim * sizeof(float);
+        const uint64_t out0_bytes = out0_dim * sizeof(float);
+        const uint64_t out1_bytes = out1_dim * sizeof(float);
+        if (!xbuf || !out0buf || !out1buf ||
+            ds4_gpu_tensor_bytes(x) < x_bytes ||
+            ds4_gpu_tensor_bytes(out0) < out0_bytes ||
+            ds4_gpu_tensor_bytes(out1) < out1_bytes) {
+            fprintf(stderr, "ds4: Metal paired Q8_0 matvec received undersized activation buffers\n");
+            return 0;
+        }
+        if (out0buf == out1buf) {
+            const uint64_t out0_offset = ds4_gpu_tensor_offset(out0);
+            const uint64_t out1_offset = ds4_gpu_tensor_offset(out1);
+            const bool outputs_overlap =
+                out0_offset < out1_offset + out1_bytes &&
+                out1_offset < out0_offset + out0_bytes;
+            if (outputs_overlap) return 0;
+        }
+
+        const uint64_t row_bytes = (in_dim / 32u) * 34u;
+        if (out0_dim > UINT64_MAX / row_bytes ||
+            out1_dim > UINT64_MAX / row_bytes) {
+            return 0;
+        }
+        const uint64_t weight0_bytes = out0_dim * row_bytes;
+        const uint64_t weight1_bytes = out1_dim * row_bytes;
+        if (weight0_offset > model_size || weight0_bytes > model_size - weight0_offset ||
+            weight1_offset > model_size || weight1_bytes > model_size - weight1_offset) {
+            fprintf(stderr, "ds4: Metal paired Q8_0 matvec range is outside the mapped model\n");
+            return 0;
+        }
+
+        uint64_t inner0 = 0;
+        uint64_t inner1 = 0;
+        id<MTLBuffer> weight0buf =
+            ds4_gpu_wrap_model_range(model_map, model_size,
+                                     weight0_offset, weight0_bytes, &inner0);
+        id<MTLBuffer> weight1buf =
+            ds4_gpu_wrap_model_range(model_map, model_size,
+                                     weight1_offset, weight1_bytes, &inner1);
+        if (!weight0buf || !weight1buf) return 0;
+
+        ds4_gpu_mv_dispatch dispatch0 = ds4_gpu_make_q8_0_mv_dispatch();
+        ds4_gpu_mv_dispatch dispatch1 = ds4_gpu_make_q8_0_mv_dispatch();
+        if (out0_dim > 65536u) dispatch0.nsg = 8;
+        if (out1_dim > 65536u) dispatch1.nsg = 8;
+        if (dispatch0.nsg != dispatch1.nsg) return 0;
+
+        ds4_gpu_q8_0_matvec_args args0 = ds4_gpu_make_q8_0_mv_args(in_dim, out0_dim);
+        ds4_gpu_q8_0_matvec_args args1 = ds4_gpu_make_q8_0_mv_args(in_dim, out1_dim);
+        /* The paired shader deliberately preserves the two-row reduction of
+         * kernel_mul_mv_q8_0_f32.  Do not inherit Q8_MV_ROWS=4 here: there is
+         * no paired r4 shader, and a four-row grid would leave half the output
+         * unwritten. */
+        const uint32_t pair_rows = 2u;
+        const NSUInteger pair_bank_smem = 32u * pair_rows * sizeof(float);
+        args0.nr0 = (int32_t)pair_rows;
+        args1.nr0 = (int32_t)pair_rows;
+        id<MTLComputePipelineState> pipeline =
+            ds4_gpu_get_mul_mv_pipeline("kernel_mul_mv_q8_0_f32_pair", dispatch0.nsg);
+        if (!pipeline) return 0;
+
+        int owned = 0;
+        id<MTLCommandBuffer> cb = ds4_gpu_command_buffer(&owned);
+        if (!cb) return 0;
+
+        id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
+        [enc setComputePipelineState:pipeline];
+        [enc setBytes:&args0 length:sizeof(args0) atIndex:0];
+        [enc setBytes:&args1 length:sizeof(args1) atIndex:1];
+        [enc setBuffer:weight0buf offset:(NSUInteger)inner0 atIndex:2];
+        [enc setBuffer:weight1buf offset:(NSUInteger)inner1 atIndex:3];
+        [enc setBuffer:xbuf offset:ds4_gpu_tensor_offset(x) atIndex:4];
+        [enc setBuffer:out0buf offset:ds4_gpu_tensor_offset(out0) atIndex:5];
+        [enc setBuffer:out1buf offset:ds4_gpu_tensor_offset(out1) atIndex:6];
+        [enc setThreadgroupMemoryLength:2u * pair_bank_smem atIndex:0];
+        const uint64_t max_out_dim = out0_dim > out1_dim ? out0_dim : out1_dim;
+        [enc dispatchThreadgroups:MTLSizeMake(((NSUInteger)max_out_dim +
+                                               (NSUInteger)pair_rows - 1u) /
+                                              (NSUInteger)pair_rows,
+                                              1,
+                                              1)
+             threadsPerThreadgroup:MTLSizeMake(32, (NSUInteger)dispatch0.nsg, 1)];
+        ds4_gpu_end_compute_encoder(cb, enc);
+
+        if (!ds4_gpu_finish_command_buffer(cb, owned, "paired Q8_0 matvec")) return 0;
+    }
+
+    return 1;
 }
 
 int ds4_gpu_matmul_q8_0_f16_out_tensor(
@@ -30529,16 +30672,31 @@ static int ds4_gpu_encode_router_select(
     if (flash_router_fast_path &&
         !g_quality_mode && n_tokens == 1 &&
         getenv("DS4_METAL_DISABLE_ROUTER_SELECT_FUSION") == NULL) {
+        const bool use_simd_weights_fusion =
+            !hash_mode &&
+            g_dsv4_router_finalize_weights_one_simd_pipeline != nil &&
+            g_dsv4_router_finalize_weights_one_simd_pipeline.threadExecutionWidth == 32u &&
+            g_dsv4_router_finalize_weights_one_simd_pipeline.maxTotalThreadsPerThreadgroup >= 256u &&
+            ds4_gpu_device_name_contains("M5");
         id<MTLComputePipelineState> softplus_sqrt_pipeline =
             ds4_gpu_hot_pipeline(g_dsv4_softplus_sqrt_pipeline,
                                     "kernel_dsv4_softplus_sqrt_f32_4");
         id<MTLComputePipelineState> router_finalize_pipeline =
-            ds4_gpu_hot_pipeline(g_dsv4_router_finalize_one_pipeline,
-                                    "kernel_dsv4_router_finalize_one");
-        id<MTLComputePipelineState> router_weights_pipeline =
-            ds4_gpu_hot_pipeline(g_dsv4_router_weights_one_pipeline,
-                                    "kernel_dsv4_router_weights_one");
-        if (!softplus_sqrt_pipeline || !router_finalize_pipeline || !router_weights_pipeline) return 0;
+            ds4_gpu_hot_pipeline(
+                use_simd_weights_fusion
+                    ? g_dsv4_router_finalize_weights_one_simd_pipeline
+                    : g_dsv4_router_finalize_one_pipeline,
+                use_simd_weights_fusion
+                    ? "kernel_dsv4_router_finalize_weights_one_simd"
+                    : "kernel_dsv4_router_finalize_one");
+        id<MTLComputePipelineState> router_weights_pipeline = use_simd_weights_fusion
+            ? nil
+            : ds4_gpu_hot_pipeline(g_dsv4_router_weights_one_pipeline,
+                                      "kernel_dsv4_router_weights_one");
+        if (!softplus_sqrt_pipeline || !router_finalize_pipeline ||
+            (!use_simd_weights_fusion && !router_weights_pipeline)) {
+            return 0;
+        }
 
         ok = ds4_gpu_encode_unary_f32_rows(cb,
                                              softplus_sqrt_pipeline,
@@ -30590,10 +30748,18 @@ static int ds4_gpu_encode_router_select(
             [enc setBytes:&zero_i32 length:sizeof(zero_i32) atIndex:4];
         }
         [enc setBuffer:selectedbuf offset:selected_off atIndex:5];
-        [enc setThreadgroupMemoryLength:256u * sizeof(float) + 256u * sizeof(int32_t) atIndex:0];
+        if (use_simd_weights_fusion) {
+            [enc setBuffer:weightsbuf offset:weights_off atIndex:6];
+        }
+        const NSUInteger router_finalize_scratch_bytes = use_simd_weights_fusion
+            ? 2u * (256u * sizeof(float) + 256u * sizeof(int32_t))
+            : 256u * sizeof(float) + 256u * sizeof(int32_t);
+        [enc setThreadgroupMemoryLength:router_finalize_scratch_bytes atIndex:0];
         [enc dispatchThreadgroups:MTLSizeMake(1, 1, 1)
              threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
         ds4_gpu_end_compute_encoder(cb, enc);
+
+        if (use_simd_weights_fusion) return 1;
 
         enc = ds4_gpu_compute_encoder(cb);
         [enc setComputePipelineState:router_weights_pipeline];
