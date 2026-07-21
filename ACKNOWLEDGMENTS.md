@@ -43,8 +43,8 @@ same thing as a linked dependency.
 [`MLX`](https://github.com/ml-explore/mlx) and
 [`MLX-LM`](https://github.com/ml-explore/mlx-lm) informed the current Qwen MLX
 affine4/group-64 storage layout, scheduling comparisons, and validation work.
-The local Qwen candidate repacks routed weights from an MLX-format source into
-the existing checksummed ExpertMajor v2 GGUF container.
+The published Qwen release repacks routed weights from an MLX-format source
+into the existing checksummed ExpertMajor v2 GGUF container.
 
 Hebrus does not link the MLX libraries at runtime. This credit does not imply
 Apple authorship, sponsorship, or endorsement of Hebrus.
