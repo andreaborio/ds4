@@ -63,6 +63,48 @@ Run a completed artifact without conversion flags:
 ./ds4 -m /absolute/path/to/MODEL-DS4-ExpertMajor-v2.gguf --ctx 8192
 ```
 
+## Build the pinned DeepSeek MLX affine2 routed store
+
+The affine2 writer consumes the exact pinned
+`mlx-community/DeepSeek-V4-Flash-2bit-DQ` checkout. It first validates the Git
+origin and revision, config and index hashes, all committed Git LFS object
+identities, every routed safetensor dtype/shape/extent, and destination free
+space. Hydrate all 19 shards before writing; the command never downloads them.
+
+```sh
+python3 gguf-tools/ds4-expert-major.py \
+  repack-deepseek-mlx-affine2 \
+  --dry-run \
+  --expected-revision 722bf559b7de93575b2320973cf2002e05bfe6c9 \
+  /path/to/DeepSeek-V4-Flash-2bit-DQ
+
+python3 gguf-tools/ds4-expert-major.py \
+  repack-deepseek-mlx-affine2 \
+  --resume \
+  --expected-revision 722bf559b7de93575b2320973cf2002e05bfe6c9 \
+  /path/to/DeepSeek-V4-Flash-2bit-DQ \
+  /Volumes/SSD/DeepSeek-V4-Flash-MLX-Affine2-ExpertMajor-v2.store
+```
+
+The writer keeps only one expert component in memory, checkpoints completed
+layers when `--resume` is enabled, verifies the final payload byte-for-byte by
+default, and installs it with a same-filesystem rename. Ordinary failures
+without `--resume` remove the partial output. `--skip-verify` is diagnostic
+only and must not be used for publication.
+
+The result is the standalone opaque `DS4EXPV2` store, not an executable GGUF.
+It must still be embedded as the sole `ds4.expert_major.v2` I8 tensor in the
+qualified DeepSeek GGUF without changing the store bytes. Verify a store
+against the same hydrated donor with:
+
+```sh
+python3 gguf-tools/ds4-expert-major.py \
+  verify-deepseek-mlx-affine2 \
+  --expected-revision 722bf559b7de93575b2320973cf2002e05bfe6c9 \
+  /path/to/DeepSeek-V4-Flash-2bit-DQ \
+  /Volumes/SSD/DeepSeek-V4-Flash-MLX-Affine2-ExpertMajor-v2.store
+```
+
 ## Generate An Imatrix
 
 First regenerate or inspect the calibration dataset:

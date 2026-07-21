@@ -34,18 +34,46 @@ static bool family_is_supported(uint64_t family) {
 }
 
 int main(int argc, char **argv) {
-    if (argc != 5) {
+    if (argc != 5 && argc != 7 && argc != 10 && argc != 11) {
         fprintf(stderr,
-                "usage: %s NATIVE.gguf STORE_OFFSET STORE_BYTES FAMILY\n",
+                "usage: %s FILE STORE_OFFSET STORE_BYTES FAMILY "
+                "[STORAGE GROUP] | "
+                "[STORAGE LAYERS EXPERTS USED SOURCE_TENSORS] | "
+                "[STORAGE GROUP LAYERS EXPERTS USED SOURCE_TENSORS]\n",
                 argv[0]);
         return 2;
     }
     uint64_t offset = 0, bytes = 0, family64 = 0;
+    uint64_t storage64 = DS4_EXPERT_STORE_STORAGE_GGML;
+    uint64_t group64 = 0;
     CHECK(parse_u64(argv[2], &offset));
     CHECK(parse_u64(argv[3], &bytes));
     CHECK(parse_u64(argv[4], &family64));
+    uint64_t layers64 = 2, experts64 = 3, used64 = 2, source_tensors = 7;
+    if (argc == 7 || argc == 11) {
+        CHECK(parse_u64(argv[5], &storage64));
+        CHECK(parse_u64(argv[6], &group64));
+    } else if (argc == 10) {
+        CHECK(parse_u64(argv[5], &storage64));
+        group64 = storage64 == DS4_EXPERT_STORE_STORAGE_MLX_AFFINE2 ?
+            (family64 == DS4_EXPERT_STORE_FAMILY_DEEPSEEK4 ?
+                DS4_EXPERT_STORE_GROUP_PROFILE_AFFINE2_G32_U64_D64 :
+                DS4_EXPERT_STORE_GLM_AFFINE2_GROUP_SIZE) :
+            (storage64 == DS4_EXPERT_STORE_STORAGE_MLX_AFFINE4 ? 64u : 0u);
+    }
+    if (argc == 10 || argc == 11) {
+        const int base = argc == 11 ? 7 : 6;
+        CHECK(parse_u64(argv[base], &layers64));
+        CHECK(parse_u64(argv[base + 1], &experts64));
+        CHECK(parse_u64(argv[base + 2], &used64));
+        CHECK(parse_u64(argv[base + 3], &source_tensors));
+    }
     CHECK(family_is_supported(family64));
     const uint32_t family = (uint32_t)family64;
+    CHECK(storage64 <= UINT32_MAX);
+    CHECK(layers64 <= UINT32_MAX);
+    CHECK(experts64 <= UINT32_MAX);
+    CHECK(used64 <= UINT32_MAX);
     const int fd = open(argv[1], O_RDONLY);
     CHECK(fd >= 0);
 
@@ -60,12 +88,12 @@ int main(int argc, char **argv) {
     CHECK(manifest != NULL);
     CHECK(manifest->version == DS4_EXPERT_STORE_V2_VERSION);
     CHECK(manifest->family == family);
-    CHECK(manifest->storage_format == DS4_EXPERT_STORE_STORAGE_GGML);
-    CHECK(manifest->group_size == 0);
-    CHECK(manifest->layer_count == 2);
-    CHECK(manifest->expert_count == 3);
-    CHECK(manifest->expert_used_count == 2);
-    CHECK(manifest->source_tensor_count == 7);
+    CHECK(manifest->storage_format == storage64);
+    CHECK(manifest->group_size == group64);
+    CHECK(manifest->layer_count == (uint32_t)layers64);
+    CHECK(manifest->expert_count == (uint32_t)experts64);
+    CHECK(manifest->expert_used_count == (uint32_t)used64);
+    CHECK(manifest->source_tensor_count == source_tensors);
     CHECK(ds4_expert_store_fd(store) >= 0);
     CHECK(ds4_expert_store_file_offset(store) == offset);
 

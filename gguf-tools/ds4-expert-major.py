@@ -15,13 +15,14 @@ import dataclasses
 import hashlib
 import json
 import os
+import plistlib
 import re
 import shutil
 import struct
 import subprocess
 import sys
 from pathlib import Path
-from typing import BinaryIO, Iterator, Protocol
+from typing import BinaryIO, Callable, Iterator, Protocol
 
 
 MAGIC = b"GGUF"
@@ -50,6 +51,20 @@ STORE_COMPONENT_OFFSET = 32
 STORE_ALIGNMENT = 4096
 MANIFEST_DIGEST_OFFSET = 168
 IO_BYTES = 8 * 1024 * 1024
+
+DEEPSEEK_AFFINE2_ORIGIN = (
+    "https://huggingface.co/mlx-community/DeepSeek-V4-Flash-2bit-DQ"
+)
+DEEPSEEK_AFFINE2_REVISION = "722bf559b7de93575b2320973cf2002e05bfe6c9"
+DEEPSEEK_AFFINE2_CONFIG_SHA256 = (
+    "b0d5c7c8d6471167b9ef6a4a97ad910a09bd1bc677e0483accdae0a21bf22f01"
+)
+DEEPSEEK_AFFINE2_INDEX_SHA256 = (
+    "d1c2d929ab0a35be32cf18026bb31d6f99dad58d6c93a5a2abbe43791f9d6c30"
+)
+DEEPSEEK_AFFINE2_TOTAL_SIZE = 96520315996
+DEEPSEEK_AFFINE2_TOTAL_PARAMETERS = 284333146519
+DEEPSEEK_AFFINE2_TENSOR_COUNT = 2610
 
 GGUF_UINT8 = 0
 GGUF_INT8 = 1
@@ -249,6 +264,21 @@ class SafeTensorShard:
     tensors: dict[str, dict[str, object]]
 
 
+@dataclasses.dataclass(frozen=True)
+class DeepSeekDonor:
+    model_dir: Path
+    origin: str
+    revision: str
+    config_sha256: str
+    index_sha256: str
+    source_digest: bytes
+    source_size: int
+    source_tensor_count: int
+    gate_groups: tuple[int, ...]
+    shard_oids: tuple[tuple[str, str, int], ...]
+    hydrated: bool
+
+
 class MLXAffineSource:
     """Minimal mmap-free reader for the routed MLX safetensor slices."""
 
@@ -280,6 +310,8 @@ class MLXAffineSource:
             tensors = json.loads(
                 pread_exact(fd, header_bytes, 8).decode("utf-8")
             )
+            if not isinstance(tensors, dict):
+                raise FormatError(f"invalid safetensor header in {path}")
         except BaseException:
             os.close(fd)
             raise
@@ -304,7 +336,20 @@ class MLXAffineSource:
                 not all(isinstance(value, int) for value in offsets) or \
                 offsets[0] < 0 or offsets[1] < offsets[0]:
             raise FormatError(f"invalid safetensor offsets for {key}")
-        return shard, shard.data_offset + offsets[0], offsets[1] - offsets[0]
+        item_bytes = {"U32": 4, "BF16": 2}.get(dtype)
+        elements = 1
+        for dim in shape:
+            if dim <= 0:
+                raise FormatError(f"invalid safetensor shape for {key}")
+            elements *= dim
+        size = offsets[1] - offsets[0]
+        if item_bytes is None or size != elements * item_bytes:
+            raise FormatError(f"safetensor byte size differs for {key}")
+        file_size = os.fstat(shard.fd).st_size
+        absolute = shard.data_offset + offsets[0]
+        if absolute > file_size or size > file_size - absolute:
+            raise FormatError(f"safetensor extent exceeds shard for {key}")
+        return shard, absolute, size
 
     def expert_bytes(self, key: str, dtype: str,
                      shape: tuple[int, ...], expert: int) -> bytes:
@@ -1060,25 +1105,27 @@ def interleave_mlx_affine2(
             len(scales) != control_bytes or len(biases) != control_bytes:
         raise FormatError("affine2 source byte geometry differs")
 
+    try:
+        import numpy as np
+    except ImportError as exc:
+        raise FormatError("numpy is required for MLX affine repacking") from exc
     splits = source_group_size // target_group_size
     target_code_bytes = target_group_size // 4
     block_bytes = target_code_bytes + 4
-    result = bytearray(rows * source_groups * splits * block_bytes)
-    cursor = 0
-    for row in range(rows):
-        for group in range(source_groups):
-            source = (row * source_groups + group) * code_bytes
-            control = (row * source_groups + group) * 2
-            for split in range(splits):
-                begin = source + split * target_code_bytes
-                result[cursor:cursor + target_code_bytes] = \
-                    weights[begin:begin + target_code_bytes]
-                cursor += target_code_bytes
-                result[cursor:cursor + 2] = scales[control:control + 2]
-                cursor += 2
-                result[cursor:cursor + 2] = biases[control:control + 2]
-                cursor += 2
-    return bytes(result)
+    packed = np.empty(
+        (rows, source_groups, splits, block_bytes), dtype=np.uint8
+    )
+    packed[:, :, :, :target_code_bytes] = np.frombuffer(
+        weights, dtype=np.uint8
+    ).reshape(rows, source_groups, splits, target_code_bytes)
+    packed[:, :, :, target_code_bytes:target_code_bytes + 2] = np.frombuffer(
+        scales, dtype=np.uint8
+    ).reshape(rows, source_groups, 1, 2)
+    packed[:, :, :, target_code_bytes + 2:target_code_bytes + 4] = \
+        np.frombuffer(biases, dtype=np.uint8).reshape(
+            rows, source_groups, 1, 2
+        )
+    return packed.tobytes()
 
 
 def validate_deepseek_affine2_config(config: dict) -> tuple[int, ...]:
@@ -1110,43 +1157,73 @@ def validate_deepseek_affine2_config(config: dict) -> tuple[int, ...]:
     return tuple(gate_groups)
 
 
-def plan_deepseek_mlx_affine2(
-        model_dir: Path,
-        expected_revision: str) -> None:
-    """Fail-closed donor/provenance check for the not-yet-written payload path.
+def deepseek_affine2_expected_tensors(
+        gate_groups: tuple[int, ...],
+        expert_count: int = 256,
+        hidden_size: int = 4096,
+        intermediate_size: int = 2048,
+) -> list[tuple[str, str, tuple[int, ...]]]:
+    expected: list[tuple[str, str, tuple[int, ...]]] = []
+    for layer, gate_group in enumerate(gate_groups):
+        role_shapes = (
+            ("gate_proj", hidden_size, intermediate_size, gate_group),
+            ("up_proj", hidden_size, intermediate_size, 64),
+            ("down_proj", intermediate_size, hidden_size, 64),
+        )
+        for role, input_dim, rows, group in role_shapes:
+            prefix = f"model.layers.{layer}.ffn.switch_mlp.{role}"
+            expected.extend((
+                (prefix + ".weight", "U32",
+                 (expert_count, rows, input_dim // 16)),
+                (prefix + ".scales", "BF16",
+                 (expert_count, rows, input_dim // group)),
+                (prefix + ".biases", "BF16",
+                 (expert_count, rows, input_dim // group)),
+            ))
+    return expected
 
-    This command deliberately stops at a physical layout plan. It does not
-    claim to have produced an ExpertMajor store until the 86 GiB writer and
-    end-to-end digest verification are implemented.
-    """
+
+def _git(model_dir: Path, *args: str, binary: bool = False):
+    result = subprocess.run(
+        ["git", "-C", str(model_dir), *args],
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+    )
+    if result.returncode:
+        error = result.stderr.decode("utf-8", "replace").strip()
+        raise FormatError(
+            f"donor provenance check failed ({' '.join(args)}): "
+            f"{error or 'git returned an error'}"
+        )
+    if binary:
+        return result.stdout
+    return result.stdout.decode("utf-8").strip()
+
+
+def load_deepseek_affine2_donor(
+        model_dir: Path,
+        expected_revision: str,
+        *,
+        require_hydrated: bool,
+        verify_shards: bool,
+) -> DeepSeekDonor:
+    """Validate the exact published donor, including committed LFS identities."""
     model_dir = model_dir.resolve()
     if not re.fullmatch(r"[0-9a-f]{40}", expected_revision):
         raise FormatError("--expected-revision must be a full lowercase SHA-1")
-
-    def git(*args: str) -> str:
-        result = subprocess.run(
-            ["git", "-C", str(model_dir), *args],
-            text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+    if expected_revision != DEEPSEEK_AFFINE2_REVISION:
+        raise FormatError(
+            "unsupported donor revision: this writer is pinned to "
+            f"{DEEPSEEK_AFFINE2_REVISION}"
         )
-        if result.returncode:
-            raise FormatError(
-                f"donor provenance check failed ({' '.join(args)}): "
-                f"{result.stderr.strip() or 'git returned an error'}"
-            )
-        return result.stdout.strip()
-
-    revision = git("rev-parse", "HEAD")
+    revision = _git(model_dir, "rev-parse", "HEAD")
     if revision != expected_revision:
         raise FormatError(
             f"donor revision differs: expected {expected_revision}, got {revision}"
         )
-    origin = git("config", "--get", "remote.origin.url").removesuffix(".git")
-    expected_origin = (
-        "https://huggingface.co/mlx-community/DeepSeek-V4-Flash-2bit-DQ"
-    )
-    if origin != expected_origin:
+    origin = _git(model_dir, "config", "--get", "remote.origin.url").removesuffix(".git")
+    if origin != DEEPSEEK_AFFINE2_ORIGIN:
         raise FormatError(
-            f"donor origin differs: expected {expected_origin}, got {origin}"
+            f"donor origin differs: expected {DEEPSEEK_AFFINE2_ORIGIN}, got {origin}"
         )
     if subprocess.run(
             ["git", "-C", str(model_dir), "diff", "--quiet", "HEAD", "--",
@@ -1163,32 +1240,22 @@ def plan_deepseek_mlx_affine2(
         index = json.loads(index_raw)
     except (OSError, json.JSONDecodeError) as exc:
         raise FormatError(f"invalid donor config/index: {exc}") from exc
+    config_sha256 = hashlib.sha256(config_raw).hexdigest()
+    index_sha256 = hashlib.sha256(index_raw).hexdigest()
+    if config_sha256 != DEEPSEEK_AFFINE2_CONFIG_SHA256 or \
+            index_sha256 != DEEPSEEK_AFFINE2_INDEX_SHA256:
+        raise FormatError("donor config/index SHA-256 differs from the pinned release")
     gate_groups = validate_deepseek_affine2_config(config)
     weight_map = index.get("weight_map")
     metadata = index.get("metadata")
-    if not isinstance(weight_map, dict) or len(weight_map) != 2610 or \
+    if not isinstance(weight_map, dict) or \
+            len(weight_map) != DEEPSEEK_AFFINE2_TENSOR_COUNT or \
             not isinstance(metadata, dict) or \
-            metadata.get("total_size") != 96520315996 or \
-            metadata.get("total_parameters") != 284333146519:
+            metadata.get("total_size") != DEEPSEEK_AFFINE2_TOTAL_SIZE or \
+            metadata.get("total_parameters") != DEEPSEEK_AFFINE2_TOTAL_PARAMETERS:
         raise FormatError("donor safetensor index identity differs")
 
-    expected_tensors: list[tuple[str, str, tuple[int, ...]]] = []
-    for layer, gate_group in enumerate(gate_groups):
-        role_shapes = (
-            ("gate_proj", 4096, 2048, gate_group),
-            ("up_proj", 4096, 2048, 64),
-            ("down_proj", 2048, 4096, 64),
-        )
-        for role, input_dim, rows, group in role_shapes:
-            prefix = f"model.layers.{layer}.ffn.switch_mlp.{role}"
-            expected_tensors.extend((
-                (prefix + ".weight", "U32",
-                 (256, rows, input_dim // 16)),
-                (prefix + ".scales", "BF16",
-                 (256, rows, input_dim // group)),
-                (prefix + ".biases", "BF16",
-                 (256, rows, input_dim // group)),
-            ))
+    expected_tensors = deepseek_affine2_expected_tensors(gate_groups)
     missing = [name for name, _, _ in expected_tensors
                if not isinstance(weight_map.get(name), str)]
     if missing:
@@ -1200,33 +1267,62 @@ def plan_deepseek_mlx_affine2(
             not isinstance(name, str) or not shard_pattern.fullmatch(name)
             for name in shard_names):
         raise FormatError("donor index shard inventory differs")
-    hydrated = 0
+    hydrated_names: list[str] = []
+    pointer_names: list[str] = []
     lfs_bytes = 0
+    shard_oids: list[tuple[str, str, int]] = []
     for name in shard_names:
         path = model_dir / name
         try:
-            head = path.read_bytes()[:256]
+            with path.open("rb") as file:
+                head = file.read(256)
         except OSError as exc:
             raise FormatError(f"donor shard is missing: {name}") from exc
+        committed = _git(model_dir, "show", f"HEAD:{name}", binary=True)
+        match = re.search(rb"\nsize (\d+)\n?", committed)
+        oid_match = re.search(rb"\noid sha256:([0-9a-f]{64})\n", committed)
+        if not committed.startswith(
+                b"version https://git-lfs.github.com/spec/v1\n") or \
+                not match or not oid_match:
+            raise FormatError(f"pinned Git object is not an LFS pointer: {name}")
+        shard_size = int(match.group(1))
+        shard_oid = oid_match.group(1).decode("ascii")
+        shard_oids.append((name, shard_oid, shard_size))
+        lfs_bytes += shard_size
         if head.startswith(b"version https://git-lfs.github.com/spec/v1\n"):
-            match = re.search(rb"\nsize (\d+)\n?", head)
-            oid = re.search(rb"\noid sha256:([0-9a-f]{64})\n", head)
-            if not match or not oid:
-                raise FormatError(f"invalid Git LFS pointer: {name}")
-            lfs_bytes += int(match.group(1))
+            if path.read_bytes() != committed:
+                raise FormatError(f"working-tree LFS pointer differs: {name}")
+            pointer_names.append(name)
         else:
-            hydrated += 1
-    if lfs_bytes and hydrated:
+            if path.stat().st_size != shard_size:
+                raise FormatError(
+                    f"hydrated shard size differs for {name}: expected "
+                    f"{shard_size}, got {path.stat().st_size}"
+                )
+            hydrated_names.append(name)
+            if verify_shards:
+                actual = hash_file(
+                    path, f"hash donor shard {len(hydrated_names)}/19"
+                ).hex()
+                if actual != shard_oid:
+                    raise FormatError(f"Git LFS SHA-256 mismatch for {name}")
+    if pointer_names and hydrated_names:
         raise FormatError("partially hydrated donor is not a reproducible input")
-    if lfs_bytes and (lfs_bytes < int(metadata["total_size"]) or
-                      lfs_bytes - int(metadata["total_size"]) >
-                          len(shard_names) * (1 << 20)):
+    if (lfs_bytes < int(metadata["total_size"]) or
+            lfs_bytes - int(metadata["total_size"]) >
+                len(shard_names) * (1 << 20)):
         # Index total_size counts tensor data; LFS objects also include each
         # safetensor JSON header and its 8-byte length prefix.
         raise FormatError("Git LFS shard sizes differ from safetensor metadata")
 
-    # Once hydrated, verify every routed header entry, not just index names.
-    if hydrated == len(shard_names):
+    hydrated = len(hydrated_names) == len(shard_names)
+    if require_hydrated and not hydrated:
+        raise FormatError(
+            "donor shards are Git LFS pointers; hydrate all 19 shards before writing"
+        )
+
+    # Once hydrated, verify every routed header entry and exact byte extent.
+    if hydrated:
         source = MLXAffineSource(model_dir)
         try:
             for name, dtype, shape in expected_tensors:
@@ -1234,41 +1330,620 @@ def plan_deepseek_mlx_affine2(
         finally:
             source.close()
 
-    gate_expert_bytes = 2048 * (4096 // 32) * 12
-    up_expert_bytes = 2048 * (4096 // 64) * 20
-    down_expert_bytes = 4096 * (2048 // 64) * 20
-    record_bytes = gate_expert_bytes + up_expert_bytes + down_expert_bytes
-    layer_bytes = record_bytes * 256
-    data_offset = align_up(
-        STORE_HEADER_BYTES + 43 * STORE_LAYER_BYTES, STORE_ALIGNMENT
+    source_identity = {
+        "schema": "ds4-deepseek-mlx-affine2-source-v1",
+        "origin": origin,
+        "revision": revision,
+        "config_sha256": config_sha256,
+        "index_sha256": index_sha256,
+        "shards": [
+            {"name": name, "oid_sha256": oid, "size": size}
+            for name, oid, size in shard_oids
+        ],
+    }
+    source_digest = hashlib.sha256(json.dumps(
+        source_identity, sort_keys=True, separators=(",", ":")
+    ).encode("utf-8")).digest()
+    return DeepSeekDonor(
+        model_dir=model_dir,
+        origin=origin,
+        revision=revision,
+        config_sha256=config_sha256,
+        index_sha256=index_sha256,
+        source_digest=source_digest,
+        source_size=int(metadata["total_size"]),
+        source_tensor_count=len(weight_map),
+        gate_groups=gate_groups,
+        shard_oids=tuple(shard_oids),
+        hydrated=hydrated,
     )
-    payload_bytes = layer_bytes * 43
-    store_bytes = data_offset + payload_bytes
+
+
+def pack_affine2_layer(layer: Layer) -> bytes:
+    result = bytearray(STORE_LAYER_BYTES)
+    struct.pack_into("<IIQQQ", result, 0, layer.index, layer.expert_count,
+                     layer.record_bytes, layer.data_offset, layer.data_size)
+    for component in layer.components:
+        block_elements = 32 if component.role == 0 else 64
+        offset = STORE_COMPONENT_OFFSET + component.role * STORE_COMPONENT_BYTES
+        struct.pack_into(
+            "<IIIIQQQQQ", result, offset,
+            component.role, STORE_TYPE_MLX_AFFINE2, 3, block_elements,
+            *component.tensor.dims, component.expert_bytes,
+            component.record_offset,
+        )
+    return bytes(result)
+
+
+def make_deepseek_affine2_store_plan(
+        source_size: int,
+        source_tensor_count: int,
+        *,
+        layer_count: int = 43,
+        expert_count: int = 256,
+        expert_used: int = 6,
+        hidden_size: int = 4096,
+        intermediate_size: int = 2048,
+) -> StorePlan:
+    if (source_size <= 0 or source_tensor_count <= layer_count * 3 or
+            not 1 <= layer_count <= STORE_MAX_ROUTED_LAYERS or
+            not 1 <= expert_count <= 384 or
+            not 1 <= expert_used <= expert_count or
+            hidden_size <= 0 or intermediate_size <= 0 or
+            hidden_size % 64 or intermediate_size % 64):
+        raise FormatError("invalid DeepSeek affine2 store geometry")
+    source = GGUF(Path("<mlx-donor>"), source_size, 0, 0, STORE_ALIGNMENT,
+                  b"", {}, [], 0)
+    cursor = align_up(
+        STORE_HEADER_BYTES + layer_count * STORE_LAYER_BYTES, STORE_ALIGNMENT
+    )
+    layers: list[Layer] = []
+    dims_by_role = (
+        (hidden_size, intermediate_size, expert_count),
+        (hidden_size, intermediate_size, expert_count),
+        (intermediate_size, hidden_size, expert_count),
+    )
+    for layer_index in range(layer_count):
+        components: list[Component] = []
+        record_offset = 0
+        for role, dims in enumerate(dims_by_role):
+            block_elements = 32 if role == 0 else 64
+            block_bytes = 12 if role == 0 else 20
+            expert_bytes = dims[0] // block_elements * block_bytes * dims[1]
+            tensor = Tensor(
+                f"blk.{layer_index}.ffn_{ROLE_NAME[role]}_exps.weight",
+                dims, STORE_TYPE_MLX_AFFINE2, 0,
+                expert_bytes * expert_count,
+            )
+            components.append(Component(
+                role, tensor, expert_bytes, record_offset
+            ))
+            record_offset += expert_bytes
+        layer_size = record_offset * expert_count
+        layers.append(Layer(
+            layer_index, expert_count, record_offset, cursor, layer_size,
+            tuple(components),
+        ))
+        cursor += layer_size
+    descriptors = b"".join(pack_affine2_layer(layer) for layer in layers)
+    data_offset = layers[0].data_offset
+    return StorePlan(
+        source=source,
+        family=STORE_FAMILY_DEEPSEEK4,
+        storage_format=STORE_STORAGE_MLX_AFFINE2,
+        group_size=STORE_GROUP_PROFILE_AFFINE2_G32_U64_D64,
+        layer_count=layer_count,
+        expert_count=expert_count,
+        expert_used_count=expert_used,
+        source_tensor_count=source_tensor_count,
+        descriptor_bytes=descriptors,
+        data_offset=data_offset,
+        data_size=cursor - data_offset,
+        store_size=cursor,
+        layers=layers,
+    )
+
+
+def plan_deepseek_mlx_affine2(
+        model_dir: Path,
+        expected_revision: str) -> None:
+    donor = load_deepseek_affine2_donor(
+        model_dir, expected_revision,
+        require_hydrated=False, verify_shards=False,
+    )
+    plan = make_deepseek_affine2_store_plan(
+        donor.source_size, donor.source_tensor_count
+    )
+
+    gate_expert_bytes = plan.layers[0].components[0].expert_bytes
+    up_expert_bytes = plan.layers[0].components[1].expert_bytes
+    down_expert_bytes = plan.layers[0].components[2].expert_bytes
+    record_bytes = plan.layers[0].record_bytes
+    layer_bytes = plan.layers[0].data_size
     if (gate_expert_bytes, up_expert_bytes, down_expert_bytes,
             record_bytes) != (3145728, 2621440, 2621440, 8388608):
         raise FormatError("internal affine2 layout calculation differs")
 
-    print("mode: plan-only (payload writer not implemented in this slice)")
-    print(f"donor_origin: {origin}")
-    print(f"donor_revision: {revision}")
-    print(f"config_sha256: {hashlib.sha256(config_raw).hexdigest()}")
-    print(f"index_sha256: {hashlib.sha256(index_raw).hexdigest()}")
-    print(f"index_tensors: {len(weight_map)}")
-    print(f"routed_source_tensors: {len(expected_tensors)}")
-    print(f"shards: {len(shard_names)}")
-    print(f"hydrated_shards: {hydrated}")
-    print(f"source_model_bytes: {metadata['total_size']}")
-    if lfs_bytes:
-        print(f"source_shard_file_bytes: {lfs_bytes}")
-    print("layers: 43")
-    print("experts: 256")
+    print("mode: plan-only")
+    print(f"donor_origin: {donor.origin}")
+    print(f"donor_revision: {donor.revision}")
+    print(f"config_sha256: {donor.config_sha256}")
+    print(f"index_sha256: {donor.index_sha256}")
+    print(f"source_manifest_sha256: {donor.source_digest.hex()}")
+    print(f"index_tensors: {donor.source_tensor_count}")
+    print(f"routed_source_tensors: {len(deepseek_affine2_expected_tensors(donor.gate_groups))}")
+    print(f"shards: {len(donor.shard_oids)}")
+    print(f"hydrated_shards: {len(donor.shard_oids) if donor.hydrated else 0}")
+    print(f"source_model_bytes: {donor.source_size}")
+    print(f"source_shard_file_bytes: {sum(item[2] for item in donor.shard_oids)}")
+    print(f"layers: {plan.layer_count}")
+    print(f"experts: {plan.expert_count}")
     print(f"gate_expert_bytes: {gate_expert_bytes}")
     print(f"up_expert_bytes: {up_expert_bytes}")
     print(f"down_expert_bytes: {down_expert_bytes}")
     print(f"record_bytes: {record_bytes}")
     print(f"layer_bytes: {layer_bytes}")
-    print(f"payload_bytes: {payload_bytes}")
-    print(f"store_bytes: {store_bytes}")
+    print(f"payload_bytes: {plan.data_size}")
+    print(f"store_bytes: {plan.store_size}")
+
+
+def deepseek_affine2_component(
+        mlx,
+        layer: int,
+        expert: int,
+        role: int,
+        hidden_size: int,
+        intermediate_size: int,
+        gate_source_group: int,
+) -> bytes:
+    specs = (
+        ("gate_proj", hidden_size, intermediate_size, gate_source_group, 32),
+        ("up_proj", hidden_size, intermediate_size, 64, 64),
+        ("down_proj", intermediate_size, hidden_size, 64, 64),
+    )
+    if not 0 <= role < len(specs):
+        raise FormatError(f"invalid DeepSeek affine2 role {role}")
+    role_name, input_dim, rows, source_group, target_group = specs[role]
+    prefix = f"model.layers.{layer}.ffn.switch_mlp.{role_name}"
+    weights = mlx.expert_bytes(
+        prefix + ".weight", "U32",
+        (mlx.expert_count, rows, input_dim // 16), expert,
+    )
+    scales = mlx.expert_bytes(
+        prefix + ".scales", "BF16",
+        (mlx.expert_count, rows, input_dim // source_group), expert,
+    )
+    biases = mlx.expert_bytes(
+        prefix + ".biases", "BF16",
+        (mlx.expert_count, rows, input_dim // source_group), expert,
+    )
+    return interleave_mlx_affine2(
+        weights, scales, biases, rows, input_dim,
+        source_group, target_group,
+    )
+
+
+def raw_store(path: Path) -> tuple[dict[str, object], list[Layer]]:
+    path = path.resolve()
+    size = path.stat().st_size
+    fake = GGUF(path, size, 0, 0, STORE_ALIGNMENT, b"", {}, [], 0)
+    tensor = Tensor(STORE_TENSOR, (size,), 24, 0, size, abs_offset=0)
+    return parse_store(fake, tensor)
+
+
+def _fsync_directory(path: Path) -> None:
+    fd = os.open(path, os.O_RDONLY)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def _volume_is_internal(path: Path) -> bool | None:
+    if sys.platform != "darwin":
+        return None
+    try:
+        result = subprocess.run(
+            ["/usr/sbin/diskutil", "info", "-plist", str(path)],
+            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+        )
+        if result.returncode:
+            return None
+        info = plistlib.loads(result.stdout)
+        value = info.get("Internal")
+        return value if isinstance(value, bool) else None
+    except (OSError, plistlib.InvalidFileException):
+        return None
+
+
+def check_deepseek_output_space(
+        destination: Path, required: int, reserve: int) -> None:
+    if reserve < 0:
+        raise FormatError("reserve space cannot be negative")
+    free = shutil.disk_usage(destination.parent).free
+    if free < required + reserve:
+        internal = _volume_is_internal(destination.parent)
+        kind = "internal volume" if internal else \
+            ("external volume" if internal is False else "destination volume")
+        raise FormatError(
+            f"insufficient free space on {kind}: need {required + reserve} "
+            f"bytes ({required} store + {reserve} reserve), have {free}"
+        )
+
+
+def _checkpoint_paths(destination: Path) -> tuple[Path, Path]:
+    partial = destination.with_name(f".{destination.name}.partial")
+    state = destination.with_name(f".{destination.name}.resume.json")
+    return partial, state
+
+
+def _checkpoint_identity(
+        plan: StorePlan,
+        source_digest: bytes,
+        gate_groups: tuple[int, ...],
+) -> dict[str, object]:
+    return {
+        "schema": "ds4-deepseek-mlx-affine2-resume-v1",
+        "source_manifest_sha256": source_digest.hex(),
+        "descriptor_sha256": hashlib.sha256(plan.descriptor_bytes).hexdigest(),
+        "store_size": plan.store_size,
+        "data_offset": plan.data_offset,
+        "layer_count": plan.layer_count,
+        "expert_count": plan.expert_count,
+        "gate_source_groups": list(gate_groups),
+    }
+
+
+def _write_checkpoint(path: Path, state: dict[str, object]) -> None:
+    temporary = path.with_name(f".{path.name}.tmp.{os.getpid()}")
+    if temporary.exists():
+        raise FormatError(f"checkpoint temporary path already exists: {temporary}")
+    fd = os.open(temporary, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
+    try:
+        data = (json.dumps(state, sort_keys=True, indent=2) + "\n").encode()
+        pwrite_all(fd, data, 0)
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+    try:
+        os.replace(temporary, path)
+        _fsync_directory(path.parent)
+    except BaseException:
+        temporary.unlink(missing_ok=True)
+        raise
+
+
+def _hash_fd_range(
+        fd: int, offset: int, size: int, digest: Digest) -> None:
+    completed = 0
+    while completed < size:
+        take = min(IO_BYTES, size - completed)
+        digest.update(pread_exact(fd, take, offset + completed))
+        completed += take
+
+
+def verify_deepseek_affine2_store_from_source(
+        mlx,
+        store_path: Path,
+        plan: StorePlan,
+        gate_groups: tuple[int, ...],
+        source_digest: bytes,
+        *,
+        hidden_size: int = 4096,
+        intermediate_size: int = 2048,
+) -> bytes:
+    manifest, layers = raw_store(store_path)
+    if (manifest["family"] != STORE_FAMILY_DEEPSEEK4 or
+            manifest["storage_format"] != STORE_STORAGE_MLX_AFFINE2 or
+            manifest["group_size"] !=
+                STORE_GROUP_PROFILE_AFFINE2_G32_U64_D64 or
+            manifest["layer_count"] != plan.layer_count or
+            manifest["expert_count"] != plan.expert_count or
+            manifest["expert_used"] != plan.expert_used_count or
+            manifest["source_tensors"] != plan.source_tensor_count or
+            manifest["source_size"] != plan.source.size or
+            manifest["source_sha256"] != source_digest or
+            len(layers) != len(plan.layers)):
+        raise FormatError("DeepSeek affine2 store identity differs")
+    if len(gate_groups) != plan.layer_count:
+        raise FormatError("DeepSeek affine2 gate group inventory differs")
+    fd = os.open(store_path, os.O_RDONLY)
+    payload_hash = hashlib.sha256()
+    try:
+        manifest_end = STORE_HEADER_BYTES + len(plan.descriptor_bytes)
+        header_padding = pread_exact(
+            fd, plan.data_offset - manifest_end, manifest_end
+        )
+        if any(header_padding):
+            raise FormatError("non-zero DeepSeek affine2 manifest padding")
+        cursor = plan.data_offset
+        for ordinal, (expected_layer, actual_layer) in enumerate(
+                zip(plan.layers, layers), 1):
+            if pack_affine2_layer(actual_layer) != pack_affine2_layer(expected_layer):
+                raise FormatError(
+                    f"DeepSeek affine2 descriptor differs at layer {ordinal - 1}"
+                )
+            gap = actual_layer.data_offset - cursor
+            if gap:
+                padding = pread_exact(fd, gap, cursor)
+                if any(padding):
+                    raise FormatError(
+                        f"non-zero padding before affine2 layer {actual_layer.index}"
+                    )
+                payload_hash.update(padding)
+            for expert in range(plan.expert_count):
+                for component in actual_layer.components:
+                    expected = deepseek_affine2_component(
+                        mlx, actual_layer.index, expert, component.role,
+                        hidden_size, intermediate_size,
+                        gate_groups[actual_layer.index],
+                    )
+                    if len(expected) != component.expert_bytes:
+                        raise FormatError(
+                            f"affine2 component size differs at layer "
+                            f"{actual_layer.index} expert {expert} role "
+                            f"{component.role}"
+                        )
+                    offset = (actual_layer.data_offset +
+                              expert * actual_layer.record_bytes +
+                              component.record_offset)
+                    actual = pread_exact(fd, component.expert_bytes, offset)
+                    payload_hash.update(actual)
+                    if actual != expected:
+                        raise FormatError(
+                            f"affine2 payload differs at layer "
+                            f"{actual_layer.index} expert {expert} role "
+                            f"{component.role}"
+                        )
+            cursor = actual_layer.data_offset + actual_layer.data_size
+            print(
+                f"\rverify DeepSeek affine2 layers {ordinal}/{plan.layer_count}",
+                end="", file=sys.stderr, flush=True,
+            )
+        print(file=sys.stderr)
+        if cursor != plan.store_size:
+            raise FormatError("DeepSeek affine2 verification did not cover the store")
+    finally:
+        os.close(fd)
+    digest = payload_hash.digest()
+    if digest != manifest["payload_sha256"]:
+        raise FormatError("DeepSeek affine2 payload SHA-256 mismatch")
+    return digest
+
+
+def write_deepseek_affine2_store_from_source(
+        mlx,
+        destination: Path,
+        plan: StorePlan,
+        gate_groups: tuple[int, ...],
+        source_digest: bytes,
+        reserve: int,
+        *,
+        resume: bool,
+        verify_after: bool,
+        hidden_size: int = 4096,
+        intermediate_size: int = 2048,
+        progress_hook: Callable[[int], None] | None = None,
+) -> bytes:
+    destination = destination.resolve()
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    if destination.exists():
+        raise FormatError(f"destination already exists: {destination}")
+    if len(gate_groups) != plan.layer_count or len(source_digest) != 32:
+        raise FormatError("invalid DeepSeek affine2 writer identity")
+    partial, state_path = _checkpoint_paths(destination)
+    identity = _checkpoint_identity(plan, source_digest, gate_groups)
+    completed_layers = 0
+    fd = -1
+    owns_partial = False
+    payload_hash = hashlib.sha256()
+    try:
+        if partial.exists() or state_path.exists():
+            if not resume or not partial.exists() or not state_path.exists():
+                raise FormatError(
+                    f"incomplete output exists; use --resume after checking "
+                    f"{partial} and {state_path}"
+                )
+            try:
+                checkpoint = json.loads(state_path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError) as exc:
+                raise FormatError(f"invalid resume checkpoint: {exc}") from exc
+            completed_layers = checkpoint.pop("completed_layers", None)
+            if checkpoint != identity or not isinstance(completed_layers, int) or \
+                    not 0 <= completed_layers <= plan.layer_count:
+                raise FormatError("resume checkpoint identity differs")
+            if partial.stat().st_size != plan.store_size:
+                raise FormatError("resume partial size differs")
+            fd = os.open(partial, os.O_RDWR)
+            provisional = make_header(plan, source_digest, bytes(32))
+            provisional = make_header(
+                plan, source_digest, bytes(32),
+                manifest_digest(provisional, plan.descriptor_bytes),
+            )
+            expected_prefix = provisional + plan.descriptor_bytes
+            if pread_exact(fd, len(expected_prefix), 0) != expected_prefix:
+                raise FormatError("resume partial manifest differs")
+            if any(pread_exact(
+                    fd, plan.data_offset - len(expected_prefix),
+                    len(expected_prefix))):
+                raise FormatError("resume partial header padding differs")
+            completed_end = plan.layers[completed_layers - 1].data_offset + \
+                plan.layers[completed_layers - 1].data_size \
+                if completed_layers else plan.data_offset
+            check_deepseek_output_space(
+                destination, plan.store_size - completed_end, reserve
+            )
+            _hash_fd_range(
+                fd, plan.data_offset, completed_end - plan.data_offset,
+                payload_hash,
+            )
+            print(
+                f"resume DeepSeek affine2 at layer {completed_layers}/"
+                f"{plan.layer_count}", file=sys.stderr,
+            )
+        else:
+            check_deepseek_output_space(destination, plan.store_size, reserve)
+            fd = os.open(partial, os.O_CREAT | os.O_EXCL | os.O_RDWR, 0o644)
+            owns_partial = True
+            os.ftruncate(fd, plan.store_size)
+            provisional = make_header(plan, source_digest, bytes(32))
+            provisional = make_header(
+                plan, source_digest, bytes(32),
+                manifest_digest(provisional, plan.descriptor_bytes),
+            )
+            pwrite_all(fd, provisional, 0)
+            pwrite_all(fd, plan.descriptor_bytes, STORE_HEADER_BYTES)
+            if resume:
+                _write_checkpoint(
+                    state_path, {**identity, "completed_layers": 0}
+                )
+
+        for ordinal in range(completed_layers, plan.layer_count):
+            layer = plan.layers[ordinal]
+            for expert in range(plan.expert_count):
+                for component in layer.components:
+                    packed = deepseek_affine2_component(
+                        mlx, layer.index, expert, component.role,
+                        hidden_size, intermediate_size,
+                        gate_groups[layer.index],
+                    )
+                    if len(packed) != component.expert_bytes:
+                        raise FormatError(
+                            f"affine2 record size differs at layer {layer.index} "
+                            f"expert {expert} role {component.role}"
+                        )
+                    offset = (layer.data_offset + expert * layer.record_bytes +
+                              component.record_offset)
+                    pwrite_all(fd, packed, offset)
+                    payload_hash.update(packed)
+            os.fsync(fd)
+            if resume:
+                _write_checkpoint(
+                    state_path,
+                    {**identity, "completed_layers": ordinal + 1},
+                )
+            print(
+                f"\rwrite DeepSeek affine2 layers {ordinal + 1}/"
+                f"{plan.layer_count}",
+                end="", file=sys.stderr, flush=True,
+            )
+            if progress_hook is not None:
+                progress_hook(ordinal + 1)
+        print(file=sys.stderr)
+        payload_digest = payload_hash.digest()
+        provisional = make_header(plan, source_digest, payload_digest)
+        header = make_header(
+            plan, source_digest, payload_digest,
+            manifest_digest(provisional, plan.descriptor_bytes),
+        )
+        pwrite_all(fd, header, 0)
+        os.fsync(fd)
+        os.close(fd)
+        fd = -1
+        if verify_after:
+            verified = verify_deepseek_affine2_store_from_source(
+                mlx, partial, plan, gate_groups, source_digest,
+                hidden_size=hidden_size,
+                intermediate_size=intermediate_size,
+            )
+            if verified != payload_digest:
+                raise FormatError("post-write affine2 digest differs")
+        if destination.exists():
+            raise FormatError(f"destination appeared during build: {destination}")
+        os.replace(partial, destination)
+        _fsync_directory(destination.parent)
+        state_path.unlink(missing_ok=True)
+        _fsync_directory(destination.parent)
+    except BaseException:
+        if fd >= 0:
+            os.close(fd)
+        if owns_partial and (not resume or not state_path.exists()):
+            partial.unlink(missing_ok=True)
+            state_path.unlink(missing_ok=True)
+        raise
+    return payload_digest
+
+
+def write_deepseek_mlx_affine2(
+        model_dir: Path,
+        destination: Path,
+        expected_revision: str,
+        reserve: int,
+        *,
+        resume: bool,
+        verify_after: bool,
+) -> None:
+    donor = load_deepseek_affine2_donor(
+        model_dir, expected_revision,
+        require_hydrated=True, verify_shards=False,
+    )
+    plan = make_deepseek_affine2_store_plan(
+        donor.source_size, donor.source_tensor_count
+    )
+    # Reject an undersized destination before spending a full sequential pass
+    # hashing the 19 hydrated source shards.
+    destination = destination.resolve()
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    partial, state_path = _checkpoint_paths(destination)
+    if partial.exists() or state_path.exists():
+        if not resume or not partial.exists() or not state_path.exists():
+            raise FormatError(
+                f"incomplete output exists; use --resume after checking "
+                f"{partial} and {state_path}"
+            )
+        # The exact remaining payload is checked after checkpoint validation.
+        check_deepseek_output_space(destination, 0, reserve)
+    else:
+        check_deepseek_output_space(destination, plan.store_size, reserve)
+    for ordinal, (name, oid, size) in enumerate(donor.shard_oids, 1):
+        path = donor.model_dir / name
+        if path.stat().st_size != size or \
+                hash_file(path, f"hash donor shard {ordinal}/19").hex() != oid:
+            raise FormatError(f"Git LFS SHA-256 mismatch for {name}")
+    mlx = MLXAffineSource(donor.model_dir)
+    mlx.expert_count = plan.expert_count
+    try:
+        payload_digest = write_deepseek_affine2_store_from_source(
+            mlx, destination, plan, donor.gate_groups,
+            donor.source_digest, reserve,
+            resume=resume, verify_after=verify_after,
+        )
+    finally:
+        mlx.close()
+    print(f"installed atomically: {destination.resolve()}")
+    print("storage: mlx-affine2-gate32-up64-down64")
+    print(f"donor_origin: {donor.origin}")
+    print(f"donor_revision: {donor.revision}")
+    print(f"config_sha256: {donor.config_sha256}")
+    print(f"index_sha256: {donor.index_sha256}")
+    print(f"source_manifest_sha256: {donor.source_digest.hex()}")
+    print(f"payload_sha256: {payload_digest.hex()}")
+    print(f"store_bytes: {plan.store_size}")
+
+
+def verify_deepseek_mlx_affine2(
+        model_dir: Path,
+        store_path: Path,
+        expected_revision: str,
+) -> None:
+    donor = load_deepseek_affine2_donor(
+        model_dir, expected_revision,
+        require_hydrated=True, verify_shards=True,
+    )
+    plan = make_deepseek_affine2_store_plan(
+        donor.source_size, donor.source_tensor_count
+    )
+    mlx = MLXAffineSource(donor.model_dir)
+    mlx.expert_count = plan.expert_count
+    try:
+        digest = verify_deepseek_affine2_store_from_source(
+            mlx, store_path, plan, donor.gate_groups, donor.source_digest
+        )
+    finally:
+        mlx.close()
+    print(f"valid DeepSeek MLX affine2 ExpertMajor v2 store: {store_path.resolve()}")
+    print(f"source_manifest_sha256: {donor.source_digest.hex()}")
+    print(f"payload_sha256: {digest.hex()}")
 
 
 def repack_mlx_affine(native_path: Path, mlx_dir: Path,
@@ -1456,18 +2131,40 @@ def main() -> int:
     affine_parser.add_argument("destination", type=Path)
     deepseek_affine_parser = subparsers.add_parser(
         "repack-deepseek-mlx-affine2",
-        help=("validate and print the pinned DeepSeek affine2 physical plan; "
-              "the payload writer is not implemented in this slice"),
+        help=("write the pinned DeepSeek MLX affine2 routed weights as one "
+              "standalone ExpertMajor v2 store"),
     )
     deepseek_affine_parser.add_argument(
-        "--dry-run", action="store_true", required=True,
-        help="required: validate provenance/index and print the layout only",
+        "--dry-run", action="store_true",
+        help="validate provenance/index and print the layout without writing",
     )
     deepseek_affine_parser.add_argument(
         "--expected-revision", required=True,
         help="full pinned donor Git revision",
     )
+    deepseek_affine_parser.add_argument(
+        "--reserve-bytes", type=parse_bytes, default=1 << 30,
+    )
+    deepseek_affine_parser.add_argument(
+        "--resume", action="store_true",
+        help="checkpoint each completed layer and resume a matching partial",
+    )
+    deepseek_affine_parser.add_argument(
+        "--skip-verify", action="store_true",
+        help="diagnostic only; publication builds verify byte-for-byte by default",
+    )
     deepseek_affine_parser.add_argument("mlx_model", type=Path)
+    deepseek_affine_parser.add_argument("destination", type=Path, nargs="?")
+    deepseek_verify_parser = subparsers.add_parser(
+        "verify-deepseek-mlx-affine2",
+        help="verify a standalone affine2 store against the pinned MLX donor",
+    )
+    deepseek_verify_parser.add_argument(
+        "--expected-revision", required=True,
+        help="full pinned donor Git revision",
+    )
+    deepseek_verify_parser.add_argument("mlx_model", type=Path)
+    deepseek_verify_parser.add_argument("store", type=Path)
     args = parser.parse_args()
     try:
         if args.command == "inspect":
@@ -1483,8 +2180,23 @@ def main() -> int:
                 args.reserve_bytes,
             )
         elif args.command == "repack-deepseek-mlx-affine2":
-            plan_deepseek_mlx_affine2(
-                args.mlx_model, args.expected_revision,
+            if args.dry_run:
+                if args.destination is not None:
+                    raise FormatError("--dry-run does not accept a destination")
+                plan_deepseek_mlx_affine2(
+                    args.mlx_model, args.expected_revision,
+                )
+            else:
+                if args.destination is None:
+                    raise FormatError("destination is required unless --dry-run is used")
+                write_deepseek_mlx_affine2(
+                    args.mlx_model, args.destination, args.expected_revision,
+                    args.reserve_bytes, resume=args.resume,
+                    verify_after=not args.skip_verify,
+                )
+        elif args.command == "verify-deepseek-mlx-affine2":
+            verify_deepseek_mlx_affine2(
+                args.mlx_model, args.store, args.expected_revision,
             )
         return 0
     except (FormatError, OSError) as exc:
