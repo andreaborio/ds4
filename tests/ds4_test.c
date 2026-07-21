@@ -3060,10 +3060,10 @@ static void test_metal_q4_selected_slots_runtime_count(void) {
         NULL, true, &resident_host_route));
     TEST_ASSERT(ds4_gpu_internal_qwen35_resident_gpu_route_calls() == 1);
     TEST_ASSERT(ds4_gpu_internal_qwen35_resident_host_readbacks() == 1);
-    for (uint32_t row = 0; row < OUT_DIM; row++) {
-        TEST_ASSERT(fabsf(resident_gpu_route.out[row] -
-                          resident_host_route.out[row]) < 1.0e-4f);
-    }
+    TEST_ASSERT(test_metal_qwen35_close(
+        "resident GPU route vs host replay",
+        resident_gpu_route.out, resident_host_route.out, OUT_DIM,
+        1.0e-4f, 1.0e-7f));
 
     test_metal_qwen_top8_result resident_repeat = {0};
     TEST_ASSERT(test_metal_qwen_top8_case(
