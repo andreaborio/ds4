@@ -43,6 +43,7 @@ INSTALL_SOURCE_PROGRAMS = $(addprefix $(INSTALL_SOURCE_BINDIR)/,$(HEBRUS_PROGRAM
 	qwen-reference-test qwen-unicode-test qwen-tokenizer-test \
 	qwen-expert-group-test expert-store-test metal-ssd-profile-test \
 	download-model-test capabilities-test command-alias-test \
+	visible-identity-test \
 	install uninstall install-test $(PROGRAMS) \
 	ds4_test ds4_agent_test
 
@@ -90,7 +91,8 @@ METAL_TEST_BINS := \
 	$(METAL_BINDIR)/test_qwen_expert_group \
 	$(METAL_BINDIR)/test_expert_store \
 	$(METAL_BINDIR)/test_metal_ssd_profile \
-	$(METAL_BINDIR)/test_ssd_residency
+	$(METAL_BINDIR)/test_ssd_residency \
+	$(METAL_BINDIR)/test_visible_identity
 
 all: metal
 
@@ -406,6 +408,21 @@ $(METAL_BINDIR)/test_ssd_residency: \
 	@mkdir -p "$(@D)"
 	$(CC) $(CFLAGS) -o $@ $^ $(LDLIBS)
 
+$(METAL_BINDIR)/test_visible_identity: \
+		tests/test_visible_identity.c hebrus_identity.h
+	@mkdir -p "$(@D)"
+	$(CC) $(CFLAGS) -I. -o $@ $<
+
+$(CPU_BINDIR)/test_visible_identity: \
+		tests/test_visible_identity.c hebrus_identity.h
+	@mkdir -p "$(@D)"
+	$(CC) $(CFLAGS) -DDS4_NO_GPU -I. -o $@ $<
+
+visible-identity-test: $(METAL_BINDIR)/test_visible_identity \
+		$(CPU_BINDIR)/test_visible_identity
+	$(METAL_BINDIR)/test_visible_identity
+	$(CPU_BINDIR)/test_visible_identity
+
 $(METAL_BINDIR)/test_qwen_gdn_ref: \
 		$(METAL_OBJDIR)/test_qwen_gdn_ref.o $(METAL_OBJDIR)/ds4_qwen_ref.o \
 		$(METAL_OBJDIR)/ds4_qwen.o
@@ -509,6 +526,7 @@ model-free-test: metal ds4_test ds4_agent_test $(METAL_BINDIR)/test_q4k_dot \
 		$(METAL_BINDIR)/test_expert_store \
 		$(METAL_BINDIR)/test_metal_ssd_profile \
 		$(METAL_BINDIR)/test_ssd_residency download-model-test \
+		visible-identity-test \
 		tests/test_capabilities.py tests/test_command_aliases.py
 	python3 tests/test_capabilities.py --bin-dir $(METAL_BINDIR) --backend metal
 	python3 tests/test_command_aliases.py --bin-dir $(METAL_BINDIR) \
@@ -721,7 +739,8 @@ model-free-test: $(PROGRAMS) ds4_test ds4_agent_test q4k-dot-test \
 		tests/test_qwen_expert_group \
 		tests/test_expert_store \
 		tests/test_metal_ssd_profile \
-		tests/test_ssd_residency download-model-test tests/test_capabilities.py \
+		tests/test_ssd_residency download-model-test visible-identity-test \
+		tests/test_capabilities.py \
 		tests/test_command_aliases.py
 	python3 tests/test_capabilities.py --bin-dir . --backend cpu
 	python3 tests/test_command_aliases.py --bin-dir . --backend cpu --layout profile
@@ -753,6 +772,12 @@ capabilities-test: $(PROGRAMS) tests/test_capabilities.py
 
 command-alias-test: $(PROGRAMS) tests/test_command_aliases.py
 	python3 tests/test_command_aliases.py --bin-dir . --backend cpu --layout profile
+
+tests/test_visible_identity: tests/test_visible_identity.c hebrus_identity.h
+	$(CC) $(CFLAGS) -DDS4_NO_GPU -I. -o $@ $<
+
+visible-identity-test: tests/test_visible_identity
+	./tests/test_visible_identity
 
 test: model-free-test
 	./ds4_test
@@ -947,4 +972,5 @@ clean:
 		tests/test_qwen_expert_group \
 		tests/test_expert_store \
 		tests/test_metal_ssd_profile \
-		tests/test_ssd_residency *.o
+		tests/test_ssd_residency \
+		tests/test_visible_identity *.o

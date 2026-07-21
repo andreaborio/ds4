@@ -54,7 +54,7 @@ typedef struct {
     bool ssd_streaming_cold;
 } bench_config;
 
-static const char *bench_public_command = "ds4-bench";
+static const char *bench_invocation = "ds4-bench";
 
 static double bench_now_sec(void) {
     struct timespec ts;
@@ -387,7 +387,8 @@ static int write_frontier_logits_json(
     }
 
     const int argmax = ds4_session_argmax(session);
-    fprintf(fp, "{\n  \"source\":\"%s\",\n  \"model\":", bench_public_command);
+    fprintf(fp, "{\n  \"source\":\"%s\",\n  \"model\":",
+            hebrus_bench_command_for(bench_invocation));
     json_write_string(fp, cfg->model_path);
     fprintf(fp,
             ",\n  \"backend\":\"%s\",\n  \"quality\":%s,\n"
@@ -564,7 +565,7 @@ static void log_context_memory(ds4_backend backend,
 }
 
 int main(int argc, char **argv) {
-    if (hebrus_is_canonical_invocation(argv[0])) bench_public_command = "hebrus-bench";
+    bench_invocation = argv[0];
     hebrus_help_set_invocation(argv[0]);
     if (ds4_build_info_requested(argc, argv)) {
         ds4_build_info_print(stdout, argv[0]);

@@ -257,7 +257,7 @@
       "location": "content",
       "token": "DS4",
       "classification": "compatibility",
-      "maximum": 41
+      "maximum": 43
     },
     {
       "path": "ONEDGE_IMATRIX.md",
@@ -796,7 +796,7 @@
       "location": "content",
       "token": "ds4",
       "classification": "migration-pending",
-      "maximum": 354
+      "maximum": 353
     },
     {
       "path": "ds4_agent.c",
@@ -804,13 +804,6 @@
       "token": "DS4",
       "classification": "migration-pending",
       "maximum": 45
-    },
-    {
-      "path": "ds4_agent.c",
-      "location": "content",
-      "token": "DwarfStar",
-      "classification": "migration-pending",
-      "maximum": 1
     },
     {
       "path": "ds4_bench.c",
@@ -1567,6 +1560,20 @@
       "token": "DS4",
       "classification": "migration-pending",
       "maximum": 40
+    },
+    {
+      "path": "hebrus_identity.h",
+      "location": "content",
+      "token": "ds4",
+      "classification": "compatibility",
+      "maximum": 5
+    },
+    {
+      "path": "hebrus_identity.h",
+      "location": "content",
+      "token": "DwarfStar",
+      "classification": "compatibility",
+      "maximum": 1
     },
     {
       "path": "linenoise.c",
@@ -2498,6 +2505,20 @@
       "token": "DS4",
       "classification": "migration-pending",
       "maximum": 53
+    },
+    {
+      "path": "tests/test_visible_identity.c",
+      "location": "content",
+      "token": "ds4",
+      "classification": "compatibility",
+      "maximum": 12
+    },
+    {
+      "path": "tests/test_visible_identity.c",
+      "location": "content",
+      "token": "DwarfStar",
+      "classification": "compatibility",
+      "maximum": 1
     },
     {
       "path": "tools/brand_boundary_audit.py",
