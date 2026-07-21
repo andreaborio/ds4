@@ -81,10 +81,11 @@ next sections.
 
 ## Model Weights
 
-This implementation only works with the ExpertMajor v2 GGUFs published for
-this project. It is not a general GGUF loader, and arbitrary Qwen, DeepSeek,
-GLM, or community GGUF files will not have the validated embedded store,
-tensor layout, quantization mix, or metadata expected by the engine. The 2 bit
+This implementation only works with the explicitly qualified ExpertMajor v2
+GGUFs published for this project. It is not a general GGUF loader, and
+arbitrary Qwen, DeepSeek, GLM, or community GGUF files will not have the
+validated embedded store, tensor layout, quantization mix, or metadata expected
+by the engine. The 2 bit
 DeepSeek quantizations provided here are not
 a joke: they behave well, work under coding agents, call tools in a reliable way.
 The 2 bit quants use a very asymmetrical quantization: only the routed MoE
@@ -100,15 +101,18 @@ complete output SHA-256 in its publication record:
   [`deepseek-expert-major-v2.md`](deepseek-expert-major-v2.md). The current
   canonical mirror is an offline converter source, not the runtime artifact.
 - [GLM 5.2 DS4 GGUF](https://huggingface.co/andreaborio/GLM-5.2-DS4-GGUF)
-- [Qwen3.6-35B-A3B DS4 GGUF](https://huggingface.co/andreaborio/Qwen3.6-35B-A3B-DS4-GGUF)
+- [Qwen3.6-35B-A3B DS4 GGUF](https://huggingface.co/andreaborio/Qwen3.6-35B-A3B-DS4-GGUF):
+  use only the MLX affine4/group-64 artifact identified in
+  [`qwen-expert-major-store.md`](qwen-expert-major-store.md). The older Q4_K_S
+  object is incompatible with this runtime.
 
 Use the exact artifact, size, and SHA-256 recorded in the family documentation.
-`download_model.sh` exposes the three qualified runtime artifacts as explicit
-`*-v2` targets. Its clearly named `offline-*` targets download only complete
-canonical converter inputs; distributed slices and legacy runtime targets are
-not exposed. The script never creates `./ds4flash.gguf`. Convert and verify an
-offline source with `gguf-tools/ds4-expert-major.py` before publication or
-inference.
+`download_model.sh` exposes all three published runtime artifacts as explicit
+`*-v2` targets. The clearly named `offline-*` targets download
+only complete canonical converter inputs; distributed slices and legacy
+runtime targets are not exposed. The script never creates `./ds4flash.gguf`.
+Convert and verify an offline source with `gguf-tools/ds4-expert-major.py`
+before publication or inference.
 
 If you want to regenerate GGUF files or collect a new imatrix, see
 [gguf-tools/README.md](../gguf-tools/README.md). Those tools are meant for offline

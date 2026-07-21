@@ -98,6 +98,25 @@ DS4_TEST_VECTOR_FILE=/path/to/official.vec ./ds4_test --logprob-vectors
 DS4_TEST_LONG_PROMPT=/path/to/prompt.txt ./ds4_test --long-context
 ```
 
+### Artifact publication boundary
+
+Runtime qualification does not make a local artifact publicly downloadable.
+A runtime download target may be enabled only after an immutable repository
+revision records the exact filename, byte count, complete output SHA-256,
+manifest contract, and compatible runtime commit. Until then, contributor QA
+may use an explicitly labelled local candidate, but release and download checks
+must report public distribution as unavailable.
+
+The current Qwen release is
+`Qwen3.6-35B-A3B-DS4-ExpertMajor-v2-MLX-Affine4-G64.gguf`, 20,808,566,880
+bytes, SHA-256
+`dd17266185833a9f05531ce366fd7284ddca1ed64aa3dcf06e321e8c72c9ea3d`.
+It is published at immutable repository revision
+`7bf9c3f7f6136aeb2599d75ee61c0cc2f18e2b02`, and
+`download_model.sh qwen-v2` must pin that exact identity. The older Q4_K_S
+object is an incompatible negative fixture, not a runnable fallback. See
+[`docs/qwen-expert-major-store.md`](docs/qwen-expert-major-store.md).
+
 CUDA and ROCm are frozen and their backend source and build targets are absent
 from the active tree. Ordinary changes must not restore them accidentally. A
 change that intentionally reactivates either backend must restore and pass the

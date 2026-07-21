@@ -109,9 +109,11 @@ Use this exact release identity for every Qwen model-backed gate:
 
 | Field | Value |
 | --- | --- |
-| File | `Qwen3.6-35B-A3B-DS4-ExpertMajor-v2-Q4_K_S.gguf` |
+| Publication state | Published at immutable revision `7bf9c3f7f6136aeb2599d75ee61c0cc2f18e2b02` |
+| File | `Qwen3.6-35B-A3B-DS4-ExpertMajor-v2-MLX-Affine4-G64.gguf` |
 | Bytes | `20,808,566,880` |
-| SHA-256 | `d7c43a6388ec20e6fe5530850350f96fdb0ac37c5ce36d3e5f92b172c447f56b` |
+| SHA-256 | `dd17266185833a9f05531ce366fd7284ddca1ed64aa3dcf06e321e8c72c9ea3d` |
+| Routed storage | MLX affine4, group size 64 |
 | Hugging Face | [`andreaborio/Qwen3.6-35B-A3B-DS4-GGUF`](https://huggingface.co/andreaborio/Qwen3.6-35B-A3B-DS4-GGUF) |
 
 The v2 file contains one routed-weight copy inside its checksummed embedded
@@ -127,7 +129,7 @@ The converter's full byte-identity verifier is the artifact gate:
 python3 gguf-tools/ds4-expert-major.py inspect CANONICAL-QWEN.gguf
 python3 gguf-tools/ds4-expert-major.py verify \
   CANONICAL-QWEN.gguf \
-  Qwen3.6-35B-A3B-DS4-ExpertMajor-v2-Q4_K_S.gguf
+  Qwen3.6-35B-A3B-DS4-ExpertMajor-v2-MLX-Affine4-G64.gguf
 ```
 
 Never use `--skip-verify` for a release artifact.
@@ -138,7 +140,7 @@ Resolve `QWEN_V2` to the absolute path whose size and complete SHA-256 match the
 table above. Normal startup is flag-free AUTO:
 
 ```sh
-QWEN_V2=/absolute/path/to/Qwen3.6-35B-A3B-DS4-ExpertMajor-v2-Q4_K_S.gguf
+QWEN_V2=/absolute/path/to/Qwen3.6-35B-A3B-DS4-ExpertMajor-v2-MLX-Affine4-G64.gguf
 ./ds4 -m "$QWEN_V2" --ctx 8192 \
   -n 32 --temp 0 \
   -p 'Scrivi solo una breve funzione Python che somma due interi.'
@@ -179,7 +181,8 @@ SSD mode must allocate the first 321-expert slab within its admitted budget and
 must not introduce swap. Keep warm page-cache evidence separate from cold
 device-I/O evidence, and never bypass a failed admission to obtain a number.
 
-The full publication baseline and interpretation are recorded in
-[`2026-07-20-qwen-expert-major-v2.md`](../../docs/benchmarks/2026-07-20-qwen-expert-major-v2.md).
-That dated record is evidence; `QA_BEFORE_RELEASES.md` remains authoritative for
+The current affine qualification and interpretation are recorded in
+[`2026-07-21-qwen-unified-affine-auto-ssd.md`](../../docs/benchmarks/2026-07-21-qwen-unified-affine-auto-ssd.md).
+That dated record is qualification evidence; the immutable repository revision
+is the publication manifest. `QA_BEFORE_RELEASES.md` remains authoritative for
 the complete release gate.

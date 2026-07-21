@@ -30,11 +30,16 @@ target, or an artifact whose complete output hash is missing.
 | `DEEPSEEK_V2` | `DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix-DS4-ExpertMajor-v2.gguf`; 86,720,114,272 bytes; SHA-256 `8378080263eb9224f7228d72e2afa4ac3cf74a116023fdec2c596ff228a33e3f` |
 | `DEEPSEEK_MIXED_V2` | Non-applicable until a mixed-quant DeepSeek ExpertMajor v2 artifact has a publication record with exact filename, bytes, and complete output SHA-256; do not resolve or use this variable before qualification |
 | `GLM_V2` | `GLM-5.2-DS4-ExpertMajor-v2-Q2_K.gguf`; 262,147,193,504 bytes; SHA-256 `7f5017e3076e706c78f2a5322b035a9e2f6519c65ff5b6be8b2d91aeff61505d` |
-| `QWEN_V2` | `Qwen3.6-35B-A3B-DS4-ExpertMajor-v2-MLX-Affine4-G64.gguf`; 20,808,566,880 bytes; SHA-256 `dd17266185833a9f05531ce366fd7284ddca1ed64aa3dcf06e321e8c72c9ea3d` |
+| `QWEN_V2` | `Qwen3.6-35B-A3B-DS4-ExpertMajor-v2-MLX-Affine4-G64.gguf`; immutable repository revision `7bf9c3f7f6136aeb2599d75ee61c0cc2f18e2b02`; 20,808,566,880 bytes; SHA-256 `dd17266185833a9f05531ce366fd7284ddca1ed64aa3dcf06e321e8c72c9ea3d`; MLX affine4/group-64 routed storage |
+| `QWEN_RETIRED_Q4_NEGATIVE` | Rejection-only input: `Qwen3.6-35B-A3B-DS4-ExpertMajor-v2-Q4_K_S.gguf`; 20,808,566,880 bytes; SHA-256 `d7c43a6388ec20e6fe5530850350f96fdb0ac37c5ce36d3e5f92b172c447f56b`; it must fail before inference |
 
 Record the test machine by hardware model, unified memory, OS build, and power
 state in the release evidence. Do not encode local hostnames, addresses, or
 network routes in this checklist.
+
+The Qwen runtime and downloader paths must both resolve the exact `QWEN_V2`
+identity above. The immutable revision, filename, byte count, complete output
+SHA-256, manifest contract, and compatible runtime commit are one release gate.
 
 ## 1. Repository And Build Sanity
 
@@ -188,13 +193,14 @@ context. Do not add an explicit residency, cache, preload, or ExpertMajor flag.
 
 The Qwen path on `main` follows the same repository, build, core-test, and
 regression rules as the other model paths. Use the verified normalized
-`QWEN_V2` artifact above and run the relevant model-backed smoke;
+`QWEN_V2` above and run the relevant model-backed smoke;
 canonical, v1, sidecar, and community GGUFs are not equivalent inputs.
 
 - Run `make model-free-test` and `./ds4_test --metal-kernels`. The latter must
   retain resident/SSD top-8 output equivalence, zero resident cache/`pread`
   accounting, malformed-route fail-closed behavior, and slab-growth checks.
-- Run `./ds4 -m "$QWEN_V2" --ctx 8192` for the normal flag-free AUTO smoke.
+- Run `./ds4 -m "$QWEN_V2" --ctx 8192` for the normal flag-free
+  AUTO smoke.
 - Run AUTO with the normal flag-free startup command; record both admission plans,
   their point-in-time inputs, resolved mode, cache tier, configured 321-expert
   slab target, cache `buffer_allocs`, task physical footprint, and system swap
@@ -209,6 +215,10 @@ canonical, v1, sidecar, and community GGUFs are not equivalent inputs.
 - Resident mode proves complete model mapping and full-tensor Metal execution,
   not that every mapped GGUF page remained physically resident. Measure the
   stronger claim separately if it is used in release language.
+- Run the model-free ExpertMajor admission fixture for a Qwen storage value of
+  GGML/Q4, and, when the exact retired file is available, run
+  `./ds4 -m "$QWEN_RETIRED_Q4_NEGATIVE" --ctx 8192`. Both must reject before
+  inference; a command that produces tokens is a release blocker.
 - Physical 16 GiB measurements and normalized-vs-source research comparisons
   improve hardware and artifact characterization, but are not additional
   release gates beyond the standard model/backend checks above. Do not claim
@@ -352,8 +362,10 @@ The agent is the most stateful component.  Test it manually, not only by build.
 
 - Test `download_model.sh` in a temporary directory so local weights are not
   overwritten.
-- Verify the `deepseek-v2`, `glm-v2`, and `qwen-v2` targets resolve to the exact
-  qualified repository and ExpertMajor v2 filename.
+- Verify `deepseek-v2`, `glm-v2`, and `qwen-v2` resolve to their exact qualified
+  repository, immutable revision, and ExpertMajor v2 filename. Qwen must pin
+  revision `7bf9c3f7f6136aeb2599d75ee61c0cc2f18e2b02` and must not resolve to the
+  retired Q4_K_S object.
 - Treat every `offline-*` target as a converter input, not a runnable artifact.
   Verify resume and file naming without launching inference from the source.
 - Verify the script never creates or changes `./ds4flash.gguf`, exposes no
@@ -379,8 +391,13 @@ The agent is the most stateful component.  Test it manually, not only by build.
 Do not sign off until:
 
 - macOS Metal Flash passed.
-- The qualified DeepSeek, GLM, and Qwen artifacts passed their model-backed
-  lanes with the residency modes defined by `docs/contracts/RUNTIME_SUPPORT.md`.
+- The qualified DeepSeek, GLM, and Qwen release artifacts passed their
+  model-backed lanes with the residency modes defined by
+  `docs/contracts/RUNTIME_SUPPORT.md`.
+- The Qwen immutable publication record and downloader gate matched the same
+  exact affine artifact used by the runtime lane.
+- The retired Qwen Q4_K_S store remained fail-closed and was not presented as a
+  runnable or downloadable fallback.
 - CUDA source/tests/build targets were confirmed absent and recorded as frozen;
   if any were restored, the complete section 6 reactivation gate passed.
 - ROCm source/tests/build targets were confirmed absent and recorded as frozen;

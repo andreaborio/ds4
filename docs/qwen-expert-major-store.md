@@ -97,6 +97,12 @@ used for publication.
 The v2 output is 3,456 bytes larger than its canonical converter input. It does
 not contain a second copy of the routed weights.
 
+These exact bytes and their matching manifest are published at immutable
+repository revision `7bf9c3f7f6136aeb2599d75ee61c0cc2f18e2b02`.
+`download_model.sh qwen-v2` pins that revision. The older Q4_K_S object is
+incompatible with the current runtime contract and is retained only for
+fail-closed testing.
+
 ## Qualification
 
 On an M5 Pro with 64 GiB, final resident prefill measured 1,661.18 t/s at 2K,
