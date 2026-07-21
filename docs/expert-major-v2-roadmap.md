@@ -18,7 +18,7 @@ records:
 - record, component, layer, and payload offsets with explicit alignment;
 - source GGUF, payload, and manifest SHA-256 identities.
 
-DS4 reconstructs canonical logical descriptors for graph binding and cache
+Hebrus reconstructs canonical logical descriptors for graph binding and cache
 identity only. Resident mapping, prefill, decode, and SSD cache fills resolve
 physical bytes through the manifest. Unknown families or versions, canonical
 routed tensors beside a v2 store, incomplete inventories, unsupported types,
@@ -49,14 +49,17 @@ layout.
 - **Implemented:** distinct `qwen35moe` family ID, 40-layer fail-closed
   geometry, generic v2 conversion, logical reconstruction, resident mapping,
   and SSD translation.
-- **Qualified candidate:** MLX affine4/group-64 resident and SSD execution on
+- **Qualified and published:** MLX affine4/group-64 resident and SSD execution on
   the hardware lanes recorded in the current benchmark index.
 - **Correctness:** the final resident and SSD lane retains deterministic token
   and logit comparisons with no new swapout in the recorded qualification.
-- **Local candidate, not yet published:**
+- **Release artifact:**
   `Qwen3.6-35B-A3B-DS4-ExpertMajor-v2-MLX-Affine4-G64.gguf`,
   20,808,566,880 bytes, SHA-256
   `dd17266185833a9f05531ce366fd7284ddca1ed64aa3dcf06e321e8c72c9ea3d`.
+  The immutable repository revision is
+  `7bf9c3f7f6136aeb2599d75ee61c0cc2f18e2b02`; its manifest requires runtime
+  commit `73a332fef82a0bcdd567d17e0de17aa004cad85d` or a compatible descendant.
   The former Q4_K_S artifact is retained only as a fail-closed negative case.
 
 ### DeepSeek V4

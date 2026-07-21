@@ -90,6 +90,7 @@ used for publication.
 | Artifact | `Qwen3.6-35B-A3B-DS4-ExpertMajor-v2-MLX-Affine4-G64.gguf` |
 | Artifact bytes | 20,808,566,880 |
 | Artifact SHA-256 | `dd17266185833a9f05531ce366fd7284ddca1ed64aa3dcf06e321e8c72c9ea3d` |
+| Minimum compatible runtime commit | `73a332fef82a0bcdd567d17e0de17aa004cad85d` |
 | Canonical source bytes | 20,808,563,424 |
 | Canonical source SHA-256 | `c33efb67bde86c9ba1f9e79c2dc42627170963bef0e915ab9b91a55cfb6d0fcd` |
 | Storage marker | `MLX_AFFINE4`, group size 64 |
@@ -99,9 +100,11 @@ not contain a second copy of the routed weights.
 
 These exact bytes and their matching manifest are published at immutable
 repository revision `7bf9c3f7f6136aeb2599d75ee61c0cc2f18e2b02`.
-`download_model.sh qwen-v2` pins that revision. The older Q4_K_S object is
-incompatible with the current runtime contract and is retained only for
-fail-closed testing.
+The manifest requires runtime commit
+`73a332fef82a0bcdd567d17e0de17aa004cad85d` or a compatible descendant;
+`download_model.sh qwen-v2` pins that revision and validates this relationship.
+The older Q4_K_S object is incompatible with the current runtime contract and
+is retained only for fail-closed testing.
 
 ## Qualification
 

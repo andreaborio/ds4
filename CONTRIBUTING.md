@@ -116,8 +116,10 @@ bytes, SHA-256
 `dd17266185833a9f05531ce366fd7284ddca1ed64aa3dcf06e321e8c72c9ea3d`.
 It is published at immutable repository revision
 `7bf9c3f7f6136aeb2599d75ee61c0cc2f18e2b02`, and
-`download_model.sh qwen-v2` must pin that exact identity. The older Q4_K_S
-object is an incompatible negative fixture, not a runnable fallback. See
+its manifest requires runtime commit
+`73a332fef82a0bcdd567d17e0de17aa004cad85d` or a compatible descendant.
+`download_model.sh qwen-v2` must pin and validate that exact identity. The older
+Q4_K_S object is an incompatible negative fixture, not a runnable fallback. See
 [`docs/qwen-expert-major-store.md`](docs/qwen-expert-major-store.md).
 
 CUDA and ROCm are frozen and their backend source and build targets are absent
@@ -140,6 +142,12 @@ make cpu
 On macOS, also run `make build-isolation-test`. The CPU-only binaries live in
 `build/cpu-$(uname -m)/bin`; `make cpu` intentionally leaves the root Metal
 commands unchanged.
+
+The GitHub Actions workflow runs the full Linux CPU/model-free premerge gate
+and a macOS arm64 lane that repeats the CPU suite, builds the Metal command
+surface, and checks Metal/CPU artifact isolation. Hosted compilation is not
+Metal kernel or qualified-model evidence; the hardware release gates below
+remain mandatory.
 
 The CPU backend is a reference/debug path, not the production performance
 target. Remember that executing the CPU path on Metal can crash the system
