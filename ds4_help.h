@@ -12,6 +12,11 @@ typedef enum {
     DS4_HELP_EVAL,
 } ds4_help_tool;
 
+/* Select the public command family from argv[0]. Canonical Hebrus binaries and
+ * legacy DS4 symlinks share one object graph, so help text must use the name
+ * through which that graph was invoked. */
+void hebrus_help_set_invocation(const char *argv0);
+
 /* Return true after printing the canonical error for a retired distributed
  * option. Both the exact spelling and --option=value forms are recognized. */
 bool ds4_help_reject_retired_distributed_option(

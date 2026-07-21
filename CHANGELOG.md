@@ -26,6 +26,14 @@ not represent a published release.
   compatibility boundary without changing durable model, cache, or historical
   identifiers.
 
+### Changed
+
+- Help headings, usage lines, examples, and retired-option diagnostics now use
+  the executable name that was invoked. Canonical `hebrus*` commands present
+  the Hebrus name, while the `ds4*` compatibility aliases preserve their
+  legacy command identity and the same options, defaults, streams, and exit
+  codes.
+
 ### Compatibility
 
 - The repository remains at <https://github.com/andreaborio/ds4> until an

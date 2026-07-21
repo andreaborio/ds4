@@ -88,10 +88,16 @@ def validate_pair(
     for args in PARITY_CASES:
         canonical_result = run(canonical, args)
         legacy_result = run(legacy, args)
+        canonical_name = os.fsencode(canonical.name)
+        legacy_name = os.fsencode(legacy.name)
+
+        def normalize(data: bytes) -> bytes:
+            return data.replace(canonical_name, legacy_name)
+
         canonical_record = (
             canonical_result.returncode,
-            canonical_result.stdout,
-            canonical_result.stderr,
+            normalize(canonical_result.stdout),
+            normalize(canonical_result.stderr),
         )
         legacy_record = (
             legacy_result.returncode,
@@ -100,6 +106,12 @@ def validate_pair(
         )
         if canonical_record != legacy_record:
             fail(f"{canonical.name}/{legacy.name} differ for {' '.join(args)}")
+
+        if args == ("--help",):
+            if not canonical_result.stdout.startswith(canonical_name + b"\n"):
+                fail(f"{canonical.name}: help does not use canonical invocation name")
+            if not legacy_result.stdout.startswith(legacy_name + b"\n"):
+                fail(f"{legacy.name}: help does not preserve legacy invocation name")
 
 
 def main() -> int:

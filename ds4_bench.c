@@ -561,6 +561,7 @@ static void log_context_memory(ds4_backend backend,
 }
 
 int main(int argc, char **argv) {
+    hebrus_help_set_invocation(argv[0]);
     if (ds4_build_info_requested(argc, argv)) {
         ds4_build_info_print(stdout);
         return 0;

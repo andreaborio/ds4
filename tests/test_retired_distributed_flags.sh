@@ -28,14 +28,7 @@ output_contains() {
 }
 
 diagnostic_name() {
-    case "$1" in
-        hebrus) echo ds4 ;;
-        hebrus-server) echo ds4-server ;;
-        hebrus-agent) echo ds4-agent ;;
-        hebrus-bench) echo ds4-bench ;;
-        hebrus-eval) echo ds4-eval ;;
-        *) echo "$1" ;;
-    esac
+    echo "$1"
 }
 
 for program in $PROGRAMS; do

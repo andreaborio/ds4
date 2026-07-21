@@ -100,13 +100,24 @@ static bool topic_is(const char *topic, const char *name) {
     return topic && strcmp(topic, name) == 0;
 }
 
+static bool help_hebrus_invocation;
+
+void hebrus_help_set_invocation(const char *argv0) {
+    const char *name = argv0 ? strrchr(argv0, '/') : NULL;
+    name = name ? name + 1 : argv0;
+    help_hebrus_invocation = name &&
+        (streq(name, "hebrus") || streq(name, "hebrus-server") ||
+         streq(name, "hebrus-agent") || streq(name, "hebrus-bench") ||
+         streq(name, "hebrus-eval"));
+}
+
 static const char *tool_name(ds4_help_tool tool) {
     switch (tool) {
-    case DS4_HELP_DS4: return "ds4";
-    case DS4_HELP_SERVER: return "ds4-server";
-    case DS4_HELP_AGENT: return "ds4-agent";
-    case DS4_HELP_BENCH: return "ds4-bench";
-    case DS4_HELP_EVAL: return "ds4-eval";
+    case DS4_HELP_DS4: return help_hebrus_invocation ? "hebrus" : "ds4";
+    case DS4_HELP_SERVER: return help_hebrus_invocation ? "hebrus-server" : "ds4-server";
+    case DS4_HELP_AGENT: return help_hebrus_invocation ? "hebrus-agent" : "ds4-agent";
+    case DS4_HELP_BENCH: return help_hebrus_invocation ? "hebrus-bench" : "ds4-bench";
+    case DS4_HELP_EVAL: return help_hebrus_invocation ? "hebrus-eval" : "ds4-eval";
     }
     return "ds4";
 }
@@ -144,28 +155,33 @@ bool ds4_help_reject_retired_distributed_option(
     return true;
 }
 
-static const char *tool_usage(ds4_help_tool tool) {
+static void print_tool_usage(FILE *fp, ds4_help_tool tool) {
     switch (tool) {
     case DS4_HELP_DS4:
-        return "Usage: ds4 [(-p PROMPT | --prompt-file FILE)] [options]";
+        fprintf(fp, "Usage: %s [(-p PROMPT | --prompt-file FILE)] [options]", tool_name(tool));
+        return;
     case DS4_HELP_SERVER:
-        return "Usage: ds4-server [options]";
+        fprintf(fp, "Usage: %s [options]", tool_name(tool));
+        return;
     case DS4_HELP_AGENT:
-        return "Usage: ds4-agent [options]";
+        fprintf(fp, "Usage: %s [options]", tool_name(tool));
+        return;
     case DS4_HELP_BENCH:
-        return "Usage: ds4-bench (--prompt-file FILE | --chat-prompt-file FILE) [options]";
+        fprintf(fp, "Usage: %s (--prompt-file FILE | --chat-prompt-file FILE) [options]", tool_name(tool));
+        return;
     case DS4_HELP_EVAL:
-        return "Usage: ds4-eval [options]";
+        fprintf(fp, "Usage: %s [options]", tool_name(tool));
+        return;
     }
-    return "Usage: ds4 [options]";
+    fprintf(fp, "Usage: %s [options]", tool_name(tool));
 }
 
 static const char *tool_summary(ds4_help_tool tool) {
     switch (tool) {
     case DS4_HELP_DS4:
-        return "Chat with a local DwarfStar model, run one-shot prompts, or inspect models.";
+        return "Chat with a local model, run one-shot prompts, or inspect models.";
     case DS4_HELP_SERVER:
-        return "Serve one loaded DwarfStar model through OpenAI, Responses, Anthropic, and completion-compatible HTTP APIs.";
+        return "Serve one loaded model through OpenAI, Responses, Anthropic, and completion-compatible HTTP APIs.";
     case DS4_HELP_AGENT:
         return "Run the native terminal coding agent with live tools, session save/restore, and a responsive prompt while the model works.";
     case DS4_HELP_BENCH:
@@ -463,45 +479,71 @@ static void print_more_info(FILE *fp, const help_colors *c, ds4_help_tool tool) 
     fputc('\n', fp);
 }
 
+static const char *example_command(char *buf, size_t size, ds4_help_tool tool,
+                                   const char *arguments) {
+    snprintf(buf, size, "./%s%s", tool_name(tool), arguments);
+    return buf;
+}
+
 static void print_examples(FILE *fp, const help_colors *c, ds4_help_tool tool, const char *topic) {
+    char command[256];
     title(fp, c, "Examples");
     if (topic_is(topic, "distributed")) {
         para(fp, c, "There is no supported distributed startup command.");
     } else if (topic_is(topic, "runtime")) {
         if (tool == DS4_HELP_SERVER) {
-            opt(fp, c, "Metal API", "./ds4-server -m ds4flash.gguf --metal --ctx 100000");
-            opt(fp, c, "quiet API", "./ds4-server --power 60 --host 127.0.0.1 --port 8000");
+            opt(fp, c, "Metal API", example_command(command, sizeof(command), tool,
+                                                     " -m ds4flash.gguf --metal --ctx 100000"));
+            opt(fp, c, "quiet API", example_command(command, sizeof(command), tool,
+                                                     " --power 60 --host 127.0.0.1 --port 8000"));
         } else if (tool == DS4_HELP_AGENT) {
-            opt(fp, c, "agent", "./ds4-agent -m ds4flash.gguf --ctx 100000");
-            opt(fp, c, "quiet agent", "./ds4-agent --power 50");
+            opt(fp, c, "agent", example_command(command, sizeof(command), tool,
+                                                 " -m ds4flash.gguf --ctx 100000"));
+            opt(fp, c, "quiet agent", example_command(command, sizeof(command), tool,
+                                                       " --power 50"));
         } else if (tool == DS4_HELP_BENCH) {
-            opt(fp, c, "bench", "./ds4-bench --prompt-file long.txt --ctx-max 32768");
-            opt(fp, c, "quiet bench", "./ds4-bench --prompt-file long.txt --power 70");
+            opt(fp, c, "bench", example_command(command, sizeof(command), tool,
+                                                 " --prompt-file long.txt --ctx-max 32768"));
+            opt(fp, c, "quiet bench", example_command(command, sizeof(command), tool,
+                                                       " --prompt-file long.txt --power 70"));
         } else if (tool == DS4_HELP_EVAL) {
-            opt(fp, c, "eval", "./ds4-eval --questions 10 --ctx 100000");
-            opt(fp, c, "CPU debug", "./ds4-eval --cpu --questions 1 --tokens 32");
+            opt(fp, c, "eval", example_command(command, sizeof(command), tool,
+                                                " --questions 10 --ctx 100000"));
+            opt(fp, c, "CPU debug", example_command(command, sizeof(command), tool,
+                                                     " --cpu --questions 1 --tokens 32"));
         } else {
-            opt(fp, c, "Metal", "./ds4 -m ds4flash.gguf --metal -c 100000");
-            opt(fp, c, "quiet thermals", "./ds4 -p \"Summarize README\" --power 50");
+            opt(fp, c, "Metal", example_command(command, sizeof(command), tool,
+                                                 " -m ds4flash.gguf --metal -c 100000"));
+            opt(fp, c, "quiet thermals", example_command(command, sizeof(command), tool,
+                                                          " -p \"Summarize README\" --power 50"));
         }
     } else if (topic_is(topic, "steering")) {
-        opt(fp, c, "steer FFN", "./ds4 -p \"Write tersely\" --dir-steering-file dir.bin --dir-steering-ffn 0.8");
+        opt(fp, c, "steer FFN", example_command(command, sizeof(command), DS4_HELP_DS4,
+                                                 " -p \"Write tersely\" --dir-steering-file dir.bin --dir-steering-ffn 0.8"));
     } else if (tool == DS4_HELP_SERVER || topic_is(topic, "api") || topic_is(topic, "kv-cache")) {
-        opt(fp, c, "local API", "./ds4-server --ctx 100000 --kv-disk-dir ~/.ds4/server-kv --kv-disk-space-mb 8192");
+        opt(fp, c, "local API", example_command(command, sizeof(command), DS4_HELP_SERVER,
+                                                 " --ctx 100000 --kv-disk-dir ~/.ds4/server-kv --kv-disk-space-mb 8192"));
         opt(fp, c, "curl", "curl http://127.0.0.1:8000/v1/models");
     } else if (tool == DS4_HELP_AGENT || topic_is(topic, "sessions") || topic_is(topic, "tools")) {
-        opt(fp, c, "interactive", "./ds4-agent");
-        opt(fp, c, "one shot", "./ds4-agent --non-interactive -p \"Create /tmp/hello.c\"");
+        opt(fp, c, "interactive", example_command(command, sizeof(command), DS4_HELP_AGENT, ""));
+        opt(fp, c, "one shot", example_command(command, sizeof(command), DS4_HELP_AGENT,
+                                                " --non-interactive -p \"Create /tmp/hello.c\""));
     } else if (tool == DS4_HELP_BENCH || topic_is(topic, "benchmark")) {
-        opt(fp, c, "csv", "./ds4-bench --prompt-file long.txt --ctx-max 32768 --csv speed.csv");
-        opt(fp, c, "prefill only", "./ds4-bench --prompt-file long.txt --gen-tokens 0");
+        opt(fp, c, "csv", example_command(command, sizeof(command), DS4_HELP_BENCH,
+                                           " --prompt-file long.txt --ctx-max 32768 --csv speed.csv"));
+        opt(fp, c, "prefill only", example_command(command, sizeof(command), DS4_HELP_BENCH,
+                                                    " --prompt-file long.txt --gen-tokens 0"));
     } else if (tool == DS4_HELP_EVAL || topic_is(topic, "evaluation")) {
-        opt(fp, c, "first 10", "./ds4-eval --questions 10 --trace eval.trace");
-        opt(fp, c, "plain", "./ds4-eval --plain --nothink --tokens 512");
+        opt(fp, c, "first 10", example_command(command, sizeof(command), DS4_HELP_EVAL,
+                                                " --questions 10 --trace eval.trace"));
+        opt(fp, c, "plain", example_command(command, sizeof(command), DS4_HELP_EVAL,
+                                             " --plain --nothink --tokens 512"));
     } else {
-        opt(fp, c, "chat", "./ds4");
-        opt(fp, c, "one shot", "./ds4 -p \"Explain mmap in C\"");
-        opt(fp, c, "long prompt", "./ds4 --think-max --prompt-file prompt.txt --ctx 393216");
+        opt(fp, c, "chat", example_command(command, sizeof(command), DS4_HELP_DS4, ""));
+        opt(fp, c, "one shot", example_command(command, sizeof(command), DS4_HELP_DS4,
+                                                " -p \"Explain mmap in C\""));
+        opt(fp, c, "long prompt", example_command(command, sizeof(command), DS4_HELP_DS4,
+                                                   " --think-max --prompt-file prompt.txt --ctx 393216"));
     }
     fputc('\n', fp);
 }
@@ -578,7 +620,8 @@ void ds4_help_print(FILE *fp, ds4_help_tool tool, const char *topic) {
 
     fprintf(fp, "%s%s%s\n", c.bright ? c.bright : "", tool_name(tool), c.off ? c.off : "");
     fprintf(fp, "%s\n\n", tool_summary(tool));
-    fprintf(fp, "%s\n\n", tool_usage(tool));
+    print_tool_usage(fp, tool);
+    fputs("\n\n", fp);
 
     if (topic) print_topic(fp, &c, tool, topic);
     else {
