@@ -566,6 +566,7 @@ static NSUInteger g_moe_q4_down_slots_bytes;
 static NSUInteger g_attn_out_group_ids_bytes;
 static int g_initialized;
 static int g_quality_mode;
+static int g_test_force_qwen35_exact_router;
 static int g_mpp_invalid_env_reported;
 #define DS4_METAL_MAX_ROUTED_EXPERT_USED 8
 static int32_t g_routed_moe_selected_override[DS4_METAL_MAX_ROUTED_EXPERT_USED];
@@ -3776,6 +3777,10 @@ void ds4_gpu_print_memory_report(const char *label) {
 
 void ds4_gpu_set_quality(bool quality) {
     g_quality_mode = quality ? 1 : 0;
+}
+
+void ds4_gpu_internal_force_qwen35_exact_router_for_test(bool enabled) {
+    g_test_force_qwen35_exact_router = enabled ? 1 : 0;
 }
 
 void ds4_gpu_set_glm_model(bool enabled) {
@@ -19668,6 +19673,71 @@ int ds4_gpu_matmul_f32_tensor(
                 return 1;
             }
             ds4_gpu_warn_mpp_fallback();
+        }
+
+        /*
+         * MLX routes matrix-shaped F32 work through a tiled QMM on every
+         * Apple GPU generation.  DS4 historically fell back to one matvec per
+         * prompt row when M5 TensorOps were unavailable, which makes Qwen's
+         * 2048x256 F32 router a double-digit share of pre-M5 prefill.  M1-M4
+         * use an exact token-tiled F32 kernel: two expert rows are staged once
+         * and reused across eight tokens while preserving the scalar lane and
+         * reduction order.  M5 and newer keep the faster TensorOps path above.
+         * Quality mode retains the original full-F32 matvec dispatch.
+         */
+        const bool pre_m5_apple_family =
+            ds4_gpu_device_name_contains("M1") ||
+            ds4_gpu_device_name_contains("M2") ||
+            ds4_gpu_device_name_contains("M3") ||
+            ds4_gpu_device_name_contains("M4");
+        const bool use_f32_exact_token_tile =
+            qwen36_router_shape &&
+            (pre_m5_apple_family ||
+             g_test_force_qwen35_exact_router) &&
+            !g_quality_mode &&
+            n_tok >= 128u &&
+            (in_dim % 32u) == 0 &&
+            (out_dim % 64u) == 0 &&
+            (g_test_force_qwen35_exact_router ||
+             getenv("DS4_METAL_DISABLE_F32_NAX_PREFILL") == NULL);
+        if (use_f32_exact_token_tile) {
+            static int logged_f32_exact_token_tile;
+            if (!logged_f32_exact_token_tile) {
+                fprintf(stderr,
+                        "ds4: Qwen pre-M5 router uses exact token-tiled F32 prefill\n");
+                logged_f32_exact_token_tile = 1;
+            }
+            enum { QWEN35_ROUTER_TOKEN_TILE = 8 };
+            ds4_gpu_q8_0_matvec_args args =
+                ds4_gpu_make_f32_mv_args(in_dim, out_dim, n_tok);
+            id<MTLComputePipelineState> exact_pipeline =
+                ds4_gpu_get_mul_mv_pipeline(
+                    "kernel_qwen35_router_f32_exact_t8", 8);
+            if (!exact_pipeline) return 0;
+
+            id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
+            [enc setComputePipelineState:exact_pipeline];
+            [enc setBytes:&args length:sizeof(args) atIndex:0];
+            [enc setBuffer:wbuf offset:(NSUInteger)inner_offset atIndex:1];
+            [enc setBuffer:xbuf offset:ds4_gpu_tensor_offset(x) atIndex:2];
+            [enc setBuffer:outbuf offset:ds4_gpu_tensor_offset(out) atIndex:3];
+            [enc setThreadgroupMemoryLength:
+                    2u * 2048u * sizeof(float) +
+                    2u * 32u * sizeof(float)
+                                    atIndex:0];
+            [enc dispatchThreadgroups:MTLSizeMake(
+                    ((NSUInteger)out_dim + 1u) / 2u,
+                    ((NSUInteger)n_tok + QWEN35_ROUTER_TOKEN_TILE - 1u) /
+                        QWEN35_ROUTER_TOKEN_TILE,
+                    1u)
+                 threadsPerThreadgroup:MTLSizeMake(32, 8, 1)];
+            ds4_gpu_end_compute_encoder(cb, enc);
+
+            if (!ds4_gpu_finish_command_buffer(
+                    cb, owned, "exact token-tiled F32 tensor matmul")) {
+                return 0;
+            }
+            return 1;
         }
 
         ds4_gpu_q8_0_matvec_args mv_args =

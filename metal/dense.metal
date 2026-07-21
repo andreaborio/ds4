@@ -644,6 +644,94 @@ typedef decltype(kernel_mul_mv_t_t_4<half, half4, half, half4>) mul_mv_t_t_4;
 template [[host_name("kernel_mul_mv_f32_f32_4")]] kernel mul_mv_t_t_4 kernel_mul_mv_t_t_4<float, float4, float, float4>;
 template [[host_name("kernel_mul_mv_f16_f32_4")]] kernel mul_mv_t_t_4 kernel_mul_mv_t_t_4<half,  half4,  float, float4>;
 
+// Exact Qwen F32 router prefill for Apple GPUs without TensorOps.  Each
+// threadgroup owns two expert rows, stages their F32 weights once, and evaluates
+// eight prompt rows sequentially.  The per-token dot-product lane assignment,
+// float4 dot order, SIMD reduction, and cross-SIMD reduction are identical to
+// kernel_mul_mv_f32_f32_4; only weight reuse and dispatch geometry change.
+[[host_name("kernel_qwen35_router_f32_exact_t8")]]
+kernel void kernel_qwen35_router_f32_exact_t8(
+        constant ds4_metal_args_mul_mv &args,
+        device const char *src0,
+        device const char *src1,
+        device       char *dst,
+        threadgroup  char *shmem [[threadgroup(0)]],
+        uint3  tgpig [[threadgroup_position_in_grid]],
+        ushort tiisg [[thread_index_in_simdgroup]],
+        ushort sgitg [[simdgroup_index_in_threadgroup]]) {
+    constexpr short NSG = 8;
+    constexpr short NR0 = 2;
+    constexpr short NW = N_SIMDWIDTH;
+    constexpr short NB = 32;
+    constexpr short NF = 16;
+    constexpr short NF4 = NF/4;
+    constexpr uint TOKEN_TILE = 8u;
+    constexpr uint ROUTER_IN = 2048u;
+    constexpr uint WEIGHT_FLOAT4_PER_ROW = ROUTER_IN/4u;
+    constexpr uint WEIGHT_FLOAT4_TOTAL =
+        NR0*WEIGHT_FLOAT4_PER_ROW;
+
+    const uint linear_tid = (uint)sgitg*NW + tiisg;
+    const int r0 = (int)tgpig.x*NR0;
+    threadgroup float4 *weight4 = (threadgroup float4 *)shmem;
+    threadgroup char *reduce_scratch =
+        shmem + WEIGHT_FLOAT4_TOTAL*sizeof(float4);
+
+    for (uint i = linear_tid; i < WEIGHT_FLOAT4_TOTAL;
+         i += (uint)NSG*NW) {
+        const uint row = i/WEIGHT_FLOAT4_PER_ROW;
+        const uint col4 = i%WEIGHT_FLOAT4_PER_ROW;
+        device const float4 *source = (device const float4 *)(
+            src0 + (uint64_t)(r0 + (int)row)*args.nb01);
+        weight4[i] = source[col4];
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    const short ix = tiisg/(NW/NF);
+    const short il = tiisg%(NW/NF);
+    const int ib0 = sgitg*NF + ix;
+    const int nb = args.ne00/NB;
+    const uint first_token = tgpig.y*TOKEN_TILE;
+
+    for (uint tile_row = 0u; tile_row < TOKEN_TILE; tile_row++) {
+        const uint token = first_token + tile_row;
+        if (token >= (uint)args.ne1) break;
+
+        device const float4 *activation4 = (device const float4 *)(
+            src1 + (uint64_t)token*args.nb11);
+        device const float4 *activation_block =
+            activation4 + (ib0*NB + il*NF)/4;
+        float sumf[NR0] = {0.0f, 0.0f};
+
+        for (int ib = ib0; ib < nb; ib += NSG*NF) {
+            float4 activation[NF4];
+            FOR_UNROLL (short i = 0; i < NF4; i++) {
+                activation[i] = activation_block[i];
+            }
+            FOR_UNROLL (short row = 0; row < NR0; row++) {
+                threadgroup const float4 *weight_block =
+                    weight4 + (uint)row*WEIGHT_FLOAT4_PER_ROW +
+                    (ib*NB + il*NF)/4;
+                float partial = 0.0f;
+                FOR_UNROLL (short i = 0; i < NF4; i++) {
+                    partial += dot(
+                        float4(weight_block[i]),
+                        float4(activation[i]));
+                }
+                sumf[row] += partial;
+            }
+            activation_block += NSG*NF*NW/4;
+        }
+
+        device float *dst_f32 =
+            (device float *)dst + (uint64_t)token*args.ne0;
+        helper_mv_reduce_and_write<NR0>(
+            dst_f32, sumf, r0, args.ne01,
+            tiisg, sgitg, reduce_scratch);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+}
+
 // DS4 compressor projections always compute two same-shaped F16 matvecs from
 // the same normalized activation: one for projected KV and one for pooling
 // scores.  This paired variant keeps the exact dense F16 row-reduction shape
