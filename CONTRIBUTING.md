@@ -184,6 +184,15 @@ allocation, or context scaling must additionally run isolated 65,536- and
 allocation strictly larger than the frontier plus generated tokens; 131,072 is
 the standard allocation for the 65,536- and 100,000-token lanes.
 
+Routing, expert-cache, residency, and expert-I/O changes must also complete one
+second 32,768-token diagnostic lane from a different prompt domain. Use
+`speed-bench/promessi_sposi.txt` for the prose/locality lane and
+`tests/long_context_security_prompt.txt` for the security/coding lane. The
+primary promotion prompt still uses A/B/B/A; one final-stack arm is sufficient
+for the second prompt unless a prompt-specific speed claim is made. Never
+compare or average throughput across the two prompts: record both complete
+prompt hashes and interpret the different routing working sets separately.
+
 Run the tiers incrementally. Stop early and reject the candidate if a tier finds
 wrong output, unsafe pressure or swap, a crash, or a clear regression. Every
 candidate that survives and is proposed for promotion must complete all four
@@ -210,6 +219,10 @@ Performance comparisons must also follow these rules:
   process invalidates the entire cohort, including already completed arms.
   Recover or stabilize the host, correct the unsafe policy when applicable,
   then restart from the first A arm; do not retain a convenient retry.
+- Make acceptance environments hermetic. The bounded M5 runner rejects
+  inherited `DS4_*` runtime flags outside its own controls and records every
+  admitted `DS4_*` variable. Use `DS4_M5_EXPLORATORY=1` for an intentional
+  flag experiment; exploratory evidence cannot promote a default.
 - Record cold and warm/page-cache cohorts separately and never average them
   together. A retained warm cohort uses the same discarded warm-up for each arm
   before A/B/B/A. A cold or first-run observation uses fresh processes and is

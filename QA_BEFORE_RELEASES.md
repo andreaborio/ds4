@@ -86,9 +86,16 @@ context-scaling changes also require isolated 65,536- and 100,000-token arms.
   Use identical discarded warm-ups for retained warm cohorts. An abort, new
   swapout, changed resolved plan, or competing inference process invalidates the
   entire cohort; restart from its first arm after recovery or correction.
+- For routing, expert-cache, residency, or expert-I/O changes, keep prose and
+  security/coding 32K prompt lanes separate. Record both prompt hashes, never
+  compare or average their throughput, and require a dedicated A/B/B/A before
+  making a speed claim for either prompt class.
 - Bind every arm to its executable, repository/diff, Metal runtime source, and
   GGUF hashes. A copied binary beside another checkout's `metal/*.metal` files
   is not the same benchmark artifact.
+- Reject inherited `DS4_*` runtime flags in acceptance arms. Intentional flag
+  experiments must be labelled exploratory and preserve their complete
+  `DS4_*` environment artifact.
 - Report tiers independently; do not use a cross-context average to hide a
   regression. The measured effect must exceed control drift, within-arm spread,
   and known measurement noise. If adaptivity selects different paths, invalidate

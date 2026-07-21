@@ -448,6 +448,7 @@ model-free-test: metal ds4_test ds4_agent_test $(METAL_BINDIR)/test_q4k_dot \
 		$(METAL_BINDIR)/test_metal_ssd_profile \
 		$(METAL_BINDIR)/test_ssd_residency
 	DS4_BIN_DIR=$(METAL_BINDIR) sh tests/test_retired_distributed_flags.sh
+	sh tests/test_benchmark_env_guard.sh
 	$(METAL_BINDIR)/ds4-eval --self-test-extractors
 	$(METAL_BINDIR)/ds4_agent_test
 	$(METAL_BINDIR)/ds4_test --server
@@ -635,6 +636,7 @@ model-free-test: ds4 ds4_test ds4_agent_test ds4-eval q4k-dot-test \
 		tests/test_metal_ssd_profile \
 		tests/test_ssd_residency
 	sh tests/test_retired_distributed_flags.sh
+	sh tests/test_benchmark_env_guard.sh
 	./ds4-eval --self-test-extractors
 	./ds4_agent_test
 	./ds4_test --server

@@ -82,6 +82,33 @@ elif (( ! exploratory )) && [[ $cache_state == unclassified ]]; then
     exit 2
 fi
 
+# Acceptance evidence must be hermetic.  A flag inherited from an interactive
+# profiling shell can otherwise change GLM/MoE/Metal behavior without appearing
+# in the benchmark label.  Runner controls use DS4_M5_*; the two telemetry
+# variables below are overwritten by this script.  Exploratory arms may retain
+# other DS4_* flags, but record every one of them in the environment artifact.
+unexpected_ds4_env=$(
+    env | awk -F= '
+        /^DS4_/ {
+            key = $1
+            if (key !~ /^DS4_M5_/ &&
+                key != "DS4_METAL_MEMORY_REPORT" &&
+                key != "DS4_METAL_STREAMING_EXPERT_TIMING_SUMMARY") {
+                print key
+            }
+        }' | LC_ALL=C sort -u
+)
+if [[ -n $unexpected_ds4_env ]] && (( ! exploratory )); then
+    print -u2 -- "acceptance arm refuses unexpected DS4 runtime environment:"
+    print -u2 -- "$unexpected_ds4_env"
+    print -u2 -- "unset these variables or set DS4_M5_EXPLORATORY=1 for a recorded experiment"
+    exit 2
+fi
+if [[ -n $unexpected_ds4_env ]]; then
+    print -u2 -- "exploratory arm records unexpected DS4 runtime environment:"
+    print -u2 -- "$unexpected_ds4_env"
+fi
+
 [[ -n $model ]] || { print -u2 -- "set DS4_M5_MODEL to the ExpertMajor v2 GGUF path"; exit 2; }
 [[ ${#model_sha256_expected} == 64 && $model_sha256_expected != *[!0-9a-fA-F]* ]] || {
     print -u2 -- "set DS4_M5_MODEL_SHA256 to the expected 64-digit GGUF SHA-256 from the campaign manifest"
@@ -278,7 +305,7 @@ prompt_bytes=$(stat -f %z "$prompt")
     exit 2
 }
 env | LC_ALL=C sort |
-    awk -F= '/^DS4_(M5|METAL)_/ { print }' >"$prefix.env"
+    awk -F= '/^DS4_/ { print }' >"$prefix.env"
 vm_stat >"$prefix.vm.before"
 sysctl -n vm.swapusage >"$prefix.swap.before"
 os_build=$(sw_vers -buildVersion)
