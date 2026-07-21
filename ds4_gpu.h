@@ -97,6 +97,10 @@ int ds4_gpu_preload_q4_expert_tables(const void *model_map, uint64_t model_size,
                                      uint32_t n_total_expert);
 int ds4_gpu_should_use_managed_kv_cache(uint64_t kv_cache_bytes, uint64_t context_bytes);
 void ds4_gpu_set_quality(bool quality);
+
+/* Test hook: force the pre-M5 exact Qwen router kernel on the current device.
+ * Production code never enables this override. */
+void ds4_gpu_internal_force_qwen35_exact_router_for_test(bool enabled);
 void ds4_gpu_set_glm_model(bool enabled);
 void ds4_gpu_set_ssd_streaming(bool enabled);
 void ds4_gpu_set_streaming_expert_readahead(bool enabled);

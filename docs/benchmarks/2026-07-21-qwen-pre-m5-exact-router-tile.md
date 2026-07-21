@@ -6,7 +6,7 @@
 - Decision: correctness-qualified through 8K. Do not use these timings as the
   clean promotion cohort.
 - Candidate commit: `d612c0c`.
-- Control: `DS4_METAL_DISABLE_F32_SIMD_PREFILL=1`.
+- Control: `DS4_METAL_DISABLE_F32_NAX_PREFILL=1`.
 - Host: M1 Pro, 16 GiB, AC power, automatic SSD residency.
 - Model: Qwen3.6-35B-A3B DS4 ExpertMajor v2 MLX affine4/group-64 GGUF,
   20,808,566,880 bytes,
@@ -68,12 +68,14 @@ retained as an opt-in path.
 ## Raw evidence
 
 - Rejected candidate summary:
-  `/Users/chinaski/Downloads/ds4-router-total-prefill-26c02af-20260721/qualification-summary.md`
+  `ds4-router-total-prefill-26c02af-20260721/qualification-summary.md`
 - Rejected candidate CSV:
-  `/Users/chinaski/Downloads/ds4-router-total-prefill-26c02af-20260721/correctness-table.csv`
+  `ds4-router-total-prefill-26c02af-20260721/correctness-table.csv`
 - Exact-tile summary:
-  `/Users/chinaski/Downloads/ds4-router-exact-tiled-d612c0c-20260721/qualification-summary.md`
+  `ds4-router-exact-tiled-d612c0c-20260721/qualification-summary.md`
 - Exact-tile directional CSV:
-  `/Users/chinaski/Downloads/ds4-router-exact-tiled-d612c0c-20260721/directional-table.csv`
+  `ds4-router-exact-tiled-d612c0c-20260721/directional-table.csv`
 - Exact-tile raw evidence:
-  `/Users/chinaski/Downloads/ds4-router-exact-tiled-d612c0c-20260721/results/`
+  `ds4-router-exact-tiled-d612c0c-20260721/results/`
+
+All evidence directories above are retained on the qualified M1 Pro host.

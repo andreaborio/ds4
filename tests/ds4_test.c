@@ -476,28 +476,20 @@ static void test_metal_f32_router_prefill_matmul(void) {
     TEST_ASSERT(ds4_gpu_tensor_write(x, 0, x_host, x_bytes) != 0);
     TEST_ASSERT(ds4_gpu_set_model_map(weights_raw, weight_alloc) != 0);
     ds4_gpu_set_quality(false);
-    char *saved_disable =
-        test_save_env("DS4_METAL_DISABLE_F32_SIMD_PREFILL");
     char *saved_disable_nax =
         test_save_env("DS4_METAL_DISABLE_F32_NAX_PREFILL");
-    char *saved_force_exact =
-        test_save_env("DS4_METAL_TEST_F32_EXACT_TOKEN_TILE");
-    setenv("DS4_METAL_DISABLE_F32_SIMD_PREFILL", "1", 1);
     setenv("DS4_METAL_DISABLE_F32_NAX_PREFILL", "1", 1);
-    unsetenv("DS4_METAL_TEST_F32_EXACT_TOKEN_TILE");
+    ds4_gpu_internal_force_qwen35_exact_router_for_test(false);
     TEST_ASSERT(ds4_gpu_matmul_f32_tensor(
                     out_scalar, weights_raw, weight_alloc, 0,
                     in_dim, out_dim, x, n_tok) != 0);
-    unsetenv("DS4_METAL_DISABLE_F32_SIMD_PREFILL");
-    setenv("DS4_METAL_TEST_F32_EXACT_TOKEN_TILE", "1", 1);
+    ds4_gpu_internal_force_qwen35_exact_router_for_test(true);
     TEST_ASSERT(ds4_gpu_matmul_f32_tensor(
                     out, weights_raw, weight_alloc, 0,
                     in_dim, out_dim, x, n_tok) != 0);
-    test_restore_env("DS4_METAL_DISABLE_F32_SIMD_PREFILL", saved_disable);
+    ds4_gpu_internal_force_qwen35_exact_router_for_test(false);
     test_restore_env(
         "DS4_METAL_DISABLE_F32_NAX_PREFILL", saved_disable_nax);
-    test_restore_env(
-        "DS4_METAL_TEST_F32_EXACT_TOKEN_TILE", saved_force_exact);
     TEST_ASSERT(ds4_gpu_tensor_read(out, 0, out_host, out_bytes) != 0);
     TEST_ASSERT(ds4_gpu_tensor_read(
                     out_scalar, 0, out_scalar_host, out_bytes) != 0);

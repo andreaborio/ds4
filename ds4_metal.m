@@ -566,6 +566,7 @@ static NSUInteger g_moe_q4_down_slots_bytes;
 static NSUInteger g_attn_out_group_ids_bytes;
 static int g_initialized;
 static int g_quality_mode;
+static int g_test_force_qwen35_exact_router;
 static int g_mpp_invalid_env_reported;
 #define DS4_METAL_MAX_ROUTED_EXPERT_USED 8
 static int32_t g_routed_moe_selected_override[DS4_METAL_MAX_ROUTED_EXPERT_USED];
@@ -3776,6 +3777,10 @@ void ds4_gpu_print_memory_report(const char *label) {
 
 void ds4_gpu_set_quality(bool quality) {
     g_quality_mode = quality ? 1 : 0;
+}
+
+void ds4_gpu_internal_force_qwen35_exact_router_for_test(bool enabled) {
+    g_test_force_qwen35_exact_router = enabled ? 1 : 0;
 }
 
 void ds4_gpu_set_glm_model(bool enabled) {
@@ -19688,12 +19693,13 @@ int ds4_gpu_matmul_f32_tensor(
         const bool use_f32_exact_token_tile =
             qwen36_router_shape &&
             (pre_m5_apple_family ||
-             getenv("DS4_METAL_TEST_F32_EXACT_TOKEN_TILE") != NULL) &&
+             g_test_force_qwen35_exact_router) &&
             !g_quality_mode &&
             n_tok >= 128u &&
             (in_dim % 32u) == 0 &&
             (out_dim % 64u) == 0 &&
-            getenv("DS4_METAL_DISABLE_F32_SIMD_PREFILL") == NULL;
+            (g_test_force_qwen35_exact_router ||
+             getenv("DS4_METAL_DISABLE_F32_NAX_PREFILL") == NULL);
         if (use_f32_exact_token_tile) {
             static int logged_f32_exact_token_tile;
             if (!logged_f32_exact_token_tile) {
