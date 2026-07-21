@@ -62,6 +62,9 @@ assert_exact_line 'RUNTIME_DEEPSEEK_BYTES=86720114272'
 assert_exact_line 'RUNTIME_DEEPSEEK_SHA256="8378080263eb9224f7228d72e2afa4ac3cf74a116023fdec2c596ff228a33e3f"'
 assert_exact_line 'RUNTIME_GLM_BYTES=262147193504'
 assert_exact_line 'RUNTIME_GLM_SHA256="7f5017e3076e706c78f2a5322b035a9e2f6519c65ff5b6be8b2d91aeff61505d"'
+assert_exact_line 'RUNTIME_QWEN_BYTES=20808566880'
+assert_exact_line 'RUNTIME_QWEN_SHA256="dd17266185833a9f05531ce366fd7284ddca1ed64aa3dcf06e321e8c72c9ea3d"'
+assert_exact_line 'RUNTIME_QWEN_REVISION="7bf9c3f7f6136aeb2599d75ee61c0cc2f18e2b02"'
 assert_case_assignment deepseek-v2 'MODEL_REPO=$RUNTIME_DEEPSEEK_REPO'
 assert_case_assignment deepseek-v2 'MODEL_FILE=$RUNTIME_DEEPSEEK_FILE'
 assert_case_assignment deepseek-v2 'MODEL_BYTES=$RUNTIME_DEEPSEEK_BYTES'
@@ -70,6 +73,11 @@ assert_case_assignment glm-v2 'MODEL_REPO=$RUNTIME_GLM_REPO'
 assert_case_assignment glm-v2 'MODEL_FILE=$RUNTIME_GLM_FILE'
 assert_case_assignment glm-v2 'MODEL_BYTES=$RUNTIME_GLM_BYTES'
 assert_case_assignment glm-v2 'MODEL_SHA256=$RUNTIME_GLM_SHA256'
+assert_case_assignment qwen-v2 'MODEL_REPO=$RUNTIME_QWEN_REPO'
+assert_case_assignment qwen-v2 'MODEL_FILE=$RUNTIME_QWEN_FILE'
+assert_case_assignment qwen-v2 'MODEL_REVISION=$RUNTIME_QWEN_REVISION'
+assert_case_assignment qwen-v2 'MODEL_BYTES=$RUNTIME_QWEN_BYTES'
+assert_case_assignment qwen-v2 'MODEL_SHA256=$RUNTIME_QWEN_SHA256'
 sh -n "$SCRIPT" || fail "download_model.sh has invalid shell syntax"
 
 # Exercise the real downloader logic without a production identity override.
@@ -84,6 +92,8 @@ sed \
     -e "s/^RUNTIME_DEEPSEEK_SHA256=.*/RUNTIME_DEEPSEEK_SHA256=\"$FIXTURE_SHA256\"/" \
     -e "s/^RUNTIME_GLM_BYTES=.*/RUNTIME_GLM_BYTES=$FIXTURE_BYTES/" \
     -e "s/^RUNTIME_GLM_SHA256=.*/RUNTIME_GLM_SHA256=\"$FIXTURE_SHA256\"/" \
+    -e "s/^RUNTIME_QWEN_BYTES=.*/RUNTIME_QWEN_BYTES=$FIXTURE_BYTES/" \
+    -e "s/^RUNTIME_QWEN_SHA256=.*/RUNTIME_QWEN_SHA256=\"$FIXTURE_SHA256\"/" \
     "$SCRIPT" >"$TEST_SCRIPT"
 chmod +x "$TEST_SCRIPT"
 
@@ -131,6 +141,7 @@ run_runtime_success() {
     target=$1
     repo=$2
     model_file=$3
+    revision=$4
     out_dir="$TMP_ROOT/out-$target"
     stdout_file="$TMP_ROOT/$target.stdout"
     stderr_file="$TMP_ROOT/$target.stderr"
@@ -152,7 +163,7 @@ model
 --local-dir
 $out_dir
 --revision
-ds4-v0.2.0
+$revision
 EOF
     cmp "$expected_log" "$FAKE_HF_LOG" >/dev/null ||
         fail "$target did not pin the exact repository revision"
@@ -168,16 +179,18 @@ EOF
 run_runtime_success \
     deepseek-v2 \
     andreaborio/DeepSeek-V4-Flash-DS4-GGUF \
-    DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix-DS4-ExpertMajor-v2.gguf
+    DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix-DS4-ExpertMajor-v2.gguf \
+    ds4-v0.2.0
 run_runtime_success \
     glm-v2 \
     andreaborio/GLM-5.2-DS4-GGUF \
-    GLM-5.2-DS4-ExpertMajor-v2-Q2_K.gguf
-
-run_expect_failure "$TMP_ROOT/qwen-unpublished.stdout" "$TMP_ROOT/qwen-unpublished.stderr" \
-    "$TEST_SCRIPT" qwen-v2
-assert_contains "$TMP_ROOT/qwen-unpublished.stderr" \
-    'Qwen now requires the ExpertMajor v2 MLX affine4/group-64 artifact'
+    GLM-5.2-DS4-ExpertMajor-v2-Q2_K.gguf \
+    ds4-v0.2.0
+run_runtime_success \
+    qwen-v2 \
+    andreaborio/Qwen3.6-35B-A3B-DS4-GGUF \
+    Qwen3.6-35B-A3B-DS4-ExpertMajor-v2-MLX-Affine4-G64.gguf \
+    7bf9c3f7f6136aeb2599d75ee61c0cc2f18e2b02
 
 CORRUPT_DIR="$TMP_ROOT/corrupt-existing"
 CORRUPT_FILE="$CORRUPT_DIR/GLM-5.2-DS4-ExpertMajor-v2-Q2_K.gguf"

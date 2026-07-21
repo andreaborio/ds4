@@ -101,14 +101,15 @@ cd ds4
 
 make -j8
 ./ds4 --build-info
+./download_model.sh qwen-v2
 ./ds4 \
-  -m /absolute/path/to/Qwen3.6-35B-A3B-DS4-ExpertMajor-v2-MLX-Affine4-G64.gguf \
+  -m gguf/Qwen3.6-35B-A3B-DS4-ExpertMajor-v2-MLX-Affine4-G64.gguf \
   --ctx 8192
 ```
 
-`download_model.sh deepseek-v2` and `download_model.sh glm-v2` install the
-published release artifacts for the other qualified families. The affine Qwen
-candidate must be supplied explicitly until its new byte identity is published.
+`download_model.sh deepseek-v2`, `download_model.sh glm-v2`, and
+`download_model.sh qwen-v2` install revision-pinned release artifacts and
+verify their complete byte size and SHA-256 before returning success.
 
 On macOS, AUTO residency keeps the model resident when it safely fits.
 Otherwise it selects SSD streaming and derives an expert-cache budget from the
@@ -204,7 +205,7 @@ backward-compatibility contract in this fork.
 
 ### Qwen3.6 ExpertMajor v2 AUTO path
 
-The supported candidate is the single-layout
+The supported release is the single-layout
 `Qwen3.6-35B-A3B-DS4-ExpertMajor-v2-MLX-Affine4-G64.gguf`. It stores the 40
 layers of routed weights once, activates automatically, and is 20,808,566,880
 bytes with SHA-256

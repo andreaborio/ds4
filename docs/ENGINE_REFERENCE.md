@@ -194,7 +194,7 @@ resolved mode and memory-plan reason. GLM release startup remains flag-free
 AUTO; `--resident` is rejected and explicit SSD/cache controls are diagnostics,
 not alternate startup instructions.
 
-The supported `qwen35moe` candidate contract is the normalized
+The supported `qwen35moe` release contract is the normalized
 Qwen3.6-35B-A3B ExpertMajor v2 MLX affine4/group-64 artifact. It remains a
 single GGUF with the standard v2 container and activates automatically in both
 resident and SSD modes. The former v2 GGML/Q4 payload is rejected. AUTO requires both the

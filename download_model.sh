@@ -9,6 +9,11 @@ RUNTIME_GLM_REPO="andreaborio/GLM-5.2-DS4-GGUF"
 RUNTIME_GLM_FILE="GLM-5.2-DS4-ExpertMajor-v2-Q2_K.gguf"
 RUNTIME_GLM_BYTES=262147193504
 RUNTIME_GLM_SHA256="7f5017e3076e706c78f2a5322b035a9e2f6519c65ff5b6be8b2d91aeff61505d"
+RUNTIME_QWEN_REPO="andreaborio/Qwen3.6-35B-A3B-DS4-GGUF"
+RUNTIME_QWEN_FILE="Qwen3.6-35B-A3B-DS4-ExpertMajor-v2-MLX-Affine4-G64.gguf"
+RUNTIME_QWEN_BYTES=20808566880
+RUNTIME_QWEN_SHA256="dd17266185833a9f05531ce366fd7284ddca1ed64aa3dcf06e321e8c72c9ea3d"
+RUNTIME_QWEN_REVISION="7bf9c3f7f6136aeb2599d75ee61c0cc2f18e2b02"
 RUNTIME_REVISION="ds4-v0.2.0"
 
 OFFLINE_DEEPSEEK_REPO="antirez/deepseek-v4-gguf"
@@ -41,7 +46,7 @@ Usage:
 Runtime targets:
   deepseek-v2  Qualified DeepSeek V4 Flash ExpertMajor v2 artifact.
   glm-v2       Qualified GLM 5.2 ExpertMajor v2 artifact.
-  qwen-v2      Reserved; unavailable until the affine4/group-64 artifact is published.
+  qwen-v2      Qualified Qwen3.6-35B-A3B affine4/group-64 artifact.
 
 Offline-only targets:
   offline-deepseek-flash-q2
@@ -94,8 +99,11 @@ case "$TARGET" in
         MODEL_SHA256=$RUNTIME_GLM_SHA256
         ;;
     qwen-v2)
-        echo "qwen-v2 is not downloadable yet: Qwen now requires the ExpertMajor v2 MLX affine4/group-64 artifact, and its qualified release identity has not been published." >&2
-        exit 1
+        MODEL_REPO=$RUNTIME_QWEN_REPO
+        MODEL_FILE=$RUNTIME_QWEN_FILE
+        MODEL_REVISION=$RUNTIME_QWEN_REVISION
+        MODEL_BYTES=$RUNTIME_QWEN_BYTES
+        MODEL_SHA256=$RUNTIME_QWEN_SHA256
         ;;
     offline-deepseek-flash-q2)
         MODEL_REPO=$OFFLINE_DEEPSEEK_REPO
