@@ -259,18 +259,18 @@ def test_safetensor_reader(tool, tmp_path: Path) -> None:
         source.close()
 
 
-def test_affine2_writer(tool, tmp_path: Path, probe: str | None) -> None:
+def test_affine2_writer(tool, tmp_path: Path, probe: str | None) -> Path:
     plan = tool.make_deepseek_affine2_store_plan(
-        123456, 100, layer_count=2, expert_count=2, expert_used=1,
-        hidden_size=64, intermediate_size=64,
+        123456, 100, layer_count=2, expert_count=3, expert_used=2,
+        hidden_size=256, intermediate_size=256,
     )
     groups = (32, 64)
     source_digest = hashlib.sha256(b"synthetic-affine2-donor").digest()
     assert plan.data_offset == 4096
     assert [component.expert_bytes for component in plan.layers[0].components] == \
-        [1536, 1280, 1280]
-    assert plan.layers[0].record_bytes == 4096
-    assert plan.store_size == 20480
+        [24576, 20480, 20480]
+    assert plan.layers[0].record_bytes == 65536
+    assert plan.store_size == 397312
 
     no_space = tmp_path / "deepseek-affine2-no-space.store"
     no_space_source = SyntheticAffineSource(plan.expert_count)
@@ -278,7 +278,7 @@ def test_affine2_writer(tool, tmp_path: Path, probe: str | None) -> None:
         tool.write_deepseek_affine2_store_from_source(
             no_space_source, no_space, plan, groups, source_digest, 1 << 63,
             resume=False, verify_after=False,
-            hidden_size=64, intermediate_size=64,
+            hidden_size=256, intermediate_size=256,
         )
     except tool.FormatError as exc:
         assert "insufficient free space" in str(exc)
@@ -291,33 +291,33 @@ def test_affine2_writer(tool, tmp_path: Path, probe: str | None) -> None:
     digest = tool.write_deepseek_affine2_store_from_source(
         source, output, plan, groups, source_digest, 0,
         resume=False, verify_after=True,
-        hidden_size=64, intermediate_size=64,
+        hidden_size=256, intermediate_size=256,
     )
     manifest, layers = tool.raw_store(output)
     assert manifest["payload_sha256"] == digest
-    assert [layer.record_bytes for layer in layers] == [4096, 4096]
+    assert [layer.record_bytes for layer in layers] == [65536, 65536]
     assert not tool._checkpoint_paths(output)[0].exists()
     assert not tool._checkpoint_paths(output)[1].exists()
     if probe:
         subprocess.run([
             probe, str(output), "0", str(output.stat().st_size),
             str(tool.STORE_FAMILY_DEEPSEEK4),
-            str(tool.STORE_STORAGE_MLX_AFFINE2), "2", "2", "1", "100",
+            str(tool.STORE_STORAGE_MLX_AFFINE2), "2", "3", "2", "100",
         ], check=True)
 
     # Layer 1 is the synthetic equivalent of production layer 42: its source
     # gate is g64, while the store is normalized to two exact g32 blocks.
     gate = source.expert_bytes(
         "model.layers.1.ffn.switch_mlp.gate_proj.weight",
-        "U32", (2, 64, 4), 0,
+        "U32", (3, 256, 16), 0,
     )
     scales = source.expert_bytes(
         "model.layers.1.ffn.switch_mlp.gate_proj.scales",
-        "BF16", (2, 64, 1), 0,
+        "BF16", (3, 256, 4), 0,
     )
     biases = source.expert_bytes(
         "model.layers.1.ffn.switch_mlp.gate_proj.biases",
-        "BF16", (2, 64, 1), 0,
+        "BF16", (3, 256, 4), 0,
     )
     gate_offset = layers[1].data_offset
     with output.open("rb") as file:
@@ -338,7 +338,7 @@ def test_affine2_writer(tool, tmp_path: Path, probe: str | None) -> None:
     try:
         tool.verify_deepseek_affine2_store_from_source(
             source, corrupt, plan, groups, source_digest,
-            hidden_size=64, intermediate_size=64,
+            hidden_size=256, intermediate_size=256,
         )
     except tool.FormatError:
         pass
@@ -356,7 +356,7 @@ def test_affine2_writer(tool, tmp_path: Path, probe: str | None) -> None:
         tool.write_deepseek_affine2_store_from_source(
             resume_source, resumable, plan, groups, source_digest, 0,
             resume=True, verify_after=False,
-            hidden_size=64, intermediate_size=64,
+            hidden_size=256, intermediate_size=256,
             progress_hook=interrupt_after_first_layer,
         )
     except RuntimeError:
@@ -370,14 +370,14 @@ def test_affine2_writer(tool, tmp_path: Path, probe: str | None) -> None:
     tool.write_deepseek_affine2_store_from_source(
         resume_source, resumable, plan, groups, source_digest, 0,
         resume=True, verify_after=False,
-        hidden_size=64, intermediate_size=64,
+        hidden_size=256, intermediate_size=256,
     )
     assert resume_source.reads
     assert {layer for layer, _, _ in resume_source.reads} == {1}
     assert resumable.exists() and not partial.exists() and not state.exists()
     tool.verify_deepseek_affine2_store_from_source(
         resume_source, resumable, plan, groups, source_digest,
-        hidden_size=64, intermediate_size=64,
+        hidden_size=256, intermediate_size=256,
     )
 
     cleanup = tmp_path / "deepseek-affine2-cleanup.store"
@@ -386,7 +386,7 @@ def test_affine2_writer(tool, tmp_path: Path, probe: str | None) -> None:
         tool.write_deepseek_affine2_store_from_source(
             cleanup_source, cleanup, plan, groups, source_digest, 0,
             resume=False, verify_after=False,
-            hidden_size=64, intermediate_size=64,
+            hidden_size=256, intermediate_size=256,
             progress_hook=interrupt_after_first_layer,
         )
     except RuntimeError:
@@ -395,6 +395,7 @@ def test_affine2_writer(tool, tmp_path: Path, probe: str | None) -> None:
         raise AssertionError("cleanup interruption was not raised")
     partial, state = tool._checkpoint_paths(cleanup)
     assert not cleanup.exists() and not partial.exists() and not state.exists()
+    return output
 
 
 def run(*args: str, ok: bool = True) -> subprocess.CompletedProcess[str]:
@@ -416,7 +417,7 @@ def main() -> int:
     with tempfile.TemporaryDirectory(prefix="ds4-expert-major-test-") as tmp:
         tmp_path = Path(tmp)
         test_safetensor_reader(tool, tmp_path)
-        test_affine2_writer(tool, tmp_path, probe)
+        affine_store = test_affine2_writer(tool, tmp_path, probe)
         source = tmp_path / "deepseek-source.gguf"
         native = tmp_path / "deepseek-native.gguf"
         write_fixture(source, "deepseek4")
@@ -441,6 +442,67 @@ def main() -> int:
             subprocess.run([probe, str(native), str(store.abs_offset),
                             str(store.size),
                             str(tool.STORE_FAMILY_DEEPSEEK4)], check=True)
+
+        hybrid = tmp_path / "deepseek-affine2-hybrid.gguf"
+        tool.plan_deepseek_affine2_hybrid_gguf(
+            native, affine_store, allow_test_geometry=True,
+        )
+        production_gate = run(
+            "embed-deepseek-mlx-affine2", "--dry-run",
+            str(native), str(affine_store), ok=False,
+        )
+        assert "not the pinned DeepSeek affine2 donor" in \
+            production_gate.stderr
+        tool.embed_deepseek_affine2_hybrid_gguf(
+            native, affine_store, hybrid, 0, verify_after=True,
+            allow_test_geometry=True,
+        )
+        assert tool.verify_deepseek_affine2_hybrid_gguf(
+            native, affine_store, hybrid, allow_test_geometry=True,
+        )
+        hybrid_gguf = tool.load_gguf(hybrid)
+        hybrid_stores = [
+            tensor for tensor in hybrid_gguf.tensors
+            if tensor.name == tool.STORE_TENSOR
+        ]
+        assert len(hybrid_stores) == 1
+        assert hybrid_stores[0].size == affine_store.stat().st_size
+        hybrid_manifest, hybrid_layers = tool.parse_store(
+            hybrid_gguf, hybrid_stores[0]
+        )
+        assert hybrid_manifest["storage_format"] == \
+            tool.STORE_STORAGE_MLX_AFFINE2
+        assert [layer.record_bytes for layer in hybrid_layers] == \
+            [65536, 65536]
+        if probe:
+            subprocess.run([
+                probe, str(hybrid), str(hybrid_stores[0].abs_offset),
+                str(hybrid_stores[0].size),
+                str(tool.STORE_FAMILY_DEEPSEEK4),
+                str(tool.STORE_STORAGE_MLX_AFFINE2),
+                "2", "3", "2", "100",
+            ], check=True)
+
+        corrupt_store = tmp_path / "deepseek-affine2-embed-corrupt.store"
+        shutil.copyfile(affine_store, corrupt_store)
+        corrupt_manifest, _ = tool.raw_store(corrupt_store)
+        with corrupt_store.open("r+b") as file:
+            file.seek(int(corrupt_manifest["data_offset"]) + 31)
+            original = file.read(1)
+            file.seek(-1, os.SEEK_CUR)
+            file.write(bytes([original[0] ^ 0x01]))
+        rejected_hybrid = tmp_path / "rejected-affine2-hybrid.gguf"
+        try:
+            tool.embed_deepseek_affine2_hybrid_gguf(
+                native, corrupt_store, rejected_hybrid, 0,
+                verify_after=True, allow_test_geometry=True,
+            )
+        except tool.FormatError as exc:
+            assert "payload SHA-256 mismatch" in str(exc)
+        else:
+            raise AssertionError("hybrid builder accepted corrupt affine2 store")
+        assert not rejected_hybrid.exists()
+        assert not list(tmp_path.glob(f".{rejected_hybrid.name}.tmp.*"))
 
         bad_manifest = tmp_path / "bad-manifest.gguf"
         shutil.copyfile(native, bad_manifest)

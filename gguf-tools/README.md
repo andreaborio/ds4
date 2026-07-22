@@ -93,9 +93,7 @@ without `--resume` remove the partial output. `--skip-verify` is diagnostic
 only and must not be used for publication.
 
 The result is the standalone opaque `DS4EXPV2` store, not an executable GGUF.
-It must still be embedded as the sole `ds4.expert_major.v2` I8 tensor in the
-qualified DeepSeek GGUF without changing the store bytes. Verify a store
-against the same hydrated donor with:
+Verify it against the same hydrated donor with:
 
 ```sh
 python3 gguf-tools/ds4-expert-major.py \
@@ -103,6 +101,40 @@ python3 gguf-tools/ds4-expert-major.py \
   --expected-revision 722bf559b7de93575b2320973cf2002e05bfe6c9 \
   /path/to/DeepSeek-V4-Flash-2bit-DQ \
   /Volumes/SSD/DeepSeek-V4-Flash-MLX-Affine2-ExpertMajor-v2.store
+```
+
+Embed that verified store as the sole `ds4.expert_major.v2` I8 tensor in an
+existing qualified DeepSeek ExpertMajor v2 GGUF. This reconstructs the GGUF
+directory and aligned tensor offsets into a new file; it never edits the base
+model or standalone store in place:
+
+```sh
+python3 gguf-tools/ds4-expert-major.py \
+  embed-deepseek-mlx-affine2 --dry-run \
+  /path/to/DeepSeek-base-ExpertMajor-v2.gguf \
+  /Volumes/SSD/DeepSeek-V4-Flash-MLX-Affine2-ExpertMajor-v2.store
+
+python3 gguf-tools/ds4-expert-major.py \
+  embed-deepseek-mlx-affine2 \
+  /path/to/DeepSeek-base-ExpertMajor-v2.gguf \
+  /Volumes/SSD/DeepSeek-V4-Flash-MLX-Affine2-ExpertMajor-v2.store \
+  /Volumes/SSD/DeepSeek-V4-Flash-MLX-Affine2-DS4.gguf
+```
+
+The default publication path hashes the base GGUF, validates the standalone
+payload digest while copying, then byte-compares every non-routed tensor and
+the complete embedded store before hashing and atomically installing the final
+GGUF. The compatibility gate requires identical DeepSeek layer/expert metadata
+and component dimensions, one input store, one output store, and no duplicate
+canonical routed tensors. The standalone `.store` can be removed after the
+final GGUF and its recorded hashes have been independently retained.
+
+```sh
+python3 gguf-tools/ds4-expert-major.py \
+  verify-deepseek-mlx-affine2-gguf \
+  /path/to/DeepSeek-base-ExpertMajor-v2.gguf \
+  /Volumes/SSD/DeepSeek-V4-Flash-MLX-Affine2-ExpertMajor-v2.store \
+  /Volumes/SSD/DeepSeek-V4-Flash-MLX-Affine2-DS4.gguf
 ```
 
 ## Generate An Imatrix

@@ -62,6 +62,9 @@ DEEPSEEK_AFFINE2_CONFIG_SHA256 = (
 DEEPSEEK_AFFINE2_INDEX_SHA256 = (
     "d1c2d929ab0a35be32cf18026bb31d6f99dad58d6c93a5a2abbe43791f9d6c30"
 )
+DEEPSEEK_AFFINE2_SOURCE_MANIFEST_SHA256 = (
+    "cce807e30b9a1855be42dacdaf407d449115248fcfe32dad4bdd884aedf8e0cc"
+)
 DEEPSEEK_AFFINE2_TOTAL_SIZE = 96520315996
 DEEPSEEK_AFFINE2_TOTAL_PARAMETERS = 284333146519
 DEEPSEEK_AFFINE2_TENSOR_COUNT = 2610
@@ -1946,6 +1949,407 @@ def verify_deepseek_mlx_affine2(
     print(f"payload_sha256: {digest.hex()}")
 
 
+def validate_gguf_tensor_extents(source: GGUF) -> None:
+    names: set[str] = set()
+    previous_end = source.data_offset
+    for tensor in sorted(source.tensors, key=lambda item: item.abs_offset):
+        if tensor.name in names:
+            raise FormatError(f"duplicate GGUF tensor name: {tensor.name}")
+        names.add(tensor.name)
+        if tensor.rel_offset % source.alignment or \
+                tensor.abs_offset < previous_end:
+            raise FormatError(
+                f"overlapping or unaligned GGUF tensor: {tensor.name}"
+            )
+        previous_end = tensor.abs_offset + tensor.size
+
+
+def deepseek_affine2_hybrid_inputs(
+        source_path: Path,
+        store_path: Path,
+        *,
+        allow_test_geometry: bool = False,
+) -> tuple[GGUF, Tensor, dict[str, object], list[Layer],
+           dict[str, object], list[Layer]]:
+    source = load_gguf(source_path)
+    if source.metadata.get("general.architecture") != "deepseek4":
+        raise FormatError("affine2 embedding requires a DeepSeek4 GGUF")
+    validate_gguf_tensor_extents(source)
+    stores = [tensor for tensor in source.tensors if tensor.name == STORE_TENSOR]
+    if len(stores) != 1 or any(ROUTED_RE.fullmatch(tensor.name)
+                               for tensor in source.tensors):
+        raise FormatError(
+            "source GGUF must contain one ExpertMajor v2 store and no "
+            "canonical routed tensors"
+        )
+    source_store = stores[0]
+    source_manifest, source_layers = parse_store(source, source_store)
+    replacement_manifest, replacement_layers = raw_store(store_path)
+    try:
+        metadata_identity = (
+            int(source.metadata["deepseek4.block_count"]),
+            int(source.metadata["deepseek4.expert_count"]),
+            int(source.metadata["deepseek4.expert_used_count"]),
+        )
+    except (KeyError, TypeError, ValueError) as exc:
+        raise FormatError("DeepSeek GGUF expert metadata is incomplete") from exc
+    if (source_manifest["family"] != STORE_FAMILY_DEEPSEEK4 or
+            replacement_manifest["family"] != STORE_FAMILY_DEEPSEEK4 or
+            replacement_manifest["storage_format"] !=
+                STORE_STORAGE_MLX_AFFINE2 or
+            replacement_manifest["group_size"] !=
+                STORE_GROUP_PROFILE_AFFINE2_G32_U64_D64 or
+            metadata_identity != (
+                replacement_manifest["layer_count"],
+                replacement_manifest["expert_count"],
+                replacement_manifest["expert_used"],
+            ) or
+            (source_manifest["layer_count"],
+             source_manifest["expert_count"],
+             source_manifest["expert_used"]) != metadata_identity or
+            len(source_layers) != len(replacement_layers)):
+        raise FormatError("replacement affine2 store identity differs from GGUF")
+    if not allow_test_geometry:
+        expected_dims = (
+            (4096, 2048, 256),
+            (4096, 2048, 256),
+            (2048, 4096, 256),
+        )
+        if (metadata_identity != (43, 256, 6) or
+                replacement_manifest["source_tensors"] !=
+                    DEEPSEEK_AFFINE2_TENSOR_COUNT or
+                replacement_manifest["source_size"] !=
+                    DEEPSEEK_AFFINE2_TOTAL_SIZE or
+                replacement_manifest["source_sha256"] != bytes.fromhex(
+                    DEEPSEEK_AFFINE2_SOURCE_MANIFEST_SHA256
+                ) or
+                any(tuple(component.tensor.dims for component in layer.components)
+                    != expected_dims for layer in replacement_layers)):
+            raise FormatError(
+                "replacement store is not the pinned DeepSeek affine2 donor"
+            )
+    for source_layer, replacement_layer in zip(
+            source_layers, replacement_layers):
+        if (source_layer.index != replacement_layer.index or
+                source_layer.expert_count != replacement_layer.expert_count or
+                any(old.tensor.dims != new.tensor.dims
+                    for old, new in zip(source_layer.components,
+                                        replacement_layer.components))):
+            raise FormatError(
+                f"replacement affine2 geometry differs at layer "
+                f"{source_layer.index}"
+            )
+    return (source, source_store, source_manifest, source_layers,
+            replacement_manifest, replacement_layers)
+
+
+def replacement_gguf_layout(
+        source: GGUF,
+        replacement_store_bytes: int,
+) -> tuple[list[Tensor], int, int]:
+    tensors: list[Tensor] = []
+    replaced = 0
+    for tensor in source.tensors:
+        if tensor.name == STORE_TENSOR:
+            tensors.append(Tensor(
+                STORE_TENSOR, (replacement_store_bytes,), 24, 0,
+                replacement_store_bytes,
+            ))
+            replaced += 1
+        else:
+            tensors.append(dataclasses.replace(tensor))
+    if replaced != 1:
+        raise FormatError("GGUF replacement requires exactly one expert store")
+    directory_bytes = sum(
+        len(pack_string(tensor.name)) + 4 + 8 * len(tensor.dims) + 4 + 8
+        for tensor in tensors
+    )
+    metadata_end = 4 + 4 + 8 + 8 + len(source.kv_raw) + directory_bytes
+    data_offset = align_up(metadata_end, source.alignment)
+    cursor = 0
+    for tensor in tensors:
+        cursor = align_up(cursor, source.alignment)
+        tensor.new_rel_offset = cursor
+        cursor += tensor.size
+    return tensors, data_offset, data_offset + cursor
+
+
+def _copy_standalone_store(
+        source_fd: int,
+        output_fd: int,
+        output_offset: int,
+        manifest: dict[str, object],
+) -> tuple[bytes, bytes]:
+    store_size = int(manifest["store_size"])
+    payload_begin = int(manifest["data_offset"])
+    payload_end = store_size
+    store_hash = hashlib.sha256()
+    payload_hash = hashlib.sha256()
+    completed = 0
+    while completed < store_size:
+        take = min(IO_BYTES, store_size - completed)
+        data = pread_exact(source_fd, take, completed)
+        pwrite_all(output_fd, data, output_offset + completed)
+        store_hash.update(data)
+        begin = max(completed, payload_begin)
+        end = min(completed + take, payload_end)
+        if begin < end:
+            payload_hash.update(data[begin - completed:end - completed])
+        completed += take
+    payload_digest = payload_hash.digest()
+    if payload_digest != manifest["payload_sha256"]:
+        raise FormatError("standalone affine2 store payload SHA-256 mismatch")
+    return store_hash.digest(), payload_digest
+
+
+def _compare_standalone_store(
+        source_fd: int,
+        output_fd: int,
+        output_offset: int,
+        manifest: dict[str, object],
+) -> bytes:
+    store_size = int(manifest["store_size"])
+    payload_begin = int(manifest["data_offset"])
+    digest = hashlib.sha256()
+    completed = 0
+    while completed < store_size:
+        take = min(IO_BYTES, store_size - completed)
+        source = pread_exact(source_fd, take, completed)
+        embedded = pread_exact(output_fd, take, output_offset + completed)
+        if source != embedded:
+            raise FormatError(
+                f"embedded affine2 store differs at byte {completed}"
+            )
+        begin = max(completed, payload_begin)
+        end = min(completed + take, store_size)
+        if begin < end:
+            digest.update(source[begin - completed:end - completed])
+        completed += take
+    payload_digest = digest.digest()
+    if payload_digest != manifest["payload_sha256"]:
+        raise FormatError("standalone affine2 store payload SHA-256 mismatch")
+    return payload_digest
+
+
+def verify_deepseek_affine2_hybrid_gguf(
+        source_path: Path,
+        store_path: Path,
+        output_path: Path,
+        *,
+        allow_test_geometry: bool = False,
+) -> bytes:
+    (source, _, _, _, replacement_manifest, _) = \
+        deepseek_affine2_hybrid_inputs(
+            source_path, store_path,
+            allow_test_geometry=allow_test_geometry,
+        )
+    output = load_gguf(output_path)
+    expected_tensors, expected_data_offset, expected_size = \
+        replacement_gguf_layout(source, int(replacement_manifest["store_size"]))
+    if (output.version != source.version or output.n_kv != source.n_kv or
+            output.kv_raw != source.kv_raw or
+            output.alignment != source.alignment or
+            output.data_offset != expected_data_offset or
+            output.size != expected_size or
+            len(output.tensors) != len(expected_tensors)):
+        raise FormatError("hybrid GGUF header or metadata differs")
+    for expected, actual in zip(expected_tensors, output.tensors):
+        if (expected.name, expected.dims, expected.ggml_type,
+                expected.new_rel_offset, expected.size) != \
+                (actual.name, actual.dims, actual.ggml_type,
+                 actual.rel_offset, actual.size):
+            raise FormatError(f"hybrid GGUF descriptor differs: {expected.name}")
+    output_store = next(
+        tensor for tensor in output.tensors if tensor.name == STORE_TENSOR
+    )
+    output_manifest, _ = parse_store(output, output_store)
+    if output_manifest["header"] != replacement_manifest["header"]:
+        raise FormatError("embedded affine2 store manifest differs")
+
+    manifest_end = output.data_offset
+    with output.path.open("rb", buffering=0) as file:
+        file.seek(0)
+        header_and_padding = read_exact(file, manifest_end)
+    # The metadata and parsed descriptors above cover the meaningful header;
+    # require deterministic zero padding up to the tensor data section.
+    directory_end = 4 + 4 + 8 + 8 + len(output.kv_raw) + sum(
+        len(pack_string(tensor.name)) + 4 + 8 * len(tensor.dims) + 4 + 8
+        for tensor in output.tensors
+    )
+    if any(header_and_padding[directory_end:]):
+        raise FormatError("hybrid GGUF header padding is non-zero")
+
+    source_by_name = {tensor.name: tensor for tensor in source.tensors}
+    source_fd = os.open(source.path, os.O_RDONLY)
+    store_fd = os.open(store_path, os.O_RDONLY)
+    output_fd = os.open(output.path, os.O_RDONLY)
+    try:
+        previous_end = output.data_offset
+        for tensor in output.tensors:
+            if tensor.abs_offset > previous_end:
+                padding = pread_exact(
+                    output_fd, tensor.abs_offset - previous_end, previous_end
+                )
+                if any(padding):
+                    raise FormatError(
+                        f"hybrid GGUF tensor padding is non-zero before "
+                        f"{tensor.name}"
+                    )
+            if tensor.name == STORE_TENSOR:
+                _compare_standalone_store(
+                    store_fd, output_fd, tensor.abs_offset,
+                    replacement_manifest,
+                )
+            else:
+                original = source_by_name[tensor.name]
+                copy_range(
+                    source_fd, original.abs_offset, output_fd, 0,
+                    tensor.size, compare_fd=output_fd,
+                    compare_offset=tensor.abs_offset,
+                )
+            previous_end = tensor.abs_offset + tensor.size
+        if previous_end != output.size:
+            raise FormatError("hybrid GGUF has unexpected trailing bytes")
+    finally:
+        os.close(source_fd)
+        os.close(store_fd)
+        os.close(output_fd)
+    return hash_file(output.path, "hash hybrid GGUF")
+
+
+def plan_deepseek_affine2_hybrid_gguf(
+        source_path: Path,
+        store_path: Path,
+        *,
+        allow_test_geometry: bool = False,
+) -> None:
+    source, source_store, source_manifest, _, replacement_manifest, _ = \
+        deepseek_affine2_hybrid_inputs(
+            source_path, store_path,
+            allow_test_geometry=allow_test_geometry,
+        )
+    _, data_offset, output_size = replacement_gguf_layout(
+        source, int(replacement_manifest["store_size"])
+    )
+    print("mode: plan-only")
+    print(f"source_gguf: {source.path}")
+    print(f"source_bytes: {source.size}")
+    print(f"source_store_bytes: {source_store.size}")
+    print(f"source_store_storage: {source_manifest['storage_format']}")
+    print(f"replacement_store: {store_path.resolve()}")
+    print(f"replacement_store_bytes: {replacement_manifest['store_size']}")
+    print(f"replacement_payload_sha256: {bytes(replacement_manifest['payload_sha256']).hex()}")
+    print(f"output_data_offset: {data_offset}")
+    print(f"output_bytes: {output_size}")
+    print(f"size_delta_bytes: {output_size - source.size}")
+
+
+def embed_deepseek_affine2_hybrid_gguf(
+        source_path: Path,
+        store_path: Path,
+        destination: Path,
+        reserve: int,
+        *,
+        verify_after: bool,
+        allow_test_geometry: bool = False,
+) -> None:
+    source, _, _, _, replacement_manifest, _ = \
+        deepseek_affine2_hybrid_inputs(
+            source_path, store_path,
+            allow_test_geometry=allow_test_geometry,
+        )
+    source_stat = source.path.stat()
+    store_path = store_path.resolve()
+    store_stat = store_path.stat()
+    source_identity = (
+        source_stat.st_dev, source_stat.st_ino, source_stat.st_size,
+        source_stat.st_mtime_ns,
+    )
+    store_identity = (
+        store_stat.st_dev, store_stat.st_ino, store_stat.st_size,
+        store_stat.st_mtime_ns,
+    )
+    tensors, data_offset, output_size = replacement_gguf_layout(
+        source, int(replacement_manifest["store_size"])
+    )
+    destination = destination.resolve()
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    if destination.exists():
+        raise FormatError(f"destination already exists: {destination}")
+    check_deepseek_output_space(destination, output_size, reserve)
+    source_digest = hash_file(source.path, "hash source GGUF")
+    temp = destination.with_name(f".{destination.name}.tmp.{os.getpid()}")
+    if temp.exists():
+        raise FormatError(f"temporary path already exists: {temp}")
+    source_fd = os.open(source.path, os.O_RDONLY)
+    store_fd = os.open(store_path, os.O_RDONLY)
+    output_fd = os.open(temp, os.O_CREAT | os.O_EXCL | os.O_RDWR, 0o644)
+    store_digest = bytes(32)
+    payload_digest = bytes(32)
+    try:
+        os.ftruncate(output_fd, output_size)
+        write_native_header(output_fd, source, tensors, data_offset)
+        source_by_name = {tensor.name: tensor for tensor in source.tensors}
+        for ordinal, tensor in enumerate(tensors, 1):
+            output_offset = data_offset + tensor.new_rel_offset
+            if tensor.name == STORE_TENSOR:
+                store_digest, payload_digest = _copy_standalone_store(
+                    store_fd, output_fd, output_offset, replacement_manifest
+                )
+            else:
+                original = source_by_name[tensor.name]
+                copy_range(
+                    source_fd, original.abs_offset, output_fd,
+                    output_offset, tensor.size,
+                )
+            if ordinal % 50 == 0 or ordinal == len(tensors):
+                print(
+                    f"\rwrite hybrid GGUF tensors {ordinal}/{len(tensors)}",
+                    end="", file=sys.stderr, flush=True,
+                )
+        print(file=sys.stderr)
+        os.fsync(output_fd)
+        os.close(output_fd)
+        output_fd = -1
+        if verify_after:
+            output_digest = verify_deepseek_affine2_hybrid_gguf(
+                source.path, store_path, temp,
+                allow_test_geometry=allow_test_geometry,
+            )
+        else:
+            output_digest = bytes(32)
+        current_source = source.path.stat()
+        current_store = store_path.stat()
+        if source_identity != (
+                current_source.st_dev, current_source.st_ino,
+                current_source.st_size, current_source.st_mtime_ns) or \
+                store_identity != (
+                    current_store.st_dev, current_store.st_ino,
+                    current_store.st_size, current_store.st_mtime_ns):
+            raise FormatError("hybrid GGUF inputs changed during the build")
+        if destination.exists():
+            raise FormatError(f"destination appeared during build: {destination}")
+        os.replace(temp, destination)
+        _fsync_directory(destination.parent)
+    except BaseException:
+        if output_fd >= 0:
+            os.close(output_fd)
+        temp.unlink(missing_ok=True)
+        raise
+    finally:
+        os.close(source_fd)
+        os.close(store_fd)
+    print(f"installed atomically: {destination}")
+    print(f"source_gguf_sha256: {source_digest.hex()}")
+    print(f"standalone_store_sha256: {store_digest.hex()}")
+    print(f"payload_sha256: {payload_digest.hex()}")
+    if verify_after:
+        print(f"output_gguf_sha256: {output_digest.hex()}")
+    else:
+        print("output_gguf_sha256: skipped")
+    print(f"output_bytes: {output_size}")
+
+
 def repack_mlx_affine(native_path: Path, mlx_dir: Path,
                       destination: Path, reserve: int) -> None:
     """Replace a Qwen v2 Q4_K payload with same-size MLX affine4 records."""
@@ -2165,6 +2569,31 @@ def main() -> int:
     )
     deepseek_verify_parser.add_argument("mlx_model", type=Path)
     deepseek_verify_parser.add_argument("store", type=Path)
+    hybrid_parser = subparsers.add_parser(
+        "embed-deepseek-mlx-affine2",
+        help="replace the routed store in a DeepSeek GGUF with affine2",
+    )
+    hybrid_parser.add_argument(
+        "--dry-run", action="store_true",
+        help="validate compatibility and print the rebuilt GGUF layout",
+    )
+    hybrid_parser.add_argument(
+        "--reserve-bytes", type=parse_bytes, default=1 << 30,
+    )
+    hybrid_parser.add_argument(
+        "--skip-verify", action="store_true",
+        help="diagnostic only; publication builds verify byte-for-byte by default",
+    )
+    hybrid_parser.add_argument("source", type=Path)
+    hybrid_parser.add_argument("store", type=Path)
+    hybrid_parser.add_argument("destination", type=Path, nargs="?")
+    hybrid_verify_parser = subparsers.add_parser(
+        "verify-deepseek-mlx-affine2-gguf",
+        help="verify a rebuilt DeepSeek affine2 GGUF byte-for-byte",
+    )
+    hybrid_verify_parser.add_argument("source", type=Path)
+    hybrid_verify_parser.add_argument("store", type=Path)
+    hybrid_verify_parser.add_argument("output", type=Path)
     args = parser.parse_args()
     try:
         if args.command == "inspect":
@@ -2198,6 +2627,24 @@ def main() -> int:
             verify_deepseek_mlx_affine2(
                 args.mlx_model, args.store, args.expected_revision,
             )
+        elif args.command == "embed-deepseek-mlx-affine2":
+            if args.dry_run:
+                if args.destination is not None:
+                    raise FormatError("--dry-run does not accept a destination")
+                plan_deepseek_affine2_hybrid_gguf(args.source, args.store)
+            else:
+                if args.destination is None:
+                    raise FormatError("destination is required unless --dry-run is used")
+                embed_deepseek_affine2_hybrid_gguf(
+                    args.source, args.store, args.destination,
+                    args.reserve_bytes, verify_after=not args.skip_verify,
+                )
+        elif args.command == "verify-deepseek-mlx-affine2-gguf":
+            digest = verify_deepseek_affine2_hybrid_gguf(
+                args.source, args.store, args.output,
+            )
+            print(f"valid DeepSeek affine2 hybrid GGUF: {args.output.resolve()}")
+            print(f"output_gguf_sha256: {digest.hex()}")
         return 0
     except (FormatError, OSError) as exc:
         print(f"ds4-expert-major: {exc}", file=sys.stderr)
