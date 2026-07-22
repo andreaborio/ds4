@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import importlib.util
 import hashlib
+import http.server
 import json
 import os
 import shutil
@@ -11,6 +12,8 @@ import struct
 import subprocess
 import sys
 import tempfile
+import threading
+import urllib.parse
 from pathlib import Path
 
 
@@ -288,6 +291,337 @@ def test_safetensor_reader(tool, tmp_path: Path) -> None:
         source.close()
 
 
+def write_deepseek_affine_safetensor_fixture(
+        path: Path, index_path: Path, source: SyntheticAffineSource,
+        *, layers: int, experts: int, hidden: int, intermediate: int,
+        gate_groups: tuple[int, ...]) -> dict:
+    entries: dict[str, dict[str, object]] = {}
+    payload = bytearray()
+    for layer in range(layers):
+        specs = (
+            ("gate_proj", hidden, intermediate, gate_groups[layer]),
+            ("up_proj", hidden, intermediate, 64),
+            ("down_proj", intermediate, hidden, 64),
+        )
+        for role, input_dim, rows, group in specs:
+            prefix = f"model.layers.{layer}.ffn.switch_mlp.{role}"
+            tensors = (
+                (prefix + ".weight", "U32",
+                 (experts, rows, input_dim // 16)),
+                (prefix + ".scales", "BF16",
+                 (experts, rows, input_dim // group)),
+                (prefix + ".biases", "BF16",
+                 (experts, rows, input_dim // group)),
+            )
+            for key, dtype, shape in tensors:
+                start = len(payload)
+                for expert in range(experts):
+                    payload.extend(source.expert_bytes(
+                        key, dtype, shape, expert
+                    ))
+                entries[key] = {
+                    "dtype": dtype, "shape": list(shape),
+                    "data_offsets": [start, len(payload)],
+                }
+    header = json.dumps(entries, separators=(",", ":")).encode()
+    path.write_bytes(struct.pack("<Q", len(header)) + header + payload)
+    shard = path.name
+    index = {
+        "metadata": {"total_size": len(payload)},
+        "weight_map": {name: shard for name in entries},
+    }
+    index_path.write_text(json.dumps(index), encoding="utf-8")
+    return index
+
+
+class HFRangeFixtureServer:
+    def __init__(self, revision: str, files: dict[str, bytes], shard: str):
+        self.revision = revision
+        self.files = files
+        self.shard = shard
+        self.oid = hashlib.sha256(files[shard]).hexdigest()
+        self.xet_hash = hashlib.sha256(b"xet" + files[shard]).hexdigest()
+        self.range_failures = 0
+        self.bad_content_range = False
+        self.bad_etag = False
+        self.ignore_range = False
+        self.range_requests = 0
+        self.head_requests = 0
+        owner = self
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def log_message(self, *_args) -> None:
+                pass
+
+            def _resolve_name(self) -> str | None:
+                prefix = f"/repo/resolve/{owner.revision}/"
+                path = urllib.parse.urlsplit(self.path).path
+                return urllib.parse.unquote(path[len(prefix):]) \
+                    if path.startswith(prefix) else None
+
+            def do_HEAD(self) -> None:
+                name = self._resolve_name()
+                if name != owner.shard:
+                    self.send_error(404)
+                    return
+                owner.head_requests += 1
+                body = owner.files[name]
+                self.send_response(302)
+                self.send_header("X-Repo-Commit", owner.revision)
+                self.send_header("X-Linked-Size", str(len(body)))
+                self.send_header("X-Linked-ETag", f'"{owner.oid}"')
+                self.send_header("X-Xet-Hash", owner.xet_hash)
+                self.send_header("Location", f"/xet/{name}")
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+
+            def do_GET(self) -> None:
+                name = self._resolve_name()
+                if name in owner.files and name != owner.shard:
+                    body = owner.files[name]
+                    etag = hashlib.sha1(body).hexdigest()
+                    self.send_response(307)
+                    self.send_header("X-Repo-Commit", owner.revision)
+                    self.send_header("X-Linked-ETag", f'"{etag}"')
+                    self.send_header("Location", f"/cache/{name}")
+                    self.send_header("Content-Length", "0")
+                    self.end_headers()
+                    return
+                path = urllib.parse.urlsplit(self.path).path
+                if path.startswith("/cache/"):
+                    name = urllib.parse.unquote(path.removeprefix("/cache/"))
+                    body = owner.files.get(name)
+                    if body is None:
+                        self.send_error(404)
+                        return
+                    self.send_response(200)
+                    self.send_header("Content-Length", str(len(body)))
+                    self.send_header(
+                        "ETag", f'"{hashlib.sha1(body).hexdigest()}"'
+                    )
+                    self.end_headers()
+                    self.wfile.write(body)
+                    return
+                if path != f"/xet/{owner.shard}":
+                    self.send_error(404)
+                    return
+                if owner.range_failures:
+                    owner.range_failures -= 1
+                    self.send_response(500)
+                    self.send_header("Content-Length", "0")
+                    self.end_headers()
+                    return
+                body = owner.files[owner.shard]
+                match = __import__("re").fullmatch(
+                    r"bytes=(\d+)-(\d+)", self.headers.get("Range", "")
+                )
+                if not match or self.headers.get("If-Range") != \
+                        f'"{owner.xet_hash}"':
+                    self.send_response(412)
+                    self.send_header("Content-Length", "0")
+                    self.end_headers()
+                    return
+                start, end = map(int, match.groups())
+                if start < 0 or end < start or end >= len(body):
+                    self.send_response(416)
+                    self.send_header("Content-Length", "0")
+                    self.end_headers()
+                    return
+                if owner.ignore_range:
+                    self.send_response(200)
+                    self.send_header("Content-Length", str(len(body)))
+                    self.send_header("ETag", f'"{owner.xet_hash}"')
+                    self.end_headers()
+                    try:
+                        self.wfile.write(body)
+                    except (BrokenPipeError, ConnectionResetError):
+                        pass
+                    return
+                data = body[start:end + 1]
+                owner.range_requests += 1
+                self.send_response(206)
+                self.send_header("Accept-Ranges", "bytes")
+                self.send_header("Content-Length", str(len(data)))
+                total = len(body) + int(owner.bad_content_range)
+                self.send_header(
+                    "Content-Range", f"bytes {start}-{end}/{total}"
+                )
+                etag = "0" * 64 if owner.bad_etag else owner.xet_hash
+                self.send_header("ETag", f'"{etag}"')
+                self.end_headers()
+                self.wfile.write(data)
+
+        self.httpd = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        self.thread = threading.Thread(
+            target=self.httpd.serve_forever, daemon=True
+        )
+
+    @property
+    def origin(self) -> str:
+        host, port = self.httpd.server_address
+        return f"http://{host}:{port}/repo"
+
+    def __enter__(self):
+        self.thread.start()
+        return self
+
+    def __exit__(self, *_args) -> None:
+        self.httpd.shutdown()
+        self.httpd.server_close()
+        self.thread.join(timeout=5)
+
+
+def test_hf_range_safetensor_source(tool, tmp_path: Path) -> None:
+    model = tmp_path / "hf-range-affine"
+    model.mkdir()
+    shard_name = "model-00001-of-00001.safetensors"
+    shard_path = model / shard_name
+    index_path = model / "model.safetensors.index.json"
+    synthetic = SyntheticAffineSource(3)
+    index = write_deepseek_affine_safetensor_fixture(
+        shard_path, index_path, synthetic,
+        layers=2, experts=3, hidden=256, intermediate=256,
+        gate_groups=(32, 64),
+    )
+    index_raw = index_path.read_bytes()
+    config_raw = b'{"fixture":"hf-range"}\n'
+    revision = "1" * 40
+    files = {
+        "config.json": config_raw,
+        "model.safetensors.index.json": index_raw,
+        shard_name: shard_path.read_bytes(),
+    }
+    with HFRangeFixtureServer(revision, files, shard_name) as server:
+        transport = tool.HFRangeTransport(
+            server.origin, revision,
+            ((shard_name, server.oid, len(files[shard_name])),),
+            chunk_bytes=32768, cache_bytes=131072,
+            retries=3, allow_http=True, token="fixture-secret",
+        )
+        assert transport.fetch_small_file(
+            "config.json", len(config_raw),
+            hashlib.sha256(config_raw).hexdigest(),
+        ) == config_raw
+        assert transport.fetch_small_file(
+            "model.safetensors.index.json", len(index_raw),
+            hashlib.sha256(index_raw).hexdigest(),
+        ) == index_raw
+        remote = tool.HFRangeMLXAffineSource(index, transport)
+        remote.expert_count = 3
+        local = tool.MLXAffineSource(model)
+        local.expert_count = 3
+        try:
+            key = "model.layers.1.ffn.switch_mlp.gate_proj.weight"
+            shape = (3, 256, 16)
+            assert remote.expert_bytes(key, "U32", shape, 2) == \
+                local.expert_bytes(key, "U32", shape, 2)
+            # A transient failure is retried, but protocol drift fails closed.
+            transport.cache.clear()
+            transport.cache_size = 0
+            server.range_failures = 1
+            key = "model.layers.0.ffn.switch_mlp.down_proj.biases"
+            assert remote.expert_bytes(key, "BF16", (3, 256, 4), 1) == \
+                local.expert_bytes(key, "BF16", (3, 256, 4), 1)
+
+            plan = tool.make_deepseek_affine2_store_plan(
+                123456, 19, layer_count=2, expert_count=3,
+                expert_used=2, hidden_size=256, intermediate_size=256,
+            )
+            digest = hashlib.sha256(b"hf-range-fixture").digest()
+            local_store = tmp_path / "hf-range-local.store"
+            remote_store = tmp_path / "hf-range-remote.store"
+            tool.write_deepseek_affine2_store_from_source(
+                local, local_store, plan, (32, 64), digest, 0,
+                resume=False, verify_after=True,
+                hidden_size=256, intermediate_size=256,
+            )
+            tool.write_deepseek_affine2_store_from_source(
+                remote, remote_store, plan, (32, 64), digest, 0,
+                resume=False, verify_after=True,
+                hidden_size=256, intermediate_size=256,
+            )
+            assert remote_store.read_bytes() == local_store.read_bytes()
+            assert transport.cache_size <= transport.cache_limit
+            assert transport.cache_hits > 0
+            remote.verify_held_shards()
+            assert transport.range_requests == server.range_requests
+            assert 0 < transport.range_requests < 100
+            # One resolver HEAD opens the shard and one revalidates it at the
+            # publication boundary; range chunks reuse the signed Xet URL.
+            assert server.head_requests == 2
+        finally:
+            local.close()
+            remote.close()
+
+    with HFRangeFixtureServer(revision, files, shard_name) as server:
+        server.bad_content_range = True
+        broken = tool.HFRangeTransport(
+            server.origin, revision,
+            ((shard_name, server.oid, len(files[shard_name])),),
+            chunk_bytes=32768, cache_bytes=65536,
+            allow_http=True,
+        )
+        try:
+            broken.read(shard_name, 0, 8)
+        except tool.FormatError as exc:
+            assert "range/ETag contract differs" in str(exc)
+        else:
+            raise AssertionError("invalid HTTP Content-Range was accepted")
+        finally:
+            broken.close()
+
+    with HFRangeFixtureServer(revision, files, shard_name) as server:
+        wrong_identity = tool.HFRangeTransport(
+            server.origin, revision,
+            ((shard_name, "0" * 64, len(files[shard_name])),),
+            chunk_bytes=32768, cache_bytes=65536,
+            allow_http=True,
+        )
+        try:
+            wrong_identity.read(shard_name, 0, 8)
+        except tool.FormatError as exc:
+            assert "HF LFS identity differs" in str(exc)
+        else:
+            raise AssertionError("wrong pinned LFS OID was accepted")
+        finally:
+            wrong_identity.close()
+
+    with HFRangeFixtureServer(revision, files, shard_name) as server:
+        server.bad_etag = True
+        broken = tool.HFRangeTransport(
+            server.origin, revision,
+            ((shard_name, server.oid, len(files[shard_name])),),
+            chunk_bytes=32768, cache_bytes=65536,
+            allow_http=True,
+        )
+        try:
+            broken.read(shard_name, 0, 8)
+        except tool.FormatError as exc:
+            assert "range/ETag contract differs" in str(exc)
+        else:
+            raise AssertionError("invalid HTTP ETag was accepted")
+        finally:
+            broken.close()
+
+    with HFRangeFixtureServer(revision, files, shard_name) as server:
+        server.ignore_range = True
+        broken = tool.HFRangeTransport(
+            server.origin, revision,
+            ((shard_name, server.oid, len(files[shard_name])),),
+            chunk_bytes=32768, cache_bytes=65536,
+            allow_http=True,
+        )
+        try:
+            broken.read(shard_name, 0, 8)
+        except tool.FormatError as exc:
+            assert "oversized HTTP response" in str(exc) or \
+                "range/ETag contract differs" in str(exc)
+        else:
+            raise AssertionError("HTTP 200/full-object range response was accepted")
+        finally:
+            broken.close()
+
+
 def test_affine2_writer(tool, tmp_path: Path, probe: str | None) -> Path:
     plan = tool.make_deepseek_affine2_store_plan(
         123456, 7, layer_count=2, expert_count=3, expert_used=2,
@@ -486,6 +820,7 @@ def main() -> int:
     with tempfile.TemporaryDirectory(prefix="ds4-expert-major-test-") as tmp:
         tmp_path = Path(tmp)
         test_safetensor_reader(tool, tmp_path)
+        test_hf_range_safetensor_source(tool, tmp_path)
         affine_store = test_affine2_writer(tool, tmp_path, probe)
         source = tmp_path / "deepseek-source.gguf"
         native = tmp_path / "deepseek-native.gguf"

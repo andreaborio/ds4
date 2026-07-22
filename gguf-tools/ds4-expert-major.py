@@ -10,17 +10,22 @@ DS4 reconstructs the canonical logical tensor inventory at load time.
 from __future__ import annotations
 
 import argparse
+import collections
 import ctypes
 import dataclasses
 import hashlib
+import http.client
 import json
 import os
 import plistlib
 import re
 import shutil
+import socket
 import struct
 import subprocess
 import sys
+import time
+import urllib.parse
 from pathlib import Path
 from typing import BinaryIO, Callable, Iterator, Protocol
 
@@ -75,6 +80,29 @@ DEEPSEEK_AFFINE2_SOURCE_MANIFEST_SHA256 = (
 DEEPSEEK_AFFINE2_TOTAL_SIZE = 96520315996
 DEEPSEEK_AFFINE2_TOTAL_PARAMETERS = 284333146519
 DEEPSEEK_AFFINE2_TENSOR_COUNT = 2610
+DEEPSEEK_AFFINE2_CONFIG_BYTES = 183852
+DEEPSEEK_AFFINE2_INDEX_BYTES = 227981
+DEEPSEEK_AFFINE2_SHARDS = (
+    ("model-00001-of-00019.safetensors", "457d73016924f2242dbd7a1cce3f09d07f91d6ac4059a0f2c996d15712b1bd7c", 4843659787),
+    ("model-00002-of-00019.safetensors", "04689685be40cc0ab5f5e3be1450611e621dd50a2ac6f118d76ee7cc70509731", 5272718542),
+    ("model-00003-of-00019.safetensors", "635c7115084c70b3ae93d09f48dc4c76e8d4a5a52eeed8523004df1d671d0227", 5138500844),
+    ("model-00004-of-00019.safetensors", "d788ebe362e1e36b6b874a764fc311100366be41ff62e661e1d243c62696b966", 5220578856),
+    ("model-00005-of-00019.safetensors", "2d36bc1599e5c4b9924cb6aa6fd63f0ae88f055775a3510ced81a8938aeb0067", 5272718667),
+    ("model-00006-of-00019.safetensors", "eaf6d2360ba27593947402f30dc60991af7d35a84e547af79c67ed7dacedacb6", 5138500999),
+    ("model-00007-of-00019.safetensors", "29a0f70e896ac6a57c601eccd4cb990ad061952ecc8a20999af207e49310e8cb", 5228865153),
+    ("model-00008-of-00019.safetensors", "78b863678dae8eb3af4d6e815fb79e0257f24da8eccafc9387fd3591d63fe028", 5272718687),
+    ("model-00009-of-00019.safetensors", "7deff1b297b1edd0ea108fe7881c14f866a2e338a83d70b4b874a49eee1152bb", 5138500953),
+    ("model-00010-of-00019.safetensors", "9c29179c0cab220f9386801c65dbb9fcc0f94495ab04322d3d807f74f613fc5a", 5220579014),
+    ("model-00011-of-00019.safetensors", "c3b5ac509186a749ab468dbe0752f66664c03ddcc726029717318553ca971683", 5272718727),
+    ("model-00012-of-00019.safetensors", "5dd698aa1e233f7aa22bba42cac8c50c8d270c2856b91b2a0cd16a96f22de7ca", 5138500945),
+    ("model-00013-of-00019.safetensors", "b23023f47e880ce7c49eb90b61362eb82efcd4ff0fce7adb6a734462729cda2f", 5228865151),
+    ("model-00014-of-00019.safetensors", "e6fbd2b3bf4638a95b3ae627a2e8e9e009f5fdb2b92d7c519670e799aecb82b1", 5272718701),
+    ("model-00015-of-00019.safetensors", "ff4b5de8d3598839c28315aec717ddc47a0319720ed402fb4bd37adac1a049bb", 5138500945),
+    ("model-00016-of-00019.safetensors", "225f4c9b6bd0fa887782f8755880427fb1df6af14615de6838efd0fa19032382", 5220578964),
+    ("model-00017-of-00019.safetensors", "68199895e97984d722885345c9708a1c63add83dac444034d3906024a70d8092", 5272718701),
+    ("model-00018-of-00019.safetensors", "06cc2d8bdd15da2dbb0ba1b831e21c8fbe10a3ec44409bd355b6177ec5cd3523", 5138500951),
+    ("model-00019-of-00019.safetensors", "26ab4448904d398dccbb7fa51e4beddf8a481428e2e621f0d50ce64695fb59a7", 3090172443),
+)
 
 GGUF_UINT8 = 0
 GGUF_INT8 = 1
@@ -399,6 +427,406 @@ class MLXAffineSource:
             raise FormatError(f"invalid expert slice for {key}")
         stride = size // experts
         return pread_exact(shard.fd, stride, offset + expert * stride)
+
+
+@dataclasses.dataclass
+class HFRemoteShard:
+    name: str
+    oid: str
+    size: int
+    xet_hash: str
+    signed_url: str
+    data_offset: int = 0
+    tensors: dict[str, dict[str, object]] = dataclasses.field(
+        default_factory=dict
+    )
+
+
+class _HFHTTPStatusError(RuntimeError):
+    def __init__(self, status: int, label: str):
+        super().__init__(f"HTTP {status} for {label}")
+        self.status = status
+
+
+class HFRangeTransport:
+    """Pinned, bounded HTTP-range access to immutable Hugging Face LFS blobs.
+
+    The Hub's pinned ``resolve/<commit>`` HEAD response binds an LFS SHA-256
+    (``X-Linked-ETag``) and size to an Xet object (``X-Xet-Hash``).  Every
+    payload request then uses the signed object URL and rejects anything except
+    the exact requested 206 extent and Xet ETag.  No shard is materialized.
+    """
+
+    def __init__(
+            self, origin: str, revision: str,
+            expected_shards: tuple[tuple[str, str, int], ...],
+            *, chunk_bytes: int = 16 << 20,
+            cache_bytes: int = 256 << 20,
+            timeout: float = 60.0,
+            retries: int = 3,
+            allow_http: bool = False,
+            token: str | None = None):
+        if not re.fullmatch(r"[0-9a-f]{40}", revision):
+            raise FormatError("HF range revision must be a full lowercase SHA-1")
+        if chunk_bytes <= 0 or cache_bytes < chunk_bytes or retries <= 0 or \
+                timeout <= 0:
+            raise FormatError("invalid HF range transport limits")
+        self.origin = origin.rstrip("/")
+        self.revision = revision
+        self.expected_shards = {
+            name: (oid, size) for name, oid, size in expected_shards
+        }
+        if len(self.expected_shards) != len(expected_shards) or any(
+                not re.fullmatch(r"model-\d{5}-of-\d{5}\.safetensors", name) or
+                not re.fullmatch(r"[0-9a-f]{64}", oid) or size <= 0
+                for name, (oid, size) in self.expected_shards.items()):
+            raise FormatError("invalid pinned HF shard manifest")
+        self.chunk_bytes = chunk_bytes
+        self.cache_limit = cache_bytes
+        self.timeout = timeout
+        self.retries = retries
+        self.allow_http = allow_http
+        self.token = token if token is not None else (
+            os.environ.get("HF_TOKEN") or
+            os.environ.get("HUGGING_FACE_HUB_TOKEN") or ""
+        )
+        if "\r" in self.token or "\n" in self.token:
+            raise FormatError("invalid Hugging Face token")
+        self.shards: dict[str, HFRemoteShard] = {}
+        self.cache: collections.OrderedDict[
+            tuple[str, int, int], bytes
+        ] = collections.OrderedDict()
+        self.cache_size = 0
+        self.range_requests = 0
+        self.cache_hits = 0
+        self._validate_url(self.origin)
+
+    @staticmethod
+    def _etag(value: str | None) -> str:
+        if value is None:
+            return ""
+        value = value.strip()
+        if value.startswith("W/"):
+            value = value[2:]
+        if len(value) >= 2 and value[0] == '"' and value[-1] == '"':
+            value = value[1:-1]
+        return value
+
+    def _validate_url(self, url: str) -> urllib.parse.SplitResult:
+        parsed = urllib.parse.urlsplit(url)
+        if parsed.username or parsed.password or not parsed.hostname or \
+                parsed.scheme not in ({"http", "https"} if self.allow_http
+                                      else {"https"}):
+            raise FormatError(f"unsafe HF range URL: {url}")
+        if not self.allow_http and parsed.hostname != "huggingface.co" and \
+                not parsed.hostname.endswith(".hf.co"):
+            raise FormatError(
+                f"HF range redirect left trusted hosts: {parsed.hostname}"
+            )
+        return parsed
+
+    def _request_once(
+            self, method: str, url: str, headers: dict[str, str],
+            max_body: int, label: str,
+    ) -> tuple[int, dict[str, str], bytes]:
+        parsed = self._validate_url(url)
+        connection_type = http.client.HTTPSConnection \
+            if parsed.scheme == "https" else http.client.HTTPConnection
+        connection = connection_type(
+            parsed.hostname, parsed.port, timeout=self.timeout
+        )
+        path = urllib.parse.urlunsplit((
+            "", "", parsed.path or "/", parsed.query, "",
+        ))
+        request_headers = {
+            "Accept-Encoding": "identity",
+            "User-Agent": "ds4-deepseek-affine2-range/1",
+            **headers,
+        }
+        # Bearer credentials are only sent to the Hub resolver.  The signed
+        # Xet/CDN URL is already authorized and must never receive the token.
+        if self.token and parsed.hostname == "huggingface.co":
+            request_headers["Authorization"] = f"Bearer {self.token}"
+        try:
+            connection.request(method, path, headers=request_headers)
+            response = connection.getresponse()
+            response_headers = {
+                key.lower(): value for key, value in response.getheaders()
+            }
+            body = b"" if method == "HEAD" else response.read(max_body + 1)
+            if len(body) > max_body:
+                raise FormatError(f"oversized HTTP response for {label}")
+            return response.status, response_headers, body
+        finally:
+            connection.close()
+
+    def _request(
+            self, method: str, url: str, headers: dict[str, str],
+            max_body: int, label: str,
+    ) -> tuple[int, dict[str, str], bytes]:
+        last_error: BaseException | None = None
+        for attempt in range(self.retries):
+            try:
+                result = self._request_once(
+                    method, url, headers, max_body, label
+                )
+                if result[0] not in (408, 425, 429) and \
+                        not 500 <= result[0] <= 599:
+                    return result
+                last_error = _HFHTTPStatusError(result[0], label)
+            except (OSError, TimeoutError, socket.timeout,
+                    http.client.HTTPException) as exc:
+                last_error = exc
+            if attempt + 1 < self.retries:
+                time.sleep(0.05 * (2 ** attempt))
+        raise FormatError(
+            f"HF request failed closed after {self.retries} attempts for "
+            f"{label}: {last_error}"
+        ) from last_error
+
+    def _resolve_url(self, name: str) -> str:
+        quoted = urllib.parse.quote(name, safe="")
+        return f"{self.origin}/resolve/{self.revision}/{quoted}"
+
+    def fetch_small_file(
+            self, name: str, expected_size: int, expected_sha256: str,
+    ) -> bytes:
+        """Fetch pinned config/index only; large LFS objects use ranges."""
+        expected_sha256_bytes = expected_sha256.lower()
+        if expected_size <= 0 or not re.fullmatch(
+                r"[0-9a-f]{64}", expected_sha256_bytes):
+            raise FormatError(f"invalid pinned identity for {name}")
+        url = self._resolve_url(name)
+        linked_etag = ""
+        for redirect in range(6):
+            status, headers, body = self._request(
+                "GET", url, {}, expected_size, name
+            )
+            if redirect == 0:
+                if headers.get("x-repo-commit") != self.revision:
+                    raise FormatError(f"HF revision differs for {name}")
+                linked_etag = self._etag(headers.get("x-linked-etag"))
+                if not re.fullmatch(r"[0-9a-f]{40,64}", linked_etag):
+                    raise FormatError(f"HF linked identity is missing for {name}")
+            if status in (301, 302, 303, 307, 308):
+                location = headers.get("location")
+                if not location:
+                    raise FormatError(f"HF redirect has no location for {name}")
+                url = urllib.parse.urljoin(url, location)
+                self._validate_url(url)
+                continue
+            if status != 200:
+                raise FormatError(f"unexpected HTTP {status} for {name}")
+            content_length = headers.get("content-length")
+            if content_length is not None and content_length != str(expected_size):
+                raise FormatError(f"HF byte size differs for {name}")
+            final_etag = self._etag(headers.get("etag"))
+            if final_etag and final_etag != linked_etag:
+                raise FormatError(f"HF object identity changed for {name}")
+            if len(body) != expected_size or \
+                    hashlib.sha256(body).hexdigest() != expected_sha256_bytes:
+                raise FormatError(f"HF content digest differs for {name}")
+            return body
+        raise FormatError(f"too many HF redirects for {name}")
+
+    def _head_shard(self, name: str) -> HFRemoteShard:
+        expected = self.expected_shards.get(name)
+        if expected is None:
+            raise FormatError(f"unregistered HF shard: {name}")
+        oid, size = expected
+        status, headers, _ = self._request(
+            "HEAD", self._resolve_url(name), {}, 0, name
+        )
+        if status not in (301, 302, 303, 307, 308):
+            raise FormatError(f"HF shard resolve did not redirect: {name}")
+        if headers.get("x-repo-commit") != self.revision or \
+                headers.get("x-linked-size") != str(size) or \
+                self._etag(headers.get("x-linked-etag")) != oid:
+            raise FormatError(f"HF LFS identity differs for {name}")
+        xet_hash = self._etag(headers.get("x-xet-hash"))
+        if not re.fullmatch(r"[0-9a-f]{64}", xet_hash):
+            raise FormatError(f"HF Xet identity is missing for {name}")
+        location = headers.get("location")
+        if not location:
+            raise FormatError(f"HF Xet redirect is missing for {name}")
+        signed_url = urllib.parse.urljoin(self._resolve_url(name), location)
+        self._validate_url(signed_url)
+        previous = self.shards.get(name)
+        if previous is not None and previous.xet_hash != xet_hash:
+            raise FormatError(f"HF Xet identity changed for {name}")
+        shard = HFRemoteShard(
+            name, oid, size, xet_hash, signed_url,
+            previous.data_offset if previous else 0,
+            previous.tensors if previous else {},
+        )
+        self.shards[name] = shard
+        return shard
+
+    def _range_request(
+            self, shard: HFRemoteShard, start: int, end: int,
+    ) -> bytes:
+        if start < 0 or end < start or end >= shard.size:
+            raise FormatError(f"invalid HF byte extent for {shard.name}")
+        length = end - start + 1
+        headers = {
+            "Range": f"bytes={start}-{end}",
+            "If-Range": f'"{shard.xet_hash}"',
+        }
+        status, response_headers, body = self._request(
+            "GET", shard.signed_url, headers, length, shard.name
+        )
+        if status in (401, 403):
+            shard = self._head_shard(shard.name)
+            status, response_headers, body = self._request(
+                "GET", shard.signed_url, headers, length, shard.name
+            )
+        expected_range = f"bytes {start}-{end}/{shard.size}"
+        if status != 206 or \
+                response_headers.get("content-range") != expected_range or \
+                response_headers.get("content-length") != str(length) or \
+                response_headers.get("accept-ranges", "").lower() != "bytes" or \
+                self._etag(response_headers.get("etag")) != shard.xet_hash or \
+                response_headers.get("content-encoding", "identity").lower() \
+                    != "identity" or len(body) != length:
+            raise FormatError(
+                f"HF range/ETag contract differs for {shard.name} "
+                f"at {start}-{end}"
+            )
+        self.range_requests += 1
+        return body
+
+    def _chunk(self, shard: HFRemoteShard, start: int) -> bytes:
+        chunk_start = start // self.chunk_bytes * self.chunk_bytes
+        chunk_end = min(shard.size, chunk_start + self.chunk_bytes) - 1
+        key = (shard.name, chunk_start, chunk_end)
+        cached = self.cache.get(key)
+        if cached is not None:
+            self.cache.move_to_end(key)
+            self.cache_hits += 1
+            return cached
+        data = self._range_request(shard, chunk_start, chunk_end)
+        while self.cache and self.cache_size + len(data) > self.cache_limit:
+            _, evicted = self.cache.popitem(last=False)
+            self.cache_size -= len(evicted)
+        self.cache[key] = data
+        self.cache_size += len(data)
+        if self.cache_size > self.cache_limit:
+            raise AssertionError("HF range cache exceeded its fixed bound")
+        return data
+
+    def _read_extent(
+            self, shard: HFRemoteShard, offset: int, size: int,
+    ) -> bytes:
+        if offset < 0 or size < 0 or offset > shard.size or \
+                size > shard.size - offset:
+            raise FormatError(f"HF extent exceeds shard {shard.name}")
+        result = bytearray()
+        cursor = offset
+        remaining = size
+        while remaining:
+            chunk = self._chunk(shard, cursor)
+            chunk_start = cursor // self.chunk_bytes * self.chunk_bytes
+            within = cursor - chunk_start
+            take = min(remaining, len(chunk) - within)
+            if take <= 0:
+                raise AssertionError("HF range chunk did not cover cursor")
+            result.extend(chunk[within:within + take])
+            cursor += take
+            remaining -= take
+        return bytes(result)
+
+    def shard(self, name: str) -> HFRemoteShard:
+        shard = self.shards.get(name) or self._head_shard(name)
+        if shard.tensors:
+            return shard
+        header_bytes = struct.unpack("<Q", self._read_extent(shard, 0, 8))[0]
+        if header_bytes <= 0 or header_bytes > 1 << 30 or \
+                header_bytes > shard.size - 8:
+            raise FormatError(f"invalid remote safetensor header in {name}")
+        try:
+            tensors = json.loads(
+                self._read_extent(shard, 8, header_bytes).decode("utf-8")
+            )
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise FormatError(
+                f"invalid remote safetensor header in {name}: {exc}"
+            ) from exc
+        if not isinstance(tensors, dict):
+            raise FormatError(f"invalid remote safetensor header in {name}")
+        shard.data_offset = 8 + header_bytes
+        shard.tensors = tensors
+        return shard
+
+    def read(self, name: str, offset: int, size: int) -> bytes:
+        return self._read_extent(self.shard(name), offset, size)
+
+    def verify_pinned_shards(self) -> None:
+        """Refresh all 19 commit/LFS/Xet bindings without downloading them."""
+        for name in self.expected_shards:
+            self._head_shard(name)
+
+    def close(self) -> None:
+        self.cache.clear()
+        self.cache_size = 0
+        self.shards.clear()
+
+
+class HFRangeMLXAffineSource:
+    """Safetensor tensor/expert reader backed by :class:`HFRangeTransport`."""
+
+    def __init__(self, index: dict, transport: HFRangeTransport):
+        weight_map = index.get("weight_map")
+        if not isinstance(weight_map, dict):
+            raise FormatError("invalid remote MLX safetensor index")
+        self.weight_map = dict(weight_map)
+        self.transport = transport
+        self.expert_count = 0
+
+    def close(self) -> None:
+        self.transport.close()
+
+    def verify_held_shards(self) -> None:
+        self.transport.verify_pinned_shards()
+
+    def tensor(self, key: str, dtype: str,
+               shape: tuple[int, ...]) -> tuple[HFRemoteShard, int, int]:
+        shard_name = self.weight_map.get(key)
+        if not isinstance(shard_name, str):
+            raise FormatError(f"MLX tensor is missing: {key}")
+        shard = self.transport.shard(shard_name)
+        entry = shard.tensors.get(key)
+        if not isinstance(entry, dict) or entry.get("dtype") != dtype or \
+                tuple(entry.get("shape", ())) != shape:
+            raise FormatError(f"MLX tensor geometry differs for {key}: {entry}")
+        offsets = entry.get("data_offsets")
+        if not isinstance(offsets, list) or len(offsets) != 2 or \
+                not all(isinstance(value, int) for value in offsets) or \
+                offsets[0] < 0 or offsets[1] < offsets[0]:
+            raise FormatError(f"invalid safetensor offsets for {key}")
+        item_bytes = {"U32": 4, "BF16": 2}.get(dtype)
+        elements = 1
+        for dim in shape:
+            if dim <= 0:
+                raise FormatError(f"invalid safetensor shape for {key}")
+            elements *= dim
+        size = offsets[1] - offsets[0]
+        if item_bytes is None or size != elements * item_bytes:
+            raise FormatError(f"safetensor byte size differs for {key}")
+        absolute = shard.data_offset + offsets[0]
+        if absolute > shard.size or size > shard.size - absolute:
+            raise FormatError(f"safetensor extent exceeds shard for {key}")
+        return shard, absolute, size
+
+    def expert_bytes(self, key: str, dtype: str,
+                     shape: tuple[int, ...], expert: int) -> bytes:
+        shard, offset, size = self.tensor(key, dtype, shape)
+        experts = shape[0]
+        if expert < 0 or expert >= experts or size % experts:
+            raise FormatError(f"invalid expert slice for {key}")
+        stride = size // experts
+        return self.transport.read(
+            shard.name, offset + expert * stride, stride
+        )
 
 
 def tensor_nbytes(ggml_type: int, dims: tuple[int, ...]) -> int:
@@ -1446,6 +1874,93 @@ def load_deepseek_affine2_donor(
     )
 
 
+def load_deepseek_affine2_hf_source(
+        expected_revision: str,
+        *, chunk_bytes: int = 16 << 20,
+        cache_bytes: int = 256 << 20,
+) -> tuple[DeepSeekDonor, HFRangeMLXAffineSource]:
+    """Open the exact public donor through pinned HF/Xet byte ranges only."""
+    if expected_revision != DEEPSEEK_AFFINE2_REVISION:
+        raise FormatError(
+            "unsupported remote donor revision: this writer is pinned to "
+            f"{DEEPSEEK_AFFINE2_REVISION}"
+        )
+    transport = HFRangeTransport(
+        DEEPSEEK_AFFINE2_ORIGIN, expected_revision,
+        DEEPSEEK_AFFINE2_SHARDS,
+        chunk_bytes=chunk_bytes, cache_bytes=cache_bytes,
+    )
+    try:
+        config_raw = transport.fetch_small_file(
+            "config.json", DEEPSEEK_AFFINE2_CONFIG_BYTES,
+            DEEPSEEK_AFFINE2_CONFIG_SHA256,
+        )
+        index_raw = transport.fetch_small_file(
+            "model.safetensors.index.json", DEEPSEEK_AFFINE2_INDEX_BYTES,
+            DEEPSEEK_AFFINE2_INDEX_SHA256,
+        )
+        try:
+            config = json.loads(config_raw)
+            index = json.loads(index_raw)
+        except json.JSONDecodeError as exc:
+            raise FormatError(f"invalid remote donor config/index: {exc}") from exc
+        gate_groups = validate_deepseek_affine2_config(config)
+        weight_map = index.get("weight_map")
+        metadata = index.get("metadata")
+        if not isinstance(weight_map, dict) or \
+                len(weight_map) != DEEPSEEK_AFFINE2_TENSOR_COUNT or \
+                not isinstance(metadata, dict) or \
+                metadata.get("total_size") != DEEPSEEK_AFFINE2_TOTAL_SIZE or \
+                metadata.get("total_parameters") != \
+                    DEEPSEEK_AFFINE2_TOTAL_PARAMETERS:
+            raise FormatError("remote donor safetensor index identity differs")
+        expected_tensors = deepseek_affine2_expected_tensors(gate_groups)
+        missing = [name for name, _, _ in expected_tensors
+                   if not isinstance(weight_map.get(name), str)]
+        if missing:
+            raise FormatError(f"remote donor index misses tensor {missing[0]}")
+        expected_names = {name for name, _, _ in DEEPSEEK_AFFINE2_SHARDS}
+        mapped_names = set(weight_map.values())
+        if mapped_names != expected_names:
+            raise FormatError("remote donor shard inventory differs")
+        transport.verify_pinned_shards()
+        source_identity = {
+            "schema": "ds4-deepseek-mlx-affine2-source-v1",
+            "origin": DEEPSEEK_AFFINE2_ORIGIN,
+            "revision": expected_revision,
+            "config_sha256": DEEPSEEK_AFFINE2_CONFIG_SHA256,
+            "index_sha256": DEEPSEEK_AFFINE2_INDEX_SHA256,
+            "shards": [
+                {"name": name, "oid_sha256": oid, "size": size}
+                for name, oid, size in DEEPSEEK_AFFINE2_SHARDS
+            ],
+        }
+        source_digest = hashlib.sha256(json.dumps(
+            source_identity, sort_keys=True, separators=(",", ":")
+        ).encode("utf-8")).digest()
+        if source_digest.hex() != DEEPSEEK_AFFINE2_SOURCE_MANIFEST_SHA256:
+            raise FormatError("remote donor manifest digest differs")
+        donor = DeepSeekDonor(
+            model_dir=Path("<hf-range>"),
+            origin=DEEPSEEK_AFFINE2_ORIGIN,
+            revision=expected_revision,
+            config_sha256=DEEPSEEK_AFFINE2_CONFIG_SHA256,
+            index_sha256=DEEPSEEK_AFFINE2_INDEX_SHA256,
+            source_digest=source_digest,
+            source_size=int(metadata["total_size"]),
+            source_tensor_count=len(weight_map),
+            gate_groups=gate_groups,
+            shard_oids=DEEPSEEK_AFFINE2_SHARDS,
+            hydrated=False,
+        )
+        source = HFRangeMLXAffineSource(index, transport)
+        source.expert_count = 256
+        return donor, source
+    except BaseException:
+        transport.close()
+        raise
+
+
 def pack_affine2_layer(layer: Layer) -> bytes:
     result = bytearray(STORE_LAYER_BYTES)
     struct.pack_into("<IIQQQ", result, 0, layer.index, layer.expert_count,
@@ -2065,6 +2580,119 @@ def verify_deepseek_mlx_affine2(
     finally:
         mlx.close()
     print(f"valid DeepSeek MLX affine2 ExpertMajor v2 store: {store_path.resolve()}")
+    print(f"source_manifest_sha256: {donor.source_digest.hex()}")
+    print(f"payload_sha256: {digest.hex()}")
+
+
+def plan_deepseek_hf_range_affine2(
+        expected_revision: str,
+        chunk_bytes: int,
+        cache_bytes: int,
+) -> None:
+    donor, mlx = load_deepseek_affine2_hf_source(
+        expected_revision, chunk_bytes=chunk_bytes,
+        cache_bytes=cache_bytes,
+    )
+    try:
+        plan = make_deepseek_affine2_store_plan(
+            donor.source_size, donor.source_tensor_count
+        )
+        print("mode: plan-only")
+        print("source_transport: hf-xet-pinned-http-range")
+        print("source_shard_materialization: none")
+        print(f"donor_origin: {donor.origin}")
+        print(f"donor_revision: {donor.revision}")
+        print(f"config_sha256: {donor.config_sha256}")
+        print(f"index_sha256: {donor.index_sha256}")
+        print(f"source_manifest_sha256: {donor.source_digest.hex()}")
+        print(f"index_tensors: {donor.source_tensor_count}")
+        print(f"shards: {len(donor.shard_oids)}")
+        print(f"source_model_bytes: {donor.source_size}")
+        print(f"source_shard_file_bytes: {sum(x[2] for x in donor.shard_oids)}")
+        print(f"range_chunk_bytes: {chunk_bytes}")
+        print(f"range_cache_bytes: {cache_bytes}")
+        print(f"layers: {plan.layer_count}")
+        print(f"experts: {plan.expert_count}")
+        print(f"record_bytes: {plan.layers[0].record_bytes}")
+        print(f"payload_bytes: {plan.data_size}")
+        print(f"store_bytes: {plan.store_size}")
+    finally:
+        mlx.close()
+
+
+def write_deepseek_hf_range_affine2(
+        destination: Path,
+        expected_revision: str,
+        reserve: int,
+        *, resume: bool,
+        verify_after: bool,
+        chunk_bytes: int,
+        cache_bytes: int,
+) -> None:
+    donor, mlx = load_deepseek_affine2_hf_source(
+        expected_revision, chunk_bytes=chunk_bytes,
+        cache_bytes=cache_bytes,
+    )
+    plan = make_deepseek_affine2_store_plan(
+        donor.source_size, donor.source_tensor_count
+    )
+    destination = destination.resolve()
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    partial, state_path = _checkpoint_paths(destination)
+    try:
+        if partial.exists() or state_path.exists():
+            if not resume or not partial.exists() or not state_path.exists():
+                raise FormatError(
+                    f"incomplete output exists; use --resume after checking "
+                    f"{partial} and {state_path}"
+                )
+            check_deepseek_output_space(destination, 0, reserve)
+        else:
+            check_deepseek_output_space(destination, plan.store_size, reserve)
+        payload_digest = write_deepseek_affine2_store_from_source(
+            mlx, destination, plan, donor.gate_groups,
+            donor.source_digest, reserve,
+            resume=resume, verify_after=verify_after,
+            pre_install_hook=mlx.verify_held_shards,
+        )
+        range_requests = mlx.transport.range_requests
+        cache_hits = mlx.transport.cache_hits
+    finally:
+        mlx.close()
+    print(f"installed atomically: {destination}")
+    print("storage: mlx-affine2-gate32-up64-down64")
+    print("source_transport: hf-xet-pinned-http-range")
+    print("source_shard_materialization: none")
+    print(f"donor_origin: {donor.origin}")
+    print(f"donor_revision: {donor.revision}")
+    print(f"source_manifest_sha256: {donor.source_digest.hex()}")
+    print(f"payload_sha256: {payload_digest.hex()}")
+    print(f"range_requests: {range_requests}")
+    print(f"range_cache_hits: {cache_hits}")
+    print(f"store_bytes: {plan.store_size}")
+
+
+def verify_deepseek_hf_range_affine2(
+        store_path: Path,
+        expected_revision: str,
+        chunk_bytes: int,
+        cache_bytes: int,
+) -> None:
+    donor, mlx = load_deepseek_affine2_hf_source(
+        expected_revision, chunk_bytes=chunk_bytes,
+        cache_bytes=cache_bytes,
+    )
+    plan = make_deepseek_affine2_store_plan(
+        donor.source_size, donor.source_tensor_count
+    )
+    try:
+        digest = verify_deepseek_affine2_store_from_source(
+            mlx, store_path, plan, donor.gate_groups, donor.source_digest
+        )
+        mlx.verify_held_shards()
+    finally:
+        mlx.close()
+    print(f"valid DeepSeek HF-range affine2 store: {store_path.resolve()}")
     print(f"source_manifest_sha256: {donor.source_digest.hex()}")
     print(f"payload_sha256: {digest.hex()}")
 
@@ -2697,6 +3325,45 @@ def main() -> int:
     )
     deepseek_verify_parser.add_argument("mlx_model", type=Path)
     deepseek_verify_parser.add_argument("store", type=Path)
+    deepseek_hf_parser = subparsers.add_parser(
+        "repack-deepseek-hf-range-affine2",
+        help=("stream the pinned DeepSeek MLX donor from HF/Xet ranges into "
+              "a standalone ExpertMajor v2 store without saving shards"),
+    )
+    deepseek_hf_parser.add_argument("--dry-run", action="store_true")
+    deepseek_hf_parser.add_argument(
+        "--expected-revision", required=True,
+        help="full pinned donor Git revision",
+    )
+    deepseek_hf_parser.add_argument(
+        "--reserve-bytes", type=parse_bytes, default=1 << 30,
+    )
+    deepseek_hf_parser.add_argument(
+        "--range-chunk-bytes", type=parse_bytes, default=16 << 20,
+    )
+    deepseek_hf_parser.add_argument(
+        "--range-cache-bytes", type=parse_bytes, default=256 << 20,
+    )
+    deepseek_hf_parser.add_argument("--resume", action="store_true")
+    deepseek_hf_parser.add_argument(
+        "--skip-verify", action="store_true",
+        help="diagnostic only; publication builds verify byte-for-byte",
+    )
+    deepseek_hf_parser.add_argument("destination", type=Path, nargs="?")
+    deepseek_hf_verify_parser = subparsers.add_parser(
+        "verify-deepseek-hf-range-affine2",
+        help="verify an affine2 store against the pinned remote HF/Xet donor",
+    )
+    deepseek_hf_verify_parser.add_argument(
+        "--expected-revision", required=True,
+    )
+    deepseek_hf_verify_parser.add_argument(
+        "--range-chunk-bytes", type=parse_bytes, default=16 << 20,
+    )
+    deepseek_hf_verify_parser.add_argument(
+        "--range-cache-bytes", type=parse_bytes, default=256 << 20,
+    )
+    deepseek_hf_verify_parser.add_argument("store", type=Path)
     hybrid_parser = subparsers.add_parser(
         "embed-deepseek-mlx-affine2",
         help="replace the routed store in a DeepSeek GGUF with affine2",
@@ -2764,6 +3431,31 @@ def main() -> int:
         elif args.command == "verify-deepseek-mlx-affine2":
             verify_deepseek_mlx_affine2(
                 args.mlx_model, args.store, args.expected_revision,
+            )
+        elif args.command == "repack-deepseek-hf-range-affine2":
+            if args.dry_run:
+                if args.destination is not None:
+                    raise FormatError("--dry-run does not accept a destination")
+                plan_deepseek_hf_range_affine2(
+                    args.expected_revision, args.range_chunk_bytes,
+                    args.range_cache_bytes,
+                )
+            else:
+                if args.destination is None:
+                    raise FormatError(
+                        "destination is required unless --dry-run is used"
+                    )
+                write_deepseek_hf_range_affine2(
+                    args.destination, args.expected_revision,
+                    args.reserve_bytes, resume=args.resume,
+                    verify_after=not args.skip_verify,
+                    chunk_bytes=args.range_chunk_bytes,
+                    cache_bytes=args.range_cache_bytes,
+                )
+        elif args.command == "verify-deepseek-hf-range-affine2":
+            verify_deepseek_hf_range_affine2(
+                args.store, args.expected_revision,
+                args.range_chunk_bytes, args.range_cache_bytes,
             )
         elif args.command == "embed-deepseek-mlx-affine2":
             if args.dry_run:
