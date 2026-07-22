@@ -904,18 +904,18 @@ int main(void) {
     assert(ds4_ssd_deepseek_expert_major_auto_cache_target(&memory,
                                                             NULL) == 0);
 
-    /* At 8K and above, the measured 64 GiB tier keeps sixteen complete
+    /* At 8K and above, the measured 64 GiB tier keeps twelve complete
      * DeepSeek route cycles hot across prefill and decode. The target remains
      * pressure bounded and does not silently affect unmeasured host tiers. */
     deepseek_tier = adaptive;
     assert(ds4_ssd_deepseek_long_context_cache_target(
                &memory, &deepseek_tier, 4387, 8191) == 0);
     assert(ds4_ssd_deepseek_long_context_cache_target(
-               &memory, &deepseek_tier, 4387, 8192) == 4129);
+               &memory, &deepseek_tier, 4387, 8192) == 3097);
     assert(ds4_ssd_deepseek_long_context_cache_target(
                &memory, &deepseek_tier, 2839, 32768) == 2839);
     assert(ds4_ssd_deepseek_long_context_cache_target(
-               &memory, &deepseek_tier, 4387, 65535) == 4129);
+               &memory, &deepseek_tier, 4387, 65535) == 3097);
     assert(ds4_ssd_deepseek_long_context_cache_target(
                &memory, &deepseek_tier, 4387, 65536) == 2065);
     assert(ds4_ssd_deepseek_long_context_cache_target(
@@ -926,7 +926,7 @@ int main(void) {
     deepseek_tier.cache_experts = adaptive.cache_experts;
     memory.physical_bytes = 95 * GIB;
     assert(ds4_ssd_deepseek_long_context_cache_target(
-               &memory, &deepseek_tier, 4387, 32768) == 4129);
+               &memory, &deepseek_tier, 4387, 32768) == 3097);
     memory.physical_bytes = 96 * GIB;
     assert(ds4_ssd_deepseek_long_context_cache_target(
                &memory, &deepseek_tier, 4387, 32768) == 0);
@@ -934,7 +934,7 @@ int main(void) {
     assert(ds4_ssd_deepseek_long_context_cache_target(
                &memory, &deepseek_tier, 4387, 32768) == 0);
     memory.physical_bytes = 64 * GIB;
-    deepseek_tier.floor.working_set_experts = UINT64_MAX / 16u + 1u;
+    deepseek_tier.floor.working_set_experts = UINT64_MAX / 12u + 1u;
     assert(ds4_ssd_deepseek_long_context_cache_target(
                &memory, &deepseek_tier, UINT32_MAX, 8192) == 0);
     assert(ds4_ssd_deepseek_long_context_cache_target(

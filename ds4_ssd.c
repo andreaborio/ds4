@@ -807,11 +807,10 @@ uint32_t ds4_ssd_deepseek_long_context_cache_target(
         memory->physical_bytes < 96u * DS4_GIB;
     if (!measured_64g_tier) return 0;
 
-    /* Sixteen complete route cycles preserve the measured 8K/32K decode win.
-     * At 65K, growing back to that tier after prefill caused swap before the
-     * first decode token. Keep eight cycles for extended contexts; the generic
-     * adaptive target remains the hard ceiling in both lanes. */
-    const uint64_t retained_cycles = n_tokens >= 65536u ? 8u : 16u;
+    /* Twelve complete route cycles align this tier with the sustained 64 GiB
+     * decode target. At 65K, keep eight cycles for extended contexts; the
+     * generic adaptive target remains the hard ceiling in both lanes. */
+    const uint64_t retained_cycles = n_tokens >= 65536u ? 8u : 12u;
     if (plan->floor.working_set_experts >
         (UINT64_MAX - 1u) / retained_cycles) {
         return 0;

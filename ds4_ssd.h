@@ -213,7 +213,7 @@ uint32_t ds4_ssd_deepseek_expert_major_auto_cache_target(
         const ds4_ssd_host_memory         *memory,
         const ds4_ssd_adaptive_cache_plan *plan);
 /* Long prompts need a resident hot set before decode starts. On the measured
- * 64 GiB tier, retain sixteen complete route cycles through 32K and eight at
+ * 64 GiB tier, retain twelve complete route cycles through 32K and eight at
  * 65K+ instead of restoring an empty decode cache. The generic pressure plan
  * remains the ceiling. Returning zero means that no measured override applies. */
 uint32_t ds4_ssd_deepseek_long_context_cache_target(
