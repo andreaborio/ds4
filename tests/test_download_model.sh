@@ -214,12 +214,12 @@ EOF
 
 run_runtime_success \
     deepseek-v2 \
-    andreaborio/DeepSeek-V4-Flash-DS4-GGUF \
+    andreaborio/DeepSeek-V4-Flash-Hebrus-GGUF \
     DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix-DS4-ExpertMajor-v2.gguf \
     ds4-v0.2.0
 run_runtime_success \
     glm-v2 \
-    andreaborio/GLM-5.2-DS4-GGUF \
+    andreaborio/GLM-5.2-Hebrus-GGUF \
     GLM-5.2-DS4-ExpertMajor-v2-Q2_K.gguf \
     ds4-v0.2.0
 run_runtime_success \

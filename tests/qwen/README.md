@@ -114,7 +114,7 @@ Use this exact release identity for every Qwen model-backed gate:
 | Bytes | `20,808,566,880` |
 | SHA-256 | `dd17266185833a9f05531ce366fd7284ddca1ed64aa3dcf06e321e8c72c9ea3d` |
 | Routed storage | MLX affine4, group size 64 |
-| Hugging Face | [`andreaborio/Qwen3.6-35B-A3B-DS4-GGUF`](https://huggingface.co/andreaborio/Qwen3.6-35B-A3B-DS4-GGUF) |
+| Hugging Face | [`andreaborio/Qwen3.6-35B-A3B-Hebrus-GGUF`](https://huggingface.co/andreaborio/Qwen3.6-35B-A3B-Hebrus-GGUF) |
 
 The v2 file contains one routed-weight copy inside its checksummed embedded
 store. Canonical Qwen GGUFs are offline converter inputs, not inference

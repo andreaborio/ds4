@@ -48,7 +48,7 @@ explicit 8K context is the predictable 64 GiB starting point; larger contexts
 should be admitted and measured independently.
 
 The artifact is hosted at
-[`andreaborio/GLM-5.2-DS4-GGUF`](https://huggingface.co/andreaborio/GLM-5.2-DS4-GGUF).
+[`andreaborio/GLM-5.2-Hebrus-GGUF`](https://huggingface.co/andreaborio/GLM-5.2-Hebrus-GGUF).
 
 | Property | Value |
 | --- | --- |

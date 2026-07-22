@@ -100,8 +100,8 @@ complete output SHA-256 in its publication record:
   output identity required by
   [`deepseek-expert-major-v2.md`](deepseek-expert-major-v2.md). The current
   canonical mirror is an offline converter source, not the runtime artifact.
-- [GLM 5.2 DS4 GGUF](https://huggingface.co/andreaborio/GLM-5.2-DS4-GGUF)
-- [Qwen3.6-35B-A3B DS4 GGUF](https://huggingface.co/andreaborio/Qwen3.6-35B-A3B-DS4-GGUF):
+- [GLM 5.2 Hebrus GGUF](https://huggingface.co/andreaborio/GLM-5.2-Hebrus-GGUF)
+- [Qwen3.6-35B-A3B Hebrus GGUF](https://huggingface.co/andreaborio/Qwen3.6-35B-A3B-Hebrus-GGUF):
   use only the MLX affine4/group-64 artifact identified in
   [`qwen-expert-major-store.md`](qwen-expert-major-store.md). The older Q4_K_S
   object is incompatible with this runtime.

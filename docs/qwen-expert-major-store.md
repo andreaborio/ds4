@@ -88,7 +88,7 @@ used for publication.
 | Item | Value |
 |---|---|
 | Publication state | `published` |
-| Repository | `andreaborio/Qwen3.6-35B-A3B-DS4-GGUF` |
+| Repository | `andreaborio/Qwen3.6-35B-A3B-Hebrus-GGUF` |
 | Artifact | `Qwen3.6-35B-A3B-DS4-ExpertMajor-v2-MLX-Affine4-G64.gguf` |
 | Artifact bytes | 20,808,566,880 |
 | Artifact SHA-256 | `dd17266185833a9f05531ce366fd7284ddca1ed64aa3dcf06e321e8c72c9ea3d` |
