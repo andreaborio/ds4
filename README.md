@@ -241,6 +241,9 @@ A short-context best is not substituted for the long-context gate.
 
 ### Project and community
 
+- [Cross-repository rebrand rollout plan](docs/REBRAND_ROLLOUT_PLAN.md) —
+  current engine, Studio, and website status; non-breaking rename order; CI,
+  compatibility, repository, release, and launch gates.
 - [Hebrus bridge launch-candidate notes](docs/releases/hebrus-bridge-launch-candidate.md) —
   implemented scope, preserved compatibility, release evidence, and external
   gates that remain pending.
