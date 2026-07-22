@@ -44,10 +44,11 @@ AUTO selects resident only when both independent gates pass:
 
 An explicit resident request also requires both gates. Failure selects bounded
 SSD streaming for AUTO and rejects an explicit resident request. The current
-Q4_K_S tensor payload alone exceeds 16 GiB, so that profile necessarily uses
-SSD. A 24 GiB device is decided from its actual Metal working-set report rather
-than an assumed ratio. The 32 GiB profile may use resident for shorter contexts
-when current pressure allows it and falls back to SSD otherwise.
+19.37 GiB routed tensor payload alone exceeds 16 GiB, so that profile
+necessarily uses SSD. A 24 GiB device is decided from its actual Metal
+working-set report rather than an assumed ratio. The 32 GiB profile may use
+resident for shorter contexts when current pressure allows it and falls back
+to SSD otherwise.
 
 For Qwen SSD streaming, pageable static weights share the larger ordinary
 headroom envelope but remain fully charged. While macOS reports normal pressure,
@@ -62,7 +63,7 @@ plus the in-flight slot: 3,521 experts for this 40-layer, top-8 model. This keep
 the previously retained zero-swap tier and rejects the next warm-cache tier,
 which produced swap in validation. Because the cap is expressed in routing
 cycles while byte admission uses the artifact's exact per-expert size, it does
-not treat Q4 storage as F32.
+not treat compact MLX affine4/group-64 storage as F32.
 
 ## Consequences
 

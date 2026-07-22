@@ -1,17 +1,20 @@
 # Contributing
 
-DwarfStar4 changes should be tested against the failure mode they can realistically
+Hebrus changes should be tested against the failure mode they can realistically
 affect. The project has two regression tracks: correctness and speed. Please
 include the commands you ran, the machine/backend, the model quant, and any
 notable failures in the PR or commit notes.
 
 ## Co-development with `antirez/ds4`
 
-This repository is a transparent research fork of
-[`antirez/ds4`](https://github.com/antirez/ds4), not a replacement for it. The
-goal is to co-develop DwarfStar: use the fork to investigate complementary
-hardware and model paths without blocking on review latency, then contribute
-general improvements back upstream.
+Hebrus is an increasingly independent inference engine that began as a
+transparent research fork of
+[`antirez/ds4`](https://github.com/antirez/ds4). It retains substantial upstream
+implementation and history while focusing on Apple Metal, embedded ExpertMajor
+storage, and SSD streaming across several model families. It is not a
+replacement for the upstream project. General improvements that remain
+applicable to upstream-supported paths continue to be contributed back after
+validation.
 
 Every change applicable to an upstream-supported path **must be opened as an
 upstream PR** once it is scoped and validated. This includes model- or
@@ -98,6 +101,34 @@ DS4_TEST_VECTOR_FILE=/path/to/official.vec ./ds4_test --logprob-vectors
 DS4_TEST_LONG_PROMPT=/path/to/prompt.txt ./ds4_test --long-context
 ```
 
+### Artifact publication boundary
+
+Runtime qualification does not make a local artifact publicly downloadable.
+A runtime download target may be enabled only after an immutable repository
+revision records the exact filename, byte count, complete output SHA-256,
+manifest contract, and compatible runtime commit. Until then, contributor QA
+may use an explicitly labelled local candidate, but release and download checks
+must report public distribution as unavailable.
+
+The machine-readable
+[Qwen release contract](docs/contracts/qwen-release.json) is the canonical
+source for every repeated identity below. The current Qwen release is
+`published` as
+`Qwen3.6-35B-A3B-DS4-ExpertMajor-v2-MLX-Affine4-G64.gguf`, 20,808,566,880
+bytes, SHA-256
+`dd17266185833a9f05531ce366fd7284ddca1ed64aa3dcf06e321e8c72c9ea3d`.
+It is published at immutable repository revision
+`7bf9c3f7f6136aeb2599d75ee61c0cc2f18e2b02`, and
+its manifest requires runtime commit
+`73a332fef82a0bcdd567d17e0de17aa004cad85d` or a compatible descendant.
+`download_model.sh qwen-v2` must pin and validate that exact identity. The older
+`Qwen3.6-35B-A3B-DS4-ExpertMajor-v2-Q4_K_S.gguf` object is `negative-only`, not
+a runnable fallback. See
+[`docs/qwen-expert-major-store.md`](docs/qwen-expert-major-store.md).
+Change the JSON contract first, update every intentional human-readable mirror,
+then run `make release-contract release-contract-test`; do not update a mirror
+as an independent release authority.
+
 CUDA and ROCm are frozen and their backend source and build targets are absent
 from the active tree. Ordinary changes must not restore them accidentally. A
 change that intentionally reactivates either backend must restore and pass the
@@ -118,6 +149,12 @@ make cpu
 On macOS, also run `make build-isolation-test`. The CPU-only binaries live in
 `build/cpu-$(uname -m)/bin`; `make cpu` intentionally leaves the root Metal
 commands unchanged.
+
+The GitHub Actions workflow runs the full Linux CPU/model-free premerge gate
+and a macOS arm64 lane that repeats the CPU suite, builds the Metal command
+surface, and checks Metal/CPU artifact isolation. Hosted compilation is not
+Metal kernel or qualified-model evidence; the hardware release gates below
+remain mandatory.
 
 The CPU backend is a reference/debug path, not the production performance
 target. Remember that executing the CPU path on Metal can crash the system

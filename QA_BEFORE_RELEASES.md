@@ -1,6 +1,6 @@
 # QA Before Releases
 
-This is the release gate for DwarfStar.  Run it before tagging or pushing a
+This is the release gate for Hebrus. Run it before tagging or pushing a
 release build.  The goal is not to prove every code path exhaustively; it is to
 exercise the paths that have historically regressed: Metal graph inference,
 model-family residency, SSD streaming, distributed rejection, disk KV cache,
@@ -30,28 +30,76 @@ target, or an artifact whose complete output hash is missing.
 | `DEEPSEEK_V2` | `DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix-DS4-ExpertMajor-v2.gguf`; 86,720,114,272 bytes; SHA-256 `8378080263eb9224f7228d72e2afa4ac3cf74a116023fdec2c596ff228a33e3f` |
 | `DEEPSEEK_MIXED_V2` | Non-applicable until a mixed-quant DeepSeek ExpertMajor v2 artifact has a publication record with exact filename, bytes, and complete output SHA-256; do not resolve or use this variable before qualification |
 | `GLM_V2` | `GLM-5.2-DS4-ExpertMajor-v2-Q2_K.gguf`; 262,147,193,504 bytes; SHA-256 `7f5017e3076e706c78f2a5322b035a9e2f6519c65ff5b6be8b2d91aeff61505d` |
-| `QWEN_V2` | `Qwen3.6-35B-A3B-DS4-ExpertMajor-v2-MLX-Affine4-G64.gguf`; 20,808,566,880 bytes; SHA-256 `dd17266185833a9f05531ce366fd7284ddca1ed64aa3dcf06e321e8c72c9ea3d` |
+| `QWEN_V2` | Status `published`; `Qwen3.6-35B-A3B-DS4-ExpertMajor-v2-MLX-Affine4-G64.gguf`; immutable repository revision `7bf9c3f7f6136aeb2599d75ee61c0cc2f18e2b02`; 20,808,566,880 bytes; SHA-256 `dd17266185833a9f05531ce366fd7284ddca1ed64aa3dcf06e321e8c72c9ea3d`; MLX affine4/group-64 routed storage; minimum compatible runtime commit `73a332fef82a0bcdd567d17e0de17aa004cad85d` |
+| `QWEN_RETIRED_Q4_NEGATIVE` | Status `negative-only`; rejection-only input `Qwen3.6-35B-A3B-DS4-ExpertMajor-v2-Q4_K_S.gguf`; 20,808,566,880 bytes; SHA-256 `d7c43a6388ec20e6fe5530850350f96fdb0ac37c5ce36d3e5f92b172c447f56b`; it must fail before inference |
+
+The machine-readable
+[Qwen release contract](docs/contracts/qwen-release.json) is the canonical
+source for both Qwen rows. `make release-contract` rejects drift in this table,
+the public documentation, the downloader, and its model-free tests.
 
 Record the test machine by hardware model, unified memory, OS build, and power
 state in the release evidence. Do not encode local hostnames, addresses, or
 network routes in this checklist.
 
+The Qwen runtime and downloader paths must both resolve the exact `QWEN_V2`
+identity above. The immutable revision, filename, byte count, complete output
+SHA-256, manifest contract, and compatible runtime commit are one release gate.
+
 ## 1. Repository And Build Sanity
 
-- Start from a clean tree except intentional release notes:
-  `git status --short`.
+- Start from the exact clean committed release tree. Release notes and every
+  other intentional change must be committed first; untracked files are not
+  allowed: `test -z "$(git status --porcelain)"`.
 - Build the normal local target:
   `make clean && make`.
 - Prove macOS Metal/CPU artifact isolation:
   `make build-isolation-test`.
+- Confirm the GitHub Linux and macOS jobs passed on the exact commit. Treat the
+  hosted macOS job as compile/model-free evidence only, never as a substitute
+  for the Metal kernel and qualified-model lanes on release hardware.
 - Build CPU-only binaries as a compile check. On macOS they remain under
   `build/cpu-$(uname -m)/bin` and must not replace the root Metal commands:
   `make cpu`.
-- Record `./ds4 --build-info` and the CPU binary's `--build-info` output.
+- Record `./hebrus --build-info`, `./ds4 --build-info`, and the CPU profile's
+  canonical and compatibility `--build-info` output.
+- Run `--capabilities=json` on all five canonical and all five compatibility
+  Metal commands and the complete CPU profile;
+  validate schema version 1, executable roles, backend identity, model-family
+  claims, and ExpertMajor wire values with `make capabilities-test` and
+  `python3 tests/test_capabilities.py --bin-dir build/cpu-$(uname -m)/bin --backend cpu`.
+- Run `make command-alias-test` and confirm each `ds4*` profile command is a
+  symlink to its single real `hebrus*` binary, with exact build-info, help,
+  capability, invalid-option, and retired-option parity.
+- Run `make install-test` and confirm a temporary `DESTDIR` receives five real
+  canonical executables, five relative compatibility aliases, valid capability
+  documents, no embedded checkout/staging paths, and an explicit-only,
+  idempotent uninstall.
 - Run whitespace checks before committing:
   `git diff --check`.
-- Confirm `./ds4 --help`, `./ds4-server --help`, and `./ds4-agent --help` render
-  cleanly, with readable section colors and no broken wrapping.
+- Confirm both names of the CLI, server, and agent render help cleanly, with
+  readable section colors and no broken wrapping.
+- On a qualified Qwen host, run the two server names sequentially against the
+  exact published artifact and compare model discovery, one seeded greedy chat
+  completion, graceful shutdown, and exit status. Set
+  `RELEASE_EVIDENCE_ROOT` explicitly to a persistent, release-owned absolute
+  directory outside the checkout, then run:
+  `QWEN_V2="$QWEN_V2" SERVER_ALIAS_EVIDENCE_DIR="$RELEASE_EVIDENCE_ROOT/hebrus-server-alias-$(git rev-parse --short=12 HEAD)" make server-alias-model-test`.
+  The opt-in target rejects a dirty or wrong engine build, validates Metal
+  capabilities before loading the model, selects an unused local port by
+  default, and retains its JSON report and logs. The evidence directory must
+  not already exist. Archive the complete evidence directory only when the
+  report is final `PASS` and
+  `server-alias-evidence-manifest.json` is present; verify every artifact hash
+  and the manifest's deterministic `bundle_sha256`, defined as SHA-256 over
+  compact sorted-key JSON containing only `schema_version` and `artifacts`.
+  `RUNNING`, a missing or invalid manifest, and every `FAIL` report are invalid
+  release evidence. The report records non-sensitive architecture, memory,
+  OS/build, and available
+  power metadata, but the release record must still identify the hardware
+  model and explain unavailable fields. This is model-backed correctness
+  evidence, not a performance benchmark, and the target is intentionally
+  excluded from `premerge`.
 
 ## 2. Core Regression Tests
 
@@ -188,13 +236,14 @@ context. Do not add an explicit residency, cache, preload, or ExpertMajor flag.
 
 The Qwen path on `main` follows the same repository, build, core-test, and
 regression rules as the other model paths. Use the verified normalized
-`QWEN_V2` artifact above and run the relevant model-backed smoke;
+`QWEN_V2` above and run the relevant model-backed smoke;
 canonical, v1, sidecar, and community GGUFs are not equivalent inputs.
 
 - Run `make model-free-test` and `./ds4_test --metal-kernels`. The latter must
   retain resident/SSD top-8 output equivalence, zero resident cache/`pread`
   accounting, malformed-route fail-closed behavior, and slab-growth checks.
-- Run `./ds4 -m "$QWEN_V2" --ctx 8192` for the normal flag-free AUTO smoke.
+- Run `./ds4 -m "$QWEN_V2" --ctx 8192` for the normal flag-free
+  AUTO smoke.
 - Run AUTO with the normal flag-free startup command; record both admission plans,
   their point-in-time inputs, resolved mode, cache tier, configured 321-expert
   slab target, cache `buffer_allocs`, task physical footprint, and system swap
@@ -209,6 +258,10 @@ canonical, v1, sidecar, and community GGUFs are not equivalent inputs.
 - Resident mode proves complete model mapping and full-tensor Metal execution,
   not that every mapped GGUF page remained physically resident. Measure the
   stronger claim separately if it is used in release language.
+- Run the model-free ExpertMajor admission fixture for a Qwen storage value of
+  GGML/Q4, and, when the exact retired file is available, run
+  `./ds4 -m "$QWEN_RETIRED_Q4_NEGATIVE" --ctx 8192`. Both must reject before
+  inference; a command that produces tokens is a release blocker.
 - Physical 16 GiB measurements and normalized-vs-source research comparisons
   improve hardware and artifact characterization, but are not additional
   release gates beyond the standard model/backend checks above. Do not claim
@@ -272,8 +325,8 @@ before model loading:
 
 `sh tests/test_retired_distributed_flags.sh`
 
-The gate covers `ds4`, `ds4-server`, `ds4-agent`, `ds4-bench`, and `ds4-eval`,
-and all nine retired flags: `--role`, `--layers`, `--listen`, `--coordinator`,
+The gate covers all five `hebrus*` commands and their five `ds4*` aliases, and
+all nine retired flags: `--role`, `--layers`, `--listen`, `--coordinator`,
 `--dist-prefill-chunk`, `--dist-prefill-window`,
 `--dist-activation-bits`, `--dist-replay-check`, and `--debug`. Also confirm:
 
@@ -352,8 +405,10 @@ The agent is the most stateful component.  Test it manually, not only by build.
 
 - Test `download_model.sh` in a temporary directory so local weights are not
   overwritten.
-- Verify the `deepseek-v2`, `glm-v2`, and `qwen-v2` targets resolve to the exact
-  qualified repository and ExpertMajor v2 filename.
+- Verify `deepseek-v2`, `glm-v2`, and `qwen-v2` resolve to their exact qualified
+  repository, immutable revision, and ExpertMajor v2 filename. Qwen must pin
+  revision `7bf9c3f7f6136aeb2599d75ee61c0cc2f18e2b02` and must not resolve to the
+  retired Q4_K_S object.
 - Treat every `offline-*` target as a converter input, not a runnable artifact.
   Verify resume and file naming without launching inference from the source.
 - Verify the script never creates or changes `./ds4flash.gguf`, exposes no
@@ -379,8 +434,13 @@ The agent is the most stateful component.  Test it manually, not only by build.
 Do not sign off until:
 
 - macOS Metal Flash passed.
-- The qualified DeepSeek, GLM, and Qwen artifacts passed their model-backed
-  lanes with the residency modes defined by `docs/contracts/RUNTIME_SUPPORT.md`.
+- The qualified DeepSeek, GLM, and Qwen release artifacts passed their
+  model-backed lanes with the residency modes defined by
+  `docs/contracts/RUNTIME_SUPPORT.md`.
+- The Qwen immutable publication record and downloader gate matched the same
+  exact affine artifact used by the runtime lane.
+- The retired Qwen Q4_K_S store remained fail-closed and was not presented as a
+  runnable or downloadable fallback.
 - CUDA source/tests/build targets were confirmed absent and recorded as frozen;
   if any were restored, the complete section 6 reactivation gate passed.
 - ROCm source/tests/build targets were confirmed absent and recorded as frozen;

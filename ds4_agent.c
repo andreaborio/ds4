@@ -2,6 +2,7 @@
 #include "ds4_help.h"
 #include "ds4_kvstore.h"
 #include "ds4_web.h"
+#include "hebrus_identity.h"
 #include "linenoise.h"
 
 #include <errno.h>
@@ -32,6 +33,8 @@
  * multiplexed editor implementation.  The agent uses it only to restore text
  * after Enter is pressed while the model is still busy. */
 int linenoiseEditInsert(struct linenoiseState *l, const char *c, size_t clen);
+
+static const char *agent_invocation = "ds4-agent";
 
 static int set_nonblock(int fd, bool on, int *old_flags);
 static bool agent_parse_bool_default(const char *s, bool def);
@@ -551,7 +554,7 @@ static agent_config parse_options(int argc, char **argv) {
             .mtp_margin = 3.0f,
         },
         .gen = {
-            .system = "You are a helpful coding assistant running inside ds4-agent.",
+            .system = hebrus_agent_system_prompt_for(argv[0]),
             .n_predict = 50000,
             .ctx_size = 100000,
             .temperature = DS4_DEFAULT_TEMPERATURE,
@@ -8903,7 +8906,7 @@ static void agent_progress_append(char *buf, size_t len, size_t *pos,
 
 static void build_prompt_text(const agent_status *st, char *buf, size_t len) {
     (void)st;
-    snprintf(buf, len, "ds4-agent> ");
+    hebrus_agent_format_prompt_for(agent_invocation, buf, len);
 }
 
 static void agent_progress_bar(int done, int total, double tps,
@@ -9980,13 +9983,11 @@ static void agent_format_welcome_banner(const agent_config *cfg,
                                         char *buf, size_t len) {
     char ctx[32];
     agent_format_ctx_size(cfg->gen.ctx_size, ctx, sizeof(ctx));
-    if (stdout_is_tty()) {
-        snprintf(buf, len,
-                 "\x1b[1;97mDwarf\x1b[1;94mStar\x1b[0m 🐋 Agent, context %s tokens\n\n",
-                 ctx);
-    } else {
-        snprintf(buf, len, "DwarfStar Agent, context %s tokens\n\n", ctx);
-    }
+    hebrus_agent_format_welcome_banner_for(agent_invocation,
+                                           stdout_is_tty(),
+                                           ctx,
+                                           buf,
+                                           len);
 }
 
 static void editor_write_welcome_banner(agent_editor *editor,
@@ -10822,8 +10823,14 @@ static int run_agent(ds4_engine *engine, agent_config *cfg) {
 
 #ifndef DS4_AGENT_TEST_NO_MAIN
 int main(int argc, char **argv) {
+    agent_invocation = argv[0];
+    hebrus_help_set_invocation(argv[0]);
     if (ds4_build_info_requested(argc, argv)) {
-        ds4_build_info_print(stdout);
+        ds4_build_info_print(stdout, argv[0]);
+        return 0;
+    }
+    if (ds4_capabilities_requested(argc, argv)) {
+        ds4_capabilities_print(stdout, DS4_EXECUTABLE_ROLE_AGENT, argv[0]);
         return 0;
     }
     agent_config cfg = parse_options(argc, argv);

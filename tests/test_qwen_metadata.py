@@ -400,6 +400,24 @@ def require(condition: bool, message: str, result: subprocess.CompletedProcess[s
     )
 
 
+def compiled_backend(binary: Path) -> str:
+    result = subprocess.run(
+        [str(binary), "--capabilities=json"],
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    require(result.returncode == 0, "capability query failed", result)
+    try:
+        document = json.loads(result.stdout)
+    except json.JSONDecodeError as exc:
+        raise AssertionError(f"capability query returned invalid JSON: {exc}") from exc
+    backend = document.get("backend")
+    if backend not in {"cpu", "metal"}:
+        raise AssertionError(f"capability query returned invalid backend: {backend!r}")
+    return backend
+
+
 def check_frozen_reference() -> None:
     template = QWEN_CHAT_TEMPLATE_PATH.read_bytes()
     assert len(template) == 7764
@@ -536,6 +554,7 @@ def main() -> int:
         print(f"usage: {sys.argv[0]} /path/to/ds4", file=sys.stderr)
         return 2
     binary = Path(sys.argv[1]).resolve()
+    backend = compiled_backend(binary)
     check_frozen_reference()
 
     with tempfile.TemporaryDirectory(prefix="ds4-qwen-metadata-") as tmp_name:
@@ -755,12 +774,20 @@ def main() -> int:
         v2_metal_output = v2_metal.stdout + v2_metal.stderr
         require(v2_metal.returncode != 0,
                 "Qwen native v2 quality guard was not enforced", v2_metal)
-        require("does not support --quality yet" in v2_metal_output,
-                "Qwen native v2 did not reach Metal option validation",
-                v2_metal)
-        require("DS4_QWEN_EXPERIMENTAL_METAL" not in v2_metal_output,
-                "Qwen native v2 still requires the experimental Metal flag",
-                v2_metal)
+        if backend == "metal":
+            require("does not support --quality yet" in v2_metal_output,
+                    "Qwen native v2 did not reach Metal option validation",
+                    v2_metal)
+            require("DS4_QWEN_EXPERIMENTAL_METAL" not in v2_metal_output,
+                    "Qwen native v2 still requires the experimental Metal flag",
+                    v2_metal)
+        else:
+            require(
+                "metal backend requested but it is unavailable in this build" in
+                v2_metal_output,
+                "CPU build did not reject the unavailable Metal backend",
+                v2_metal,
+            )
         v2_model.unlink()
 
     print("qwen metadata tests: OK")

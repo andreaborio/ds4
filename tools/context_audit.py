@@ -119,6 +119,7 @@ def source_metrics(files: list[Path]) -> tuple[dict[str, int], dict[str, list[st
         "largest_source_lines": largest_lines,
     }
     details = {
+        "direct_ds4_env_names": sorted(env_names),
         "implementation_includes": implementation_includes,
         "maybe_unused_markers": maybe_unused,
         "personal_absolute_path_hits": personal_paths,
@@ -292,11 +293,55 @@ def main() -> int:
             issues.append(f"missing context budget: {args.budget}")
         else:
             budget = json.loads(args.budget.read_text(encoding="utf-8"))
-            for name, maximum in budget.items():
+            for name, policy in budget.items():
                 actual = metrics.get(name)
                 if actual is None:
                     issues.append(f"unknown context budget metric: {name}")
-                elif actual > maximum:
+                    continue
+
+                maximum = policy
+                if isinstance(policy, dict):
+                    maximum = policy.get("maximum")
+                    baseline = policy.get("baseline")
+                    reason = policy.get("reason")
+                    classified = policy.get("accepted_additions")
+                    if not isinstance(maximum, int):
+                        issues.append(f"{name} context budget needs an integer maximum")
+                        continue
+                    if not isinstance(baseline, int):
+                        issues.append(f"{name} classified context budget needs an integer baseline")
+                    if not isinstance(reason, str) or not reason.strip():
+                        issues.append(f"{name} classified context budget needs a reason")
+                    if not isinstance(classified, dict) or not classified:
+                        issues.append(f"{name} classified context budget needs accepted additions")
+                    else:
+                        additions: list[str] = []
+                        for category, names in classified.items():
+                            if not isinstance(category, str) or not isinstance(names, list) or not all(
+                                isinstance(item, str) for item in names
+                            ):
+                                issues.append(f"{name} has an invalid accepted-addition category")
+                                continue
+                            additions.extend(names)
+                        if len(additions) != len(set(additions)):
+                            issues.append(f"{name} accepted additions contain duplicates")
+                        if isinstance(baseline, int) and baseline + len(set(additions)) != maximum:
+                            issues.append(
+                                f"{name} classified budget does not match baseline plus accepted additions"
+                            )
+                        if name == "direct_ds4_env_names":
+                            observed = set(details["direct_ds4_env_names"])
+                            missing = sorted(set(additions) - observed)
+                            if missing:
+                                issues.append(
+                                    f"{name} accepted additions are not direct source reads: "
+                                    + ", ".join(missing)
+                                )
+                elif not isinstance(policy, int):
+                    issues.append(f"{name} context budget must be an integer or policy object")
+                    continue
+
+                if actual > maximum:
                     issues.append(f"{name} increased: {actual} > budget {maximum}")
 
     print(json.dumps(metrics, indent=2, sort_keys=True))

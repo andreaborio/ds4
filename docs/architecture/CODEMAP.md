@@ -10,9 +10,20 @@ below that is relevant to the task. Historical benchmark notes are evidence,
 not architecture specifications. The production-backend boundary is recorded
 in [`ADR 0002`](../adr/0002-apple-metal-production-runtime.md). Qwen's
 RAM/working-set adaptation is isolated in
-[`ADR 0004`](../adr/0004-qwen-metal-hardware-memory-policy.md).
+[`ADR 0004`](../adr/0004-qwen-metal-hardware-memory-policy.md). The proposed
+Hebrus public-name migration and its immutable compatibility boundary are
+recorded in [`ADR 0005`](../adr/0005-hebrus-naming-and-compatibility-boundary.md).
+For the runtime data and admission path at a glance, see the accessible
+[`mmap → ExpertMajor → AUTO → Metal/SSD flow`](hebrus-runtime-flow.svg).
 
 ## Runtime Entry Points
+
+The Makefile links one canonical `hebrus*` executable per role from these
+entrypoints and publishes the corresponding `ds4*` name as a symlink to the
+same file. It also owns the `DESTDIR`/`PREFIX`/`BINDIR` install boundary:
+canonical executables are copied, compatibility aliases stay relative, and
+uninstall names every removable path explicitly. There are no alias-specific
+wrappers or object graphs.
 
 | Path | Primary responsibility |
 | --- | --- |
@@ -21,7 +32,7 @@ RAM/working-set adaptation is isolated in
 | `ds4_agent.c` | Stateful coding-agent TUI, tools, session commands, and interruption state |
 | `ds4_bench.c` | Context-frontier prefill/decode benchmark driver |
 | `ds4_eval.c` | Evaluation driver and extractor checks |
-| `ds4_build.c` | Build identity reported by executables |
+| `ds4_build.c` | Build identity and the versioned machine-readable capability contract reported by executables |
 
 These programs should use the public engine/session API in `ds4.h`. They should
 not acquire tensor, ExpertMajor, or Metal-kernel ownership.
@@ -98,6 +109,13 @@ not validated.
 | Path | Primary responsibility |
 | --- | --- |
 | `tests/` | Model-free, model-backed, kernel, tokenizer, server, and build-isolation regressions |
+| `tests/test_capabilities.py` | Exact schema and cross-executable checks for the model-free build/capability contract |
+| `tests/test_command_aliases.py` | Canonical/legacy symlink layout, binary identity, and CLI-output parity checks |
+| `tests/test_install.sh` | Temporary-root install/uninstall layout, path portability, capability, and explicit-removal checks |
+| `tools/brand_boundary.json` + `tools/brand_boundary_audit.py` | Exact canonical, bridged, and permanently preserved identity contract plus explicit per-file legacy `ds4`/`DS4`/`DwarfStar` classification and monotonic count ceilings; `--check` rejects contract drift, new groups, and increases, while `--refresh` requires exact authorizations before widening a ceiling |
+| `tests/test_brand_boundary_audit.py` | Fail-closed fixtures for new files and tokens, increases, reductions, deterministic refresh, and invalid manifests |
+| `docs/contracts/qwen-release.json` + `tools/qwen_release_contract.py` | Canonical published/negative-only Qwen artifact identity and the model-free gate that parses its documentation, downloader, and test surfaces for drift |
+| `tests/test_qwen_release_contract.py` | Fail-closed fixtures for prose, table, downloader, schema, status, and negative-only Qwen release-contract drift |
 | `tests/qwen/` | Qwen fixtures, provenance, reference collectors, and model-specific gates |
 | `tests/test-vectors/` | Official and local continuation vectors plus provenance |
 | `gguf-tools/` | Quantization, ExpertMajor conversion, imatrix, and quality-scoring tools |
@@ -115,6 +133,7 @@ not be copied into new tests.
 | `CONTRIBUTING.md` | Contribution, regression, and upstream-coordination gates |
 | `QA_BEFORE_RELEASES.md` | Complete release checklist |
 | `docs/contracts/RUNTIME_SUPPORT.md` | Current supported runtime/model matrix |
+| `docs/contracts/BRAND_COMPATIBILITY.md` | Canonical Hebrus names, compatibility aliases, and permanently stable identifiers |
 | `docs/adr/` | Accepted architectural decisions and their consequences |
 | `GOLD_METAL_SSD.md` | Metal/SSD planner details and performance gates; support authority remains `RUNTIME_SUPPORT.md` |
 | `FORK_NOTES.md` | Time-stamped fork/upstream boundary ledger |

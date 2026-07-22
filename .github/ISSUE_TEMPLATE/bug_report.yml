@@ -1,0 +1,140 @@
+name: Bug report
+description: Report a reproducible Hebrus runtime, build, API, model-loading, or compatibility problem.
+title: "[Bug]: "
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for helping improve Hebrus. Search existing issues before filing a report.
+
+        For a possible vulnerability, stop here and follow the [security policy](https://github.com/andreaborio/ds4/blob/main/SECURITY.md). Do not post vulnerability details, secrets, private data, model weights, or model blobs in an issue.
+
+  - type: checkboxes
+    id: prerequisites
+    attributes:
+      label: Prerequisites
+      options:
+        - label: I searched the open and closed issues for an existing report.
+          required: true
+        - label: This is not an undisclosed security vulnerability.
+          required: true
+        - label: I will not attach model weights, model blobs, secrets, or private data.
+          required: true
+
+  - type: textarea
+    id: summary
+    attributes:
+      label: Problem summary
+      description: Describe the failure and its impact in a few precise sentences.
+      placeholder: What failed, where, and how does it affect you?
+    validations:
+      required: true
+
+  - type: dropdown
+    id: component
+    attributes:
+      label: Affected area
+      options:
+        - CLI or inference engine
+        - Server or API
+        - Agent mode
+        - Metal backend
+        - SSD streaming or ExpertMajor
+        - GGUF, conversion, or model download
+        - Build, tests, or documentation
+        - Compatibility alias or legacy interface
+        - Other
+    validations:
+      required: true
+
+  - type: textarea
+    id: build
+    attributes:
+      label: Build identity
+      description: Include the exact commit, whether the tree is dirty, and `./hebrus --build-info` when available.
+      render: shell
+      placeholder: |
+        git rev-parse HEAD
+        git status --short
+        ./hebrus --build-info
+    validations:
+      required: true
+
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment and resolved execution plan
+      description: Include Mac model, Apple chip, RAM, macOS build, power mode, selected backend, storage, and the resolved resident/SSD plan. For non-production reference paths, identify the backend explicitly.
+      placeholder: |
+        Hardware:
+        Memory:
+        OS build:
+        Power mode:
+        Storage/model volume:
+        Backend and resolved plan:
+    validations:
+      required: true
+
+  - type: textarea
+    id: model
+    attributes:
+      label: Model artifact identity
+      description: If model-backed, include family, exact filename, byte size, SHA-256, provenance, and quantization. Do not upload or link redistributed weights unless you are authorized to do so. Write "Not model-backed" when inapplicable.
+      placeholder: |
+        Family:
+        Filename:
+        Size in bytes:
+        SHA-256:
+        Provenance/conversion:
+        Quantization:
+    validations:
+      required: true
+
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: Minimal reproduction
+      description: Provide the smallest sanitized command or request that reproduces the problem, including relevant flags and environment variables.
+      render: shell
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+      description: What should have happened?
+    validations:
+      required: true
+
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behavior and diagnostics
+      description: Include the exact error and the smallest useful log excerpt. Redact tokens, paths containing personal information, prompts, and private data.
+    validations:
+      required: true
+
+  - type: dropdown
+    id: executable
+    attributes:
+      label: Entry point used
+      options:
+        - hebrus
+        - ds4 compatibility alias
+        - Library or embedded API
+        - Other
+    validations:
+      required: true
+
+  - type: textarea
+    id: compatibility
+    attributes:
+      label: Compatibility observations
+      description: Note whether the same problem occurs through the canonical Hebrus entry point and any applicable `ds4*` compatibility alias. Include API, exit-code, environment-variable, or on-disk compatibility details when relevant.
+
+  - type: textarea
+    id: additional
+    attributes:
+      label: Additional context
+      description: Add links to minimal source patches or public logs if useful. Do not attach model files, binaries, large generated outputs, or sensitive data.

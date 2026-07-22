@@ -1,0 +1,22 @@
+{
+  "schemaVersion": 1,
+  "modelFamily": "Qwen3.6-35B-A3B",
+  "downloadTarget": "qwen-v2",
+  "repository": "andreaborio/Qwen3.6-35B-A3B-DS4-GGUF",
+  "publishedArtifact": {
+    "status": "published",
+    "filename": "Qwen3.6-35B-A3B-DS4-ExpertMajor-v2-MLX-Affine4-G64.gguf",
+    "revision": "7bf9c3f7f6136aeb2599d75ee61c0cc2f18e2b02",
+    "bytes": 20808566880,
+    "sha256": "dd17266185833a9f05531ce366fd7284ddca1ed64aa3dcf06e321e8c72c9ea3d",
+    "runtimeCommit": "73a332fef82a0bcdd567d17e0de17aa004cad85d",
+    "storage": "mlx-affine4",
+    "groupSize": 64
+  },
+  "negativeArtifact": {
+    "status": "negative-only",
+    "filename": "Qwen3.6-35B-A3B-DS4-ExpertMajor-v2-Q4_K_S.gguf",
+    "bytes": 20808566880,
+    "sha256": "d7c43a6388ec20e6fe5530850350f96fdb0ac37c5ce36d3e5f92b172c447f56b"
+  }
+}

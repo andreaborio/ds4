@@ -1,0 +1,131 @@
+name: Performance report
+description: Report a reproducible performance regression, result, or optimization opportunity with controlled evidence.
+title: "[Performance]: "
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Performance reports must be reproducible and correctness-preserving. Separate cold and warm runs, identify exact artifacts, and disclose memory pressure or competing workloads.
+
+        Do not attach model weights, model blobs, large binaries, secrets, or private prompts. Possible vulnerabilities belong under [SECURITY.md](https://github.com/andreaborio/ds4/blob/main/SECURITY.md), not in a public issue.
+
+  - type: checkboxes
+    id: prerequisites
+    attributes:
+      label: Evidence prerequisites
+      options:
+        - label: The result uses an exact build and model artifact identity.
+          required: true
+        - label: Correctness was checked before comparing speed or memory.
+          required: true
+        - label: Cold and warm measurements are separated, and competing workloads are disclosed.
+          required: true
+        - label: I will not attach model weights, model blobs, secrets, or private data.
+          required: true
+
+  - type: dropdown
+    id: report_type
+    attributes:
+      label: Report type
+      options:
+        - Performance regression
+        - Optimization proposal
+        - Reproducible benchmark result
+        - Memory or storage-pressure problem
+        - Other
+    validations:
+      required: true
+
+  - type: textarea
+    id: summary
+    attributes:
+      label: Summary and hypothesis
+      description: State the observed behavior, the baseline, the candidate, and your current explanation.
+    validations:
+      required: true
+
+  - type: textarea
+    id: build
+    attributes:
+      label: Build identities
+      description: Provide exact baseline and candidate commits, dirty-tree state, compiler/build options, and `./hebrus --build-info` output.
+      render: shell
+    validations:
+      required: true
+
+  - type: textarea
+    id: artifact
+    attributes:
+      label: Model artifact identity
+      description: Include family, exact filename, size in bytes, SHA-256, provenance/conversion, quantization, and manifest identity if applicable. Do not upload the artifact.
+    validations:
+      required: true
+
+  - type: textarea
+    id: environment
+    attributes:
+      label: Hardware and operating environment
+      description: Include Mac model, Apple chip, RAM, macOS build, power mode, storage device/filesystem, free space, thermal state if known, and all competing processes.
+    validations:
+      required: true
+
+  - type: textarea
+    id: workload
+    attributes:
+      label: Workload and resolved plan
+      description: Include exact sanitized commands, backend, resident/SSD mode, context, prompt/decode lengths, batch settings, thread settings, cache policy, and relevant environment variables.
+      render: shell
+    validations:
+      required: true
+
+  - type: checkboxes
+    id: frontier
+    attributes:
+      label: Performance frontiers covered
+      description: Select completed lanes. Explain omissions below; do not claim a general promotion from a single lane.
+      options:
+        - label: Short, context 128 with at least 128 decoded tokens
+        - label: Medium, context 2048 with at least 128 decoded tokens
+        - label: Large, context 8192 with at least 128 decoded tokens
+        - label: Long, context 32768 with at least 128 decoded tokens
+        - label: Extended 65K/100K lane when the change affects long-context memory or scheduling
+
+  - type: textarea
+    id: procedure
+    attributes:
+      label: Measurement procedure
+      description: Describe A/B/B/A ordering or why it is inapplicable, repetition count, warm-up, cold-cache method, sampling tools, and how inherited `DS4_*` variables were excluded or recorded.
+    validations:
+      required: true
+
+  - type: textarea
+    id: correctness
+    attributes:
+      label: Correctness and decode evidence
+      description: Provide parity/cosine/logit checks as appropriate, successful decoded-token evidence, and any quality gates used. Performance without valid output is not a pass.
+    validations:
+      required: true
+
+  - type: textarea
+    id: results
+    attributes:
+      label: Results
+      description: Separate cold and warm values. Include prefill/decode throughput, time to first token, wall time, peak RSS, swap, memory pressure, bytes read, and variance where available.
+      placeholder: |
+        Lane | Order | Cold/warm | Baseline | Candidate | Delta | Correctness
+    validations:
+      required: true
+
+  - type: textarea
+    id: conclusion
+    attributes:
+      label: Interpretation and requested decision
+      description: State what the evidence supports, important limitations, and the change or follow-up you propose.
+    validations:
+      required: true
+
+  - type: textarea
+    id: evidence
+    attributes:
+      label: Public evidence links
+      description: Link compact public logs, scripts, or patches. Remove absolute personal paths and sensitive prompts; do not attach model files or large benchmark residue.

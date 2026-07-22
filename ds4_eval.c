@@ -1,5 +1,6 @@
 #include "ds4.h"
 #include "ds4_help.h"
+#include "hebrus_identity.h"
 
 /* ds4-eval: small built-in benchmark integration test.
  *
@@ -1933,12 +1934,15 @@ static void tui_signal_restore(int sig) {
     raise(sig);
 }
 
+static const char *eval_invocation = "ds4-eval";
+
 static void tui_draw_title(eval_ui *ui) {
     term_move(1, 1);
     tui_clear_left_line(ui, 1);
     char elapsed[32];
     format_run_elapsed(elapsed, sizeof(elapsed), tui_run_clock_visible_sec(ui));
-    fputs("ds4-eval (" ANSI_BOLD "p" ANSI_RESET ")ause (" ANSI_BOLD "q" ANSI_RESET ")uit", stdout);
+    printf("%s (" ANSI_BOLD "p" ANSI_RESET ")ause (" ANSI_BOLD "q" ANSI_RESET ")uit",
+           hebrus_eval_command_for(eval_invocation));
     printf(" %s", elapsed);
     if (ui->paused) {
         fputs(" " ANSI_RED ANSI_BOLD "PAUSED" ANSI_RESET, stdout);
@@ -4077,8 +4081,14 @@ static uint32_t eval_residency_context_hint(const eval_config *cfg) {
 }
 
 int main(int argc, char **argv) {
+    eval_invocation = argv[0];
+    hebrus_help_set_invocation(argv[0]);
     if (ds4_build_info_requested(argc, argv)) {
-        ds4_build_info_print(stdout);
+        ds4_build_info_print(stdout, argv[0]);
+        return 0;
+    }
+    if (ds4_capabilities_requested(argc, argv)) {
+        ds4_capabilities_print(stdout, DS4_EXECUTABLE_ROLE_EVAL, argv[0]);
         return 0;
     }
     eval_config cfg = parse_options(argc, argv);

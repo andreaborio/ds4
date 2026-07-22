@@ -1,0 +1,44 @@
+name: Model support
+description: Request or report compatibility for a model artifact
+title: "[Model]: "
+labels: ["model-support"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Hebrus supports only explicitly qualified artifacts. Do not attach weights, private prompts, secrets, traces, or KV snapshots.
+  - type: input
+    id: artifact
+    attributes:
+      label: Artifact identity
+      description: Repository, immutable revision, exact filename, byte size, and SHA-256.
+    validations:
+      required: true
+  - type: input
+    id: build
+    attributes:
+      label: Hebrus build
+      description: Commit plus `hebrus --build-info` and `hebrus --capabilities=json`.
+    validations:
+      required: true
+  - type: input
+    id: hardware
+    attributes:
+      label: Hardware and OS
+      placeholder: Mac model, chip, unified memory, macOS version
+    validations:
+      required: true
+  - type: textarea
+    id: result
+    attributes:
+      label: Observed behavior
+      description: Include the exact admission or runtime error and the command with personal paths removed.
+    validations:
+      required: true
+  - type: checkboxes
+    id: hygiene
+    attributes:
+      label: Privacy check
+      options:
+        - label: I removed prompts, tokens, personal paths, model weights, traces, and cache payloads.
+          required: true

@@ -8,13 +8,16 @@ its qualified SSD-streaming path.
 ## User-facing contract
 
 ```sh
-make                         # namespaced Metal build; publishes ./ds4*
-./ds4 -m DEEPSEEK-OR-QWEN-DS4-ExpertMajor-v2.gguf  # AUTO
-./ds4 -m DEEPSEEK-OR-QWEN-DS4-ExpertMajor-v2.gguf --resident
-./ds4 -m DEEPSEEK-OR-QWEN-DS4-ExpertMajor-v2.gguf --ssd-streaming
-./ds4 -m GLM-5.2-DS4-ExpertMajor-v2-Q2_K.gguf --ctx 8192  # AUTO -> SSD
-./ds4 --build-info
+make                         # publishes ./hebrus* plus legacy ./ds4* aliases
+./hebrus -m DEEPSEEK-OR-QWEN-DS4-ExpertMajor-v2.gguf  # AUTO
+./hebrus -m DEEPSEEK-OR-QWEN-DS4-ExpertMajor-v2.gguf --resident
+./hebrus -m DEEPSEEK-OR-QWEN-DS4-ExpertMajor-v2.gguf --ssd-streaming
+./hebrus -m GLM-5.2-DS4-ExpertMajor-v2-Q2_K.gguf --ctx 8192  # AUTO -> SSD
+./hebrus --build-info
 ```
+
+The `./ds4` and `./ds4-server` names remain byte-identical compatibility
+aliases throughout the bridge and 1.x compatibility window.
 
 DeepSeek V4, GLM 5.2, and Qwen3.6 inference accepts only a validated embedded
 `ds4.expert_major.v2` store on Apple Metal. Canonical GGUFs remain offline

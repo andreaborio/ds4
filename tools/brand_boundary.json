@@ -1,0 +1,2699 @@
+{
+  "schema_version": 1,
+  "identity_contract": {
+    "brand": "Hebrus",
+    "canonical_commands": [
+      "hebrus",
+      "hebrus-server",
+      "hebrus-agent",
+      "hebrus-bench",
+      "hebrus-eval"
+    ],
+    "command_aliases": {
+      "ds4": "hebrus",
+      "ds4-server": "hebrus-server",
+      "ds4-agent": "hebrus-agent",
+      "ds4-bench": "hebrus-bench",
+      "ds4-eval": "hebrus-eval"
+    },
+    "accepted_engine_ids": [
+      "hebrus",
+      "ds4"
+    ],
+    "environment_prefixes": {
+      "preserved": [
+        "DS4_"
+      ],
+      "deferred": [
+        "HEBRUS_"
+      ]
+    },
+    "permanent_literals": [
+      "ds4.expert_major.v1",
+      "ds4.expert_major.v2"
+    ],
+    "repositories": {
+      "historical_origin": "antirez/ds4",
+      "pre_rename": "andreaborio/ds4"
+    }
+  },
+  "scope": {
+    "tokens": [
+      "ds4",
+      "DS4",
+      "DwarfStar"
+    ],
+    "locations": [
+      "path",
+      "content"
+    ],
+    "excluded_paths": [
+      "tools/brand_boundary.json"
+    ]
+  },
+  "category_definitions": {
+    "serialized/permanent": "Identifiers embedded in versioned fixtures, wire schemas, on-disk data, or published artifact identities that must not be renamed by the brand migration.",
+    "compatibility": "Legacy commands, environment names, repository identities, probes, and bridge contracts retained for existing users and integrations.",
+    "historical-attribution": "Fork ancestry, authorship, third-party credit, release records, and benchmark evidence that must preserve their historical spelling.",
+    "migration-pending": "Active source, tests, tooling, or current documentation whose internal legacy spelling remains to be handled by a later mechanical migration."
+  },
+  "refresh_policy": {
+    "reductions": "python3 tools/brand_boundary_audit.py --refresh",
+    "existing_increase": "python3 tools/brand_boundary_audit.py --refresh --accept-increase 'PATH:LOCATION:TOKEN'",
+    "new_group": "python3 tools/brand_boundary_audit.py --refresh --classify 'PATH:LOCATION:TOKEN=CLASSIFICATION'"
+  },
+  "entries": [
+    {
+      "path": ".github/ISSUE_TEMPLATE/bug_report.yml",
+      "location": "content",
+      "token": "ds4",
+      "classification": "compatibility",
+      "maximum": 3
+    },
+    {
+      "path": ".github/ISSUE_TEMPLATE/config.yml",
+      "location": "content",
+      "token": "ds4",
+      "classification": "compatibility",
+      "maximum": 2
+    },
+    {
+      "path": ".github/ISSUE_TEMPLATE/feature_request.yml",
+      "location": "content",
+      "token": "ds4",
+      "classification": "compatibility",
+      "maximum": 2
+    },
+    {
+      "path": ".github/ISSUE_TEMPLATE/feature_request.yml",
+      "location": "content",
+      "token": "DS4",
+      "classification": "compatibility",
+      "maximum": 1
+    },
+    {
+      "path": ".github/ISSUE_TEMPLATE/performance_report.yml",
+      "location": "content",
+      "token": "ds4",
+      "classification": "compatibility",
+      "maximum": 1
+    },
+    {
+      "path": ".github/ISSUE_TEMPLATE/performance_report.yml",
+      "location": "content",
+      "token": "DS4",
+      "classification": "compatibility",
+      "maximum": 1
+    },
+    {
+      "path": ".github/pull_request_template.md",
+      "location": "content",
+      "token": "ds4",
+      "classification": "compatibility",
+      "maximum": 1
+    },
+    {
+      "path": ".github/pull_request_template.md",
+      "location": "content",
+      "token": "DS4",
+      "classification": "compatibility",
+      "maximum": 1
+    },
+    {
+      "path": ".gitignore",
+      "location": "content",
+      "token": "ds4",
+      "classification": "migration-pending",
+      "maximum": 11
+    },
+    {
+      "path": "ACKNOWLEDGMENTS.md",
+      "location": "content",
+      "token": "ds4",
+      "classification": "historical-attribution",
+      "maximum": 3
+    },
+    {
+      "path": "CHANGELOG.md",
+      "location": "content",
+      "token": "ds4",
+      "classification": "compatibility",
+      "maximum": 6
+    },
+    {
+      "path": "CHANGELOG.md",
+      "location": "content",
+      "token": "DS4",
+      "classification": "compatibility",
+      "maximum": 1
+    },
+    {
+      "path": "CITATION.cff",
+      "location": "content",
+      "token": "ds4",
+      "classification": "compatibility",
+      "maximum": 3
+    },
+    {
+      "path": "CONTRIBUTING.md",
+      "location": "content",
+      "token": "ds4",
+      "classification": "migration-pending",
+      "maximum": 22
+    },
+    {
+      "path": "CONTRIBUTING.md",
+      "location": "content",
+      "token": "DS4",
+      "classification": "migration-pending",
+      "maximum": 9
+    },
+    {
+      "path": "EXPERT_PRUNE.md",
+      "location": "content",
+      "token": "ds4",
+      "classification": "migration-pending",
+      "maximum": 9
+    },
+    {
+      "path": "EXPERT_PRUNE.md",
+      "location": "content",
+      "token": "DS4",
+      "classification": "migration-pending",
+      "maximum": 12
+    },
+    {
+      "path": "FORK_NOTES.md",
+      "location": "content",
+      "token": "ds4",
+      "classification": "historical-attribution",
+      "maximum": 20
+    },
+    {
+      "path": "FORK_NOTES.md",
+      "location": "content",
+      "token": "DS4",
+      "classification": "historical-attribution",
+      "maximum": 2
+    },
+    {
+      "path": "FORK_NOTES.md",
+      "location": "content",
+      "token": "DwarfStar",
+      "classification": "historical-attribution",
+      "maximum": 1
+    },
+    {
+      "path": "GOLD_METAL_SSD.md",
+      "location": "content",
+      "token": "ds4",
+      "classification": "migration-pending",
+      "maximum": 5
+    },
+    {
+      "path": "GOLD_METAL_SSD.md",
+      "location": "content",
+      "token": "DS4",
+      "classification": "migration-pending",
+      "maximum": 6
+    },
+    {
+      "path": "GOVERNANCE.md",
+      "location": "content",
+      "token": "ds4",
+      "classification": "compatibility",
+      "maximum": 2
+    },
+    {
+      "path": "LICENSE",
+      "location": "content",
+      "token": "ds4",
+      "classification": "historical-attribution",
+      "maximum": 1
+    },
+    {
+      "path": "MERGE_LOG.md",
+      "location": "content",
+      "token": "ds4",
+      "classification": "historical-attribution",
+      "maximum": 29
+    },
+    {
+      "path": "MERGE_LOG.md",
+      "location": "content",
+      "token": "DS4",
+      "classification": "historical-attribution",
+      "maximum": 5
+    },
+    {
+      "path": "Makefile",
+      "location": "content",
+      "token": "ds4",
+      "classification": "compatibility",
+      "maximum": 495
+    },
+    {
+      "path": "Makefile",
+      "location": "content",
+      "token": "DS4",
+      "classification": "compatibility",
+      "maximum": 43
+    },
+    {
+      "path": "ONEDGE_IMATRIX.md",
+      "location": "content",
+      "token": "ds4",
+      "classification": "migration-pending",
+      "maximum": 9
+    },
+    {
+      "path": "ONEDGE_IMATRIX.md",
+      "location": "content",
+      "token": "DS4",
+      "classification": "migration-pending",
+      "maximum": 1
+    },
+    {
+      "path": "QA_BEFORE_RELEASES.md",
+      "location": "content",
+      "token": "ds4",
+      "classification": "compatibility",
+      "maximum": 26
+    },
+    {
+      "path": "QA_BEFORE_RELEASES.md",
+      "location": "content",
+      "token": "DS4",
+      "classification": "compatibility",
+      "maximum": 10
+    },
+    {
+      "path": "README.md",
+      "location": "content",
+      "token": "ds4",
+      "classification": "migration-pending",
+      "maximum": 12
+    },
+    {
+      "path": "README.md",
+      "location": "content",
+      "token": "DS4",
+      "classification": "migration-pending",
+      "maximum": 5
+    },
+    {
+      "path": "SECURITY.md",
+      "location": "content",
+      "token": "ds4",
+      "classification": "compatibility",
+      "maximum": 1
+    },
+    {
+      "path": "SSD_STREAMING_VERIFICATION.md",
+      "location": "content",
+      "token": "ds4",
+      "classification": "migration-pending",
+      "maximum": 9
+    },
+    {
+      "path": "SSD_STREAMING_VERIFICATION.md",
+      "location": "content",
+      "token": "DS4",
+      "classification": "migration-pending",
+      "maximum": 11
+    },
+    {
+      "path": "dir-steering/README.md",
+      "location": "content",
+      "token": "ds4",
+      "classification": "migration-pending",
+      "maximum": 12
+    },
+    {
+      "path": "dir-steering/README.md",
+      "location": "content",
+      "token": "DS4",
+      "classification": "migration-pending",
+      "maximum": 2
+    },
+    {
+      "path": "dir-steering/out/verbosity.json",
+      "location": "content",
+      "token": "ds4",
+      "classification": "serialized/permanent",
+      "maximum": 1
+    },
+    {
+      "path": "dir-steering/tools/build_direction.py",
+      "location": "content",
+      "token": "ds4",
+      "classification": "migration-pending",
+      "maximum": 18
+    },
+    {
+      "path": "dir-steering/tools/build_direction.py",
+      "location": "content",
+      "token": "DS4",
+      "classification": "migration-pending",
+      "maximum": 5
+    },
+    {
+      "path": "dir-steering/tools/run_sweep.py",
+      "location": "content",
+      "token": "ds4",
+      "classification": "migration-pending",
+      "maximum": 6
+    },
+    {
+      "path": "docs/ENGINE_REFERENCE.md",
+      "location": "content",
+      "token": "ds4",
+      "classification": "migration-pending",
+      "maximum": 48
+    },
+    {
+      "path": "docs/ENGINE_REFERENCE.md",
+      "location": "content",
+      "token": "DS4",
+      "classification": "migration-pending",
+      "maximum": 43
+    },
+    {
+      "path": "docs/HF_MODEL_RENAME_INVENTORY.md",
+      "location": "content",
+      "token": "DS4",
+      "classification": "serialized/permanent",
+      "maximum": 9
+    },
+    {
+      "path": "docs/REBRAND_ROLLOUT_PLAN.md",
+      "location": "content",
+      "token": "ds4",
+      "classification": "compatibility",
+      "maximum": 12
+    },
+    {
+      "path": "docs/REBRAND_ROLLOUT_PLAN.md",
+      "location": "content",
+      "token": "DS4",
+      "classification": "compatibility",
+      "maximum": 11
+    },
+    {
+      "path": "docs/adr/0001-expert-major-v2-only.md",
+      "location": "content",
+      "token": "ds4",
+      "classification": "migration-pending",
+      "maximum": 1
+    },
+    {
+      "path": "docs/adr/0005-hebrus-naming-and-compatibility-boundary.md",
+      "location": "content",
+      "token": "ds4",
+      "classification": "compatibility",
+      "maximum": 7
+    },
+    {
+      "path": "docs/adr/0005-hebrus-naming-and-compatibility-boundary.md",
+      "location": "content",
+      "token": "DS4",
+      "classification": "compatibility",
+      "maximum": 4
+    },
+    {
+      "path": "docs/architecture/CODEMAP.md",
+      "location": "content",
+      "token": "ds4",
+      "classification": "migration-pending",
+      "maximum": 47
+    },
+    {
+      "path": "docs/architecture/CODEMAP.md",
+      "location": "content",
+      "token": "DS4",
+      "classification": "migration-pending",
+      "maximum": 1
+    },
+    {
+      "path": "docs/architecture/CODEMAP.md",
+      "location": "content",
+      "token": "DwarfStar",
+      "classification": "migration-pending",
+      "maximum": 1
+    },
+    {
+      "path": "docs/architecture/hebrus-runtime-flow.svg",
+      "location": "content",
+      "token": "ds4",
+      "classification": "serialized/permanent",
+      "maximum": 1
+    },
+    {
+      "path": "docs/benchmarks/2026-07-14-m5-pro.md",
+      "location": "content",
+      "token": "ds4",
+      "classification": "historical-attribution",
+      "maximum": 14
+    },
+    {
+      "path": "docs/benchmarks/2026-07-14-m5-pro.md",
+      "location": "content",
+      "token": "DS4",
+      "classification": "historical-attribution",
+      "maximum": 5
+    },
+    {
+      "path": "docs/benchmarks/2026-07-15-qwen-ds4-vs-llamacpp.md",
+      "location": "path",
+      "token": "ds4",
+      "classification": "historical-attribution",
+      "maximum": 1
+    },
+    {
+      "path": "docs/benchmarks/2026-07-15-qwen-ds4-vs-llamacpp.md",
+      "location": "content",
+      "token": "ds4",
+      "classification": "historical-attribution",
+      "maximum": 7
+    },
+    {
+      "path": "docs/benchmarks/2026-07-15-qwen-ds4-vs-llamacpp.md",
+      "location": "content",
+      "token": "DS4",
+      "classification": "historical-attribution",
+      "maximum": 19
+    },
+    {
+      "path": "docs/benchmarks/2026-07-17-deepseek-native-expert-major.md",
+      "location": "content",
+      "token": "ds4",
+      "classification": "historical-attribution",
+      "maximum": 9
+    },
+    {
+      "path": "docs/benchmarks/2026-07-17-deepseek-native-expert-major.md",
+      "location": "content",
+      "token": "DS4",
+      "classification": "historical-attribution",
+      "maximum": 15
+    },
+    {
+      "path": "docs/benchmarks/2026-07-17-deepseek-qwen-transfer-audit.md",
+      "location": "content",
+      "token": "ds4",
+      "classification": "historical-attribution",
+      "maximum": 2
+    },
+    {
+      "path": "docs/benchmarks/2026-07-17-deepseek-qwen-transfer-audit.md",
+      "location": "content",
+      "token": "DS4",
+      "classification": "historical-attribution",
+      "maximum": 4
+    },
+    {
+      "path": "docs/benchmarks/2026-07-17-qwen-native-expert-major.md",
+      "location": "content",
+      "token": "DS4",
+      "classification": "historical-attribution",
+      "maximum": 1
+    },
+    {
+      "path": "docs/benchmarks/2026-07-20-agent-friendly-refactor-validation.md",
+      "location": "content",
+      "token": "ds4",
+      "classification": "historical-attribution",
+      "maximum": 6
+    },
+    {
+      "path": "docs/benchmarks/2026-07-20-agent-friendly-refactor-validation.md",
+      "location": "content",
+      "token": "DS4",
+      "classification": "historical-attribution",
+      "maximum": 8
+    },
+    {
+      "path": "docs/benchmarks/2026-07-20-glm52-expert-major-v2.md",
+      "location": "content",
+      "token": "ds4",
+      "classification": "historical-attribution",
+      "maximum": 2
+    },
+    {
+      "path": "docs/benchmarks/2026-07-20-glm52-expert-major-v2.md",
+      "location": "content",
+      "token": "DS4",
+      "classification": "historical-attribution",
+      "maximum": 7
+    },
+    {
+      "path": "docs/benchmarks/2026-07-20-long-context-metal-stack.md",
+      "location": "content",
+      "token": "ds4",
+      "classification": "historical-attribution",
+      "maximum": 8
+    },
+    {
+      "path": "docs/benchmarks/2026-07-20-qwen-expert-major-v2.md",
+      "location": "content",
+      "token": "ds4",
+      "classification": "historical-attribution",
+      "maximum": 2
+    },
+    {
+      "path": "docs/benchmarks/2026-07-20-qwen-expert-major-v2.md",
+      "location": "content",
+      "token": "DS4",
+      "classification": "historical-attribution",
+      "maximum": 4
+    },
+    {
+      "path": "docs/benchmarks/2026-07-21-qwen-f32-router-nax-prefill.md",
+      "location": "content",
+      "token": "DS4",
+      "classification": "historical-attribution",
+      "maximum": 6
+    },
+    {
+      "path": "docs/benchmarks/2026-07-21-qwen-mlx-affine-nax-prefill.md",
+      "location": "content",
+      "token": "DS4",
+      "classification": "historical-attribution",
+      "maximum": 4
+    },
+    {
+      "path": "docs/benchmarks/2026-07-21-qwen-pre-m5-exact-router-tile.md",
+      "location": "content",
+      "token": "ds4",
+      "classification": "historical-attribution",
+      "maximum": 6
+    },
+    {
+      "path": "docs/benchmarks/2026-07-21-qwen-pre-m5-exact-router-tile.md",
+      "location": "content",
+      "token": "DS4",
+      "classification": "historical-attribution",
+      "maximum": 3
+    },
+    {
+      "path": "docs/benchmarks/2026-07-21-qwen-q4-paired-mmid-prefill.md",
+      "location": "content",
+      "token": "ds4",
+      "classification": "historical-attribution",
+      "maximum": 1
+    },
+    {
+      "path": "docs/benchmarks/2026-07-21-qwen-q4-paired-mmid-prefill.md",
+      "location": "content",
+      "token": "DS4",
+      "classification": "historical-attribution",
+      "maximum": 1
+    },
+    {
+      "path": "docs/benchmarks/2026-07-21-qwen-split-k-hardware-policy.md",
+      "location": "content",
+      "token": "ds4",
+      "classification": "historical-attribution",
+      "maximum": 6
+    },
+    {
+      "path": "docs/benchmarks/2026-07-21-qwen-unified-affine-auto-ssd.md",
+      "location": "content",
+      "token": "ds4",
+      "classification": "historical-attribution",
+      "maximum": 2
+    },
+    {
+      "path": "docs/benchmarks/2026-07-21-qwen-unified-affine-auto-ssd.md",
+      "location": "content",
+      "token": "DS4",
+      "classification": "historical-attribution",
+      "maximum": 4
+    },
+    {
+      "path": "docs/benchmarks/2026-07-21-upstream-metal-transfer-audit.md",
+      "location": "content",
+      "token": "ds4",
+      "classification": "historical-attribution",
+      "maximum": 11
+    },
+    {
+      "path": "docs/benchmarks/2026-07-22-qwen-kv-pair-blit.md",
+      "location": "content",
+      "token": "ds4",
+      "classification": "historical-attribution",
+      "maximum": 8
+    },
+    {
+      "path": "docs/benchmarks/2026-07-22-qwen-kv-pair-blit.md",
+      "location": "content",
+      "token": "DS4",
+      "classification": "historical-attribution",
+      "maximum": 1
+    },
+    {
+      "path": "docs/benchmarks/2026-07-22-qwen-ssd-flash-prefill.md",
+      "location": "content",
+      "token": "DS4",
+      "classification": "historical-attribution",
+      "maximum": 2
+    },
+    {
+      "path": "docs/benchmarks/README.md",
+      "location": "content",
+      "token": "ds4",
+      "classification": "historical-attribution",
+      "maximum": 2
+    },
+    {
+      "path": "docs/contracts/BRAND_COMPATIBILITY.md",
+      "location": "content",
+      "token": "ds4",
+      "classification": "compatibility",
+      "maximum": 20
+    },
+    {
+      "path": "docs/contracts/BRAND_COMPATIBILITY.md",
+      "location": "content",
+      "token": "DS4",
+      "classification": "compatibility",
+      "maximum": 2
+    },
+    {
+      "path": "docs/contracts/RUNTIME_SUPPORT.md",
+      "location": "content",
+      "token": "ds4",
+      "classification": "compatibility",
+      "maximum": 1
+    },
+    {
+      "path": "docs/contracts/RUNTIME_SUPPORT.md",
+      "location": "content",
+      "token": "DS4",
+      "classification": "compatibility",
+      "maximum": 5
+    },
+    {
+      "path": "docs/contracts/qwen-release.json",
+      "location": "content",
+      "token": "DS4",
+      "classification": "serialized/permanent",
+      "maximum": 3
+    },
+    {
+      "path": "docs/deepseek-expert-major-v2.md",
+      "location": "content",
+      "token": "ds4",
+      "classification": "migration-pending",
+      "maximum": 4
+    },
+    {
+      "path": "docs/deepseek-expert-major-v2.md",
+      "location": "content",
+      "token": "DS4",
+      "classification": "migration-pending",
+      "maximum": 6
+    },
+    {
+      "path": "docs/expert-major-v2-roadmap.md",
+      "location": "content",
+      "token": "ds4",
+      "classification": "migration-pending",
+      "maximum": 2
+    },
+    {
+      "path": "docs/expert-major-v2-roadmap.md",
+      "location": "content",
+      "token": "DS4",
+      "classification": "migration-pending",
+      "maximum": 3
+    },
+    {
+      "path": "docs/glm52-expert-major-v2.md",
+      "location": "content",
+      "token": "ds4",
+      "classification": "migration-pending",
+      "maximum": 1
+    },
+    {
+      "path": "docs/glm52-expert-major-v2.md",
+      "location": "content",
+      "token": "DS4",
+      "classification": "migration-pending",
+      "maximum": 11
+    },
+    {
+      "path": "docs/guides/MIGRATING_TO_HEBRUS.md",
+      "location": "content",
+      "token": "ds4",
+      "classification": "compatibility",
+      "maximum": 24
+    },
+    {
+      "path": "docs/guides/MIGRATING_TO_HEBRUS.md",
+      "location": "content",
+      "token": "DS4",
+      "classification": "compatibility",
+      "maximum": 6
+    },
+    {
+      "path": "docs/qwen-expert-major-store.md",
+      "location": "content",
+      "token": "ds4",
+      "classification": "migration-pending",
+      "maximum": 8
+    },
+    {
+      "path": "docs/qwen-expert-major-store.md",
+      "location": "content",
+      "token": "DS4",
+      "classification": "migration-pending",
+      "maximum": 9
+    },
+    {
+      "path": "docs/releases/hebrus-bridge-launch-candidate.md",
+      "location": "content",
+      "token": "ds4",
+      "classification": "compatibility",
+      "maximum": 8
+    },
+    {
+      "path": "docs/releases/hebrus-bridge-launch-candidate.md",
+      "location": "content",
+      "token": "DS4",
+      "classification": "compatibility",
+      "maximum": 2
+    },
+    {
+      "path": "docs/releases/v0.1.0.md",
+      "location": "content",
+      "token": "ds4",
+      "classification": "historical-attribution",
+      "maximum": 7
+    },
+    {
+      "path": "docs/releases/v0.1.0.md",
+      "location": "content",
+      "token": "DS4",
+      "classification": "historical-attribution",
+      "maximum": 3
+    },
+    {
+      "path": "docs/releases/v0.1.0.md",
+      "location": "content",
+      "token": "DwarfStar",
+      "classification": "historical-attribution",
+      "maximum": 1
+    },
+    {
+      "path": "docs/releases/v0.2.0.md",
+      "location": "content",
+      "token": "ds4",
+      "classification": "historical-attribution",
+      "maximum": 2
+    },
+    {
+      "path": "docs/releases/v0.2.0.md",
+      "location": "content",
+      "token": "DS4",
+      "classification": "historical-attribution",
+      "maximum": 4
+    },
+    {
+      "path": "docs/releases/v0.2.0.md",
+      "location": "content",
+      "token": "DwarfStar",
+      "classification": "historical-attribution",
+      "maximum": 1
+    },
+    {
+      "path": "download_model.sh",
+      "location": "content",
+      "token": "ds4",
+      "classification": "migration-pending",
+      "maximum": 6
+    },
+    {
+      "path": "download_model.sh",
+      "location": "content",
+      "token": "DS4",
+      "classification": "migration-pending",
+      "maximum": 10
+    },
+    {
+      "path": "ds4.c",
+      "location": "path",
+      "token": "ds4",
+      "classification": "migration-pending",
+      "maximum": 1
+    },
+    {
+      "path": "ds4.c",
+      "location": "content",
+      "token": "ds4",
+      "classification": "migration-pending",
+      "maximum": 5227
+    },
+    {
+      "path": "ds4.c",
+      "location": "content",
+      "token": "DS4",
+      "classification": "migration-pending",
+      "maximum": 4470
+    },
+    {
+      "path": "ds4.h",
+      "location": "path",
+      "token": "ds4",
+      "classification": "migration-pending",
+      "maximum": 1
+    },
+    {
+      "path": "ds4.h",
+      "location": "content",
+      "token": "ds4",
+      "classification": "migration-pending",
+      "maximum": 320
+    },
+    {
+      "path": "ds4.h",
+      "location": "content",
+      "token": "DS4",
+      "classification": "migration-pending",
+      "maximum": 40
+    },
+    {
+      "path": "ds4_agent.c",
+      "location": "path",
+      "token": "ds4",
+      "classification": "migration-pending",
+      "maximum": 1
+    },
+    {
+      "path": "ds4_agent.c",
+      "location": "content",
+      "token": "ds4",
+      "classification": "migration-pending",
+      "maximum": 353
+    },
+    {
+      "path": "ds4_agent.c",
+      "location": "content",
+      "token": "DS4",
+      "classification": "migration-pending",
+      "maximum": 45
+    },
+    {
+      "path": "ds4_bench.c",
+      "location": "path",
+      "token": "ds4",
+      "classification": "migration-pending",
+      "maximum": 1
+    },
+    {
+      "path": "ds4_bench.c",
+      "location": "content",
+      "token": "ds4",
+      "classification": "migration-pending",
+      "maximum": 147
+    },
+    {
+      "path": "ds4_bench.c",
+      "location": "content",
+      "token": "DS4",
+      "classification": "migration-pending",
+      "maximum": 21
+    },
+    {
+      "path": "ds4_build.c",
+      "location": "path",
+      "token": "ds4",
+      "classification": "migration-pending",
+      "maximum": 1
+    },
+    {
+      "path": "ds4_build.c",
+      "location": "content",
+      "token": "ds4",
+      "classification": "migration-pending",
+      "maximum": 26
+    },
+    {
+      "path": "ds4_build.c",
+      "location": "content",
+      "token": "DS4",
+      "classification": "migration-pending",
+      "maximum": 20
+    },
+    {
+      "path": "ds4_cli.c",
+      "location": "path",
+      "token": "ds4",
+      "classification": "migration-pending",
+      "maximum": 1
+    },
+    {
+      "path": "ds4_cli.c",
+      "location": "content",
+      "token": "ds4",
+      "classification": "migration-pending",
+      "maximum": 403
+    },
+    {
+      "path": "ds4_cli.c",
+      "location": "content",
+      "token": "DS4",
+      "classification": "migration-pending",
+      "maximum": 45
+    },
+    {
+      "path": "ds4_eval.c",
+      "location": "path",
+      "token": "ds4",
+      "classification": "migration-pending",
+      "maximum": 1
+    },
+    {
+      "path": "ds4_eval.c",
+      "location": "content",
+      "token": "ds4",
+      "classification": "migration-pending",
+      "maximum": 158
+    },
+    {
+      "path": "ds4_eval.c",
+      "location": "content",
+      "token": "DS4",
+      "classification": "migration-pending",
+      "maximum": 22
+    },
+    {
+      "path": "ds4_expert_store.c",
+      "location": "path",
+      "token": "ds4",
+      "classification": "migration-pending",
+      "maximum": 1
+    },
+    {
+      "path": "ds4_expert_store.c",
+      "location": "content",
+      "token": "ds4",
+      "classification": "migration-pending",
+      "maximum": 31
+    },
+    {
+      "path": "ds4_expert_store.c",
+      "location": "content",
+      "token": "DS4",
+      "classification": "migration-pending",
+      "maximum": 13
+    },
+    {
+      "path": "ds4_expert_store.h",
+      "location": "path",
+      "token": "ds4",
+      "classification": "migration-pending",
+      "maximum": 1
+    },
+    {
+      "path": "ds4_expert_store.h",
+      "location": "content",
+      "token": "ds4",
+      "classification": "migration-pending",
+      "maximum": 29
+    },
+    {
+      "path": "ds4_expert_store.h",
+      "location": "content",
+      "token": "DS4",
+      "classification": "migration-pending",
+      "maximum": 21
+    },
+    {
+      "path": "ds4_gpu.h",
+      "location": "path",
+      "token": "ds4",
+      "classification": "migration-pending",
+      "maximum": 1
+    },
+    {
+      "path": "ds4_gpu.h",
+      "location": "content",
+      "token": "ds4",
+      "classification": "migration-pending",
+      "maximum": 726
+    },
+    {
+      "path": "ds4_gpu.h",
+      "location": "content",
+      "token": "DS4",
+      "classification": "migration-pending",
+      "maximum": 13
+    },
+    {
+      "path": "ds4_help.c",
+      "location": "path",
+      "token": "ds4",
+      "classification": "migration-pending",
+      "maximum": 1
+    },
+    {
+      "path": "ds4_help.c",
+      "location": "content",
+      "token": "ds4",
+      "classification": "migration-pending",
+      "maximum": 32
+    },
+    {
+      "path": "ds4_help.c",
+      "location": "content",
+      "token": "DS4",
+      "classification": "migration-pending",
+      "maximum": 81
+    },
+    {
+      "path": "ds4_help.h",
+      "location": "path",
+      "token": "ds4",
+      "classification": "migration-pending",
+      "maximum": 1
+    },
+    {
+      "path": "ds4_help.h",
+      "location": "content",
+      "token": "ds4",
+      "classification": "migration-pending",
+      "maximum": 5
+    },
+    {
+      "path": "ds4_help.h",
+      "location": "content",
+      "token": "DS4",
+      "classification": "migration-pending",
+      "maximum": 8
+    },
+    {
+      "path": "ds4_kvstore.c",
+      "location": "path",
+      "token": "ds4",
+      "classification": "migration-pending",
+      "maximum": 1
+    },
+    {
+      "path": "ds4_kvstore.c",
+      "location": "content",
+      "token": "ds4",
+      "classification": "migration-pending",
+      "maximum": 233
+    },
+    {
+      "path": "ds4_kvstore.c",
+      "location": "content",
+      "token": "DS4",
+      "classification": "migration-pending",
+      "maximum": 52
+    },
+    {
+      "path": "ds4_kvstore.h",
+      "location": "path",
+      "token": "ds4",
+      "classification": "migration-pending",
+      "maximum": 1
+    },
+    {
+      "path": "ds4_kvstore.h",
+      "location": "content",
+      "token": "ds4",
+      "classification": "migration-pending",
+      "maximum": 101
+    },
+    {
+      "path": "ds4_kvstore.h",
+      "location": "content",
+      "token": "DS4",
+      "classification": "migration-pending",
+      "maximum": 20
+    },
+    {
+      "path": "ds4_metal.m",
+      "location": "path",
+      "token": "ds4",
+      "classification": "migration-pending",
+      "maximum": 1
+    },
+    {
+      "path": "ds4_metal.m",
+      "location": "content",
+      "token": "ds4",
+      "classification": "migration-pending",
+      "maximum": 6662
+    },
+    {
+      "path": "ds4_metal.m",
+      "location": "content",
+      "token": "DS4",
+      "classification": "migration-pending",
+      "maximum": 1070
+    },
+    {
+      "path": "ds4_profile.c",
+      "location": "path",
+      "token": "ds4",
+      "classification": "migration-pending",
+      "maximum": 1
+    },
+    {
+      "path": "ds4_profile.c",
+      "location": "content",
+      "token": "ds4",
+      "classification": "migration-pending",
+      "maximum": 13
+    },
+    {
+      "path": "ds4_profile.c",
+      "location": "content",
+      "token": "DS4",
+      "classification": "migration-pending",
+      "maximum": 10
+    },
+    {
+      "path": "ds4_profile.h",
+      "location": "path",
+      "token": "ds4",
+      "classification": "migration-pending",
+      "maximum": 1
+    },
+    {
+      "path": "ds4_profile.h",
+      "location": "content",
+      "token": "ds4",
+      "classification": "migration-pending",
+      "maximum": 8
+    },
+    {
+      "path": "ds4_profile.h",
+      "location": "content",
+      "token": "DS4",
+      "classification": "migration-pending",
+      "maximum": 4
+    },
+    {
+      "path": "ds4_qwen.c",
+      "location": "path",
+      "token": "ds4",
+      "classification": "migration-pending",
+      "maximum": 1
+    },
+    {
+      "path": "ds4_qwen.c",
+      "location": "content",
+      "token": "ds4",
+      "classification": "migration-pending",
+      "maximum": 51
+    },
+    {
+      "path": "ds4_qwen.h",
+      "location": "path",
+      "token": "ds4",
+      "classification": "migration-pending",
+      "maximum": 1
+    },
+    {
+      "path": "ds4_qwen.h",
+      "location": "content",
+      "token": "ds4",
+      "classification": "migration-pending",
+      "maximum": 44
+    },
+    {
+      "path": "ds4_qwen.h",
+      "location": "content",
+      "token": "DS4",
+      "classification": "migration-pending",
+      "maximum": 2
+    },
+    {
+      "path": "ds4_qwen_expert_group.c",
+      "location": "path",
+      "token": "ds4",
+      "classification": "migration-pending",
+      "maximum": 1
+    },
+    {
+      "path": "ds4_qwen_expert_group.c",
+      "location": "content",
+      "token": "ds4",
+      "classification": "migration-pending",
+      "maximum": 31
+    },
+    {
+      "path": "ds4_qwen_expert_group.c",
+      "location": "content",
+      "token": "DS4",
+      "classification": "migration-pending",
+      "maximum": 21
+    },
+    {
+      "path": "ds4_qwen_expert_group.h",
+      "location": "path",
+      "token": "ds4",
+      "classification": "migration-pending",
+      "maximum": 1
+    },
+    {
+      "path": "ds4_qwen_expert_group.h",
+      "location": "content",
+      "token": "ds4",
+      "classification": "migration-pending",
+      "maximum": 26
+    },
+    {
+      "path": "ds4_qwen_expert_group.h",
+      "location": "content",
+      "token": "DS4",
+      "classification": "migration-pending",
+      "maximum": 8
+    },
+    {
+      "path": "ds4_qwen_ref.c",
+      "location": "path",
+      "token": "ds4",
+      "classification": "migration-pending",
+      "maximum": 1
+    },
+    {
+      "path": "ds4_qwen_ref.c",
+      "location": "content",
+      "token": "ds4",
+      "classification": "migration-pending",
+      "maximum": 12
+    },
+    {
+      "path": "ds4_qwen_ref.h",
+      "location": "path",
+      "token": "ds4",
+      "classification": "migration-pending",
+      "maximum": 1
+    },
+    {
+      "path": "ds4_qwen_ref.h",
+      "location": "content",
+      "token": "ds4",
+      "classification": "migration-pending",
+      "maximum": 11
+    },
+    {
+      "path": "ds4_qwen_ref.h",
+      "location": "content",
+      "token": "DS4",
+      "classification": "migration-pending",
+      "maximum": 2
+    },
+    {
+      "path": "ds4_qwen_unicode.c",
+      "location": "path",
+      "token": "ds4",
+      "classification": "migration-pending",
+      "maximum": 1
+    },
+    {
+      "path": "ds4_qwen_unicode.c",
+      "location": "content",
+      "token": "ds4",
+      "classification": "migration-pending",
+      "maximum": 9
+    },
+    {
+      "path": "ds4_qwen_unicode.c",
+      "location": "content",
+      "token": "DS4",
+      "classification": "migration-pending",
+      "maximum": 2
+    },
+    {
+      "path": "ds4_qwen_unicode.h",
+      "location": "path",
+      "token": "ds4",
+      "classification": "migration-pending",
+      "maximum": 1
+    },
+    {
+      "path": "ds4_qwen_unicode.h",
+      "location": "content",
+      "token": "ds4",
+      "classification": "migration-pending",
+      "maximum": 6
+    },
+    {
+      "path": "ds4_qwen_unicode.h",
+      "location": "content",
+      "token": "DS4",
+      "classification": "migration-pending",
+      "maximum": 6
+    },
+    {
+      "path": "ds4_qwen_unicode_data.inc",
+      "location": "path",
+      "token": "ds4",
+      "classification": "migration-pending",
+      "maximum": 1
+    },
+    {
+      "path": "ds4_server.c",
+      "location": "path",
+      "token": "ds4",
+      "classification": "migration-pending",
+      "maximum": 1
+    },
+    {
+      "path": "ds4_server.c",
+      "location": "content",
+      "token": "ds4",
+      "classification": "migration-pending",
+      "maximum": 476
+    },
+    {
+      "path": "ds4_server.c",
+      "location": "content",
+      "token": "DS4",
+      "classification": "migration-pending",
+      "maximum": 565
+    },
+    {
+      "path": "ds4_ssd.c",
+      "location": "path",
+      "token": "ds4",
+      "classification": "migration-pending",
+      "maximum": 1
+    },
+    {
+      "path": "ds4_ssd.c",
+      "location": "content",
+      "token": "ds4",
+      "classification": "migration-pending",
+      "maximum": 71
+    },
+    {
+      "path": "ds4_ssd.c",
+      "location": "content",
+      "token": "DS4",
+      "classification": "migration-pending",
+      "maximum": 83
+    },
+    {
+      "path": "ds4_ssd.h",
+      "location": "path",
+      "token": "ds4",
+      "classification": "migration-pending",
+      "maximum": 1
+    },
+    {
+      "path": "ds4_ssd.h",
+      "location": "content",
+      "token": "ds4",
+      "classification": "migration-pending",
+      "maximum": 74
+    },
+    {
+      "path": "ds4_ssd.h",
+      "location": "content",
+      "token": "DS4",
+      "classification": "migration-pending",
+      "maximum": 17
+    },
+    {
+      "path": "ds4_streaming_hotlist.inc",
+      "location": "path",
+      "token": "ds4",
+      "classification": "migration-pending",
+      "maximum": 1
+    },
+    {
+      "path": "ds4_streaming_hotlist.inc",
+      "location": "content",
+      "token": "ds4",
+      "classification": "migration-pending",
+      "maximum": 9
+    },
+    {
+      "path": "ds4_streaming_hotlist_glm52.inc",
+      "location": "path",
+      "token": "ds4",
+      "classification": "migration-pending",
+      "maximum": 1
+    },
+    {
+      "path": "ds4_streaming_hotlist_glm52.inc",
+      "location": "content",
+      "token": "ds4",
+      "classification": "migration-pending",
+      "maximum": 4
+    },
+    {
+      "path": "ds4_web.c",
+      "location": "path",
+      "token": "ds4",
+      "classification": "migration-pending",
+      "maximum": 1
+    },
+    {
+      "path": "ds4_web.c",
+      "location": "content",
+      "token": "ds4",
+      "classification": "migration-pending",
+      "maximum": 30
+    },
+    {
+      "path": "ds4_web.c",
+      "location": "content",
+      "token": "DS4",
+      "classification": "migration-pending",
+      "maximum": 17
+    },
+    {
+      "path": "ds4_web.h",
+      "location": "path",
+      "token": "ds4",
+      "classification": "migration-pending",
+      "maximum": 1
+    },
+    {
+      "path": "ds4_web.h",
+      "location": "content",
+      "token": "ds4",
+      "classification": "migration-pending",
+      "maximum": 18
+    },
+    {
+      "path": "ds4_web.h",
+      "location": "content",
+      "token": "DS4",
+      "classification": "migration-pending",
+      "maximum": 2
+    },
+    {
+      "path": "gguf-tools/Makefile",
+      "location": "content",
+      "token": "ds4",
+      "classification": "migration-pending",
+      "maximum": 32
+    },
+    {
+      "path": "gguf-tools/Makefile",
+      "location": "content",
+      "token": "DS4",
+      "classification": "migration-pending",
+      "maximum": 1
+    },
+    {
+      "path": "gguf-tools/README.md",
+      "location": "content",
+      "token": "ds4",
+      "classification": "migration-pending",
+      "maximum": 14
+    },
+    {
+      "path": "gguf-tools/README.md",
+      "location": "content",
+      "token": "DS4",
+      "classification": "migration-pending",
+      "maximum": 11
+    },
+    {
+      "path": "gguf-tools/deepseek4-quantize.c",
+      "location": "content",
+      "token": "ds4",
+      "classification": "migration-pending",
+      "maximum": 47
+    },
+    {
+      "path": "gguf-tools/deepseek4-quantize.c",
+      "location": "content",
+      "token": "DS4",
+      "classification": "migration-pending",
+      "maximum": 54
+    },
+    {
+      "path": "gguf-tools/ds4-expert-major.py",
+      "location": "path",
+      "token": "ds4",
+      "classification": "migration-pending",
+      "maximum": 1
+    },
+    {
+      "path": "gguf-tools/ds4-expert-major.py",
+      "location": "content",
+      "token": "ds4",
+      "classification": "migration-pending",
+      "maximum": 2
+    },
+    {
+      "path": "gguf-tools/ds4-expert-major.py",
+      "location": "content",
+      "token": "DS4",
+      "classification": "migration-pending",
+      "maximum": 5
+    },
+    {
+      "path": "gguf-tools/imatrix/README.md",
+      "location": "content",
+      "token": "ds4",
+      "classification": "migration-pending",
+      "maximum": 9
+    },
+    {
+      "path": "gguf-tools/imatrix/README.md",
+      "location": "content",
+      "token": "DS4",
+      "classification": "migration-pending",
+      "maximum": 12
+    },
+    {
+      "path": "gguf-tools/imatrix/dataset/README.md",
+      "location": "content",
+      "token": "ds4",
+      "classification": "migration-pending",
+      "maximum": 3
+    },
+    {
+      "path": "gguf-tools/imatrix/dataset/README.md",
+      "location": "content",
+      "token": "DS4",
+      "classification": "migration-pending",
+      "maximum": 2
+    },
+    {
+      "path": "gguf-tools/imatrix/dataset/build_ds4_imatrix_dataset.py",
+      "location": "path",
+      "token": "ds4",
+      "classification": "migration-pending",
+      "maximum": 1
+    },
+    {
+      "path": "gguf-tools/imatrix/dataset/build_ds4_imatrix_dataset.py",
+      "location": "content",
+      "token": "ds4",
+      "classification": "migration-pending",
+      "maximum": 131
+    },
+    {
+      "path": "gguf-tools/imatrix/dataset/build_ds4_imatrix_dataset.py",
+      "location": "content",
+      "token": "DS4",
+      "classification": "migration-pending",
+      "maximum": 8
+    },
+    {
+      "path": "gguf-tools/imatrix/dataset/build_ds4_imatrix_dataset.py",
+      "location": "content",
+      "token": "DwarfStar",
+      "classification": "migration-pending",
+      "maximum": 1
+    },
+    {
+      "path": "gguf-tools/quality-testing/README.md",
+      "location": "content",
+      "token": "DS4",
+      "classification": "migration-pending",
+      "maximum": 1
+    },
+    {
+      "path": "gguf-tools/quality-testing/score_official.c",
+      "location": "content",
+      "token": "ds4",
+      "classification": "migration-pending",
+      "maximum": 28
+    },
+    {
+      "path": "gguf-tools/quality-testing/score_official.c",
+      "location": "content",
+      "token": "DS4",
+      "classification": "migration-pending",
+      "maximum": 3
+    },
+    {
+      "path": "gguf-tools/quants.c",
+      "location": "content",
+      "token": "ds4",
+      "classification": "migration-pending",
+      "maximum": 146
+    },
+    {
+      "path": "gguf-tools/quants.c",
+      "location": "content",
+      "token": "DS4",
+      "classification": "migration-pending",
+      "maximum": 89
+    },
+    {
+      "path": "gguf-tools/quants.h",
+      "location": "content",
+      "token": "ds4",
+      "classification": "migration-pending",
+      "maximum": 20
+    },
+    {
+      "path": "gguf-tools/quants.h",
+      "location": "content",
+      "token": "DS4",
+      "classification": "migration-pending",
+      "maximum": 40
+    },
+    {
+      "path": "hebrus_identity.h",
+      "location": "content",
+      "token": "ds4",
+      "classification": "compatibility",
+      "maximum": 5
+    },
+    {
+      "path": "hebrus_identity.h",
+      "location": "content",
+      "token": "DwarfStar",
+      "classification": "compatibility",
+      "maximum": 1
+    },
+    {
+      "path": "linenoise.c",
+      "location": "content",
+      "token": "ds4",
+      "classification": "migration-pending",
+      "maximum": 1
+    },
+    {
+      "path": "metal/argsort.metal",
+      "location": "content",
+      "token": "ds4",
+      "classification": "migration-pending",
+      "maximum": 8
+    },
+    {
+      "path": "metal/argsort.metal",
+      "location": "content",
+      "token": "DS4",
+      "classification": "migration-pending",
+      "maximum": 10
+    },
+    {
+      "path": "metal/bin.metal",
+      "location": "content",
+      "token": "ds4",
+      "classification": "migration-pending",
+      "maximum": 5
+    },
+    {
+      "path": "metal/bin.metal",
+      "location": "content",
+      "token": "DS4",
+      "classification": "migration-pending",
+      "maximum": 1
+    },
+    {
+      "path": "metal/concat.metal",
+      "location": "content",
+      "token": "ds4",
+      "classification": "migration-pending",
+      "maximum": 2
+    },
+    {
+      "path": "metal/concat.metal",
+      "location": "content",
+      "token": "DS4",
+      "classification": "migration-pending",
+      "maximum": 2
+    },
+    {
+      "path": "metal/cpy.metal",
+      "location": "content",
+      "token": "ds4",
+      "classification": "migration-pending",
+      "maximum": 2
+    },
+    {
+      "path": "metal/cpy.metal",
+      "location": "content",
+      "token": "DS4",
+      "classification": "migration-pending",
+      "maximum": 2
+    },
+    {
+      "path": "metal/dense.metal",
+      "location": "content",
+      "token": "ds4",
+      "classification": "migration-pending",
+      "maximum": 29
+    },
+    {
+      "path": "metal/dense.metal",
+      "location": "content",
+      "token": "DS4",
+      "classification": "migration-pending",
+      "maximum": 13
+    },
+    {
+      "path": "metal/dsv4_hc.metal",
+      "location": "content",
+      "token": "ds4",
+      "classification": "migration-pending",
+      "maximum": 27
+    },
+    {
+      "path": "metal/dsv4_hc.metal",
+      "location": "content",
+      "token": "DS4",
+      "classification": "migration-pending",
+      "maximum": 5
+    },
+    {
+      "path": "metal/dsv4_kv.metal",
+      "location": "content",
+      "token": "ds4",
+      "classification": "migration-pending",
+      "maximum": 10
+    },
+    {
+      "path": "metal/dsv4_kv.metal",
+      "location": "content",
+      "token": "DS4",
+      "classification": "migration-pending",
+      "maximum": 5
+    },
+    {
+      "path": "metal/dsv4_misc.metal",
+      "location": "content",
+      "token": "ds4",
+      "classification": "migration-pending",
+      "maximum": 79
+    },
+    {
+      "path": "metal/dsv4_misc.metal",
+      "location": "content",
+      "token": "DS4",
+      "classification": "migration-pending",
+      "maximum": 15
+    },
+    {
+      "path": "metal/dsv4_rope.metal",
+      "location": "content",
+      "token": "ds4",
+      "classification": "migration-pending",
+      "maximum": 2
+    },
+    {
+      "path": "metal/dsv4_rope.metal",
+      "location": "content",
+      "token": "DS4",
+      "classification": "migration-pending",
+      "maximum": 2
+    },
+    {
+      "path": "metal/flash_attn.metal",
+      "location": "content",
+      "token": "ds4",
+      "classification": "migration-pending",
+      "maximum": 11
+    },
+    {
+      "path": "metal/flash_attn.metal",
+      "location": "content",
+      "token": "DS4",
+      "classification": "migration-pending",
+      "maximum": 6
+    },
+    {
+      "path": "metal/get_rows.metal",
+      "location": "content",
+      "token": "ds4",
+      "classification": "migration-pending",
+      "maximum": 4
+    },
+    {
+      "path": "metal/get_rows.metal",
+      "location": "content",
+      "token": "DS4",
+      "classification": "migration-pending",
+      "maximum": 2
+    },
+    {
+      "path": "metal/glu.metal",
+      "location": "content",
+      "token": "ds4",
+      "classification": "migration-pending",
+      "maximum": 3
+    },
+    {
+      "path": "metal/glu.metal",
+      "location": "content",
+      "token": "DS4",
+      "classification": "migration-pending",
+      "maximum": 1
+    },
+    {
+      "path": "metal/moe.metal",
+      "location": "content",
+      "token": "ds4",
+      "classification": "migration-pending",
+      "maximum": 231
+    },
+    {
+      "path": "metal/moe.metal",
+      "location": "content",
+      "token": "DS4",
+      "classification": "migration-pending",
+      "maximum": 11
+    },
+    {
+      "path": "metal/norm.metal",
+      "location": "content",
+      "token": "ds4",
+      "classification": "migration-pending",
+      "maximum": 5
+    },
+    {
+      "path": "metal/norm.metal",
+      "location": "content",
+      "token": "DS4",
+      "classification": "migration-pending",
+      "maximum": 3
+    },
+    {
+      "path": "metal/qwen35.metal",
+      "location": "content",
+      "token": "ds4",
+      "classification": "migration-pending",
+      "maximum": 42
+    },
+    {
+      "path": "metal/qwen35.metal",
+      "location": "content",
+      "token": "DS4",
+      "classification": "migration-pending",
+      "maximum": 2
+    },
+    {
+      "path": "metal/repeat.metal",
+      "location": "content",
+      "token": "ds4",
+      "classification": "migration-pending",
+      "maximum": 2
+    },
+    {
+      "path": "metal/repeat.metal",
+      "location": "content",
+      "token": "DS4",
+      "classification": "migration-pending",
+      "maximum": 2
+    },
+    {
+      "path": "metal/set_rows.metal",
+      "location": "content",
+      "token": "ds4",
+      "classification": "migration-pending",
+      "maximum": 2
+    },
+    {
+      "path": "metal/set_rows.metal",
+      "location": "content",
+      "token": "DS4",
+      "classification": "migration-pending",
+      "maximum": 2
+    },
+    {
+      "path": "metal/softmax.metal",
+      "location": "content",
+      "token": "ds4",
+      "classification": "migration-pending",
+      "maximum": 3
+    },
+    {
+      "path": "metal/softmax.metal",
+      "location": "content",
+      "token": "DS4",
+      "classification": "migration-pending",
+      "maximum": 3
+    },
+    {
+      "path": "metal/sum_rows.metal",
+      "location": "content",
+      "token": "ds4",
+      "classification": "migration-pending",
+      "maximum": 2
+    },
+    {
+      "path": "metal/sum_rows.metal",
+      "location": "content",
+      "token": "DS4",
+      "classification": "migration-pending",
+      "maximum": 2
+    },
+    {
+      "path": "metal/unary.metal",
+      "location": "content",
+      "token": "ds4",
+      "classification": "migration-pending",
+      "maximum": 3
+    },
+    {
+      "path": "metal/unary.metal",
+      "location": "content",
+      "token": "DS4",
+      "classification": "migration-pending",
+      "maximum": 4
+    },
+    {
+      "path": "runtime/ds4_deepseek_cache_phase.inc",
+      "location": "path",
+      "token": "ds4",
+      "classification": "migration-pending",
+      "maximum": 1
+    },
+    {
+      "path": "runtime/ds4_deepseek_cache_phase.inc",
+      "location": "content",
+      "token": "ds4",
+      "classification": "migration-pending",
+      "maximum": 29
+    },
+    {
+      "path": "runtime/ds4_deepseek_cache_phase.inc",
+      "location": "content",
+      "token": "DS4",
+      "classification": "migration-pending",
+      "maximum": 5
+    },
+    {
+      "path": "runtime/ds4_glm_graph.inc",
+      "location": "path",
+      "token": "ds4",
+      "classification": "migration-pending",
+      "maximum": 1
+    },
+    {
+      "path": "runtime/ds4_glm_graph.inc",
+      "location": "content",
+      "token": "ds4",
+      "classification": "migration-pending",
+      "maximum": 779
+    },
+    {
+      "path": "runtime/ds4_glm_graph.inc",
+      "location": "content",
+      "token": "DS4",
+      "classification": "migration-pending",
+      "maximum": 774
+    },
+    {
+      "path": "runtime/ds4_metal_glm.inc",
+      "location": "path",
+      "token": "ds4",
+      "classification": "migration-pending",
+      "maximum": 1
+    },
+    {
+      "path": "runtime/ds4_metal_glm.inc",
+      "location": "content",
+      "token": "ds4",
+      "classification": "migration-pending",
+      "maximum": 1104
+    },
+    {
+      "path": "runtime/ds4_metal_glm.inc",
+      "location": "content",
+      "token": "DS4",
+      "classification": "migration-pending",
+      "maximum": 58
+    },
+    {
+      "path": "runtime/ds4_qwen_memory_policy.inc",
+      "location": "path",
+      "token": "ds4",
+      "classification": "migration-pending",
+      "maximum": 1
+    },
+    {
+      "path": "runtime/ds4_qwen_memory_policy.inc",
+      "location": "content",
+      "token": "ds4",
+      "classification": "migration-pending",
+      "maximum": 14
+    },
+    {
+      "path": "runtime/ds4_qwen_memory_policy.inc",
+      "location": "content",
+      "token": "DS4",
+      "classification": "migration-pending",
+      "maximum": 3
+    },
+    {
+      "path": "speed-bench/README.md",
+      "location": "content",
+      "token": "ds4",
+      "classification": "migration-pending",
+      "maximum": 4
+    },
+    {
+      "path": "speed-bench/README.md",
+      "location": "content",
+      "token": "DS4",
+      "classification": "migration-pending",
+      "maximum": 1
+    },
+    {
+      "path": "speed-bench/build_long_context_prompt.py",
+      "location": "content",
+      "token": "ds4",
+      "classification": "migration-pending",
+      "maximum": 1
+    },
+    {
+      "path": "speed-bench/plot_speed.py",
+      "location": "content",
+      "token": "ds4",
+      "classification": "migration-pending",
+      "maximum": 3
+    },
+    {
+      "path": "speed-bench/run_m5_dsflash_arm.sh",
+      "location": "content",
+      "token": "ds4",
+      "classification": "migration-pending",
+      "maximum": 11
+    },
+    {
+      "path": "speed-bench/run_m5_dsflash_arm.sh",
+      "location": "content",
+      "token": "DS4",
+      "classification": "migration-pending",
+      "maximum": 59
+    },
+    {
+      "path": "tests/ds4_agent_test.c",
+      "location": "path",
+      "token": "ds4",
+      "classification": "migration-pending",
+      "maximum": 1
+    },
+    {
+      "path": "tests/ds4_agent_test.c",
+      "location": "content",
+      "token": "ds4",
+      "classification": "migration-pending",
+      "maximum": 4
+    },
+    {
+      "path": "tests/ds4_test.c",
+      "location": "path",
+      "token": "ds4",
+      "classification": "migration-pending",
+      "maximum": 1
+    },
+    {
+      "path": "tests/ds4_test.c",
+      "location": "content",
+      "token": "ds4",
+      "classification": "migration-pending",
+      "maximum": 810
+    },
+    {
+      "path": "tests/ds4_test.c",
+      "location": "content",
+      "token": "DS4",
+      "classification": "migration-pending",
+      "maximum": 151
+    },
+    {
+      "path": "tests/gen_qwen_unicode.py",
+      "location": "content",
+      "token": "ds4",
+      "classification": "migration-pending",
+      "maximum": 3
+    },
+    {
+      "path": "tests/generate_long_context_story_prompt.py",
+      "location": "content",
+      "token": "ds4",
+      "classification": "migration-pending",
+      "maximum": 1
+    },
+    {
+      "path": "tests/glm_long_context_smoke.sh",
+      "location": "content",
+      "token": "ds4",
+      "classification": "migration-pending",
+      "maximum": 4
+    },
+    {
+      "path": "tests/glm_long_context_smoke.sh",
+      "location": "content",
+      "token": "DS4",
+      "classification": "migration-pending",
+      "maximum": 10
+    },
+    {
+      "path": "tests/internal/ds4_agent_unit.h",
+      "location": "path",
+      "token": "ds4",
+      "classification": "migration-pending",
+      "maximum": 1
+    },
+    {
+      "path": "tests/internal/ds4_agent_unit.h",
+      "location": "content",
+      "token": "ds4",
+      "classification": "migration-pending",
+      "maximum": 1
+    },
+    {
+      "path": "tests/internal/ds4_agent_unit.h",
+      "location": "content",
+      "token": "DS4",
+      "classification": "migration-pending",
+      "maximum": 2
+    },
+    {
+      "path": "tests/internal/ds4_agent_unit.inc",
+      "location": "path",
+      "token": "ds4",
+      "classification": "migration-pending",
+      "maximum": 1
+    },
+    {
+      "path": "tests/internal/ds4_agent_unit.inc",
+      "location": "content",
+      "token": "ds4",
+      "classification": "migration-pending",
+      "maximum": 1
+    },
+    {
+      "path": "tests/internal/ds4_qwen_cpu_test_hooks.h",
+      "location": "path",
+      "token": "ds4",
+      "classification": "migration-pending",
+      "maximum": 1
+    },
+    {
+      "path": "tests/internal/ds4_qwen_cpu_test_hooks.h",
+      "location": "content",
+      "token": "ds4",
+      "classification": "migration-pending",
+      "maximum": 7
+    },
+    {
+      "path": "tests/internal/ds4_qwen_cpu_test_hooks.h",
+      "location": "content",
+      "token": "DS4",
+      "classification": "migration-pending",
+      "maximum": 4
+    },
+    {
+      "path": "tests/qwen/README.md",
+      "location": "content",
+      "token": "ds4",
+      "classification": "migration-pending",
+      "maximum": 6
+    },
+    {
+      "path": "tests/qwen/README.md",
+      "location": "content",
+      "token": "DS4",
+      "classification": "migration-pending",
+      "maximum": 6
+    },
+    {
+      "path": "tests/qwen/UNICODE_DATA_PROVENANCE.md",
+      "location": "content",
+      "token": "ds4",
+      "classification": "migration-pending",
+      "maximum": 1
+    },
+    {
+      "path": "tests/qwen/compare_logits.py",
+      "location": "content",
+      "token": "ds4",
+      "classification": "migration-pending",
+      "maximum": 81
+    },
+    {
+      "path": "tests/qwen/compare_logits.py",
+      "location": "content",
+      "token": "DS4",
+      "classification": "migration-pending",
+      "maximum": 25
+    },
+    {
+      "path": "tests/qwen/qwen_unicode_ucd_cache.txt",
+      "location": "content",
+      "token": "ds4",
+      "classification": "migration-pending",
+      "maximum": 1
+    },
+    {
+      "path": "tests/qwen/test_compare_logits.py",
+      "location": "content",
+      "token": "ds4",
+      "classification": "migration-pending",
+      "maximum": 39
+    },
+    {
+      "path": "tests/qwen/test_qwen35_metal.m",
+      "location": "content",
+      "token": "ds4",
+      "classification": "migration-pending",
+      "maximum": 5
+    },
+    {
+      "path": "tests/qwen/test_qwen35_metal.m",
+      "location": "content",
+      "token": "DS4",
+      "classification": "migration-pending",
+      "maximum": 2
+    },
+    {
+      "path": "tests/test-vectors/README.md",
+      "location": "content",
+      "token": "ds4",
+      "classification": "migration-pending",
+      "maximum": 5
+    },
+    {
+      "path": "tests/test-vectors/README.md",
+      "location": "content",
+      "token": "DS4",
+      "classification": "migration-pending",
+      "maximum": 3
+    },
+    {
+      "path": "tests/test-vectors/fetch_official_vectors.py",
+      "location": "content",
+      "token": "ds4",
+      "classification": "migration-pending",
+      "maximum": 3
+    },
+    {
+      "path": "tests/test-vectors/local-golden.vec",
+      "location": "content",
+      "token": "ds4",
+      "classification": "serialized/permanent",
+      "maximum": 1
+    },
+    {
+      "path": "tests/test-vectors/manifest.json",
+      "location": "content",
+      "token": "ds4",
+      "classification": "serialized/permanent",
+      "maximum": 1
+    },
+    {
+      "path": "tests/test-vectors/official.vec",
+      "location": "content",
+      "token": "ds4",
+      "classification": "serialized/permanent",
+      "maximum": 1
+    },
+    {
+      "path": "tests/test-vectors/official/long_code_audit.official.json",
+      "location": "content",
+      "token": "ds4",
+      "classification": "serialized/permanent",
+      "maximum": 1
+    },
+    {
+      "path": "tests/test-vectors/official/long_memory_archive.official.json",
+      "location": "content",
+      "token": "ds4",
+      "classification": "serialized/permanent",
+      "maximum": 1
+    },
+    {
+      "path": "tests/test-vectors/official/short_code_completion.official.json",
+      "location": "content",
+      "token": "ds4",
+      "classification": "serialized/permanent",
+      "maximum": 1
+    },
+    {
+      "path": "tests/test-vectors/official/short_italian_fact.official.json",
+      "location": "content",
+      "token": "ds4",
+      "classification": "serialized/permanent",
+      "maximum": 1
+    },
+    {
+      "path": "tests/test-vectors/official/short_reasoning_plain.official.json",
+      "location": "content",
+      "token": "ds4",
+      "classification": "serialized/permanent",
+      "maximum": 1
+    },
+    {
+      "path": "tests/test_benchmark_env_guard.sh",
+      "location": "content",
+      "token": "DS4",
+      "classification": "migration-pending",
+      "maximum": 9
+    },
+    {
+      "path": "tests/test_brand_boundary_audit.py",
+      "location": "content",
+      "token": "ds4",
+      "classification": "migration-pending",
+      "maximum": 31
+    },
+    {
+      "path": "tests/test_brand_boundary_audit.py",
+      "location": "content",
+      "token": "DS4",
+      "classification": "migration-pending",
+      "maximum": 5
+    },
+    {
+      "path": "tests/test_brand_boundary_audit.py",
+      "location": "content",
+      "token": "DwarfStar",
+      "classification": "migration-pending",
+      "maximum": 2
+    },
+    {
+      "path": "tests/test_build_isolation.sh",
+      "location": "content",
+      "token": "ds4",
+      "classification": "migration-pending",
+      "maximum": 9
+    },
+    {
+      "path": "tests/test_capabilities.py",
+      "location": "content",
+      "token": "ds4",
+      "classification": "compatibility",
+      "maximum": 7
+    },
+    {
+      "path": "tests/test_command_aliases.py",
+      "location": "content",
+      "token": "ds4",
+      "classification": "compatibility",
+      "maximum": 9
+    },
+    {
+      "path": "tests/test_command_aliases.py",
+      "location": "content",
+      "token": "DS4",
+      "classification": "compatibility",
+      "maximum": 1
+    },
+    {
+      "path": "tests/test_download_model.sh",
+      "location": "content",
+      "token": "ds4",
+      "classification": "migration-pending",
+      "maximum": 5
+    },
+    {
+      "path": "tests/test_download_model.sh",
+      "location": "content",
+      "token": "DS4",
+      "classification": "migration-pending",
+      "maximum": 12
+    },
+    {
+      "path": "tests/test_expert_major.py",
+      "location": "content",
+      "token": "ds4",
+      "classification": "migration-pending",
+      "maximum": 3
+    },
+    {
+      "path": "tests/test_expert_major.py",
+      "location": "content",
+      "token": "DS4",
+      "classification": "migration-pending",
+      "maximum": 1
+    },
+    {
+      "path": "tests/test_expert_store.c",
+      "location": "content",
+      "token": "ds4",
+      "classification": "migration-pending",
+      "maximum": 13
+    },
+    {
+      "path": "tests/test_expert_store.c",
+      "location": "content",
+      "token": "DS4",
+      "classification": "migration-pending",
+      "maximum": 9
+    },
+    {
+      "path": "tests/test_install.sh",
+      "location": "content",
+      "token": "ds4",
+      "classification": "compatibility",
+      "maximum": 10
+    },
+    {
+      "path": "tests/test_metal_ssd_profile.c",
+      "location": "content",
+      "token": "ds4",
+      "classification": "migration-pending",
+      "maximum": 16
+    },
+    {
+      "path": "tests/test_metal_ssd_profile.c",
+      "location": "content",
+      "token": "DS4",
+      "classification": "migration-pending",
+      "maximum": 19
+    },
+    {
+      "path": "tests/test_q4k_dot.c",
+      "location": "content",
+      "token": "ds4",
+      "classification": "migration-pending",
+      "maximum": 1
+    },
+    {
+      "path": "tests/test_q4k_dot.c",
+      "location": "content",
+      "token": "DS4",
+      "classification": "migration-pending",
+      "maximum": 2
+    },
+    {
+      "path": "tests/test_q4k_top8.c",
+      "location": "content",
+      "token": "ds4",
+      "classification": "migration-pending",
+      "maximum": 8
+    },
+    {
+      "path": "tests/test_qwen_attention_ref.c",
+      "location": "content",
+      "token": "ds4",
+      "classification": "migration-pending",
+      "maximum": 27
+    },
+    {
+      "path": "tests/test_qwen_expert_group.c",
+      "location": "content",
+      "token": "ds4",
+      "classification": "migration-pending",
+      "maximum": 63
+    },
+    {
+      "path": "tests/test_qwen_expert_group.c",
+      "location": "content",
+      "token": "DS4",
+      "classification": "migration-pending",
+      "maximum": 44
+    },
+    {
+      "path": "tests/test_qwen_gdn_ref.c",
+      "location": "content",
+      "token": "ds4",
+      "classification": "migration-pending",
+      "maximum": 31
+    },
+    {
+      "path": "tests/test_qwen_metadata.py",
+      "location": "content",
+      "token": "ds4",
+      "classification": "migration-pending",
+      "maximum": 10
+    },
+    {
+      "path": "tests/test_qwen_metadata.py",
+      "location": "content",
+      "token": "DS4",
+      "classification": "migration-pending",
+      "maximum": 7
+    },
+    {
+      "path": "tests/test_qwen_session.c",
+      "location": "content",
+      "token": "ds4",
+      "classification": "migration-pending",
+      "maximum": 171
+    },
+    {
+      "path": "tests/test_qwen_session.c",
+      "location": "content",
+      "token": "DS4",
+      "classification": "migration-pending",
+      "maximum": 62
+    },
+    {
+      "path": "tests/test_qwen_state.c",
+      "location": "content",
+      "token": "ds4",
+      "classification": "migration-pending",
+      "maximum": 56
+    },
+    {
+      "path": "tests/test_qwen_tokenizer.c",
+      "location": "content",
+      "token": "ds4",
+      "classification": "migration-pending",
+      "maximum": 252
+    },
+    {
+      "path": "tests/test_qwen_tokenizer.c",
+      "location": "content",
+      "token": "DS4",
+      "classification": "migration-pending",
+      "maximum": 103
+    },
+    {
+      "path": "tests/test_qwen_unicode.c",
+      "location": "content",
+      "token": "ds4",
+      "classification": "migration-pending",
+      "maximum": 29
+    },
+    {
+      "path": "tests/test_qwen_unicode.c",
+      "location": "content",
+      "token": "DS4",
+      "classification": "migration-pending",
+      "maximum": 9
+    },
+    {
+      "path": "tests/test_retired_distributed_flags.sh",
+      "location": "content",
+      "token": "ds4",
+      "classification": "compatibility",
+      "maximum": 5
+    },
+    {
+      "path": "tests/test_retired_distributed_flags.sh",
+      "location": "content",
+      "token": "DS4",
+      "classification": "compatibility",
+      "maximum": 1
+    },
+    {
+      "path": "tests/test_server_alias_model.py",
+      "location": "content",
+      "token": "ds4",
+      "classification": "compatibility",
+      "maximum": 3
+    },
+    {
+      "path": "tests/test_server_alias_model.py",
+      "location": "content",
+      "token": "DS4",
+      "classification": "compatibility",
+      "maximum": 6
+    },
+    {
+      "path": "tests/test_server_alias_model_unit.py",
+      "location": "content",
+      "token": "ds4",
+      "classification": "compatibility",
+      "maximum": 4
+    },
+    {
+      "path": "tests/test_server_alias_model_unit.py",
+      "location": "content",
+      "token": "DS4",
+      "classification": "compatibility",
+      "maximum": 6
+    },
+    {
+      "path": "tests/test_ssd_residency.c",
+      "location": "content",
+      "token": "ds4",
+      "classification": "migration-pending",
+      "maximum": 226
+    },
+    {
+      "path": "tests/test_ssd_residency.c",
+      "location": "content",
+      "token": "DS4",
+      "classification": "migration-pending",
+      "maximum": 53
+    },
+    {
+      "path": "tests/test_visible_identity.c",
+      "location": "content",
+      "token": "ds4",
+      "classification": "compatibility",
+      "maximum": 12
+    },
+    {
+      "path": "tests/test_visible_identity.c",
+      "location": "content",
+      "token": "DwarfStar",
+      "classification": "compatibility",
+      "maximum": 1
+    },
+    {
+      "path": "tools/brand_boundary_audit.py",
+      "location": "content",
+      "token": "ds4",
+      "classification": "migration-pending",
+      "maximum": 12
+    },
+    {
+      "path": "tools/brand_boundary_audit.py",
+      "location": "content",
+      "token": "DS4",
+      "classification": "migration-pending",
+      "maximum": 3
+    },
+    {
+      "path": "tools/brand_boundary_audit.py",
+      "location": "content",
+      "token": "DwarfStar",
+      "classification": "migration-pending",
+      "maximum": 2
+    },
+    {
+      "path": "tools/context_audit.py",
+      "location": "content",
+      "token": "ds4",
+      "classification": "compatibility",
+      "maximum": 17
+    },
+    {
+      "path": "tools/context_audit.py",
+      "location": "content",
+      "token": "DS4",
+      "classification": "compatibility",
+      "maximum": 6
+    },
+    {
+      "path": "tools/context_budget.json",
+      "location": "content",
+      "token": "ds4",
+      "classification": "compatibility",
+      "maximum": 1
+    },
+    {
+      "path": "tools/context_budget.json",
+      "location": "content",
+      "token": "DS4",
+      "classification": "compatibility",
+      "maximum": 9
+    }
+  ]
+}

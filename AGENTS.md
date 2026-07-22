@@ -31,9 +31,9 @@ and resolve the contradiction in the same change.
 The production path is Apple Metal inference with an embedded ExpertMajor v2
 store. DeepSeek V4 and Qwen3.6 have qualified AUTO/resident/SSD modes. GLM 5.2
 is SSD-only: normal AUTO resolves to SSD streaming and a resident request is
-rejected. The minimum actively qualified host class is Apple Silicon with 64 GB
-unified memory. See the runtime support contract and accepted ADRs for exact
-boundaries.
+rejected. DeepSeek and GLM require at least 64 GiB of unified memory; Qwen has a
+separate hardware-aware 16 GiB minimum and necessarily uses SSD at that tier.
+See the runtime support contract and accepted ADRs for exact boundaries.
 
 CUDA and ROCm are frozen and their backend source is intentionally absent from
 the active tree. Do not restore or extend it without a new accepted decision;

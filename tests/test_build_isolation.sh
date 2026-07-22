@@ -5,7 +5,7 @@ ROOT=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 ARCH=$(uname -m)
 METAL_REL="build/metal-${ARCH}/bin"
 CPU_REL="build/cpu-${ARCH}/bin"
-PROGRAMS="ds4 ds4-server ds4-bench ds4-eval ds4-agent"
+PAIRS="hebrus:ds4 hebrus-server:ds4-server hebrus-bench:ds4-bench hebrus-eval:ds4-eval hebrus-agent:ds4-agent"
 MAKE_BIN=${MAKE:-make}
 
 fail() {
@@ -43,15 +43,30 @@ cd "$ROOT"
 "$MAKE_BIN" metal
 
 root_state=""
-for name in $PROGRAMS; do
-    [ -L "$name" ] || fail "$name is not a published Metal symlink"
-    [ "$(readlink "$name")" = "$METAL_REL/$name" ] || \
-        fail "$name does not point at $METAL_REL/$name"
-    [ -x "$METAL_REL/$name" ] || fail "missing $METAL_REL/$name"
-    assert_metal_binary "$name"
-    assert_build_info "$name" metal
-    root_state="$root_state $name:$(stat -f '%i:%m' "$name")"
+for pair in $PAIRS; do
+    canonical=${pair%%:*}
+    legacy=${pair#*:}
+    for name in "$canonical" "$legacy"; do
+        [ -L "$name" ] || fail "$name is not a published Metal symlink"
+        [ "$(readlink "$name")" = "$METAL_REL/$canonical" ] || \
+            fail "$name does not point at $METAL_REL/$canonical"
+        assert_metal_binary "$name"
+        assert_build_info "$name" metal
+        root_state="$root_state $name:$(stat -f '%i:%m' "$name")"
+    done
+    [ -x "$METAL_REL/$canonical" ] || fail "missing $METAL_REL/$canonical"
+    [ ! -L "$METAL_REL/$canonical" ] || \
+        fail "$METAL_REL/$canonical is not the canonical binary"
+    [ -L "$METAL_REL/$legacy" ] || fail "$METAL_REL/$legacy is not an alias"
+    [ "$(readlink "$METAL_REL/$legacy")" = "$canonical" ] || \
+        fail "$METAL_REL/$legacy does not point at $canonical"
 done
+
+python3 tests/test_capabilities.py --bin-dir "$METAL_REL" --backend metal
+python3 tests/test_command_aliases.py --bin-dir "$METAL_REL" \
+    --backend metal --layout profile
+python3 tests/test_command_aliases.py --bin-dir . \
+    --backend metal --layout published
 
 [ -f "build/metal-${ARCH}/obj/ds4.o" ] || fail "missing Metal core object"
 [ -f "build/metal-${ARCH}/obj/ds4_metal.o" ] || fail "missing Metal backend object"
@@ -62,23 +77,40 @@ done
 [ ! -e "build/cpu-${ARCH}/obj/ds4_metal.o" ] || fail "CPU profile contains a Metal object"
 
 after_cpu_state=""
-for name in $PROGRAMS; do
-    [ -x "$CPU_REL/$name" ] || fail "missing $CPU_REL/$name"
-    assert_cpu_binary "$CPU_REL/$name"
-    assert_build_info "$CPU_REL/$name" cpu
-    assert_metal_binary "$name"
-    after_cpu_state="$after_cpu_state $name:$(stat -f '%i:%m' "$name")"
+for pair in $PAIRS; do
+    canonical=${pair%%:*}
+    legacy=${pair#*:}
+    [ -x "$CPU_REL/$canonical" ] || fail "missing $CPU_REL/$canonical"
+    [ ! -L "$CPU_REL/$canonical" ] || \
+        fail "$CPU_REL/$canonical is not the canonical binary"
+    [ -L "$CPU_REL/$legacy" ] || fail "$CPU_REL/$legacy is not an alias"
+    [ "$(readlink "$CPU_REL/$legacy")" = "$canonical" ] || \
+        fail "$CPU_REL/$legacy does not point at $canonical"
+    for name in "$canonical" "$legacy"; do
+        assert_cpu_binary "$CPU_REL/$name"
+        assert_build_info "$CPU_REL/$name" cpu
+        assert_metal_binary "$name"
+        after_cpu_state="$after_cpu_state $name:$(stat -f '%i:%m' "$name")"
+    done
 done
+
+python3 tests/test_capabilities.py --bin-dir "$CPU_REL" --backend cpu
+python3 tests/test_command_aliases.py --bin-dir "$CPU_REL" \
+    --backend cpu --layout profile
 
 [ "$root_state" = "$after_cpu_state" ] || \
     fail "make cpu modified one or more published Metal root links"
 
 "$MAKE_BIN" metal
 
-for name in $PROGRAMS; do
-    [ "$(readlink "$name")" = "$METAL_REL/$name" ] || \
-        fail "final $name does not point at the Metal profile"
-    assert_metal_binary "$name"
+for pair in $PAIRS; do
+    canonical=${pair%%:*}
+    legacy=${pair#*:}
+    for name in "$canonical" "$legacy"; do
+        [ "$(readlink "$name")" = "$METAL_REL/$canonical" ] || \
+            fail "final $name does not point at $METAL_REL/$canonical"
+        assert_metal_binary "$name"
+    done
 done
 
 echo "build-isolation: PASS (metal-${ARCH} -> cpu-${ARCH} -> metal-${ARCH})"

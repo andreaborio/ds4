@@ -1,5 +1,6 @@
 #include "ds4.h"
 #include "ds4_help.h"
+#include "hebrus_identity.h"
 #include "linenoise.h"
 
 /* ds4 CLI.
@@ -64,6 +65,7 @@ typedef struct {
 } cli_config;
 
 static volatile sig_atomic_t cli_interrupted;
+static const char *cli_invocation = "ds4";
 
 static void cli_sigint_handler(int sig) {
     (void)sig;
@@ -1495,7 +1497,7 @@ static int run_repl(ds4_engine *engine, cli_config *cfg) {
     int rc = 0;
     for (;;) {
         errno = 0;
-        char *line = linenoise("ds4> ");
+        char *line = linenoise(hebrus_cli_prompt_for(cli_invocation));
         if (!line) {
             if (errno == EAGAIN || cli_interrupt_requested()) {
                 cli_interrupt_clear();
@@ -1891,8 +1893,14 @@ static cli_config parse_options(int argc, char **argv) {
 }
 
 int main(int argc, char **argv) {
+    cli_invocation = argv[0];
+    hebrus_help_set_invocation(argv[0]);
     if (ds4_build_info_requested(argc, argv)) {
-        ds4_build_info_print(stdout);
+        ds4_build_info_print(stdout, argv[0]);
+        return 0;
+    }
+    if (ds4_capabilities_requested(argc, argv)) {
+        ds4_capabilities_print(stdout, DS4_EXECUTABLE_ROLE_CLI, argv[0]);
         return 0;
     }
     cli_config cfg = parse_options(argc, argv);

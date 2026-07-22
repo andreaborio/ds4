@@ -4,6 +4,11 @@ set -eu
 ROOT=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 RUNNER=$ROOT/speed-bench/run_m5_dsflash_arm.sh
 
+if ! command -v zsh >/dev/null 2>&1; then
+    echo "benchmark-env-guard: PASS (zsh-only M5 runner skipped on this host)"
+    exit 0
+fi
+
 fail() {
     echo "benchmark-env-guard: FAIL: $*" >&2
     exit 1

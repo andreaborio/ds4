@@ -3,7 +3,7 @@ set -eu
 
 ROOT=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 BIN_DIR=${DS4_BIN_DIR:-$ROOT}
-PROGRAMS="ds4 ds4-server ds4-agent ds4-bench ds4-eval"
+PROGRAMS="hebrus hebrus-server hebrus-agent hebrus-bench hebrus-eval ds4 ds4-server ds4-agent ds4-bench ds4-eval"
 OPTIONS="--role --layers --listen --coordinator --dist-prefill-chunk --dist-prefill-window --dist-activation-bits --dist-replay-check --debug"
 
 fail() {
@@ -25,6 +25,10 @@ output_contains() {
         *"$1"*) return 0 ;;
         *) return 1 ;;
     esac
+}
+
+diagnostic_name() {
+    echo "$1"
 }
 
 for program in $PROGRAMS; do
@@ -60,7 +64,7 @@ for program in $PROGRAMS; do
     done
 
     for option in $OPTIONS; do
-        expected="$program: distributed option $option was retired; distributed inference is not supported"
+        expected="$(diagnostic_name "$program"): distributed option $option was retired; distributed inference is not supported"
 
         run_and_capture "$binary" "$option"
         [ "$STATUS" -eq 2 ] ||

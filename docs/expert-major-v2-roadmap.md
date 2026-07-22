@@ -18,7 +18,7 @@ records:
 - record, component, layer, and payload offsets with explicit alignment;
 - source GGUF, payload, and manifest SHA-256 identities.
 
-DS4 reconstructs canonical logical descriptors for graph binding and cache
+Hebrus reconstructs canonical logical descriptors for graph binding and cache
 identity only. Resident mapping, prefill, decode, and SSD cache fills resolve
 physical bytes through the manifest. Unknown families or versions, canonical
 routed tensors beside a v2 store, incomplete inventories, unsupported types,
@@ -30,8 +30,11 @@ The release runtime accepts ExpertMajor v2 artifacts only on local Apple Metal.
 The normal CLI is the same for all three families:
 
 ```sh
-./ds4 -m /absolute/path/to/MODEL-DS4-ExpertMajor-v2.gguf --ctx 8192
+./hebrus -m /absolute/path/to/MODEL-DS4-ExpertMajor-v2.gguf --ctx 8192
 ```
+
+`./ds4` remains a byte-identical compatibility alias; it is no longer the
+primary command in new documentation.
 
 AUTO chooses the family-qualified resident or SSD consumer. No ExpertMajor,
 sidecar, backend, cache, preload, or power flag is required. Canonical GGUFs
@@ -49,14 +52,18 @@ layout.
 - **Implemented:** distinct `qwen35moe` family ID, 40-layer fail-closed
   geometry, generic v2 conversion, logical reconstruction, resident mapping,
   and SSD translation.
-- **Qualified on M5 Pro 64 GiB:** resident output matches the retired v1
-  control. The 2K v2/v1/v2 lane measured 318.96/29.54, 320.59/29.59, and
-  318.83/29.54 prefill/decode t/s.
-- **Correctness:** all three evidence files are byte-identical with SHA-256
-  `399504c6ce3d4531ee0f2207702e96e2324c9b5c8dbf98adf47dfb9e64cae54d`;
-  no new swapout was observed.
-- **Release artifact:** 20,808,566,880 bytes, SHA-256
-  `d7c43a6388ec20e6fe5530850350f96fdb0ac37c5ce36d3e5f92b172c447f56b`.
+- **Qualified and published:** MLX affine4/group-64 resident and SSD execution on
+  the hardware lanes recorded in the current benchmark index.
+- **Correctness:** the final resident and SSD lane retains deterministic token
+  and logit comparisons with no new swapout in the recorded qualification.
+- **Release artifact:**
+  `Qwen3.6-35B-A3B-DS4-ExpertMajor-v2-MLX-Affine4-G64.gguf`,
+  20,808,566,880 bytes, SHA-256
+  `dd17266185833a9f05531ce366fd7284ddca1ed64aa3dcf06e321e8c72c9ea3d`.
+  The immutable repository revision is
+  `7bf9c3f7f6136aeb2599d75ee61c0cc2f18e2b02`; its manifest requires runtime
+  commit `73a332fef82a0bcdd567d17e0de17aa004cad85d` or a compatible descendant.
+  The former Q4_K_S artifact is retained only as a fail-closed negative case.
 
 ### DeepSeek V4
 

@@ -1,0 +1,109 @@
+name: Feature request
+description: Propose a focused Hebrus capability or support-contract change.
+title: "[Feature]: "
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Explain the user problem before the implementation. Hebrus prioritizes Apple Metal inference and SSD streaming while preserving deliberate compatibility and upstream attribution.
+
+        Performance claims belong in the dedicated performance report. Security reports must follow [SECURITY.md](https://github.com/andreaborio/ds4/blob/main/SECURITY.md) and must not be disclosed here.
+
+  - type: checkboxes
+    id: prerequisites
+    attributes:
+      label: Prerequisites
+      options:
+        - label: I searched existing issues and discussions for this proposal.
+          required: true
+        - label: This request contains no undisclosed vulnerability details, secrets, or model blobs.
+          required: true
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem and use case
+      description: Who needs this, what are they trying to do, and what limitation exists today?
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed behavior
+      description: Describe observable behavior and acceptance criteria. Keep implementation details separate when possible.
+    validations:
+      required: true
+
+  - type: dropdown
+    id: component
+    attributes:
+      label: Primary area
+      options:
+        - CLI or inference engine
+        - Server or API
+        - Agent mode
+        - Metal backend
+        - SSD streaming or ExpertMajor
+        - GGUF, conversion, or model distribution
+        - Build, tests, or documentation
+        - Compatibility or migration
+        - Other
+    validations:
+      required: true
+
+  - type: dropdown
+    id: contract
+    attributes:
+      label: Expected support-contract impact
+      options:
+        - No contract change
+        - Additive behavior within the current production path
+        - Experimental or reference-only path
+        - Compatibility or serialized-format change
+        - Backend or model-family support change
+        - Unsure
+    validations:
+      required: true
+
+  - type: dropdown
+    id: upstreamability
+    attributes:
+      label: Upstreamability classification
+      description: Choose the classification defined by the contribution policy.
+      options:
+        - General, reproducible, and safe for the affected backends
+        - Potentially general, but not yet proven across the affected paths
+        - Model-, quant-, or hardware-specific research
+        - Equivalent change already exists upstream
+        - Measured regression without a necessary correctness fix
+    validations:
+      required: true
+
+  - type: textarea
+    id: compatibility
+    attributes:
+      label: Compatibility and migration impact
+      description: Cover canonical `hebrus*` interfaces, `ds4*` aliases, `DS4_*` variables, serialized identifiers, GGUF metadata, disk-KV data, API behavior, and exit codes as applicable. State "None" when unaffected.
+    validations:
+      required: true
+
+  - type: textarea
+    id: evidence
+    attributes:
+      label: Validation and evidence plan
+      description: List model-free tests, required model artifacts and hashes, correctness checks, performance frontiers, documentation, and migration coverage needed to accept this feature.
+    validations:
+      required: true
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: Describe workarounds or smaller designs and why they do not solve the use case.
+
+  - type: textarea
+    id: references
+    attributes:
+      label: References
+      description: Link specifications, prior art, source code, or public measurements. Do not attach model weights, local benchmark residue, or large binaries.
