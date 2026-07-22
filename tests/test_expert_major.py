@@ -242,6 +242,35 @@ def test_safetensor_reader(tool, tmp_path: Path) -> None:
     finally:
         source.close()
 
+    guarded = tmp_path / "mlx-reader-guarded"
+    guarded.mkdir()
+    shutil.copyfile(model / "model.safetensors.index.json",
+                    guarded / "model.safetensors.index.json")
+    guarded_shard = guarded / shard
+    write_safetensor_fixture(guarded_shard)
+    guarded_bytes = guarded_shard.read_bytes()
+    expected_shards = ((
+        shard, hashlib.sha256(guarded_bytes).hexdigest(), len(guarded_bytes),
+    ),)
+    source = tool.MLXAffineSource(
+        guarded, expected_shards, verify_open_fds=True
+    )
+    try:
+        source.expert_bytes("weight", "U32", (2, 2, 1), 0)
+        with guarded_shard.open("r+b") as file:
+            file.seek(-1, os.SEEK_END)
+            original = file.read(1)
+            file.seek(-1, os.SEEK_END)
+            file.write(bytes([original[0] ^ 0x01]))
+        try:
+            source.verify_held_shards()
+        except tool.FormatError as exc:
+            assert "Git LFS shard changed while writing" in str(exc)
+        else:
+            raise AssertionError("held donor shard mutation was accepted")
+    finally:
+        source.close()
+
     broken = tmp_path / "mlx-reader-truncated"
     broken.mkdir()
     shutil.copyfile(model / "model.safetensors.index.json",
@@ -261,7 +290,7 @@ def test_safetensor_reader(tool, tmp_path: Path) -> None:
 
 def test_affine2_writer(tool, tmp_path: Path, probe: str | None) -> Path:
     plan = tool.make_deepseek_affine2_store_plan(
-        123456, 100, layer_count=2, expert_count=3, expert_used=2,
+        123456, 7, layer_count=2, expert_count=3, expert_used=2,
         hidden_size=256, intermediate_size=256,
     )
     groups = (32, 64)
@@ -302,7 +331,7 @@ def test_affine2_writer(tool, tmp_path: Path, probe: str | None) -> Path:
         subprocess.run([
             probe, str(output), "0", str(output.stat().st_size),
             str(tool.STORE_FAMILY_DEEPSEEK4),
-            str(tool.STORE_STORAGE_MLX_AFFINE2), "2", "3", "2", "100",
+            str(tool.STORE_STORAGE_MLX_AFFINE2), "2", "3", "2", "7",
         ], check=True)
 
     # Layer 1 is the synthetic equivalent of production layer 42: its source
@@ -366,6 +395,25 @@ def test_affine2_writer(tool, tmp_path: Path, probe: str | None) -> Path:
     partial, state = tool._checkpoint_paths(resumable)
     assert partial.exists() and state.exists() and not resumable.exists()
     assert json.loads(state.read_text())["completed_layers"] == 1
+    with partial.open("r+b") as file:
+        corrupt_offset = plan.layers[0].data_offset + 17
+        file.seek(corrupt_offset)
+        original = file.read(1)
+        file.seek(corrupt_offset)
+        file.write(bytes([original[0] ^ 0x01]))
+    try:
+        tool.write_deepseek_affine2_store_from_source(
+            resume_source, resumable, plan, groups, source_digest, 0,
+            resume=True, verify_after=False,
+            hidden_size=256, intermediate_size=256,
+        )
+    except tool.FormatError as exc:
+        assert "resume partial layer 0 digest differs" in str(exc)
+    else:
+        raise AssertionError("resume accepted a corrupted completed prefix")
+    with partial.open("r+b") as file:
+        file.seek(corrupt_offset)
+        file.write(original)
     resume_source.reads.clear()
     tool.write_deepseek_affine2_store_from_source(
         resume_source, resumable, plan, groups, source_digest, 0,
@@ -395,6 +443,27 @@ def test_affine2_writer(tool, tmp_path: Path, probe: str | None) -> Path:
         raise AssertionError("cleanup interruption was not raised")
     partial, state = tool._checkpoint_paths(cleanup)
     assert not cleanup.exists() and not partial.exists() and not state.exists()
+
+    race = tmp_path / "deepseek-affine2-race.store"
+    race_winner = b"race-winner-must-survive"
+
+    def create_race_winner() -> None:
+        race.write_bytes(race_winner)
+
+    try:
+        tool.write_deepseek_affine2_store_from_source(
+            SyntheticAffineSource(plan.expert_count), race, plan, groups,
+            source_digest, 0, resume=False, verify_after=False,
+            hidden_size=256, intermediate_size=256,
+            pre_install_hook=create_race_winner,
+        )
+    except OSError:
+        pass
+    else:
+        raise AssertionError("standalone writer replaced a race winner")
+    assert race.read_bytes() == race_winner
+    race_partial, race_state = tool._checkpoint_paths(race)
+    assert not race_partial.exists() and not race_state.exists()
     return output
 
 
@@ -435,6 +504,7 @@ def main() -> int:
         built = run("build", "--reserve-bytes", "0", str(source), str(native))
         assert "installed atomically" in built.stdout
         run("verify", str(source), str(native))
+        native_sha256 = hashlib.sha256(native.read_bytes()).hexdigest()
 
         native_gguf = tool.load_gguf(native)
         store = next(t for t in native_gguf.tensors if t.name == tool.STORE_TENSOR)
@@ -445,20 +515,31 @@ def main() -> int:
 
         hybrid = tmp_path / "deepseek-affine2-hybrid.gguf"
         tool.plan_deepseek_affine2_hybrid_gguf(
-            native, affine_store, allow_test_geometry=True,
+            native, affine_store, native_sha256, allow_test_geometry=True,
         )
+        try:
+            tool.plan_deepseek_affine2_hybrid_gguf(
+                native, affine_store, "0" * 64, allow_test_geometry=True,
+            )
+        except tool.FormatError as exc:
+            assert "source GGUF SHA-256 differs" in str(exc)
+        else:
+            raise AssertionError("hybrid planner accepted the wrong source SHA-256")
         production_gate = run(
             "embed-deepseek-mlx-affine2", "--dry-run",
+            "--expected-source-sha256", native_sha256,
             str(native), str(affine_store), ok=False,
         )
         assert "not the pinned DeepSeek affine2 donor" in \
             production_gate.stderr
         tool.embed_deepseek_affine2_hybrid_gguf(
-            native, affine_store, hybrid, 0, verify_after=True,
+            native, affine_store, hybrid, 0, native_sha256,
+            verify_after=True,
             allow_test_geometry=True,
         )
         assert tool.verify_deepseek_affine2_hybrid_gguf(
-            native, affine_store, hybrid, allow_test_geometry=True,
+            native, affine_store, hybrid, native_sha256,
+            allow_test_geometry=True,
         )
         hybrid_gguf = tool.load_gguf(hybrid)
         hybrid_stores = [
@@ -480,8 +561,66 @@ def main() -> int:
                 str(hybrid_stores[0].size),
                 str(tool.STORE_FAMILY_DEEPSEEK4),
                 str(tool.STORE_STORAGE_MLX_AFFINE2),
-                "2", "3", "2", "100",
+                "2", "3", "2", "7",
             ], check=True)
+
+        mismatched_plan = tool.make_deepseek_affine2_store_plan(
+            123456, 8, layer_count=2, expert_count=3, expert_used=2,
+            hidden_size=256, intermediate_size=256,
+        )
+        mismatched_store = tmp_path / "deepseek-affine2-count8.store"
+        tool.write_deepseek_affine2_store_from_source(
+            SyntheticAffineSource(mismatched_plan.expert_count),
+            mismatched_store, mismatched_plan, (32, 64),
+            hashlib.sha256(b"synthetic-count8-donor").digest(), 0,
+            resume=False, verify_after=False,
+            hidden_size=256, intermediate_size=256,
+        )
+        # The base GGUF and MLX donor are distinct source containers. Their
+        # tensor inventory counts need not match; the embedded store preserves
+        # the donor provenance while layer/expert geometry is checked against
+        # the base model.
+        tool.plan_deepseek_affine2_hybrid_gguf(
+            native, mismatched_store, native_sha256,
+            allow_test_geometry=True,
+        )
+        foreign_inventory_hybrid = \
+            tmp_path / "deepseek-affine2-foreign-inventory.gguf"
+        tool.embed_deepseek_affine2_hybrid_gguf(
+            native, mismatched_store, foreign_inventory_hybrid, 0,
+            native_sha256, verify_after=True, allow_test_geometry=True,
+        )
+        foreign_gguf = tool.load_gguf(foreign_inventory_hybrid)
+        foreign_store = next(
+            tensor for tensor in foreign_gguf.tensors
+            if tensor.name == tool.STORE_TENSOR
+        )
+        foreign_manifest, _ = tool.parse_store(foreign_gguf, foreign_store)
+        assert foreign_manifest["source_tensors"] == 8
+
+        hybrid_race = tmp_path / "deepseek-affine2-hybrid-race.gguf"
+        race_winner = b"hybrid-race-winner-must-survive"
+        original_install = tool.install_no_replace
+
+        def install_hybrid_after_race(temp: Path, destination: Path) -> None:
+            destination.write_bytes(race_winner)
+            original_install(temp, destination)
+
+        tool.install_no_replace = install_hybrid_after_race
+        try:
+            try:
+                tool.embed_deepseek_affine2_hybrid_gguf(
+                    native, affine_store, hybrid_race, 0, native_sha256,
+                    verify_after=False, allow_test_geometry=True,
+                )
+            except OSError:
+                pass
+            else:
+                raise AssertionError("hybrid writer replaced a race winner")
+        finally:
+            tool.install_no_replace = original_install
+        assert hybrid_race.read_bytes() == race_winner
+        assert not list(tmp_path.glob(f".{hybrid_race.name}.tmp.*"))
 
         corrupt_store = tmp_path / "deepseek-affine2-embed-corrupt.store"
         shutil.copyfile(affine_store, corrupt_store)
@@ -494,7 +633,7 @@ def main() -> int:
         rejected_hybrid = tmp_path / "rejected-affine2-hybrid.gguf"
         try:
             tool.embed_deepseek_affine2_hybrid_gguf(
-                native, corrupt_store, rejected_hybrid, 0,
+                native, corrupt_store, rejected_hybrid, 0, native_sha256,
                 verify_after=True, allow_test_geometry=True,
             )
         except tool.FormatError as exc:
@@ -557,6 +696,7 @@ def main() -> int:
         run("build", "--reserve-bytes", "0", str(glm_source),
             str(glm_native))
         run("verify", str(glm_source), str(glm_native))
+        glm_native_sha256 = hashlib.sha256(glm_native.read_bytes()).hexdigest()
         glm_gguf = tool.load_gguf(glm_native)
         glm_store = next(
             tensor for tensor in glm_gguf.tensors

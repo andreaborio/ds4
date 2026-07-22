@@ -62,6 +62,13 @@ DEEPSEEK_AFFINE2_CONFIG_SHA256 = (
 DEEPSEEK_AFFINE2_INDEX_SHA256 = (
     "d1c2d929ab0a35be32cf18026bb31d6f99dad58d6c93a5a2abbe43791f9d6c30"
 )
+DEEPSEEK_QUALIFIED_SOURCE_GGUF_SHA256 = (
+    "8378080263eb9224f7228d72e2afa4ac3cf74a116023fdec2c596ff228a33e3f"
+)
+GLM_QUALIFIED_SOURCE_GGUF_SHA256 = (
+    "7f5017e3076e706c78f2a5322b035a9e2f6519c65ff5b6be8b2d91aeff61505d"
+)
+GLM_AFFINE2_SOURCE_SHA256_KEY = "ds4.expert_store.source_gguf_sha256"
 DEEPSEEK_AFFINE2_SOURCE_MANIFEST_SHA256 = (
     "cce807e30b9a1855be42dacdaf407d449115248fcfe32dad4bdd884aedf8e0cc"
 )
@@ -285,7 +292,10 @@ class DeepSeekDonor:
 class MLXAffineSource:
     """Minimal mmap-free reader for the routed MLX safetensor slices."""
 
-    def __init__(self, model_dir: Path):
+    def __init__(
+            self, model_dir: Path,
+            expected_shards: tuple[tuple[str, str, int], ...] = (),
+            verify_open_fds: bool = False):
         self.model_dir = model_dir.resolve()
         index_path = self.model_dir / "model.safetensors.index.json"
         try:
@@ -294,6 +304,10 @@ class MLXAffineSource:
         except (OSError, KeyError, TypeError, json.JSONDecodeError) as exc:
             raise FormatError(f"invalid MLX safetensor index: {exc}") from exc
         self.shards: dict[str, SafeTensorShard] = {}
+        self.expected_shards = {
+            name: (oid, size) for name, oid, size in expected_shards
+        }
+        self.verify_open_fds = verify_open_fds
 
     def close(self) -> None:
         for shard in self.shards.values():
@@ -307,6 +321,19 @@ class MLXAffineSource:
         path = (self.model_dir / name).resolve()
         fd = os.open(path, os.O_RDONLY)
         try:
+            expected = self.expected_shards.get(name)
+            if expected is not None:
+                expected_oid, expected_size = expected
+                stat = os.fstat(fd)
+                if stat.st_size != expected_size:
+                    raise FormatError(
+                        f"Git LFS size mismatch for open shard {name}"
+                    )
+                if self.verify_open_fds and \
+                        hash_fd(fd, expected_size).hex() != expected_oid:
+                    raise FormatError(
+                        f"Git LFS SHA-256 mismatch for open shard {name}"
+                    )
             header_bytes = struct.unpack("<Q", pread_exact(fd, 8, 0))[0]
             if header_bytes <= 0 or header_bytes > 1 << 30:
                 raise FormatError(f"invalid safetensor header size in {path}")
@@ -321,6 +348,16 @@ class MLXAffineSource:
         shard = SafeTensorShard(path, fd, 8 + header_bytes, tensors)
         self.shards[name] = shard
         return shard
+
+    def verify_held_shards(self) -> None:
+        """Rehash the exact donor FDs that supplied the writer's bytes."""
+        for name, (oid, size) in self.expected_shards.items():
+            shard = self._shard(name)
+            stat = os.fstat(shard.fd)
+            if stat.st_size != size or hash_fd(shard.fd, size).hex() != oid:
+                raise FormatError(
+                    f"Git LFS shard changed while writing: {name}"
+                )
 
     def tensor(self, key: str, dtype: str,
                shape: tuple[int, ...]) -> tuple[SafeTensorShard, int, int]:
@@ -642,6 +679,34 @@ def pread_exact(fd: int, size: int, offset: int) -> bytes:
             raise FormatError(f"short read at {offset + len(result)}")
         result.extend(chunk)
     return bytes(result)
+
+
+def hash_fd(fd: int, size: int) -> bytes:
+    digest = hashlib.sha256()
+    completed = 0
+    while completed < size:
+        take = min(IO_BYTES, size - completed)
+        digest.update(pread_exact(fd, take, completed))
+        completed += take
+    return digest.digest()
+
+
+def expected_sha256(text: str, label: str) -> bytes:
+    if not re.fullmatch(r"[0-9a-f]{64}", text):
+        raise FormatError(f"{label} must be a full lowercase SHA-256")
+    return bytes.fromhex(text)
+
+
+def verify_expected_file_sha256(
+        path: Path, expected: str, label: str) -> bytes:
+    wanted = expected_sha256(expected, label)
+    actual = hash_file(path, f"hash {label}")
+    if actual != wanted:
+        raise FormatError(
+            f"{label} SHA-256 differs: expected {wanted.hex()}, "
+            f"got {actual.hex()}"
+        )
+    return actual
 
 
 def pwrite_all(fd: int, data: bytes, offset: int) -> None:
@@ -1031,6 +1096,25 @@ def clone_file(source: Path, destination: Path) -> None:
     clone.argtypes = (ctypes.c_char_p, ctypes.c_char_p, ctypes.c_int)
     clone.restype = ctypes.c_int
     if clone(os.fsencode(source), os.fsencode(destination), 0) != 0:
+        error = ctypes.get_errno()
+        raise OSError(error, os.strerror(error), destination)
+
+
+def install_no_replace(temp: Path, destination: Path) -> None:
+    """Atomically rename a completed artifact without replacing a race winner."""
+    libc = ctypes.CDLL(None, use_errno=True)
+    rename_exclusive = getattr(libc, "renamex_np", None)
+    if rename_exclusive is None:
+        raise FormatError(
+            "exclusive atomic rename is unavailable; refusing artifact install"
+        )
+    rename_exclusive.argtypes = (
+        ctypes.c_char_p, ctypes.c_char_p, ctypes.c_uint,
+    )
+    rename_exclusive.restype = ctypes.c_int
+    rename_excl = 0x00000004
+    if rename_exclusive(
+            os.fsencode(temp), os.fsencode(destination), rename_excl) != 0:
         error = ctypes.get_errno()
         raise OSError(error, os.strerror(error), destination)
 
@@ -1586,7 +1670,7 @@ def _checkpoint_identity(
         gate_groups: tuple[int, ...],
 ) -> dict[str, object]:
     return {
-        "schema": "ds4-deepseek-mlx-affine2-resume-v1",
+        "schema": "ds4-deepseek-mlx-affine2-resume-v2",
         "source_manifest_sha256": source_digest.hex(),
         "descriptor_sha256": hashlib.sha256(plan.descriptor_bytes).hexdigest(),
         "store_size": plan.store_size,
@@ -1727,6 +1811,7 @@ def write_deepseek_affine2_store_from_source(
         hidden_size: int = 4096,
         intermediate_size: int = 2048,
         progress_hook: Callable[[int], None] | None = None,
+        pre_install_hook: Callable[[], None] | None = None,
 ) -> bytes:
     destination = destination.resolve()
     destination.parent.mkdir(parents=True, exist_ok=True)
@@ -1740,6 +1825,7 @@ def write_deepseek_affine2_store_from_source(
     fd = -1
     owns_partial = False
     payload_hash = hashlib.sha256()
+    completed_layer_digests: list[str] = []
     try:
         if partial.exists() or state_path.exists():
             if not resume or not partial.exists() or not state_path.exists():
@@ -1752,8 +1838,20 @@ def write_deepseek_affine2_store_from_source(
             except (OSError, json.JSONDecodeError) as exc:
                 raise FormatError(f"invalid resume checkpoint: {exc}") from exc
             completed_layers = checkpoint.pop("completed_layers", None)
+            completed_prefix_sha256 = checkpoint.pop(
+                "completed_prefix_sha256", None
+            )
+            completed_layer_digests = checkpoint.pop(
+                "completed_layer_sha256", None
+            )
             if checkpoint != identity or not isinstance(completed_layers, int) or \
-                    not 0 <= completed_layers <= plan.layer_count:
+                    not 0 <= completed_layers <= plan.layer_count or \
+                    not isinstance(completed_prefix_sha256, str) or \
+                    not isinstance(completed_layer_digests, list) or \
+                    len(completed_layer_digests) != completed_layers or \
+                    any(not isinstance(item, str) or
+                        not re.fullmatch(r"[0-9a-f]{64}", item)
+                        for item in completed_layer_digests):
                 raise FormatError("resume checkpoint identity differs")
             if partial.stat().st_size != plan.store_size:
                 raise FormatError("resume partial size differs")
@@ -1776,10 +1874,20 @@ def write_deepseek_affine2_store_from_source(
             check_deepseek_output_space(
                 destination, plan.store_size - completed_end, reserve
             )
-            _hash_fd_range(
-                fd, plan.data_offset, completed_end - plan.data_offset,
-                payload_hash,
-            )
+            for ordinal in range(completed_layers):
+                layer = plan.layers[ordinal]
+                layer_hash = hashlib.sha256()
+                _hash_fd_range(
+                    fd, layer.data_offset, layer.data_size, layer_hash
+                )
+                if layer_hash.hexdigest() != completed_layer_digests[ordinal]:
+                    raise FormatError(
+                        f"resume partial layer {layer.index} digest differs"
+                    )
+            _hash_fd_range(fd, plan.data_offset,
+                           completed_end - plan.data_offset, payload_hash)
+            if payload_hash.hexdigest() != completed_prefix_sha256:
+                raise FormatError("resume partial prefix digest differs")
             print(
                 f"resume DeepSeek affine2 at layer {completed_layers}/"
                 f"{plan.layer_count}", file=sys.stderr,
@@ -1798,11 +1906,18 @@ def write_deepseek_affine2_store_from_source(
             pwrite_all(fd, plan.descriptor_bytes, STORE_HEADER_BYTES)
             if resume:
                 _write_checkpoint(
-                    state_path, {**identity, "completed_layers": 0}
+                    state_path, {
+                        **identity,
+                        "completed_layers": 0,
+                        "completed_prefix_sha256":
+                            hashlib.sha256().hexdigest(),
+                        "completed_layer_sha256": [],
+                    }
                 )
 
         for ordinal in range(completed_layers, plan.layer_count):
             layer = plan.layers[ordinal]
+            layer_hash = hashlib.sha256()
             for expert in range(plan.expert_count):
                 for component in layer.components:
                     packed = deepseek_affine2_component(
@@ -1819,11 +1934,18 @@ def write_deepseek_affine2_store_from_source(
                               component.record_offset)
                     pwrite_all(fd, packed, offset)
                     payload_hash.update(packed)
+                    layer_hash.update(packed)
             os.fsync(fd)
+            completed_layer_digests.append(layer_hash.hexdigest())
             if resume:
                 _write_checkpoint(
                     state_path,
-                    {**identity, "completed_layers": ordinal + 1},
+                    {
+                        **identity,
+                        "completed_layers": ordinal + 1,
+                        "completed_prefix_sha256": payload_hash.hexdigest(),
+                        "completed_layer_sha256": completed_layer_digests,
+                    },
                 )
             print(
                 f"\rwrite DeepSeek affine2 layers {ordinal + 1}/"
@@ -1851,9 +1973,9 @@ def write_deepseek_affine2_store_from_source(
             )
             if verified != payload_digest:
                 raise FormatError("post-write affine2 digest differs")
-        if destination.exists():
-            raise FormatError(f"destination appeared during build: {destination}")
-        os.replace(partial, destination)
+        if pre_install_hook is not None:
+            pre_install_hook()
+        install_no_replace(partial, destination)
         _fsync_directory(destination.parent)
         state_path.unlink(missing_ok=True)
         _fsync_directory(destination.parent)
@@ -1898,18 +2020,16 @@ def write_deepseek_mlx_affine2(
         check_deepseek_output_space(destination, 0, reserve)
     else:
         check_deepseek_output_space(destination, plan.store_size, reserve)
-    for ordinal, (name, oid, size) in enumerate(donor.shard_oids, 1):
-        path = donor.model_dir / name
-        if path.stat().st_size != size or \
-                hash_file(path, f"hash donor shard {ordinal}/19").hex() != oid:
-            raise FormatError(f"Git LFS SHA-256 mismatch for {name}")
-    mlx = MLXAffineSource(donor.model_dir)
+    mlx = MLXAffineSource(
+        donor.model_dir, donor.shard_oids, verify_open_fds=True
+    )
     mlx.expert_count = plan.expert_count
     try:
         payload_digest = write_deepseek_affine2_store_from_source(
             mlx, destination, plan, donor.gate_groups,
             donor.source_digest, reserve,
             resume=resume, verify_after=verify_after,
+            pre_install_hook=mlx.verify_held_shards,
         )
     finally:
         mlx.close()
@@ -1967,11 +2087,15 @@ def validate_gguf_tensor_extents(source: GGUF) -> None:
 def deepseek_affine2_hybrid_inputs(
         source_path: Path,
         store_path: Path,
+        expected_source_sha256: str,
         *,
         allow_test_geometry: bool = False,
 ) -> tuple[GGUF, Tensor, dict[str, object], list[Layer],
-           dict[str, object], list[Layer]]:
+           dict[str, object], list[Layer], bytes]:
     source = load_gguf(source_path)
+    source_container_sha256 = verify_expected_file_sha256(
+        source.path, expected_source_sha256, "source GGUF"
+    )
     if source.metadata.get("general.architecture") != "deepseek4":
         raise FormatError("affine2 embedding requires a DeepSeek4 GGUF")
     validate_gguf_tensor_extents(source)
@@ -2040,7 +2164,8 @@ def deepseek_affine2_hybrid_inputs(
                 f"{source_layer.index}"
             )
     return (source, source_store, source_manifest, source_layers,
-            replacement_manifest, replacement_layers)
+            replacement_manifest, replacement_layers,
+            source_container_sha256)
 
 
 def replacement_gguf_layout(
@@ -2135,12 +2260,13 @@ def verify_deepseek_affine2_hybrid_gguf(
         source_path: Path,
         store_path: Path,
         output_path: Path,
+        expected_source_sha256: str,
         *,
         allow_test_geometry: bool = False,
 ) -> bytes:
-    (source, _, _, _, replacement_manifest, _) = \
+    (source, _, _, _, replacement_manifest, _, _) = \
         deepseek_affine2_hybrid_inputs(
-            source_path, store_path,
+            source_path, store_path, expected_source_sha256,
             allow_test_geometry=allow_test_geometry,
         )
     output = load_gguf(output_path)
@@ -2220,12 +2346,14 @@ def verify_deepseek_affine2_hybrid_gguf(
 def plan_deepseek_affine2_hybrid_gguf(
         source_path: Path,
         store_path: Path,
+        expected_source_sha256: str,
         *,
         allow_test_geometry: bool = False,
 ) -> None:
-    source, source_store, source_manifest, _, replacement_manifest, _ = \
+    (source, source_store, source_manifest, _, replacement_manifest, _,
+     source_container_sha256) = \
         deepseek_affine2_hybrid_inputs(
-            source_path, store_path,
+            source_path, store_path, expected_source_sha256,
             allow_test_geometry=allow_test_geometry,
         )
     _, data_offset, output_size = replacement_gguf_layout(
@@ -2233,6 +2361,7 @@ def plan_deepseek_affine2_hybrid_gguf(
     )
     print("mode: plan-only")
     print(f"source_gguf: {source.path}")
+    print(f"source_gguf_sha256: {source_container_sha256.hex()}")
     print(f"source_bytes: {source.size}")
     print(f"source_store_bytes: {source_store.size}")
     print(f"source_store_storage: {source_manifest['storage_format']}")
@@ -2249,13 +2378,14 @@ def embed_deepseek_affine2_hybrid_gguf(
         store_path: Path,
         destination: Path,
         reserve: int,
+        expected_source_sha256: str,
         *,
         verify_after: bool,
         allow_test_geometry: bool = False,
 ) -> None:
-    source, _, _, _, replacement_manifest, _ = \
+    source, _, _, _, replacement_manifest, _, source_digest = \
         deepseek_affine2_hybrid_inputs(
-            source_path, store_path,
+            source_path, store_path, expected_source_sha256,
             allow_test_geometry=allow_test_geometry,
         )
     source_stat = source.path.stat()
@@ -2277,7 +2407,6 @@ def embed_deepseek_affine2_hybrid_gguf(
     if destination.exists():
         raise FormatError(f"destination already exists: {destination}")
     check_deepseek_output_space(destination, output_size, reserve)
-    source_digest = hash_file(source.path, "hash source GGUF")
     temp = destination.with_name(f".{destination.name}.tmp.{os.getpid()}")
     if temp.exists():
         raise FormatError(f"temporary path already exists: {temp}")
@@ -2314,6 +2443,7 @@ def embed_deepseek_affine2_hybrid_gguf(
         if verify_after:
             output_digest = verify_deepseek_affine2_hybrid_gguf(
                 source.path, store_path, temp,
+                expected_source_sha256,
                 allow_test_geometry=allow_test_geometry,
             )
         else:
@@ -2327,9 +2457,7 @@ def embed_deepseek_affine2_hybrid_gguf(
                     current_store.st_dev, current_store.st_ino,
                     current_store.st_size, current_store.st_mtime_ns):
             raise FormatError("hybrid GGUF inputs changed during the build")
-        if destination.exists():
-            raise FormatError(f"destination appeared during build: {destination}")
-        os.replace(temp, destination)
+        install_no_replace(temp, destination)
         _fsync_directory(destination.parent)
     except BaseException:
         if output_fd >= 0:
@@ -2584,12 +2712,22 @@ def main() -> int:
         "--skip-verify", action="store_true",
         help="diagnostic only; publication builds verify byte-for-byte by default",
     )
+    hybrid_parser.add_argument(
+        "--expected-source-sha256", required=True,
+        help=("full pinned SHA-256 of the input DeepSeek GGUF container "
+              f"(qualified: {DEEPSEEK_QUALIFIED_SOURCE_GGUF_SHA256})"),
+    )
     hybrid_parser.add_argument("source", type=Path)
     hybrid_parser.add_argument("store", type=Path)
     hybrid_parser.add_argument("destination", type=Path, nargs="?")
     hybrid_verify_parser = subparsers.add_parser(
         "verify-deepseek-mlx-affine2-gguf",
         help="verify a rebuilt DeepSeek affine2 GGUF byte-for-byte",
+    )
+    hybrid_verify_parser.add_argument(
+        "--expected-source-sha256", required=True,
+        help=("full pinned SHA-256 of the input DeepSeek GGUF container "
+              f"(qualified: {DEEPSEEK_QUALIFIED_SOURCE_GGUF_SHA256})"),
     )
     hybrid_verify_parser.add_argument("source", type=Path)
     hybrid_verify_parser.add_argument("store", type=Path)
@@ -2631,17 +2769,21 @@ def main() -> int:
             if args.dry_run:
                 if args.destination is not None:
                     raise FormatError("--dry-run does not accept a destination")
-                plan_deepseek_affine2_hybrid_gguf(args.source, args.store)
+                plan_deepseek_affine2_hybrid_gguf(
+                    args.source, args.store, args.expected_source_sha256
+                )
             else:
                 if args.destination is None:
                     raise FormatError("destination is required unless --dry-run is used")
                 embed_deepseek_affine2_hybrid_gguf(
                     args.source, args.store, args.destination,
-                    args.reserve_bytes, verify_after=not args.skip_verify,
+                    args.reserve_bytes, args.expected_source_sha256,
+                    verify_after=not args.skip_verify,
                 )
         elif args.command == "verify-deepseek-mlx-affine2-gguf":
             digest = verify_deepseek_affine2_hybrid_gguf(
                 args.source, args.store, args.output,
+                args.expected_source_sha256,
             )
             print(f"valid DeepSeek affine2 hybrid GGUF: {args.output.resolve()}")
             print(f"output_gguf_sha256: {digest.hex()}")

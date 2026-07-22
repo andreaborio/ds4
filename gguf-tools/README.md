@@ -87,10 +87,15 @@ python3 gguf-tools/ds4-expert-major.py \
 ```
 
 The writer keeps only one expert component in memory, checkpoints completed
-layers when `--resume` is enabled, verifies the final payload byte-for-byte by
-default, and installs it with a same-filesystem rename. Ordinary failures
-without `--resume` remove the partial output. `--skip-verify` is diagnostic
-only and must not be used for publication.
+layers when `--resume` is enabled, and authenticates every completed layer plus
+the cumulative completed prefix before resuming. `--skip-verify` never bypasses
+that checkpoint authentication. The exact held shard file descriptors are
+SHA-256 checked against their committed Git LFS identities when opened and
+again immediately before installation. The final payload is verified
+byte-for-byte by default and installed with an exclusive atomic rename that
+cannot replace a destination created by a concurrent process. Ordinary
+failures without `--resume` remove the partial output. `--skip-verify` is
+diagnostic only and must not be used for publication.
 
 The result is the standalone opaque `DS4EXPV2` store, not an executable GGUF.
 Verify it against the same hydrated donor with:
@@ -111,27 +116,33 @@ model or standalone store in place:
 ```sh
 python3 gguf-tools/ds4-expert-major.py \
   embed-deepseek-mlx-affine2 --dry-run \
+  --expected-source-sha256 8378080263eb9224f7228d72e2afa4ac3cf74a116023fdec2c596ff228a33e3f \
   /path/to/DeepSeek-base-ExpertMajor-v2.gguf \
   /Volumes/SSD/DeepSeek-V4-Flash-MLX-Affine2-ExpertMajor-v2.store
 
 python3 gguf-tools/ds4-expert-major.py \
   embed-deepseek-mlx-affine2 \
+  --expected-source-sha256 8378080263eb9224f7228d72e2afa4ac3cf74a116023fdec2c596ff228a33e3f \
   /path/to/DeepSeek-base-ExpertMajor-v2.gguf \
   /Volumes/SSD/DeepSeek-V4-Flash-MLX-Affine2-ExpertMajor-v2.store \
   /Volumes/SSD/DeepSeek-V4-Flash-MLX-Affine2-DS4.gguf
 ```
 
-The default publication path hashes the base GGUF, validates the standalone
-payload digest while copying, then byte-compares every non-routed tensor and
-the complete embedded store before hashing and atomically installing the final
-GGUF. The compatibility gate requires identical DeepSeek layer/expert metadata
-and component dimensions, one input store, one output store, and no duplicate
-canonical routed tensors. The standalone `.store` can be removed after the
-final GGUF and its recorded hashes have been independently retained.
+The base GGUF is pinned by its required full container SHA-256; the value above
+identifies the qualified 86,720,114,272-byte source. The default publication
+path validates the standalone payload digest while copying, then byte-compares
+every non-routed tensor and the complete embedded store before hashing and
+atomically installing the final GGUF without replacing a race winner. The
+compatibility gate requires identical DeepSeek layer/expert metadata, original
+source tensor inventory, and component dimensions, one input store, one output
+store, and no duplicate canonical routed tensors. The standalone `.store` can
+be removed after the final GGUF and its recorded hashes have been independently
+retained.
 
 ```sh
 python3 gguf-tools/ds4-expert-major.py \
   verify-deepseek-mlx-affine2-gguf \
+  --expected-source-sha256 8378080263eb9224f7228d72e2afa4ac3cf74a116023fdec2c596ff228a33e3f \
   /path/to/DeepSeek-base-ExpertMajor-v2.gguf \
   /Volumes/SSD/DeepSeek-V4-Flash-MLX-Affine2-ExpertMajor-v2.store \
   /Volumes/SSD/DeepSeek-V4-Flash-MLX-Affine2-DS4.gguf
