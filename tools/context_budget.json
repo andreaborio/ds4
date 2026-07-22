@@ -1,6 +1,6 @@
 {
   "direct_ds4_env_names": {
-    "maximum": 334,
+    "maximum": 333,
     "baseline": 324,
     "reason": "Accepted Qwen Metal benchmark, diagnostic-bisect, and profiling controls added with the affine runtime; normal release startup remains flag-free and every later direct name still exceeds this ceiling.",
     "accepted_additions": {
@@ -8,7 +8,6 @@
         "DS4_METAL_DISABLE_F32_NAX_PREFILL",
         "DS4_METAL_DISABLE_MLX_AFFINE_NAX",
         "DS4_METAL_DISABLE_MLX_AFFINE_STREAM_MM_ID",
-        "DS4_METAL_DISABLE_QWEN_FLASH_PREFILL",
         "DS4_METAL_DISABLE_QWEN_GDN_PRENORMALIZE"
       ],
       "benchmark_canary": [
