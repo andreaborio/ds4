@@ -1,6 +1,6 @@
 # Hebrus Rebrand Rollout Plan
 
-- Status: compatibility bridges merged; Hugging Face model moves completed
+- Status: compatibility bridges merged; GitHub and Hugging Face renames completed
 - Last updated: 2026-07-22
 - Scope: Hebrus engine, Hebrus Studio, the Hebrus Studio website, and the
   qualified Hugging Face model repositories
@@ -27,10 +27,10 @@ stable naming boundary remains in
 
 | Surface | Canonical work | State | Immediate constraint |
 | --- | --- | --- | --- |
-| Engine | `andreaborio/ds4`, merged PR [#6](https://github.com/andreaborio/ds4/pull/6) at `7686f70` | Compatibility bridge merged; complete local premerge and Linux/macOS CI green | Model-backed release lanes remain required before a final release |
-| Studio | `andreaborio/dsbox`, merged PR [#11](https://github.com/andreaborio/dsbox/pull/11) at `dd13cb5` | Compatibility bridge merged; 409 tests, build, audit, and local/CI packaged-app verification green | Publish and verify a post-merge development candidate before the final signed release |
-| Website | `andreaborio/hebrus-site`, `main` at `23507e2` | Published on GitHub Pages; clean install, zero-vulnerability audit, lint, static export, and Pages test green | Final logo, canonical post-rename links, and final signed download remain pending |
-| Model Hub | Three consolidated `andreaborio/*-Hebrus-GGUF` repositories | In-place moves completed; exact revisions, files, hashes, counters, Git heads, range downloads, and DS4-ID redirects verified | Refresh live model-card wording and retain continuous redirect/download monitoring |
+| Engine | `andreaborio/hebrus`, merged PR [#6](https://github.com/andreaborio/hebrus/pull/6) at `7686f70` | In-place rename completed; 35 stars, 4 forks, releases, PRs, fork ancestry, old-URL redirect, and clone parity verified | Model-backed release lanes remain required before a final release |
+| Studio | `andreaborio/hebrus-studio`, merged PR [#11](https://github.com/andreaborio/hebrus-studio/pull/11) at `dd13cb5` | In-place rename completed; 5 stars, releases, preview DMG, old-URL redirect, and clone parity verified | Publish and verify a post-merge development candidate before the final signed release |
+| Website | `andreaborio/hebrus-site`, `main` at `086ade3` | Canonical source and DMG links merged; lint, static export, ranged DMG request, and Pages test green | Final logo and final signed download remain pending |
+| Model Hub | Three consolidated `andreaborio/*-Hebrus-GGUF` repositories | In-place moves and Hebrus model-card refreshes completed; exact revisions, files, hashes, counters, Git heads, range downloads, and DS4-ID redirects verified | Retain continuous redirect/download monitoring |
 
 Release work must use the active engine rebrand branch, the active Studio bridge
 branch, and the GitHub Pages site checkout identified in the table above. A
@@ -46,7 +46,7 @@ rebrand integration.
 | --- | --- | --- |
 | `Hebrus`, `hebrus`, and the five `hebrus*` commands | Five `ds4*` command aliases through the complete 1.x line | `ds4.expert_major.v2`, wire values, GGUF metadata, disk-KV ABI, published filenames and hashes |
 | `Hebrus Studio` visible product and Finder name | `com.dsbox.desktop`, `$HOME/.dsbox`, legacy Electron `userData`, browser keys, `DSBOX_*` configuration | Existing user models, conversations, settings, downloads, release artifacts, tags, and historical links |
-| Future `andreaborio/hebrus` and `andreaborio/hebrus-studio` repository names | Old GitHub URLs through in-place rename redirects; consumers accept old and new engine identities | Git history, authorship, upstream remote, fork ancestry, licenses, acknowledgments, citations |
+| `andreaborio/hebrus` and `andreaborio/hebrus-studio` repository names | Old GitHub URLs through in-place rename redirects; consumers accept old and new engine identities | Git history, authorship, upstream remote, fork ancestry, licenses, acknowledgments, citations |
 | `*-Hebrus-GGUF` as the canonical Hugging Face repository display identity | Historical `*-DS4-GGUF` repository IDs and already-installed repository directory names | GGUF filenames, bytes, immutable revisions, LFS/Xet objects, SHA-256 values, `ds4.expert_major.v2` metadata |
 | Future `HEBRUS_*` aliases through one resolver | Existing `DS4_*` variables; conflicting old/new values fail closed | A textual replacement of environment variables, C symbols, paths, or serialized identifiers |
 
@@ -148,6 +148,9 @@ Exit gate: visual assets and copy are versioned, consistent, accessible, and
 traceable to the same candidate release.
 
 ## Phase 4 — Administrative repository renames
+
+Completed on 2026-07-22. The checks below remain the regression contract for
+future repository and release changes.
 
 Perform in-place GitHub renames only; do not create history-less replacement
 repositories and do not reuse the old names.
