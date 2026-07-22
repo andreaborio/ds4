@@ -79,9 +79,10 @@ cleanly before replacing an application bundle; do not delete `$HOME/.dsbox`.
 
 ## 2. Install the announced bridge revision
 
-Use the immutable release tag or commit from the release announcement. Until a
-release is announced, the public repository remains
-[`andreaborio/ds4`](https://github.com/andreaborio/ds4).
+Use the immutable release tag or commit from the release announcement. The
+canonical public repository is
+[`andreaborio/hebrus`](https://github.com/andreaborio/hebrus); the previous URL
+continues to redirect for transport compatibility.
 
 For a user-local source installation:
 

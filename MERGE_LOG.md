@@ -1,6 +1,6 @@
 # Upstream merge log
 
-Record of syncs of this fork (`andreaborio/ds4`) with upstream `antirez/ds4`, and how the
+Record of syncs of this fork (`andreaborio/hebrus`) with upstream `antirez/ds4`, and how the
 fork's engine additions were preserved across upstream refactors. See
 [`FORK_NOTES.md`](FORK_NOTES.md) for per-change upstreamability and [`README.md`](README.md)
 ("This fork") for what each addition does.
@@ -17,7 +17,7 @@ short-context bring-up rather than a mainline feature.
 
 No new upstream commits were present after `80ebbc3` during the 2026-06-24
 refresh; the work here is publishing the already-validated sync and bringing the
-fork README up to date before pushing `andreaborio/ds4`.
+fork README up to date before pushing the repository now named `andreaborio/hebrus`.
 
 ### 2026-06-24 verification on M5 Pro / 64 GB
 

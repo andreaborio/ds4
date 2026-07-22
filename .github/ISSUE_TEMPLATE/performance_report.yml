@@ -7,7 +7,7 @@ body:
       value: |
         Performance reports must be reproducible and correctness-preserving. Separate cold and warm runs, identify exact artifacts, and disclose memory pressure or competing workloads.
 
-        Do not attach model weights, model blobs, large binaries, secrets, or private prompts. Possible vulnerabilities belong under [SECURITY.md](https://github.com/andreaborio/ds4/blob/main/SECURITY.md), not in a public issue.
+        Do not attach model weights, model blobs, large binaries, secrets, or private prompts. Possible vulnerabilities belong under [SECURITY.md](https://github.com/andreaborio/hebrus/blob/main/SECURITY.md), not in a public issue.
 
   - type: checkboxes
     id: prerequisites

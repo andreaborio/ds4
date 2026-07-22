@@ -88,11 +88,10 @@ compatibility, not permission to reset an absolute local path.
 
 ## Repository and application bridge
 
-Until the administrative rename occurs, the engine repository remains
-`andreaborio/ds4`. Bridge consumers accept both `andreaborio/ds4` and the
-planned `andreaborio/hebrus` identity over HTTPS or SSH. The existing fork is
-renamed in place; no history-less replacement is created and the old repository
-name must not be reused.
+The engine repository was renamed in place to `andreaborio/hebrus`. Bridge
+consumers accept both the previous `andreaborio/ds4` identity and the canonical
+identity over HTTPS or SSH. No history-less replacement was created, and the
+old repository name must not be reused.
 
 The companion application's public name is **Hebrus Studio**. Its persisted
 DSBox identity remains a compatibility boundary for the bridge release:

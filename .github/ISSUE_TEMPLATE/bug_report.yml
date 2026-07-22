@@ -7,7 +7,7 @@ body:
       value: |
         Thanks for helping improve Hebrus. Search existing issues before filing a report.
 
-        For a possible vulnerability, stop here and follow the [security policy](https://github.com/andreaborio/ds4/blob/main/SECURITY.md). Do not post vulnerability details, secrets, private data, model weights, or model blobs in an issue.
+        For a possible vulnerability, stop here and follow the [security policy](https://github.com/andreaborio/hebrus/blob/main/SECURITY.md). Do not post vulnerability details, secrets, private data, model weights, or model blobs in an issue.
 
   - type: checkboxes
     id: prerequisites
