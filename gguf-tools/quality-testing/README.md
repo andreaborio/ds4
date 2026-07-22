@@ -48,7 +48,7 @@ tracked because they are derived from an external API.
 make -C gguf-tools quality-score
 ```
 
-The scorer links against the DS4 runtime and uses Metal by default.
+The scorer links against the Hebrus runtime and uses Metal by default.
 
 ## 3. Score GGUF Variants
 

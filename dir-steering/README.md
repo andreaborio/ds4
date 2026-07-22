@@ -1,15 +1,15 @@
 # Directional Steering
 
-Directional steering is a runtime activation edit for DS4. A steering file is a
+Directional steering is a runtime activation edit for Hebrus. A steering file is a
 flat `f32` matrix with one normalized 4096-wide direction per layer. During
-inference, ds4 can apply the edit after attention outputs, FFN outputs, or both:
+inference, Hebrus can apply the edit after attention outputs, FFN outputs, or both:
 
 ```text
 y = y - scale * direction[layer] * dot(direction[layer], y)
 ```
 
 Positive scale removes the represented direction. Negative scale amplifies it.
-With no steering file or zero scales, ds4 follows the normal inference path.
+With no steering file or zero scales, Hebrus follows the normal inference path.
 
 ## Runtime Options
 
@@ -39,8 +39,8 @@ Build the vector:
 
 ```sh
 python3 dir-steering/tools/build_direction.py \
-  --ds4 ./ds4 \
-  --model ds4flash.gguf \
+  --ds4 ./hebrus \
+  --model deepseek-v4-flash.gguf \
   --good-file dir-steering/examples/succinct.txt \
   --bad-file dir-steering/examples/verbose.txt \
   --out dir-steering/out/verbosity.json \
@@ -58,7 +58,7 @@ dir-steering/out/verbosity.f32
 Try a terse run:
 
 ```sh
-./ds4 -m ds4flash.gguf --nothink --temp 0 -n 160 \
+./hebrus -m deepseek-v4-flash.gguf --nothink --temp 0 -n 160 \
   --dir-steering-file dir-steering/out/verbosity.f32 \
   --dir-steering-ffn -1 \
   -p "Explain why databases use indexes."
@@ -67,7 +67,7 @@ Try a terse run:
 Try a verbose run:
 
 ```sh
-./ds4 -m ds4flash.gguf --nothink --temp 0 -n 220 \
+./hebrus -m deepseek-v4-flash.gguf --nothink --temp 0 -n 220 \
   --dir-steering-file dir-steering/out/verbosity.f32 \
   --dir-steering-ffn 2 \
   -p "Explain why databases use indexes."
@@ -85,8 +85,8 @@ Use the sweep helper to test several strengths on a fixed prompt set:
 
 ```sh
 python3 dir-steering/tools/run_sweep.py \
-  --ds4 ./ds4 \
-  --model ds4flash.gguf \
+  --ds4 ./hebrus \
+  --model deepseek-v4-flash.gguf \
   --direction dir-steering/out/verbosity.f32 \
   --prompts dir-steering/examples/eval_prompts.txt \
   --scales "-1,-0.5,0,0.5,1,2" \
@@ -124,7 +124,7 @@ The extractor compares two prompt sets:
 - `good-file`: target prompts for the direction you want to represent.
 - `bad-file`: contrast prompts that should be separated from the target.
 
-It captures DS4 activations from the same local GPU graph used for inference,
+It captures Hebrus activations from the same local GPU graph used for inference,
 averages target minus contrast, normalizes one vector per layer, and writes both
 metadata JSON and the runtime `.f32` file.
 

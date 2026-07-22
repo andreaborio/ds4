@@ -1,5 +1,8 @@
 # Qwen3.6 fixtures and ExpertMajor v2 gates
 
+The internal `ds4_test` target retains its historical compatibility name;
+runtime examples use the public `hebrus` executable.
+
 This directory contains frozen Qwen3.6 reference data, reproducible fixture
 collectors, and narrow offline checks. Current production inference accepts
 only the qualified embedded ExpertMajor v2 artifact on Apple Metal. The support
@@ -141,7 +144,7 @@ table above. Normal startup is flag-free AUTO:
 
 ```sh
 QWEN_V2=/absolute/path/to/Qwen3.6-35B-A3B-DS4-ExpertMajor-v2-MLX-Affine4-G64.gguf
-./ds4 -m "$QWEN_V2" --ctx 8192 \
+./hebrus -m "$QWEN_V2" --ctx 8192 \
   -n 32 --temp 0 \
   -p 'Scrivi solo una breve funzione Python che somma due interi.'
 ```
@@ -166,17 +169,17 @@ a host where resident admission succeeds, run the same deterministic prompt in
 both modes:
 
 ```sh
-./ds4 -m "$QWEN_V2" --ctx 8192 --resident \
+./hebrus -m "$QWEN_V2" --ctx 8192 --resident \
   -n 32 --temp 0 \
   -p 'Scrivi solo una breve funzione Python che somma due interi.'
 
-./ds4 -m "$QWEN_V2" --ctx 8192 --ssd-streaming \
+./hebrus -m "$QWEN_V2" --ctx 8192 --ssd-streaming \
   -n 32 --temp 0 \
   -p 'Scrivi solo una breve funzione Python che somma due interi.'
 ```
 
 Compare deterministic output and logits, not plausibility alone. Resident mode
-must use complete mapped tensors with zero DS4 expert-cache `pread` accounting.
+must use complete mapped tensors with zero Hebrus expert-cache `pread` accounting.
 SSD mode must allocate the first 321-expert slab within its admitted budget and
 must not introduce swap. Keep warm page-cache evidence separate from cold
 device-I/O evidence, and never bypass a failed admission to obtain a number.

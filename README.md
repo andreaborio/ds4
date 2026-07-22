@@ -64,6 +64,10 @@ to load, even when their model family name looks compatible.
 The current production contract is Apple Silicon + Metal + embedded
 ExpertMajor v2. AUTO is the normal startup mode.
 
+> Published artifact filenames carrying the legacy prefix are frozen compatibility
+> identifiers tied to existing hashes and manifests. They do not represent the
+> current product name; the runtime and user-facing project are Hebrus.
+
 | Model family | Minimum unified memory | Qualified execution | Artifact availability |
 | --- | ---: | --- | --- |
 | DeepSeek V4 Flash | 64 GiB | AUTO resolving to resident or SSD; explicit modes for qualification | Published ExpertMajor v2 artifact; `download_model.sh deepseek-v2` |
@@ -263,12 +267,11 @@ can create substantial memory pressure and I/O. Follow AUTO, use only exact
 qualified artifacts, monitor swap and memory pressure, and do not expose a
 local server to untrusted networks without an appropriate security boundary.
 
-The separate companion desktop application is **Hebrus Studio**, currently
-developed in the existing
-[`andreaborio/dsbox`](https://github.com/andreaborio/dsbox) fork until its
-administrative rename. Its bridge release preserves the DSBox bundle ID, data
-locations, environment namespace, storage keys, and rollback path so the public
-rename does not split existing installations.
+The companion desktop application is published as
+[`andreaborio/hebrus-studio`](https://github.com/andreaborio/hebrus-studio).
+Its compatibility bridge preserves the legacy DSBox bundle ID, data locations,
+environment namespace, storage keys, and rollback path so the public rename
+does not split existing installations.
 
 ## Contributing and security
 

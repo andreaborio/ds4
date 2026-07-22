@@ -1,6 +1,6 @@
-# DS4 Imatrix Calibration Dataset
+# Hebrus Imatrix Calibration Dataset
 
-This directory contains DS4-rendered chat prompts for collecting activation
+This directory contains Hebrus-rendered chat prompts for collecting activation
 statistics before building new low-bit GGUF files.
 
 Run:
@@ -36,7 +36,7 @@ Some records include DSML tool schemas, sampled DSML tool calls, and tool-result
 turns so the imatrix sees the same special-token patterns used by agent clients.
 The corpus is provider-neutral and also includes language/prose rewriting,
 summarization, copy-editing, extraction, multilingual translation, programming
-prompts, Bash scripting, algorithm recall, `ds4-eval` benchmark-reasoning
+prompts, Bash scripting, algorithm recall, `hebrus-eval` benchmark-reasoning
 prompts, long-context code synthesis, agent transcript replay, log diagnosis,
 prose fact recovery, delayed-constraint and small needle tasks, Metal/C code
 review tasks, and inference-specific debugging tasks.

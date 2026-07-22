@@ -1,4 +1,4 @@
-# DS4 Imatrix Pipeline
+# Hebrus Imatrix Pipeline
 
 This directory contains the calibration dataset and instructions used to build
 activation importance matrices for DeepSeek V4 Flash and Pro GGUF
@@ -15,7 +15,7 @@ layer.  Both variants expose three routed expert tensors per layer:
 For gate/up tensors, the collector records the squared FFN-normalized input
 activation.  For down tensors, it records the squared routed SwiGLU row after
 route weighting.  The result tells the quantizer which input columns are used
-more heavily by the actual DS4 inference graph.
+more heavily by the actual Hebrus inference graph.
 
 ## 1. Build The Calibration Dataset
 
@@ -33,14 +33,14 @@ The important output is:
 gguf-tools/imatrix/dataset/rendered_prompts.txt
 ```
 
-It contains DS4-rendered chat prompts, separated by visible
+It contains Hebrus-rendered chat prompts, separated by visible
 `DS4_IMATRIX_PROMPT` markers.  The prompts include:
 
 - C/Metal source-review prompts from this repository.
 - Long-context snippets.
-- Agent/tool-call prompts using DS4's DSML syntax.
+- Agent/tool-call prompts using Hebrus' DSML syntax.
 - Language/prose rewriting, summarization, extraction, and translation prompts.
-- `ds4-eval` GPQA Diamond, SuperGPQA, and AIME2025 benchmark prompts.
+- `hebrus-eval` GPQA Diamond, SuperGPQA, and AIME2025 benchmark prompts.
 - Both thinking and non-thinking assistant prefixes.
 
 Check the generated `gguf-tools/imatrix/dataset/manifest.json` for the exact
@@ -48,7 +48,7 @@ record count and coarse token estimate of the current tree.
 
 ## 2. Collect The Imatrix
 
-Use the DS4 runtime itself to collect routed MoE activation statistics.  The
+Use the Hebrus runtime itself to collect routed MoE activation statistics. The
 collector uses the loaded GGUF metadata. Runtime admission still applies: the
 collector must use an admitted ExpertMajor v2 artifact, not a canonical
 converter input.
@@ -56,7 +56,7 @@ converter input.
 Flash example:
 
 ```sh
-./ds4 \
+./hebrus \
   -m DEEPSEEK-DS4-ExpertMajor-v2.gguf \
   --imatrix-dataset gguf-tools/imatrix/dataset/rendered_prompts.txt \
   --imatrix-out ../deepseek-v4-quants/imatrix/DeepSeek-V4-Flash-chat-v2-routed-moe-ds4-1p5m.dat \
@@ -70,10 +70,10 @@ an executable collection recipe.
 Useful smoke-test limits:
 
 ```sh
-./ds4 \
+./hebrus \
   -m DEEPSEEK-DS4-ExpertMajor-v2.gguf \
   --imatrix-dataset gguf-tools/imatrix/dataset/rendered_prompts.txt \
-  --imatrix-out /tmp/ds4-test.imatrix.dat \
+  --imatrix-out /tmp/hebrus-test.imatrix.dat \
   --imatrix-max-prompts 1 \
   --imatrix-max-tokens 4096
 ```
@@ -82,7 +82,7 @@ The collector is Metal-only because it hooks the layer-major Metal prefill graph
 It does not change inference math; it reads the already materialized MoE inputs
 and accumulates `sum(x[column]^2)` per routed expert.
 
-The output format is llama.cpp's legacy binary `.dat` imatrix format.  DS4 packs
+The output format is llama.cpp's legacy binary `.dat` imatrix format. Hebrus packs
 per-expert vectors into one entry per routed expert tensor:
 
 ```text
@@ -170,11 +170,11 @@ avg greedy LCP:         12.21 imatrix / 11.94 old
 ## Compatibility
 
 The `.dat` file is intentionally in llama.cpp's legacy imatrix format, so the
-data is not conceptually tied to DS4.  In practice, it is immediately useful
-only with a quantizer that understands DS4's tensor names and packed per-expert
+data is not conceptually tied to Hebrus. In practice, it is immediately useful
+only with a quantizer that understands Hebrus' tensor names and packed per-expert
 entries.  The current `deepseek4-quantize` tooling does that.
 
 Other GGUF creation tools can use the same imatrix if they implement the same
-name mapping and per-expert slicing convention.  Without that DS4-specific
+name mapping and per-expert slicing convention. Without that Hebrus-specific
 mapping, a generic imatrix loader will see valid data but will not know how to
 apply the packed routed-expert vectors correctly.
