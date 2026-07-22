@@ -311,10 +311,10 @@ sysctl -n vm.swapusage >"$prefix.swap.before"
 os_build=$(sw_vers -buildVersion)
 power_source=$(pmset -g batt | head -n 1 | sed -E "s/^Now drawing from '(.*)'$/\1/")
 
-swapout_before=$(vm_value Swapouts)
-pagein_before=$(vm_value Pageins)
-wired_before=$(vm_value "Pages wired down")
-pressure_before=$(free_percent)
+swapout_before=$(vm_value Swapouts || true)
+pagein_before=$(vm_value Pageins || true)
+wired_before=$(vm_value "Pages wired down" || true)
+pressure_before=$(free_percent || true)
 require_uint swapout_before "$swapout_before"
 require_uint pagein_before "$pagein_before"
 require_uint wired_before "$wired_before"
@@ -383,9 +383,12 @@ print -- "$pid" >"$prefix.pid"
 while kill -0 "$pid" 2>/dev/null; do
     now=$(date +%s)
     elapsed=$((now - start_epoch))
-    swapout_now=$(vm_value Swapouts)
-    free_now=$(free_percent)
-    wired_now=$(vm_value "Pages wired down")
+    # These samples are deliberately validated below. Keep a transient command
+    # failure from tripping `set -e` before the runner can record a precise
+    # telemetry abort reason and terminate the child.
+    swapout_now=$(vm_value Swapouts || true)
+    free_now=$(free_percent || true)
+    wired_now=$(vm_value "Pages wired down" || true)
     if ! is_uint "$swapout_now"; then
         abort_reason=telemetry_swapout_unavailable
     elif ! is_uint "$free_now"; then
@@ -399,7 +402,11 @@ while kill -0 "$pid" 2>/dev/null; do
         (( free_now < pressure_min )) && pressure_min=$free_now
         (( wired_now > peak_wired_pages )) && peak_wired_pages=$wired_now
         wired_bytes=$((wired_now * page_size))
-        rss_now=$(ps -o rss= -p "$pid" 2>/dev/null | awk '{print $1 + 0}')
+        # The child may exit between kill -0 above and this sample. That race
+        # is normal; an empty RSS sample is ignored rather than aborting the
+        # runner before it writes the final summary.
+        rss_now=$(ps -o rss= -p "$pid" 2>/dev/null |
+            awk '{print $1 + 0}' || true)
         if is_uint "$rss_now" && (( rss_now > peak_rss_kib )); then
             peak_rss_kib=$rss_now
         fi
@@ -440,10 +447,10 @@ fi
 end_epoch=$(date +%s)
 vm_stat >"$prefix.vm.after"
 sysctl -n vm.swapusage >"$prefix.swap.after"
-swapout_after=$(vm_value Swapouts)
-pagein_after=$(vm_value Pageins)
-wired_after=$(vm_value "Pages wired down")
-pressure_after=$(free_percent)
+swapout_after=$(vm_value Swapouts || true)
+pagein_after=$(vm_value Pageins || true)
+wired_after=$(vm_value "Pages wired down" || true)
+pressure_after=$(free_percent || true)
 require_uint swapout_after "$swapout_after"
 require_uint pagein_after "$pagein_after"
 require_uint wired_after "$wired_after"
