@@ -774,14 +774,13 @@ uint32_t ds4_ssd_deepseek_expert_major_auto_cache_target(
         memory->physical_bytes < 96u * DS4_GIB;
     if (!measured_64g_tier) return plan->cache_experts;
 
-    /* Seventeen complete token working sets are the largest stable tier
-     * admitted by the 9/16 envelope on the measured 64 GiB M5 Pro.  After
-     * isolating GLM-only batch reuse this tier recovered decode throughput;
-     * the next practical tier crossed the runtime pressure guard.  Express
-     * the target in route cycles rather than one artifact-specific count and
-     * retain the generic point-in-time plan as the safety ceiling, so AUTO
-     * still contracts when the host has less reclaimable memory. */
-    const uint64_t measured_cycles = 17u;
+    /* Twelve complete token working sets retain most of the measured decode
+     * locality without the delayed swap observed after restoring the former
+     * seventeen-cycle tier on the 64 GiB M5 Pro.  Express the target in route
+     * cycles rather than one artifact-specific count and retain the generic
+     * point-in-time plan as the safety ceiling, so AUTO still contracts when
+     * the host has less reclaimable memory. */
+    const uint64_t measured_cycles = 12u;
     if (plan->floor.working_set_experts >
         (UINT64_MAX - 1u) / measured_cycles) {
         return 0;

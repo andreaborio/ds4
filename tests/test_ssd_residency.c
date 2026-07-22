@@ -842,10 +842,9 @@ int main(void) {
     assert(adaptive.current_headroom_bytes == 4 * GIB);
     assert(adaptive.platform_headroom_bytes == 8 * GIB);
 
-    /* Reproduce the bounded M5 canary snapshot.  The safety budget alone can
-     * fit the old 4903-expert tier, while the stable envelope and the strict
-     * static reserve independently hold AUTO at the nearby measured sweet
-     * spot, 4387 experts / 28.92 GiB. */
+    /* Reproduce the bounded M5 canary snapshot.  The generic safety plan can
+     * admit 4387 experts / 28.92 GiB, while the DeepSeek-specific 64 GiB
+     * policy below selects the lower sustained-safe target. */
     memory = (ds4_ssd_host_memory){
         .physical_bytes = 64 * GIB,
         .recommended_bytes = 51 * GIB + 84 * GIB / 100u,
@@ -867,7 +866,7 @@ int main(void) {
            8 * GIB + GIB / 5u);
     assert(adaptive.cache_experts == 4387);
     assert(ds4_ssd_deepseek_expert_major_auto_cache_target(
-               &memory, &adaptive) == 4387);
+               &memory, &adaptive) == 3097);
 
     /* The 64 GiB DeepSeek target is a pressure-bounded route-cycle policy,
      * not a fixed allocation: a smaller admitted candidate wins. Hosts above
@@ -875,14 +874,14 @@ int main(void) {
     ds4_ssd_adaptive_cache_plan deepseek_tier = adaptive;
     deepseek_tier.cache_experts = 5500;
     assert(ds4_ssd_deepseek_expert_major_auto_cache_target(
-               &memory, &deepseek_tier) == 4387);
+               &memory, &deepseek_tier) == 3097);
     deepseek_tier.cache_experts = 2839;
     assert(ds4_ssd_deepseek_expert_major_auto_cache_target(
                &memory, &deepseek_tier) == 2839);
     deepseek_tier.cache_experts = 5500;
     memory.physical_bytes = 95 * GIB;
     assert(ds4_ssd_deepseek_expert_major_auto_cache_target(
-               &memory, &deepseek_tier) == 4387);
+               &memory, &deepseek_tier) == 3097);
     memory.physical_bytes = 96 * GIB;
     assert(ds4_ssd_deepseek_expert_major_auto_cache_target(
                &memory, &deepseek_tier) == 5500);
@@ -894,10 +893,10 @@ int main(void) {
                &memory, &deepseek_tier) == 5500);
     memory.physical_bytes = 64 * GIB;
     deepseek_tier.cache_experts = UINT32_MAX;
-    deepseek_tier.floor.working_set_experts = UINT32_MAX / 17u + 1u;
+    deepseek_tier.floor.working_set_experts = UINT32_MAX / 12u + 1u;
     assert(ds4_ssd_deepseek_expert_major_auto_cache_target(
                &memory, &deepseek_tier) == 0);
-    deepseek_tier.floor.working_set_experts = UINT64_MAX / 17u + 1u;
+    deepseek_tier.floor.working_set_experts = UINT64_MAX / 12u + 1u;
     assert(ds4_ssd_deepseek_expert_major_auto_cache_target(
                &memory, &deepseek_tier) == 0);
     assert(ds4_ssd_deepseek_expert_major_auto_cache_target(NULL,
