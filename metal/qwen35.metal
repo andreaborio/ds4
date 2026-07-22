@@ -1569,15 +1569,12 @@ kernel void kernel_qwen35_gqa_split_k_pad_f32(
     }
 }
 
-// Packs the final partial 64-token block from Qwen's staged token-major F16
-// K/V cache into the head-major padding ABI consumed by non-vector
-// FlashAttention.  The deliberately sparse token stride matches the ordinary
-// cache arguments, so the shared FlashAttention kernel needs no Qwen-specific
-// indexing branch.
-kernel void kernel_qwen35_gqa_prefill_pad_kv_f16(
+// Repack the final partial block from the persistent token-major F32 cache
+// into the sparse head-major padding ABI consumed by FlashAttention.
+kernel void kernel_qwen35_gqa_prefill_pad_kv_f32(
         constant ds4_metal_args_qwen35_gqa_decode &args [[buffer(0)]],
-        device const half *key_cache [[buffer(1)]],
-        device const half *value_cache [[buffer(2)]],
+        device const float *key_cache [[buffer(1)]],
+        device const float *value_cache [[buffer(2)]],
         device char *pad [[buffer(3)]],
         uint3 tgpig [[threadgroup_position_in_grid]],
         uint tiitg [[thread_index_in_threadgroup]],
@@ -1601,10 +1598,10 @@ kernel void kernel_qwen35_gqa_prefill_pad_kv_f16(
         (ulong)kv_head * token_stride * C;
 
     for (uint row = 0; row < C; row++) {
-        device half *dst_row =
-            (device half *)(dst + (ulong)row * token_stride);
+        device float *dst_row =
+            (device float *)(dst + (ulong)row * token_stride);
         if (row < valid) {
-            device const half *src_row = (device const half *)(src +
+            device const float *src_row = (device const float *)(src +
                 (ulong)(first + row) * token_stride +
                 (ulong)kv_head * head_stride);
             for (uint dim = tiitg; dim < args.head_dim; dim += ntg.x) {
@@ -1612,35 +1609,9 @@ kernel void kernel_qwen35_gqa_prefill_pad_kv_f16(
             }
         } else {
             for (uint dim = tiitg; dim < args.head_dim; dim += ntg.x) {
-                dst_row[dim] = 0.0h;
+                dst_row[dim] = 0.0f;
             }
         }
-    }
-}
-
-// The mask tail follows both padded K/V regions and is dense [query][64].
-// Keeping this copy on the GPU lets the reusable Qwen pad allocation remain
-// private on M5-class devices.
-kernel void kernel_qwen35_gqa_prefill_pad_mask_f16(
-        constant ds4_metal_args_qwen35_gqa_prefill &args [[buffer(0)]],
-        device const half *mask [[buffer(1)]],
-        device char *pad [[buffer(2)]],
-        uint3 tgpig [[threadgroup_position_in_grid]],
-        uint tiitg [[thread_index_in_threadgroup]],
-        uint3 ntg [[threads_per_threadgroup]]) {
-    constexpr uint C = 64;
-    const uint q = tgpig.x;
-    if (q >= args.n_token) return;
-    const uint n_kv = args.position0 + args.n_token;
-    const uint valid = n_kv % C;
-    const uint first = n_kv - valid;
-    const ulong region_bytes =
-        args.key_token_stride * C * args.n_kv_head;
-    device half *dst = (device half *)(pad + 2u * region_bytes) +
-        (ulong)q * C;
-    device const half *src = mask + (ulong)q * n_kv + first;
-    for (uint i = tiitg; i < C; i += ntg.x) {
-        dst[i] = i < valid ? src[i] : -MAXHALF;
     }
 }
 
@@ -2359,6 +2330,7 @@ kernel void kernel_qwen35_gqa_prefill_reuse8_f32(
         }
     }
 }
+
 
 // One threadgroup normalizes and gates one value-head row.  Scratch holds one
 // partial sum per SIMD group; the host allocates n_simdgroup floats.

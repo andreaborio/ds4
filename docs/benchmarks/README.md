@@ -7,6 +7,7 @@ because their numbers remain useful.
 
 | Record | Status | Scope |
 | --- | --- | --- |
+| [`2026-07-22-qwen-kv-pair-blit.md`](2026-07-22-qwen-kv-pair-blit.md) | Owner-authorized merge; full release matrix incomplete, SSD speed effect within noise | Qwen K/V cache pair-blit on M5 resident/SSD and M1 Pro 16/32 GiB, including invalid 16 GiB timing evidence |
 | [`2026-07-22-qwen-ssd-flash-prefill.md`](2026-07-22-qwen-ssd-flash-prefill.md) | Directional candidate; battery cohort, promotion pending | Qwen implicit-causal FlashAttention transfer to SSD, memory accounting, and first 2K/8K A/B |
 | [`2026-07-21-qwen-pre-m5-exact-router-tile.md`](2026-07-21-qwen-pre-m5-exact-router-tile.md) | Directional; timing cohort contaminated | Exact F32 router weight reuse on M1 Pro through 8K, rejected approximate predecessor, and pending clean promotion lane |
 | [`2026-07-21-qwen-split-k-hardware-policy.md`](2026-07-21-qwen-split-k-hardware-policy.md) | Current Qwen qualification evidence | F32 split-K A/B at 8K/32K on 64 GiB, transfer validation on 16 GiB, and hardware-aware AUTO validation on 16/32/64 GiB |

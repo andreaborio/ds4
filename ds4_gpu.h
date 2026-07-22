@@ -36,6 +36,19 @@ int ds4_gpu_tensor_read(const ds4_gpu_tensor *tensor, uint64_t offset, void *dat
 int ds4_gpu_tensor_copy(ds4_gpu_tensor *dst, uint64_t dst_offset,
                           const ds4_gpu_tensor *src, uint64_t src_offset,
                           uint64_t bytes);
+/* Validate both exact byte ranges before encoding either copy, then record
+ * both operations in one blit encoder on the active command batch. */
+int ds4_gpu_tensor_copy_pair(
+        ds4_gpu_tensor       *dst0,
+        uint64_t              dst_offset0,
+        const ds4_gpu_tensor *src0,
+        uint64_t              src_offset0,
+        uint64_t              bytes0,
+        ds4_gpu_tensor       *dst1,
+        uint64_t              dst_offset1,
+        const ds4_gpu_tensor *src1,
+        uint64_t              src_offset1,
+        uint64_t              bytes1);
 int ds4_gpu_tensor_copy_f32_to_f16(ds4_gpu_tensor *dst, uint64_t dst_offset,
                                    const ds4_gpu_tensor *src, uint64_t src_offset,
                                    uint64_t count);
@@ -886,13 +899,26 @@ int ds4_gpu_qwen35_gqa_prefill_tensor(
         uint32_t              n_kv_head,
         uint32_t              head_dim);
 
+/* Stable telemetry IDs returned through reuse_used.  Path 0 is the serial
+ * legacy oracle, path 1 is the exact F32 K/V-reuse fallback, and path 2 is the
+ * direct-F32 FlashAttention prefill specialization.  request_reuse remains a
+ * boolean policy input: zero forces path 0, while a nonzero value permits the
+ * selector to try path 2 and then path 1 when Flash is unavailable before any
+ * GPU work is submitted. */
+enum {
+    DS4_GPU_QWEN35_GQA_PATH_LEGACY = 0,
+    DS4_GPU_QWEN35_GQA_PATH_EXACT_REUSE = 1,
+    DS4_GPU_QWEN35_GQA_PATH_FLASH_F32 = 2,
+};
+
 /* K/V-tile reuse specialization for Qwen's 8:1 grouped-query geometry.  The
  * capability is deliberately separate from policy: an engine resolves it
  * once, combines it with its per-request feature mask, then passes that result
  * as request_reuse.  The select wrappers preserve the existing kernel for a
  * disabled feature, incompatible geometry, short context, or a device whose
- * pipeline cannot host the 16-SIMD-group tile.  reuse_used reports the actual
- * structural path and is suitable for strict campaign telemetry.
+ * pipeline cannot host the specialization.  reuse_used reports one of the
+ * DS4_GPU_QWEN35_GQA_PATH_* values above and is suitable for strict campaign
+ * telemetry.
  *
  * A selected reuse dispatch is never retried through the legacy kernel after
  * a GPU error: doing so could conceal a partial write and invalidate exact-run

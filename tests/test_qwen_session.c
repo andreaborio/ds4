@@ -202,43 +202,138 @@ static void test_model_aware_context_memory(void) {
 }
 
 static void test_qwen_metal_session_context_budget(void) {
-    ds4_engine engine;
-    ds4_context_memory planned = {0};
+    ds4_engine resident_engine;
+    ds4_engine ssd_engine;
+    ds4_context_memory resident_8k = {0};
+    ds4_context_memory resident_100k = {0};
+    ds4_context_memory resident_max = {0};
+    ds4_context_memory ssd_explicit_8k = {0};
+    ds4_context_memory ssd_resolved_8k = {0};
     ds4_context_memory requested = {0};
-    fake_qwen_engine(&engine, true);
-    engine.backend = DS4_BACKEND_METAL;
-    engine.qwen_metal_runtime = true;
+    fake_qwen_engine(&resident_engine, true);
+    resident_engine.backend = DS4_BACKEND_METAL;
+    resident_engine.qwen_metal_runtime = true;
 
     CHECK(ds4_engine_context_memory_estimate_with_prefill(
-              &engine, 8, 0, &planned));
-    engine.residency_plan.runtime_bytes = planned.total_bytes;
+              &resident_engine, 8192, 0, &resident_8k));
+    CHECK(resident_8k.prefill_cap == QWEN35_RESIDENT_PREFILL_TOKENS);
+    resident_engine.residency_plan.runtime_bytes = resident_8k.total_bytes;
 
     CHECK(ds4_qwen35_metal_session_context_fits_runtime_plan(
-              &engine, 8, &requested));
-    CHECK(requested.total_bytes == planned.total_bytes);
+              &resident_engine, 8192, &requested));
+    CHECK(requested.total_bytes == resident_8k.total_bytes);
     CHECK(ds4_qwen35_metal_session_context_fits_runtime_plan(
-              &engine, 4, &requested));
-    CHECK(requested.total_bytes < planned.total_bytes);
+              &resident_engine, 4096, &requested));
+    CHECK(requested.total_bytes < resident_8k.total_bytes);
     CHECK(!ds4_qwen35_metal_session_context_fits_runtime_plan(
-               &engine, 9, &requested));
-    CHECK(requested.total_bytes > planned.total_bytes);
+               &resident_engine, 8193, &requested));
+    CHECK(requested.total_bytes > resident_8k.total_bytes);
 
-    uint64_t flash_8k = 0;
-    uint64_t flash_32k = 0;
-    uint64_t flash_max = 0;
-    CHECK(qwen35_metal_persistent_runtime_bytes(8192, &flash_8k));
-    CHECK(qwen35_metal_persistent_runtime_bytes(32768, &flash_32k));
+    CHECK(ds4_engine_context_memory_estimate_with_prefill(
+              &resident_engine, 100000, 0, &resident_100k));
+    CHECK(resident_100k.raw_cap == 100000u);
+    CHECK(resident_100k.prefill_cap == QWEN35_RESIDENT_PREFILL_TOKENS);
+    CHECK(ds4_engine_context_memory_estimate_with_prefill(
+              &resident_engine, QWEN35_CONTEXT_LENGTH, 0, &resident_max));
+    CHECK(resident_max.raw_cap == QWEN35_CONTEXT_LENGTH);
+    CHECK(resident_max.prefill_cap == QWEN35_RESIDENT_PREFILL_TOKENS);
+    CHECK(!ds4_engine_context_memory_estimate_with_prefill(
+               &resident_engine, QWEN35_CONTEXT_LENGTH + 1u, 0,
+               &requested));
+
+    fake_qwen_engine(&ssd_engine, true);
+    ssd_engine.backend = DS4_BACKEND_METAL;
+    ssd_engine.qwen_metal_runtime = true;
+    ssd_engine.residency_requested = DS4_RESIDENCY_SSD;
+    CHECK(ds4_engine_context_memory_estimate_with_prefill(
+              &ssd_engine, 8192, 0, &ssd_explicit_8k));
+    CHECK(ssd_explicit_8k.prefill_cap == QWEN35_PREFILL_MICRO_TOKENS);
+
+    ssd_engine.residency_requested = DS4_RESIDENCY_AUTO;
+    ssd_engine.residency_plan.resolved = DS4_RESIDENCY_SSD;
+    CHECK(ds4_engine_context_memory_estimate_with_prefill(
+              &ssd_engine, 8192, 0, &ssd_resolved_8k));
+    CHECK(ssd_resolved_8k.prefill_cap == QWEN35_PREFILL_MICRO_TOKENS);
+    CHECK(ssd_resolved_8k.total_bytes == ssd_explicit_8k.total_bytes);
+    CHECK(resident_8k.total_bytes - ssd_resolved_8k.total_bytes ==
+          UINT64_C(1582768128));
+    CHECK(resident_8k.scratch_bytes - ssd_resolved_8k.scratch_bytes ==
+          UINT64_C(1582768128));
+
+    uint64_t resident_runtime_8k = 0;
+    uint64_t resident_runtime_32k = 0;
+    uint64_t resident_runtime_100k = 0;
+    uint64_t resident_runtime_max = 0;
+    uint64_t ssd_runtime_8k = 0;
+    uint64_t ssd_runtime_100k = 0;
+    uint64_t ssd_runtime_max = 0;
     CHECK(qwen35_metal_persistent_runtime_bytes(
-              QWEN35_CONTEXT_LENGTH, &flash_max));
-    CHECK(flash_32k - flash_8k ==
+              8192, QWEN35_RESIDENT_PREFILL_TOKENS,
+              &resident_runtime_8k));
+    CHECK(qwen35_metal_persistent_runtime_bytes(
+              32768, QWEN35_RESIDENT_PREFILL_TOKENS,
+              &resident_runtime_32k));
+    CHECK(qwen35_metal_persistent_runtime_bytes(
+              100000, QWEN35_RESIDENT_PREFILL_TOKENS,
+              &resident_runtime_100k));
+    CHECK(qwen35_metal_persistent_runtime_bytes(
+              QWEN35_CONTEXT_LENGTH, QWEN35_RESIDENT_PREFILL_TOKENS,
+              &resident_runtime_max));
+    CHECK(!qwen35_metal_persistent_runtime_bytes(
+               QWEN35_CONTEXT_LENGTH + 1u,
+               QWEN35_RESIDENT_PREFILL_TOKENS, &resident_runtime_max));
+    CHECK(!qwen35_metal_persistent_runtime_bytes(
+               8192, 0, &resident_runtime_8k));
+    CHECK(!qwen35_metal_persistent_runtime_bytes(
+               8192, QWEN35_RESIDENT_PREFILL_TOKENS + 1u,
+               &resident_runtime_8k));
+    CHECK(qwen35_metal_persistent_runtime_bytes(
+              8192, QWEN35_PREFILL_MICRO_TOKENS, &ssd_runtime_8k));
+    CHECK(qwen35_metal_persistent_runtime_bytes(
+              100000, QWEN35_PREFILL_MICRO_TOKENS,
+              &ssd_runtime_100k));
+    CHECK(qwen35_metal_persistent_runtime_bytes(
+              QWEN35_CONTEXT_LENGTH, QWEN35_PREFILL_MICRO_TOKENS,
+              &ssd_runtime_max));
+    CHECK(resident_runtime_32k - resident_runtime_8k ==
           (uint64_t)(32768u - 8192u) *
-              (QWEN35_METAL_GRAPH_CONTEXT_BYTES_PER_TOKEN +
-               QWEN35_FLASH_PREFILL_BYTES_PER_TOKEN));
-    CHECK((uint64_t)QWEN35_CONTEXT_LENGTH *
-              QWEN35_FLASH_PREFILL_BYTES_PER_TOKEN ==
-          UINT64_C(536870912));
-    CHECK(QWEN35_FLASH_PREFILL_PAD_BYTES == UINT64_C(262144));
-    CHECK(flash_max > flash_32k);
+              QWEN35_METAL_GRAPH_CONTEXT_BYTES_PER_TOKEN);
+    CHECK(QWEN35_FLASH_PREFILL_PAD_BYTES == UINT64_C(524288));
+    CHECK(resident_runtime_100k > resident_runtime_32k);
+    CHECK(resident_runtime_max > resident_runtime_100k);
+    CHECK(resident_runtime_8k - ssd_runtime_8k ==
+          UINT64_C(1582768128));
+    CHECK(resident_runtime_100k - ssd_runtime_100k ==
+          UINT64_C(1582768128));
+    CHECK(resident_runtime_max - ssd_runtime_max ==
+          UINT64_C(1582768128));
+    CHECK(resident_8k.total_bytes == resident_runtime_8k);
+    CHECK(ssd_resolved_8k.total_bytes == ssd_runtime_8k);
+
+    ds4_residency_plan auto_to_ssd = {
+        .requested = DS4_RESIDENCY_AUTO,
+        .resolved = DS4_RESIDENCY_SSD,
+        .model_bytes = UINT64_C(123456789),
+        .runtime_bytes = resident_runtime_100k,
+        .headroom_bytes = UINT64_C(987654321),
+    };
+    uint64_t resident_required = 0;
+    uint64_t ssd_required = 0;
+    CHECK(qwen35_u64_add(auto_to_ssd.model_bytes,
+                         resident_runtime_100k, &resident_required));
+    CHECK(qwen35_u64_add(resident_required, auto_to_ssd.headroom_bytes,
+                         &resident_required));
+    auto_to_ssd.required_bytes = resident_required;
+    CHECK(qwen35_u64_add(auto_to_ssd.model_bytes,
+                         ssd_runtime_100k, &ssd_required));
+    CHECK(qwen35_u64_add(ssd_required, auto_to_ssd.headroom_bytes,
+                         &ssd_required));
+    CHECK(qwen35_metal_residency_plan_rebase_runtime(
+              &auto_to_ssd, 100000, QWEN35_PREFILL_MICRO_TOKENS));
+    CHECK(auto_to_ssd.runtime_bytes == ssd_runtime_100k);
+    CHECK(auto_to_ssd.required_bytes == ssd_required);
+    CHECK(resident_required - auto_to_ssd.required_bytes ==
+          UINT64_C(1582768128));
 }
 
 static void test_qwen_residency_request_normalization(void) {

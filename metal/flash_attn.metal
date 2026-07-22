@@ -346,13 +346,26 @@ void kernel_flash_attn_ext_impl(
     constexpr short NQ  = Q/NSG;
     constexpr short SH  = 2*C;
 
-    constexpr short TS = 2*SH;
-    constexpr short T  = DK + 2*PV;
+    // Every offset below is expressed in half elements because shmem_f16 is
+    // the dynamic-threadgroup-memory ABI.  Derive each typed region's width
+    // instead of assuming that only Q can become F32: otherwise a future
+    // specialization can silently overlap Q, the F32 output accumulator, or
+    // the F32 score tile while the host still allocates the nominal layout.
+    static_assert(sizeof(q_t) % sizeof(half) == 0, "unaligned Q storage");
+    static_assert(sizeof(o_t) % sizeof(half) == 0, "unaligned O storage");
+    static_assert(sizeof(s_t) % sizeof(half) == 0, "unaligned S storage");
+    constexpr short Q_STORAGE = sizeof(q_t)/sizeof(half);
+    constexpr short O_STORAGE = sizeof(o_t)/sizeof(half);
+    constexpr short S_STORAGE = sizeof(s_t)/sizeof(half);
+    constexpr short T  = Q_STORAGE*DK + O_STORAGE*PV;
+    constexpr short TS = S_STORAGE*SH;
 
     threadgroup q_t  * sq  = (threadgroup q_t  *) (shmem_f16 + 0*T);
     threadgroup q4_t * sq4 = (threadgroup q4_t *) (shmem_f16 + 0*T);
-    threadgroup o_t  * so  = (threadgroup o_t  *) (shmem_f16 + 0*T + Q*DK);
-    threadgroup o4_t * so4 = (threadgroup o4_t *) (shmem_f16 + 0*T + Q*DK);
+    threadgroup o_t  * so  = (threadgroup o_t  *)
+        (shmem_f16 + Q*Q_STORAGE*DK);
+    threadgroup o4_t * so4 = (threadgroup o4_t *)
+        (shmem_f16 + Q*Q_STORAGE*DK);
     threadgroup s_t  * ss  = (threadgroup s_t  *) (shmem_f16 + Q*T);
     threadgroup s2_t * ss2 = (threadgroup s2_t *) (shmem_f16 + Q*T);
 
@@ -456,7 +469,12 @@ void kernel_flash_attn_ext_impl(
                 if (key_first > query_max) {
                     break;
                 }
-                blk_cur = key_end <= query_min + 1 ? 2 : 1;
+                // A partial final K/V block still needs its padding mask even
+                // when every real key is visible.  Treating it as fully
+                // unmasked admits the zero-padded rows into the denominator
+                // and shrinks the final query output.
+                blk_cur = key_end <= query_min + 1 && key_end - key_first == C
+                    ? 2 : 1;
             }
 
             if (FC_flash_attn_ext_has_kvpad && ic + C > args.ne11) {
@@ -963,8 +981,17 @@ kernel void kernel_flash_attn_ext(
     float,  float2,    simdgroup_float8x8, \
     float,  float4,    simdgroup_float8x8
 
+#define FA_NONVEC_TYPES_F32 \
+    float,  float4,    simdgroup_float8x8, \
+    float,  float4x4,  simdgroup_float8x8, \
+    float,  float4x4,  simdgroup_float8x8, \
+    float,             simdgroup_float8x8, \
+    float,  float2,    simdgroup_float8x8, \
+    float,  float4,    simdgroup_float8x8
+
 typedef decltype(kernel_flash_attn_ext<FA_NONVEC_TYPES, half4x4, 1, dequantize_f16, half4x4, 1, dequantize_f16, 512, 512>) flash_attn_ext_dk512_t;
 typedef decltype(kernel_flash_attn_ext<FA_NONVEC_TYPES, half4x4, 1, dequantize_f16, half4x4, 1, dequantize_f16, 256, 256>) flash_attn_ext_dk256_t;
+typedef decltype(kernel_flash_attn_ext<FA_NONVEC_TYPES_F32, float4x4, 1, dequantize_f32, float4x4, 1, dequantize_f32, 256, 256>) flash_attn_ext_f32_dk256_t;
 
 // Host-visible prefill FlashAttention variant for DS4's 512-wide F16 K/V rows.
 template [[host_name("kernel_flash_attn_ext_f16_dk512_dv512")]]
@@ -974,7 +1001,11 @@ kernel flash_attn_ext_dk512_t kernel_flash_attn_ext<FA_NONVEC_TYPES, half4x4, 1,
 template [[host_name("kernel_flash_attn_ext_f16_dk256_dv256")]]
 kernel flash_attn_ext_dk256_t kernel_flash_attn_ext<FA_NONVEC_TYPES, half4x4, 1, dequantize_f16, half4x4, 1, dequantize_f16, 256, 256>;
 
+template [[host_name("kernel_flash_attn_ext_f32_dk256_dv256")]]
+kernel flash_attn_ext_f32_dk256_t kernel_flash_attn_ext<FA_NONVEC_TYPES_F32, float4x4, 1, dequantize_f32, float4x4, 1, dequantize_f32, 256, 256>;
+
 #undef FA_NONVEC_TYPES
+#undef FA_NONVEC_TYPES_F32
 
 constant bool FC_flash_attn_ext_vec_has_mask  [[function_constant(FC_FLASH_ATTN_EXT_VEC + 0)]];
 constant bool FC_flash_attn_ext_vec_has_sinks [[function_constant(FC_FLASH_ATTN_EXT_VEC + 1)]];

@@ -754,6 +754,107 @@ static bool test_metal_qwen35_close(
     return ok;
 }
 
+static void test_metal_tensor_copy_pair(void) {
+    enum {
+        TENSOR_BYTES = 96,
+        COPY0_SRC_OFFSET = 7,
+        COPY0_DST_OFFSET = 13,
+        COPY0_BYTES = 29,
+        COPY1_SRC_OFFSET = 19,
+        COPY1_DST_OFFSET = 47,
+        COPY1_BYTES = 31,
+    };
+    uint8_t src0_host[TENSOR_BYTES];
+    uint8_t src1_host[TENSOR_BYTES];
+    uint8_t sentinel[TENSOR_BYTES];
+    uint8_t pair0_host[TENSOR_BYTES];
+    uint8_t pair1_host[TENSOR_BYTES];
+    uint8_t ref0_host[TENSOR_BYTES];
+    uint8_t ref1_host[TENSOR_BYTES];
+    for (size_t i = 0; i < TENSOR_BYTES; i++) {
+        src0_host[i] = (uint8_t)(i * 17u + 3u);
+        src1_host[i] = (uint8_t)(i * 29u + 11u);
+        sentinel[i] = (uint8_t)(0xa5u ^ (uint8_t)i);
+    }
+
+    ds4_gpu_tensor *src0 = ds4_gpu_tensor_alloc(TENSOR_BYTES);
+    ds4_gpu_tensor *src1 = ds4_gpu_tensor_alloc(TENSOR_BYTES);
+    ds4_gpu_tensor *pair0 = ds4_gpu_tensor_alloc(TENSOR_BYTES);
+    ds4_gpu_tensor *pair1 = ds4_gpu_tensor_alloc(TENSOR_BYTES);
+    ds4_gpu_tensor *ref0 = ds4_gpu_tensor_alloc(TENSOR_BYTES);
+    ds4_gpu_tensor *ref1 = ds4_gpu_tensor_alloc(TENSOR_BYTES);
+    bool ok = src0 && src1 && pair0 && pair1 && ref0 && ref1;
+    TEST_ASSERT(ok);
+    if (ok) {
+        ok = ds4_gpu_tensor_write(src0, 0, src0_host, TENSOR_BYTES) != 0 &&
+             ds4_gpu_tensor_write(src1, 0, src1_host, TENSOR_BYTES) != 0 &&
+             ds4_gpu_tensor_write(pair0, 0, sentinel, TENSOR_BYTES) != 0 &&
+             ds4_gpu_tensor_write(pair1, 0, sentinel, TENSOR_BYTES) != 0 &&
+             ds4_gpu_tensor_write(ref0, 0, sentinel, TENSOR_BYTES) != 0 &&
+             ds4_gpu_tensor_write(ref1, 0, sentinel, TENSOR_BYTES) != 0;
+        TEST_ASSERT(ok);
+    }
+
+    /* The pair must be byte-identical to the existing exact copy primitive. */
+    if (ok) {
+        ok = ds4_gpu_begin_commands() != 0 &&
+             ds4_gpu_tensor_copy(ref0, COPY0_DST_OFFSET,
+                                 src0, COPY0_SRC_OFFSET, COPY0_BYTES) != 0 &&
+             ds4_gpu_tensor_copy(ref1, COPY1_DST_OFFSET,
+                                 src1, COPY1_SRC_OFFSET, COPY1_BYTES) != 0 &&
+             ds4_gpu_end_commands() != 0;
+        TEST_ASSERT(ok);
+    }
+    if (ok) {
+        ok = ds4_gpu_begin_commands() != 0 &&
+             ds4_gpu_tensor_copy_pair(
+                 pair0, COPY0_DST_OFFSET, src0, COPY0_SRC_OFFSET, COPY0_BYTES,
+                 pair1, COPY1_DST_OFFSET, src1, COPY1_SRC_OFFSET, COPY1_BYTES) != 0 &&
+             ds4_gpu_end_commands() != 0;
+        TEST_ASSERT(ok);
+    }
+    if (ok) {
+        ok = ds4_gpu_tensor_read(pair0, 0, pair0_host, TENSOR_BYTES) != 0 &&
+             ds4_gpu_tensor_read(pair1, 0, pair1_host, TENSOR_BYTES) != 0 &&
+             ds4_gpu_tensor_read(ref0, 0, ref0_host, TENSOR_BYTES) != 0 &&
+             ds4_gpu_tensor_read(ref1, 0, ref1_host, TENSOR_BYTES) != 0 &&
+             memcmp(pair0_host, ref0_host, TENSOR_BYTES) == 0 &&
+             memcmp(pair1_host, ref1_host, TENSOR_BYTES) == 0;
+        TEST_ASSERT(ok);
+    }
+
+    /* An invalid second range rejects the whole operation before the valid
+     * first copy is encoded. */
+    if (ok) {
+        ok = ds4_gpu_tensor_write(pair0, 0, sentinel, TENSOR_BYTES) != 0 &&
+             ds4_gpu_tensor_write(pair1, 0, sentinel, TENSOR_BYTES) != 0 &&
+             ds4_gpu_begin_commands() != 0;
+        TEST_ASSERT(ok);
+    }
+    if (ok) {
+        TEST_ASSERT(ds4_gpu_tensor_copy_pair(
+            pair0, COPY0_DST_OFFSET, src0, COPY0_SRC_OFFSET, COPY0_BYTES,
+            pair1, TENSOR_BYTES - 3u, src1, COPY1_SRC_OFFSET,
+            COPY1_BYTES) == 0);
+        ok = ds4_gpu_end_commands() != 0;
+        TEST_ASSERT(ok);
+    }
+    if (ok) {
+        ok = ds4_gpu_tensor_read(pair0, 0, pair0_host, TENSOR_BYTES) != 0 &&
+             ds4_gpu_tensor_read(pair1, 0, pair1_host, TENSOR_BYTES) != 0 &&
+             memcmp(pair0_host, sentinel, TENSOR_BYTES) == 0 &&
+             memcmp(pair1_host, sentinel, TENSOR_BYTES) == 0;
+        TEST_ASSERT(ok);
+    }
+
+    ds4_gpu_tensor_free(src0);
+    ds4_gpu_tensor_free(src1);
+    ds4_gpu_tensor_free(pair0);
+    ds4_gpu_tensor_free(pair1);
+    ds4_gpu_tensor_free(ref0);
+    ds4_gpu_tensor_free(ref1);
+}
+
 /* Private ds4.c hooks: intentionally absent from ds4.h so this allocation
  * scaffold cannot become an engine/session API before the executor exists. */
 extern size_t ds4_internal_qwen35_gpu_graph_size(void);
@@ -1910,20 +2011,15 @@ static void test_metal_qwen35_primitives(void) {
             ds4_gpu_tensor *out_gpu =
                 test_metal_tensor_from_f32(zero, QUERY_N);
             if (query_gpu && key_gpu && value_gpu && out_gpu) {
-                char *saved = test_save_env(
-                    "DS4_METAL_DISABLE_QWEN_FLASH_PREFILL");
                 bool have_legacy = false;
                 bool have_resident = false;
                 bool have_ssd = false;
                 int reuse_used = -1;
 
                 ds4_gpu_set_ssd_streaming(false);
-                setenv("DS4_METAL_DISABLE_QWEN_FLASH_PREFILL", "1", 1);
-                TEST_ASSERT(ds4_gpu_qwen35_gqa_prefill_select_tensor(
+                TEST_ASSERT(ds4_gpu_qwen35_gqa_prefill_tensor(
                     out_gpu, query_gpu, key_gpu, value_gpu,
-                    POSITION0, N_TOKEN, N_QUERY_HEAD, N_KV_HEAD, HEAD_DIM,
-                    0, &reuse_used));
-                TEST_ASSERT(reuse_used == 0);
+                    POSITION0, N_TOKEN, N_QUERY_HEAD, N_KV_HEAD, HEAD_DIM));
                 have_legacy = test_metal_read_f32(
                     out_gpu, legacy, QUERY_N);
                 if (have_legacy) {
@@ -1932,13 +2028,26 @@ static void test_metal_qwen35_primitives(void) {
                         legacy, expected, QUERY_N, 2.0e-4f, 2.0e-4f);
                 }
 
-                unsetenv("DS4_METAL_DISABLE_QWEN_FLASH_PREFILL");
+                /* request_reuse is policy, not a hint: disabling it must
+                 * select the independently callable legacy/oracle kernel. */
                 reuse_used = -1;
                 TEST_ASSERT(ds4_gpu_qwen35_gqa_prefill_select_tensor(
                     out_gpu, query_gpu, key_gpu, value_gpu,
                     POSITION0, N_TOKEN, N_QUERY_HEAD, N_KV_HEAD, HEAD_DIM,
                     0, &reuse_used));
-                TEST_ASSERT(reuse_used == 1);
+                TEST_ASSERT(reuse_used == DS4_GPU_QWEN35_GQA_PATH_LEGACY);
+                if (have_legacy &&
+                    test_metal_read_f32(out_gpu, ssd, QUERY_N)) {
+                    TEST_ASSERT(memcmp(legacy, ssd,
+                                       sizeof(*legacy) * QUERY_N) == 0);
+                }
+
+                reuse_used = -1;
+                TEST_ASSERT(ds4_gpu_qwen35_gqa_prefill_select_tensor(
+                    out_gpu, query_gpu, key_gpu, value_gpu,
+                    POSITION0, N_TOKEN, N_QUERY_HEAD, N_KV_HEAD, HEAD_DIM,
+                    1, &reuse_used));
+                TEST_ASSERT(reuse_used == DS4_GPU_QWEN35_GQA_PATH_FLASH_F32);
                 have_resident = test_metal_read_f32(
                     out_gpu, resident, QUERY_N);
 
@@ -1947,22 +2056,20 @@ static void test_metal_qwen35_primitives(void) {
                 TEST_ASSERT(ds4_gpu_qwen35_gqa_prefill_select_tensor(
                     out_gpu, query_gpu, key_gpu, value_gpu,
                     POSITION0, N_TOKEN, N_QUERY_HEAD, N_KV_HEAD, HEAD_DIM,
-                    0, &reuse_used));
-                TEST_ASSERT(reuse_used == 1);
+                    1, &reuse_used));
+                TEST_ASSERT(reuse_used == DS4_GPU_QWEN35_GQA_PATH_FLASH_F32);
                 have_ssd = test_metal_read_f32(out_gpu, ssd, QUERY_N);
 
                 if (have_legacy && have_resident) {
                     test_metal_qwen35_close(
-                        "Qwen implicit-causal resident FlashAttention",
-                        resident, legacy, QUERY_N, 3.0e-3f, 3.0e-3f);
+                        "Qwen direct-F32 implicit-causal FlashAttention",
+                        resident, legacy, QUERY_N, 2.0e-6f, 2.0e-6f);
                 }
                 if (have_resident && have_ssd) {
                     TEST_ASSERT(memcmp(resident, ssd,
                                        sizeof(*resident) * QUERY_N) == 0);
                 }
                 ds4_gpu_set_ssd_streaming(false);
-                test_restore_env(
-                    "DS4_METAL_DISABLE_QWEN_FLASH_PREFILL", saved);
             }
             ds4_gpu_tensor_free(query_gpu);
             ds4_gpu_tensor_free(key_gpu);
@@ -1977,6 +2084,81 @@ static void test_metal_qwen35_primitives(void) {
         free(legacy);
         free(resident);
         free(ssd);
+        free(zero);
+    }
+
+    /* Adversarial 64-key boundaries.  With Q=K=0 and V=1 the exact causal
+     * result is one in every lane.  This catches a partial-tail block being
+     * included in the online-softmax denominator more than once: the old bug
+     * produced a visibly sub-unit result at 65/70/129 keys. */
+    {
+        enum {
+            N_QUERY_HEAD = 16,
+            N_KV_HEAD = 2,
+            HEAD_DIM = 256,
+            QUERY_N = N_QUERY_HEAD * HEAD_DIM,
+            CACHE_ROW_N = N_KV_HEAD * HEAD_DIM,
+            MAX_N_KV = 129,
+            CACHE_N = MAX_N_KV * CACHE_ROW_N,
+        };
+        static const uint32_t n_kv_cases[] = {
+            63u, 64u, 65u, 70u, 127u, 128u, 129u,
+        };
+        float *query = calloc((size_t)QUERY_N, sizeof(*query));
+        float *key = calloc((size_t)CACHE_N, sizeof(*key));
+        float *value = malloc((size_t)CACHE_N * sizeof(*value));
+        float *expected = malloc((size_t)QUERY_N * sizeof(*expected));
+        float *actual = malloc((size_t)QUERY_N * sizeof(*actual));
+        float *zero = calloc((size_t)QUERY_N, sizeof(*zero));
+        TEST_ASSERT(query && key && value && expected && actual && zero);
+        if (query && key && value && expected && actual && zero) {
+            for (size_t i = 0; i < CACHE_N; i++) value[i] = 1.0f;
+            for (size_t i = 0; i < QUERY_N; i++) expected[i] = 1.0f;
+
+            ds4_gpu_tensor *query_gpu =
+                test_metal_tensor_from_f32(query, QUERY_N);
+            ds4_gpu_tensor *key_gpu =
+                test_metal_tensor_from_f32(key, CACHE_N);
+            ds4_gpu_tensor *value_gpu =
+                test_metal_tensor_from_f32(value, CACHE_N);
+            ds4_gpu_tensor *out_gpu =
+                test_metal_tensor_from_f32(zero, QUERY_N);
+            if (query_gpu && key_gpu && value_gpu && out_gpu) {
+                ds4_gpu_set_ssd_streaming(false);
+                for (size_t c = 0;
+                     c < sizeof(n_kv_cases) / sizeof(n_kv_cases[0]); c++) {
+                    const uint32_t n_kv = n_kv_cases[c];
+                    int reuse_used = -1;
+                    TEST_ASSERT(ds4_gpu_qwen35_gqa_prefill_select_tensor(
+                        out_gpu, query_gpu, key_gpu, value_gpu,
+                        n_kv - 1u, 1u,
+                        N_QUERY_HEAD, N_KV_HEAD, HEAD_DIM,
+                        1, &reuse_used));
+                    if (n_kv >= 64u) {
+                        TEST_ASSERT(
+                            reuse_used == DS4_GPU_QWEN35_GQA_PATH_FLASH_F32);
+                    } else {
+                        TEST_ASSERT(
+                            reuse_used != DS4_GPU_QWEN35_GQA_PATH_FLASH_F32);
+                    }
+                    if (test_metal_read_f32(out_gpu, actual, QUERY_N)) {
+                        test_metal_qwen35_close(
+                            "Qwen direct-F32 FlashAttention 64-key tail",
+                            actual, expected, QUERY_N, 2.0e-6f, 2.0e-6f);
+                    }
+                }
+                ds4_gpu_set_ssd_streaming(false);
+            }
+            ds4_gpu_tensor_free(query_gpu);
+            ds4_gpu_tensor_free(key_gpu);
+            ds4_gpu_tensor_free(value_gpu);
+            ds4_gpu_tensor_free(out_gpu);
+        }
+        free(query);
+        free(key);
+        free(value);
+        free(expected);
+        free(actual);
         free(zero);
     }
 
@@ -3338,6 +3520,7 @@ static void test_metal_q4_selected_slots_runtime_count(void) {
 #endif
 
 static void test_metal_kernel_group(void) {
+    test_metal_tensor_copy_pair();
     test_metal_qwen35_graph_state();
     test_metal_f16_matvec_fast_nr0_4();
     test_metal_f16_prefill_matmul();

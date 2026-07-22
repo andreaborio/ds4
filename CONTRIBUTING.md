@@ -241,6 +241,18 @@ Performance comparisons must also follow these rules:
 - Evaluate adaptive choices per hardware/context lane. A candidate may be
   selected only in lanes where it wins; preserve an exact fallback for the
   other lanes until the default policy is proven there.
+- A candidate that provably removes at least 40% of a bounded runtime resource
+  (for example transferred bytes, storage reads, allocations, syscalls, or
+  encoder creation) may be promoted even when its throughput effect is within
+  measurement noise.  This resource-efficiency rule applies only when output
+  remains exact, no safety or swap regression appears, and every retained
+  end-to-end inference throughput and latency metric (prefill/decode
+  throughput, phase wall, TTFT, and TPOT) regresses by less than 2.0% in each
+  qualified lane.  Resource-specific timing remains mandatory telemetry but is
+  not itself this end-to-end threshold unless it is the optimization target.
+  The rule does not waive the context matrix or permit averaging tiers to hide
+  a larger regression; record both the structural/resource reduction and the
+  complete per-tier performance table.
 - Measure optimizations incrementally and then measure the final combined
   stack against the original baseline. Interactions can create or erase a win;
   do not add percentages from isolated experiments to predict the stack.

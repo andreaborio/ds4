@@ -14715,15 +14715,12 @@ typedef enum {
     ((uint64_t)QWEN35_FULL_ATTENTION_LAYER_COUNT * 2u * \
          QWEN35_N_HEAD_KV * QWEN35_N_HEAD_DIM * sizeof(float) + \
      sizeof(float))
-/* Qwen FlashAttention preserves the F32 persistent KV cache and stages one
- * live F16 K/V frontier shared by all full-attention layers.  Its peak is
- * linear in context; the final partial 64-key tile needs one bounded pair of
- * sparse head-major pad regions. */
-#define QWEN35_FLASH_PREFILL_BYTES_PER_TOKEN \
-    ((uint64_t)2u * QWEN35_N_HEAD_KV * QWEN35_N_HEAD_DIM * sizeof(uint16_t))
+/* Direct-F32 Qwen FlashAttention reads the persistent KV cache in place.  Its
+ * only global auxiliary allocation is the bounded pair of sparse head-major
+ * regions used for the final partial 64-key tile. */
 #define QWEN35_FLASH_PREFILL_PAD_BYTES \
     ((uint64_t)2u * QWEN35_N_HEAD_KV * QWEN35_N_HEAD_KV * \
-     QWEN35_N_HEAD_DIM * 64u * sizeof(uint16_t))
+     QWEN35_N_HEAD_DIM * 64u * sizeof(float))
 #define QWEN35_HOST_LOGITS_BYTES \
     ((uint64_t)QWEN35_N_VOCAB * sizeof(float))
 #define QWEN35_RECURRENT_SNAPSHOT_BYTES \
@@ -14766,13 +14763,15 @@ static bool qwen35_u64_mul(uint64_t a, uint64_t b, uint64_t *out) {
 
 static bool qwen35_metal_persistent_runtime_bytes(
         uint32_t  context_tokens,
+        uint32_t  prefill_cap,
         uint64_t *bytes_out) {
     uint64_t context_bytes = 0;
     uint64_t batch_bytes = 0;
-    uint64_t flash_bytes = 0;
     uint64_t total = QWEN35_METAL_GRAPH_NON_BATCH_BYTES;
     return context_tokens != 0 && context_tokens <= QWEN35_CONTEXT_LENGTH &&
-           qwen35_u64_mul(QWEN35_RESIDENT_PREFILL_TOKENS,
+           prefill_cap != 0 &&
+           prefill_cap <= QWEN35_RESIDENT_PREFILL_TOKENS &&
+           qwen35_u64_mul(prefill_cap,
                           QWEN35_METAL_GRAPH_BATCH_BYTES_PER_TOKEN,
                           &batch_bytes) &&
            qwen35_u64_add(total, batch_bytes, &total) &&
@@ -14780,10 +14779,6 @@ static bool qwen35_metal_persistent_runtime_bytes(
                           QWEN35_METAL_GRAPH_CONTEXT_BYTES_PER_TOKEN,
                           &context_bytes) &&
            qwen35_u64_add(total, context_bytes, &total) &&
-           qwen35_u64_mul(context_tokens,
-                          QWEN35_FLASH_PREFILL_BYTES_PER_TOKEN,
-                          &flash_bytes) &&
-           qwen35_u64_add(total, flash_bytes, &total) &&
            qwen35_u64_add(total, QWEN35_FLASH_PREFILL_PAD_BYTES, &total) &&
            qwen35_u64_add(total, QWEN35_HOST_LOGITS_BYTES, &total) &&
            (*bytes_out = total, true);
@@ -16362,18 +16357,11 @@ static bool qwen35_gpu_encode_full_attention_one(
     const uint64_t cache_row_offset = (uint64_t)position * cache_row_bytes;
     if (ok) {
         *state_mutated = true;
-        ok = ds4_gpu_tensor_copy(
-                 graph->full_attn_key[layer_index],
-                 cache_row_offset,
-                 graph->key,
-                 0,
-                 cache_row_bytes) != 0 &&
-             ds4_gpu_tensor_copy(
-                 graph->full_attn_value[layer_index],
-                 cache_row_offset,
-                 graph->value,
-                 0,
-                 cache_row_bytes) != 0;
+        ok = ds4_gpu_tensor_copy_pair(
+                 graph->full_attn_key[layer_index], cache_row_offset,
+                 graph->key, 0, cache_row_bytes,
+                 graph->full_attn_value[layer_index], cache_row_offset,
+                 graph->value, 0, cache_row_bytes) != 0;
     }
     QWEN35_PROFILE_ATTN_STAGE("kv_cache");
     int gqa_reuse_used = 0;
@@ -16893,18 +16881,11 @@ static bool qwen35_gpu_encode_full_attention_batch(
     const uint64_t cache_bytes = (uint64_t)n_token * cache_row_bytes;
     if (ok) {
         *state_mutated = true;
-        ok = ds4_gpu_tensor_copy(
-                 graph->full_attn_key[layer_index],
-                 cache_offset,
-                 graph->batch_key,
-                 0,
-                 cache_bytes) != 0 &&
-             ds4_gpu_tensor_copy(
-                 graph->full_attn_value[layer_index],
-                 cache_offset,
-                 graph->batch_value,
-                 0,
-                 cache_bytes) != 0;
+        ok = ds4_gpu_tensor_copy_pair(
+                 graph->full_attn_key[layer_index], cache_offset,
+                 graph->batch_key, 0, cache_bytes,
+                 graph->full_attn_value[layer_index], cache_offset,
+                 graph->batch_value, 0, cache_bytes) != 0;
     }
     int gqa_reuse_used = 0;
     if (ok) {
@@ -38186,9 +38167,16 @@ static bool ds4_engine_context_memory_estimate_private(
     if ((uint32_t)ctx_size > QWEN35_CONTEXT_LENGTH) return false;
 
     if (e->backend == DS4_BACKEND_METAL) {
+        const bool ssd_runtime =
+            e->residency_requested == DS4_RESIDENCY_SSD ||
+            e->residency == DS4_RESIDENCY_SSD ||
+            e->residency_plan.resolved == DS4_RESIDENCY_SSD;
+        const uint32_t prefill_cap = ssd_runtime
+            ? QWEN35_PREFILL_MICRO_TOKENS
+            : QWEN35_RESIDENT_PREFILL_TOKENS;
         uint64_t persistent_bytes = 0;
         if (!qwen35_metal_persistent_runtime_bytes(
-                (uint32_t)ctx_size, &persistent_bytes)) {
+                (uint32_t)ctx_size, prefill_cap, &persistent_bytes)) {
             return false;
         }
         *out = (ds4_context_memory){
@@ -38202,7 +38190,7 @@ static bool ds4_engine_context_memory_estimate_private(
                  QWEN35_N_HEAD_KV * QWEN35_N_HEAD_DIM * sizeof(float) *
                  (uint32_t)ctx_size) - QWEN35_RECURRENT_SNAPSHOT_BYTES,
             .total_bytes = persistent_bytes,
-            .prefill_cap = QWEN35_RESIDENT_PREFILL_TOKENS,
+            .prefill_cap = prefill_cap,
             .raw_cap = (uint32_t)ctx_size,
         };
         return true;
@@ -38229,6 +38217,25 @@ static bool ds4_engine_context_memory_estimate_private(
 }
 
 #include "runtime/ds4_qwen_memory_policy.inc"
+
+static bool qwen35_metal_residency_plan_rebase_runtime(
+        ds4_residency_plan *plan,
+        uint32_t            context_tokens,
+        uint32_t            prefill_cap) {
+    if (!plan) return false;
+
+    uint64_t runtime_bytes = 0;
+    uint64_t required_bytes = 0;
+    return qwen35_metal_persistent_runtime_bytes(
+               context_tokens, prefill_cap, &runtime_bytes) &&
+           qwen35_u64_add(plan->model_bytes, runtime_bytes,
+                          &required_bytes) &&
+           qwen35_u64_add(required_bytes, plan->headroom_bytes,
+                          &required_bytes) &&
+           (plan->runtime_bytes = runtime_bytes,
+            plan->required_bytes = required_bytes,
+            true);
+}
 
 static bool ds4_engine_resolve_residency(ds4_engine               *e,
                                          const ds4_engine_options *opt) {
@@ -38417,22 +38424,21 @@ static bool ds4_engine_resolve_residency(ds4_engine               *e,
         }
     }
 #endif
-    if (qwen_resident_decode_workspace_charged &&
+    if (e->backend == DS4_BACKEND_METAL &&
+        e->model.family == DS4_MODEL_FAMILY_QWEN35_MOE &&
         e->residency_plan.resolved == DS4_RESIDENCY_SSD) {
-        /* The SSD planner reserves this workspace in decode_peak and must not
-         * lose an expert-cache tier to a duplicate provisional charge. */
-        if (e->residency_plan.runtime_bytes <
-                qwen_resident_decode_workspace ||
-            e->residency_plan.required_bytes <
-                qwen_resident_decode_workspace) {
+        /* AUTO is intentionally admitted against the 8K resident graph. Once
+         * either fixed-budget or live-pressure policy resolves SSD, replace
+         * that provisional peak with the graph actually allocated by the SSD
+         * session. The phase planner adds the prompt-verifier workspace to
+         * its prefill/decode peaks, so it must not remain in this base twice. */
+        if (!qwen35_metal_residency_plan_rebase_runtime(
+                &e->residency_plan, context_size,
+                QWEN35_PREFILL_MICRO_TOKENS)) {
             fprintf(stderr,
-                    "ds4: invalid Qwen resident-workspace accounting\n");
+                    "ds4: could not rebase Qwen SSD runtime accounting\n");
             return false;
         }
-        e->residency_plan.runtime_bytes -=
-            qwen_resident_decode_workspace;
-        e->residency_plan.required_bytes -=
-            qwen_resident_decode_workspace;
         qwen_resident_decode_workspace_charged = false;
     }
     e->qwen35_decode_workspace_bytes =

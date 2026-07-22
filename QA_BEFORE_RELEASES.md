@@ -30,7 +30,7 @@ target, or an artifact whose complete output hash is missing.
 | `DEEPSEEK_V2` | `DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix-DS4-ExpertMajor-v2.gguf`; 86,720,114,272 bytes; SHA-256 `8378080263eb9224f7228d72e2afa4ac3cf74a116023fdec2c596ff228a33e3f` |
 | `DEEPSEEK_MIXED_V2` | Non-applicable until a mixed-quant DeepSeek ExpertMajor v2 artifact has a publication record with exact filename, bytes, and complete output SHA-256; do not resolve or use this variable before qualification |
 | `GLM_V2` | `GLM-5.2-DS4-ExpertMajor-v2-Q2_K.gguf`; 262,147,193,504 bytes; SHA-256 `7f5017e3076e706c78f2a5322b035a9e2f6519c65ff5b6be8b2d91aeff61505d` |
-| `QWEN_V2` | `Qwen3.6-35B-A3B-DS4-ExpertMajor-v2-Q4_K_S.gguf`; 20,808,566,880 bytes; SHA-256 `d7c43a6388ec20e6fe5530850350f96fdb0ac37c5ce36d3e5f92b172c447f56b` |
+| `QWEN_V2` | `Qwen3.6-35B-A3B-DS4-ExpertMajor-v2-MLX-Affine4-G64.gguf`; 20,808,566,880 bytes; SHA-256 `dd17266185833a9f05531ce366fd7284ddca1ed64aa3dcf06e321e8c72c9ea3d` |
 
 Record the test machine by hardware model, unified memory, OS build, and power
 state in the release evidence. Do not encode local hostnames, addresses, or
