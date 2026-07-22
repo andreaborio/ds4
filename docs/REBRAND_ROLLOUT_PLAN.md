@@ -27,7 +27,7 @@ stable naming boundary remains in
 
 | Surface | Canonical work | State | Immediate constraint |
 | --- | --- | --- | --- |
-| Engine | `andreaborio/ds4`, branch `codex/hebrus-phase-0` | Clean; 36 commits ahead and 3 commits behind `origin/main`; brand-boundary audit green | Reconcile the three Qwen Metal/SSD commits from `main` before any release or rename |
+| Engine | `andreaborio/ds4`, branch `codex/hebrus-phase-0` | Rebased on current `origin/main`; 39 commits ahead and 0 behind; complete model-free premerge gate green | Publish the integration branch for review; model-backed release lanes remain required before release |
 | Studio | `andreaborio/dsbox`, branch `codex/hebrus-engine-bridge` plus two newer `main` brand commits | Bridge is pushed and the `0.4.0-dev.1` prerelease exists; branch is 13 commits ahead and 2 behind `main` | Rebuild the bridge on current `main` and clear all CI failures |
 | Website | `andreaborio/hebrus-site`, `main` | Published on GitHub Pages; Pages workflow green | Final logo, canonical post-rename links, and final signed download remain pending |
 | Model Hub | Three consolidated `andreaborio/*-DS4-GGUF` repositories | Immutable qualified revisions are consumed by Studio and engine release contracts | Add dual repository-ID compatibility before moving any Hugging Face repository |
