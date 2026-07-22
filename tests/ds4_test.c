@@ -1864,12 +1864,16 @@ static void test_metal_qwen35_primitives(void) {
         float *query = malloc((size_t)QUERY_N * sizeof(*query));
         float *key = malloc((size_t)CACHE_N * sizeof(*key));
         float *value = malloc((size_t)CACHE_N * sizeof(*value));
+        float *expected = malloc((size_t)QUERY_N * sizeof(*expected));
+        float *score = malloc((size_t)N_KV * sizeof(*score));
         float *legacy = malloc((size_t)QUERY_N * sizeof(*legacy));
         float *resident = malloc((size_t)QUERY_N * sizeof(*resident));
         float *ssd = malloc((size_t)QUERY_N * sizeof(*ssd));
         float *zero = calloc((size_t)QUERY_N, sizeof(*zero));
-        TEST_ASSERT(query && key && value && legacy && resident && ssd && zero);
-        if (query && key && value && legacy && resident && ssd && zero) {
+        TEST_ASSERT(query && key && value && expected && score && legacy &&
+                    resident && ssd && zero);
+        if (query && key && value && expected && score && legacy && resident &&
+            ssd && zero) {
             for (size_t i = 0; i < QUERY_N; i++) {
                 query[i] = 0.17f * sinf((float)(i + 1u) * 0.0031f) -
                            0.06f * cosf((float)(i + 9u) * 0.0047f);
@@ -1882,6 +1886,19 @@ static void test_metal_qwen35_primitives(void) {
                     value[at] = 0.33f * sinf((float)(at + 5u) * 0.0037f) -
                                 0.08f * cosf((float)(at + 11u) * 0.0021f);
                 }
+            }
+            for (size_t token = 0; token < N_TOKEN; token++) {
+                TEST_ASSERT(ds4_qwen35_cpu_gqa_decode_f32(
+                    expected + token * QUERY_ROW_N,
+                    score,
+                    POSITION0 + token + 1u,
+                    query + token * QUERY_ROW_N,
+                    key,
+                    value,
+                    POSITION0 + token + 1u,
+                    N_QUERY_HEAD,
+                    N_KV_HEAD,
+                    HEAD_DIM));
             }
 
             ds4_gpu_tensor *query_gpu =
@@ -1909,6 +1926,11 @@ static void test_metal_qwen35_primitives(void) {
                 TEST_ASSERT(reuse_used == 0);
                 have_legacy = test_metal_read_f32(
                     out_gpu, legacy, QUERY_N);
+                if (have_legacy) {
+                    test_metal_qwen35_close(
+                        "Qwen production-geometry F32 prefill",
+                        legacy, expected, QUERY_N, 2.0e-4f, 2.0e-4f);
+                }
 
                 unsetenv("DS4_METAL_DISABLE_QWEN_FLASH_PREFILL");
                 reuse_used = -1;
@@ -1950,6 +1972,8 @@ static void test_metal_qwen35_primitives(void) {
         free(query);
         free(key);
         free(value);
+        free(expected);
+        free(score);
         free(legacy);
         free(resident);
         free(ssd);
