@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="https://raw.githubusercontent.com/andreaborio/hebrus-site/main/public/og.png" width="900" alt="Hebrus Studio — Metal first. SSD when memory ends.">
+  <img src="docs/media/hebrus-typographic.png" width="900" alt="Hebrus Studio — Metal first. SSD when memory ends.">
 </p>
 
 # Hebrus
