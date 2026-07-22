@@ -8,13 +8,13 @@ Run each retained frontier in a separate process. For example:
 
 ```
 for frontier in 128 2048 8192 32768; do
-  ./ds4-bench \
-    -m /absolute/path/to/QUALIFIED-DS4-ExpertMajor-v2.gguf \
+  ./hebrus-bench \
+    -m /absolute/path/to/qualified-model.gguf \
     --prompt-file speed-bench/promessi_sposi.txt \
     --ctx-start "$frontier" --ctx-max "$frontier" \
     --ctx-alloc 65536 --gen-tokens 128 \
-    --csv "/tmp/ds4-$frontier.csv" \
-    --dump-decode-evidence-dir "/tmp/ds4-$frontier-evidence"
+    --csv "/tmp/hebrus-$frontier.csv" \
+    --dump-decode-evidence-dir "/tmp/hebrus-$frontier-evidence"
 done
 ```
 
@@ -27,7 +27,7 @@ and 100,000-token lanes defined in `CONTRIBUTING.md`.
 On the qualified M5 lane, `run_m5_dsflash_arm.sh` extends an undersized prompt
 deterministically for frontiers above 32,768 tokens. The generated prompt, its
 source, both SHA-256 values, and whether extension occurred are recorded beside
-the run. `ds4-bench` still verifies the actual model-specific token count and
+the run. `hebrus-bench` still verifies the actual model-specific token count and
 fails closed if the prompt is too short.
 
 Provide PR including your numbers if your hardware was not already tested.

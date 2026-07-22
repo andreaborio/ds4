@@ -78,7 +78,7 @@
     <tspan x="364" dy="29">• index routed-expert</tspan>
     <tspan x="378" dy="20">records before inference</tspan>
   </text>
-  <text class="code" x="364" y="383">ds4.expert_major.v2</text>
+  <text class="code" x="364" y="383">ExpertMajor v2</text>
 
   <rect class="stage stage-policy" x="640" y="145" width="256" height="266" rx="16"/>
   <circle class="step" cx="668" cy="172" r="14"/>

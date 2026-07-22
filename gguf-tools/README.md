@@ -1,19 +1,19 @@
-# DS4 GGUF Tools
+# Hebrus GGUF Tools
 
 This directory contains the offline tools used to build and evaluate the
-DeepSeek V4, GLM 5.2, and Qwen3.6 GGUF files supported by `ds4`.
+DeepSeek V4, GLM 5.2, and Qwen3.6 GGUF files supported by Hebrus.
 
 The important pieces are:
 
 - `deepseek4-quantize.c`: C HF-safetensors to GGUF quantizer.
 - `quants.[ch]`: the deliberately small local quantization implementation used
-  by the quantizer.  It implements the DS4 output formats we actually ship:
+  by the quantizer. It implements the Hebrus output formats we actually ship:
   `q8_0`, `q4_K`, `q2_K`, and `iq2_xxs`.
 - `ds4-expert-major.py`: deterministic canonical-to-native layout converter
   and byte-level verifier for DeepSeek, GLM, and Qwen
   `ds4.expert_major.v2` GGUFs.
 - `imatrix/`: dataset and instructions for collecting routed-MoE activation
-  importance with `ds4`.
+  importance with Hebrus.
 - `quality-testing/`: prompts and scripts used to compare local GGUF variants
   against official DeepSeek V4 Flash continuations.
 
@@ -27,7 +27,7 @@ The quantizer is plain C and does not link GGML.  GGUF metadata handling,
 safetensors loading, FP4/FP8 dequantization, and the quantizers used by our Q2
 and Q4 recipes live in this directory.
 
-## Build a DS4-native ExpertMajor v2 GGUF
+## Build a Hebrus ExpertMajor v2 GGUF
 
 Reorder an already qualified DeepSeek, GLM, or Qwen GGUF without changing
 quantization:
@@ -60,7 +60,7 @@ filesystem.
 Run a completed artifact without conversion flags:
 
 ```sh
-./ds4 -m /absolute/path/to/MODEL-DS4-ExpertMajor-v2.gguf --ctx 8192
+./hebrus -m /absolute/path/to/MODEL-DS4-ExpertMajor-v2.gguf --ctx 8192
 ```
 
 ## Generate An Imatrix
@@ -71,22 +71,22 @@ First regenerate or inspect the calibration dataset:
 python3 gguf-tools/imatrix/dataset/build_ds4_imatrix_dataset.py
 ```
 
-Then collect activation statistics with the DS4 runtime:
+Then collect activation statistics with the Hebrus runtime:
 
 ```sh
-./ds4 \
+./hebrus \
   -m gguf/DeepSeek-V4-Flash-Q4KExperts-F16HC-F16Compressor-F16Indexer-Q8Attn-Q8Shared-Q8Out-chat-v2.gguf \
   --imatrix-dataset gguf-tools/imatrix/dataset/rendered_prompts.txt \
   --imatrix-out gguf/DeepSeek-V4-Flash-chat-v2-routed-moe-ds4.dat \
   --ctx 32768
 ```
 
-The imatrix file is useful immediately with this DS4 quantizer.  Generic GGUF
-tools need DS4-specific tensor-name mapping and per-expert slicing before they
+The imatrix file is useful immediately with the Hebrus quantizer. Generic GGUF
+tools need Hebrus-specific tensor-name mapping and per-expert slicing before they
 can use it correctly.  The accepted imatrix format is the legacy llama.cpp
-binary `.dat` file emitted by `ds4 --imatrix-out`.
+binary `.dat` file emitted by `hebrus --imatrix-out`.
 
-Generating this `.dat` file locally is possible, but slow: it runs the DS4
+Generating this `.dat` file locally is possible, but slow: it runs the Hebrus
 prefill graph over the full calibration corpus and reads routed-MoE activation
 statistics back from the GPU.  The latest published imatrix-generated GGUF files
 are available in the antirez Hugging Face repository:
@@ -157,7 +157,7 @@ from the dequantized weight itself:
 importance[column] = sum(row[column]^2) over all rows
 ```
 
-This is a weight-energy heuristic.  It is not as good as measuring real DS4
+This is a weight-energy heuristic. It is not as good as measuring real Hebrus
 activations, but it gives the quantizer a stable column weighting and was good
 enough for the first working 2-bit GGUFs.
 
