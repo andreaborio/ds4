@@ -90,6 +90,10 @@ struct ds4_metal_args_flash_attn_ext {
     float    m1;
     int32_t  n_head_log2;
     float    logit_softcap;
+    // Zero preserves the generic external-mask ABI.  A positive value is the
+    // one-based absolute position of query row zero and enables an implicit
+    // causal mask without materializing [query][key] storage.
+    int32_t  causal_q_offset_plus_one;
 };
 
 struct ds4_metal_args_flash_attn_ext_vec {
@@ -368,7 +372,7 @@ void kernel_flash_attn_ext_impl(
         pm2[jj] = (device const half2 *) ((device const char *) mask + (iq1 + j)*args.nb31 + (iq2%args.ne32)*args.nb32 + (iq3%args.ne33)*args.nb33);
     }
 
-    {
+    if (args.causal_q_offset_plus_one == 0) {
         const int32_t nblk1 = ((args.ne01 + Q - 1)/Q);
         const int32_t nblk0 = ((args.ne11 + C - 1)/C);
 
@@ -435,6 +439,26 @@ void kernel_flash_attn_ext_impl(
                 break;
             }
 
+            char blk_cur = 1;
+            if (args.causal_q_offset_plus_one != 0) {
+                const int32_t query_offset =
+                    args.causal_q_offset_plus_one - 1;
+                const int32_t query_min = query_offset + iq1;
+                const int32_t query_last =
+                    min((int32_t)args.ne01 - 1, (int32_t)iq1 + Q - 1);
+                const int32_t query_max = query_offset + query_last;
+                const int32_t key_first = ic;
+                const int32_t key_end = min(ic + C, args.ne11);
+
+                // Key blocks are ordered.  Once an entire block is in the
+                // future, every later block is also invisible to this query
+                // tile and can be skipped without QK or V work.
+                if (key_first > query_max) {
+                    break;
+                }
+                blk_cur = key_end <= query_min + 1 ? 2 : 1;
+            }
+
             if (FC_flash_attn_ext_has_kvpad && ic + C > args.ne11) {
                 k    = pad;
                 v    = k + args.nb11*C*args.ne_12_2*args.ne_12_3;
@@ -471,8 +495,6 @@ void kernel_flash_attn_ext_impl(
 
                 ic = 0;
             }
-
-            char blk_cur = 1;
 
             if (FC_flash_attn_ext_has_mask) {
                 blk_cur = blk[ic0];
@@ -617,6 +639,26 @@ void kernel_flash_attn_ext_impl(
                     }
 
                     simdgroup_store(mqk, ss + 8*cc, SH, 0, false);
+                }
+            }
+
+            if (args.causal_q_offset_plus_one != 0 && blk_cur == 1) {
+                const int32_t query_offset =
+                    args.causal_q_offset_plus_one - 1;
+                const int32_t key0 = ic0*C + 2*(int32_t)tiisg;
+                FOR_UNROLL (short jj = 0; jj < NQ; ++jj) {
+                    const short j = jj*NSG + sgitg;
+                    const int32_t query_row = (int32_t)iq1 + j;
+                    const int32_t query_position = query_offset + query_row;
+                    const half m0 = query_row < args.ne01 &&
+                                            key0 < args.ne11 &&
+                                            key0 <= query_position
+                                        ? 0.0h : -MAXHALF;
+                    const half m1 = query_row < args.ne01 &&
+                                            key0 + 1 < args.ne11 &&
+                                            key0 + 1 <= query_position
+                                        ? 0.0h : -MAXHALF;
+                    sm2[j*SH + tiisg] = half2(m0, m1);
                 }
             }
 

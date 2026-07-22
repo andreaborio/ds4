@@ -1844,6 +1844,118 @@ static void test_metal_qwen35_primitives(void) {
         ds4_gpu_tensor_free(out_gpu);
     }
 
+    /* The production 256-wide FlashAttention path must preserve causal GQA
+     * semantics across a non-zero prefix and a partial 64-key tail.  Resident
+     * and SSD modes intentionally select the same kernel; the legacy F32 path
+     * remains an independently selected numerical control. */
+    {
+        enum {
+            POSITION0 = 5,
+            N_TOKEN = 65,
+            N_KV = POSITION0 + N_TOKEN,
+            N_QUERY_HEAD = 16,
+            N_KV_HEAD = 2,
+            HEAD_DIM = 256,
+            QUERY_ROW_N = N_QUERY_HEAD * HEAD_DIM,
+            QUERY_N = N_TOKEN * QUERY_ROW_N,
+            CACHE_ROW_N = N_KV_HEAD * HEAD_DIM,
+            CACHE_N = N_KV * CACHE_ROW_N,
+        };
+        float *query = malloc((size_t)QUERY_N * sizeof(*query));
+        float *key = malloc((size_t)CACHE_N * sizeof(*key));
+        float *value = malloc((size_t)CACHE_N * sizeof(*value));
+        float *legacy = malloc((size_t)QUERY_N * sizeof(*legacy));
+        float *resident = malloc((size_t)QUERY_N * sizeof(*resident));
+        float *ssd = malloc((size_t)QUERY_N * sizeof(*ssd));
+        float *zero = calloc((size_t)QUERY_N, sizeof(*zero));
+        TEST_ASSERT(query && key && value && legacy && resident && ssd && zero);
+        if (query && key && value && legacy && resident && ssd && zero) {
+            for (size_t i = 0; i < QUERY_N; i++) {
+                query[i] = 0.17f * sinf((float)(i + 1u) * 0.0031f) -
+                           0.06f * cosf((float)(i + 9u) * 0.0047f);
+            }
+            for (size_t token = 0; token < N_KV; token++) {
+                for (size_t i = 0; i < CACHE_ROW_N; i++) {
+                    const size_t at = token * CACHE_ROW_N + i;
+                    key[at] = 0.14f * cosf((float)(at + 3u) * 0.0029f) +
+                              0.04f * sinf((float)(at + 7u) * 0.0053f);
+                    value[at] = 0.33f * sinf((float)(at + 5u) * 0.0037f) -
+                                0.08f * cosf((float)(at + 11u) * 0.0021f);
+                }
+            }
+
+            ds4_gpu_tensor *query_gpu =
+                test_metal_tensor_from_f32(query, QUERY_N);
+            ds4_gpu_tensor *key_gpu =
+                test_metal_tensor_from_f32(key, CACHE_N);
+            ds4_gpu_tensor *value_gpu =
+                test_metal_tensor_from_f32(value, CACHE_N);
+            ds4_gpu_tensor *out_gpu =
+                test_metal_tensor_from_f32(zero, QUERY_N);
+            if (query_gpu && key_gpu && value_gpu && out_gpu) {
+                char *saved = test_save_env(
+                    "DS4_METAL_DISABLE_QWEN_FLASH_PREFILL");
+                bool have_legacy = false;
+                bool have_resident = false;
+                bool have_ssd = false;
+                int reuse_used = -1;
+
+                ds4_gpu_set_ssd_streaming(false);
+                setenv("DS4_METAL_DISABLE_QWEN_FLASH_PREFILL", "1", 1);
+                TEST_ASSERT(ds4_gpu_qwen35_gqa_prefill_select_tensor(
+                    out_gpu, query_gpu, key_gpu, value_gpu,
+                    POSITION0, N_TOKEN, N_QUERY_HEAD, N_KV_HEAD, HEAD_DIM,
+                    0, &reuse_used));
+                TEST_ASSERT(reuse_used == 0);
+                have_legacy = test_metal_read_f32(
+                    out_gpu, legacy, QUERY_N);
+
+                unsetenv("DS4_METAL_DISABLE_QWEN_FLASH_PREFILL");
+                reuse_used = -1;
+                TEST_ASSERT(ds4_gpu_qwen35_gqa_prefill_select_tensor(
+                    out_gpu, query_gpu, key_gpu, value_gpu,
+                    POSITION0, N_TOKEN, N_QUERY_HEAD, N_KV_HEAD, HEAD_DIM,
+                    0, &reuse_used));
+                TEST_ASSERT(reuse_used == 1);
+                have_resident = test_metal_read_f32(
+                    out_gpu, resident, QUERY_N);
+
+                ds4_gpu_set_ssd_streaming(true);
+                reuse_used = -1;
+                TEST_ASSERT(ds4_gpu_qwen35_gqa_prefill_select_tensor(
+                    out_gpu, query_gpu, key_gpu, value_gpu,
+                    POSITION0, N_TOKEN, N_QUERY_HEAD, N_KV_HEAD, HEAD_DIM,
+                    0, &reuse_used));
+                TEST_ASSERT(reuse_used == 1);
+                have_ssd = test_metal_read_f32(out_gpu, ssd, QUERY_N);
+
+                if (have_legacy && have_resident) {
+                    test_metal_qwen35_close(
+                        "Qwen implicit-causal resident FlashAttention",
+                        resident, legacy, QUERY_N, 3.0e-3f, 3.0e-3f);
+                }
+                if (have_resident && have_ssd) {
+                    TEST_ASSERT(memcmp(resident, ssd,
+                                       sizeof(*resident) * QUERY_N) == 0);
+                }
+                ds4_gpu_set_ssd_streaming(false);
+                test_restore_env(
+                    "DS4_METAL_DISABLE_QWEN_FLASH_PREFILL", saved);
+            }
+            ds4_gpu_tensor_free(query_gpu);
+            ds4_gpu_tensor_free(key_gpu);
+            ds4_gpu_tensor_free(value_gpu);
+            ds4_gpu_tensor_free(out_gpu);
+        }
+        free(query);
+        free(key);
+        free(value);
+        free(legacy);
+        free(resident);
+        free(ssd);
+        free(zero);
+    }
+
     /* Production-library Qwen router wrapper.  Offset views exercise the
      * graph's split-4+4 layout, while parent guards prove the fixed contiguous
      * ABI cannot write outside the selected top-8 rows. */

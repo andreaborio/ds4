@@ -222,6 +222,23 @@ static void test_qwen_metal_session_context_budget(void) {
     CHECK(!ds4_qwen35_metal_session_context_fits_runtime_plan(
                &engine, 9, &requested));
     CHECK(requested.total_bytes > planned.total_bytes);
+
+    uint64_t flash_8k = 0;
+    uint64_t flash_32k = 0;
+    uint64_t flash_max = 0;
+    CHECK(qwen35_metal_persistent_runtime_bytes(8192, &flash_8k));
+    CHECK(qwen35_metal_persistent_runtime_bytes(32768, &flash_32k));
+    CHECK(qwen35_metal_persistent_runtime_bytes(
+              QWEN35_CONTEXT_LENGTH, &flash_max));
+    CHECK(flash_32k - flash_8k ==
+          (uint64_t)(32768u - 8192u) *
+              (QWEN35_METAL_GRAPH_CONTEXT_BYTES_PER_TOKEN +
+               QWEN35_FLASH_PREFILL_BYTES_PER_TOKEN));
+    CHECK((uint64_t)QWEN35_CONTEXT_LENGTH *
+              QWEN35_FLASH_PREFILL_BYTES_PER_TOKEN ==
+          UINT64_C(536870912));
+    CHECK(QWEN35_FLASH_PREFILL_PAD_BYTES == UINT64_C(262144));
+    CHECK(flash_max > flash_32k);
 }
 
 static void test_qwen_residency_request_normalization(void) {

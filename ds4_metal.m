@@ -5512,6 +5512,7 @@ typedef struct {
     float    m1;
     int32_t  n_head_log2;
     float    logit_softcap;
+    int32_t  causal_q_offset_plus_one;
 } ds4_gpu_flash_attn_vec_args;
 
 typedef struct {
@@ -28089,12 +28090,13 @@ int ds4_gpu_qwen35_gqa_decode_select_tensor(
  * The generic non-vector FlashAttention kernel already understands grouped
  * query attention through ne_12_2, but consumes F16 K/V.  Stage the live cache
  * frontier into one reusable F16 scratch allocation and leave the persistent
- * cache untouched.  This is intentionally resident-only while the SSD path
- * retains its qualified 64-row scheduler and exact F32 attention fallback.
+ * cache untouched.  The same path is used for resident and SSD execution:
+ * expert residency does not change the attention tensors or their arithmetic.
  *
- * A Qwen-specific pad pair repacks only the final partial 64-key tile, so the
+ * A Qwen-specific pad kernel repacks only the final partial 64-key tile, so the
  * fast path covers arbitrary prompt lengths without converting the persistent
- * cache layout.
+ * cache layout.  Causality is implicit in the FlashAttention kernel; avoiding
+ * the dense F16 [query][key] mask keeps auxiliary storage linear in context.
  */
 static int ds4_gpu_qwen35_gqa_prefill_flash_f16_tensor(
         ds4_gpu_tensor       *out,
@@ -28111,14 +28113,14 @@ static int ds4_gpu_qwen35_gqa_prefill_flash_f16_tensor(
         QWEN_FLASH_NCPSG = 64,
     };
     if (!out || !query || !key_cache || !value_cache ||
-        g_ssd_streaming_mode || n_token == 0u || n_query_head == 0u ||
+        n_token == 0u || n_query_head == 0u ||
         n_kv_head == 0u || head_dim != 256u ||
         n_query_head % n_kv_head != 0u ||
         position0 > UINT32_MAX - n_token) {
         return 0;
     }
     const uint32_t n_kv = position0 + n_token;
-    if (n_kv < QWEN_FLASH_NCPSG) return 0;
+    if (n_kv < QWEN_FLASH_NCPSG || n_kv > INT32_MAX) return 0;
 
     const uint64_t query_values =
         (uint64_t)n_token * n_query_head * head_dim;
@@ -28138,27 +28140,14 @@ static int ds4_gpu_qwen35_gqa_prefill_flash_f16_tensor(
     const uint64_t cache_token_bytes =
         (uint64_t)n_kv_head * cache_head_bytes;
 
-    const NSUInteger mask_bytes =
-        (NSUInteger)n_token * (NSUInteger)n_kv * sizeof(uint16_t);
-    if (n_token != 0u &&
-        mask_bytes / sizeof(uint16_t) / (NSUInteger)n_token !=
-            (NSUInteger)n_kv) {
-        return 0;
-    }
-    const NSUInteger nblk0 =
-        ((NSUInteger)n_kv + QWEN_FLASH_NCPSG - 1u) / QWEN_FLASH_NCPSG;
     const NSUInteger nblk1 =
         ((NSUInteger)n_token + QWEN_FLASH_NQPTG - 1u) / QWEN_FLASH_NQPTG;
-    if (nblk0 != 0u && nblk1 > NSUIntegerMax / nblk0) return 0;
-    const NSUInteger blk_bytes =
-        ds4_gpu_align_up_ns(nblk0 * nblk1, 32u);
     const bool has_kvpad = (n_kv % QWEN_FLASH_NCPSG) != 0u;
     const NSUInteger pad_kv_region_bytes = has_kvpad
         ? (NSUInteger)cache_token_bytes * QWEN_FLASH_NCPSG * n_kv_head
         : 0u;
     const NSUInteger pad_bytes = has_kvpad
-        ? 2u * pad_kv_region_bytes +
-              (NSUInteger)n_token * QWEN_FLASH_NCPSG * sizeof(uint16_t)
+        ? 2u * pad_kv_region_bytes
         : 1u;
 
     id<MTLBuffer> query_buf = ds4_gpu_tensor_buffer(query);
@@ -28180,35 +28169,24 @@ static int ds4_gpu_qwen35_gqa_prefill_flash_f16_tensor(
                                          "ds4_qwen_flash_attn_pad") ||
         !ds4_gpu_ensure_scratch_buffer(&g_flash_attn_blk_buffer,
                                          &g_flash_attn_blk_bytes,
-                                         blk_bytes,
+                                         1u,
                                          "ds4_qwen_flash_attn_blk")) {
         return 0;
     }
-    id<MTLBuffer> mask_buffer = ds4_gpu_glm_prefill_mask_buffer(
-        position0, n_token, n_kv, mask_bytes);
-    if (!mask_buffer) return 0;
 
-    const bool bc_mask = (n_token % QWEN_FLASH_NQPTG) != 0u;
     const int32_t cache_token_values =
         (int32_t)(n_kv_head * head_dim);
     const uint32_t nsg = 4u;
-    id<MTLComputePipelineState> blk_pipeline =
-        ds4_gpu_get_flash_attn_blk_pipeline(QWEN_FLASH_NQPTG,
-                                             QWEN_FLASH_NCPSG);
     id<MTLComputePipelineState> attn_pipeline =
         ds4_gpu_get_flash_attn_pipeline(
             "kernel_flash_attn_ext_f16_dk256_dv256",
-            true, false, false, false, has_kvpad, bc_mask,
+            false, false, false, false, has_kvpad, false,
             cache_token_values, cache_token_values, (int32_t)nsg);
     id<MTLComputePipelineState> pad_kv_pipeline = has_kvpad
         ? ds4_gpu_get_pipeline("kernel_qwen35_gqa_prefill_pad_kv_f16")
         : nil;
-    id<MTLComputePipelineState> pad_mask_pipeline = has_kvpad
-        ? ds4_gpu_get_pipeline("kernel_qwen35_gqa_prefill_pad_mask_f16")
-        : nil;
     const NSUInteger threads = 32u * (NSUInteger)nsg;
-    if (!blk_pipeline || !attn_pipeline ||
-        (has_kvpad && (!pad_kv_pipeline || !pad_mask_pipeline)) ||
+    if (!attn_pipeline || (has_kvpad && !pad_kv_pipeline) ||
         attn_pipeline.maxTotalThreadsPerThreadgroup < threads) {
         return 0;
     }
@@ -28254,57 +28232,7 @@ static int ds4_gpu_qwen35_gqa_prefill_flash_f16_tensor(
         [pad_enc dispatchThreadgroups:MTLSizeMake(n_kv_head, 2u, 1u)
               threadsPerThreadgroup:MTLSizeMake(head_dim, 1u, 1u)];
         ds4_gpu_end_compute_encoder(cb, pad_enc);
-
-        ds4_gpu_qwen35_gqa_prefill_args pad_mask_args = {
-            .position0 = position0,
-            .n_token = n_token,
-            .n_query_head = n_query_head,
-            .n_kv_head = n_kv_head,
-            .head_dim = head_dim,
-            .reserved = 0u,
-            .query_token_stride = 0u,
-            .query_head_stride = 0u,
-            .query_dim_stride = 0u,
-            .key_token_stride = cache_token_bytes,
-            .key_head_stride = cache_head_bytes,
-            .key_dim_stride = sizeof(uint16_t),
-            .value_token_stride = cache_token_bytes,
-            .value_head_stride = cache_head_bytes,
-            .value_dim_stride = sizeof(uint16_t),
-            .output_token_stride = 0u,
-            .output_head_stride = 0u,
-            .output_dim_stride = 0u,
-        };
-        pad_enc = ds4_gpu_compute_encoder(cb);
-        if (!pad_enc) return 0;
-        [pad_enc setComputePipelineState:pad_mask_pipeline];
-        [pad_enc setBytes:&pad_mask_args length:sizeof(pad_mask_args) atIndex:0];
-        [pad_enc setBuffer:mask_buffer offset:0u atIndex:1];
-        [pad_enc setBuffer:g_flash_attn_pad_buffer offset:0u atIndex:2];
-        [pad_enc dispatchThreadgroups:MTLSizeMake(n_token, 1u, 1u)
-              threadsPerThreadgroup:MTLSizeMake(QWEN_FLASH_NCPSG, 1u, 1u)];
-        ds4_gpu_end_compute_encoder(cb, pad_enc);
     }
-
-    ds4_gpu_flash_attn_blk_args blk_args = {
-        .ne01 = (int32_t)n_token,
-        .ne30 = (int32_t)n_kv,
-        .ne31 = (int32_t)n_token,
-        .ne32 = 1,
-        .ne33 = 1,
-        .nb31 = (uint64_t)n_kv * sizeof(uint16_t),
-        .nb32 = mask_bytes,
-        .nb33 = mask_bytes,
-    };
-    id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
-    if (!enc) return 0;
-    [enc setComputePipelineState:blk_pipeline];
-    [enc setBytes:&blk_args length:sizeof(blk_args) atIndex:0];
-    [enc setBuffer:mask_buffer offset:0 atIndex:1];
-    [enc setBuffer:g_flash_attn_blk_buffer offset:0 atIndex:2];
-    [enc dispatchThreadgroups:MTLSizeMake(nblk0, nblk1, 1u)
-         threadsPerThreadgroup:MTLSizeMake(32u, 1u, 1u)];
-    ds4_gpu_end_compute_encoder(cb, enc);
 
     const uint64_t query_head_bytes =
         (uint64_t)head_dim * sizeof(float);
@@ -28331,9 +28259,9 @@ static int ds4_gpu_qwen35_gqa_prefill_flash_f16_tensor(
         .ne31 = (int32_t)n_token,
         .ne32 = 1,
         .ne33 = 1,
-        .nb31 = (uint64_t)n_kv * sizeof(uint16_t),
-        .nb32 = mask_bytes,
-        .nb33 = mask_bytes,
+        .nb31 = 0u,
+        .nb32 = 0u,
+        .nb33 = 0u,
         .ne1 = (int32_t)n_query_head,
         .ne2 = (int32_t)n_token,
         .ne3 = 1,
@@ -28343,6 +28271,7 @@ static int ds4_gpu_qwen35_gqa_prefill_flash_f16_tensor(
         .m1 = 0.0f,
         .n_head_log2 = 0,
         .logit_softcap = 0.0f,
+        .causal_q_offset_plus_one = (int32_t)position0 + 1,
     };
     const NSUInteger padded_v = ds4_gpu_align_up_ns(head_dim, 64u);
     const NSUInteger shared_elems =
@@ -28352,7 +28281,7 @@ static int ds4_gpu_qwen35_gqa_prefill_flash_f16_tensor(
     const NSUInteger shared_bytes =
         ds4_gpu_align_up_ns(shared_elems * sizeof(uint16_t), 16u);
 
-    enc = ds4_gpu_compute_encoder(cb);
+    id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
     if (!enc) return 0;
     [enc setComputePipelineState:attn_pipeline];
     [enc setBytes:&args length:sizeof(args) atIndex:0];
@@ -28360,7 +28289,7 @@ static int ds4_gpu_qwen35_gqa_prefill_flash_f16_tensor(
     [enc setBuffer:g_flash_attn_kv_buffer offset:0u atIndex:2];
     [enc setBuffer:g_flash_attn_kv_buffer
             offset:(NSUInteger)cache_f16_bytes atIndex:3];
-    [enc setBuffer:mask_buffer offset:0u atIndex:4];
+    [enc setBuffer:g_flash_attn_pad_buffer offset:0u atIndex:4];
     [enc setBuffer:query_buf offset:ds4_gpu_tensor_offset(query) atIndex:5];
     [enc setBuffer:g_flash_attn_pad_buffer offset:0u atIndex:6];
     [enc setBuffer:g_flash_attn_blk_buffer offset:0u atIndex:7];
@@ -28387,18 +28316,19 @@ int ds4_gpu_qwen35_gqa_prefill_select_tensor(
         int                   request_reuse,
         int                  *reuse_used) {
     if (reuse_used) *reuse_used = 0;
-    if (getenv("DS4_METAL_DISABLE_QWEN_FLASH_PREFILL") == NULL &&
-        !g_ssd_streaming_mode) {
+    if (getenv("DS4_METAL_DISABLE_QWEN_FLASH_PREFILL") == NULL) {
         const int ok = ds4_gpu_qwen35_gqa_prefill_flash_f16_tensor(
             out, query, key_cache, value_cache, position0, n_token,
             n_query_head, n_kv_head, head_dim);
         if (ok) {
-            static int logged;
-            if (!logged) {
+            static int logged[2];
+            const unsigned mode = g_ssd_streaming_mode ? 1u : 0u;
+            if (!logged[mode]) {
                 fprintf(stderr,
-                        "ds4: Qwen resident prefill FlashAttention "
-                        "enabled (F32 cache, staged F16 GQA)\n");
-                logged = 1;
+                        "ds4: Qwen %s prefill FlashAttention enabled "
+                        "(F32 cache, staged F16 GQA, implicit causal mask)\n",
+                        mode ? "SSD" : "resident");
+                logged[mode] = 1;
             }
             if (reuse_used) *reuse_used = 1;
             return 1;

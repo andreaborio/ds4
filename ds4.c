@@ -14715,6 +14715,15 @@ typedef enum {
     ((uint64_t)QWEN35_FULL_ATTENTION_LAYER_COUNT * 2u * \
          QWEN35_N_HEAD_KV * QWEN35_N_HEAD_DIM * sizeof(float) + \
      sizeof(float))
+/* Qwen FlashAttention preserves the F32 persistent KV cache and stages one
+ * live F16 K/V frontier shared by all full-attention layers.  Its peak is
+ * linear in context; the final partial 64-key tile needs one bounded pair of
+ * sparse head-major pad regions. */
+#define QWEN35_FLASH_PREFILL_BYTES_PER_TOKEN \
+    ((uint64_t)2u * QWEN35_N_HEAD_KV * QWEN35_N_HEAD_DIM * sizeof(uint16_t))
+#define QWEN35_FLASH_PREFILL_PAD_BYTES \
+    ((uint64_t)2u * QWEN35_N_HEAD_KV * QWEN35_N_HEAD_KV * \
+     QWEN35_N_HEAD_DIM * 64u * sizeof(uint16_t))
 #define QWEN35_HOST_LOGITS_BYTES \
     ((uint64_t)QWEN35_N_VOCAB * sizeof(float))
 #define QWEN35_RECURRENT_SNAPSHOT_BYTES \
@@ -14760,6 +14769,7 @@ static bool qwen35_metal_persistent_runtime_bytes(
         uint64_t *bytes_out) {
     uint64_t context_bytes = 0;
     uint64_t batch_bytes = 0;
+    uint64_t flash_bytes = 0;
     uint64_t total = QWEN35_METAL_GRAPH_NON_BATCH_BYTES;
     return context_tokens != 0 && context_tokens <= QWEN35_CONTEXT_LENGTH &&
            qwen35_u64_mul(QWEN35_RESIDENT_PREFILL_TOKENS,
@@ -14770,6 +14780,11 @@ static bool qwen35_metal_persistent_runtime_bytes(
                           QWEN35_METAL_GRAPH_CONTEXT_BYTES_PER_TOKEN,
                           &context_bytes) &&
            qwen35_u64_add(total, context_bytes, &total) &&
+           qwen35_u64_mul(context_tokens,
+                          QWEN35_FLASH_PREFILL_BYTES_PER_TOKEN,
+                          &flash_bytes) &&
+           qwen35_u64_add(total, flash_bytes, &total) &&
+           qwen35_u64_add(total, QWEN35_FLASH_PREFILL_PAD_BYTES, &total) &&
            qwen35_u64_add(total, QWEN35_HOST_LOGITS_BYTES, &total) &&
            (*bytes_out = total, true);
 }
