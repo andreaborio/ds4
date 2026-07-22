@@ -379,11 +379,18 @@
       "maximum": 43
     },
     {
+      "path": "docs/HF_MODEL_RENAME_INVENTORY.md",
+      "location": "content",
+      "token": "DS4",
+      "classification": "serialized/permanent",
+      "maximum": 9
+    },
+    {
       "path": "docs/REBRAND_ROLLOUT_PLAN.md",
       "location": "content",
       "token": "ds4",
       "classification": "compatibility",
-      "maximum": 11
+      "maximum": 12
     },
     {
       "path": "docs/REBRAND_ROLLOUT_PLAN.md",

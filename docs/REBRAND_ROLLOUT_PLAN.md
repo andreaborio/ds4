@@ -1,6 +1,6 @@
 # Hebrus Rebrand Rollout Plan
 
-- Status: active integration plan; repository renames not yet authorized
+- Status: active integration; compatibility PRs open, public renames gated
 - Last updated: 2026-07-22
 - Scope: Hebrus engine, Hebrus Studio, the Hebrus Studio website, and the
   qualified Hugging Face model repositories
@@ -27,10 +27,10 @@ stable naming boundary remains in
 
 | Surface | Canonical work | State | Immediate constraint |
 | --- | --- | --- | --- |
-| Engine | `andreaborio/ds4`, branch `codex/hebrus-phase-0` | Rebased on current `origin/main`; 39 commits ahead and 0 behind; complete model-free premerge gate green | Publish the integration branch for review; model-backed release lanes remain required before release |
-| Studio | `andreaborio/dsbox`, branch `codex/hebrus-engine-bridge` plus two newer `main` brand commits | Bridge is pushed and the `0.4.0-dev.1` prerelease exists; branch is 13 commits ahead and 2 behind `main` | Rebuild the bridge on current `main` and clear all CI failures |
-| Website | `andreaborio/hebrus-site`, `main` | Published on GitHub Pages; Pages workflow green | Final logo, canonical post-rename links, and final signed download remain pending |
-| Model Hub | Three consolidated `andreaborio/*-DS4-GGUF` repositories | Immutable qualified revisions are consumed by Studio and engine release contracts | Add dual repository-ID compatibility before moving any Hugging Face repository |
+| Engine | `andreaborio/ds4`, PR [#6](https://github.com/andreaborio/ds4/pull/6) | Rebased on current `origin/main`; local complete premerge green; macOS CI green | Fix the Linux-only zsh runner gate, then require all CI and model-backed release lanes before release |
+| Studio | `andreaborio/dsbox`, PR [#11](https://github.com/andreaborio/dsbox/pull/11) | Rebased on current `main`; 409 tests, build, audit, and local packaged-app verification green; dual HF IDs implemented | Require the rerun macOS package check and all PR checks to be green before merge |
+| Website | `andreaborio/hebrus-site`, `main` at `23507e2` | Published on GitHub Pages; clean install, zero-vulnerability audit, lint, static export, and Pages test green | Final logo, canonical post-rename links, and final signed download remain pending |
+| Model Hub | Three consolidated `andreaborio/*-DS4-GGUF` repositories | Public pre-move snapshot recorded in [`HF_MODEL_RENAME_INVENTORY.md`](HF_MODEL_RENAME_INVENTORY.md); Studio bridge accepts future Hebrus IDs | Merge the compatibility bridge, repeat the inventory immediately before each authenticated move, then move one repository at a time |
 
 Release work must use the active engine rebrand branch, the active Studio bridge
 branch, and the GitHub Pages site checkout identified in the table above. A
@@ -75,19 +75,19 @@ dropped commits.
 
 ## Phase 1 — Restore green CI before further renaming
 
-### Studio blockers already observed
+### Studio blockers and resolutions
 
-1. Update the vulnerable `fast-uri` dependency resolution and rerun
-   `npm audit --audit-level=high` from a clean lockfile install.
-2. Fix the macOS package verifier false positive that classifies the font path
+1. **Resolved:** the rebased lockfile reports zero vulnerabilities under
+   `npm audit --audit-level=high` from a clean install.
+2. **Resolved locally:** the macOS package verifier false positive that classified the font path
    `/dist/fonts/hebrus` as an embedded engine executable. The verifier must
    distinguish executable payloads from font/assets by type and location, not
    by basename alone.
-3. Make the persisted-artifact resume test deterministic: the current failure
+3. **Resolved:** the persisted-artifact resume test is deterministic: the previous failure
    compares `[null, null]` with `[null, undefined]`. Decide and document the
    boundary representation, then assert that contract consistently rather than
    weakening the compatibility check.
-4. Rerun typecheck, brand audit, the complete test suite, production build,
+4. **Green locally:** typecheck, brand audit, the complete test suite, production build,
    ad-hoc macOS packaging contract, and legacy upgrade/rollback exercise on the
    same candidate SHA.
 
