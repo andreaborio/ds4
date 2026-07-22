@@ -73,7 +73,7 @@ brand-boundary-audit: tools/brand_boundary_audit.py tools/brand_boundary.json
 brand-boundary-test: tools/brand_boundary_audit.py tests/test_brand_boundary_audit.py
 	python3 tests/test_brand_boundary_audit.py
 
-brand-asset-test: tests/test_brand_asset.py docs/media/hebrus-logo.png README.md
+brand-asset-test: tests/test_brand_asset.py docs/media/hebrus-typographic.png README.md
 	python3 tests/test_brand_asset.py
 
 ifeq ($(UNAME_S),Darwin)

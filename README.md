@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="docs/media/hebrus-logo.png" width="320" alt="Hebrus logo">
+  <img src="docs/media/hebrus-typographic.png" width="900" alt="Hebrus Studio — Metal first. SSD when memory ends.">
 </p>
 
 # Hebrus
@@ -17,14 +17,14 @@ the only capacity boundary.
 [Contributing](CONTRIBUTING.md)
 
 > [!NOTE]
-> Hebrus is the working public engine name and the canonical executable
-> namespace in the current bridge. The repository is still
-> [`andreaborio/ds4`](https://github.com/andreaborio/ds4), and
-> [ADR 0005](docs/adr/0005-hebrus-naming-and-compatibility-boundary.md) remains
-> **Proposed** while namespace and legal screening remain incomplete. The
-> companion application is named **Hebrus Studio** and its bridge release is
-> implemented locally but not yet published. This repository has not been
-> administratively renamed.
+> **Hebrus** is the public engine name and canonical executable namespace.
+> The engine is published at
+> [`andreaborio/hebrus`](https://github.com/andreaborio/hebrus), with
+> [`Hebrus Studio`](https://github.com/andreaborio/hebrus-studio) as its
+> companion macOS application. Durable `ds4` and `DSBox` identifiers remain
+> only where changing their bytes would break model, application, or user-data
+> compatibility; see
+> [ADR 0005](docs/adr/0005-hebrus-naming-and-compatibility-boundary.md).
 
 > [!IMPORTANT]
 > Hebrus began as a fork of
@@ -104,8 +104,8 @@ Build and verify the engine without loading model weights:
 
 ```sh
 xcode-select --install
-git clone https://github.com/andreaborio/ds4.git
-cd ds4
+git clone https://github.com/andreaborio/hebrus.git
+cd hebrus
 
 make -j
 ./hebrus --build-info
