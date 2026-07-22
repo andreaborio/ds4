@@ -1,16 +1,17 @@
 # Hugging Face Model Rename Inventory
 
-- Snapshot time: 2026-07-22, before any repository move
+- Snapshot time: 2026-07-22, immediately before the repository moves
+- Move status: all three in-place moves completed and verified on 2026-07-22
 - Namespace: `andreaborio`
 - Visibility: all three repositories are public and ungated
 - Purpose: establish a reviewable baseline for the in-place DS4-to-Hebrus
   repository moves described in
   [`REBRAND_ROLLOUT_PLAN.md`](REBRAND_ROLLOUT_PLAN.md)
 
-This snapshot is preparatory evidence, not authorization to move a repository.
-Repeat the API inventory immediately before every move because revisions,
-cards, counters, and file inventories can change after this document is
-committed.
+This snapshot is the pre-move baseline used for the completed operations. The
+post-move comparison covered revisions, full sibling inventories, file sizes,
+LFS SHA-256 values, visibility, gating, downloads, likes, Git heads, legacy URL
+redirects, and ranged reads through each old repository ID.
 
 ## Repository baseline
 
@@ -19,6 +20,10 @@ committed.
 | `andreaborio/DeepSeek-V4-Flash-DS4-GGUF` | `andreaborio/DeepSeek-V4-Flash-Hebrus-GGUF` | `2ba412c5d8048f8adfb24446e776015133aed9e0` | 319 | 0 | 5 |
 | `andreaborio/GLM-5.2-DS4-GGUF` | `andreaborio/GLM-5.2-Hebrus-GGUF` | `0182407316ad8a3cf6cb676dad9ae298af8e091a` | 98 | 0 | 19 |
 | `andreaborio/Qwen3.6-35B-A3B-DS4-GGUF` | `andreaborio/Qwen3.6-35B-A3B-Hebrus-GGUF` | `7bf9c3f7f6136aeb2599d75ee61c0cc2f18e2b02` | 343 | 0 | 7 |
+
+All old web and API endpoints returned HTTP `307` to the corresponding Hebrus
+ID. Old pinned `resolve` requests redirected and completed as HTTP `206 Partial
+Content`; old and new Git URLs returned the same recorded HEAD for every model.
 
 ## Qualified runtime artifacts
 

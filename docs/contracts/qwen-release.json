@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "modelFamily": "Qwen3.6-35B-A3B",
   "downloadTarget": "qwen-v2",
-  "repository": "andreaborio/Qwen3.6-35B-A3B-DS4-GGUF",
+  "repository": "andreaborio/Qwen3.6-35B-A3B-Hebrus-GGUF",
   "publishedArtifact": {
     "status": "published",
     "filename": "Qwen3.6-35B-A3B-DS4-ExpertMajor-v2-MLX-Affine4-G64.gguf",

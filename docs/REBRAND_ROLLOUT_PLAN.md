@@ -1,6 +1,6 @@
 # Hebrus Rebrand Rollout Plan
 
-- Status: active integration; compatibility PRs open, public renames gated
+- Status: compatibility bridges merged; Hugging Face model moves completed
 - Last updated: 2026-07-22
 - Scope: Hebrus engine, Hebrus Studio, the Hebrus Studio website, and the
   qualified Hugging Face model repositories
@@ -27,10 +27,10 @@ stable naming boundary remains in
 
 | Surface | Canonical work | State | Immediate constraint |
 | --- | --- | --- | --- |
-| Engine | `andreaborio/ds4`, PR [#6](https://github.com/andreaborio/ds4/pull/6) | Rebased on current `origin/main`; local complete premerge green; macOS CI green | Fix the Linux-only zsh runner gate, then require all CI and model-backed release lanes before release |
-| Studio | `andreaborio/dsbox`, PR [#11](https://github.com/andreaborio/dsbox/pull/11) | Rebased on current `main`; 409 tests, build, audit, and local packaged-app verification green; dual HF IDs implemented | Require the rerun macOS package check and all PR checks to be green before merge |
+| Engine | `andreaborio/ds4`, merged PR [#6](https://github.com/andreaborio/ds4/pull/6) at `7686f70` | Compatibility bridge merged; complete local premerge and Linux/macOS CI green | Model-backed release lanes remain required before a final release |
+| Studio | `andreaborio/dsbox`, merged PR [#11](https://github.com/andreaborio/dsbox/pull/11) at `dd13cb5` | Compatibility bridge merged; 409 tests, build, audit, and local/CI packaged-app verification green | Publish and verify a post-merge development candidate before the final signed release |
 | Website | `andreaborio/hebrus-site`, `main` at `23507e2` | Published on GitHub Pages; clean install, zero-vulnerability audit, lint, static export, and Pages test green | Final logo, canonical post-rename links, and final signed download remain pending |
-| Model Hub | Three consolidated `andreaborio/*-DS4-GGUF` repositories | Public pre-move snapshot recorded in [`HF_MODEL_RENAME_INVENTORY.md`](HF_MODEL_RENAME_INVENTORY.md); Studio bridge accepts future Hebrus IDs | Merge the compatibility bridge, repeat the inventory immediately before each authenticated move, then move one repository at a time |
+| Model Hub | Three consolidated `andreaborio/*-Hebrus-GGUF` repositories | In-place moves completed; exact revisions, files, hashes, counters, Git heads, range downloads, and DS4-ID redirects verified | Refresh live model-card wording and retain continuous redirect/download monitoring |
 
 Release work must use the active engine rebrand branch, the active Studio bridge
 branch, and the GitHub Pages site checkout identified in the table above. A
@@ -174,7 +174,8 @@ published artifact or historical attribution link was rewritten destructively.
 
 Hugging Face documents an in-place move operation that redirects the old URL
 and preserves download counts and likes. Use that operation rather than copying
-or re-uploading weights. The initial public move set is:
+or re-uploading weights. The initial public move set was completed on
+2026-07-22:
 
 | Current repository | Future canonical repository |
 | --- | --- |
