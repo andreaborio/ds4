@@ -390,7 +390,7 @@
       "location": "content",
       "token": "ds4",
       "classification": "compatibility",
-      "maximum": 12
+      "maximum": 10
     },
     {
       "path": "docs/REBRAND_ROLLOUT_PLAN.md",
