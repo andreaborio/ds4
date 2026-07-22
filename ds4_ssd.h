@@ -221,6 +221,11 @@ uint32_t ds4_ssd_deepseek_long_context_cache_target(
         const ds4_ssd_adaptive_cache_plan *plan,
         uint32_t                           decode_target,
         uint32_t                           n_tokens);
+/* A phase transition exists only when AUTO initialized both endpoints and the
+ * decode endpoint can restore capacity after the prefill contraction. */
+bool ds4_ssd_deepseek_phase_cache_targets_enabled(
+        uint32_t prefill_target,
+        uint32_t decode_target);
 /* Pure transition policy used by cold and resumed sessions. The work size
  * selects the prefill schedule; the resulting total context selects the
  * bounded long-context decode tier, with a 128-token guard before each hard

@@ -12,9 +12,9 @@ static bool ds4_session_deepseek_phase_cache_enabled(
         s->engine->model.family != DS4_MODEL_FAMILY_DEEPSEEK4 ||
         !s->engine->model.native_expert_store_v2 ||
         !s->engine->ssd_streaming ||
-        s->engine->deepseek_prefill_cache_experts == 0 ||
-        s->engine->deepseek_decode_cache_experts <=
-            s->engine->deepseek_prefill_cache_experts) {
+        !ds4_ssd_deepseek_phase_cache_targets_enabled(
+            s->engine->deepseek_prefill_cache_experts,
+            s->engine->deepseek_decode_cache_experts)) {
         return false;
     }
     return true;
@@ -70,6 +70,9 @@ static int ds4_session_deepseek_finish_prefill_cache(
         bool         prefill_succeeded,
         char        *err,
         size_t       errlen) {
+    /* An explicit cache budget bypasses AUTO and therefore has no phase
+     * endpoints.  Leave that configured budget untouched after prefill. */
+    if (!ds4_session_deepseek_phase_cache_enabled(s)) return 0;
     uint32_t current =
         ds4_gpu_stream_expert_cache_configured_count();
     const uint32_t cache_before = current;

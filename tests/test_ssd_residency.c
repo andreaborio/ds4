@@ -943,6 +943,13 @@ int main(void) {
     assert(ds4_ssd_deepseek_long_context_cache_target(
                &memory, NULL, 4387, 8192) == 0);
 
+    /* Explicit cache budgets bypass AUTO and leave both phase targets zero.
+     * That state must be a no-op, never a request to shrink the cache to zero. */
+    assert(!ds4_ssd_deepseek_phase_cache_targets_enabled(0, 0));
+    assert(!ds4_ssd_deepseek_phase_cache_targets_enabled(0, 4387));
+    assert(!ds4_ssd_deepseek_phase_cache_targets_enabled(259, 259));
+    assert(ds4_ssd_deepseek_phase_cache_targets_enabled(259, 4387));
+
     /* Resume decisions use the work size for the batching floor and the total
      * resulting context for the post-prefill cap. */
     assert(ds4_ssd_deepseek_prefill_phase_cache_target(

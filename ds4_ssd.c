@@ -826,6 +826,12 @@ uint32_t ds4_ssd_deepseek_long_context_cache_target(
     return target == 0 || target > UINT32_MAX ? 0 : (uint32_t)target;
 }
 
+bool ds4_ssd_deepseek_phase_cache_targets_enabled(
+        uint32_t prefill_target,
+        uint32_t decode_target) {
+    return prefill_target != 0 && decode_target > prefill_target;
+}
+
 enum { DS4_DEEPSEEK_CONTEXT_TIER_GUARD_TOKENS = 128 };
 
 uint32_t ds4_ssd_deepseek_prefill_phase_cache_target(
