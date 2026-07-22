@@ -5,7 +5,7 @@
 The project intends to receive vulnerability reports through GitHub's private
 vulnerability reporting flow:
 
-<https://github.com/andreaborio/ds4/security/advisories/new>
+<https://github.com/andreaborio/hebrus/security/advisories/new>
 
 Private vulnerability reporting is not enabled for this repository yet.
 Enabling it is a required administrative step before public launch; until then,

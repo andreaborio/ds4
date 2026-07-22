@@ -1,4 +1,4 @@
-# Fork notes — andreaborio/ds4
+# Fork notes — andreaborio/hebrus
 
 This is a transparent co-development fork of **antirez/ds4** (DwarfStar). This
 file records grouped fork deltas, their evidence, and their upstream status so

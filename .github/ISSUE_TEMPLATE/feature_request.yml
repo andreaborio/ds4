@@ -7,7 +7,7 @@ body:
       value: |
         Explain the user problem before the implementation. Hebrus prioritizes Apple Metal inference and SSD streaming while preserving deliberate compatibility and upstream attribution.
 
-        Performance claims belong in the dedicated performance report. Security reports must follow [SECURITY.md](https://github.com/andreaborio/ds4/blob/main/SECURITY.md) and must not be disclosed here.
+        Performance claims belong in the dedicated performance report. Security reports must follow [SECURITY.md](https://github.com/andreaborio/hebrus/blob/main/SECURITY.md) and must not be disclosed here.
 
   - type: checkboxes
     id: prerequisites

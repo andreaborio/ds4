@@ -10,8 +10,8 @@ abstract: >-
   An open-source inference engine focused on Apple Metal, embedded ExpertMajor
   model stores, and SSD streaming for large mixture-of-experts models.
 license: MIT
-repository-code: "https://github.com/andreaborio/ds4"
-url: "https://github.com/andreaborio/ds4"
+repository-code: "https://github.com/andreaborio/hebrus"
+url: "https://github.com/andreaborio/hebrus"
 keywords:
   - Apple Metal
   - GGUF
