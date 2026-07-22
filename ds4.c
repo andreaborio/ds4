@@ -19221,6 +19221,12 @@ static bool metal_graph_stream_layer_spans(
     if (!weights || model_size == 0 || !spans || il >= DS4_N_LAYER) {
         return false;
     }
+    /* Affine2 exists only as individually cached physical records.  Refuse a
+     * future planner regression before it can turn into a 2 GiB layer pread. */
+    if (!decode_only &&
+        ds4_gpu_expert_store_v2_requires_selected_addr()) {
+        return false;
+    }
     uint64_t expert_offset = 0;
     uint64_t expert_size = 0;
     const bool native_full_layer =
@@ -19508,10 +19514,18 @@ static uint32_t metal_graph_stream_prefill_batch_selected_addr_auto_min(void) {
     return 0;
 }
 
-static bool metal_graph_stream_prefill_batch_selected_addr_enabled(
+static bool metal_graph_stream_prefill_batch_selected_addr_enabled_with_cache(
         const ds4_gpu_graph *g,
         const ds4_weights   *weights,
-        uint32_t             n_tokens) {
+        uint32_t             n_tokens,
+        uint32_t             configured_cache_count) {
+    /* The virtual affine2 tensors cannot be mapped or decoded as a physical
+     * full layer.  Select the cache/address-table map for every non-empty batch
+     * before applying the optional IQ2/Q2 policy and its diagnostic gates. */
+    if (ds4_gpu_expert_store_v2_selected_addr_required(
+            n_tokens, g && g->ssd_streaming)) {
+        return true;
+    }
     if (!g ||
         !g->ssd_streaming ||
         g->quality ||
@@ -19529,7 +19543,7 @@ static bool metal_graph_stream_prefill_batch_selected_addr_enabled(
         return false;
     }
 
-    if (ds4_gpu_stream_expert_cache_configured_count() < DS4_N_EXPERT) {
+    if (configured_cache_count < DS4_N_EXPERT) {
         return false;
     }
 
@@ -19542,6 +19556,114 @@ static bool metal_graph_stream_prefill_batch_selected_addr_enabled(
     const uint32_t min_tokens =
         metal_graph_stream_prefill_batch_selected_addr_auto_min();
     return max_tokens != 0 && n_tokens >= min_tokens && n_tokens <= max_tokens;
+}
+
+static bool metal_graph_stream_prefill_batch_selected_addr_enabled(
+        const ds4_gpu_graph *g,
+        const ds4_weights   *weights,
+        uint32_t             n_tokens) {
+    return metal_graph_stream_prefill_batch_selected_addr_enabled_with_cache(
+        g, weights, n_tokens,
+        ds4_gpu_stream_expert_cache_configured_count());
+}
+
+int ds4_gpu_internal_deepseek_prefill_planner_test(
+        bool     affine2_store_installed,
+        uint64_t affine2_model_size) {
+    if ((ds4_gpu_expert_store_v2_requires_selected_addr() != 0) !=
+        affine2_store_installed) {
+        return 0;
+    }
+    ds4_tensor gate = {
+        .type = affine2_store_installed ?
+            DS4_TENSOR_MLX_AFFINE2 : DS4_TENSOR_IQ2_XXS,
+    };
+    ds4_tensor up = gate;
+    ds4_tensor down = {
+        .type = affine2_store_installed ?
+            DS4_TENSOR_MLX_AFFINE2 : DS4_TENSOR_Q2_K,
+    };
+    ds4_weights weights;
+    memset(&weights, 0, sizeof(weights));
+    weights.layer[0].ffn_gate_exps = &gate;
+    weights.layer[0].ffn_up_exps = &up;
+    weights.layer[0].ffn_down_exps = &down;
+    ds4_tensor static_weight = {
+        .bytes = 64u,
+        .abs_offset = 0u,
+    };
+    weights.layer[0].attn_norm = &static_weight;
+
+    ds4_gpu_graph graph;
+    memset(&graph, 0, sizeof(graph));
+    graph.ssd_streaming = true;
+    const uint32_t tokens[] = {1u, 2u, 760u, 761u, 2048u, 4096u};
+    const bool iq2_expected[] = {false, true, true, false, false, false};
+    if (affine2_store_installed) {
+        /* quality=true deliberately disables the ordinary IQ2 path. Affine2
+         * must still choose its only exact representation at every frontier. */
+        graph.quality = true;
+    }
+    int ok = 1;
+    for (size_t i = 0; i < sizeof(tokens) / sizeof(tokens[0]); i++) {
+        const bool enabled =
+            metal_graph_stream_prefill_batch_selected_addr_enabled_with_cache(
+                &graph, &weights, tokens[i], DS4_N_EXPERT);
+        const bool expected = affine2_store_installed ? true : iq2_expected[i];
+        if (enabled != expected) {
+            fprintf(stderr,
+                    "ds4: prefill planner policy test mismatch affine2=%d "
+                    "tokens=%u enabled=%d expected=%d cache=%u\n",
+                    affine2_store_installed ? 1 : 0,
+                    tokens[i],
+                    enabled ? 1 : 0,
+                    expected ? 1 : 0,
+                    DS4_N_EXPERT);
+            ok = 0;
+            break;
+        }
+    }
+    if (ok && metal_graph_stream_prefill_batch_selected_addr_enabled_with_cache(
+            &graph, &weights, 0u, DS4_N_EXPERT)) {
+        ok = 0;
+    }
+    graph.ssd_streaming = false;
+    if (ok && metal_graph_stream_prefill_batch_selected_addr_enabled_with_cache(
+            &graph, &weights, 2048u, DS4_N_EXPERT)) {
+        ok = 0;
+    }
+    if (ok && affine2_store_installed) {
+        ds4_weights span_weights = weights;
+        span_weights.layer[0].ffn_gate_exps = NULL;
+        span_weights.layer[0].ffn_up_exps = NULL;
+        span_weights.layer[0].ffn_down_exps = NULL;
+        uint64_t layer_offset = 0;
+        uint64_t layer_bytes = 0;
+        ds4_model_map_span_vec decode_spans;
+        ds4_model_map_span_vec full_spans;
+        memset(&decode_spans, 0, sizeof(decode_spans));
+        memset(&full_spans, 0, sizeof(full_spans));
+        const bool fixture_valid =
+            affine2_model_size != 0u &&
+            ds4_gpu_expert_store_v2_layer_span(
+                0u, affine2_model_size,
+                &layer_offset, &layer_bytes) != 0 &&
+            layer_bytes == UINT64_C(2147483648) &&
+            layer_offset <= affine2_model_size &&
+            layer_bytes <= affine2_model_size - layer_offset &&
+            metal_graph_stream_layer_spans(
+                &span_weights, affine2_model_size, 0u, true, &decode_spans);
+        if (!fixture_valid ||
+            metal_graph_stream_layer_spans(
+                &span_weights, affine2_model_size, 0u, false, &full_spans)) {
+            free(decode_spans.v);
+            free(full_spans.v);
+            ok = 0;
+        } else {
+            free(decode_spans.v);
+        }
+    }
+    return ok;
 }
 
 

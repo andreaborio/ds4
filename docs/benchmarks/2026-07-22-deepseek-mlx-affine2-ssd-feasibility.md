@@ -1,11 +1,16 @@
 # DeepSeek MLX affine2 and SSD-streaming feasibility (2026-07-22)
 
-Status: research / HOLD; not qualified for promotion.
+Status: research / HOLD; planner safety correction implemented, not qualified
+for promotion.
 
 Decision: keep `codex/mlx-deepseek-ssd-study` as an experimental branch. Do
 not merge the affine2 runtime into a supported DeepSeek path until the artifact
 writer, residency contract, SSD planner, end-to-end correctness, quality, and
 required performance matrices are complete.
+
+The follow-up planner correction in this record is a fail-closed safety fix. It
+does not change the support contract or constitute evidence that affine2 is
+faster than the qualified IQ2/Q2 artifact.
 
 Supersedes: none.
 
@@ -18,10 +23,12 @@ in DS4, including the 64 GiB SSD-streaming path. The answer is split:
   multiplication, and route sorting are credible implementation ideas for a
   compute-bound MoE path.
 - The current DeepSeek affine2 candidate does not establish an end-to-end
-  benefit. It has no writable model artifact, rejects resident execution,
-  moves 18.52% more bytes per expert miss than the qualified IQ2/Q2 store, and
-  has a planner/backend mismatch that can request full-store prefill reads in
-  addition to selected-record loads.
+  benefit. It has no writable model artifact, rejects resident execution, and
+  moves 18.52% more bytes per expert miss than the qualified IQ2/Q2 store. The
+  audit also found a planner/backend mismatch that could request full-store
+  prefill reads in addition to selected-record loads; the follow-up change on
+  this branch now removes that mismatch with one mandatory selected-address
+  decision shared by C mapping and Metal dispatch.
 - No DeepSeek affine2 timing or quality result is reported here. The only
   attempted model A/B was stopped before inference by the repository's AC
   power guard. Treating that stopped run as performance evidence would violate
@@ -133,15 +140,16 @@ later fails. That conflicts with the supported DeepSeek AUTO/resident/SSD
 contract unless either resident execution is implemented and qualified or the
 new format is made explicitly SSD-only in the residency planner and contract.
 
-### SSD planner and Metal dispatch disagree
+### SSD planner and Metal dispatch divergence: corrected, not qualified
 
-The C prefill predicate recognizes selected-address batching only for the
+Before the follow-up correction, the C prefill predicate recognized
+selected-address batching only for the
 qualified IQ2/Q2 tensor types. Full-layer `pread` preparation is enabled by
 default. When that predicate is false, `metal_graph_stream_layer_spans()` adds
 the complete physical ExpertMajor layer. The Metal backend independently
-forces every affine2 batch onto selected-address compute.
+forced every affine2 batch onto selected-address compute.
 
-The resulting plan is full-layer preparation plus selected-record compute.
+The resulting plan was full-layer preparation plus selected-record compute.
 Under the default 4,096-token Flash chunk cap, the full-layer preparation alone
 would request the following routed bytes:
 
@@ -152,19 +160,23 @@ would request the following routed bytes:
 | 8,192 | 2 | 172 GiB |
 | 32,768 | 8 | 688 GiB |
 
-These are code-path byte requests, not measured physical NAND traffic. Page
+These were code-path byte requests, not measured physical NAND traffic. Page
 cache hits can reduce device I/O. Conversely, an 86 GiB routed store exceeds
 the host's 64 GiB unified memory, so repeated scans are likely to be
 cache-expulsive. Selected-address cache loads are additional requests. Current
 Metal `pread_bytes` telemetry counts the expert cache loader but not the layer
 prepare worker, so it cannot by itself reveal this amplification.
 
-A safe correction is not merely adding affine2 to the existing IQ2 predicate:
-that predicate has a 760-token automatic ceiling and respects disable/quality
-conditions that the forced Metal affine2 path does not. One canonical
-"mandatory affine2 selected-address" decision must control both the C mapping
-and Metal dispatch for every batch. I/O overlap and cache policy should remain
-a separate change and a separate experiment.
+The implemented correction does not merely add affine2 to the existing IQ2
+predicate: that predicate has a 760-token automatic ceiling and respects
+disable/quality conditions that the affine2 path cannot safely use. Instead,
+validated store metadata is now the authority for one mandatory affine2
+selected-address decision. The C planner and Metal dispatch both use it for
+every non-empty SSD batch. The C layer-span builder also rejects an affine2
+full-layer request, and the address-table builder ignores its optional disable
+bisect while constructing a mandatory affine2 selected batch. IQ2/Q2 thresholds
+and diagnostic gates remain unchanged. I/O overlap and cache policy remain
+separate, unmodified experiments.
 
 Two secondary gaps also need explicit treatment:
 
@@ -202,6 +214,37 @@ not a throughput measurement or store-to-output end-to-end test.
 Runtime Metal source SHA-256 reported by the suite:
 `96a7d8a4f37593fc1153d359de99ca40dfd9e0d8a146b289ff0600bd1b928c67`.
 
+### Follow-up planner regression coverage
+
+The correction adds model-free coverage at both sides of the C/Metal boundary:
+
+- affine2 selects the mandatory address path at 1, 2, 760, 761, 2,048, and
+  4,096 tokens, while an empty batch and non-SSD execution do not;
+- the result remains mandatory with the ordinary selected-batch and address
+  table disable flags set, and with the quality gate that disables optional
+  IQ2 batching;
+- an affine2 full-layer span request fails before any page-in or `pread` can be
+  scheduled;
+- the unchanged IQ2/Q2 policy remains off at 1 token, on at 2 and 760, and off
+  at 761, 2,048, and 4,096 tokens;
+- the Metal affine2 admission helper covers zero, boundary, and long batches,
+  plus SSD, address-table, and geometry negatives.
+
+The follow-up passed:
+
+```sh
+make -j8
+./build/metal-arm64/bin/ds4_test --metal-expert-pack
+./build/metal-arm64/bin/ds4_test --metal-kernels
+make premerge
+```
+
+`make premerge` repeated build isolation and the complete model-free gate. The
+CPU isolation build emitted only the repository's existing unused-function
+warnings. The independent sparse-store tests prove planner/dispatch agreement
+over the virtual 86 GiB geometry; they still do not execute a physical affine2
+artifact.
+
 ### Controlled model A/B attempt
 
 Clean detached worktrees for the control and candidate were built separately.
@@ -222,6 +265,113 @@ cohort was retained. The guard was not bypassed. A second blocker is that no
 affine2 GGUF exists; the roughly 14 GiB free on the internal disk is also far
 below the estimated 94.2 GiB output plus safe conversion scratch.
 
+### Exploratory 64 GiB battery smoke after the planner correction
+
+At the user's request, three direct `ds4-bench` smokes were run on the qualified
+IQ2/Q2 artifact without AC power. They were deliberately outside the M5
+acceptance harness and used `--power 50`, which adds idle time to cap duty
+cycle. They are not an A/B cohort, do not exercise affine2, and their throughput
+cannot qualify or promote this change. The first two runs are correctness
+failures; a third, minimal AUTO-cache discriminant is finite.
+
+The two explicit-cache failures used this code and runtime identity:
+
+| Item | Identity |
+| --- | --- |
+| Source parent | `97f7a19e5361f0c74454d39fe3db4f2e56e246c4` |
+| Dirty binary diff SHA-256 | `34da5e2512339797a7c1e39d45b13b3941bd0f9b1ff9a456d5376645d3698082` |
+| `ds4-bench` SHA-256 | `603d3dd6e12e74eee895e6d9a53ab39552982ad5f1357a9d2b7053bc470ab5ac` |
+| Runtime Metal source SHA-256 | `96a7d8a4f37593fc1153d359de99ca40dfd9e0d8a146b289ff0600bd1b928c67` |
+| Prompt SHA-256 | `f53e0d80cb2d4492d24ebd63c7000c397b16ae70f9bf09b3763e5d8323ec209f` |
+| Model | qualified DeepSeek v2 identity recorded above; published hash was not recomputed |
+
+Both processes used SSD streaming, a 517-record cache (3.408 GiB), one
+preloaded record, a 512-token allocation, greedy decode, and the prose prompt.
+
+The lane labels are
+`battery-power_exploratory-unqualified_ctx33_g8_p50_ssd-cache517_preload1`
+and
+`battery-power_exploratory-unqualified_ctx128_g16_p50_ssd-cache517_preload1_warm-biased-retry`.
+
+```sh
+DS4_METAL_MEMORY_REPORT=1 \
+DS4_METAL_STREAMING_EXPERT_TIMING_SUMMARY=1 \
+./build/metal-arm64/bin/ds4-bench --metal -m "$DEEPSEEK_V2" \
+  --ssd-streaming --ssd-streaming-cache-experts 517 \
+  --ssd-streaming-preload-experts 1 --power 50 \
+  --prompt-file speed-bench/promessi_sposi.txt \
+  --ctx-start "$N" --ctx-max "$N" --ctx-alloc 512 \
+  --gen-tokens "$G" --csv "$OUT.csv" \
+  --dump-frontier-logits-dir "$OUT.logits" \
+  --dump-decode-evidence-dir "$OUT.evidence"
+```
+
+| Lane | Result | Prefill | Decode | Prefill cache hit | Prefill expert loads / evictions | Prefill `pread` |
+| --- | --- | ---: | ---: | ---: | ---: | ---: |
+| 33 + 8, cache state unclassified | **FAIL: non-finite decode** | 5.01 tok/s | invalid 1.16 tok/s | 68.33% | 2,696 / 2,179 | 17.771 GiB, 8,088 calls, 593.340 ms |
+| 128 + 16, uncontrolled warm-biased retry | **FAIL: non-finite decode** | 12.95 tok/s | invalid 1.45 tok/s | 85.24% | 4,875 / 4,358 | 32.135 GiB, 14,625 calls, 1,030.861 ms |
+
+The planned footprint was 4.44 GiB. The host was at 26-25% battery and
+discharging. System free-memory readings stayed between 78% and 93%; the peak
+observed wired count was 697,091 16 KiB pages (10.637 GiB). The pre-existing
+system `Swapouts` counter stayed exactly `660581` before, during, and after the
+runs, and no competing inference process was present.
+
+The first 128-token attempt completed its prefill and then stopped because the
+requested logits directory had not been created. It produced no retained CSV
+or evidence and did not change the swapout counter. The directory was created
+and the same lane was rerun, which makes its prefill warm-biased in addition to
+the decode correctness failure.
+
+Retained artifact identities (scratch files were not committed) are:
+
+| Lane | CSV SHA-256 | Frontier logits SHA-256 | Decode evidence SHA-256 |
+| --- | --- | --- | --- |
+| 33 + 8 | `7e545bb9eb10e5e64143793416a7ea45ff89a0b374d29e1316ca1d5f7e5e1431` | `2b7a9559a7afb48addd345f20a2495efa60c74b0bac7d787b7ff6446b5e7fc8d` | `daadf654c78a22200d3e74bbdc68d08e2b4fa0d825242c3e2336f7fdc2cbaf8c` |
+| 128 + 16 | `1ce1873f1362f129b2adb63f44a4dad5d6fc5eea5b4ed23839324e4797bdbe20` | `c66812e6aa99ca6b450a8af7092a9dfd9d44ac957f4ee8396b94da626beb5c4c` | `d1392d510b53e8ff60b95491c4b062e459a49ce31bd9637d8dda34e2ec7df3d7` |
+
+The frontier logits were finite, selecting token 54 at 33 tokens and token 14 at
+128 tokens. The decode evidence then contained `[54, 0, 0, 0, 0, 0, 0, 0]` and
+`[14, 0, ...]`, respectively, and all 129,280 final logits in each file were
+non-finite (`null` in JSON). Thus every decode timing above is invalid.
+
+This is a pre-existing explicit-cache phase bug, not an affine2 effect. An
+explicit `--ssd-streaming-cache-experts 517` bypasses the AUTO cache planner,
+leaving the four DeepSeek phase targets at zero. The post-prefill transition is
+still called, reduces the configured cache from 517 to zero, and the first
+decode evaluation performs no expert loads before producing non-finite logits.
+Git history attributes the unconditional transition to `0432c121`. Fixing that
+cache policy is intentionally kept out of this planner/dispatch correction.
+
+One minimal 33 + 2 discriminant, labelled
+`battery-power_exploratory-unqualified_ctx33_g2_p50_ssd-auto`, then omitted the
+explicit cache and preload, letting the qualified AUTO policy select 4,387
+records (28.92 GiB; 29.95 GiB total planned). It used this updated
+implementation identity:
+
+| Item | AUTO discriminant identity |
+| --- | --- |
+| Source parent | `97f7a19e5361f0c74454d39fe3db4f2e56e246c4` |
+| Code-only dirty diff SHA-256 | `6bdd4a539c8444a9e454da4b9ccebaf98a529826ffe55b2d4fb1f1c3578f7fe5` |
+| `ds4-bench` SHA-256 | `ad7c4dddfbee051fc3262b6cf03898d7f26bbd34949630241ce25412165fe0df` |
+| Runtime Metal source SHA-256 | `96a7d8a4f37593fc1153d359de99ca40dfd9e0d8a146b289ff0600bd1b928c67` |
+
+The AUTO lane produced tokens `[54, 93729]`, final argmax 14, and 129,280
+finite final logits. Its prefill frontier file is byte-identical to the failed
+33-token lane, isolating the break after prefill. Decode recorded an 83.91% hit
+rate, 83 loads/evictions, and 0.547119 GiB over 249 `pread` calls. The measured
+2.81 prefill and 0.32 decode tok/s remain non-promotable because this was one
+two-token, duty-capped, battery-powered process with no control arm.
+
+AUTO scratch identities were CSV
+`7abf54beecd83334e7df328d3d954ebdd86dbf2c507afb36360c6f9dcce7c2bc`,
+frontier logits
+`2b7a9559a7afb48addd345f20a2495efa60c74b0bac7d787b7ff6446b5e7fc8d`,
+and decode evidence
+`bfbbf26af9bf7730023b8e1dd8382047400bcbd7376fb187bf3ed7649cbe3311`.
+Battery fell from 21% to 20%; free-memory bottomed at 34%, wired memory peaked
+at 2,114,499 16 KiB pages (32.265 GiB), and `Swapouts` remained `660581`.
+
 ## Required experiment before reconsideration
 
 1. Implement a fail-closed writer/verifier with full donor and base provenance,
@@ -230,19 +380,22 @@ below the estimated 94.2 GiB output plus safe conversion scratch.
 2. Resolve the resident-versus-SSD contract before model admission. Add C and
    Python fixtures plus store -> `pread` -> cache -> address table -> routed MoE
    end-to-end tests and AUTO/resident/SSD startup tests.
-3. Align the C mapping plan and Metal dispatch. First compare current
-   full-layer prepare against mandatory selected-only mapping without changing
-   the affine kernels. Add separate counters for layer-prepare bytes, cache
-   loader bytes, and physical disk I/O.
-4. Run the official continuation scorer against the pinned donor, preserve
+3. Validate the now-shared C/Metal selected-address decision on the physical
+   affine2 artifact at every required frontier. Prove that no full-layer
+   prepare occurs, and add separate counters for layer-prepare bytes, cache
+   loader bytes, and physical disk I/O before interpreting performance.
+4. Fix and independently validate the pre-existing explicit-cache transition
+   that can reduce a DeepSeek decode cache to zero; make non-finite logits fail
+   closed before using explicit cache controls in a benchmark cohort.
+5. Run the official continuation scorer against the pinned donor, preserve
    greedy evidence, and qualify the quantization independently of timing.
-5. On AC power with no competing inference process and zero swapout, run
+6. On AC power with no competing inference process and zero swapout, run
    isolated cold and warm A/B/B/A cohorts at 128, 2,048, 8,192, and 32,768,
    each with at least 128 greedy decode tokens. Use both the prose and
    security/coding prompts at 32K. Record plan, control drift, within-arm
    spread, TPOT p50/p95, route uniqueness, cache hits/misses/evictions,
    `pread` calls/bytes/time, layer-prepare bytes, pressure, and swap.
-6. If the correction touches shared SSD/Metal policy, repeat the required
+7. If the correction touches shared SSD/Metal policy, repeat the required
    DeepSeek, GLM, and Qwen regression matrices. A synthetic kernel win may
    reject or justify further work, but may not promote the runtime.
 

@@ -3214,7 +3214,43 @@ static void test_metal_kernel_group(void) {
 }
 
 static void test_metal_qwen35_expert_pack(void) {
+    char *saved_batch_disable = test_save_env(
+        "DS4_METAL_DISABLE_STREAMING_PREFILL_BATCH_SELECTED_ADDR");
+    char *saved_addr_disable = test_save_env(
+        "DS4_METAL_DISABLE_STREAMING_EXPERT_ADDR_TABLE");
+    char *saved_batch_enable = test_save_env(
+        "DS4_METAL_ENABLE_STREAMING_PREFILL_BATCH_SELECTED_ADDR");
+    char *saved_batch_min = test_save_env(
+        "DS4_METAL_STREAMING_PREFILL_BATCH_SELECTED_ADDR_MIN");
+    char *saved_batch_max = test_save_env(
+        "DS4_METAL_STREAMING_PREFILL_BATCH_SELECTED_ADDR_MAX");
+    char *saved_clamped = test_save_env("DS4_METAL_MOE_WRITE_CLAMPED_ACT");
+    char *saved_pair_disable = test_save_env(
+        "DS4_METAL_DISABLE_ROUTED_PAIR_SWIGLU_FUSION");
+    setenv("DS4_METAL_DISABLE_STREAMING_PREFILL_BATCH_SELECTED_ADDR", "1", 1);
+    setenv("DS4_METAL_DISABLE_STREAMING_EXPERT_ADDR_TABLE", "1", 1);
     TEST_ASSERT(ds4_gpu_internal_qwen35_expert_pack_test() != 0);
+    unsetenv("DS4_METAL_DISABLE_STREAMING_PREFILL_BATCH_SELECTED_ADDR");
+    unsetenv("DS4_METAL_DISABLE_STREAMING_EXPERT_ADDR_TABLE");
+    unsetenv("DS4_METAL_ENABLE_STREAMING_PREFILL_BATCH_SELECTED_ADDR");
+    unsetenv("DS4_METAL_STREAMING_PREFILL_BATCH_SELECTED_ADDR_MIN");
+    unsetenv("DS4_METAL_STREAMING_PREFILL_BATCH_SELECTED_ADDR_MAX");
+    unsetenv("DS4_METAL_MOE_WRITE_CLAMPED_ACT");
+    unsetenv("DS4_METAL_DISABLE_ROUTED_PAIR_SWIGLU_FUSION");
+    TEST_ASSERT(ds4_gpu_internal_deepseek_prefill_planner_test(false, 0u) != 0);
+    test_restore_env("DS4_METAL_DISABLE_STREAMING_PREFILL_BATCH_SELECTED_ADDR",
+                     saved_batch_disable);
+    test_restore_env("DS4_METAL_DISABLE_STREAMING_EXPERT_ADDR_TABLE",
+                     saved_addr_disable);
+    test_restore_env("DS4_METAL_ENABLE_STREAMING_PREFILL_BATCH_SELECTED_ADDR",
+                     saved_batch_enable);
+    test_restore_env("DS4_METAL_STREAMING_PREFILL_BATCH_SELECTED_ADDR_MIN",
+                     saved_batch_min);
+    test_restore_env("DS4_METAL_STREAMING_PREFILL_BATCH_SELECTED_ADDR_MAX",
+                     saved_batch_max);
+    test_restore_env("DS4_METAL_MOE_WRITE_CLAMPED_ACT", saved_clamped);
+    test_restore_env("DS4_METAL_DISABLE_ROUTED_PAIR_SWIGLU_FUSION",
+                     saved_pair_disable);
     TEST_ASSERT(ds4_gpu_internal_deepseek_affine2_kernel_test() != 0);
     TEST_ASSERT(ds4_gpu_internal_expert_store_v2_kernel_test() != 0);
 }

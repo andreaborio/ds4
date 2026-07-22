@@ -350,11 +350,7 @@ static id<MTLBuffer> g_qwen35_expert_pack_resident_buffers[
 static void ds4_gpu_qwen35_expert_pack_state_reset(void);
 
 static uint64_t ds4_gpu_stream_up_expert_bytes(uint64_t gate_expert_bytes) {
-    if (g_qwen35_expert_pack.active &&
-        g_qwen35_expert_pack.storage_format ==
-            DS4_EXPERT_STORE_STORAGE_MLX_AFFINE2 &&
-        g_qwen35_expert_pack.group_size ==
-            DS4_EXPERT_STORE_GROUP_PROFILE_AFFINE2_G32_U64_D64) {
+    if (ds4_gpu_expert_store_v2_requires_selected_addr()) {
         return DS4_DEEPSEEK_AFFINE2_UP_EXPERT_BYTES;
     }
     return gate_expert_bytes;
@@ -9901,6 +9897,21 @@ int ds4_gpu_expert_store_v2_layer_span(
     return 1;
 }
 
+int ds4_gpu_expert_store_v2_requires_selected_addr(void) {
+    const ds4_gpu_qwen35_expert_pack_state *pack = &g_qwen35_expert_pack;
+    return pack->active && pack->embedded_v2 &&
+           pack->storage_format == DS4_EXPERT_STORE_STORAGE_MLX_AFFINE2 &&
+           pack->group_size ==
+               DS4_EXPERT_STORE_GROUP_PROFILE_AFFINE2_G32_U64_D64;
+}
+
+int ds4_gpu_expert_store_v2_selected_addr_required(
+        uint32_t n_tokens,
+        bool     ssd_streaming) {
+    return n_tokens > 0u && ssd_streaming &&
+           ds4_gpu_expert_store_v2_requires_selected_addr();
+}
+
 int ds4_gpu_expert_store_v2_install(
         int                                  fd,
         uint64_t                             file_size,
@@ -12405,6 +12416,13 @@ static int ds4_gpu_stream_compact_addr_requested(void) {
 }
 
 static int ds4_gpu_stream_expert_addr_table_requested(void) {
+    /* The disable flag is a bisect for optional layouts.  Affine2 has no
+     * alternate byte interpretation, so a selected-batch build must still
+     * publish real addresses instead of silently leaving zero-filled slots. */
+    const bool mandatory_affine2 =
+        g_stream_prefill_batch_selected_addr_building &&
+        ds4_gpu_expert_store_v2_selected_addr_required(
+            1u, g_ssd_streaming_mode != 0);
     return g_ssd_streaming_mode &&
            (getenv("DS4_METAL_ENABLE_STREAMING_EXPERT_ADDR_TABLE") != NULL ||
             getenv("DS4_METAL_ENABLE_STREAMING_EXPERT_HIT_VALIDATOR") != NULL ||
@@ -12414,7 +12432,8 @@ static int ds4_gpu_stream_expert_addr_table_requested(void) {
             (getenv("DS4_METAL_ENABLE_STREAMING_PREFILL_BATCH_SELECTED_ADDR") != NULL &&
              getenv("DS4_METAL_DISABLE_STREAMING_PREFILL_BATCH_SELECTED_ADDR") == NULL) ||
             ds4_gpu_stream_expert_split_requested()) &&
-           getenv("DS4_METAL_DISABLE_STREAMING_EXPERT_ADDR_TABLE") == NULL;
+           (mandatory_affine2 ||
+            getenv("DS4_METAL_DISABLE_STREAMING_EXPERT_ADDR_TABLE") == NULL);
 }
 
 static int ds4_gpu_stream_expert_addr_table_kernel_requested(void) {
@@ -35797,11 +35816,23 @@ int ds4_gpu_internal_qwen35_expert_pack_test(void) {
             &affine_resolved_bytes) != 1 ||
         affine_resolved_record != affine_boundary_physical ||
         affine_resolved_bytes != affine_record_bytes ||
-        affine_boundary_physical + affine_record_bytes != affine_file_size) {
+        affine_boundary_physical + affine_record_bytes != affine_file_size ||
+        !ds4_gpu_expert_store_v2_requires_selected_addr() ||
+        !ds4_gpu_internal_deepseek_prefill_planner_test(
+            true, affine_model_size)) {
         goto cleanup;
     }
+    const int affine_saved_ssd_streaming = g_ssd_streaming_mode;
+    ds4_gpu_set_ssd_streaming(true);
+    g_stream_prefill_batch_selected_addr_building++;
+    const int affine_addr_table_requested =
+        ds4_gpu_stream_expert_addr_table_requested();
+    g_stream_prefill_batch_selected_addr_building--;
+    ds4_gpu_set_ssd_streaming(affine_saved_ssd_streaming != 0);
+    if (!affine_addr_table_requested) goto cleanup;
     ds4_gpu_expert_store_v2_clear();
     installed = 0;
+    if (ds4_gpu_expert_store_v2_requires_selected_addr()) goto cleanup;
     ok = 1;
 
 cleanup:
@@ -35871,12 +35902,16 @@ static int ds4_gpu_internal_deepseek_affine2_stream_policy_test(void) {
         (gate_row), 3145728u, 1280u, 2621440u, 640u, 2621440u, \
         4096u, 2048u, 4096u, (ssd), (addr))
     const int ok =
+        DS4_TEST_AFFINE2_PATH(0u, true, true, 1536u) == 0 &&
         DS4_TEST_AFFINE2_PATH(1u, true, true, 1536u) == 1 &&
-        DS4_TEST_AFFINE2_PATH(31u, true, true, 1536u) == 1 &&
+        DS4_TEST_AFFINE2_PATH(2u, true, true, 1536u) == 1 &&
         DS4_TEST_AFFINE2_PATH(32u, true, true, 1536u) == 1 &&
         DS4_TEST_AFFINE2_PATH(255u, true, true, 1536u) == 1 &&
         DS4_TEST_AFFINE2_PATH(256u, true, true, 1536u) == 1 &&
+        DS4_TEST_AFFINE2_PATH(760u, true, true, 1536u) == 1 &&
+        DS4_TEST_AFFINE2_PATH(761u, true, true, 1536u) == 1 &&
         DS4_TEST_AFFINE2_PATH(2048u, true, true, 1536u) == 1 &&
+        DS4_TEST_AFFINE2_PATH(4096u, true, true, 1536u) == 1 &&
         DS4_TEST_AFFINE2_PATH(256u, false, true, 1536u) == 0 &&
         DS4_TEST_AFFINE2_PATH(256u, true, false, 1536u) == 0 &&
         DS4_TEST_AFFINE2_PATH(256u, true, true, 1535u) == 0;
@@ -36979,11 +37014,10 @@ int ds4_gpu_qwen35_routed_moe_batch_select_tensor(
             DS4_EXPERT_STORE_STORAGE_MLX_AFFINE4 &&
         g_qwen35_expert_pack.group_size == 64u;
     const bool deepseek_affine2_store =
-        g_qwen35_expert_pack.active &&
-        g_qwen35_expert_pack.storage_format ==
-            DS4_EXPERT_STORE_STORAGE_MLX_AFFINE2 &&
-        g_qwen35_expert_pack.group_size ==
-            DS4_EXPERT_STORE_GROUP_PROFILE_AFFINE2_G32_U64_D64;
+        ds4_gpu_expert_store_v2_requires_selected_addr() != 0;
+    const bool deepseek_affine2_selected_addr_required =
+        ds4_gpu_expert_store_v2_selected_addr_required(
+            n_tokens, g_ssd_streaming_mode != 0);
     const bool deepseek_affine2_stream_admitted = deepseek_affine2_store &&
         ds4_gpu_deepseek_affine2_stream_admitted(
             n_tokens, n_total_expert, n_expert, gate_type, down_type,
@@ -36991,7 +37025,8 @@ int ds4_gpu_qwen35_routed_moe_batch_select_tensor(
             up_row_bytes, up_expert_bytes,
             down_row_bytes, down_expert_bytes,
             expert_in_dim, expert_mid_dim, out_dim,
-            g_ssd_streaming_mode, true);
+            g_ssd_streaming_mode,
+            deepseek_affine2_selected_addr_required);
     if (deepseek_affine2_store &&
         (!deepseek_affine2_stream_admitted ||
          up_tensor_bytes != UINT64_C(671088640))) {
@@ -37221,7 +37256,7 @@ int ds4_gpu_qwen35_routed_moe_batch_select_tensor(
         uint64_t expert_major_down_inner = 0;
         uint64_t expert_major_stride = 0;
         const bool batch_selected_addr_enabled =
-            deepseek_affine2_store ||
+            deepseek_affine2_selected_addr_required ||
             ds4_gpu_stream_prefill_batch_selected_addr_enabled(n_tokens,
                                                                n_total_expert,
                                                                n_expert,
@@ -37296,7 +37331,8 @@ int ds4_gpu_qwen35_routed_moe_batch_select_tensor(
                 (g_moe_mul_mv_addr_q4_k_pair_swiglu_pipeline != nil &&
                  g_moe_mul_mv_addr_q4_k_sum6_pipeline != nil));
         const bool use_deepseek_affine2_selected_addr =
-            deepseek_affine2_store && batch_selected_addr_enabled;
+            deepseek_affine2_selected_addr_required &&
+            batch_selected_addr_enabled;
         const bool use_stream_batch_selected_addr =
             use_iq2_batch_selected_addr ||
             use_qwen_q4_batch_selected_addr ||

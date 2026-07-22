@@ -86,6 +86,14 @@ int ds4_gpu_expert_store_v2_layer_span(
         uint64_t model_size,
         uint64_t *offset,
         uint64_t *size);
+/* Some validated physical stores have no safe full-layer or resident
+ * interpretation.  The mapping planner and Metal dispatcher both use these
+ * queries so store metadata, rather than duplicated tensor heuristics, is the
+ * authority for mandatory selected-address execution. */
+int ds4_gpu_expert_store_v2_requires_selected_addr(void);
+int ds4_gpu_expert_store_v2_selected_addr_required(
+        uint32_t n_tokens,
+        bool     ssd_streaming);
 int ds4_gpu_expert_store_v2_enable_resident(void);
 void ds4_gpu_expert_store_v2_clear(void);
 int ds4_gpu_set_model_map_range(const void *model_map, uint64_t model_size, uint64_t map_offset, uint64_t map_size, uint64_t max_tensor_bytes);
@@ -1646,6 +1654,11 @@ int ds4_gpu_internal_qwen35_expert_pack_test(void);
 int ds4_gpu_internal_expert_store_v2_kernel_test(void);
 /* Exact MLX affine2 selected-address projections for decode and prefill. */
 int ds4_gpu_internal_deepseek_affine2_kernel_test(void);
+/* C-side mapping/prepare policy regressions.  The true arm is called while the
+ * sparse affine2 store is installed; false covers the unchanged IQ2 limits. */
+int ds4_gpu_internal_deepseek_prefill_planner_test(
+        bool     affine2_store_installed,
+        uint64_t affine2_model_size);
 
 /* =========================================================================
  * Hyper-Connection Kernels.
