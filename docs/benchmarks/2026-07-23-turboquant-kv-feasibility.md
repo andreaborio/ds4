@@ -1,7 +1,8 @@
 # TurboQuant KV cross-engine feasibility — 2026-07-23
 
-Status: active Qwen research evidence; measured on the 32 GiB M1 Pro lane,
-not promoted as a production speed or universal-RAM claim.
+Status: active Qwen research evidence; measured on the 16 GiB and 32 GiB
+M1 Pro lanes, not promoted as a production speed, quality, or universal-RAM
+claim.
 
 ## Decision
 
@@ -237,14 +238,119 @@ The result is nevertheless useful for the original feasibility question:
 packed resident storage remains bounded enough to execute 100K on the 32 GiB
 M1 Pro, whereas F32 resident is already rejected at 32K.
 
-## 16 GiB LAN Status
+## 16 GiB M1 Pro SSD Cohorts
 
-The 16 GiB M1 Pro is identified as `macbookpro.lan` / `192.168.1.212`.
-The host still answers ICMP and is present in ARP, but TCP/22 times out. A
-magic packet did not restore Remote Login. The earlier direct-link endpoint
-`169.254.83.36`, previously used with the same physical Mac, is also
-unreachable. No source was copied and no benchmark was started there.
+Remote Login returned on the LAN host at `192.168.1.212`. The physical host is
+an Apple M1 Pro with 16 GiB unified memory, running macOS 26.5 build `25F71`
+and connected to AC power. It had 93.75 MiB of pre-existing swap allocation,
+so the runner used the cumulative `vm_stat` swapout counter as the invalidation
+signal. Every retained arm completed with zero new swapouts.
 
-This is an external access blocker, not permission to substitute the
-32 GiB/Tailscale machine or the local M5. The 16 GiB fresh-process SSD cohort
-remains required as soon as either LAN endpoint returns.
+The isolated remote source commit is
+`264904f210b555f98f42080b7bb30a78b5f6e80e`, created from local research
+commit `61b75cc`. The benchmark binary SHA-256 is
+`8d0692012d4f0348ffa01b4cbddad2c36989bc63a3b6bc1760822220780ac504`.
+The model is the same `20,808,566,880`-byte artifact used on the 32 GiB lane,
+with SHA-256
+`dd17266185833a9f05531ce366fd7284ddca1ed64aa3dcf06e321e8c72c9ea3d`.
+Before the model-backed cohort, `make kv-quant-test`, `make ds4_test`,
+`ds4_test --metal-kernels`, and the `ds4-bench` build passed on this host.
+All retained Metal strategies passed the decoded-cache reference fixture:
+direct paths were within `4.48e-09`, and F16-staged Flash was within
+`5.16e-06`.
+
+Each model-backed arm used a fresh process, explicit SSD streaming, a
+one-second pressure/swap watchdog, and no preload. The guard terminated an arm
+if free-memory pressure fell below 20%, a new swapout appeared, or the 32K
+runtime exceeded 30 minutes. No valid arm triggered it. Two setup attempts are
+not evidence: one ran from the wrong working directory and failed before Metal
+or model allocation; another was immediately terminated after a monitor-shell
+error, before inference and without a swapout.
+
+### Short and adaptive-policy observations
+
+The 128-token smoke completed baseline and TQ4 `auto` with zero swapouts.
+Baseline/TQ4 prefill was 35.12/57.85 tok/s, decode was 12.06/12.07 tok/s, and
+task footprint was 4.88/4.87 GiB. The baseline was the cold first process and
+the adaptive expert-cache plans differed, so this is a compatibility smoke,
+not a speed A/B.
+
+At 2K, normal SSD policy reinvested the TQ4 memory saving in the expert cache:
+the baseline settled at 2,881 cached experts while every TQ4 arm settled at
+3,521. This is valid end-to-end AUTO behavior, but it is not a same-plan
+comparison:
+
+| 2K policy / strategy | Expert cache | Prefill tok/s | Decode tok/s | Task footprint |
+| --- | ---: | ---: | ---: | ---: |
+| F32 adaptive baseline | 2,881 | 157.61 | 14.15 | 5.47 GiB |
+| TQ4 `auto` | 3,521 | 221.03 | 14.08 | 6.47 GiB |
+| TQ4 `flash` | 3,521 | 221.29 | 14.49 | 6.46 GiB |
+| TQ4 `split` | 3,521 | 221.62 | 13.90 | 6.47 GiB |
+| TQ4 `parallel` | 3,521 | 219.96 | 13.47 | 6.46 GiB |
+| TQ4 `reuse8` | 3,521 | 221.15 | 11.07 | 6.47 GiB |
+| TQ4 `serial` | 3,521 | 221.22 | 8.44 | 6.46 GiB |
+
+All TQ4 strategies produced the same full-logit artifact. Their relative
+decode result is therefore execution-policy evidence, while the F32/TQ4 task
+footprints above mainly show how AUTO spends available RAM.
+
+### Exact-cache 2K and 8K comparisons
+
+Fixing both paths to exactly 2,881 expert entries produces a clean 2K pair.
+F32/TQ4 Flash measured 158.32/221.90 prefill tok/s and 14.33/14.19 decode
+tok/s. Runtime tensors fell from 722.76 to 648.60 MiB and task footprint from
+5.47 to 5.41 GiB. TQ4 therefore saved 74.16 MiB of live runtime tensors,
+increased prefill by 40.16% through its Flash path, and reduced decode by
+0.98%. Both arms had zero swapout delta.
+
+The complete exact-cache 8K matrix was:
+
+| 8K strategy | Prefill tok/s | Decode tok/s | Decode vs F32 | Runtime tensors | Task footprint | Pressure minimum |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| F32 baseline | 93.88 | 13.12 | control | 962.78 MiB | 5.74 GiB | 34% |
+| TQ4 `auto` | 276.00 | 12.64 | -3.66% | 679.33 MiB | 5.50 GiB | 36% |
+| TQ4 `flash` | 275.16 | 12.80 | -2.44% | 679.33 MiB | 5.50 GiB | 36% |
+| TQ4 `split` | 277.05 | 12.22 | -6.86% | 679.33 MiB | 5.51 GiB | 36% |
+| TQ4 `parallel` | 277.04 | 10.10 | -23.02% | 679.33 MiB | 5.50 GiB | 36% |
+| TQ4 `reuse8` | 278.58 | 6.23 | -52.52% | 679.33 MiB | 5.51 GiB | 36% |
+| TQ4 `serial` | 276.87 | 3.79 | -71.11% | 679.33 MiB | 5.50 GiB | 36% |
+
+All arms completed with zero new swapouts and all TQ4 strategies again emitted
+byte-identical full-logit artifacts. The packed path saved 283.45 MiB, or
+29.44%, of live runtime tensors. Flash scratch grew from 2.75 to 50.93 MiB,
+but task footprint still fell by about 0.24 GiB. The large prefill increase is
+the combined packed-cache/Flash research path versus the pre-M5 F32 SSD path;
+it must not be generalized to resident mode or another SoC.
+
+### Exact-cache 32K comparison
+
+The 32K pair used capacity 32,897, exactly 2,881 expert entries, and 128 greedy
+decode tokens:
+
+| 32K path | Prefill tok/s | Decode tok/s | Runtime tensors live / peak | Task footprint | Scratch | Pressure minimum | Wall time |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| F32 baseline | 29.18 | 10.67 | 1,922.88 / 2,497.94 MiB | 6.68 GiB | 2.75 MiB | 25% | 1,136 s |
+| TQ4 Flash | 231.77 | 10.16 | 802.23 / 1,377.30 MiB | 5.77 GiB | 195.02 MiB | 36% | 155 s |
+
+Both completed without a guard, competing process, or new swapout. TQ4 saved
+1,120.65 MiB of live and peak runtime tensors, reduced reported task footprint
+by 0.91 GiB, and raised minimum free-memory pressure by 11 percentage points
+despite 192.27 MiB of additional Flash staging scratch. Persistent runtime
+preflight fell from 3.28 to 2.19 GiB. Prefill was 7.94 times baseline, while
+decode was 4.78% slower.
+
+The 32K frontier argmax remained identical. Top-set overlap was 5/5, 18/20,
+60/64, and 97/100; full-vocabulary RMSE was `0.16947`, MAE `0.13516`, and
+maximum absolute movement `0.87727`. Greedy generation nevertheless first
+diverged at token 9 of 128. This is explicit lossy-quality evidence and blocks
+promotion without the required continuation-NLL and cross-model qualification.
+
+### 16 GiB interpretation
+
+The 16 GiB lane confirms that packed KV creates material memory headroom and
+that Flash is the only retained M1 policy close to the F32 decode rate. It also
+explains why deleting other strategies before the M5 comparison would be
+premature: the M1 ordering is consistent at 2K, 8K, and 32K, but it says
+nothing definitive about M5 scheduling. No implementation is removed, and no
+production default, admission rule, or snapshot format changes from these
+cohorts.

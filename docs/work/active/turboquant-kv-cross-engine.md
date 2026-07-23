@@ -121,9 +121,10 @@
 - The 64 GiB M5 Pro development host is reserved for another thread's model
   lane. This task runs only model-free commands there.
 - The 16 GiB M1 Pro is the LAN lane at `192.168.1.212`
-  (`macbookpro.lan`). It responds to ICMP, but TCP/22 is currently
-  unreachable; do not start or copy until SSH is available and the host is
-  re-probed.
+  (`macbookpro.lan`). Remote Login is restored. The isolated source and result
+  roots, relative to the remote home directory, are
+  `BEEP/ds4-tq4-kv-16g-20260723/src` and
+  `BEEP/ds4-tq4-kv-16g-20260723/results`.
 - The 32 GiB lane is the Tailscale benchmark Mac
   `cescos-macbook-pro-1` (`100.99.235.116`). It is authenticated through the
   active SSH control connection and is an M1 Pro with 32 GiB, on AC.
@@ -146,22 +147,33 @@
   201.79/12.13 and 161.81/9.43 tok/s respectively. Minimum pressure fell to
   19% and 16%, so these are functional exploratory/OOB gates only and cannot
   promote the candidate.
-- The LAN endpoint was retried after the 32 GiB connection was restored.
-  ICMP/ARP are present but TCP/22 still times out. A LAN magic packet did not
-  restore Remote Login. The earlier direct-link endpoint `169.254.83.36` is
-  also unreachable. Once either route is reachable, re-probe power, pressure,
-  swapout, free disk, artifact identity, checkout isolation, and absence of a
-  DS4 process.
+- The 16 GiB source commit is
+  `264904f210b555f98f42080b7bb30a78b5f6e80e`, synchronized from local
+  `61b75cc`; the binary SHA-256 is
+  `8d0692012d4f0348ffa01b4cbddad2c36989bc63a3b6bc1760822220780ac504`.
+  The host is an M1 Pro on AC running macOS 26.5 build `25F71`. Its Qwen
+  artifact matches the 32 GiB cohort SHA-256 `dd172661...c9ea3d`.
+- All retained Metal strategies and model-free gates available before model
+  loading pass on 16 GiB. Fresh-process 2K and exact-cache 8K matrices
+  completed with zero new swapouts. At exact-cache 8K, TQ4 saved 283.45 MiB
+  of live runtime tensors; Flash decode was 2.44% below F32 while `split`,
+  `parallel`, `reuse8`, and `serial` lost 6.86%, 23.02%, 52.52%, and 71.11%.
+- The exact-cache 32K pair also completed with zero new swapouts. F32/TQ4
+  Flash prefill was 29.18/231.77 tok/s and decode 10.67/10.16 tok/s. TQ4
+  reduced live runtime tensors from 1,922.88 to 802.23 MiB, task footprint
+  from 6.68 to 5.77 GiB, and raised minimum free pressure from 25% to 36%.
+  The 32K argmax was stable, but greedy output diverged at token 9; this
+  remains unqualified lossy research.
 - Run only one model process per host. Qwen uses AUTO/SSD on 16 GiB and
   AUTO/resident on 32 GiB; DeepSeek/GLM follow the support contract, and GLM
   resident must continue to fail closed.
 
 ## Next Safe Action
 
-Preserve the completed 32 GiB 2K/8K/32K/65K/100K artifacts. As soon as TCP/22
-returns, stage the same source on the 16 GiB LAN host and run fresh-process SSD
-controls before advancing only through pressure-safe frontiers. Compare the
-retained strategies on M5 when its isolated inference lane becomes available.
-Production allocation, snapshots, and default dispatch remain unchanged until
-the complete qualification matrix succeeds; strategy removal happens only
-after that hardware decision.
+Preserve the completed 16 GiB SSD and 32 GiB resident artifacts. Compare every
+retained strategy on M5 when its isolated inference lane becomes available,
+then make the execution-policy decision from the combined hardware evidence.
+The shared cache contract still requires real DeepSeek and GLM implementations
+and qualified model runs before any promotion. Production allocation,
+snapshots, admission, and default dispatch remain unchanged until that matrix
+succeeds; strategy removal happens only after the hardware decision.
