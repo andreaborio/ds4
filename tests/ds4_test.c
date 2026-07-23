@@ -3,7 +3,6 @@
 #include "../ds4_server.c"
 #ifndef DS4_NO_GPU
 #include "../ds4_gpu.h"
-#include "../ds4_kv_quant.h"
 #include "../ds4_qwen.h"
 #include <math.h>
 #ifdef __APPLE__
@@ -895,14 +894,9 @@ static void test_metal_qwen35_graph_state(void) {
     TEST_ASSERT(graph_size > 0);
     if (graph_size == 0) return;
 
-    char *saved_tq4 = test_save_env("DS4_QWEN_KV_TQ4");
-    unsetenv("DS4_QWEN_KV_TQ4");
     uint8_t *graph = calloc(1, graph_size);
     TEST_ASSERT(graph != NULL);
-    if (!graph) {
-        test_restore_env("DS4_QWEN_KV_TQ4", saved_tq4);
-        return;
-    }
+    if (!graph) return;
 
     uint64_t allocated = UINT64_MAX;
     TEST_ASSERT(!ds4_internal_qwen35_gpu_graph_alloc(
@@ -1104,85 +1098,6 @@ static void test_metal_qwen35_graph_state(void) {
     TEST_ASSERT(cleared);
     ds4_internal_qwen35_gpu_graph_free(graph, graph_size);
     free(graph);
-    test_restore_env("DS4_QWEN_KV_TQ4", saved_tq4);
-}
-
-static void test_metal_qwen35_tq4_graph_state(void) {
-    const uint32_t ctx_capacity = 3u;
-    const size_t graph_size = ds4_internal_qwen35_gpu_graph_size();
-    TEST_ASSERT(graph_size > 0u);
-    if (graph_size == 0u) return;
-
-    uint8_t *baseline_graph = calloc(1u, graph_size);
-    uint8_t *tq4_graph = calloc(1u, graph_size);
-    TEST_ASSERT(baseline_graph != NULL && tq4_graph != NULL);
-    if (!baseline_graph || !tq4_graph) {
-        free(baseline_graph);
-        free(tq4_graph);
-        return;
-    }
-
-    char *saved_tq4 = test_save_env("DS4_QWEN_KV_TQ4");
-    uint64_t baseline_bytes = 0u;
-    uint64_t tq4_bytes = 0u;
-    unsetenv("DS4_QWEN_KV_TQ4");
-    TEST_ASSERT(ds4_internal_qwen35_gpu_graph_alloc(
-        baseline_graph, graph_size, ctx_capacity));
-    TEST_ASSERT(ds4_internal_qwen35_gpu_graph_allocated_bytes(
-        baseline_graph, graph_size, &baseline_bytes));
-
-    TEST_ASSERT(setenv("DS4_QWEN_KV_TQ4", "1", 1) == 0);
-    TEST_ASSERT(ds4_internal_qwen35_gpu_graph_alloc(
-        tq4_graph, graph_size, ctx_capacity));
-    TEST_ASSERT(ds4_internal_qwen35_gpu_graph_allocated_bytes(
-        tq4_graph, graph_size, &tq4_bytes));
-
-    const uint64_t key_vector_bytes =
-        ds4_kv_tq4_key_bytes(QWEN35_N_HEAD_DIM);
-    const uint64_t value_vector_bytes =
-        ds4_kv_tq4_value_bytes(QWEN35_N_HEAD_DIM);
-    const uint64_t key_layer_bytes =
-        (uint64_t)ctx_capacity * QWEN35_N_HEAD_KV * key_vector_bytes;
-    const uint64_t value_layer_bytes =
-        (uint64_t)ctx_capacity * QWEN35_N_HEAD_KV * value_vector_bytes;
-    const uint64_t f32_layer_bytes =
-        2ull * ctx_capacity * QWEN35_N_HEAD_KV *
-        QWEN35_N_HEAD_DIM * sizeof(float);
-    const uint64_t expected_tq4_bytes =
-        baseline_bytes -
-        (uint64_t)QWEN35_FULL_ATTENTION_LAYER_COUNT * f32_layer_bytes +
-        (uint64_t)QWEN35_FULL_ATTENTION_LAYER_COUNT *
-            (key_layer_bytes + value_layer_bytes);
-    TEST_ASSERT(key_vector_bytes == 130u);
-    TEST_ASSERT(value_vector_bytes == 132u);
-    TEST_ASSERT(tq4_bytes == expected_tq4_bytes);
-    TEST_ASSERT(tq4_bytes < baseline_bytes);
-
-    for (uint32_t il = 0u; il < QWEN35_N_LAYER; il++) {
-        ds4_gpu_tensor *state[4] = {0};
-        TEST_ASSERT(ds4_internal_qwen35_gpu_graph_layer_state(
-            tq4_graph, graph_size, il, state));
-        if (ds4_qwen35_layer_is_full_attention(il)) {
-            TEST_ASSERT(ds4_gpu_tensor_bytes(state[0]) == key_layer_bytes);
-            TEST_ASSERT(ds4_gpu_tensor_bytes(state[1]) == value_layer_bytes);
-        }
-    }
-    TEST_ASSERT(ds4_internal_qwen35_gpu_graph_reset(
-        tq4_graph, graph_size));
-    for (uint32_t il = 0u; il < QWEN35_N_LAYER; il++) {
-        if (!ds4_qwen35_layer_is_full_attention(il)) continue;
-        ds4_gpu_tensor *state[4] = {0};
-        TEST_ASSERT(ds4_internal_qwen35_gpu_graph_layer_state(
-            tq4_graph, graph_size, il, state));
-        TEST_ASSERT(test_metal_tensor_is_all_zero(state[0]));
-        TEST_ASSERT(test_metal_tensor_is_all_zero(state[1]));
-    }
-
-    ds4_internal_qwen35_gpu_graph_free(baseline_graph, graph_size);
-    ds4_internal_qwen35_gpu_graph_free(tq4_graph, graph_size);
-    test_restore_env("DS4_QWEN_KV_TQ4", saved_tq4);
-    free(baseline_graph);
-    free(tq4_graph);
 }
 
 static void test_metal_qwen35_primitives(void) {
@@ -2182,248 +2097,6 @@ static void test_metal_qwen35_primitives(void) {
     }
 
     free(model_raw);
-}
-
-static void test_metal_qwen35_tq4_attention(void) {
-    enum {
-        /* Cross both the 64-key tile and 2048-key split-K frontiers with a
-         * short non-zero-prefix chunk. This covers packed-to-F16 staging,
-         * tail padding, causal masking, tiled prefill, and split-K decode
-         * without making the query side of the fixture quadratic. */
-        POSITION0 = 2046,
-        N_TOKEN = 3,
-        N_KV = POSITION0 + N_TOKEN,
-        N_QUERY_HEAD = 16,
-        N_KV_HEAD = 2,
-        HEAD_DIM = 256,
-        LAYER_INDEX = 3,
-        QUERY_ROW_N = N_QUERY_HEAD * HEAD_DIM,
-        QUERY_N = N_TOKEN * QUERY_ROW_N,
-        CACHE_ROW_N = N_KV_HEAD * HEAD_DIM,
-        CACHE_N = N_KV * CACHE_ROW_N,
-        KEY_VECTOR_BYTES = HEAD_DIM / 2 + 2,
-        VALUE_VECTOR_BYTES = HEAD_DIM / 2 + 4,
-        KEY_ROW_BYTES = N_KV_HEAD * KEY_VECTOR_BYTES,
-        VALUE_ROW_BYTES = N_KV_HEAD * VALUE_VECTOR_BYTES,
-        KEY_CACHE_BYTES = N_KV * KEY_ROW_BYTES,
-        VALUE_CACHE_BYTES = N_KV * VALUE_ROW_BYTES,
-    };
-    const uint32_t seed = 42u + LAYER_INDEX * 1337u;
-    float *query = malloc((size_t)QUERY_N * sizeof(*query));
-    float *key = malloc((size_t)CACHE_N * sizeof(*key));
-    float *value = malloc((size_t)CACHE_N * sizeof(*value));
-    float *decoded_key = malloc((size_t)CACHE_N * sizeof(*decoded_key));
-    float *decoded_value = malloc((size_t)CACHE_N * sizeof(*decoded_value));
-    float *expected = malloc((size_t)QUERY_N * sizeof(*expected));
-    float *actual = malloc((size_t)QUERY_N * sizeof(*actual));
-    float *decode_actual =
-        malloc((size_t)QUERY_ROW_N * sizeof(*decode_actual));
-    float *zero = calloc((size_t)QUERY_N, sizeof(*zero));
-    uint8_t *packed_key = malloc(KEY_CACHE_BYTES);
-    uint8_t *packed_value = malloc(VALUE_CACHE_BYTES);
-    TEST_ASSERT(query && key && value && decoded_key && decoded_value &&
-                expected && actual && decode_actual && zero &&
-                packed_key && packed_value);
-    if (!query || !key || !value || !decoded_key || !decoded_value ||
-        !expected || !actual || !decode_actual || !zero ||
-        !packed_key || !packed_value) {
-        goto cleanup_host;
-    }
-
-    for (size_t i = 0u; i < QUERY_N; i++) {
-        query[i] =
-            0.23f * sinf((float)(i + 1u) * 0.013f) -
-            0.07f * cosf((float)(i + 5u) * 0.021f);
-    }
-    for (size_t i = 0u; i < CACHE_N; i++) {
-        key[i] =
-            0.19f * cosf((float)(i + 2u) * 0.017f) +
-            0.05f * sinf((float)(i + 7u) * 0.023f);
-        value[i] =
-            0.41f * sinf((float)(i + 3u) * 0.011f) -
-            0.09f * cosf((float)(i + 11u) * 0.019f);
-    }
-
-    ds4_gpu_tensor *key_cache_gpu =
-        ds4_gpu_tensor_alloc(KEY_CACHE_BYTES);
-    ds4_gpu_tensor *value_cache_gpu =
-        ds4_gpu_tensor_alloc(VALUE_CACHE_BYTES);
-    ds4_gpu_tensor *prefix_key_gpu =
-        test_metal_tensor_from_f32(key, POSITION0 * CACHE_ROW_N);
-    ds4_gpu_tensor *prefix_value_gpu =
-        test_metal_tensor_from_f32(value, POSITION0 * CACHE_ROW_N);
-    ds4_gpu_tensor *tail_key_gpu = test_metal_tensor_from_f32(
-        key + POSITION0 * CACHE_ROW_N, N_TOKEN * CACHE_ROW_N);
-    ds4_gpu_tensor *tail_value_gpu = test_metal_tensor_from_f32(
-        value + POSITION0 * CACHE_ROW_N, N_TOKEN * CACHE_ROW_N);
-    TEST_ASSERT(key_cache_gpu && value_cache_gpu &&
-                prefix_key_gpu && prefix_value_gpu &&
-                tail_key_gpu && tail_value_gpu);
-    if (!key_cache_gpu || !value_cache_gpu ||
-        !prefix_key_gpu || !prefix_value_gpu ||
-        !tail_key_gpu || !tail_value_gpu) {
-        goto cleanup_gpu_store;
-    }
-
-    TEST_ASSERT(ds4_gpu_qwen35_tq4_store_tensor(
-        key_cache_gpu, value_cache_gpu,
-        prefix_key_gpu, prefix_value_gpu,
-        0u, POSITION0, N_KV_HEAD, HEAD_DIM, LAYER_INDEX));
-    TEST_ASSERT(ds4_gpu_qwen35_tq4_store_tensor(
-        key_cache_gpu, value_cache_gpu,
-        tail_key_gpu, tail_value_gpu,
-        POSITION0, N_TOKEN, N_KV_HEAD, HEAD_DIM, LAYER_INDEX));
-    TEST_ASSERT(ds4_gpu_tensor_read(
-        key_cache_gpu, 0u, packed_key, KEY_CACHE_BYTES));
-    TEST_ASSERT(ds4_gpu_tensor_read(
-        value_cache_gpu, 0u, packed_value, VALUE_CACHE_BYTES));
-
-    {
-        float scratch[HEAD_DIM];
-        float reference_key[HEAD_DIM];
-        uint8_t expected_key[KEY_VECTOR_BYTES];
-        uint8_t expected_value[VALUE_VECTOR_BYTES];
-        for (uint32_t token = 0u; token < N_KV; token++) {
-            for (uint32_t head = 0u; head < N_KV_HEAD; head++) {
-                const size_t vector =
-                    (size_t)token * N_KV_HEAD + head;
-                const float *key_source =
-                    key + vector * HEAD_DIM;
-                const float *value_source =
-                    value + vector * HEAD_DIM;
-                const uint8_t *key_source_packed =
-                    packed_key + vector * KEY_VECTOR_BYTES;
-                const uint8_t *value_source_packed =
-                    packed_value + vector * VALUE_VECTOR_BYTES;
-                TEST_ASSERT(ds4_kv_tq4_key_encode_reference(
-                    expected_key, sizeof(expected_key),
-                    key_source, HEAD_DIM, seed,
-                    scratch, HEAD_DIM));
-                TEST_ASSERT(ds4_kv_tq4_key_decode_reference(
-                    reference_key, HEAD_DIM,
-                    expected_key, sizeof(expected_key),
-                    seed, scratch, HEAD_DIM));
-                TEST_ASSERT(ds4_kv_tq4_key_decode_reference(
-                    decoded_key + vector * HEAD_DIM, HEAD_DIM,
-                    key_source_packed, KEY_VECTOR_BYTES,
-                    seed, scratch, HEAD_DIM));
-                double dot = 0.0;
-                double reference_norm2 = 0.0;
-                double metal_norm2 = 0.0;
-                for (uint32_t dim = 0u; dim < HEAD_DIM; dim++) {
-                    const double reference = reference_key[dim];
-                    const double metal =
-                        decoded_key[vector * HEAD_DIM + dim];
-                    dot += reference * metal;
-                    reference_norm2 += reference * reference;
-                    metal_norm2 += metal * metal;
-                }
-                const double cosine =
-                    dot / sqrt(reference_norm2 * metal_norm2);
-                TEST_ASSERT(cosine > 0.999);
-
-                TEST_ASSERT(ds4_kv_tq4_value_encode_reference(
-                    expected_value, sizeof(expected_value),
-                    value_source, HEAD_DIM));
-                TEST_ASSERT(memcmp(
-                    expected_value, value_source_packed,
-                    VALUE_VECTOR_BYTES) == 0);
-                TEST_ASSERT(ds4_kv_tq4_value_decode_reference(
-                    decoded_value + vector * HEAD_DIM, HEAD_DIM,
-                    value_source_packed, VALUE_VECTOR_BYTES));
-            }
-        }
-    }
-
-    {
-        float score[N_KV];
-        for (uint32_t token = 0u; token < N_TOKEN; token++) {
-            TEST_ASSERT(ds4_qwen35_cpu_gqa_decode_f32(
-                expected + token * QUERY_ROW_N,
-                score,
-                POSITION0 + token + 1u,
-                query + token * QUERY_ROW_N,
-                decoded_key,
-                decoded_value,
-                POSITION0 + token + 1u,
-                N_QUERY_HEAD,
-                N_KV_HEAD,
-                HEAD_DIM));
-        }
-    }
-
-    {
-        ds4_gpu_tensor *query_gpu =
-            test_metal_tensor_from_f32(query, QUERY_N);
-        ds4_gpu_tensor *out_gpu =
-            test_metal_tensor_from_f32(zero, QUERY_N);
-        ds4_gpu_tensor *decode_query_gpu = test_metal_tensor_from_f32(
-            query + (N_TOKEN - 1u) * QUERY_ROW_N, QUERY_ROW_N);
-        ds4_gpu_tensor *decode_out_gpu =
-            test_metal_tensor_from_f32(zero, QUERY_ROW_N);
-        TEST_ASSERT(query_gpu && out_gpu &&
-                    decode_query_gpu && decode_out_gpu);
-        if (query_gpu && out_gpu && decode_query_gpu && decode_out_gpu) {
-            TEST_ASSERT(ds4_gpu_qwen35_tq4_gqa_prefill_tensor(
-                out_gpu, query_gpu, key_cache_gpu, value_cache_gpu,
-                POSITION0, N_TOKEN, N_QUERY_HEAD, N_KV_HEAD,
-                HEAD_DIM, LAYER_INDEX));
-            if (test_metal_read_f32(out_gpu, actual, QUERY_N)) {
-                test_metal_qwen35_close(
-                    "Qwen TQ4 GQA prefill",
-                    actual, expected, QUERY_N, 7.0e-4f, 7.0e-4f);
-            }
-
-            static const char *const strategies[] = {
-                "auto", "serial", "parallel", "split", "reuse8", "flash",
-            };
-            char *saved_strategy =
-                test_save_env("DS4_QWEN_TQ4_DECODE");
-            for (size_t i = 0u;
-                 i < sizeof(strategies) / sizeof(strategies[0]); i++) {
-                setenv("DS4_QWEN_TQ4_DECODE", strategies[i], 1);
-                TEST_ASSERT(ds4_gpu_qwen35_tq4_gqa_decode_tensor(
-                    decode_out_gpu, decode_query_gpu,
-                    key_cache_gpu, value_cache_gpu,
-                    N_KV, N_QUERY_HEAD, N_KV_HEAD,
-                    HEAD_DIM, LAYER_INDEX));
-                if (test_metal_read_f32(
-                        decode_out_gpu, decode_actual, QUERY_ROW_N)) {
-                    test_metal_qwen35_close(
-                        strategies[i],
-                        decode_actual,
-                        expected + (N_TOKEN - 1u) * QUERY_ROW_N,
-                        QUERY_ROW_N, 7.0e-4f, 7.0e-4f);
-                }
-            }
-            test_restore_env(
-                "DS4_QWEN_TQ4_DECODE", saved_strategy);
-        }
-        ds4_gpu_tensor_free(query_gpu);
-        ds4_gpu_tensor_free(out_gpu);
-        ds4_gpu_tensor_free(decode_query_gpu);
-        ds4_gpu_tensor_free(decode_out_gpu);
-    }
-
-cleanup_gpu_store:
-    ds4_gpu_tensor_free(key_cache_gpu);
-    ds4_gpu_tensor_free(value_cache_gpu);
-    ds4_gpu_tensor_free(prefix_key_gpu);
-    ds4_gpu_tensor_free(prefix_value_gpu);
-    ds4_gpu_tensor_free(tail_key_gpu);
-    ds4_gpu_tensor_free(tail_value_gpu);
-cleanup_host:
-    free(query);
-    free(key);
-    free(value);
-    free(decoded_key);
-    free(decoded_value);
-    free(expected);
-    free(actual);
-    free(decode_actual);
-    free(zero);
-    free(packed_key);
-    free(packed_value);
 }
 
 #ifdef __APPLE__
@@ -3530,14 +3203,12 @@ static void test_metal_q4_selected_slots_runtime_count(void) {
 
 static void test_metal_kernel_group(void) {
     test_metal_qwen35_graph_state();
-    test_metal_qwen35_tq4_graph_state();
     test_metal_f16_matvec_fast_nr0_4();
     test_metal_f16_prefill_matmul();
     test_metal_f32_router_prefill_matmul();
     test_metal_q8_0_prefill_matmul();
     test_metal_glm_compact_indexer_warmup_mapping();
     test_metal_qwen35_primitives();
-    test_metal_qwen35_tq4_attention();
     TEST_ASSERT(ds4_gpu_internal_qwen35_expert_group_test() != 0);
     test_metal_q4_selected_slots_runtime_count();
 }

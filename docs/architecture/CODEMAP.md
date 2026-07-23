@@ -35,7 +35,6 @@ not acquire tensor, ExpertMajor, or Metal-kernel ownership.
 | `ds4_expert_store.[ch]` | Embedded ExpertMajor store metadata, validation, and indexed range access |
 | `ds4_ssd.[ch]` | SSD residency and read-policy support shared with the runtime |
 | `ds4_profile.[ch]` | Metal/SSD profiling records and summaries |
-| `ds4_kv_quant.[ch]` | Internal cross-engine KV surface geometry and deterministic TQ4 conformance reference; production cache ownership remains model-specific |
 | `ds4_kvstore.[ch]` | Disk-backed server/agent KV checkpoint store |
 | `ds4_help.[ch]` | Shared structured command help and centralized rejection of retired CLI flags |
 
@@ -134,10 +133,6 @@ worded as a current instruction.
   relevant kernels, gold gates, and family tests.
 - SSD/cache behavior: inspect `ds4_ssd.*`, ExpertMajor access in `ds4.c`, Metal
   ExpertMajor wrappers, profiling, and SSD/model tests.
-- Packed KV work: read
-  [`KV_QUANTIZATION.md`](KV_QUANTIZATION.md), then inspect
-  `ds4_kv_quant.*` and the owning Qwen, DeepSeek, or GLM graph. The shared
-  module does not authorize cross-family tensor reinterpretation.
 - Tokenizer/template: inspect tokenizer sections in `ds4.c`, Qwen Unicode code,
   golden vectors, server rendering, and API tests.
 - Server/session behavior: inspect `ds4_server.c`, `ds4_kvstore.*`, public

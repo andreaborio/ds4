@@ -32,7 +32,7 @@ PROGRAMS := ds4 ds4-server ds4-bench ds4-eval ds4-agent
 	metal build-isolation-test q4k-dot-test qwen-metadata-test \
 	qwen-reference-test qwen-unicode-test qwen-tokenizer-test \
 	qwen-expert-group-test expert-store-test metal-ssd-profile-test \
-	kv-quant-test download-model-test $(PROGRAMS) ds4_test ds4_agent_test
+	download-model-test $(PROGRAMS) ds4_test ds4_agent_test
 
 download-model-test: tests/test_download_model.sh download_model.sh
 	sh tests/test_download_model.sh
@@ -50,8 +50,8 @@ CPU_BINDIR := $(BUILD_ROOT)/$(CPU_PROFILE)/bin
 
 METAL_LDLIBS := $(LDLIBS) -framework Foundation -framework Metal
 
-METAL_CORE_OBJS := $(addprefix $(METAL_OBJDIR)/,ds4.o ds4_build.o ds4_ssd.o ds4_profile.o ds4_expert_store.o ds4_kv_quant.o ds4_qwen.o ds4_qwen_unicode.o ds4_qwen_expert_group.o ds4_metal.o)
-CPU_CORE_OBJS := $(addprefix $(CPU_OBJDIR)/,ds4.o ds4_build.o ds4_ssd.o ds4_profile.o ds4_expert_store.o ds4_kv_quant.o ds4_qwen.o ds4_qwen_unicode.o)
+METAL_CORE_OBJS := $(addprefix $(METAL_OBJDIR)/,ds4.o ds4_build.o ds4_ssd.o ds4_profile.o ds4_expert_store.o ds4_qwen.o ds4_qwen_unicode.o ds4_qwen_expert_group.o ds4_metal.o)
+CPU_CORE_OBJS := $(addprefix $(CPU_OBJDIR)/,ds4.o ds4_build.o ds4_ssd.o ds4_profile.o ds4_expert_store.o ds4_qwen.o ds4_qwen_unicode.o)
 
 METAL_BINS := $(addprefix $(METAL_BINDIR)/,$(PROGRAMS))
 CPU_BINS := $(addprefix $(CPU_BINDIR)/,$(PROGRAMS))
@@ -68,7 +68,6 @@ METAL_TEST_BINS := \
 	$(METAL_BINDIR)/test_qwen_unicode \
 	$(METAL_BINDIR)/test_qwen_tokenizer \
 	$(METAL_BINDIR)/test_qwen_expert_group \
-	$(METAL_BINDIR)/test_kv_quant \
 	$(METAL_BINDIR)/test_expert_store \
 	$(METAL_BINDIR)/test_metal_ssd_profile \
 	$(METAL_BINDIR)/test_ssd_residency
@@ -165,10 +164,10 @@ $(METAL_OBJDIR)/%.o: %.c
 # the dependency explicit as well as in the generated .d file so incremental
 # builds remain correct before dependency metadata exists.
 $(METAL_OBJDIR)/ds4.o: runtime/ds4_glm_graph.inc \
-		runtime/ds4_deepseek_cache_phase.inc ds4_kv_quant.h
+		runtime/ds4_deepseek_cache_phase.inc
 
 $(CPU_OBJDIR)/ds4.o: runtime/ds4_glm_graph.inc \
-		runtime/ds4_deepseek_cache_phase.inc ds4_kv_quant.h
+		runtime/ds4_deepseek_cache_phase.inc
 
 $(CPU_OBJDIR)/%.o: %.c
 	@mkdir -p "$(@D)"
@@ -204,7 +203,7 @@ $(CPU_OBJDIR)/ds4_qwen_unicode.o: ds4_qwen_unicode.c ds4_qwen_unicode.h \
 	$(CC) $(CFLAGS) -DDS4_NO_GPU $(DEPFLAGS) -c -o $@ $<
 
 $(METAL_OBJDIR)/ds4_test_core.o: ds4.c ds4.h ds4_ssd.h ds4_profile.h \
-		ds4_gpu.h ds4_kv_quant.h ds4_qwen.h ds4_expert_store.h \
+		ds4_gpu.h ds4_qwen.h ds4_expert_store.h \
 		ds4_qwen_unicode.h ds4_streaming_hotlist.inc \
 		tests/internal/ds4_qwen_cpu_test_hooks.h
 	@mkdir -p "$(@D)"
@@ -247,7 +246,7 @@ $(METAL_OBJDIR)/test_q4k_top8.o: tests/test_q4k_top8.c \
 		-DDS4_TEST_HOOKS -I. -c -o $@ $<
 
 $(METAL_OBJDIR)/test_qwen_session.o: tests/test_qwen_session.c ds4.c ds4.h \
-		ds4_ssd.h ds4_profile.h ds4_gpu.h ds4_kv_quant.h ds4_qwen.h \
+		ds4_ssd.h ds4_profile.h ds4_gpu.h ds4_qwen.h \
 		ds4_qwen_unicode.h runtime/ds4_glm_graph.inc \
 		runtime/ds4_deepseek_cache_phase.inc
 	@mkdir -p "$(@D)"
@@ -255,8 +254,7 @@ $(METAL_OBJDIR)/test_qwen_session.o: tests/test_qwen_session.c ds4.c ds4.h \
 		-Wno-unused-function -Wno-unused-parameter -I. -c -o $@ $<
 
 $(METAL_OBJDIR)/test_qwen_tokenizer.o: tests/test_qwen_tokenizer.c ds4.c \
-		ds4.h ds4_kvstore.h ds4_ssd.h ds4_profile.h ds4_gpu.h \
-		ds4_kv_quant.h ds4_qwen.h \
+		ds4.h ds4_kvstore.h ds4_ssd.h ds4_profile.h ds4_gpu.h ds4_qwen.h \
 		ds4_qwen_unicode.h tests/qwen/qwen36_tokenizer_fixture.inc
 	@mkdir -p "$(@D)"
 	$(CC) $(CFLAGS) $(QWEN_CFLAGS) $(DEPFLAGS) -DDS4_NO_GPU \
@@ -271,18 +269,6 @@ $(METAL_OBJDIR)/test_qwen_expert_group.o: tests/test_qwen_expert_group.c \
 		ds4_qwen_expert_group.h
 	@mkdir -p "$(@D)"
 	$(CC) $(CFLAGS) $(DEPFLAGS) -I. -c -o $@ $<
-
-$(METAL_OBJDIR)/test_kv_quant.o: tests/test_kv_quant.c ds4_kv_quant.h
-	@mkdir -p "$(@D)"
-	$(CC) $(CFLAGS) $(DEPFLAGS) -I. -c -o $@ $<
-
-$(METAL_OBJDIR)/ds4_kv_quant.o: ds4_kv_quant.c ds4_kv_quant.h
-	@mkdir -p "$(@D)"
-	$(CC) $(CFLAGS) $(DEPFLAGS) -c -o $@ $<
-
-$(CPU_OBJDIR)/ds4_kv_quant.o: ds4_kv_quant.c ds4_kv_quant.h
-	@mkdir -p "$(@D)"
-	$(CC) $(CFLAGS) -DDS4_NO_GPU $(DEPFLAGS) -c -o $@ $<
 
 $(METAL_OBJDIR)/test_expert_store.o: tests/test_expert_store.c \
 		ds4_expert_store.h
@@ -341,7 +327,6 @@ $(METAL_BINDIR)/test_q4k_top8: \
 		$(METAL_OBJDIR)/ds4_ssd.o \
 		$(METAL_OBJDIR)/ds4_profile.o \
 		$(METAL_OBJDIR)/ds4_expert_store.o \
-		$(METAL_OBJDIR)/ds4_kv_quant.o \
 		$(METAL_OBJDIR)/ds4_qwen.o $(METAL_OBJDIR)/ds4_qwen_unicode.o
 	@mkdir -p "$(@D)"
 	$(CC) $(CFLAGS) -o $@ $^ $(LDLIBS)
@@ -351,7 +336,6 @@ $(METAL_BINDIR)/test_qwen_session: \
 		$(METAL_OBJDIR)/ds4_ssd.o \
 		$(METAL_OBJDIR)/ds4_profile.o \
 		$(METAL_OBJDIR)/ds4_expert_store.o \
-		$(METAL_OBJDIR)/ds4_kv_quant.o \
 		$(METAL_OBJDIR)/ds4_qwen.o $(METAL_OBJDIR)/ds4_qwen_unicode.o
 	@mkdir -p "$(@D)"
 	$(CC) $(CFLAGS) -o $@ $^ $(LDLIBS)
@@ -362,7 +346,6 @@ $(METAL_BINDIR)/test_qwen_tokenizer: \
 		$(METAL_OBJDIR)/ds4_ssd.o \
 		$(METAL_OBJDIR)/ds4_profile.o \
 		$(METAL_OBJDIR)/ds4_expert_store.o \
-		$(METAL_OBJDIR)/ds4_kv_quant.o \
 		$(METAL_OBJDIR)/ds4_qwen.o $(METAL_OBJDIR)/ds4_qwen_unicode.o
 	@mkdir -p "$(@D)"
 	$(CC) $(CFLAGS) -o $@ $^ $(LDLIBS)
@@ -400,11 +383,6 @@ $(METAL_BINDIR)/test_qwen_expert_group: \
 	@mkdir -p "$(@D)"
 	$(CC) $(CFLAGS) -o $@ $^ $(LDLIBS)
 
-$(METAL_BINDIR)/test_kv_quant: \
-		$(METAL_OBJDIR)/test_kv_quant.o $(METAL_OBJDIR)/ds4_kv_quant.o
-	@mkdir -p "$(@D)"
-	$(CC) $(CFLAGS) -o $@ $^ $(LDLIBS)
-
 $(METAL_BINDIR)/test_expert_store: \
 		$(METAL_OBJDIR)/test_expert_store.o \
 		$(METAL_OBJDIR)/ds4_expert_store.o
@@ -418,10 +396,6 @@ $(METAL_BINDIR)/test_metal_ssd_profile: \
 	$(CC) $(CFLAGS) -o $@ $^ $(LDLIBS)
 
 qwen-expert-group-test: $(METAL_BINDIR)/test_qwen_expert_group
-	$<
-
-kv-quant-test: $(METAL_BINDIR)/test_kv_quant
-	python3 tests/gen_kv_quant_centroids.py --check
 	$<
 
 expert-store-test: $(METAL_BINDIR)/test_expert_store
@@ -474,7 +448,6 @@ model-free-test: metal ds4_test ds4_agent_test $(METAL_BINDIR)/test_q4k_dot \
 		$(METAL_BINDIR)/test_qwen_unicode \
 		$(METAL_BINDIR)/test_qwen_tokenizer \
 		$(METAL_BINDIR)/test_qwen_expert_group \
-		$(METAL_BINDIR)/test_kv_quant \
 		$(METAL_BINDIR)/test_expert_store \
 		$(METAL_BINDIR)/test_metal_ssd_profile \
 		$(METAL_BINDIR)/test_ssd_residency download-model-test
@@ -494,8 +467,6 @@ model-free-test: metal ds4_test ds4_agent_test $(METAL_BINDIR)/test_q4k_dot \
 	$(METAL_BINDIR)/test_qwen_unicode
 	$(METAL_BINDIR)/test_qwen_tokenizer
 	$(METAL_BINDIR)/test_qwen_expert_group
-	python3 tests/gen_kv_quant_centroids.py --check
-	$(METAL_BINDIR)/test_kv_quant
 	DS4_EXPERT_STORE_PROBE=$(METAL_BINDIR)/test_expert_store \
 		python3 tests/test_expert_major.py
 	$(METAL_BINDIR)/test_metal_ssd_profile
@@ -537,8 +508,7 @@ else
 
 CFLAGS += -D_GNU_SOURCE -fno-finite-math-only
 CPU_CORE_OBJS := ds4_cpu.o ds4_build_cpu.o ds4_ssd.o \
-	ds4_profile.o ds4_expert_store.o ds4_kv_quant.o ds4_qwen.o \
-	ds4_qwen_unicode.o
+	ds4_profile.o ds4_expert_store.o ds4_qwen.o ds4_qwen_unicode.o
 
 all: cpu
 
@@ -628,17 +598,12 @@ linenoise.o: linenoise.c linenoise.h
 	$(CC) $(CFLAGS) -c -o $@ linenoise.c
 
 ds4_cpu.o: ds4.c ds4.h ds4_ssd.h ds4_profile.h ds4_gpu.h ds4_qwen.h \
-		ds4_expert_store.h ds4_kv_quant.h ds4_qwen_unicode.h \
-		ds4_streaming_hotlist.inc
+		ds4_expert_store.h ds4_qwen_unicode.h ds4_streaming_hotlist.inc
 	$(CC) $(CFLAGS) -DDS4_NO_GPU -c -o $@ ds4.c
 
-ds4_kv_quant.o: ds4_kv_quant.c ds4_kv_quant.h
-	$(CC) $(CFLAGS) -DDS4_NO_GPU -c -o $@ ds4_kv_quant.c
-
 ds4_test_core.o: ds4.c ds4.h ds4_ssd.h ds4_profile.h \
-		ds4_gpu.h ds4_qwen.h ds4_expert_store.h ds4_kv_quant.h \
-		ds4_qwen_unicode.h ds4_streaming_hotlist.inc \
-		tests/internal/ds4_qwen_cpu_test_hooks.h
+		ds4_gpu.h ds4_qwen.h ds4_expert_store.h ds4_qwen_unicode.h \
+		ds4_streaming_hotlist.inc tests/internal/ds4_qwen_cpu_test_hooks.h
 	$(CC) $(CFLAGS) $(QWEN_CFLAGS) -DDS4_NO_GPU -DDS4_TEST_HOOKS \
 		-Wno-unused-function -Wno-unused-parameter -c -o $@ ds4.c
 
@@ -671,7 +636,6 @@ model-free-test: ds4 ds4_test ds4_agent_test ds4-eval q4k-dot-test \
 		tests/test_qwen_gdn_ref tests/test_qwen_attention_ref \
 		tests/test_qwen_state tests/test_qwen_unicode \
 		tests/test_qwen_expert_group \
-		tests/test_kv_quant \
 		tests/test_expert_store \
 		tests/test_metal_ssd_profile \
 		tests/test_ssd_residency download-model-test
@@ -688,8 +652,6 @@ model-free-test: ds4 ds4_test ds4_agent_test ds4-eval q4k-dot-test \
 	./tests/test_qwen_state
 	./tests/test_qwen_unicode
 	./tests/test_qwen_expert_group
-	python3 tests/gen_kv_quant_centroids.py --check
-	./tests/test_kv_quant
 	DS4_EXPERT_STORE_PROBE=./tests/test_expert_store \
 		python3 tests/test_expert_major.py
 	./tests/test_metal_ssd_profile
@@ -728,13 +690,12 @@ test_q4k_top8.o: tests/test_q4k_top8.c \
 		-I. -c -o $@ $<
 
 tests/test_q4k_top8: test_q4k_top8.o ds4_test_core.o ds4_build_cpu.o \
-		ds4_ssd.o ds4_profile.o ds4_expert_store.o ds4_kv_quant.o \
+		ds4_ssd.o ds4_profile.o ds4_expert_store.o \
 		ds4_qwen.o ds4_qwen_unicode.o
 	$(CC) $(CFLAGS) -o $@ $^ $(LDLIBS)
 
 tests/test_qwen_session: tests/test_qwen_session.c ds4.c ds4.h ds4_ssd.h ds4_profile.h \
-		ds4_gpu.h ds4_kv_quant.c ds4_kv_quant.h ds4_qwen.h \
-		ds4_qwen_unicode.h \
+		ds4_gpu.h ds4_qwen.h ds4_qwen_unicode.h \
 		ds4_build.c ds4_ssd.c ds4_profile.c ds4_qwen.c \
 		ds4_qwen_unicode.c ds4_qwen_unicode_data.inc \
 		ds4_streaming_hotlist.inc runtime/ds4_glm_graph.inc \
@@ -742,20 +703,17 @@ tests/test_qwen_session: tests/test_qwen_session.c ds4.c ds4.h ds4_ssd.h ds4_pro
 	$(CC) $(CFLAGS) $(QWEN_CFLAGS) -DDS4_NO_GPU \
 		-Wno-unused-function -Wno-unused-parameter -I. -o $@ \
 		tests/test_qwen_session.c ds4_build.c ds4_ssd.c \
-		ds4_profile.c ds4_kv_quant.c ds4_qwen.c ds4_qwen_unicode.c \
-		$(LDLIBS)
+		ds4_profile.c ds4_qwen.c ds4_qwen_unicode.c $(LDLIBS)
 
 tests/test_qwen_tokenizer: tests/test_qwen_tokenizer.c ds4.c ds4.h \
 		ds4_kvstore.c ds4_kvstore.h ds4_ssd.h ds4_profile.c ds4_profile.h ds4_gpu.h ds4_qwen.h \
-		ds4_kv_quant.c ds4_kv_quant.h ds4_qwen_unicode.h \
-		ds4_build.c ds4_ssd.c \
+		ds4_qwen_unicode.h ds4_build.c ds4_ssd.c \
 		ds4_qwen.c ds4_qwen_unicode.c ds4_qwen_unicode_data.inc \
 		ds4_streaming_hotlist.inc tests/qwen/qwen36_tokenizer_fixture.inc
 	$(CC) $(CFLAGS) $(QWEN_CFLAGS) -DDS4_NO_GPU \
 		-Wno-unused-function -Wno-unused-parameter -I. -o $@ \
 		tests/test_qwen_tokenizer.c ds4_kvstore.c ds4_build.c ds4_ssd.c \
-		ds4_profile.c ds4_kv_quant.c ds4_qwen.c ds4_qwen_unicode.c \
-		$(LDLIBS)
+		ds4_profile.c ds4_qwen.c ds4_qwen_unicode.c $(LDLIBS)
 
 qwen-metadata-test: ds4 tests/test_qwen_metadata.py
 	python3 tests/test_qwen_metadata.py ./ds4
@@ -804,14 +762,6 @@ tests/test_qwen_expert_group: tests/test_qwen_expert_group.c \
 
 qwen-expert-group-test: tests/test_qwen_expert_group
 	./tests/test_qwen_expert_group
-
-tests/test_kv_quant: tests/test_kv_quant.c ds4_kv_quant.c ds4_kv_quant.h
-	$(CC) $(CFLAGS) -I. -o $@ tests/test_kv_quant.c \
-		ds4_kv_quant.c $(LDLIBS)
-
-kv-quant-test: tests/test_kv_quant
-	python3 tests/gen_kv_quant_centroids.py --check
-	./tests/test_kv_quant
 
 tests/test_expert_store: tests/test_expert_store.c ds4_expert_store.c \
 		ds4_expert_store.h

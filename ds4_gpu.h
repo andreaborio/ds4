@@ -895,44 +895,6 @@ int ds4_gpu_qwen35_gqa_prefill_tensor(
         uint32_t              n_kv_head,
         uint32_t              head_dim);
 
-/* Research-only TQ4 v1 path for Qwen full-attention cache rows. The store
- * packs normalized/rotated keys and uniform values directly into persistent
- * byte tensors. Attention consumes those tensors without allocating a global
- * dequantized cache. `layer_index` owns the deterministic sign seed. */
-int ds4_gpu_qwen35_tq4_store_tensor(
-        ds4_gpu_tensor       *key_cache,
-        ds4_gpu_tensor       *value_cache,
-        const ds4_gpu_tensor *key,
-        const ds4_gpu_tensor *value,
-        uint32_t              position0,
-        uint32_t              n_token,
-        uint32_t              n_kv_head,
-        uint32_t              head_dim,
-        uint32_t              layer_index);
-
-int ds4_gpu_qwen35_tq4_gqa_decode_tensor(
-        ds4_gpu_tensor       *out,
-        const ds4_gpu_tensor *query,
-        const ds4_gpu_tensor *key_cache,
-        const ds4_gpu_tensor *value_cache,
-        uint32_t              n_kv,
-        uint32_t              n_query_head,
-        uint32_t              n_kv_head,
-        uint32_t              head_dim,
-        uint32_t              layer_index);
-
-int ds4_gpu_qwen35_tq4_gqa_prefill_tensor(
-        ds4_gpu_tensor       *out,
-        const ds4_gpu_tensor *query,
-        const ds4_gpu_tensor *key_cache,
-        const ds4_gpu_tensor *value_cache,
-        uint32_t              position0,
-        uint32_t              n_token,
-        uint32_t              n_query_head,
-        uint32_t              n_kv_head,
-        uint32_t              head_dim,
-        uint32_t              layer_index);
-
 /* K/V-tile reuse specialization for Qwen's 8:1 grouped-query geometry.  The
  * capability is deliberately separate from policy: an engine resolves it
  * once, combines it with its per-request feature mask, then passes that result

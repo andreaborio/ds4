@@ -7,7 +7,7 @@ because their numbers remain useful.
 
 | Record | Status | Scope |
 | --- | --- | --- |
-| [`2026-07-23-turboquant-kv-feasibility.md`](2026-07-23-turboquant-kv-feasibility.md) | Active feasibility study | Native packed-KV reference/planner, cross-engine surface map, and unqualified Qwen-first allocation estimate |
+| [`2026-07-23-turboquant-kv-feasibility.md`](2026-07-23-turboquant-kv-feasibility.md) | Rejected / archived | Qwen TQ4 evidence on 16/32 GiB plus K16/V32 evidence on 16 GiB; quality/performance rejection and removal decision |
 | [`2026-07-22-deepseek-mlx-affine2-ssd-feasibility.md`](2026-07-22-deepseek-mlx-affine2-ssd-feasibility.md) | Research / HOLD; planner safety fixed, not qualified | MLX affine2 transfer audit for DeepSeek, shared selected-address correction, battery correctness finding, and required promotion gates |
 | [`2026-07-21-qwen-pre-m5-exact-router-tile.md`](2026-07-21-qwen-pre-m5-exact-router-tile.md) | Directional; timing cohort contaminated | Exact F32 router weight reuse on M1 Pro through 8K, rejected approximate predecessor, and pending clean promotion lane |
 | [`2026-07-21-qwen-split-k-hardware-policy.md`](2026-07-21-qwen-split-k-hardware-policy.md) | Current Qwen qualification evidence | F32 split-K A/B at 8K/32K on 64 GiB, transfer validation on 16 GiB, and hardware-aware AUTO validation on 16/32/64 GiB |
