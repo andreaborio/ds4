@@ -51,6 +51,15 @@ not a production inference fallback.
   attention, routing, KV, or generated-output drift.
 - Keep the release path singular. A successful experiment becomes the default
   and loses its flag; a rejected experiment and its scaffolding are removed.
+- Treat working branches as temporary task state. After an experiment is
+  closed, promote its durable conclusion, commit the cleaned terminal state,
+  create and push an annotated
+  `experiments/{accepted,rejected,abandoned}/YYYY-MM-DD-<slug>` tag, verify the
+  exact remote tag object and peeled commit, audit tracked, untracked, and
+  ignored files, and only then remove the clean worktree and working branch.
+  Never archive or delete a dirty, active, shared, or ambiguously owned branch.
+  Follow the complete procedure in
+  [`docs/work/README.md`](docs/work/README.md).
 - Do not add model backward compatibility, sidecars, canonical routed-weight
   fallback, ExpertMajor v1 inference, or admission bypasses.
 - Do not add C++. Objective-C belongs only where Metal requires it.

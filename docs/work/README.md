@@ -52,6 +52,7 @@ promote durable facts to their canonical destination and delete the handoff.
 | Release procedure | `QA_BEFORE_RELEASES.md` |
 | User-visible startup/behavior | README, help, or focused model documentation |
 | Accepted/rejected performance claim | Dated record under `docs/benchmarks/` with reproducible evidence |
+| Identified commit lineages of a closed experiment | Pushed annotated `experiments/...` Git tags; never a substitute for the canonical result document |
 | Fork/upstream boundary | `FORK_NOTES.md` |
 
 Do not copy a canonical checklist into another document. Link to it and record
@@ -68,6 +69,120 @@ only task-specific evidence.
    intentionally retained process.
 6. If the task is merge-ready, perform the pre-merge review below and delete
    the active handoff after knowledge promotion.
+
+## Closing And Archiving Experiment Branches
+
+Working branches and worktrees exist only while their task is active. Preserve
+every identified lineage of a closed experiment with immutable annotated tags,
+then remove its working refs so inactive experiments do not accumulate as
+branches. Use exactly one of these namespaces:
+
+```text
+experiments/accepted/YYYY-MM-DD-<slug>
+experiments/rejected/YYYY-MM-DD-<slug>
+experiments/abandoned/YYYY-MM-DD-<slug>
+```
+
+Use the plain name for the cleaned terminal lineage. If the experiment has a
+side tip that is not its ancestor, preserve it with a descriptive suffix such
+as `-side-<name>` or `-part-<number>` in the same outcome namespace.
+
+The outcome means:
+
+- `accepted`: the qualified result has been promoted to the production path
+  and merged or is otherwise durably reachable from its integration branch;
+- `rejected`: evidence supports a negative decision and all rejected code,
+  flags, tests, and scaffolding have been removed from the terminal commit;
+- `abandoned`: work stopped without an acceptance or rejection claim. The tag
+  preserves provenance, but its contents are not evidence for a product or
+  performance conclusion.
+
+Close an experiment in this order:
+
+1. Resolve the exact branches, worktrees, terminal commit, merge base, owner,
+   and dirty state. Inspect the experiment's branch and worktree refs, relevant
+   branch reflogs, and any known rewritten, reset, detached, or side tips. Stop
+   if another task still owns any part or the intended archive scope is
+   ambiguous. A tag preserves only the ancestors of its target.
+2. Promote durable facts to the canonical documents above, delete the active
+   handoff and experimental residue, complete the applicable review and checks,
+   and commit that cleaned terminal state. An accepted experiment must first
+   reach its intended integration branch; a useful negative performance result
+   must retain its dated `docs/benchmarks/` record.
+3. Confirm the intended tag names are unused locally and remotely, and inspect
+   the selected remote's push URL. Never overwrite or force-update an existing
+   archive tag. Create an annotated primary tag at the terminal commit. Its
+   message records the outcome, decision-record path or reason none exists, and
+   whether runtime code was promoted:
+
+   ```sh
+   git remote get-url --push <remote>
+   git show-ref --verify refs/tags/experiments/<outcome>/YYYY-MM-DD-<slug>
+   git ls-remote --exit-code <remote> \
+     refs/tags/experiments/<outcome>/YYYY-MM-DD-<slug>
+   git tag -a experiments/<outcome>/YYYY-MM-DD-<slug> <commit> \
+     -m "<outcome>, evidence location, and promotion status"
+   ```
+
+   A missing-name check is expected to report no matching ref; any existing
+   local or remote ref must be inspected instead of replaced. For every
+   identified experiment tip, prove it is an ancestor of the primary tag's
+   peeled commit with `git merge-base --is-ancestor`. If it is not, create and
+   document a companion annotated tag for that tip. Do not delete any source
+   ref until every intended tip is reachable from at least one archive tag.
+
+4. Record the local annotated-tag object OID and peeled commit OID. Push only
+   each exact tag to the canonical writable remote, then query the same exact
+   refs with `--exit-code`:
+
+   ```sh
+   git rev-parse refs/tags/experiments/<outcome>/YYYY-MM-DD-<slug>
+   git rev-parse 'refs/tags/experiments/<outcome>/YYYY-MM-DD-<slug>^{}'
+   git push <remote> refs/tags/experiments/<outcome>/YYYY-MM-DD-<slug>
+   git ls-remote --exit-code <remote> \
+     refs/tags/experiments/<outcome>/YYYY-MM-DD-<slug> \
+     'refs/tags/experiments/<outcome>/YYYY-MM-DD-<slug>^{}'
+   ```
+
+   Compare both remote OIDs exactly with the two local OIDs: the first is the
+   annotated tag object and the second is its peeled commit. A missing line,
+   mismatch, unexpected push URL, or pre-existing tag with different annotation
+   blocks deletion. Repeat the reachability and exact-OID checks for every
+   companion tag.
+
+5. Resolve the exact worktree path from `git worktree list --porcelain`. Audit
+   tracked and untracked state with
+   `git status --porcelain=v1 --untracked-files=all`, then separately inspect
+   ignored files with `git status --short --ignored`. Preserve every needed
+   model, log, benchmark artifact, or generated file at its declared retention
+   location outside the worktree. Stop if any file's ownership or retention is
+   uncertain.
+6. Only after all archive refs and files pass those checks, remove the exact
+   worktree without `--force` and delete the local working branch. Delete a
+   remote working branch only when it exists, is conclusively closed, and no
+   collaborator still uses it. Never use a bulk or pattern-based deletion for
+   experiment branches.
+
+Tags in this namespace are immutable archive identities: do not retarget,
+overwrite, or reuse them. Reopen an archived experiment under a new working
+branch:
+
+```sh
+git switch -c codex/<new-task> \
+  experiments/<outcome>/YYYY-MM-DD-<slug>
+```
+
+If a new clone does not fetch an archive tag automatically, fetch that exact
+tag before reopening it:
+
+```sh
+git fetch <remote> \
+  refs/tags/experiments/<outcome>/YYYY-MM-DD-<slug>:refs/tags/experiments/<outcome>/YYYY-MM-DD-<slug>
+```
+
+The pushed tags preserve every explicitly audited implementation lineage
+off-machine and across garbage collection. Canonical Markdown records preserve
+the conclusion; neither one replaces the other.
 
 ## Pre-Merge Review
 
