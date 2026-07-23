@@ -41,6 +41,7 @@
 
 #include "ds4.h"
 #include "ds4_expert_store.h"
+#include "ds4_kv_quant.h"
 #include "ds4_profile.h"
 #include "ds4_qwen.h"
 #include "ds4_qwen_unicode.h"
@@ -14758,6 +14759,70 @@ typedef enum {
 #define QWEN35_PREFILL_MICRO_TOKENS 2048u
 #define QWEN35_RESIDENT_PREFILL_TOKENS 8192u
 
+static bool qwen35_kv_tq4_requested(void) {
+    const char *value = getenv("DS4_QWEN_KV_TQ4");
+    return value && value[0] && strcmp(value, "0") != 0;
+}
+
+static bool qwen35_full_attention_cache_plan(
+        uint32_t           context_tokens,
+        bool               tq4,
+        ds4_kv_plan_total *total) {
+    if (!total || context_tokens == 0u ||
+        context_tokens > QWEN35_CONTEXT_LENGTH) {
+        return false;
+    }
+    *total = (ds4_kv_plan_total){0};
+    const ds4_kv_surface key = {
+        .family = DS4_KV_FAMILY_QWEN35,
+        .kind = DS4_KV_SURFACE_FULL_KEY,
+        .storage = tq4
+            ? DS4_KV_STORAGE_TQ4_KEY : DS4_KV_STORAGE_F32,
+        .layer_count = QWEN35_FULL_ATTENTION_LAYER_COUNT,
+        .capacity_rows = context_tokens,
+        .vectors_per_row = QWEN35_N_HEAD_KV,
+        .vector_dim = QWEN35_N_HEAD_DIM,
+    };
+    ds4_kv_surface value = key;
+    value.kind = DS4_KV_SURFACE_FULL_VALUE;
+    value.storage = tq4
+        ? DS4_KV_STORAGE_TQ4_VALUE : DS4_KV_STORAGE_F32;
+    ds4_kv_surface_plan key_plan = {0};
+    ds4_kv_surface_plan value_plan = {0};
+    return ds4_kv_surface_plan_checked(&key, &key_plan) &&
+           ds4_kv_surface_plan_checked(&value, &value_plan) &&
+           ds4_kv_plan_add_checked(total, &key_plan) &&
+           ds4_kv_plan_add_checked(total, &value_plan);
+}
+
+static bool qwen35_full_attention_layer_cache_bytes(
+        uint32_t  context_tokens,
+        bool      tq4,
+        bool      key,
+        uint64_t *bytes_out) {
+    if (!bytes_out || context_tokens == 0u ||
+        context_tokens > QWEN35_CONTEXT_LENGTH) {
+        return false;
+    }
+    const ds4_kv_surface surface = {
+        .family = DS4_KV_FAMILY_QWEN35,
+        .kind = key
+            ? DS4_KV_SURFACE_FULL_KEY : DS4_KV_SURFACE_FULL_VALUE,
+        .storage = !tq4
+            ? DS4_KV_STORAGE_F32
+            : (key ? DS4_KV_STORAGE_TQ4_KEY
+                   : DS4_KV_STORAGE_TQ4_VALUE),
+        .layer_count = 1u,
+        .capacity_rows = context_tokens,
+        .vectors_per_row = QWEN35_N_HEAD_KV,
+        .vector_dim = QWEN35_N_HEAD_DIM,
+    };
+    ds4_kv_surface_plan plan = {0};
+    if (!ds4_kv_surface_plan_checked(&surface, &plan)) return false;
+    *bytes_out = plan.total_bytes;
+    return true;
+}
+
 /* A suffix that fits one historical micro batch must stay on that path.  In
  * particular, shrinking a warm decode cache for a 2..64 token agent/tool
  * continuation costs more than the macro scheduler can recover. */
@@ -14783,14 +14848,16 @@ static bool qwen35_metal_persistent_runtime_bytes(
     uint64_t context_bytes = 0;
     uint64_t batch_bytes = 0;
     uint64_t total = QWEN35_METAL_GRAPH_NON_BATCH_BYTES;
+    ds4_kv_plan_total cache = {0};
     return context_tokens != 0 && context_tokens <= QWEN35_CONTEXT_LENGTH &&
+           qwen35_full_attention_cache_plan(
+               context_tokens, qwen35_kv_tq4_requested(), &cache) &&
            qwen35_u64_mul(QWEN35_RESIDENT_PREFILL_TOKENS,
                           QWEN35_METAL_GRAPH_BATCH_BYTES_PER_TOKEN,
                           &batch_bytes) &&
            qwen35_u64_add(total, batch_bytes, &total) &&
-           qwen35_u64_mul(context_tokens,
-                          QWEN35_METAL_GRAPH_CONTEXT_BYTES_PER_TOKEN,
-                          &context_bytes) &&
+           qwen35_u64_mul(context_tokens, sizeof(float), &context_bytes) &&
+           qwen35_u64_add(context_bytes, cache.total_bytes, &context_bytes) &&
            qwen35_u64_add(total, context_bytes, &total) &&
            qwen35_u64_add(total, QWEN35_HOST_LOGITS_BYTES, &total) &&
            (*bytes_out = total, true);
@@ -14944,6 +15011,7 @@ typedef struct {
     uint32_t prefill_cap;
     uint32_t n_tokens;
     bool state_valid;
+    bool full_attn_tq4;
 
     /* Reused one-token work tensors. */
     ds4_gpu_tensor *hidden[2];
@@ -14996,8 +15064,9 @@ typedef struct {
     ds4_gpu_tensor *batch_shared_out;
     ds4_gpu_tensor *batch_shared_gate_logit;
 
-    /* Exactly one state kind is live for each model layer.  Full-attention
-     * rows are [context][kv_head][head_dim].  Recurrent state is
+    /* Exactly one state kind is live for each model layer. Full-attention
+     * rows are either F32 [context][kv_head][head_dim] or TQ4 v1 packed
+     * [context][kv_head][vector_stride]. Recurrent state is
      * [value_head][value_dim][key_dim], with value_dim == key_dim == 128. */
     ds4_gpu_tensor *full_attn_key[QWEN35_N_LAYER];
     ds4_gpu_tensor *full_attn_value[QWEN35_N_LAYER];
@@ -15478,9 +15547,22 @@ static bool qwen35_gpu_graph_state_allocated(
 
     uint32_t n_full_attention = 0;
     uint32_t n_recurrent = 0;
+    uint64_t key_cache_bytes = 0;
+    uint64_t value_cache_bytes = 0;
+    if (!qwen35_full_attention_layer_cache_bytes(
+            g->ctx_capacity, g->full_attn_tq4, true, &key_cache_bytes) ||
+        !qwen35_full_attention_layer_cache_bytes(
+            g->ctx_capacity, g->full_attn_tq4, false,
+            &value_cache_bytes)) {
+        return false;
+    }
     for (uint32_t il = 0; il < QWEN35_N_LAYER; il++) {
         if (ds4_qwen35_layer_is_full_attention(il)) {
             if (!g->full_attn_key[il] || !g->full_attn_value[il] ||
+                ds4_gpu_tensor_bytes(g->full_attn_key[il]) !=
+                    key_cache_bytes ||
+                ds4_gpu_tensor_bytes(g->full_attn_value[il]) !=
+                    value_cache_bytes ||
                 g->conv[il] || g->recurrent[il]) {
                 return false;
             }
@@ -15517,15 +15599,27 @@ static bool qwen35_gpu_graph_reset(ds4_qwen35_gpu_graph *g) {
     bool ok = true;
     for (uint32_t il = 0; il < QWEN35_N_LAYER; il++) {
         if (ds4_qwen35_layer_is_full_attention(il)) {
-            const uint64_t elements = (uint64_t)g->ctx_capacity *
-                QWEN35_N_HEAD_KV * QWEN35_N_HEAD_DIM;
-            if (ds4_gpu_tensor_fill_f32(
-                    g->full_attn_key[il], 0.0f, elements) == 0) {
+            uint64_t key_bytes = 0;
+            uint64_t value_bytes = 0;
+            if (!qwen35_full_attention_layer_cache_bytes(
+                    g->ctx_capacity, g->full_attn_tq4, true, &key_bytes) ||
+                !qwen35_full_attention_layer_cache_bytes(
+                    g->ctx_capacity, g->full_attn_tq4, false,
+                    &value_bytes) ||
+                (key_bytes % sizeof(float)) != 0u ||
+                (value_bytes % sizeof(float)) != 0u) {
                 ok = false;
-            }
-            if (ds4_gpu_tensor_fill_f32(
-                    g->full_attn_value[il], 0.0f, elements) == 0) {
-                ok = false;
+            } else {
+                if (ds4_gpu_tensor_fill_f32(
+                        g->full_attn_key[il], 0.0f,
+                        key_bytes / sizeof(float)) == 0) {
+                    ok = false;
+                }
+                if (ds4_gpu_tensor_fill_f32(
+                        g->full_attn_value[il], 0.0f,
+                        value_bytes / sizeof(float)) == 0) {
+                    ok = false;
+                }
             }
         } else {
             const uint64_t conv_elements =
@@ -15630,6 +15724,14 @@ static bool qwen35_gpu_graph_alloc(
     ds4_qwen35_gpu_graph next = {0};
     next.ctx_capacity = ctx_capacity;
     next.prefill_cap = prefill_cap;
+    next.full_attn_tq4 = qwen35_kv_tq4_requested();
+    if (next.full_attn_tq4) {
+        fprintf(stderr,
+                "ds4: Qwen research TQ4 KV cache enabled "
+                "(format=%u key=130B value=132B per 256D KV-head vector; "
+                "no global F32 dequantized cache)\n",
+                DS4_KV_TQ_FORMAT_VERSION);
+    }
 
 #define QWEN35_GPU_ALLOC_F32(field, d0, d1, d2, d3) \
     next.field = qwen35_gpu_tensor_alloc_shape(       \
@@ -15730,10 +15832,26 @@ static bool qwen35_gpu_graph_alloc(
     uint32_t n_recurrent = 0;
     for (uint32_t il = 0; il < QWEN35_N_LAYER; il++) {
         if (ds4_qwen35_layer_is_full_attention(il)) {
-            QWEN35_GPU_ALLOC_F32(full_attn_key[il], ctx_capacity,
-                                 QWEN35_N_HEAD_KV, QWEN35_N_HEAD_DIM, 1);
-            QWEN35_GPU_ALLOC_F32(full_attn_value[il], ctx_capacity,
-                                 QWEN35_N_HEAD_KV, QWEN35_N_HEAD_DIM, 1);
+            if (next.full_attn_tq4) {
+                uint64_t key_bytes = 0;
+                uint64_t value_bytes = 0;
+                if (qwen35_full_attention_layer_cache_bytes(
+                        ctx_capacity, true, true, &key_bytes) &&
+                    qwen35_full_attention_layer_cache_bytes(
+                        ctx_capacity, true, false, &value_bytes)) {
+                    next.full_attn_key[il] =
+                        ds4_gpu_tensor_alloc(key_bytes);
+                    next.full_attn_value[il] =
+                        ds4_gpu_tensor_alloc(value_bytes);
+                }
+            } else {
+                QWEN35_GPU_ALLOC_F32(full_attn_key[il], ctx_capacity,
+                                     QWEN35_N_HEAD_KV,
+                                     QWEN35_N_HEAD_DIM, 1);
+                QWEN35_GPU_ALLOC_F32(full_attn_value[il], ctx_capacity,
+                                     QWEN35_N_HEAD_KV,
+                                     QWEN35_N_HEAD_DIM, 1);
+            }
             n_full_attention++;
         } else {
             QWEN35_GPU_ALLOC_F32(conv[il], QWEN35_SSM_CONV_CHANNEL,
@@ -16363,40 +16481,68 @@ static bool qwen35_gpu_encode_full_attention_one(
     }
     QWEN35_PROFILE_ATTN_STAGE("rope");
 
-    const uint64_t cache_row_values =
-        (uint64_t)QWEN35_N_HEAD_KV * QWEN35_N_HEAD_DIM;
-    const uint64_t cache_row_bytes = cache_row_values * sizeof(float);
-    const uint64_t cache_row_offset = (uint64_t)position * cache_row_bytes;
     if (ok) {
         *state_mutated = true;
-        ok = ds4_gpu_tensor_copy(
-                 graph->full_attn_key[layer_index],
-                 cache_row_offset,
-                 graph->key,
-                 0,
-                 cache_row_bytes) != 0 &&
-             ds4_gpu_tensor_copy(
-                 graph->full_attn_value[layer_index],
-                 cache_row_offset,
-                 graph->value,
-                 0,
-                 cache_row_bytes) != 0;
+        if (graph->full_attn_tq4) {
+            ok = ds4_gpu_qwen35_tq4_store_tensor(
+                     graph->full_attn_key[layer_index],
+                     graph->full_attn_value[layer_index],
+                     graph->key,
+                     graph->value,
+                     position,
+                     1u,
+                     QWEN35_N_HEAD_KV,
+                     QWEN35_N_HEAD_DIM,
+                     layer_index) != 0;
+        } else {
+            const uint64_t cache_row_values =
+                (uint64_t)QWEN35_N_HEAD_KV * QWEN35_N_HEAD_DIM;
+            const uint64_t cache_row_bytes =
+                cache_row_values * sizeof(float);
+            const uint64_t cache_row_offset =
+                (uint64_t)position * cache_row_bytes;
+            ok = ds4_gpu_tensor_copy(
+                     graph->full_attn_key[layer_index],
+                     cache_row_offset,
+                     graph->key,
+                     0,
+                     cache_row_bytes) != 0 &&
+                 ds4_gpu_tensor_copy(
+                     graph->full_attn_value[layer_index],
+                     cache_row_offset,
+                     graph->value,
+                     0,
+                     cache_row_bytes) != 0;
+        }
     }
     QWEN35_PROFILE_ATTN_STAGE("kv_cache");
     int gqa_reuse_used = 0;
     if (ok) {
-        ok = ds4_gpu_qwen35_gqa_decode_select_tensor(
-                 graph->heads,
-                 graph->query,
-                 graph->full_attn_key[layer_index],
-                 graph->full_attn_value[layer_index],
-                 position + 1u,
-                 QWEN35_N_HEAD,
-                 QWEN35_N_HEAD_KV,
-                 QWEN35_N_HEAD_DIM,
-                 gqa_reuse ? 1 : 0,
-                 &gqa_reuse_used) != 0;
-        if (ok && gqa_reuse &&
+        if (graph->full_attn_tq4) {
+            ok = ds4_gpu_qwen35_tq4_gqa_decode_tensor(
+                     graph->heads,
+                     graph->query,
+                     graph->full_attn_key[layer_index],
+                     graph->full_attn_value[layer_index],
+                     position + 1u,
+                     QWEN35_N_HEAD,
+                     QWEN35_N_HEAD_KV,
+                     QWEN35_N_HEAD_DIM,
+                     layer_index) != 0;
+        } else {
+            ok = ds4_gpu_qwen35_gqa_decode_select_tensor(
+                     graph->heads,
+                     graph->query,
+                     graph->full_attn_key[layer_index],
+                     graph->full_attn_value[layer_index],
+                     position + 1u,
+                     QWEN35_N_HEAD,
+                     QWEN35_N_HEAD_KV,
+                     QWEN35_N_HEAD_DIM,
+                     gqa_reuse ? 1 : 0,
+                     &gqa_reuse_used) != 0;
+        }
+        if (ok && !graph->full_attn_tq4 && gqa_reuse &&
             position + 1u >= QWEN35_GQA_REUSE_MIN_CONTEXT &&
             !gqa_reuse_used) {
             ok = false;
@@ -16404,8 +16550,12 @@ static bool qwen35_gpu_encode_full_attention_one(
                 activity(activity_ud, "campaign_invalid",
                          (int)layer_index + 1, QWEN35_N_LAYER);
             }
-        } else if (ok && gqa_reuse_used && activity) {
+        } else if (ok && !graph->full_attn_tq4 &&
+                   gqa_reuse_used && activity) {
             activity(activity_ud, "gqa_reuse",
+                     (int)layer_index + 1, QWEN35_N_LAYER);
+        } else if (ok && graph->full_attn_tq4 && activity) {
+            activity(activity_ud, "kv_tq4",
                      (int)layer_index + 1, QWEN35_N_LAYER);
         }
     }
@@ -16894,41 +17044,71 @@ static bool qwen35_gpu_encode_full_attention_batch(
                  10000000.0f) != 0;
     }
 
-    const uint64_t cache_row_values =
-        (uint64_t)QWEN35_N_HEAD_KV * QWEN35_N_HEAD_DIM;
-    const uint64_t cache_row_bytes = cache_row_values * sizeof(float);
-    const uint64_t cache_offset = (uint64_t)position * cache_row_bytes;
-    const uint64_t cache_bytes = (uint64_t)n_token * cache_row_bytes;
     if (ok) {
         *state_mutated = true;
-        ok = ds4_gpu_tensor_copy(
-                 graph->full_attn_key[layer_index],
-                 cache_offset,
-                 graph->batch_key,
-                 0,
-                 cache_bytes) != 0 &&
-             ds4_gpu_tensor_copy(
-                 graph->full_attn_value[layer_index],
-                 cache_offset,
-                 graph->batch_value,
-                 0,
-                 cache_bytes) != 0;
+        if (graph->full_attn_tq4) {
+            ok = ds4_gpu_qwen35_tq4_store_tensor(
+                     graph->full_attn_key[layer_index],
+                     graph->full_attn_value[layer_index],
+                     graph->batch_key,
+                     graph->batch_value,
+                     position,
+                     n_token,
+                     QWEN35_N_HEAD_KV,
+                     QWEN35_N_HEAD_DIM,
+                     layer_index) != 0;
+        } else {
+            const uint64_t cache_row_values =
+                (uint64_t)QWEN35_N_HEAD_KV * QWEN35_N_HEAD_DIM;
+            const uint64_t cache_row_bytes =
+                cache_row_values * sizeof(float);
+            const uint64_t cache_offset =
+                (uint64_t)position * cache_row_bytes;
+            const uint64_t cache_bytes =
+                (uint64_t)n_token * cache_row_bytes;
+            ok = ds4_gpu_tensor_copy(
+                     graph->full_attn_key[layer_index],
+                     cache_offset,
+                     graph->batch_key,
+                     0,
+                     cache_bytes) != 0 &&
+                 ds4_gpu_tensor_copy(
+                     graph->full_attn_value[layer_index],
+                     cache_offset,
+                     graph->batch_value,
+                     0,
+                     cache_bytes) != 0;
+        }
     }
     int gqa_reuse_used = 0;
     if (ok) {
-        ok = ds4_gpu_qwen35_gqa_prefill_select_tensor(
-                 graph->batch_heads,
-                 graph->batch_query,
-                 graph->full_attn_key[layer_index],
-                 graph->full_attn_value[layer_index],
-                 position,
-                 n_token,
-                 QWEN35_N_HEAD,
-                 QWEN35_N_HEAD_KV,
-                 QWEN35_N_HEAD_DIM,
-                 gqa_reuse ? 1 : 0,
-                 &gqa_reuse_used) != 0;
-        if (ok && gqa_reuse &&
+        if (graph->full_attn_tq4) {
+            ok = ds4_gpu_qwen35_tq4_gqa_prefill_tensor(
+                     graph->batch_heads,
+                     graph->batch_query,
+                     graph->full_attn_key[layer_index],
+                     graph->full_attn_value[layer_index],
+                     position,
+                     n_token,
+                     QWEN35_N_HEAD,
+                     QWEN35_N_HEAD_KV,
+                     QWEN35_N_HEAD_DIM,
+                     layer_index) != 0;
+        } else {
+            ok = ds4_gpu_qwen35_gqa_prefill_select_tensor(
+                     graph->batch_heads,
+                     graph->batch_query,
+                     graph->full_attn_key[layer_index],
+                     graph->full_attn_value[layer_index],
+                     position,
+                     n_token,
+                     QWEN35_N_HEAD,
+                     QWEN35_N_HEAD_KV,
+                     QWEN35_N_HEAD_DIM,
+                     gqa_reuse ? 1 : 0,
+                     &gqa_reuse_used) != 0;
+        }
+        if (ok && !graph->full_attn_tq4 && gqa_reuse &&
             position + n_token >= QWEN35_GQA_REUSE_MIN_CONTEXT &&
             !gqa_reuse_used) {
             ok = false;
@@ -16936,8 +17116,12 @@ static bool qwen35_gpu_encode_full_attention_batch(
                 activity(activity_ud, "campaign_invalid",
                          (int)layer_index + 1, QWEN35_N_LAYER);
             }
-        } else if (ok && gqa_reuse_used && activity) {
+        } else if (ok && !graph->full_attn_tq4 &&
+                   gqa_reuse_used && activity) {
             activity(activity_ud, "gqa_reuse",
+                     (int)layer_index + 1, QWEN35_N_LAYER);
+        } else if (ok && graph->full_attn_tq4 && activity) {
+            activity(activity_ud, "kv_tq4",
                      (int)layer_index + 1, QWEN35_N_LAYER);
         }
     }
@@ -38350,20 +38534,21 @@ static bool ds4_engine_context_memory_estimate_private(
 
     if (e->backend == DS4_BACKEND_METAL) {
         uint64_t persistent_bytes = 0;
+        ds4_kv_plan_total cache = {0};
         if (!qwen35_metal_persistent_runtime_bytes(
-                (uint32_t)ctx_size, &persistent_bytes)) {
+                (uint32_t)ctx_size, &persistent_bytes) ||
+            !qwen35_full_attention_cache_plan(
+                (uint32_t)ctx_size, qwen35_kv_tq4_requested(), &cache) ||
+            persistent_bytes < cache.total_bytes ||
+            persistent_bytes - cache.total_bytes <
+                QWEN35_RECURRENT_SNAPSHOT_BYTES) {
             return false;
         }
         *out = (ds4_context_memory){
-            .raw_bytes =
-                (uint64_t)QWEN35_FULL_ATTENTION_LAYER_COUNT * 2u *
-                QWEN35_N_HEAD_KV * QWEN35_N_HEAD_DIM * sizeof(float) *
-                (uint32_t)ctx_size,
+            .raw_bytes = cache.total_bytes,
             .compressed_bytes = QWEN35_RECURRENT_SNAPSHOT_BYTES,
             .scratch_bytes = persistent_bytes -
-                ((uint64_t)QWEN35_FULL_ATTENTION_LAYER_COUNT * 2u *
-                 QWEN35_N_HEAD_KV * QWEN35_N_HEAD_DIM * sizeof(float) *
-                 (uint32_t)ctx_size) - QWEN35_RECURRENT_SNAPSHOT_BYTES,
+                cache.total_bytes - QWEN35_RECURRENT_SNAPSHOT_BYTES,
             .total_bytes = persistent_bytes,
             .prefill_cap = QWEN35_RESIDENT_PREFILL_TOKENS,
             .raw_cap = (uint32_t)ctx_size,
@@ -38491,9 +38676,12 @@ static bool ds4_engine_resolve_residency(ds4_engine               *e,
     if (e->model.family == DS4_MODEL_FAMILY_QWEN35_MOE) {
         fprintf(stderr,
                 "ds4: Qwen residency runtime %.2f GiB at context %u "
-                "(conservative full-F32 KV/recurrent estimate)\n",
+                "(%s KV/recurrent estimate)\n",
                 (double)context.total_bytes / 1073741824.0,
-                context_size);
+                context_size,
+                qwen35_kv_tq4_requested()
+                    ? "research TQ4 full-attention"
+                    : "production F32 full-attention");
     }
     uint64_t recommended = 0;
 #ifndef DS4_NO_GPU

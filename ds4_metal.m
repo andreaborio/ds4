@@ -4728,6 +4728,46 @@ typedef struct {
 } ds4_gpu_qwen35_gqa_prefill_args;
 
 typedef struct {
+    uint32_t position0;
+    uint32_t n_token;
+    uint32_t n_kv_head;
+    uint32_t head_dim;
+    uint32_t seed;
+    uint32_t reserved;
+    uint64_t key_input_token_stride;
+    uint64_t key_input_head_stride;
+    uint64_t key_input_dim_stride;
+    uint64_t value_input_token_stride;
+    uint64_t value_input_head_stride;
+    uint64_t value_input_dim_stride;
+    uint64_t key_cache_token_stride;
+    uint64_t key_cache_head_stride;
+    uint64_t value_cache_token_stride;
+    uint64_t value_cache_head_stride;
+} ds4_gpu_qwen35_tq4_store_args;
+
+typedef struct {
+    uint32_t cache_tokens;
+    uint32_t query_position0;
+    uint32_t n_query_token;
+    uint32_t n_query_head;
+    uint32_t n_kv_head;
+    uint32_t head_dim;
+    uint32_t seed;
+    uint32_t reserved;
+    uint64_t query_token_stride;
+    uint64_t query_head_stride;
+    uint64_t query_dim_stride;
+    uint64_t key_cache_token_stride;
+    uint64_t key_cache_head_stride;
+    uint64_t value_cache_token_stride;
+    uint64_t value_cache_head_stride;
+    uint64_t output_token_stride;
+    uint64_t output_head_stride;
+    uint64_t output_dim_stride;
+} ds4_gpu_qwen35_tq4_attention_args;
+
+typedef struct {
     uint32_t n_token;
     uint32_t reserved;
     uint64_t logits_token_stride;
@@ -4766,6 +4806,10 @@ typedef char ds4_gpu_qwen35_gqa_decode_args_size[
     sizeof(ds4_gpu_qwen35_gqa_decode_args) == 96 ? 1 : -1];
 typedef char ds4_gpu_qwen35_gqa_prefill_args_size[
     sizeof(ds4_gpu_qwen35_gqa_prefill_args) == 120 ? 1 : -1];
+typedef char ds4_gpu_qwen35_tq4_store_args_size[
+    sizeof(ds4_gpu_qwen35_tq4_store_args) == 104 ? 1 : -1];
+typedef char ds4_gpu_qwen35_tq4_attention_args_size[
+    sizeof(ds4_gpu_qwen35_tq4_attention_args) == 112 ? 1 : -1];
 typedef char ds4_gpu_qwen35_router_top8_args_size[
     sizeof(ds4_gpu_qwen35_router_top8_args) == 56 ? 1 : -1];
 
@@ -27683,6 +27727,533 @@ int ds4_gpu_qwen35_gated_delta_controls_tensor(
         ssm_a_offset, dt_bias_offset, 1u, n_value_head);
 }
 
+static int ds4_gpu_qwen35_tq4_layout(
+        uint32_t  n_kv_head,
+        uint32_t  head_dim,
+        uint64_t *f32_token_bytes,
+        uint64_t *key_head_bytes,
+        uint64_t *key_token_bytes,
+        uint64_t *value_head_bytes,
+        uint64_t *value_token_bytes) {
+    if (n_kv_head == 0u || head_dim != 256u ||
+        !f32_token_bytes || !key_head_bytes || !key_token_bytes ||
+        !value_head_bytes || !value_token_bytes) {
+        return 0;
+    }
+    const uint64_t f32_head_bytes = (uint64_t)head_dim * sizeof(float);
+    *key_head_bytes = ((uint64_t)head_dim + 1u) / 2u + sizeof(uint16_t);
+    *value_head_bytes =
+        ((uint64_t)head_dim + 1u) / 2u + 2u * sizeof(uint16_t);
+    if (n_kv_head > UINT64_MAX / f32_head_bytes ||
+        n_kv_head > UINT64_MAX / *key_head_bytes ||
+        n_kv_head > UINT64_MAX / *value_head_bytes) {
+        return 0;
+    }
+    *f32_token_bytes = (uint64_t)n_kv_head * f32_head_bytes;
+    *key_token_bytes = (uint64_t)n_kv_head * *key_head_bytes;
+    *value_token_bytes = (uint64_t)n_kv_head * *value_head_bytes;
+    return 1;
+}
+
+static uint32_t ds4_gpu_qwen35_tq4_seed(uint32_t layer_index) {
+    return UINT32_C(42) + layer_index * UINT32_C(1337);
+}
+
+typedef enum {
+    DS4_QWEN35_TQ4_DECODE_INVALID = -1,
+    DS4_QWEN35_TQ4_DECODE_AUTO = 0,
+    DS4_QWEN35_TQ4_DECODE_SERIAL,
+    DS4_QWEN35_TQ4_DECODE_PARALLEL,
+    DS4_QWEN35_TQ4_DECODE_SPLIT_K,
+    DS4_QWEN35_TQ4_DECODE_REUSE8,
+    DS4_QWEN35_TQ4_DECODE_FLASH_F16,
+} ds4_gpu_qwen35_tq4_decode_strategy;
+
+static ds4_gpu_qwen35_tq4_decode_strategy
+ds4_gpu_qwen35_tq4_decode_strategy_from_env(void) {
+    const char *value = getenv("DS4_QWEN_TQ4_DECODE");
+    if (!value || value[0] == '\0' || strcmp(value, "auto") == 0) {
+        return DS4_QWEN35_TQ4_DECODE_AUTO;
+    }
+    if (strcmp(value, "serial") == 0) {
+        return DS4_QWEN35_TQ4_DECODE_SERIAL;
+    }
+    if (strcmp(value, "parallel") == 0) {
+        return DS4_QWEN35_TQ4_DECODE_PARALLEL;
+    }
+    if (strcmp(value, "split") == 0) {
+        return DS4_QWEN35_TQ4_DECODE_SPLIT_K;
+    }
+    if (strcmp(value, "reuse8") == 0) {
+        return DS4_QWEN35_TQ4_DECODE_REUSE8;
+    }
+    if (strcmp(value, "flash") == 0) {
+        return DS4_QWEN35_TQ4_DECODE_FLASH_F16;
+    }
+    fprintf(stderr,
+            "ds4: invalid DS4_QWEN_TQ4_DECODE=%s; expected "
+            "auto, serial, parallel, split, reuse8, or flash\n",
+            value);
+    return DS4_QWEN35_TQ4_DECODE_INVALID;
+}
+
+static const char *ds4_gpu_qwen35_tq4_decode_strategy_name(
+        ds4_gpu_qwen35_tq4_decode_strategy strategy) {
+    switch (strategy) {
+        case DS4_QWEN35_TQ4_DECODE_AUTO: return "auto";
+        case DS4_QWEN35_TQ4_DECODE_SERIAL: return "serial";
+        case DS4_QWEN35_TQ4_DECODE_PARALLEL: return "parallel";
+        case DS4_QWEN35_TQ4_DECODE_SPLIT_K: return "split";
+        case DS4_QWEN35_TQ4_DECODE_REUSE8: return "reuse8";
+        case DS4_QWEN35_TQ4_DECODE_FLASH_F16: return "flash";
+        case DS4_QWEN35_TQ4_DECODE_INVALID: break;
+    }
+    return "invalid";
+}
+
+static int ds4_gpu_qwen35_gqa_prefill_flash_f16_tensor(
+        ds4_gpu_tensor       *out,
+        const ds4_gpu_tensor *query,
+        const ds4_gpu_tensor *key_cache,
+        const ds4_gpu_tensor *value_cache,
+        uint32_t              position0,
+        uint32_t              n_token,
+        uint32_t              n_query_head,
+        uint32_t              n_kv_head,
+        uint32_t              head_dim,
+        int                   packed_tq4,
+        uint32_t              layer_index);
+
+static int ds4_gpu_qwen35_tq4_decode_flash_f16_tensor(
+        ds4_gpu_tensor       *out,
+        const ds4_gpu_tensor *query,
+        const ds4_gpu_tensor *key_cache,
+        const ds4_gpu_tensor *value_cache,
+        uint32_t              n_kv,
+        uint32_t              n_query_head,
+        uint32_t              n_kv_head,
+        uint32_t              head_dim,
+        uint32_t              layer_index);
+
+int ds4_gpu_qwen35_tq4_store_tensor(
+        ds4_gpu_tensor       *key_cache,
+        ds4_gpu_tensor       *value_cache,
+        const ds4_gpu_tensor *key,
+        const ds4_gpu_tensor *value,
+        uint32_t              position0,
+        uint32_t              n_token,
+        uint32_t              n_kv_head,
+        uint32_t              head_dim,
+        uint32_t              layer_index) {
+    if (!g_initialized && !ds4_gpu_init()) return 0;
+    if (!key_cache || !value_cache || !key || !value || n_token == 0u ||
+        position0 > UINT32_MAX - n_token) {
+        return 0;
+    }
+
+    uint64_t f32_token_bytes = 0u;
+    uint64_t key_head_bytes = 0u, key_token_bytes = 0u;
+    uint64_t value_head_bytes = 0u, value_token_bytes = 0u;
+    if (!ds4_gpu_qwen35_tq4_layout(
+            n_kv_head, head_dim, &f32_token_bytes,
+            &key_head_bytes, &key_token_bytes,
+            &value_head_bytes, &value_token_bytes)) {
+        return 0;
+    }
+    const uint64_t cache_tokens = (uint64_t)position0 + n_token;
+    if (n_token > UINT64_MAX / f32_token_bytes ||
+        cache_tokens > UINT64_MAX / key_token_bytes ||
+        cache_tokens > UINT64_MAX / value_token_bytes) {
+        return 0;
+    }
+    const uint64_t input_bytes = (uint64_t)n_token * f32_token_bytes;
+    const uint64_t key_cache_bytes = cache_tokens * key_token_bytes;
+    const uint64_t value_cache_bytes = cache_tokens * value_token_bytes;
+
+    @autoreleasepool {
+        id<MTLComputePipelineState> pipeline =
+            ds4_gpu_get_pipeline("kernel_qwen35_tq4_store");
+        id<MTLBuffer> key_input_buf = ds4_gpu_tensor_buffer(key);
+        id<MTLBuffer> value_input_buf = ds4_gpu_tensor_buffer(value);
+        id<MTLBuffer> key_cache_buf = ds4_gpu_tensor_buffer(key_cache);
+        id<MTLBuffer> value_cache_buf = ds4_gpu_tensor_buffer(value_cache);
+        if (!pipeline || !key_input_buf || !value_input_buf ||
+            !key_cache_buf || !value_cache_buf ||
+            pipeline.maxTotalThreadsPerThreadgroup < head_dim ||
+            ds4_gpu_tensor_bytes(key) < input_bytes ||
+            ds4_gpu_tensor_bytes(value) < input_bytes ||
+            ds4_gpu_tensor_bytes(key_cache) < key_cache_bytes ||
+            ds4_gpu_tensor_bytes(value_cache) < value_cache_bytes) {
+            fprintf(stderr,
+                    "ds4: Metal Qwen TQ4 store received incompatible geometry or buffers\n");
+            return 0;
+        }
+
+        ds4_gpu_qwen35_tq4_store_args args = {
+            .position0 = position0,
+            .n_token = n_token,
+            .n_kv_head = n_kv_head,
+            .head_dim = head_dim,
+            .seed = ds4_gpu_qwen35_tq4_seed(layer_index),
+            .reserved = 0u,
+            .key_input_token_stride = f32_token_bytes,
+            .key_input_head_stride =
+                (uint64_t)head_dim * sizeof(float),
+            .key_input_dim_stride = sizeof(float),
+            .value_input_token_stride = f32_token_bytes,
+            .value_input_head_stride =
+                (uint64_t)head_dim * sizeof(float),
+            .value_input_dim_stride = sizeof(float),
+            .key_cache_token_stride = key_token_bytes,
+            .key_cache_head_stride = key_head_bytes,
+            .value_cache_token_stride = value_token_bytes,
+            .value_cache_head_stride = value_head_bytes,
+        };
+
+        int owned = 0;
+        id<MTLCommandBuffer> cb = ds4_gpu_command_buffer(&owned);
+        if (!cb) return 0;
+        id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
+        if (!enc) return 0;
+        [enc setComputePipelineState:pipeline];
+        [enc setBytes:&args length:sizeof(args) atIndex:0];
+        [enc setBuffer:key_input_buf
+                offset:ds4_gpu_tensor_offset(key)
+               atIndex:1];
+        [enc setBuffer:value_input_buf
+                offset:ds4_gpu_tensor_offset(value)
+               atIndex:2];
+        [enc setBuffer:key_cache_buf
+                offset:ds4_gpu_tensor_offset(key_cache)
+               atIndex:3];
+        [enc setBuffer:value_cache_buf
+                offset:ds4_gpu_tensor_offset(value_cache)
+               atIndex:4];
+        [enc setThreadgroupMemoryLength:
+             ds4_gpu_qwen35_threadgroup_f32_bytes(
+                 2u * (NSUInteger)head_dim + 2u)
+                                 atIndex:0];
+        [enc dispatchThreadgroups:MTLSizeMake(n_kv_head, n_token, 1u)
+             threadsPerThreadgroup:MTLSizeMake(head_dim, 1u, 1u)];
+        ds4_gpu_end_compute_encoder(cb, enc);
+        if (!ds4_gpu_finish_command_buffer(
+                cb, owned, "Qwen TQ4 K/V store")) {
+            return 0;
+        }
+    }
+    return 1;
+}
+
+static int ds4_gpu_qwen35_tq4_attention_tensor(
+        ds4_gpu_tensor       *out,
+        const ds4_gpu_tensor *query,
+        const ds4_gpu_tensor *key_cache,
+        const ds4_gpu_tensor *value_cache,
+        uint32_t              cache_tokens,
+        uint32_t              query_position0,
+        uint32_t              n_query_token,
+        uint32_t              n_query_head,
+        uint32_t              n_kv_head,
+        uint32_t              head_dim,
+        uint32_t              layer_index,
+        ds4_gpu_qwen35_tq4_decode_strategy strategy,
+        const char           *label) {
+    if (!g_initialized && !ds4_gpu_init()) return 0;
+    if (!out || !query || !key_cache || !value_cache ||
+        cache_tokens == 0u || n_query_token == 0u ||
+        n_query_head == 0u || n_kv_head == 0u ||
+        n_query_head % n_kv_head != 0u ||
+        query_position0 >= cache_tokens ||
+        n_query_token > cache_tokens - query_position0) {
+        return 0;
+    }
+
+    uint64_t kv_f32_token_bytes = 0u;
+    uint64_t key_head_bytes = 0u, key_token_bytes = 0u;
+    uint64_t value_head_bytes = 0u, value_token_bytes = 0u;
+    if (!ds4_gpu_qwen35_tq4_layout(
+            n_kv_head, head_dim, &kv_f32_token_bytes,
+            &key_head_bytes, &key_token_bytes,
+            &value_head_bytes, &value_token_bytes)) {
+        return 0;
+    }
+    (void)kv_f32_token_bytes;
+    const uint64_t query_head_bytes =
+        (uint64_t)head_dim * sizeof(float);
+    if (n_query_head > UINT64_MAX / query_head_bytes) return 0;
+    const uint64_t query_token_bytes =
+        (uint64_t)n_query_head * query_head_bytes;
+    if (n_query_token > UINT64_MAX / query_token_bytes ||
+        cache_tokens > UINT64_MAX / key_token_bytes ||
+        cache_tokens > UINT64_MAX / value_token_bytes) {
+        return 0;
+    }
+    const uint64_t query_bytes =
+        (uint64_t)n_query_token * query_token_bytes;
+    const uint64_t key_cache_bytes =
+        (uint64_t)cache_tokens * key_token_bytes;
+    const uint64_t value_cache_bytes =
+        (uint64_t)cache_tokens * value_token_bytes;
+
+    @autoreleasepool {
+        const bool is_decode = n_query_token == 1u;
+        const bool serial_decode =
+            is_decode && strategy == DS4_QWEN35_TQ4_DECODE_SERIAL;
+        const bool parallel_decode = is_decode && !serial_decode;
+        const bool reuse8_decode =
+            parallel_decode &&
+            strategy == DS4_QWEN35_TQ4_DECODE_REUSE8 &&
+            n_query_head == 8u * n_kv_head &&
+            head_dim == 256u;
+        const bool split_k_decode =
+            parallel_decode &&
+            (strategy == DS4_QWEN35_TQ4_DECODE_SPLIT_K ||
+             (strategy == DS4_QWEN35_TQ4_DECODE_AUTO &&
+              cache_tokens >= 2048u));
+        const NSUInteger split_groups = 4u;
+        const NSUInteger split_partitions = 8u * split_groups;
+        const NSUInteger split_head_bytes =
+            split_partitions * ((NSUInteger)head_dim + 2u) * sizeof(float);
+        const NSUInteger split_bytes =
+            (NSUInteger)n_query_head * split_head_bytes;
+        const NSUInteger rotated_query_bytes =
+            (NSUInteger)query_token_bytes;
+        if (split_k_decode &&
+            split_bytes > NSUIntegerMax - rotated_query_bytes) {
+            return 0;
+        }
+        const NSUInteger split_scratch_bytes =
+            rotated_query_bytes + split_bytes;
+        id<MTLComputePipelineState> pipeline =
+            ds4_gpu_get_pipeline(reuse8_decode
+                ? "kernel_qwen35_tq4_decode_reuse8"
+                : split_k_decode
+                ? "kernel_qwen35_tq4_decode_split_k"
+                : parallel_decode
+                    ? "kernel_qwen35_tq4_decode_parallel"
+                    : "kernel_qwen35_tq4_attention");
+        id<MTLComputePipelineState> reduce_pipeline = split_k_decode
+            ? ds4_gpu_get_pipeline(
+                  "kernel_qwen35_tq4_decode_split_k_reduce")
+            : nil;
+        id<MTLComputePipelineState> rotate_pipeline = split_k_decode
+            ? ds4_gpu_get_pipeline("kernel_qwen35_tq4_rotate_query")
+            : nil;
+        if (split_k_decode &&
+            !ds4_gpu_ensure_scratch_buffer(
+                &g_flash_attn_tmp_buffer, &g_flash_attn_tmp_bytes,
+                split_scratch_bytes, "ds4_qwen_tq4_decode_split_k")) {
+            return 0;
+        }
+        id<MTLBuffer> query_buf = ds4_gpu_tensor_buffer(query);
+        id<MTLBuffer> key_buf = ds4_gpu_tensor_buffer(key_cache);
+        id<MTLBuffer> value_buf = ds4_gpu_tensor_buffer(value_cache);
+        id<MTLBuffer> out_buf = ds4_gpu_tensor_buffer(out);
+        const NSUInteger threads_per_group =
+            reuse8_decode ? 512u : head_dim;
+        if ((strategy == DS4_QWEN35_TQ4_DECODE_REUSE8 &&
+             !reuse8_decode) ||
+            !pipeline || !query_buf || !key_buf || !value_buf || !out_buf ||
+            (split_k_decode && !reduce_pipeline) ||
+            (split_k_decode && !rotate_pipeline) ||
+            pipeline.maxTotalThreadsPerThreadgroup < threads_per_group ||
+            (split_k_decode &&
+             (reduce_pipeline.maxTotalThreadsPerThreadgroup < head_dim ||
+              rotate_pipeline.maxTotalThreadsPerThreadgroup < head_dim)) ||
+            ds4_gpu_tensor_bytes(query) < query_bytes ||
+            ds4_gpu_tensor_bytes(key_cache) < key_cache_bytes ||
+            ds4_gpu_tensor_bytes(value_cache) < value_cache_bytes ||
+            ds4_gpu_tensor_bytes(out) < query_bytes) {
+            fprintf(stderr,
+                    "ds4: Metal Qwen TQ4 attention received incompatible geometry or buffers\n");
+            return 0;
+        }
+
+        ds4_gpu_qwen35_tq4_attention_args args = {
+            .cache_tokens = cache_tokens,
+            .query_position0 = query_position0,
+            .n_query_token = n_query_token,
+            .n_query_head = n_query_head,
+            .n_kv_head = n_kv_head,
+            .head_dim = head_dim,
+            .seed = ds4_gpu_qwen35_tq4_seed(layer_index),
+            .reserved = split_k_decode ? (uint32_t)split_groups : 0u,
+            .query_token_stride = query_token_bytes,
+            .query_head_stride = query_head_bytes,
+            .query_dim_stride = sizeof(float),
+            .key_cache_token_stride = key_token_bytes,
+            .key_cache_head_stride = key_head_bytes,
+            .value_cache_token_stride = value_token_bytes,
+            .value_cache_head_stride = value_head_bytes,
+            .output_token_stride = split_k_decode ? 0u : query_token_bytes,
+            .output_head_stride =
+                split_k_decode ? split_head_bytes : query_head_bytes,
+            .output_dim_stride = sizeof(float),
+        };
+
+        int owned = 0;
+        id<MTLCommandBuffer> cb = ds4_gpu_command_buffer(&owned);
+        if (!cb) return 0;
+        id<MTLComputeCommandEncoder> enc = nil;
+        if (split_k_decode) {
+            enc = ds4_gpu_compute_encoder(cb);
+            if (!enc) return 0;
+            [enc setComputePipelineState:rotate_pipeline];
+            [enc setBytes:&args length:sizeof(args) atIndex:0];
+            [enc setBuffer:query_buf
+                    offset:ds4_gpu_tensor_offset(query)
+                   atIndex:1];
+            [enc setBuffer:g_flash_attn_tmp_buffer offset:0u atIndex:2];
+            [enc setThreadgroupMemoryLength:
+                 ds4_gpu_qwen35_threadgroup_f32_bytes(head_dim)
+                                     atIndex:0];
+            [enc dispatchThreadgroups:
+                 MTLSizeMake(n_query_head, 1u, 1u)
+                 threadsPerThreadgroup:MTLSizeMake(head_dim, 1u, 1u)];
+            ds4_gpu_end_compute_encoder(cb, enc);
+        }
+        enc = ds4_gpu_compute_encoder(cb);
+        if (!enc) return 0;
+        [enc setComputePipelineState:pipeline];
+        [enc setBytes:&args length:sizeof(args) atIndex:0];
+        [enc setBuffer:split_k_decode
+                ? g_flash_attn_tmp_buffer
+                : query_buf
+                offset:split_k_decode
+                    ? 0u
+                    : ds4_gpu_tensor_offset(query)
+               atIndex:1];
+        [enc setBuffer:key_buf
+                offset:ds4_gpu_tensor_offset(key_cache)
+               atIndex:2];
+        [enc setBuffer:value_buf
+                offset:ds4_gpu_tensor_offset(value_cache)
+               atIndex:3];
+        [enc setBuffer:split_k_decode
+                ? g_flash_attn_tmp_buffer
+                : out_buf
+                offset:split_k_decode
+                    ? rotated_query_bytes
+                    : ds4_gpu_tensor_offset(out)
+               atIndex:4];
+        const NSUInteger scratch_floats = parallel_decode
+            ? reuse8_decode
+                ? 28u * (NSUInteger)head_dim + 32u
+                : split_k_decode
+                ? 0u
+                : (NSUInteger)head_dim +
+                8u * ((NSUInteger)head_dim + 2u) + 1u
+            : 2u * (NSUInteger)head_dim + 4u;
+        if (scratch_floats != 0u) {
+            [enc setThreadgroupMemoryLength:
+                 ds4_gpu_qwen35_threadgroup_f32_bytes(scratch_floats)
+                                     atIndex:0];
+        }
+        [enc dispatchThreadgroups:
+             MTLSizeMake(
+                 reuse8_decode ? n_kv_head : n_query_head,
+                 split_k_decode ? split_groups : n_query_token,
+                 1u)
+             threadsPerThreadgroup:
+                 MTLSizeMake(threads_per_group, 1u, 1u)];
+        ds4_gpu_end_compute_encoder(cb, enc);
+        if (split_k_decode) {
+            enc = ds4_gpu_compute_encoder(cb);
+            if (!enc) return 0;
+            [enc setComputePipelineState:reduce_pipeline];
+            [enc setBytes:&args length:sizeof(args) atIndex:0];
+            [enc setBuffer:g_flash_attn_tmp_buffer
+                    offset:rotated_query_bytes atIndex:1];
+            [enc setBuffer:out_buf
+                    offset:ds4_gpu_tensor_offset(out)
+                   atIndex:2];
+            [enc setThreadgroupMemoryLength:
+                 ds4_gpu_qwen35_threadgroup_f32_bytes(
+                     split_partitions + 1u)
+                                     atIndex:0];
+            [enc dispatchThreadgroups:
+                 MTLSizeMake(n_query_head, 1u, 1u)
+                 threadsPerThreadgroup:MTLSizeMake(head_dim, 1u, 1u)];
+            ds4_gpu_end_compute_encoder(cb, enc);
+        }
+        if (!ds4_gpu_finish_command_buffer(cb, owned, label)) return 0;
+    }
+    return 1;
+}
+
+int ds4_gpu_qwen35_tq4_gqa_decode_tensor(
+        ds4_gpu_tensor       *out,
+        const ds4_gpu_tensor *query,
+        const ds4_gpu_tensor *key_cache,
+        const ds4_gpu_tensor *value_cache,
+        uint32_t              n_kv,
+        uint32_t              n_query_head,
+        uint32_t              n_kv_head,
+        uint32_t              head_dim,
+        uint32_t              layer_index) {
+    if (n_kv == 0u) return 0;
+    const ds4_gpu_qwen35_tq4_decode_strategy strategy =
+        ds4_gpu_qwen35_tq4_decode_strategy_from_env();
+    if (strategy == DS4_QWEN35_TQ4_DECODE_INVALID) return 0;
+    static uint32_t logged_strategies;
+    const uint32_t strategy_bit = UINT32_C(1) << (uint32_t)strategy;
+    if ((logged_strategies & strategy_bit) == 0u) {
+        fprintf(stderr, "ds4: Qwen TQ4 decode strategy=%s\n",
+                ds4_gpu_qwen35_tq4_decode_strategy_name(strategy));
+        logged_strategies |= strategy_bit;
+    }
+    if (strategy == DS4_QWEN35_TQ4_DECODE_FLASH_F16) {
+        return ds4_gpu_qwen35_tq4_decode_flash_f16_tensor(
+            out, query, key_cache, value_cache, n_kv,
+            n_query_head, n_kv_head, head_dim, layer_index);
+    }
+    if (strategy == DS4_QWEN35_TQ4_DECODE_AUTO &&
+        n_kv >= 2048u &&
+        ds4_gpu_qwen35_tq4_decode_flash_f16_tensor(
+            out, query, key_cache, value_cache, n_kv,
+            n_query_head, n_kv_head, head_dim, layer_index)) {
+        return 1;
+    }
+    return ds4_gpu_qwen35_tq4_attention_tensor(
+        out, query, key_cache, value_cache,
+        n_kv, n_kv - 1u, 1u,
+        n_query_head, n_kv_head, head_dim, layer_index, strategy,
+        "Qwen TQ4 GQA decode");
+}
+
+int ds4_gpu_qwen35_tq4_gqa_prefill_tensor(
+        ds4_gpu_tensor       *out,
+        const ds4_gpu_tensor *query,
+        const ds4_gpu_tensor *key_cache,
+        const ds4_gpu_tensor *value_cache,
+        uint32_t              position0,
+        uint32_t              n_token,
+        uint32_t              n_query_head,
+        uint32_t              n_kv_head,
+        uint32_t              head_dim,
+        uint32_t              layer_index) {
+    if (n_token == 0u || position0 > UINT32_MAX - n_token) return 0;
+    if (ds4_gpu_qwen35_gqa_prefill_flash_f16_tensor(
+            out, query, key_cache, value_cache,
+            position0, n_token, n_query_head, n_kv_head, head_dim,
+            1, layer_index)) {
+        static int logged;
+        if (!logged) {
+            fprintf(stderr,
+                    "ds4: Qwen TQ4 prefill FlashAttention enabled "
+                    "(packed persistent cache, reusable F16 staging)\n");
+            logged = 1;
+        }
+        return 1;
+    }
+    return ds4_gpu_qwen35_tq4_attention_tensor(
+        out, query, key_cache, value_cache,
+        position0 + n_token, position0, n_token,
+        n_query_head, n_kv_head, head_dim, layer_index,
+        DS4_QWEN35_TQ4_DECODE_AUTO,
+        "Qwen TQ4 GQA prefill");
+}
+
 int ds4_gpu_qwen35_gqa_decode_tensor(
         ds4_gpu_tensor       *out,
         const ds4_gpu_tensor *query,
@@ -28190,6 +28761,310 @@ static int ds4_gpu_qwen35_gqa_decode_split_k_f32_tensor(
     return 1;
 }
 
+/*
+ * Experimental packed-cache decode consumer. The persistent cache remains
+ * TQ4; only the live frontier for the current layer is expanded into a
+ * reusable F16 buffer, then consumed by the shared vector FlashAttention
+ * split-K kernel. Keys stay in the signed/Hadamard domain, so the query is
+ * rotated once and no inverse transform is needed during staging.
+ */
+static int ds4_gpu_qwen35_tq4_decode_flash_f16_tensor(
+        ds4_gpu_tensor       *out,
+        const ds4_gpu_tensor *query,
+        const ds4_gpu_tensor *key_cache,
+        const ds4_gpu_tensor *value_cache,
+        uint32_t              n_kv,
+        uint32_t              n_query_head,
+        uint32_t              n_kv_head,
+        uint32_t              head_dim,
+        uint32_t              layer_index) {
+    enum {
+        TQ4_FLASH_NWG = 32,
+        TQ4_FLASH_NCPSG = 32,
+    };
+    if (!out || !query || !key_cache || !value_cache ||
+        n_kv < 2048u || n_query_head != 16u ||
+        n_kv_head != 2u || head_dim != 256u) {
+        return 0;
+    }
+
+    uint64_t unused_f32_token_bytes = 0u;
+    uint64_t key_head_bytes = 0u, key_token_bytes = 0u;
+    uint64_t value_head_bytes = 0u, value_token_bytes = 0u;
+    if (!ds4_gpu_qwen35_tq4_layout(
+            n_kv_head, head_dim, &unused_f32_token_bytes,
+            &key_head_bytes, &key_token_bytes,
+            &value_head_bytes, &value_token_bytes) ||
+        n_kv > UINT64_MAX / key_token_bytes ||
+        n_kv > UINT64_MAX / value_token_bytes) {
+        return 0;
+    }
+    const uint64_t source_key_bytes = (uint64_t)n_kv * key_token_bytes;
+    const uint64_t source_value_bytes =
+        (uint64_t)n_kv * value_token_bytes;
+    const uint64_t query_head_bytes =
+        (uint64_t)head_dim * sizeof(float);
+    const uint64_t query_bytes =
+        (uint64_t)n_query_head * query_head_bytes;
+    const uint64_t f16_head_bytes =
+        (uint64_t)head_dim * sizeof(uint16_t);
+    const uint64_t f16_token_bytes =
+        (uint64_t)n_kv_head * f16_head_bytes;
+    if (n_kv > UINT64_MAX / f16_token_bytes) return 0;
+    const uint64_t cache_f16_bytes =
+        (uint64_t)n_kv * f16_token_bytes;
+    if (cache_f16_bytes > NSUIntegerMax / 2u ||
+        query_bytes > NSUIntegerMax) {
+        return 0;
+    }
+
+    id<MTLBuffer> query_buf = ds4_gpu_tensor_buffer(query);
+    id<MTLBuffer> key_buf = ds4_gpu_tensor_buffer(key_cache);
+    id<MTLBuffer> value_buf = ds4_gpu_tensor_buffer(value_cache);
+    id<MTLBuffer> out_buf = ds4_gpu_tensor_buffer(out);
+    if (!query_buf || !key_buf || !value_buf || !out_buf ||
+        ds4_gpu_tensor_bytes(query) < query_bytes ||
+        ds4_gpu_tensor_bytes(key_cache) < source_key_bytes ||
+        ds4_gpu_tensor_bytes(value_cache) < source_value_bytes ||
+        ds4_gpu_tensor_bytes(out) < query_bytes) {
+        return 0;
+    }
+
+    const uint32_t nwg = TQ4_FLASH_NWG;
+    const uint32_t ncpsg = TQ4_FLASH_NCPSG;
+    const uint32_t nsg =
+        ds4_gpu_flash_attn_vec_nsg(n_kv, nwg, ncpsg);
+    const bool has_kvpad = (n_kv % ncpsg) != 0u;
+    const int32_t token_values =
+        (int32_t)(n_kv_head * head_dim);
+    id<MTLComputePipelineState> rotate_pipeline =
+        ds4_gpu_get_pipeline("kernel_qwen35_tq4_rotate_query");
+    id<MTLComputePipelineState> dequant_pipeline =
+        ds4_gpu_get_pipeline(
+            "kernel_qwen35_tq4_dequantize_rotated_f16");
+    id<MTLComputePipelineState> vec_pipeline =
+        ds4_gpu_get_flash_attn_vec_pipeline(
+            "kernel_flash_attn_ext_vec_f16_dk256_dv256",
+            false, false, false, false, has_kvpad,
+            token_values, token_values, (int32_t)nsg, (int32_t)nwg);
+    id<MTLComputePipelineState> reduce_pipeline =
+        ds4_gpu_get_flash_attn_reduce_pipeline(
+            (int32_t)head_dim, (int32_t)nwg);
+    id<MTLComputePipelineState> pad_pipeline = has_kvpad
+        ? ds4_gpu_get_pipeline("kernel_qwen35_gqa_split_k_pad_f16")
+        : nil;
+    const NSUInteger vec_threads = 32u * (NSUInteger)nsg;
+    const NSUInteger reduce_threads = 32u * (NSUInteger)nwg;
+    if (!rotate_pipeline || !dequant_pipeline ||
+        !vec_pipeline || !reduce_pipeline ||
+        (has_kvpad && !pad_pipeline) ||
+        rotate_pipeline.maxTotalThreadsPerThreadgroup < head_dim ||
+        dequant_pipeline.maxTotalThreadsPerThreadgroup < head_dim ||
+        vec_pipeline.maxTotalThreadsPerThreadgroup < vec_threads ||
+        reduce_pipeline.maxTotalThreadsPerThreadgroup < reduce_threads) {
+        return 0;
+    }
+
+    const NSUInteger nrows = (NSUInteger)n_query_head;
+    const NSUInteger tmp_bytes =
+        nrows * (NSUInteger)head_dim * (NSUInteger)nwg * sizeof(float) +
+        nrows * (2u * (NSUInteger)nwg) * sizeof(float);
+    const NSUInteger pad_bytes = has_kvpad
+        ? 2u * (NSUInteger)ncpsg * (NSUInteger)f16_token_bytes *
+              (NSUInteger)n_kv_head
+        : 1u;
+    if (!ds4_gpu_ensure_scratch_buffer(
+            &g_flash_attn_kv_buffer, &g_flash_attn_kv_bytes,
+            (NSUInteger)(2u * cache_f16_bytes),
+            "ds4_qwen_tq4_decode_kv_f16") ||
+        !ds4_gpu_ensure_scratch_buffer(
+            &g_flash_attn_tmp_buffer, &g_flash_attn_tmp_bytes,
+            tmp_bytes, "ds4_qwen_tq4_decode_flash_tmp") ||
+        !ds4_gpu_ensure_scratch_buffer(
+            &g_flash_attn_ring_buffer, &g_flash_attn_ring_bytes,
+            (NSUInteger)query_bytes,
+            "ds4_qwen_tq4_decode_rotated_query") ||
+        !ds4_gpu_ensure_qwen35_gqa_split_k_pad(pad_bytes)) {
+        return 0;
+    }
+
+    ds4_gpu_qwen35_tq4_attention_args attention_args = {
+        .cache_tokens = n_kv,
+        .query_position0 = n_kv - 1u,
+        .n_query_token = 1u,
+        .n_query_head = n_query_head,
+        .n_kv_head = n_kv_head,
+        .head_dim = head_dim,
+        .seed = ds4_gpu_qwen35_tq4_seed(layer_index),
+        .reserved = 0u,
+        .query_token_stride = query_bytes,
+        .query_head_stride = query_head_bytes,
+        .query_dim_stride = sizeof(float),
+        .key_cache_token_stride = key_token_bytes,
+        .key_cache_head_stride = key_head_bytes,
+        .value_cache_token_stride = value_token_bytes,
+        .value_cache_head_stride = value_head_bytes,
+        .output_token_stride = query_bytes,
+        .output_head_stride = query_head_bytes,
+        .output_dim_stride = sizeof(float),
+    };
+    ds4_gpu_qwen35_tq4_store_args dequant_args = {
+        .position0 = 0u,
+        .n_token = n_kv,
+        .n_kv_head = n_kv_head,
+        .head_dim = head_dim,
+        .seed = ds4_gpu_qwen35_tq4_seed(layer_index),
+        .reserved = 0u,
+        .key_input_token_stride = key_token_bytes,
+        .key_input_head_stride = key_head_bytes,
+        .key_input_dim_stride = 0u,
+        .value_input_token_stride = value_token_bytes,
+        .value_input_head_stride = value_head_bytes,
+        .value_input_dim_stride = 0u,
+        .key_cache_token_stride = f16_token_bytes,
+        .key_cache_head_stride = f16_head_bytes,
+        .value_cache_token_stride = f16_token_bytes,
+        .value_cache_head_stride = f16_head_bytes,
+    };
+    ds4_gpu_flash_attn_vec_args vec_args = {
+        .ne01 = 1,
+        .ne02 = (int32_t)n_query_head,
+        .ne03 = 1,
+        .nb01 = query_bytes,
+        .nb02 = query_head_bytes,
+        .nb03 = query_bytes,
+        .ne11 = (int32_t)n_kv,
+        .ne_12_2 = (int32_t)n_kv_head,
+        .ne_12_3 = 1,
+        .ns10 = token_values,
+        .nb11 = f16_token_bytes,
+        .nb12 = f16_head_bytes,
+        .nb13 = cache_f16_bytes,
+        .ns20 = token_values,
+        .nb21 = f16_token_bytes,
+        .nb22 = f16_head_bytes,
+        .nb23 = cache_f16_bytes,
+        .ne31 = 1,
+        .ne32 = 1,
+        .ne33 = 1,
+        .nb31 = 0u,
+        .nb32 = 0u,
+        .nb33 = 0u,
+        .ne1 = (int32_t)n_query_head,
+        .ne2 = 1,
+        .ne3 = 1,
+        .scale = 1.0f / sqrtf((float)head_dim),
+        .max_bias = 0.0f,
+        .m0 = 0.0f,
+        .m1 = 0.0f,
+        .n_head_log2 = 0,
+        .logit_softcap = 0.0f,
+    };
+    const NSUInteger shared_elems =
+        (ds4_gpu_align_up_ns(head_dim, 128u) + 4u * ncpsg +
+         2u * ds4_gpu_align_up_ns(head_dim, 128u)) * nsg;
+    const NSUInteger shared_bytes =
+        ds4_gpu_align_up_ns(
+            shared_elems * sizeof(uint16_t), 16u);
+
+    int owned = 0;
+    id<MTLCommandBuffer> cb = ds4_gpu_command_buffer(&owned);
+    if (!cb) return 0;
+    id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
+    if (!enc) return 0;
+    [enc setComputePipelineState:rotate_pipeline];
+    [enc setBytes:&attention_args
+           length:sizeof(attention_args) atIndex:0];
+    [enc setBuffer:query_buf
+            offset:ds4_gpu_tensor_offset(query) atIndex:1];
+    [enc setBuffer:g_flash_attn_ring_buffer offset:0u atIndex:2];
+    [enc setThreadgroupMemoryLength:
+         ds4_gpu_qwen35_threadgroup_f32_bytes(head_dim) atIndex:0];
+    [enc dispatchThreadgroups:MTLSizeMake(n_query_head, 1u, 1u)
+         threadsPerThreadgroup:MTLSizeMake(head_dim, 1u, 1u)];
+    ds4_gpu_end_compute_encoder(cb, enc);
+
+    enc = ds4_gpu_compute_encoder(cb);
+    if (!enc) return 0;
+    [enc setComputePipelineState:dequant_pipeline];
+    [enc setBytes:&dequant_args length:sizeof(dequant_args) atIndex:0];
+    [enc setBuffer:key_buf
+            offset:ds4_gpu_tensor_offset(key_cache) atIndex:1];
+    [enc setBuffer:value_buf
+            offset:ds4_gpu_tensor_offset(value_cache) atIndex:2];
+    [enc setBuffer:g_flash_attn_kv_buffer offset:0u atIndex:3];
+    [enc setBuffer:g_flash_attn_kv_buffer
+            offset:(NSUInteger)cache_f16_bytes atIndex:4];
+    [enc dispatchThreadgroups:MTLSizeMake(n_kv_head, n_kv, 1u)
+         threadsPerThreadgroup:MTLSizeMake(head_dim, 1u, 1u)];
+    ds4_gpu_end_compute_encoder(cb, enc);
+
+    if (has_kvpad) {
+        ds4_gpu_qwen35_gqa_decode_args pad_args = {
+            .n_kv = n_kv,
+            .n_query_head = n_query_head,
+            .n_kv_head = n_kv_head,
+            .head_dim = head_dim,
+            .query_head_stride = query_head_bytes,
+            .query_dim_stride = sizeof(float),
+            .key_token_stride = f16_token_bytes,
+            .key_head_stride = f16_head_bytes,
+            .key_dim_stride = sizeof(uint16_t),
+            .value_token_stride = f16_token_bytes,
+            .value_head_stride = f16_head_bytes,
+            .value_dim_stride = sizeof(uint16_t),
+            .output_head_stride = query_head_bytes,
+            .output_dim_stride = sizeof(float),
+        };
+        enc = ds4_gpu_compute_encoder(cb);
+        if (!enc) return 0;
+        [enc setComputePipelineState:pad_pipeline];
+        [enc setBytes:&pad_args length:sizeof(pad_args) atIndex:0];
+        [enc setBuffer:g_flash_attn_kv_buffer offset:0u atIndex:1];
+        [enc setBuffer:g_flash_attn_kv_buffer
+                offset:(NSUInteger)cache_f16_bytes atIndex:2];
+        [enc setBuffer:g_qwen35_gqa_split_k_pad_buffer
+                offset:0u atIndex:3];
+        [enc dispatchThreadgroups:MTLSizeMake(n_kv_head, 2u, 1u)
+             threadsPerThreadgroup:MTLSizeMake(head_dim, 1u, 1u)];
+        ds4_gpu_end_compute_encoder(cb, enc);
+    }
+
+    enc = ds4_gpu_compute_encoder(cb);
+    if (!enc) return 0;
+    [enc setComputePipelineState:vec_pipeline];
+    [enc setBytes:&vec_args length:sizeof(vec_args) atIndex:0];
+    [enc setBuffer:g_flash_attn_ring_buffer offset:0u atIndex:1];
+    [enc setBuffer:g_flash_attn_kv_buffer offset:0u atIndex:2];
+    [enc setBuffer:g_flash_attn_kv_buffer
+            offset:(NSUInteger)cache_f16_bytes atIndex:3];
+    [enc setBuffer:g_qwen35_gqa_split_k_pad_buffer offset:0u atIndex:4];
+    [enc setBuffer:g_qwen35_gqa_split_k_pad_buffer offset:0u atIndex:5];
+    [enc setBuffer:g_qwen35_gqa_split_k_pad_buffer offset:0u atIndex:6];
+    [enc setBuffer:g_flash_attn_tmp_buffer offset:0u atIndex:7];
+    [enc setThreadgroupMemoryLength:shared_bytes atIndex:0];
+    [enc dispatchThreadgroups:MTLSizeMake(1u, n_query_head, nwg)
+         threadsPerThreadgroup:MTLSizeMake(32u, nsg, 1u)];
+    ds4_gpu_end_compute_encoder(cb, enc);
+
+    ds4_gpu_flash_attn_reduce_args reduce_args = {
+        .nrows = (int32_t)nrows,
+    };
+    enc = ds4_gpu_compute_encoder(cb);
+    if (!enc) return 0;
+    [enc setComputePipelineState:reduce_pipeline];
+    [enc setBytes:&reduce_args length:sizeof(reduce_args) atIndex:0];
+    [enc setBuffer:g_flash_attn_tmp_buffer offset:0u atIndex:1];
+    [enc setBuffer:out_buf
+            offset:ds4_gpu_tensor_offset(out) atIndex:2];
+    [enc dispatchThreadgroups:MTLSizeMake(nrows, 1u, 1u)
+         threadsPerThreadgroup:MTLSizeMake(reduce_threads, 1u, 1u)];
+    ds4_gpu_end_compute_encoder(cb, enc);
+
+    return ds4_gpu_finish_command_buffer(
+        cb, owned, "Qwen TQ4 staged-F16 split-K decode") != 0;
+}
+
 int ds4_gpu_qwen35_gqa_decode_select_tensor(
         ds4_gpu_tensor       *out,
         const ds4_gpu_tensor *query,
@@ -28341,13 +29216,16 @@ static int ds4_gpu_qwen35_gqa_prefill_flash_f16_tensor(
         uint32_t              n_token,
         uint32_t              n_query_head,
         uint32_t              n_kv_head,
-        uint32_t              head_dim) {
+        uint32_t              head_dim,
+        int                   packed_tq4,
+        uint32_t              layer_index) {
     enum {
         QWEN_FLASH_NQPTG = 8,
         QWEN_FLASH_NCPSG = 64,
     };
     if (!out || !query || !key_cache || !value_cache ||
-        g_ssd_streaming_mode || n_token == 0u || n_query_head == 0u ||
+        (!packed_tq4 && g_ssd_streaming_mode) ||
+        n_token == 0u || n_query_head == 0u ||
         n_kv_head == 0u || head_dim != 256u ||
         n_query_head % n_kv_head != 0u ||
         position0 > UINT32_MAX - n_token) {
@@ -28366,13 +29244,29 @@ static int ds4_gpu_qwen35_gqa_prefill_flash_f16_tensor(
         return 0;
     }
     const uint64_t query_bytes = query_values * sizeof(float);
-    const uint64_t cache_bytes = cache_values * sizeof(float);
     const uint64_t cache_f16_bytes = cache_values * sizeof(uint16_t);
     if (cache_f16_bytes > NSUIntegerMax / 2u) return 0;
     const uint64_t cache_head_bytes =
         (uint64_t)head_dim * sizeof(uint16_t);
     const uint64_t cache_token_bytes =
         (uint64_t)n_kv_head * cache_head_bytes;
+    uint64_t source_key_bytes = cache_values * sizeof(float);
+    uint64_t source_value_bytes = source_key_bytes;
+    uint64_t tq4_key_head_bytes = 0u, tq4_key_token_bytes = 0u;
+    uint64_t tq4_value_head_bytes = 0u, tq4_value_token_bytes = 0u;
+    if (packed_tq4) {
+        uint64_t unused_f32_token_bytes = 0u;
+        if (!ds4_gpu_qwen35_tq4_layout(
+                n_kv_head, head_dim, &unused_f32_token_bytes,
+                &tq4_key_head_bytes, &tq4_key_token_bytes,
+                &tq4_value_head_bytes, &tq4_value_token_bytes) ||
+            n_kv > UINT64_MAX / tq4_key_token_bytes ||
+            n_kv > UINT64_MAX / tq4_value_token_bytes) {
+            return 0;
+        }
+        source_key_bytes = (uint64_t)n_kv * tq4_key_token_bytes;
+        source_value_bytes = (uint64_t)n_kv * tq4_value_token_bytes;
+    }
 
     const NSUInteger mask_bytes =
         (NSUInteger)n_token * (NSUInteger)n_kv * sizeof(uint16_t);
@@ -28403,8 +29297,8 @@ static int ds4_gpu_qwen35_gqa_prefill_flash_f16_tensor(
     id<MTLBuffer> out_buf = ds4_gpu_tensor_buffer(out);
     if (!query_buf || !key_buf || !value_buf || !out_buf ||
         ds4_gpu_tensor_bytes(query) < query_bytes ||
-        ds4_gpu_tensor_bytes(key_cache) < cache_bytes ||
-        ds4_gpu_tensor_bytes(value_cache) < cache_bytes ||
+        ds4_gpu_tensor_bytes(key_cache) < source_key_bytes ||
+        ds4_gpu_tensor_bytes(value_cache) < source_value_bytes ||
         ds4_gpu_tensor_bytes(out) < query_bytes ||
         !ds4_gpu_ensure_scratch_buffer(&g_flash_attn_kv_buffer,
                                          &g_flash_attn_kv_bytes,
@@ -28452,14 +29346,60 @@ static int ds4_gpu_qwen35_gqa_prefill_flash_f16_tensor(
     int owned = 0;
     id<MTLCommandBuffer> cb = ds4_gpu_command_buffer(&owned);
     if (!cb) return 0;
-    if (!ds4_gpu_encode_cpy_f32_f16_1d(
-            cb, key_buf, ds4_gpu_tensor_offset(key_cache),
-            g_flash_attn_kv_buffer, 0u, (uint32_t)cache_values) ||
-        !ds4_gpu_encode_cpy_f32_f16_1d(
-            cb, value_buf, ds4_gpu_tensor_offset(value_cache),
-            g_flash_attn_kv_buffer, (NSUInteger)cache_f16_bytes,
-            (uint32_t)cache_values)) {
-        return 0;
+    if (packed_tq4) {
+        id<MTLComputePipelineState> dequant_pipeline =
+            ds4_gpu_get_pipeline("kernel_qwen35_tq4_dequantize_f16");
+        if (!dequant_pipeline ||
+            dequant_pipeline.maxTotalThreadsPerThreadgroup < head_dim) {
+            return 0;
+        }
+        ds4_gpu_qwen35_tq4_store_args dequant_args = {
+            .position0 = 0u,
+            .n_token = n_kv,
+            .n_kv_head = n_kv_head,
+            .head_dim = head_dim,
+            .seed = ds4_gpu_qwen35_tq4_seed(layer_index),
+            .reserved = 0u,
+            .key_input_token_stride = tq4_key_token_bytes,
+            .key_input_head_stride = tq4_key_head_bytes,
+            .key_input_dim_stride = 0u,
+            .value_input_token_stride = tq4_value_token_bytes,
+            .value_input_head_stride = tq4_value_head_bytes,
+            .value_input_dim_stride = 0u,
+            .key_cache_token_stride = cache_token_bytes,
+            .key_cache_head_stride = cache_head_bytes,
+            .value_cache_token_stride = cache_token_bytes,
+            .value_cache_head_stride = cache_head_bytes,
+        };
+        id<MTLComputeCommandEncoder> dequant_enc =
+            ds4_gpu_compute_encoder(cb);
+        if (!dequant_enc) return 0;
+        [dequant_enc setComputePipelineState:dequant_pipeline];
+        [dequant_enc setBytes:&dequant_args
+                       length:sizeof(dequant_args) atIndex:0];
+        [dequant_enc setBuffer:key_buf
+                        offset:ds4_gpu_tensor_offset(key_cache) atIndex:1];
+        [dequant_enc setBuffer:value_buf
+                        offset:ds4_gpu_tensor_offset(value_cache) atIndex:2];
+        [dequant_enc setBuffer:g_flash_attn_kv_buffer
+                        offset:0u atIndex:3];
+        [dequant_enc setBuffer:g_flash_attn_kv_buffer
+                        offset:(NSUInteger)cache_f16_bytes atIndex:4];
+        [dequant_enc setThreadgroupMemoryLength:
+             ds4_gpu_qwen35_threadgroup_f32_bytes(head_dim) atIndex:0];
+        [dequant_enc dispatchThreadgroups:MTLSizeMake(n_kv_head, n_kv, 1u)
+                  threadsPerThreadgroup:MTLSizeMake(head_dim, 1u, 1u)];
+        ds4_gpu_end_compute_encoder(cb, dequant_enc);
+    } else {
+        if (!ds4_gpu_encode_cpy_f32_f16_1d(
+                cb, key_buf, ds4_gpu_tensor_offset(key_cache),
+                g_flash_attn_kv_buffer, 0u, (uint32_t)cache_values) ||
+            !ds4_gpu_encode_cpy_f32_f16_1d(
+                cb, value_buf, ds4_gpu_tensor_offset(value_cache),
+                g_flash_attn_kv_buffer, (NSUInteger)cache_f16_bytes,
+                (uint32_t)cache_values)) {
+            return 0;
+        }
     }
 
     if (has_kvpad) {
@@ -28606,8 +29546,10 @@ static int ds4_gpu_qwen35_gqa_prefill_flash_f16_tensor(
          threadsPerThreadgroup:MTLSizeMake(32u, nsg, 1u)];
     ds4_gpu_end_compute_encoder(cb, enc);
 
-    return ds4_gpu_finish_command_buffer(cb, owned,
-                                          "Qwen prefill FlashAttention") != 0;
+    return ds4_gpu_finish_command_buffer(
+        cb, owned, packed_tq4
+            ? "Qwen TQ4 prefill FlashAttention"
+            : "Qwen prefill FlashAttention") != 0;
 }
 
 int ds4_gpu_qwen35_gqa_prefill_select_tensor(
@@ -28627,7 +29569,7 @@ int ds4_gpu_qwen35_gqa_prefill_select_tensor(
         !g_ssd_streaming_mode) {
         const int ok = ds4_gpu_qwen35_gqa_prefill_flash_f16_tensor(
             out, query, key_cache, value_cache, position0, n_token,
-            n_query_head, n_kv_head, head_dim);
+            n_query_head, n_kv_head, head_dim, 0, 0u);
         if (ok) {
             static int logged;
             if (!logged) {
