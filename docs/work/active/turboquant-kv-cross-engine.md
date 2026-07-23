@@ -123,23 +123,38 @@
 - The 32 GiB 2K and 8K fresh-process cohorts are recorded in
   `docs/benchmarks/2026-07-23-turboquant-kv-feasibility.md`. TQ4 reduced task
   footprint by about 140 MiB at 2K and 550 MiB at 8K. Prefill is flat after
-  Flash staging; M1 Pro decode ranges from about 2% to 8% below F32 for the
-  useful direct variants. `reuse8` loses more on M1 and remains present for
-  the M5 comparison.
+  Flash staging; on the single-binary selector confirmation, M1 Pro decode is
+  within noise at 2K under `auto` and 2.87% below F32 at 8K. `split` is 5.17%
+  below at 8K; `reuse8` loses 68.64% there and remains present for the M5
+  comparison. All arms have zero swapout delta and byte-identical TQ4 logits
+  within each context.
+- At 32K the F32 resident control fails closed at admission: 25.23 GiB is
+  required against the 24.96 GiB fixed working-set budget at capacity 33,024.
+  TQ4 resident is admitted and all retained strategies complete at about
+  2.84 GiB task footprint, 23% minimum pressure, and zero swap. Flash/auto is
+  the best M1 strategy at about 17.1 decode tok/s. This proves a resident
+  capacity gain, not an F32/TQ4 same-plan speed comparison.
+- TQ4 resident `auto` also completed 65,536 and 100,000 real-token frontiers
+  with full logits/decode artifacts and zero swap. Prefill/decode were
+  201.79/12.13 and 161.81/9.43 tok/s respectively. Minimum pressure fell to
+  19% and 16%, so these are functional exploratory/OOB gates only and cannot
+  promote the candidate.
 - The LAN endpoint was retried after the 32 GiB connection was restored.
-  ICMP/ARP are present but TCP/22 still times out. Once it is reachable,
-  re-probe power, pressure, swapout, free disk, artifact identity, checkout
-  isolation, and absence of a DS4 process.
+  ICMP/ARP are present but TCP/22 still times out. A LAN magic packet did not
+  restore Remote Login. The earlier direct-link endpoint `169.254.83.36` is
+  also unreachable. Once either route is reachable, re-probe power, pressure,
+  swapout, free disk, artifact identity, checkout isolation, and absence of a
+  DS4 process.
 - Run only one model process per host. Qwen uses AUTO/SSD on 16 GiB and
   AUTO/resident on 32 GiB; DeepSeek/GLM follow the support contract, and GLM
   resident must continue to fail closed.
 
 ## Next Safe Action
 
-Synchronize the selectable-strategy source on the 32 GiB host and preserve its
-already completed 2K/8K cohort. As soon as TCP/22 returns, stage the same tree
-on the 16 GiB LAN host and run fresh-process controls before advancing its
-safe frontiers. Compare the retained strategies on M5 when its isolated
-inference lane becomes available. Production allocation, snapshots, and
-default dispatch remain unchanged until the complete qualification matrix
-succeeds; strategy removal happens only after that hardware decision.
+Preserve the completed 32 GiB 2K/8K/32K/65K/100K artifacts. As soon as TCP/22
+returns, stage the same source on the 16 GiB LAN host and run fresh-process SSD
+controls before advancing only through pressure-safe frontiers. Compare the
+retained strategies on M5 when its isolated inference lane becomes available.
+Production allocation, snapshots, and default dispatch remain unchanged until
+the complete qualification matrix succeeds; strategy removal happens only
+after that hardware decision.

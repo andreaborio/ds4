@@ -149,3 +149,102 @@ These cohorts establish a real memory reduction and expose an M1 decode-cost
 tradeoff. They do not decide the final dispatch. In particular, no strategy
 will be removed until the 16 GiB LAN lane and the M5 lane have run the same
 selectable implementations.
+
+### Single-binary strategy confirmation
+
+After restoring every implementation behind `DS4_QWEN_TQ4_DECODE`, the 32 GiB
+host repeated baseline plus all six choices from remote source
+`1d3972eca07a76fdd9ffc3e3deeb62587c6e7581` and binary SHA-256
+`5481339d8be43b587f5020a37b82ebcde1f892d98d6e65fd1d30a4c3015f1b5d`.
+The process, model, allocation, and runner were fresh for every arm.
+
+| Context | Strategy | Prefill tok/s | Decode tok/s | Decode vs F32 | Task footprint |
+| --- | --- | ---: | ---: | ---: | ---: |
+| 2K | F32 baseline | 388.53 | 27.45 | control | 2.28 GiB |
+| 2K | TQ4 `serial` | 389.35 | 11.78 | -57.09% | 2.14 GiB |
+| 2K | TQ4 `parallel` | 388.20 | 24.21 | -11.80% | 2.14 GiB |
+| 2K | TQ4 `split` | 386.79 | 27.25 | -0.73% | 2.14 GiB |
+| 2K | TQ4 `reuse8` | 386.98 | 17.24 | -37.19% | 2.14 GiB |
+| 2K | TQ4 `flash` | 389.05 | 26.82 | -2.30% | 2.14 GiB |
+| 2K | TQ4 `auto` | 388.04 | 27.50 | +0.18% | 2.14 GiB |
+| 8K | F32 baseline | 335.89 | 25.13 | control | 2.88 GiB |
+| 8K | TQ4 `serial` | 336.54 | 4.29 | -82.93% | 2.34 GiB |
+| 8K | TQ4 `parallel` | 337.64 | 16.21 | -35.50% | 2.34 GiB |
+| 8K | TQ4 `split` | 336.78 | 23.83 | -5.17% | 2.34 GiB |
+| 8K | TQ4 `reuse8` | 336.49 | 7.88 | -68.64% | 2.34 GiB |
+| 8K | TQ4 `flash` | 337.27 | 24.36 | -3.06% | 2.33 GiB |
+| 8K | TQ4 `auto` | 337.23 | 24.41 | -2.87% | 2.34 GiB |
+
+Every arm completed with zero swapout delta and no competing process.
+System-wide free-memory pressure stayed at or above 24% for the 8K F32
+control and 26% for the TQ4 arms. Within each context all TQ4 strategies
+produced byte-identical logits artifacts: strategy selection changes execution
+only, not the quantized-cache result.
+
+The table also explains the M1 degradation. F32 attention reads a
+compute-ready cache; TQ4 saves persistent bandwidth and allocation but must
+unpack nibbles, load F16 metadata, reconstruct values, and perform the key
+rotation contract during every attention use. `serial` and `reuse8` add
+barrier/occupancy costs that dominate on M1. Split-K and Flash expose enough
+parallelism to recover most, but not all, of that cost at 8K. M5 must be
+measured rather than inferred because its tensor/Metal capabilities and
+scheduling balance differ materially from this pre-M5 lane.
+
+### 32K admission and retained-strategy frontier
+
+The F32 resident control could not be run safely at 32K on this 32 GiB host.
+With capacity 33,024, resident preflight calculated 25.23 GiB required against
+the profile's fixed 24.96 GiB working-set budget and rejected the request
+before model loading. A deliberately over-allocated 65,536-capacity attempt
+was also rejected (26.47 GiB required). Both failures had normal initial
+pressure, zero swap, and no inference allocation; they are admission evidence,
+not failed inference runs.
+
+TQ4 resident was admitted at capacity 33,024 and completed every retained
+strategy:
+
+| Strategy | Prefill tok/s | Decode tok/s | Task footprint | Pressure minimum |
+| --- | ---: | ---: | ---: | ---: |
+| TQ4 `auto` | 262.22 | 17.08 | 2.84 GiB | 23% |
+| TQ4 `flash` | 262.45 | 17.10 | 2.84 GiB | 23% |
+| TQ4 `split` | 262.55 | 15.80 | 2.84 GiB | 23% |
+| TQ4 `parallel` | 262.63 | 6.90 | 2.84 GiB | 23% |
+| TQ4 `reuse8` | 262.27 | 2.49 | 2.84 GiB | 23% |
+| TQ4 `serial` | 262.50 | 1.21 | 2.84 GiB | 23% |
+
+Every 32K arm completed with zero swapout delta, no process contamination,
+and the same full-logit artifact hash. This is not a same-plan F32/TQ4 speed
+comparison because no F32 resident arm was admitted. It does establish that
+the packed cache changes a 32K resident request from rejected to runnable on
+this host. It also preserves the M1 execution-policy evidence: Flash wins
+among the retained strategies at the long frontier.
+
+### 65K and 100K functional frontiers
+
+The `auto`/Flash TQ4 resident path completed both required long-context
+frontiers with 128 greedy decode tokens:
+
+| Frontier | Capacity | Prefill tok/s | Decode tok/s | Task footprint | Pressure minimum | Wired peak | Swapout |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 65,536 | 65,792 | 201.79 | 12.13 | 3.56 GiB | 19% | 24.996 GiB | 0 |
+| 100,000 | 100,256 | 161.81 | 9.43 | 3.12 GiB | 16% | 25.970 GiB | 0 |
+
+Both produced complete logits and decode-evidence artifacts without an
+out-of-bounds failure, changed resolved plan, concurrent inference process, or
+swap. They are functional exploratory evidence only: their pressure minima
+fell below the 20% launch threshold, so neither can promote the candidate.
+The result is nevertheless useful for the original feasibility question:
+packed resident storage remains bounded enough to execute 100K on the 32 GiB
+M1 Pro, whereas F32 resident is already rejected at 32K.
+
+## 16 GiB LAN Status
+
+The 16 GiB M1 Pro is identified as `macbookpro.lan` / `192.168.1.212`.
+The host still answers ICMP and is present in ARP, but TCP/22 times out. A
+magic packet did not restore Remote Login. The earlier direct-link endpoint
+`169.254.83.36`, previously used with the same physical Mac, is also
+unreachable. No source was copied and no benchmark was started there.
+
+This is an external access blocker, not permission to substitute the
+32 GiB/Tailscale machine or the local M5. The 16 GiB fresh-process SSD cohort
+remains required as soon as either LAN endpoint returns.
