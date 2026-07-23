@@ -1,7 +1,9 @@
 # DeepSeek MLX affine2 and SSD-streaming feasibility (2026-07-22)
 
-Status: research / HOLD; planner safety correction implemented, not qualified
-for promotion.
+Status: research / HOLD for affine2; planner safety correction implemented.
+The 2026-07-23 AC follow-up below separately validates the explicit-cache
+correctness fix and records rejected IQ2/Q2 performance candidates. The safe
+AUTO12 default remains unchanged.
 
 Decision: keep `codex/mlx-deepseek-ssd-study` as an experimental branch. Do
 not merge the affine2 runtime into a supported DeepSeek path until the artifact
@@ -372,6 +374,185 @@ and decode evidence
 Battery fell from 21% to 20%; free-memory bottomed at 34%, wired memory peaked
 at 2,114,499 16 KiB pages (32.265 GiB), and `Swapouts` remained `660581`.
 
+## 2026-07-23 AC follow-up on the qualified IQ2/Q2 artifact
+
+This follow-up does not time affine2: no physical affine2 artifact exists. It
+uses the qualified IQ2/Q2 ExpertMajor v2 artifact to fix the cache-transition
+bug found above, establish context measurements, and screen the simplest SSD
+prefill/decode changes while the host is on AC power.
+
+All retained successful measurement and cohort arms used separate processes,
+128 greedy decode tokens, the published model identity above,
+process-contamination checks, finite frontier and decode evidence, and a
+zero-new-swap gate. Explicitly rejected/aborted screens are identified below
+and excluded from performance aggregates. Scratch logs remain outside the
+repository. The prose prompt SHA-256 was
+`f53e0d80cb2d4492d24ebd63c7000c397b16ae70f9bf09b3763e5d8323ec209f`.
+The 32K security/coding prompt is the checked-in fixture.
+
+### Explicit cache correctness fix
+
+The explicit-cache failure was corrected by making a DeepSeek phase transition
+a no-op unless AUTO initialized a non-zero prefill target and a larger decode
+target. Thus `--ssd-streaming-cache-experts 517` remains 517 after prefill
+instead of becoming zero. The pure transition helper covers zero/equal/valid
+targets, and the fixed 517-record canary produced 128 decode tokens and all
+129,280 finite final logits. Its evidence matched the retained fixed-cache and
+pre-MLX-control runs at the same prompt and context.
+
+### Fixed-cache context measurements
+
+These are exploratory context measurements, not an A/B performance promotion.
+They use exact cache 517 and therefore emphasize SSD miss cost.
+
+| Prompt | Context | Prefill | Decode | Decode p95 | Wired peak | New swap |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| Prose | 128 | 25.81 tok/s | 9.20 tok/s | 126.453 ms | 20,250 MiB | 0 |
+| Prose | 2,048 | 156.42 tok/s | 7.72 tok/s | 140.060 ms | 17,304 MiB | 0 |
+| Prose | 8,192 | 172.83 tok/s | 8.89 tok/s | 124.739 ms | 16,775 MiB | 0 |
+| Prose | 32,768 | 165.73 tok/s | 8.04 tok/s | 136.300 ms | 16,622 MiB | 0 |
+| Security/coding | 32,768 | 173.52 tok/s | 6.55 tok/s | 165.101 ms | 16,745 MiB | 0 |
+
+Prompt identity matters. The prose and security/coding 32K rows must not be
+combined as repeat measurements. The security/coding row's raw frontier
+evidence SHA-256 was
+`5547c4434479e3fe61672df5523e994ee751986362a2465a32d3b2bc340de2d0`,
+matching its historical oracle.
+
+### Cache-size and eviction sweep
+
+An exact 128-token screen shows why decode cache capacity dominates SSD decode:
+
+| Cache | Prefill | Decode | Hit rate | Decode `pread` | Read amplification | Wired peak | New swap |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 517 fixed | 25.81 tok/s | 9.20 tok/s | 0.604 | 86.208 GiB | 3.109 | 20,250 MiB | 0 |
+| 3,097 fixed | 21.64 tok/s | 12.71 tok/s | 0.896 | 22.649 GiB | 1.137 | 33,584 MiB | 0 |
+
+The larger fixed cache improves decode 38.2% and reduces measured decode reads
+73.7%, but it slows this prefill screen because a fixed budget cannot contract
+during prefill. That result motivated phase-specific AUTO targets rather than
+one large fixed cache.
+
+At 2K, AUTO14 and AUTO17 were then compared in a valid A/B/B/A cohort. Control
+drift was 0.032% for prefill, 1.30% for decode throughput, and 2.41% for p95.
+Every run added zero swap and produced identical evidence.
+
+| 2K policy | Prefill mean | Decode mean | Decode p95 mean | Wired peak mean | New swap |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| AUTO17 / 4,387 | 155.945 tok/s | 10.820 tok/s | **94.699 ms** | 42,314 MiB | 0 |
+| AUTO14 / 3,613 | **161.000 tok/s** | 10.775 tok/s | 101.183 ms | 37,090 MiB | 0 |
+
+AUTO14 improves the reported prefill interval 3.24%, but decode throughput is
+effectively neutral and p95 is 6.85% worse. `ds4-bench` times phase restore and
+hotlist seed inside its prefill interval; both policies use 259 records during
+the actual batched prefill, while 3,613 versus 4,387 is the post-prefill target.
+The table must therefore not be interpreted as a math-kernel prefill result.
+
+The existing layer-staleness eviction tie-break was screened once at AUTO14:
+160.11 prefill tok/s, 10.87 decode tok/s, and 99.980 ms p95. It did not recover
+AUTO17's 94.699 ms cohort mean and was rejected without a full cohort.
+
+### Context-tiered candidate: not promoted
+
+One candidate kept 17 complete route cycles for short-context decode,
+contracted to 12 cycles before decode at the 8K guard, and to eight cycles at
+the 65K guard. Batched prefill stayed at the 259-record correctness floor.
+
+| Resulting context | Post-prefill/decode target | Records |
+| --- | ---: | ---: |
+| 0 through 8,063 | 17 route cycles | 4,387 |
+| 8,064 through 65,407 | 12 route cycles | 3,097 |
+| 65,408 and above | 8 route cycles | 2,065 |
+
+The 128-token guard made the candidate runtime boundaries 8,064 and 65,408;
+the pure long-target helper was checked at 8,192 and 65,536. An explicit cache
+still bypassed all phase targets.
+
+Two final dirty-build canaries based on `6315de2` used binary SHA-256
+`a6aabd7135be15ccc81d37f57fc434a4a68658c784ede410b732dc68138191c1`
+and code diff SHA-256
+`194c8d5e6798d29b36cf3e3784583ed7a6faeabe9f5822aad03e84282f4d3b61`.
+
+| Canary | Initial ceiling | Prefill target | Decode target | Prefill | Decode | p95 | Wired peak | New swap |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 2K | 4,387 | 259 | 4,387 | 150.78 tok/s | 10.88 tok/s | 96.526 ms | 42,556 MiB | 0 |
+| 8K | 4,387 | 259 | 3,097 | 195.96 tok/s | 9.76 tok/s | 113.087 ms | 33,952 MiB | 0 |
+
+The 8K log explicitly records `4387 -> 259 -> 3097`. Against the earlier
+fixed-517 8K canary, the tiered canary is 13.4% faster in prefill, 9.8% faster
+in decode, and 9.3% lower in p95. This is encouraging but remains an
+unpaired canary comparison; the percentages are not a promotion-grade A/B.
+
+The required direct comparisons against the actual AUTO12 baseline did not
+meet the stability gate. The AUTO12/AUTO17 2K A/B/B/A sequence was:
+
+| Arm | Policy | Prefill | Decode | Decode p95 | New swap |
+| --- | --- | ---: | ---: | ---: | ---: |
+| A1 | AUTO12 | 144.98 tok/s | 10.00 tok/s | 112.292 ms | 0 |
+| B1 | AUTO17 | 143.80 tok/s | 10.29 tok/s | 101.771 ms | 0 |
+| B2 | AUTO17 | 147.00 tok/s | 10.66 tok/s | 95.575 ms | 0 |
+| A2 | AUTO12 | 166.47 tok/s | 10.42 tok/s | 107.292 ms | 0 |
+
+The controls drifted 14.8% in prefill. AUTO17's mean decode signal was 2.6%
+higher and p95 10.1% lower, but its prefill mean was lower and the cohort is
+invalid. It cannot establish an overall speedup or restore a tier previously
+reduced for delayed swap.
+
+AUTO14 was also compared directly against AUTO12 after the host reported 83%
+free memory. Its A/B/B/A sequence was:
+
+| Arm | Policy | Prefill | Decode | Decode p95 | New swap |
+| --- | --- | ---: | ---: | ---: | ---: |
+| A1 | AUTO12 | 164.96 tok/s | 10.43 tok/s | 105.261 ms | 0 |
+| B1 | AUTO14 | 160.19 tok/s | 10.61 tok/s | 102.691 ms | 0 |
+| B2 | AUTO14 | 156.06 tok/s | 10.55 tok/s | 104.694 ms | 0 |
+| A2 | AUTO12 | 92.25 tok/s | 6.92 tok/s | 226.321 ms | 0 |
+
+A2 slowed despite zero new swap and no competing inference process, making the
+cohort unusable. Since neither candidate proves a stable prefill and decode
+win over AUTO12, the context-tiered code/test diff was withdrawn. AUTO12 / 12
+cycles (3,097 records) remains the runtime default; 65K+ continues to use the
+existing eight-cycle long-context cap.
+
+### Simple prefill fast-path screens
+
+The three lowest-effort existing controls were screened after the cache sweep.
+None is promoted.
+
+| Candidate | Design | Result | Correctness / safety | Decision |
+| --- | --- | --- | --- | --- |
+| Batch HC+RMSNorm fusion | Exact 517, 2K A/B/B/A | Prefill means 189.88 A vs 190.78 B (+0.48%); p95 114.38 vs 120.89 ms | Evidence identical, swap zero, but mean-normalized control prefill drift 3.65% | Reject as below noise |
+| Prefill chunk 8,192 | Exact 517, 8K screen | Candidate aborted before decode | **372 new swapout pages** | Hard reject |
+| Layer prepare-ahead 2 | Exact 517, 2K A/B/A screen | 127.08 A1, 148.22 B, 154.45 A2 prefill tok/s | Evidence identical and zero added swap; A drift 21.5% | Reject as page-cache state, not causal |
+
+The unsafe 8,192-chunk arm changed the system swapout counter from 897,897 to
+898,269. The runner stopped it at the first sample over the zero-page limit;
+no decode evidence was produced. Subsequent retained screens used 898,269 as
+their immutable baseline and added zero pages. This rejected arm is never
+mixed into safe performance aggregates.
+
+### GLM and Qwen parallel audit
+
+Two independent read-only agents checked for planner/dispatch and cache-policy
+problems analogous to DeepSeek. They did not modify code or run a model.
+
+| Family | Priority | Finding | Consequence |
+| --- | --- | --- | --- |
+| Qwen | P1 | SSD frontend requires grouped selected-address from batch 8, while Metal affine4 uses it from 32 | Batches 8 through 31 can return `expert_group_used=0` and abort |
+| Qwen | P1/P2 | Cache growth rechecks pressure only on the low-RAM tier | 32 GiB AUTO and 64 GiB forced SSD can allocate slabs after a stale admission snapshot |
+| Qwen | P2 | Planner charges an 8,192-token arena while SSD runtime uses 2,048 | About 1.47 GiB / 894 experts of conservative over-accounting |
+| Qwen | P2 | Ordinary phase-finish failure lacks macro-prefill rollback semantics | Public prompt position and abort semantics can diverge |
+| GLM | P1 | AUTO lacks a measured host gate below 64 GiB | An unqualified low-memory host may receive the generic aggressive plan |
+| GLM | P1 | Admission does not require the qualified Q2_K routed format | Unsupported routed quantizations can reach incomplete dispatch coverage |
+| GLM | P2 | `DS4_METAL_GLM_DISABLE_STREAMING_EXPERT_CACHE` can make mapping and dispatch disagree | Full-layer mapping plus cache loads can duplicate SSD work |
+| GLM | P2 | Explicit numeric cache bypasses snapshot/planner admission | Lazy slab allocation can create delayed pressure or swap |
+
+Neither family has the exact DeepSeek zero-target transition bug. Qwen's first
+finding is the closest planner/dispatch mismatch and should be fixed with one
+shared threshold, plus boundary tests at 7/8/31/32. GLM/Qwen runtime fixes and
+their required model matrices are deliberately separate from this DeepSeek
+branch result.
+
 ## Required experiment before reconsideration
 
 1. Implement a fail-closed writer/verifier with full donor and base provenance,
@@ -384,9 +565,9 @@ at 2,114,499 16 KiB pages (32.265 GiB), and `Swapouts` remained `660581`.
    affine2 artifact at every required frontier. Prove that no full-layer
    prepare occurs, and add separate counters for layer-prepare bytes, cache
    loader bytes, and physical disk I/O before interpreting performance.
-4. Fix and independently validate the pre-existing explicit-cache transition
-   that can reduce a DeepSeek decode cache to zero; make non-finite logits fail
-   closed before using explicit cache controls in a benchmark cohort.
+4. Preserve the now-fixed explicit-cache transition coverage and make
+   non-finite logits fail closed before using any new cache control in a
+   benchmark cohort.
 5. Run the official continuation scorer against the pinned donor, preserve
    greedy evidence, and qualify the quantization independently of timing.
 6. On AC power with no competing inference process and zero swapout, run
