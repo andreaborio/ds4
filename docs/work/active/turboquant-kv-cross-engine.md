@@ -106,6 +106,13 @@
   starting tree's unchanged `tests/test_expert_store.c` does not compile
   because `DS4_EXPERT_STORE_GLM_AFFINE2_GROUP_SIZE` is absent. This remains an
   external gate blocker, not a waiver.
+- On the current research SHA, `make premerge` stops earlier in
+  `tools/context_audit.py`: the active handoff is intentionally present and
+  the two research environment names raise `direct_ds4_env_names` from its
+  budget of 334 to 336. This is not waived. After the 16 GiB/M5 policy
+  decision, remove the strategy selectors and active handoff, restore the
+  audit budget, and rerun the gate; the unchanged Expert Store failure remains
+  the next known external blocker.
 - Durable design is in `docs/architecture/KV_QUANTIZATION.md`; initial evidence
   is in `docs/benchmarks/2026-07-23-turboquant-kv-feasibility.md`.
 
