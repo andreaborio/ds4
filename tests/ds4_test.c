@@ -879,6 +879,7 @@ extern bool ds4_internal_qwen35_gpu_graph_layer_state(
     ds4_gpu_tensor **state);
 extern void ds4_internal_qwen35_gpu_graph_free(
     void *storage, size_t storage_bytes);
+extern bool ds4_internal_qwen35_prefill_expert_group_request_test(void);
 
 static bool test_metal_tensor_view_partition(
         ds4_gpu_tensor       *parent,
@@ -980,6 +981,8 @@ static bool test_metal_tensor_is_all_zero(
 }
 
 static void test_metal_qwen35_graph_state(void) {
+    TEST_ASSERT(ds4_internal_qwen35_prefill_expert_group_request_test());
+
     /* Three rows are enough to prove the context term without turning this
      * model-free lifetime test into a real long-context allocation. */
     const uint32_t ctx_capacity = 3;

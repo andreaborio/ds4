@@ -14749,6 +14749,52 @@ static bool qwen35_prefill_suffix_needs_phase(uint32_t suffix_tokens) {
     return suffix_tokens > QWEN35_PREFILL_MICRO_TOKENS;
 }
 
+static bool qwen35_prefill_should_request_expert_group(
+        const ds4_model *model,
+        bool             expert_group,
+        uint32_t         n_token,
+        uint32_t         expert_group_min_tokens) {
+    if (!expert_group || n_token < expert_group_min_tokens) return false;
+
+    /* MLX-affine SSD selected-address batches below the routed-MM threshold
+     * cannot consume the grouped route table.  Keep the exact address path
+     * active and reserve grouping for the 32+ token MM-ID path. */
+    if (model &&
+        model->family == DS4_MODEL_FAMILY_QWEN35_MOE &&
+        model->native_expert_store_v2 &&
+        expert_group_min_tokens < QWEN35_RESIDENT_EXPERT_GROUP_MIN_TOKENS &&
+        n_token < QWEN35_RESIDENT_EXPERT_GROUP_MIN_TOKENS) {
+        return false;
+    }
+    return true;
+}
+
+bool ds4_internal_qwen35_prefill_expert_group_request_test(void) {
+    ds4_model qwen_mlx = {
+        .family = DS4_MODEL_FAMILY_QWEN35_MOE,
+        .native_expert_store_v2 = true,
+    };
+    ds4_model qwen_legacy = {
+        .family = DS4_MODEL_FAMILY_QWEN35_MOE,
+        .native_expert_store_v2 = false,
+    };
+    return
+        !qwen35_prefill_should_request_expert_group(
+            &qwen_mlx, true, 7u, QWEN35_SSD_EXPERT_GROUP_MIN_TOKENS) &&
+        !qwen35_prefill_should_request_expert_group(
+            &qwen_mlx, true, 8u, QWEN35_SSD_EXPERT_GROUP_MIN_TOKENS) &&
+        !qwen35_prefill_should_request_expert_group(
+            &qwen_mlx, true, 31u, QWEN35_SSD_EXPERT_GROUP_MIN_TOKENS) &&
+        qwen35_prefill_should_request_expert_group(
+            &qwen_mlx, true, 32u, QWEN35_SSD_EXPERT_GROUP_MIN_TOKENS) &&
+        qwen35_prefill_should_request_expert_group(
+            &qwen_mlx, true, 32u, QWEN35_RESIDENT_EXPERT_GROUP_MIN_TOKENS) &&
+        qwen35_prefill_should_request_expert_group(
+            &qwen_legacy, true, 8u, QWEN35_SSD_EXPERT_GROUP_MIN_TOKENS) &&
+        !qwen35_prefill_should_request_expert_group(
+            &qwen_mlx, false, 32u, QWEN35_SSD_EXPERT_GROUP_MIN_TOKENS);
+}
+
 static bool qwen35_u64_add(uint64_t a, uint64_t b, uint64_t *out) {
     if (!out || b > UINT64_MAX - a) return false;
     *out = a + b;
@@ -16979,7 +17025,8 @@ static bool qwen35_gpu_encode_ffn_batch(
      * grouping at 8..31 rows would disable the established paired matvec even
      * though mm_id grouping starts only at 32. */
     const bool request_expert_group =
-        expert_group && n_token >= expert_group_min_tokens;
+        qwen35_prefill_should_request_expert_group(
+            model, expert_group, n_token, expert_group_min_tokens);
 
     const bool detail_profile =
         getenv("DS4_QWEN_METAL_PREFILL_DETAIL_PROFILE") != NULL &&
