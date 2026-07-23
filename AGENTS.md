@@ -69,6 +69,19 @@ not a production inference fallback.
 - Generated files need a reproducible generator, input provenance, and a check
   mode. Do not commit local logs, binaries, model files, or benchmark scratch.
 
+### Implementation Explanations
+
+When proposing, attempting, or reporting an implementation, explain the intent,
+mechanism, expected effect, and important risks in clear, plain language. Use a
+small concrete example whenever it makes the change easier to understand, and
+keep the example focused on one idea at a time.
+
+Analogies and metaphors must preserve the relevant technical relationships.
+Explicitly map their parts to the real code, runtime state, or data flow, and
+state where the comparison stops being accurate. Do not use a memorable
+metaphor if it would hide an important constraint or imply behavior the system
+does not have.
+
 ## Knowledge Across Sessions
 
 Use the lifecycle in [`docs/work/README.md`](docs/work/README.md). An active
@@ -91,6 +104,28 @@ Choose tests by realistic impact using `CONTRIBUTING.md`; use the complete
 `QA_BEFORE_RELEASES.md` gate for releases. A structural change to common model,
 session, ExpertMajor, SSD, tokenizer, Metal graph, prefill, or decode code must
 rerun the qualified DeepSeek, GLM, and Qwen models before merge.
+
+### Test Result Reporting
+
+Whenever an agent reports test or benchmark results in chat, a handoff, commit
+or PR notes, or a benchmark record, present the results in Markdown tables
+rather than prose alone. Keep rows in chronological order and identify each new
+run with an ISO 8601 timestamp including the timezone, captured at the start of
+the run whenever practical, so the experiment sequence is unambiguous.
+
+For inference performance results, use separate columns for prefill throughput
+and decode throughput, and include decode TPOT p50/p95 when collected. Every
+comparable row must show the delta against the tested `main` baseline and
+against the most recent comparable experiment, with the commit or experiment
+identity for both references. Keep model, artifact, mode, prompt/frontier,
+hardware, and other acceptance conditions visible in the table or an adjacent
+metadata table.
+
+Never manufacture a comparison between unlike conditions. If a matching
+`main` baseline, previous experiment, timestamp, or phase-specific metric is
+unavailable, write `N/A` and explain why. For non-performance tests, use a
+table containing at least the timestamp, revision or experiment, test
+command/lane, and result.
 
 A short-context run may reject an inference optimization for correctness,
 safety, or a clear regression, but it may never promote the change or
