@@ -7,6 +7,7 @@ because their numbers remain useful.
 
 | Record | Status | Scope |
 | --- | --- | --- |
+| [`2026-07-24-qwen-24g-cache-guard.md`](2026-07-24-qwen-24g-cache-guard.md) | Safety fix implemented; physical M5 24 GiB confirmation pending | Qwen 24 GiB sustained-decode watchdog incident, guarded cache policy, model-free regression, and exact Hebrus Studio physical recheck gate |
 | [`2026-07-22-qwen-kv-pair-blit.md`](2026-07-22-qwen-kv-pair-blit.md) | Owner-authorized merge; full release matrix incomplete, SSD speed effect within noise | Qwen K/V cache pair-blit on M5 resident/SSD and M1 Pro 16/32 GiB, including invalid 16 GiB timing evidence |
 | [`2026-07-22-qwen-ssd-flash-prefill.md`](2026-07-22-qwen-ssd-flash-prefill.md) | Directional candidate; battery cohort, promotion pending | Qwen implicit-causal FlashAttention transfer to SSD, memory accounting, and first 2K/8K A/B |
 | [`2026-07-21-qwen-pre-m5-exact-router-tile.md`](2026-07-21-qwen-pre-m5-exact-router-tile.md) | Directional; timing cohort contaminated | Exact F32 router weight reuse on M1 Pro through 8K, rejected approximate predecessor, and pending clean promotion lane |

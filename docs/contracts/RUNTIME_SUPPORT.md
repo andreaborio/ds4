@@ -33,6 +33,15 @@ Q4_K_S payload is rejected rather than decoded through a compatibility path.
 The named policy is unit-tested at every cut; performance claims remain limited
 to the physical hosts and exact workloads in the release evidence.
 
+Qwen SSD plans on 16 and 24 GiB are guarded tiers. They require an affirmative
+normal-pressure signal at admission and every prefill/decode phase entry,
+including entries where the configured budget is unchanged but lazy slabs can
+still populate, and cap the routed-expert cache at 3,521 experts (about
+5.80 GiB for the published artifact). This prevents a sustained decode from
+turning an optimistic warm file-cache snapshot into unsafe wired slab growth.
+A higher 24 GiB ceiling may replace it only after the complete physical
+context/cache safety matrix passes; the current support boundary is unchanged.
+
 The lower-memory extension is Qwen-specific. Hosts below 64 GiB remain outside
 the DeepSeek and GLM production contract. Do not infer support for another
 family from Qwen's successful admission.

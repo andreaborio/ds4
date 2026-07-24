@@ -264,6 +264,21 @@ bool ds4_residency_plan_apply_qwen_metal_hardware_policy(
         const ds4_qwen_metal_hardware_policy *policy,
         ds4_residency_plan                   *plan);
 bool ds4_ssd_low_ram_cache_policy(uint64_t physical_bytes);
+/* Qwen's 16/24 GiB SSD tiers use a measured cache ceiling and require an
+ * affirmative normal-pressure signal before allocating or growing cache
+ * storage.  Keep this separate from the generic <=16 GiB policy because the
+ * latter also controls DeepSeek-specific behavior. */
+bool ds4_ssd_qwen_guarded_cache_policy(uint64_t physical_bytes);
+/* A guarded Qwen phase rechecks pressure even when its configured cache budget
+ * is unchanged: lazy expert slabs can still become physically populated during
+ * later work. `cache_budget_changed` is explicit so tests keep both paths
+ * covered; it must never weaken the pressure decision. */
+bool ds4_ssd_qwen_phase_pressure_allowed(
+        bool guarded,
+        bool cache_budget_changed,
+        bool snapshot_available,
+        bool pressure_status_available,
+        bool pressure_normal);
 bool ds4_ssd_static_pin_host_supported(uint64_t physical_bytes);
 bool ds4_ssd_working_set_after_reserve(uint64_t  recommended_bytes,
                                        uint64_t  runtime_bytes,

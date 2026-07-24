@@ -415,12 +415,13 @@ int main(void) {
     assert(floor.working_set_experts == 330);
     assert(floor.minimum_cache_experts == 331);
 
-    /* Qwen's supported Q4_K artifact has three equally sized expert slabs.
-     * Each block stores 256 values in 144 bytes: gate/up are 2048x512 and
-     * down is 512x2048, so every selected expert occupies 3 x 589824 bytes.
-     * One complete token route spans 40 layers x top-8; the extra cache slot
-     * prevents the first load of the next token from evicting a still-live
-     * expert in the current route. */
+    /* The qualified MLX affine4/group-64 artifact retains Q4_K logical tensor
+     * geometry for these cache-size calculations while execution reads its
+     * embedded affine expert store. Each logical block covers 256 values in
+     * 144 bytes: gate/up are 2048x512 and down is 512x2048, so every selected
+     * expert occupies 3 x 589824 bytes. One complete token route spans 40
+     * layers x top-8; the extra cache slot prevents the first load of the next
+     * token from evicting a still-live expert in the current route. */
     const uint64_t qwen_q4_k_block_bytes = 144u;
     const uint64_t qwen_gate_row_bytes =
         (QWEN35_N_EMBD / 256u) * qwen_q4_k_block_bytes;
@@ -513,14 +514,20 @@ int main(void) {
         assert(warm_plan.normal_pressure_full_file_credit_active);
         assert(cold_plan.reclaimable_bytes == warm_plan.reclaimable_bytes);
         assert(cold_plan.cache_experts == warm_plan.cache_experts);
+        if (qwen_profile_gib[i] <= 24u) {
+            assert(ds4_ssd_qwen_guarded_cache_policy(physical));
+            assert(cold_plan.cache_experts == 3521u);
+        } else {
+            assert(!ds4_ssd_qwen_guarded_cache_policy(physical));
+        }
         assert(cold_plan.cache_experts >= previous_cache_experts);
         previous_cache_experts = cold_plan.cache_experts;
     }
 
     /* Qwen keeps the complete static mapping charged on 16 GiB, but those
      * unpinned pages share ordinary headroom because macOS can reclaim and
-     * stream them again. Unlike DeepSeek's measured low-RAM performance cap,
-     * Qwen consumes the largest complete tier admitted by its safety budget. */
+     * stream them again. The guarded 16/24 GiB profiles then apply their
+     * independent 3,521-expert ceiling after the safety budget is computed. */
     ds4_ssd_host_memory qwen_memory = {
         .physical_bytes = 16 * GIB,
         .recommended_bytes = 12 * GIB,
@@ -634,6 +641,58 @@ int main(void) {
     assert(qwen_m1_unknown.wire_budget_bytes >= floor.minimum_cache_bytes);
     assert(qwen_m1_unknown.cache_experts == 321);
 
+    /* A 24 GiB Qwen host previously consumed every complete route admitted by
+     * its synthetic 18 GiB Metal budget (14.24 GiB in this fixture).  The
+     * guarded profile reuses the proven 5.80 GiB ceiling and fails closed when
+     * pressure is elevated or unavailable, before phase cache growth. */
+    qwen_memory = (ds4_ssd_host_memory){
+        .physical_bytes = 24 * GIB,
+        .recommended_bytes = 18 * GIB,
+        .free_bytes = 20 * GIB,
+        .pressure_status_available = true,
+        .pressure_normal = true,
+    };
+    ds4_ssd_adaptive_cache_plan qwen_24g = {0};
+    assert(ds4_ssd_adaptive_cache_plan_make_strict_with_static_reserve(
+        &qwen_memory,
+        512 * MIB,
+        5 * GIB / 2u,
+        false,
+        QWEN35_N_LAYER,
+        QWEN35_N_EXPERT_USED,
+        qwen_expert_bytes,
+        qwen_max_cacheable,
+        &qwen_24g));
+    assert(qwen_24g.cache_experts == 3521);
+    assert(qwen_24g.cache_bytes == UINT64_C(3521) * qwen_expert_bytes);
+    assert(qwen_24g.cache_bytes < 6 * GIB);
+    assert(!qwen_24g.low_ram_shared_static_headroom_active);
+    assert(!qwen_24g.low_ram_floor_ceiling_active);
+
+    qwen_memory.pressure_normal = false;
+    assert(!ds4_ssd_adaptive_cache_plan_make_strict_with_static_reserve(
+        &qwen_memory,
+        512 * MIB,
+        5 * GIB / 2u,
+        false,
+        QWEN35_N_LAYER,
+        QWEN35_N_EXPERT_USED,
+        qwen_expert_bytes,
+        qwen_max_cacheable,
+        &qwen_24g));
+    qwen_memory.pressure_status_available = false;
+    qwen_memory.pressure_normal = true;
+    assert(!ds4_ssd_adaptive_cache_plan_make_strict_with_static_reserve(
+        &qwen_memory,
+        512 * MIB,
+        5 * GIB / 2u,
+        false,
+        QWEN35_N_LAYER,
+        QWEN35_N_EXPERT_USED,
+        qwen_expert_bytes,
+        qwen_max_cacheable,
+        &qwen_24g));
+
     qwen_memory = (ds4_ssd_host_memory){
         .physical_bytes = 64 * GIB,
         .recommended_bytes = 52 * GIB,
@@ -675,6 +734,26 @@ int main(void) {
     assert(!ds4_ssd_low_ram_cache_policy(0));
     assert(ds4_ssd_low_ram_cache_policy(16 * GIB));
     assert(!ds4_ssd_low_ram_cache_policy(16 * GIB + 1u));
+    assert(!ds4_ssd_qwen_guarded_cache_policy(0));
+    assert(ds4_ssd_qwen_guarded_cache_policy(16 * GIB));
+    assert(ds4_ssd_qwen_guarded_cache_policy(24 * GIB));
+    assert(!ds4_ssd_qwen_guarded_cache_policy(24 * GIB + 1u));
+    const bool qwen_16g_guarded =
+        ds4_ssd_qwen_guarded_cache_policy(16 * GIB);
+    const bool qwen_32g_guarded =
+        ds4_ssd_qwen_guarded_cache_policy(32 * GIB);
+    for (int changed = 0; changed <= 1; changed++) {
+        assert(ds4_ssd_qwen_phase_pressure_allowed(
+            qwen_16g_guarded, changed != 0, true, true, true));
+        assert(!ds4_ssd_qwen_phase_pressure_allowed(
+            qwen_16g_guarded, changed != 0, true, true, false));
+        assert(!ds4_ssd_qwen_phase_pressure_allowed(
+            qwen_16g_guarded, changed != 0, true, false, true));
+        assert(!ds4_ssd_qwen_phase_pressure_allowed(
+            qwen_16g_guarded, changed != 0, false, true, true));
+        assert(ds4_ssd_qwen_phase_pressure_allowed(
+            qwen_32g_guarded, changed != 0, false, false, false));
+    }
     assert(!ds4_ssd_static_pin_host_supported(0));
     assert(!ds4_ssd_static_pin_host_supported(16 * GIB));
     assert(!ds4_ssd_static_pin_host_supported(64 * GIB - 1u));

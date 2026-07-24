@@ -258,8 +258,12 @@ Performance comparisons must also follow these rules:
   then restart from the first A arm; do not retain a convenient retry.
 - Make acceptance environments hermetic. The bounded M5 runner rejects
   inherited `DS4_*` runtime flags outside its own controls and records every
-  admitted `DS4_*` variable. Use `DS4_M5_EXPLORATORY=1` for an intentional
-  flag experiment; exploratory evidence cannot promote a default.
+  admitted `DS4_*` variable. The exact `DS4_QWEN_TELEMETRY_JSONL` sink is the
+  only optional runtime-output exception: it must be the fresh dedicated
+  `$DS4_M5_PREFIX.qwen-telemetry.jsonl` path, is retained and hashed with the
+  arm, and must pass JSONL, terminal `runtime_close`, and runtime-failure-marker
+  validation. Use `DS4_M5_EXPLORATORY=1` for an intentional flag experiment;
+  exploratory evidence cannot promote a default.
 - Record cold and warm/page-cache cohorts separately and never average them
   together. A retained warm cohort uses the same discarded warm-up for each arm
   before A/B/B/A. A cold or first-run observation uses fresh processes and is
@@ -268,7 +272,12 @@ Performance comparisons must also follow these rules:
   before, during, and after every retained arm.
 - Record the repository HEAD, dirty-diff SHA-256 when applicable, `--build-info`,
   executable SHA-256, qualified GGUF identity, and the SHA-256 of the complete
-  runtime Metal source set. Retain the runtime `ds4: metal_library` identity
+  runtime Metal source set. Before cache-state preparation, the bounded M5
+  runner must compute the complete GGUF SHA-256 once and bind its evidence to
+  the resolved path, device, inode, byte count, and modification time. Every
+  arm verifies, copies, and hashes that evidence without rereading the GGUF;
+  merely recording an expected digest is invalid. Retain the runtime
+  `ds4: metal_library` identity
   line, which fingerprints the assembled source including diagnostic source
   overrides and records compile-mode macros. Metal sources are compiled at
   runtime, so a frozen executable run from a different source checkout is not a

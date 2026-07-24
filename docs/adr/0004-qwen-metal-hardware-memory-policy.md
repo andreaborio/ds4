@@ -2,6 +2,7 @@
 
 - Status: Accepted
 - Date: 2026-07-21
+- Amended: 2026-07-24
 
 ## Context
 
@@ -17,6 +18,15 @@ Apple ships a finite set of common unified-memory cuts, but
 `recommendedMaxWorkingSetSize` also varies by chip and GPU configuration. A
 safe policy therefore cannot infer capacity from RAM labels alone or hardcode
 one cache count for every Metal device.
+
+A later sustained Qwen decode on an M5 with 24 GiB exposed a second
+discontinuity. That tier had no routing-cycle ceiling and did not require a
+fresh normal-pressure signal at every phase entry. Its lazy 321-expert slabs
+could therefore continue growing, even with an unchanged configured budget,
+until macOS reported `WARNING`, at which point Hebrus Studio's watchdog
+correctly terminated Hebrus Server to protect the machine. Thinking length
+changed how quickly the cache reached that state; it was not the cause of the
+shutdown.
 
 ## Decision
 
@@ -55,15 +65,19 @@ headroom envelope but remain fully charged. While macOS reports normal pressure,
 the bounded file-backed page pool receives full reclaimable credit on every
 Qwen profile. This makes equivalent cold and warm GGUF page states produce the
 same cache plan. Elevated or unavailable pressure retains half credit; the
-16 GiB profile additionally requires an affirmative normal-pressure signal.
-The result is capped independently by live reclaimable memory and Metal's
-recommended working set, then rounded down to complete `1 + 320*k` routing
-cycles. The 16 GiB profile has an additional measured ceiling of eleven cycles
-plus the in-flight slot: 3,521 experts for this 40-layer, top-8 model. This keeps
-the previously retained zero-swap tier and rejects the next warm-cache tier,
-which produced swap in validation. Because the cap is expressed in routing
-cycles while byte admission uses the artifact's exact per-expert size, it does
-not treat compact MLX affine4/group-64 storage as F32.
+guarded 16 and 24 GiB SSD profiles additionally require an affirmative
+normal-pressure signal at admission and every phase entry, including an
+unchanged configured budget whose lazy slabs can still populate. The result is
+capped independently by live reclaimable memory and Metal's recommended working
+set, then rounded down to complete `1 + 320*k` routing cycles. The
+guarded profiles have a ceiling of eleven cycles plus the in-flight slot: 3,521
+experts for this 40-layer, top-8 model, about 5.80 GiB for the qualified
+artifact. On 16 GiB this retains the measured zero-swap tier and rejects the
+next warm-cache tier, which produced swap in validation. On 24 GiB it replaces
+the unsafe uncapped target until a larger physical tier passes the complete
+context/cache safety matrix. Because the cap is expressed in routing cycles
+while byte admission uses the artifact's exact per-expert size, it does not
+treat compact MLX affine4/group-64 storage as F32.
 
 ## Consequences
 
@@ -79,6 +93,9 @@ not treat compact MLX affine4/group-64 storage as F32.
 - Physical 16/32/64 GiB validation and the retained split-K controls are
   recorded in
   [`2026-07-21-qwen-split-k-hardware-policy.md`](../benchmarks/2026-07-21-qwen-split-k-hardware-policy.md).
+- The reported Hebrus Studio 24 GiB watchdog failure, model-free regression,
+  and required physical confirmation are recorded in
+  [`2026-07-24-qwen-24g-cache-guard.md`](../benchmarks/2026-07-24-qwen-24g-cache-guard.md).
 - DeepSeek and GLM retain their independent memory policies.
 - Changing the reserve formula, normal-pressure credit, or routing-cycle
   rounding requires the context/cache acceptance matrix in

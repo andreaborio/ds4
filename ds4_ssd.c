@@ -350,6 +350,23 @@ bool ds4_ssd_low_ram_cache_policy(uint64_t physical_bytes) {
     return physical_bytes != 0 && physical_bytes <= 16u * DS4_GIB;
 }
 
+bool ds4_ssd_qwen_guarded_cache_policy(uint64_t physical_bytes) {
+    return physical_bytes != 0 && physical_bytes <= 24u * DS4_GIB;
+}
+
+bool ds4_ssd_qwen_phase_pressure_allowed(
+        bool guarded,
+        bool cache_budget_changed,
+        bool snapshot_available,
+        bool pressure_status_available,
+        bool pressure_normal) {
+    (void)cache_budget_changed;
+    return !guarded ||
+           (snapshot_available &&
+            pressure_status_available &&
+            pressure_normal);
+}
+
 bool ds4_ssd_resident_pressure_plan_make(
         const ds4_ssd_host_memory      *memory,
         uint64_t                        model_bytes,
@@ -443,6 +460,9 @@ static bool ds4_ssd_adaptive_cache_plan_make_policy(
     const bool qwen_policy = !apply_deepseek_tuning;
     const bool qwen_low_ram_policy =
         qwen_policy && low_ram_host;
+    const bool qwen_guarded_cache_policy =
+        qwen_policy &&
+        ds4_ssd_qwen_guarded_cache_policy(memory->physical_bytes);
     out->low_ram_shared_static_headroom_active = qwen_low_ram_policy;
     out->low_ram_floor_ceiling_active =
         apply_deepseek_tuning && low_ram_host;
@@ -626,25 +646,29 @@ static bool ds4_ssd_adaptive_cache_plan_make_policy(
 
     /* DeepSeek measurements on M1 16 GiB show that the second complete cache
      * tier loses end-to-end time as page-cache displacement dominates. Keep
-     * that model-specific performance ceiling; Qwen instead consumes every
-     * complete tier admitted by the pressure and platform budgets above. */
+     * that model-specific performance ceiling. Qwen profiles above its
+     * guarded small-host tier consume every complete tier admitted by the
+     * pressure and platform budgets above. */
     if (out->low_ram_floor_ceiling_active &&
         raw_experts > out->floor.minimum_cache_experts) {
         raw_experts = out->floor.minimum_cache_experts;
     }
 
-    if (qwen_low_ram_policy) {
-        /* The 16 GiB Qwen lane is performance-tuned, not allowed to consume
-         * every byte that a warm file-cache snapshot appears to expose. Eleven
-         * complete routes plus the in-flight slot (3521 experts for 40x8)
-         * retained the previous zero-swap win; the next route tier introduced
-         * swap even though macOS still reported normal pressure. The cap is in
-         * routing cycles, so byte safety remains quantization-aware through
-         * per_expert_bytes above. */
-        const uint64_t qwen_low_ram_cache_ceiling =
+    if (qwen_guarded_cache_policy) {
+        /* Small-memory Qwen hosts are not allowed to turn every byte exposed
+         * by a normal, warm file-cache snapshot into wired expert storage.
+         * Eleven complete routes plus the in-flight slot (3521 experts for
+         * 40x8, about 5.80 GiB for the qualified artifact) is the retained
+         * zero-swap 16 GiB ceiling.  A physical 24 GiB report showed that its
+         * previously uncapped target could cross macOS WARNING during a
+         * sustained decode, so that tier now reuses the conservative ceiling
+         * until a larger physical-host tier passes the full safety matrix.
+         * The cap is expressed in routing cycles while byte admission remains
+         * quantization-aware through per_expert_bytes above. */
+        const uint64_t qwen_guarded_cache_ceiling =
             1u + 11u * out->floor.working_set_experts;
-        if (raw_experts > qwen_low_ram_cache_ceiling) {
-            raw_experts = qwen_low_ram_cache_ceiling;
+        if (raw_experts > qwen_guarded_cache_ceiling) {
+            raw_experts = qwen_guarded_cache_ceiling;
         }
     }
 
@@ -666,10 +690,10 @@ static bool ds4_ssd_adaptive_cache_plan_make_policy(
 
     out->cache_experts = (uint32_t)cache_experts;
     out->cache_bytes = cache_experts * per_expert_bytes;
-    if (qwen_low_ram_policy &&
+    if (qwen_guarded_cache_policy &&
         (!memory->pressure_status_available || !memory->pressure_normal)) {
-        /* The 2 GiB envelope deliberately spends more of a small host's free
-         * budget.  It is therefore valid only with an affirmative normal
+        /* Guarded small-host envelopes deliberately spend a material part of
+         * reclaimable memory.  They are valid only with an affirmative normal
          * pressure signal; missing telemetry is not evidence of headroom. */
         return false;
     }

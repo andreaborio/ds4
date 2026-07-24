@@ -141,9 +141,16 @@ context-scaling changes also require isolated 65,536- and 100,000-token arms.
 - Bind every arm to its executable, repository/diff, Metal runtime source, and
   GGUF hashes. A copied binary beside another checkout's `metal/*.metal` files
   is not the same benchmark artifact.
-- Reject inherited `DS4_*` runtime flags in acceptance arms. Intentional flag
-  experiments must be labelled exploratory and preserve their complete
-  `DS4_*` environment artifact.
+- Reject inherited `DS4_*` runtime flags in acceptance arms. The fresh,
+  dedicated `$DS4_M5_PREFIX.qwen-telemetry.jsonl` value of
+  `DS4_QWEN_TELEMETRY_JSONL` is the sole optional runtime exception and must be
+  retained, hashed, structurally valid, terminated by one `runtime_close`, and
+  free of runtime telemetry-failure markers. Prepare the complete model-hash
+  evidence once before cache-state setup; every arm must match its
+  expected/actual hash, path, device, inode, size, and mtime and copy/hash the
+  evidence without rereading the GGUF. Intentional flag experiments must be
+  labelled exploratory and preserve their complete `DS4_*` environment
+  artifact.
 - Report tiers independently; do not use a cross-context average to hide a
   regression. The measured effect must exceed control drift, within-arm spread,
   and known measurement noise. If adaptivity selects different paths, invalidate
@@ -255,6 +262,17 @@ canonical, v1, sidecar, and community GGUFs are not equivalent inputs.
 - In SSD mode, verify the first route allocates one 321-expert slab (about
   0.529 GiB), later growth remains within the admitted cache budget, and no new
   swap appears. Separate warm page-cache evidence from cold device-I/O evidence.
+- On a physical 24 GiB Mac, exercise Hebrus Studio's persistent streaming
+  server with the Sarajevo travel reproducer and thinking `medium` and `high`
+  under the configured 16,384-token candidate context. Record the seed and
+  require each natural response to end normally; an ordinary EOS is not a
+  failure. For each thinking setting, also run a deterministic sustained-decode
+  companion past 1,719 generated tokens in the same server process. When AUTO
+  resolves to SSD, require the guarded 3,521-expert decode ceiling and an
+  affirmative normal-pressure signal at admission and every phase entry,
+  including unchanged-budget entries on a subsequent request, then complete
+  that request. Any pressure `WARNING`, new swapout, watchdog `SIGTERM`, or
+  client-stream failure blocks release.
 - Resident mode proves complete model mapping and full-tensor Metal execution,
   not that every mapped GGUF page remained physically resident. Measure the
   stronger claim separately if it is used in release language.

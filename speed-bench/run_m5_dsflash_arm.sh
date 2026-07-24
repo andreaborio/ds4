@@ -1,11 +1,195 @@
 #!/bin/zsh
 
-# Bounded M5 Pro / 64 GiB Metal benchmark arm. The default remains DeepSeek
-# SSD streaming; DS4_M5_RESIDENCY=auto|resident reuses the same guard for GLM
-# and Qwen. Every run is killed before sustained swap or a wired-memory level
-# close to the host user-wire limit; transient pressure is recorded as evidence.
+# Bounded 24 GiB and 64+ GiB M5 Metal benchmark arm. The 64 GiB default remains
+# DeepSeek SSD streaming; DS4_M5_RESIDENCY=auto|resident reuses the same guard
+# for GLM and Qwen. Every run is stopped on new swap or a wired-memory level
+# above the qualified host limit; the 24 GiB profile also stops below its
+# minimum-free-memory floor.
 
 set -euo pipefail
+
+is_uint() {
+    case ${1:-} in
+        ''|*[!0-9]*) return 1 ;;
+        *) return 0 ;;
+    esac
+}
+
+require_uint() {
+    local name=$1
+    local value=${2:-}
+    is_uint "$value" || {
+        print -u2 -- "invalid or unavailable telemetry/config: $name=${value:-<empty>}"
+        exit 2
+    }
+}
+
+require_sha256() {
+    local name=$1
+    local value=${2:-}
+    [[ ${#value} == 64 && $value != *[!0-9a-fA-F]* ]] || {
+        print -u2 -- "$name must be a 64-digit SHA-256"
+        exit 2
+    }
+}
+
+validate_qwen_telemetry() {
+    python3 - "$1" <<'PY'
+import json
+import sys
+
+path = sys.argv[1]
+record_count = 0
+last_event = None
+runtime_close_count = 0
+invalid_events = {
+    "campaign_invalid",
+    "memory_pressure",
+    "prefill_abort",
+    "runtime_fallback",
+}
+seen_invalid = set()
+try:
+    with open(path, "r", encoding="utf-8") as source:
+        for line_number, raw in enumerate(source, 1):
+            if not raw.endswith("\n"):
+                raise ValueError(f"line {line_number} is not newline-terminated")
+            record = json.loads(raw)
+            if not isinstance(record, dict) or record.get("schema") != 1:
+                raise ValueError(f"line {line_number} has an invalid schema")
+            event = record.get("event")
+            if not isinstance(event, str):
+                raise ValueError(f"line {line_number} has no event")
+            record_count += 1
+            last_event = event
+            if event == "runtime_close":
+                runtime_close_count += 1
+            if event in invalid_events:
+                seen_invalid.add(event)
+except (OSError, UnicodeError, json.JSONDecodeError, ValueError) as exc:
+    print(f"invalid Qwen telemetry JSONL: {exc}", file=sys.stderr)
+    raise SystemExit(1)
+
+if record_count == 0:
+    print("invalid Qwen telemetry JSONL: no records", file=sys.stderr)
+    raise SystemExit(1)
+if last_event != "runtime_close":
+    print("invalid Qwen telemetry JSONL: terminal runtime_close is missing",
+          file=sys.stderr)
+    raise SystemExit(1)
+if runtime_close_count != 1:
+    print("invalid Qwen telemetry JSONL: runtime_close is not unique",
+          file=sys.stderr)
+    raise SystemExit(1)
+
+if seen_invalid:
+    print("invalid Qwen telemetry JSONL: invalidating event(s): "
+          + ",".join(sorted(seen_invalid)), file=sys.stderr)
+    raise SystemExit(1)
+
+print(record_count)
+PY
+}
+
+inference_processes() {
+    local process_snapshot
+    process_snapshot=$(ps -axo pid=,ppid=,comm=) || return 1
+    print -r -- "$process_snapshot" |
+        awk -v self="$$" -v child="${pid:-0}" '
+        {
+            process_pid = $1
+            process_ppid = $2
+            command = $3
+            sub(/^.*\//, "", command)
+            if (process_pid != self && process_pid != child &&
+                (command ~ /^(hebrus|ds4)(-(server|agent|bench|eval))?$/ ||
+                 command == "llama-server")) {
+                print process_pid, process_ppid, command
+            }
+        }'
+}
+
+refuse_inference_competitors() {
+    local competitors
+    if ! competitors=$(inference_processes); then
+        print -u2 -- "cannot inspect inference competitors"
+        return 1
+    fi
+    if [[ -n $competitors ]]; then
+        print -u2 -- "refusing to run beside another inference process:"
+        print -u2 -- "$competitors"
+        return 1
+    fi
+}
+
+if [[ ${1:-} == --prepare-model-hash-evidence ]]; then
+    (( $# == 1 )) || {
+        print -u2 -- "usage: $0 --prepare-model-hash-evidence"
+        exit 2
+    }
+    model=${DS4_M5_MODEL:-}
+    model_sha256_expected=${DS4_M5_MODEL_SHA256:-}
+    model_hash_evidence=${DS4_M5_MODEL_HASH_EVIDENCE:-}
+    [[ -n $model ]] || {
+        print -u2 -- "set DS4_M5_MODEL to the ExpertMajor v2 GGUF path"
+        exit 2
+    }
+    [[ -f $model ]] || { print -u2 -- "missing model: $model"; exit 2; }
+    require_sha256 DS4_M5_MODEL_SHA256 "$model_sha256_expected"
+    [[ $model_hash_evidence == /* ]] || {
+        print -u2 -- "DS4_M5_MODEL_HASH_EVIDENCE must be an absolute path"
+        exit 2
+    }
+    [[ ! -e $model_hash_evidence && ! -L $model_hash_evidence ]] || {
+        print -u2 -- "refusing to overwrite model hash evidence: $model_hash_evidence"
+        exit 2
+    }
+    [[ -d ${model_hash_evidence:h} ]] || {
+        print -u2 -- "model hash evidence directory does not exist: ${model_hash_evidence:h}"
+        exit 2
+    }
+    refuse_inference_competitors || exit 2
+
+    model_absolute=${model:A}
+    model_path_sha256=$(
+        print -rn -- "$model_absolute" | shasum -a 256 | awk '{print $1}'
+    )
+    identity_before=$(stat -f '%d:%i:%z:%m' "$model")
+    model_sha256_actual=$(shasum -a 256 "$model" | awk '{print $1}')
+    identity_after=$(stat -f '%d:%i:%z:%m' "$model")
+    [[ $identity_before == $identity_after ]] || {
+        print -u2 -- "model identity changed during complete SHA-256 verification"
+        exit 2
+    }
+    require_sha256 actual_model_sha256 "$model_sha256_actual"
+    model_sha256_expected=${model_sha256_expected:l}
+    model_sha256_actual=${model_sha256_actual:l}
+    if [[ $model_sha256_actual != $model_sha256_expected ]]; then
+        print -u2 -- "model SHA-256 mismatch"
+        print -u2 -- "expected=$model_sha256_expected"
+        print -u2 -- "actual=$model_sha256_actual"
+        exit 2
+    fi
+    refuse_inference_competitors || exit 2
+
+    IFS=: read -r model_device model_inode model_bytes model_mtime_epoch \
+        <<<"$identity_after"
+    verified_at=$(date -Iseconds)
+    {
+        print -r -- "schema=1"
+        print -r -- "model_path_sha256=$model_path_sha256"
+        print -r -- "model_device=$model_device"
+        print -r -- "model_inode=$model_inode"
+        print -r -- "model_bytes=$model_bytes"
+        print -r -- "model_mtime_epoch=$model_mtime_epoch"
+        print -r -- "model_sha256_expected=$model_sha256_expected"
+        print -r -- "model_sha256_actual=$model_sha256_actual"
+        print -r -- "verified_at=$verified_at"
+    } >"$model_hash_evidence"
+    print -- "model hash evidence prepared: $model_hash_evidence"
+    print -- "actual=$model_sha256_actual"
+    exit 0
+fi
 
 if (( $# < 2 || $# > 3 )); then
     print -u2 -- "usage: $0 LABEL auto|auto_pin|exactN|exactN_pin [GEN_TOKENS]"
@@ -23,17 +207,19 @@ root=${DS4_M5_ROOT:-${0:A:h:h}}
 bin=${DS4_M5_BIN:-$root/build/metal-arm64/bin/ds4-bench}
 model=${DS4_M5_MODEL:-}
 model_sha256_expected=${DS4_M5_MODEL_SHA256:-}
+model_hash_evidence=${DS4_M5_MODEL_HASH_EVIDENCE:-}
 prompt=${DS4_M5_PROMPT:-$root/tests/long_context_security_prompt.txt}
 prompt_source=$prompt
 prefix=${DS4_M5_PREFIX:-${TMPDIR:-/tmp}/ds4-m5-${label}}
 preload=${DS4_M5_PRELOAD_EXPERTS:-4096}
+preload_policy=${DS4_M5_PRELOAD_POLICY:-explicit}
 residency=${DS4_M5_RESIDENCY:-ssd}
 max_seconds=${DS4_M5_MAX_SECONDS:-240}
 min_free_percent=${DS4_M5_MIN_FREE_PERCENT:-20}
 max_swapout_pages=${DS4_M5_MAX_SWAPOUT_PAGES:-0}
-max_wired_gib=${DS4_M5_MAX_WIRED_GIB:-46}
 cache_state=${DS4_M5_CACHE_STATE:-unclassified}
 exploratory=${DS4_M5_EXPLORATORY:-0}
+qwen_telemetry_jsonl=${DS4_QWEN_TELEMETRY_JSONL:-}
 
 case $mode in
     auto)          cache=auto; pin=0 ;;
@@ -50,9 +236,24 @@ case $residency in
     ssd|auto|resident) ;;
     *) print -u2 -- "DS4_M5_RESIDENCY must be ssd, auto, or resident"; exit 2 ;;
 esac
+case $preload_policy in
+    explicit|omit) ;;
+    *) print -u2 -- "DS4_M5_PRELOAD_POLICY must be explicit or omit"; exit 2 ;;
+esac
 if [[ $residency != ssd && ( $cache != auto || $pin != 0 ) ]]; then
     print -u2 -- "exact cache and pin modes require DS4_M5_RESIDENCY=ssd"
     exit 2
+fi
+if [[ $residency != ssd && $preload_policy != explicit ]]; then
+    print -u2 -- "DS4_M5_PRELOAD_POLICY=omit requires DS4_M5_RESIDENCY=ssd"
+    exit 2
+fi
+if [[ $preload_policy == explicit ]]; then
+    require_uint DS4_M5_PRELOAD_EXPERTS "$preload"
+    (( preload > 0 )) || {
+        print -u2 -- "DS4_M5_PRELOAD_EXPERTS must be positive when DS4_M5_PRELOAD_POLICY=explicit"
+        exit 2
+    }
 fi
 
 case $gen_tokens in
@@ -85,15 +286,18 @@ fi
 # Acceptance evidence must be hermetic.  A flag inherited from an interactive
 # profiling shell can otherwise change GLM/MoE/Metal behavior without appearing
 # in the benchmark label.  Runner controls use DS4_M5_*; the two telemetry
-# variables below are overwritten by this script.  Exploratory arms may retain
-# other DS4_* flags, but record every one of them in the environment artifact.
+# variables below are overwritten by this script. Qwen telemetry is the one
+# explicitly controlled runtime output admitted in an acceptance arm.
+# Exploratory arms may retain other DS4_* flags, but record every one of them
+# in the environment artifact.
 unexpected_ds4_env=$(
     env | awk -F= '
         /^DS4_/ {
             key = $1
             if (key !~ /^DS4_M5_/ &&
                 key != "DS4_METAL_MEMORY_REPORT" &&
-                key != "DS4_METAL_STREAMING_EXPERT_TIMING_SUMMARY") {
+                key != "DS4_METAL_STREAMING_EXPERT_TIMING_SUMMARY" &&
+                key != "DS4_QWEN_TELEMETRY_JSONL") {
                 print key
             }
         }' | LC_ALL=C sort -u
@@ -108,77 +312,153 @@ if [[ -n $unexpected_ds4_env ]]; then
     print -u2 -- "exploratory arm records unexpected DS4 runtime environment:"
     print -u2 -- "$unexpected_ds4_env"
 fi
+if [[ -n $qwen_telemetry_jsonl ]]; then
+    [[ $qwen_telemetry_jsonl == /* ]] || {
+        print -u2 -- "DS4_QWEN_TELEMETRY_JSONL must be an absolute path"
+        exit 2
+    }
+    [[ $qwen_telemetry_jsonl == "$prefix.qwen-telemetry.jsonl" ]] || {
+        print -u2 -- "DS4_QWEN_TELEMETRY_JSONL must equal DS4_M5_PREFIX.qwen-telemetry.jsonl"
+        exit 2
+    }
+    [[ ! -e $qwen_telemetry_jsonl && ! -L $qwen_telemetry_jsonl ]] || {
+        print -u2 -- "refusing to append to existing Qwen telemetry: $qwen_telemetry_jsonl"
+        exit 2
+    }
+fi
 
 [[ -n $model ]] || { print -u2 -- "set DS4_M5_MODEL to the ExpertMajor v2 GGUF path"; exit 2; }
-[[ ${#model_sha256_expected} == 64 && $model_sha256_expected != *[!0-9a-fA-F]* ]] || {
-    print -u2 -- "set DS4_M5_MODEL_SHA256 to the expected 64-digit GGUF SHA-256 from the campaign manifest"
-    exit 2
-}
+require_sha256 DS4_M5_MODEL_SHA256 "$model_sha256_expected"
 [[ -x $bin ]] || { print -u2 -- "missing executable: $bin"; exit 2; }
 [[ -f $model ]] || { print -u2 -- "missing model: $model"; exit 2; }
 [[ -f $prompt ]] || { print -u2 -- "missing prompt: $prompt"; exit 2; }
-pmset -g batt | head -n 1 | grep -q "AC Power" || {
+[[ $model_hash_evidence == /* ]] || {
+    print -u2 -- "set DS4_M5_MODEL_HASH_EVIDENCE to fresh one-shot verification evidence"
+    exit 2
+}
+[[ -f $model_hash_evidence && ! -L $model_hash_evidence ]] || {
+    print -u2 -- "missing regular model hash evidence: $model_hash_evidence"
+    exit 2
+}
+
+power_status=$(pmset -g batt)
+[[ $power_status == *"AC Power"* ]] || {
     print -u2 -- "M5 benchmark requires AC power"
     exit 2
 }
 
 pid=
-inference_processes() {
-    ps -axo pid=,ppid=,comm= | awk -v self="$$" -v child="${pid:-0}" '
-        {
-            process_pid = $1
-            process_ppid = $2
-            command = $3
-            sub(/^.*\//, "", command)
-            if (process_pid != self && process_pid != child &&
-                command ~ /^(ds4|llama-server)/) {
-                print process_pid, process_ppid, command
-            }
-        }'
-}
+refuse_inference_competitors || exit 2
 
-competitors=$(inference_processes)
-if [[ -n $competitors ]]; then
-    print -u2 -- "refusing to run beside another inference process:"
-    print -u2 -- "$competitors"
+evidence_lines=("${(@f)$(cat -- "$model_hash_evidence")}")
+(( ${#evidence_lines} == 9 )) &&
+    [[ $evidence_lines[1] == "schema=1" &&
+       $evidence_lines[2] == model_path_sha256=* &&
+       $evidence_lines[3] == model_device=* &&
+       $evidence_lines[4] == model_inode=* &&
+       $evidence_lines[5] == model_bytes=* &&
+       $evidence_lines[6] == model_mtime_epoch=* &&
+       $evidence_lines[7] == model_sha256_expected=* &&
+       $evidence_lines[8] == model_sha256_actual=* &&
+       $evidence_lines[9] == verified_at=* ]] || {
+    print -u2 -- "malformed model hash evidence: $model_hash_evidence"
+    exit 2
+}
+evidence_model_path_sha256=${evidence_lines[2]#model_path_sha256=}
+evidence_model_device=${evidence_lines[3]#model_device=}
+evidence_model_inode=${evidence_lines[4]#model_inode=}
+evidence_model_bytes=${evidence_lines[5]#model_bytes=}
+evidence_model_mtime=${evidence_lines[6]#model_mtime_epoch=}
+evidence_sha256_expected=${evidence_lines[7]#model_sha256_expected=}
+model_sha256_actual=${evidence_lines[8]#model_sha256_actual=}
+evidence_verified_at=${evidence_lines[9]#verified_at=}
+require_sha256 evidence_model_sha256_expected "$evidence_sha256_expected"
+require_sha256 evidence_model_sha256_actual "$model_sha256_actual"
+model_sha256_expected=${model_sha256_expected:l}
+evidence_sha256_expected=${evidence_sha256_expected:l}
+model_sha256_actual=${model_sha256_actual:l}
+model_absolute=${model:A}
+current_model_path_sha256=$(
+    print -rn -- "$model_absolute" | shasum -a 256 | awk '{print $1}'
+)
+current_model_device=$(stat -f %d "$model")
+current_model_inode=$(stat -f %i "$model")
+current_model_bytes=$(stat -f %z "$model")
+current_model_mtime=$(stat -f %m "$model")
+if [[ $evidence_sha256_expected != $model_sha256_expected ||
+      $model_sha256_actual != $model_sha256_expected ||
+      $evidence_model_path_sha256 != $current_model_path_sha256 ||
+      $evidence_model_device != $current_model_device ||
+      $evidence_model_inode != $current_model_inode ||
+      $evidence_model_bytes != $current_model_bytes ||
+      $evidence_model_mtime != $current_model_mtime ||
+      -z $evidence_verified_at ]]; then
+    print -u2 -- "model hash evidence does not match the configured model identity"
+    print -u2 -- "expected=$model_sha256_expected"
+    print -u2 -- "actual=$model_sha256_actual"
     exit 2
 fi
+model_hash_evidence_sha256=$(
+    shasum -a 256 "$model_hash_evidence" | awk '{print $1}'
+)
 
+require_uint DS4_M5_MIN_FREE_PERCENT "$min_free_percent"
+require_uint DS4_M5_MAX_SWAPOUT_PAGES "$max_swapout_pages"
+host_memory_bytes=$(sysctl -n hw.memsize 2>/dev/null || true)
+require_uint hw.memsize "$host_memory_bytes"
+gib_bytes=$((1024 * 1024 * 1024))
+if (( host_memory_bytes == 24 * gib_bytes )); then
+    host_memory_profile=24g
+    default_max_wired_gib=17
+    max_wired_gib=${DS4_M5_MAX_WIRED_GIB:-$default_max_wired_gib}
+    require_uint DS4_M5_MAX_WIRED_GIB "$max_wired_gib"
+    (( max_wired_gib > 0 && max_wired_gib <= default_max_wired_gib )) || {
+        print -u2 -- "24 GiB arms require DS4_M5_MAX_WIRED_GIB in 1..17"
+        exit 2
+    }
+    (( min_free_percent >= 20 )) || {
+        print -u2 -- "24 GiB arms require DS4_M5_MIN_FREE_PERCENT >= 20"
+        exit 2
+    }
+    (( max_swapout_pages == 0 )) || {
+        print -u2 -- "24 GiB arms require DS4_M5_MAX_SWAPOUT_PAGES=0"
+        exit 2
+    }
+    if [[ $residency == ssd && $preload_policy != omit ]]; then
+        print -u2 -- "24 GiB forced-SSD arms require DS4_M5_PRELOAD_POLICY=omit"
+        exit 2
+    fi
+    if [[ $cache != auto ]] && (( cache > 3521 )); then
+        print -u2 -- "24 GiB arms reject an exact cache above 3521 experts"
+        exit 2
+    fi
+elif (( host_memory_bytes >= 64 * gib_bytes )); then
+    host_memory_profile=64g-plus
+    default_max_wired_gib=46
+    max_wired_gib=${DS4_M5_MAX_WIRED_GIB:-$default_max_wired_gib}
+else
+    print -u2 -- "unsupported M5 benchmark memory size: $host_memory_bytes bytes (expected 24 GiB or at least 64 GiB)"
+    exit 2
+fi
 vm_value() {
     vm_stat | awk -v key="$1:" '
-        index($0, key) == 1 {
+        !found && index($0, key) == 1 {
             line = $0
             sub(/^[^:]*:[[:space:]]*/, "", line)
             gsub(/\./, "", line)
             gsub(/[[:space:]]/, "", line)
             if (line ~ /^[0-9]+$/) print line
-            exit
+            found = 1
         }'
 }
 
 free_percent() {
     memory_pressure -Q 2>/dev/null |
-        awk '/System-wide memory free percentage:/ {
+        awk '!found && /System-wide memory free percentage:/ {
             gsub(/%/, "", $5)
             if ($5 ~ /^[0-9]+$/) print $5
-            exit
+            found = 1
         }'
-}
-
-is_uint() {
-    case ${1:-} in
-        ''|*[!0-9]*) return 1 ;;
-        *) return 0 ;;
-    esac
-}
-
-require_uint() {
-    local name=$1
-    local value=${2:-}
-    is_uint "$value" || {
-        print -u2 -- "invalid or unavailable telemetry/config: $name=${value:-<empty>}"
-        exit 2
-    }
 }
 
 require_uint DS4_M5_MAX_SECONDS "$max_seconds"
@@ -218,7 +498,10 @@ export DS4_METAL_STREAMING_EXPERT_TIMING_SUMMARY=1
 runtime_args=()
 case $residency in
     ssd)
-        runtime_args=(--ssd-streaming --ssd-streaming-preload-experts "$preload")
+        runtime_args=(--ssd-streaming)
+        if [[ $preload_policy == explicit ]]; then
+            runtime_args+=(--ssd-streaming-preload-experts "$preload")
+        fi
         if [[ $cache != auto ]]; then
             runtime_args+=(--ssd-streaming-cache-experts "$cache")
         fi
@@ -228,7 +511,8 @@ case $residency in
 esac
 
 if [[ -e $prefix.logits || -e $prefix.evidence || -e $prefix.summary ||
-      -e $prefix.csv || -e $prefix.prompt.txt ]]; then
+      -e $prefix.csv || -e $prefix.prompt.txt || -e $prefix.model.sha256 ||
+      -e $prefix.model-hash-evidence ]]; then
     print -u2 -- "refusing to overwrite existing result prefix: $prefix"
     exit 2
 fi
@@ -251,6 +535,13 @@ if (( ctx_max > 32768 && prompt_source_bytes < prompt_minimum_bytes )); then
 fi
 mkdir -p -- "$prefix.logits"
 mkdir -p -- "$prefix.evidence"
+print -- "$model_sha256_actual" >"$prefix.model.sha256"
+cp -- "$model_hash_evidence" "$prefix.model-hash-evidence"
+[[ $(shasum -a 256 "$prefix.model-hash-evidence" | awk '{print $1}') ==
+   $model_hash_evidence_sha256 ]] || {
+    print -u2 -- "copied model hash evidence failed checksum verification"
+    exit 2
+}
 
 # Make every artifact self-identifying.  Labels alone cannot distinguish two
 # dirty builds or reconstruct which opt-in ablation flags were active.
@@ -309,7 +600,8 @@ env | LC_ALL=C sort |
 vm_stat >"$prefix.vm.before"
 sysctl -n vm.swapusage >"$prefix.swap.before"
 os_build=$(sw_vers -buildVersion)
-power_source=$(pmset -g batt | head -n 1 | sed -E "s/^Now drawing from '(.*)'$/\1/")
+power_source=$(print -r -- "$power_status" |
+    sed -nE "s/^Now drawing from '(.*)'$/\\1/p")
 
 swapout_before=$(vm_value Swapouts)
 pagein_before=$(vm_value Pageins)
@@ -361,7 +653,25 @@ trap 'abort_reason=signal_hup; terminate_tree; exit 130' HUP
 trap 'abort_reason=signal_int; terminate_tree; exit 130' INT
 trap 'abort_reason=signal_term; terminate_tree; exit 130' TERM
 
-print -- "START label=$label residency=$residency mode=$mode cache=$cache preload=$preload gen=$gen_tokens ctx_start=$ctx_start ctx_max=$ctx_max step_mul=$step_mul ctx_alloc=$ctx_alloc"
+# Close the evidence-to-exec race without rereading the GGUF payload. A file
+# replacement or metadata change after the first manifest check invalidates the
+# arm before the benchmark child can open it.
+launch_model_absolute=${model:A}
+launch_model_path_sha256=$(
+    print -rn -- "$launch_model_absolute" | shasum -a 256 | awk '{print $1}'
+)
+launch_model_identity=$(stat -f '%d:%i:%z:%m' "$model" 2>/dev/null || true)
+if [[ $launch_model_path_sha256 != $evidence_model_path_sha256 ||
+      $launch_model_identity !=
+          "$evidence_model_device:$evidence_model_inode:$evidence_model_bytes:$evidence_model_mtime" ]]; then
+    print -u2 -- "model identity changed after hash-evidence verification"
+    exit 2
+fi
+refuse_inference_competitors || exit 2
+
+preload_record=$preload
+[[ $preload_policy == omit ]] && preload_record=omitted
+print -- "START label=$label residency=$residency mode=$mode cache=$cache preload=$preload_record gen=$gen_tokens ctx_start=$ctx_start ctx_max=$ctx_max step_mul=$step_mul ctx_alloc=$ctx_alloc"
 (
     cd "$root" || exit 2
     "$bin" \
@@ -383,9 +693,9 @@ print -- "$pid" >"$prefix.pid"
 while kill -0 "$pid" 2>/dev/null; do
     now=$(date +%s)
     elapsed=$((now - start_epoch))
-    swapout_now=$(vm_value Swapouts)
-    free_now=$(free_percent)
-    wired_now=$(vm_value "Pages wired down")
+    swapout_now=$(vm_value Swapouts || true)
+    free_now=$(free_percent || true)
+    wired_now=$(vm_value "Pages wired down" || true)
     if ! is_uint "$swapout_now"; then
         abort_reason=telemetry_swapout_unavailable
     elif ! is_uint "$free_now"; then
@@ -399,13 +709,28 @@ while kill -0 "$pid" 2>/dev/null; do
         (( free_now < pressure_min )) && pressure_min=$free_now
         (( wired_now > peak_wired_pages )) && peak_wired_pages=$wired_now
         wired_bytes=$((wired_now * page_size))
-        rss_now=$(ps -o rss= -p "$pid" 2>/dev/null | awk '{print $1 + 0}')
-        if is_uint "$rss_now" && (( rss_now > peak_rss_kib )); then
+        # The child may exit between kill -0 and ps. Missing RSS at that exact
+        # boundary is not a safety failure; the independent process scan below
+        # still fails closed if process enumeration itself is unavailable.
+        rss_now=$(
+            ps -o rss= -p "$pid" 2>/dev/null |
+                awk 'NF { print $1 + 0 }' || true
+        )
+        if ! is_uint "$rss_now"; then
+            if kill -0 "$pid" 2>/dev/null; then
+                abort_reason=telemetry_rss_unavailable
+            fi
+        elif (( rss_now > peak_rss_kib )); then
             peak_rss_kib=$rss_now
         fi
 
-        if (( swapout_delta > max_swapout_pages )); then
+        if [[ -n $abort_reason ]]; then
+            :
+        elif (( swapout_delta > max_swapout_pages )); then
             abort_reason="swapout_over_${max_swapout_pages}_pages"
+        elif [[ $host_memory_profile == 24g ]] &&
+             (( free_now < min_free_percent )); then
+            abort_reason="free_memory_below_${min_free_percent}_percent"
         elif (( wired_bytes > max_wired_bytes )); then
             abort_reason="wired_memory_over_${max_wired_gib}_GiB"
         elif (( elapsed > max_seconds )); then
@@ -413,8 +738,9 @@ while kill -0 "$pid" 2>/dev/null; do
         fi
     fi
 
-    competitors=$(inference_processes)
-    if [[ -n $competitors ]]; then
+    if ! competitors=$(inference_processes); then
+        abort_reason=telemetry_process_list_unavailable
+    elif [[ -n $competitors ]]; then
         process_contamination=$competitors
         abort_reason=concurrent_inference_process
     fi
@@ -438,22 +764,46 @@ else
 fi
 
 end_epoch=$(date +%s)
-vm_stat >"$prefix.vm.after"
-sysctl -n vm.swapusage >"$prefix.swap.after"
-swapout_after=$(vm_value Swapouts)
-pagein_after=$(vm_value Pageins)
-wired_after=$(vm_value "Pages wired down")
-pressure_after=$(free_percent)
-require_uint swapout_after "$swapout_after"
-require_uint pagein_after "$pagein_after"
-require_uint wired_after "$wired_after"
-require_uint pressure_after "$pressure_after"
+if ! vm_stat >"$prefix.vm.after"; then
+    [[ -n $abort_reason ]] || abort_reason=telemetry_vm_stat_snapshot_unavailable
+    rc=125
+fi
+if ! sysctl -n vm.swapusage >"$prefix.swap.after"; then
+    [[ -n $abort_reason ]] || abort_reason=telemetry_swap_snapshot_unavailable
+    rc=125
+fi
+swapout_after=$(vm_value Swapouts || true)
+pagein_after=$(vm_value Pageins || true)
+wired_after=$(vm_value "Pages wired down" || true)
+pressure_after=$(free_percent || true)
+if ! is_uint "$swapout_after"; then
+    [[ -n $abort_reason ]] || abort_reason=telemetry_swapout_unavailable
+    swapout_after=$swapout_before
+    rc=125
+fi
+if ! is_uint "$pagein_after"; then
+    [[ -n $abort_reason ]] || abort_reason=telemetry_pagein_unavailable
+    pagein_after=$pagein_before
+    rc=125
+fi
+if ! is_uint "$wired_after"; then
+    [[ -n $abort_reason ]] || abort_reason=telemetry_wired_unavailable
+    wired_after=$wired_before
+    rc=125
+fi
+if ! is_uint "$pressure_after"; then
+    [[ -n $abort_reason ]] || abort_reason=telemetry_memory_pressure_unavailable
+    pressure_after=$pressure_before
+    rc=125
+fi
 print -- "$pressure_after" >"$prefix.pressure.after"
 (( pressure_after < pressure_min )) && pressure_min=$pressure_after
 print -- "$pressure_min" >"$prefix.pressure.min"
 
-competitors=$(inference_processes)
-if [[ -n $competitors ]]; then
+if ! competitors=$(inference_processes); then
+    [[ -n $abort_reason ]] || abort_reason=telemetry_process_list_unavailable
+    rc=125
+elif [[ -n $competitors ]]; then
     process_contamination=$competitors
     abort_reason=concurrent_inference_process
     rc=125
@@ -467,6 +817,39 @@ if (( swapout_after < swapout_before )); then
     rc=125
 elif (( swapout_after - swapout_before > max_swapout_pages )); then
     abort_reason="swapout_over_${max_swapout_pages}_pages"
+    rc=125
+elif [[ $host_memory_profile == 24g ]] &&
+     (( pressure_after < min_free_percent )); then
+    abort_reason="free_memory_below_${min_free_percent}_percent"
+    rc=125
+elif (( wired_after * page_size > max_wired_bytes )); then
+    abort_reason="wired_memory_over_${max_wired_gib}_GiB"
+    rc=125
+fi
+
+# The pre-exec check closes replacement during evidence preparation; this
+# second tuple check proves the same file identity survived the complete arm.
+post_model_identity_match=0
+if [[ -f $model ]] &&
+   post_model_device=$(stat -f %d "$model") &&
+   post_model_inode=$(stat -f %i "$model") &&
+   post_model_bytes=$(stat -f %z "$model") &&
+   post_model_mtime=$(stat -f %m "$model"); then
+    post_model_absolute=${model:A}
+    post_model_path_sha256=$(
+        print -rn -- "$post_model_absolute" |
+            shasum -a 256 | awk '{print $1}'
+    )
+    if [[ $post_model_path_sha256 == $evidence_model_path_sha256 &&
+          $post_model_device == $evidence_model_device &&
+          $post_model_inode == $evidence_model_inode &&
+          $post_model_bytes == $evidence_model_bytes &&
+          $post_model_mtime == $evidence_model_mtime ]]; then
+        post_model_identity_match=1
+    fi
+fi
+if (( ! post_model_identity_match )); then
+    abort_reason=model_identity_changed_during_arm
     rc=125
 fi
 
@@ -511,6 +894,40 @@ else
     : >"$prefix.evidence.content.sha256"
 fi
 
+qwen_telemetry_sha256=disabled
+qwen_telemetry_validation=disabled
+qwen_telemetry_records=0
+if [[ -n $qwen_telemetry_jsonl ]]; then
+    if [[ ! -s $qwen_telemetry_jsonl ]]; then
+        [[ -n $result_error ]] || result_error=missing_qwen_telemetry
+        print -u2 -- "benchmark produced no Qwen telemetry JSONL"
+        qwen_telemetry_sha256=missing
+        qwen_telemetry_validation=missing
+    else
+        if ! qwen_telemetry_sha256=$(
+            shasum -a 256 "$qwen_telemetry_jsonl" | awk '{print $1}'
+        ); then
+            result_error=qwen_telemetry_hash_failed
+            qwen_telemetry_sha256=failed
+            qwen_telemetry_validation=hash-failed
+        elif grep -Eq \
+            '^ds4: (Qwen telemetry write failed; disabling telemetry|Qwen telemetry close failed|cannot open Qwen telemetry|cannot initialize Qwen telemetry lock)' \
+            "$prefix.stderr"; then
+            result_error=qwen_telemetry_runtime_failure
+            qwen_telemetry_validation=runtime-failure
+            print -u2 -- "Qwen telemetry runtime reported an open/write/close failure"
+        elif qwen_telemetry_records=$(
+            validate_qwen_telemetry "$qwen_telemetry_jsonl"
+        ); then
+            qwen_telemetry_validation=valid
+        else
+            result_error=invalid_qwen_telemetry
+            qwen_telemetry_validation=invalid
+            qwen_telemetry_records=0
+        fi
+    fi
+fi
+
 grep -m 1 '^ds4: metal_library ' "$prefix.stderr" >"$prefix.metal-library" || true
 if [[ ! -s $prefix.metal-library ]]; then
     [[ -n $result_error ]] || result_error=missing_runtime_metal_identity
@@ -538,7 +955,8 @@ fi
     print -- "mode=$mode"
     print -- "residency=$residency"
     print -- "cache=$cache"
-    print -- "preload=$preload"
+    print -- "preload_policy=$preload_policy"
+    print -- "preload=$preload_record"
     print -- "gen_tokens=$gen_tokens"
     print -- "ctx_start=$ctx_start"
     print -- "ctx_max=$ctx_max"
@@ -558,8 +976,13 @@ fi
     print -- "resolved_plan_file=$prefix.resolved-plan"
     print -- "resolved_plan_sha256=$resolved_plan_sha256"
     print -- "model=$model"
-    print -- "model_sha256_expected=${model_sha256_expected:l}"
-    print -- "model_sha256_verification=expected-only"
+    print -- "model_sha256_expected=$model_sha256_expected"
+    print -- "model_sha256_actual=$model_sha256_actual"
+    print -- "model_sha256_file=$prefix.model.sha256"
+    print -- "model_hash_evidence=$prefix.model-hash-evidence"
+    print -- "model_hash_evidence_sha256=$model_hash_evidence_sha256"
+    print -- "model_hash_verified_at=$evidence_verified_at"
+    print -- "model_sha256_verification=one-shot-evidence-match"
     print -- "model_bytes=$model_bytes"
     print -- "model_mtime_epoch=$model_mtime"
     print -- "prompt_source=$prompt_source"
@@ -570,9 +993,18 @@ fi
     print -- "prompt_expanded=$prompt_expanded"
     print -- "os_build=$os_build"
     print -- "power_source=$power_source"
+    print -- "host_memory_bytes=$host_memory_bytes"
+    print -- "host_memory_profile=$host_memory_profile"
+    print -- "min_free_percent=$min_free_percent"
+    print -- "max_swapout_pages=$max_swapout_pages"
+    print -- "max_wired_gib=$max_wired_gib"
     print -- "cache_state=$cache_state"
     print -- "exploratory=$exploratory"
     print -- "env_file=$prefix.env"
+    print -- "qwen_telemetry_jsonl=${qwen_telemetry_jsonl:-disabled}"
+    print -- "qwen_telemetry_sha256=$qwen_telemetry_sha256"
+    print -- "qwen_telemetry_validation=$qwen_telemetry_validation"
+    print -- "qwen_telemetry_records=$qwen_telemetry_records"
     print -- "pid=$run_pid"
     print -- "process_rc=$rc"
     print -- "rc=$final_rc"

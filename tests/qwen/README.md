@@ -160,6 +160,18 @@ evidence. At minimum, validate the available lower-memory lanes as follows:
 
 - 16 GiB: AUTO resolves to SSD, pressure is explicitly normal, and swap does
   not increase;
+- 24 GiB: AUTO resolves according to the two resident gates; when it resolves
+  to SSD, the logged prefill/decode plan requires normal pressure and never
+  exceeds 3,521 experts (about 5.80 GiB for this artifact). Each phase entry,
+  including one whose configured budget is unchanged, must carry a fresh
+  normal-pressure signal. Repeat the reported Sarajevo travel prompt through
+  the same Hebrus Studio persistent streaming endpoint with thinking `medium`
+  and `high` under the configured 16,384-token candidate context and record the
+  seed. Each natural response must finish normally; separately run a
+  deterministic sustained-decode companion past 1,719 generated tokens for
+  each setting, then require a subsequent request to complete in the same
+  Hebrus Server process, with no pressure `WARNING`, new swapout, or watchdog
+  `SIGTERM`;
 - 32 GiB: AUTO resolves to resident when both logged budgets pass, and falls
   back to SSD rather than forcing residency when either gate fails;
 - 64 GiB reference: preserve the existing resident/SSD correctness lanes.
