@@ -122,6 +122,13 @@ macOS pressure, equivalent free and bounded file-backed pages receive equal
 credit on every Qwen profile, so warming the GGUF cannot by itself shrink AUTO.
 The planner then chooses a complete `1 + 320*k` expert tier and grows Metal
 storage in 321-expert slabs (about 0.529 GiB) instead of the generic 4 GiB slab.
+On 16 and 24 GiB hosts, Qwen's SSD plan is additionally guarded: it requires
+an affirmative normal-pressure signal at admission and before each prefill or
+decode cache phase, including when the configured budget is unchanged, and
+caps the cache at 3,521 experts (about 5.80 GiB for the published artifact).
+The unchanged-budget check matters because later requests can still populate
+lazy expert slabs. Hebrus Studio's watchdog remains a last-resort safety
+boundary, not the cache-sizing mechanism.
 DeepSeek retains its independently qualified resident/SSD planners. GLM retains
 its independent SSD-only planner and schedule.
 

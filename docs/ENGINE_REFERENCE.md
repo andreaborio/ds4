@@ -268,9 +268,12 @@ resident and SSD modes. The former v2 GGML/Q4 payload is rejected. AUTO requires
 normal working-set calculation and a live unified-memory pressure snapshot; if
 either cannot admit resident mode, it uses bounded SSD streaming. Qwen's cache
 planner charges its complete non-routed page set separately and grows cache
-storage in 321-expert (about 0.529 GiB) slabs. The DeepSeek resident/SSD planner
-and GLM SSD-only planner remain independent. Exact artifact and validation
-details live in
+storage in 321-expert (about 0.529 GiB) slabs. Its 16 and 24 GiB SSD tiers
+require an affirmative normal-pressure signal at admission and every phase
+entry, including an unchanged configured budget because lazy slabs can still
+populate, and stop at 3,521 experts (about 5.80 GiB for the published artifact).
+The DeepSeek resident/SSD planner and GLM SSD-only planner remain independent.
+Exact artifact and validation details live in
 [`qwen-expert-major-store.md`](qwen-expert-major-store.md) and the consolidated
 [`affine AUTO/SSD gate`](benchmarks/2026-07-21-qwen-unified-affine-auto-ssd.md).
 

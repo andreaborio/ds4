@@ -43,6 +43,13 @@ resident mapping when the full working set fits its Metal and host-memory
 budgets; otherwise it selects the SSD expert cache. Explicit residency flags
 remain diagnostics, not release instructions.
 
+When AUTO selects SSD on a 16 or 24 GiB host, the cache plan is guarded. It
+requires an affirmative normal-pressure signal at admission and before
+every prefill/decode phase entry, including an unchanged configured budget
+whose lazy slabs can still populate, and caps the routed cache at 3,521 experts
+(about 5.80 GiB for this artifact). This is intentionally below the byte target
+that a warm 24 GiB snapshot could otherwise expose during a long decode.
+
 In resident mode each complete expert-major layer is exposed as a read-only
 Metal buffer with the manifest record size as its expert stride. Only
 non-routed GGUF spans and those 40 layer buffers are registered for residency;

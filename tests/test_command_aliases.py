@@ -8,6 +8,7 @@ import hashlib
 import json
 import os
 import pathlib
+import re
 import subprocess
 import sys
 
@@ -98,10 +99,19 @@ def validate_pair(
         legacy_name = os.fsencode(legacy.name)
 
         def normalize(data: bytes) -> bytes:
-            return (
+            normalized = (
                 data.replace(canonical_name, legacy_name)
                 .replace(b'"engine_id": "hebrus"', b'"engine_id": "ds4"')
                 .replace(b"hebrus build", b"ds4 build")
+            )
+            # Server diagnostics include wall-clock time. The two aliases run
+            # sequentially and may straddle a second boundary even though they
+            # resolve to the same executable; compare the diagnostic content,
+            # not that incidental timestamp.
+            return re.sub(
+                rb"(?m)^\d{4} \d{2}:\d{2}:\d{2}(?= ds4-server:)",
+                b"0000 00:00:00",
+                normalized,
             )
 
         canonical_record = (
@@ -111,8 +121,8 @@ def validate_pair(
         )
         legacy_record = (
             legacy_result.returncode,
-            legacy_result.stdout,
-            legacy_result.stderr,
+            normalize(legacy_result.stdout),
+            normalize(legacy_result.stderr),
         )
         if canonical_record != legacy_record:
             fail(f"{canonical.name}/{legacy.name} differ for {' '.join(args)}")

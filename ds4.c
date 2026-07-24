@@ -38919,8 +38919,6 @@ static bool ds4_engine_plan_qwen35_metal_phases(
     e->qwen35_request_headroom_bytes =
         prefill_out->current_headroom_bytes +
         prefill_out->pressure_margin_bytes;
-    e->qwen35_pressure_gate_required =
-        prefill_out->low_ram_shared_static_headroom_active;
     return true;
 }
 
@@ -39142,7 +39140,7 @@ static bool ds4_engine_configure_qwen35_metal_streaming(ds4_engine *e) {
             &e->qwen35_weights, &geometry)) {
         fprintf(stderr,
                 "ds4: Qwen SSD streaming cache geometry does not match the "
-                "supported Q4_K_S artifact\n");
+                "supported MLX affine4/group-64 artifact\n");
         return false;
     }
     if (geometry.minimum_cache_experts > UINT32_MAX) {
@@ -39177,13 +39175,23 @@ static bool ds4_engine_configure_qwen35_metal_streaming(ds4_engine *e) {
                 "ds4: Qwen SSD cache planning requires a host-memory snapshot\n");
         return false;
     }
+    e->qwen35_pressure_gate_required =
+        ds4_ssd_qwen_guarded_cache_policy(memory.physical_bytes);
+    if (e->qwen35_pressure_gate_required &&
+        (!memory.pressure_status_available || !memory.pressure_normal)) {
+        fprintf(stderr,
+                "ds4: Qwen SSD guarded-memory preflight requires normal "
+                "macOS pressure; current pressure is %s\n",
+                !memory.pressure_status_available ? "unknown" : "elevated");
+        return false;
+    }
     const bool auto_plan_ok = ds4_engine_plan_qwen35_metal_phases(
         e, &memory, static_page_coverage_bytes, &geometry,
         &prefill_plan, &decode_plan);
-    if (prefill_plan.low_ram_shared_static_headroom_active &&
+    if (e->qwen35_pressure_gate_required &&
         prefill_plan.pageable_static_reserve_bytes != 0) {
         fprintf(stderr,
-                "ds4: Qwen SSD low-RAM preflight: pressure %s, reclaimable "
+                "ds4: Qwen SSD guarded-memory preflight: pressure %s, reclaimable "
                 "%.2f GiB; one request reserve %.2f GiB including pressure; "
                 "persistent runtime %.2f GiB, prefill phase workspace %.2f GiB; "
                 "prefill/decode cache envelopes %.2f/%.2f GiB "
@@ -39257,8 +39265,9 @@ static bool ds4_engine_configure_qwen35_metal_streaming(ds4_engine *e) {
     e->ssd_streaming_cache_bytes =
         (uint64_t)cache_experts * geometry.per_expert_bytes;
     /* A Qwen layer has only 256 routed experts, so a larger cold cache adds
-     * allocation/locking pressure but no prefill parallelism. On <=16 GiB AUTO
-     * hosts, start at the safe route floor and grow in-place before decode. */
+     * allocation/locking pressure but no prefill parallelism. On guarded
+     * 16/24 GiB AUTO hosts, start at the safe route floor and grow in-place
+     * before decode. */
     const uint32_t initial_cache_experts =
         e->qwen35_prefill_cache_experts;
     ds4_gpu_set_streaming_expert_cache_expert_bytes(
@@ -41224,6 +41233,43 @@ done:
     return ok;
 }
 
+static int ds4_session_qwen35_metal_require_phase_pressure(
+        ds4_session *s,
+        const char  *phase,
+        bool         cache_budget_changed,
+        char        *err,
+        size_t       errlen) {
+    if (!s || !s->engine || !phase) return 1;
+    if (!s->engine->qwen35_pressure_gate_required) return 0;
+
+    ds4_ssd_host_memory memory = {0};
+    const bool snapshot_available =
+        ds4_gpu_host_memory_snapshot(&memory);
+    if (ds4_ssd_qwen_phase_pressure_allowed(
+            true,
+            cache_budget_changed,
+            snapshot_available,
+            memory.pressure_status_available,
+            memory.pressure_normal)) {
+        return 0;
+    }
+
+    qwen35_telemetry_emit(
+        s->engine, "memory_pressure",
+        "\"phase\":\"%s\",\"normal\":false,"
+        "\"cache_budget_changed\":%s,"
+        "\"action\":\"stop_before_phase\"",
+        phase,
+        cache_budget_changed ? "true" : "false");
+    if (err && errlen) {
+        snprintf(err, errlen,
+                 "memory pressure is not normal; refusing Qwen %s "
+                 "cache phase",
+                 phase);
+    }
+    return 1;
+}
+
 static int ds4_session_qwen35_metal_finish_prefill_cache(
         ds4_session *s,
         char        *err,
@@ -41233,6 +41279,11 @@ static int ds4_session_qwen35_metal_finish_prefill_cache(
     const uint32_t current =
         ds4_gpu_stream_expert_cache_configured_count();
     const uint32_t target = s->engine->qwen35_decode_cache_experts;
+    const bool cache_budget_changed = target > current;
+    if (ds4_session_qwen35_metal_require_phase_pressure(
+            s, "decode", cache_budget_changed, err, errlen) != 0) {
+        return 1;
+    }
     if (target <= current) {
         if (report_phase_budget) {
             qwen35_telemetry_emit(
@@ -41247,21 +41298,6 @@ static int ds4_session_qwen35_metal_finish_prefill_cache(
             "\"to_experts\":%u,\"changed\":false",
             current, current);
         return 0;
-    }
-    ds4_ssd_host_memory memory = {0};
-    if (s->engine->qwen35_pressure_gate_required &&
-        (!ds4_gpu_host_memory_snapshot(&memory) ||
-         !memory.pressure_status_available || !memory.pressure_normal)) {
-        qwen35_telemetry_emit(
-            s->engine, "memory_pressure",
-            "\"phase\":\"decode\",\"normal\":false,"
-            "\"action\":\"stop_before_cache_growth\"");
-        if (errlen) {
-            snprintf(err, errlen,
-                     "memory pressure is not normal; refusing Qwen decode "
-                     "cache growth");
-        }
-        return 1;
     }
     if (!ds4_gpu_grow_streaming_expert_cache_budget(target)) {
         if (errlen) {
@@ -41334,6 +41370,11 @@ static int ds4_session_qwen35_metal_prepare_prefill_cache(
     const uint32_t current =
         ds4_gpu_stream_expert_cache_configured_count();
     const uint32_t target = s->engine->qwen35_prefill_cache_experts;
+    const bool cache_budget_changed = current != target;
+    if (ds4_session_qwen35_metal_require_phase_pressure(
+            s, "prefill", cache_budget_changed, err, errlen) != 0) {
+        return 1;
+    }
     if (current == target) {
         qwen35_telemetry_emit(
             s->engine, "phase_budget",
@@ -41348,21 +41389,6 @@ static int ds4_session_qwen35_metal_prepare_prefill_cache(
         return 0;
     }
 
-    ds4_ssd_host_memory memory = {0};
-    if (s->engine->qwen35_pressure_gate_required &&
-        (!ds4_gpu_host_memory_snapshot(&memory) ||
-         !memory.pressure_status_available || !memory.pressure_normal)) {
-        qwen35_telemetry_emit(
-            s->engine, "memory_pressure",
-            "\"phase\":\"prefill\",\"normal\":false,"
-            "\"action\":\"stop_before_workspace\"");
-        if (errlen) {
-            snprintf(err, errlen,
-                     "memory pressure is not normal; refusing Qwen macro "
-                     "workspace allocation");
-        }
-        return 1;
-    }
     if (!ds4_gpu_reconfigure_streaming_expert_cache_budget(target)) {
         if (errlen) {
             snprintf(err, errlen,
@@ -41413,6 +41439,14 @@ static int ds4_session_sync_qwen35_metal(
     }
 
     const int start = s->checkpoint.len;
+    const int suffix_tokens = prompt->len - start;
+    const bool long_prefill = qwen35_prefill_suffix_needs_phase(
+        (uint32_t)suffix_tokens);
+    const bool phase_feature_enabled =
+        (s->engine->qwen35_features.enabled &
+         QWEN35_FEATURE_PHASE_BUDGET) != 0;
+    const bool phase_budget =
+        s->engine->ssd_streaming && long_prefill && phase_feature_enabled;
     const double prefill_t0 = now_sec();
     qwen35_telemetry_emit(
         s->engine, "prefill_begin",
@@ -41423,19 +41457,16 @@ static int ds4_session_sync_qwen35_metal(
     if (s->progress) {
         s->progress(s->progress_ud, "prefill_begin", start, prompt->len);
     }
-    const int suffix_tokens = prompt->len - start;
-    const bool long_prefill = qwen35_prefill_suffix_needs_phase(
-        (uint32_t)suffix_tokens);
-    const bool phase_feature_enabled =
-        (s->engine->qwen35_features.enabled &
-         QWEN35_FEATURE_PHASE_BUDGET) != 0;
-    const bool phase_budget =
-        s->engine->ssd_streaming && long_prefill && phase_feature_enabled;
     /* Phase budgeting is deliberately independent from macro scheduling so a
      * one-off macro ablation changes only ordering, not its cache envelope. */
-    if (phase_budget &&
-        ds4_session_qwen35_metal_prepare_prefill_cache(
-            s, err, errlen) != 0) {
+    const int phase_prepare = phase_budget
+        ? ds4_session_qwen35_metal_prepare_prefill_cache(
+            s, err, errlen)
+        : (s->engine->ssd_streaming
+            ? ds4_session_qwen35_metal_require_phase_pressure(
+                s, "prefill", false, err, errlen)
+            : 0);
+    if (phase_prepare != 0) {
         qwen35_telemetry_emit(
             s->engine, "prefill_abort",
             "\"start\":%d,\"frontier\":%d,"
