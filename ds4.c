@@ -1128,10 +1128,7 @@ static void ds4_expert_profile_write_layer(FILE *fp, uint32_t il) {
             avg_jaccard);
 
     fputs("      \"top_experts\": [", fp);
-    /* Default: compact top-16. With DS4_EXPERT_PROFILE_FULL set, emit the full
-     * per-expert ranking so a static prune/keep-set can be chosen per layer. */
-    const uint32_t top_n = getenv("DS4_EXPERT_PROFILE_FULL") ? unique :
-                           (unique < 16u ? unique : 16u);
+    const uint32_t top_n = unique < 16u ? unique : 16u;
     for (uint32_t i = 0; i < top_n; i++) {
         const double pct = selections ?
             100.0 * (double)entries[i].count / (double)selections : 0.0;
@@ -8004,53 +8001,6 @@ static void matvec_any(float *out, const ds4_model *m, const ds4_tensor *w, cons
     }
 }
 
-/* Optional static expert prune mask for cache-fraction experiments.  Point
- * DS4_EXPERT_PRUNE_MASK at a DS4_MAX_LAYER-line x N_EXPERT grid of '0'/'1'
- * ('1' = prune).  When active, router selection scores of pruned experts are
- * forced below any survivor before top-k, so they are never selected and
- * never fetched: each token routes to its next-best surviving expert.
- * Applied in the CPU reference router (which the Metal masked select and the
- * router-ahead prefetch predictor share), keeping all paths consistent.
- * Off by default. */
-static int8_t g_expert_prune_mask[DS4_MAX_LAYER][DS4_MAX_EXPERT];
-static int g_expert_prune_mask_state = -1; /* -1 unchecked, 0 off, 1 active */
-static void ds4_expert_prune_mask_ensure(void) {
-    if (g_expert_prune_mask_state >= 0) return;
-    g_expert_prune_mask_state = 0;
-    const char *path = getenv("DS4_EXPERT_PRUNE_MASK");
-    if (!path || !path[0]) return;
-    FILE *f = fopen(path, "r");
-    if (!f) { fprintf(stderr, "ds4: prune mask open failed: %s\n", path); return; }
-    long pruned = 0;
-    for (uint32_t il = 0; il < DS4_MAX_LAYER; il++) {
-        int c; uint32_t e = 0;
-        while ((c = fgetc(f)) != EOF && c != '\n') {
-            if ((c == '0' || c == '1') && e < DS4_MAX_EXPERT) {
-                g_expert_prune_mask[il][e] = (int8_t)(c == '1');
-                if (c == '1') pruned++;
-                e++;
-            }
-        }
-        if (c == EOF) break;
-    }
-    fclose(f);
-    g_expert_prune_mask_state = pruned > 0 ? 1 : 0;
-    fprintf(stderr, "ds4: expert prune mask %s (%ld experts pruned) from %s\n",
-            g_expert_prune_mask_state ? "ACTIVE" : "empty", pruned, path);
-}
-
-static void ds4_expert_prune_mask_apply_selection(
-        uint32_t il,
-        float   *selection,
-        uint32_t n_expert) {
-    ds4_expert_prune_mask_ensure();
-    if (g_expert_prune_mask_state != 1 || il >= DS4_MAX_LAYER) return;
-    for (uint32_t e = 0; e < n_expert && e < DS4_MAX_EXPERT; e++) {
-        /* -ffast-math: large finite sentinel instead of -INFINITY. */
-        if (g_expert_prune_mask[il][e]) selection[e] = -1e30f;
-    }
-}
-
 static float tensor_1d_value(const ds4_model *m, const ds4_tensor *t, uint64_t i) {
     if (i >= t->elements) ds4_die("tensor scalar index is out of bounds");
     if (t->type == 0) {
@@ -13454,7 +13404,6 @@ static void layer_glm_router_selected_experts(
         float                  expert_weight[DS4_MAX_EXPERT_USED],
         const ds4_model       *model,
         const ds4_layer_weights *layer,
-        uint32_t               il,
         const float           *x) {
     float logits[DS4_MAX_EXPERT];
     float probs[DS4_MAX_EXPERT];
@@ -13466,8 +13415,6 @@ static void layer_glm_router_selected_experts(
         probs[i] = sigmoid_stable(logits[i]);
         selection[i] = probs[i] + bias[i];
     }
-    ds4_expert_prune_mask_apply_selection(il, selection, DS4_N_EXPERT);
-
     topk_desc(selection, (int)DS4_N_EXPERT, (int)DS4_N_EXPERT_USED, selected);
 
     float sum = 0.0f;
@@ -13707,7 +13654,7 @@ static void layer_glm_ffn_one_f32_ref(
         float *moe = xmalloc((size_t)DS4_N_EMBD * sizeof(moe[0]));
         float *shared = xmalloc((size_t)DS4_N_EMBD * sizeof(shared[0]));
 
-        layer_glm_router_selected_experts(selected, expert_weight, model, layer, il, norm);
+        layer_glm_router_selected_experts(selected, expert_weight, model, layer, norm);
         layer_glm_routed_moe_one_f32_ref(moe, mid, model, layer, norm,
                                          selected, expert_weight);
         layer_glm_shared_ffn_one_f32_ref(shared, model, layer, norm);
@@ -13782,8 +13729,7 @@ static void layer_glm_routed_moe_one(
         float                   * out,
         const ds4_model         * model,
         const ds4_layer_weights * layer,
-        const float             * x,
-        uint32_t                  il) {
+        const float             * x) {
     int selected[DS4_MAX_EXPERT_USED];
     float expert_weight[DS4_MAX_EXPERT_USED];
     const uint64_t expert_in_dim = layer->ffn_gate_exps->dim[0];
@@ -13799,7 +13745,7 @@ static void layer_glm_routed_moe_one(
 
     memset(out, 0, (size_t)DS4_N_EMBD * sizeof(out[0]));
     ds4_quantize_row_q8_K(x, xq, (int64_t)expert_in_dim);
-    layer_glm_router_selected_experts(selected, expert_weight, model, layer, il, x);
+    layer_glm_router_selected_experts(selected, expert_weight, model, layer, x);
 
     matvec_experts_mid_prequant(mid_all, model,
                                 layer->ffn_gate_exps,
@@ -13820,19 +13766,17 @@ static void layer_glm_routed_moe_one(
     free(midq);
     free(xq);
     free(mid_all);
-    (void)il;
 }
 
 static void layer_glm_sparse_ffn_one(
         float                   * out,
         const ds4_model         * model,
         const ds4_layer_weights * layer,
-        const float             * x,
-        uint32_t                  il) {
+        const float             * x) {
     float *moe = xmalloc((size_t)DS4_N_EMBD * sizeof(moe[0]));
     float *shared = xmalloc((size_t)DS4_N_EMBD * sizeof(shared[0]));
 
-    layer_glm_routed_moe_one(moe, model, layer, x, il);
+    layer_glm_routed_moe_one(moe, model, layer, x);
     layer_shared_ffn_one(shared, model, layer, x);
     for (uint32_t i = 0; i < DS4_N_EMBD; i++) out[i] = moe[i] + shared[i];
 
@@ -13852,7 +13796,7 @@ static void layer_glm_ffn_one(
     if (il < DS4_N_LEADING_DENSE) {
         layer_glm_dense_ffn_one(out, model, layer, norm);
     } else {
-        layer_glm_sparse_ffn_one(out, model, layer, norm, il);
+        layer_glm_sparse_ffn_one(out, model, layer, norm);
     }
 
     free(norm);
@@ -21484,25 +21428,6 @@ static bool metal_graph_streaming_expert_hotlist_enabled(const ds4_gpu_graph *g)
            getenv("DS4_METAL_DISABLE_STREAMING_EXPERT_HOTLIST") == NULL;
 }
 
-static bool metal_graph_streaming_expert_hotlist_priority_policy(
-        ds4_streaming_hotlist_priority_policy *policy) {
-    const char *env =
-        getenv("DS4_METAL_STREAMING_EXPERT_HOTLIST_PRIORITY");
-    if (ds4_parse_streaming_hotlist_priority_policy(env, policy)) return true;
-    fprintf(stderr,
-            "ds4: invalid DS4_METAL_STREAMING_EXPERT_HOTLIST_PRIORITY=%s; "
-            "expected adaptive, legacy, or a positive integer\n",
-            env ? env : "");
-    return false;
-}
-
-static uint32_t metal_graph_streaming_expert_hotlist_initial_priority(
-        const ds4_streaming_hotlist_priority_policy *policy,
-        uint32_t                                      legacy_priority) {
-    return policy->mode == DS4_STREAMING_HOTLIST_PRIORITY_LEGACY ?
-        legacy_priority : policy->priority;
-}
-
 static bool metal_graph_streaming_expert_hotlist_add(
         uint32_t    layer,
         uint32_t    expert,
@@ -21527,7 +21452,6 @@ static bool metal_graph_streaming_expert_hotlist_add(
 static bool metal_graph_streaming_expert_hotlist_load_file(
         const char *path,
         uint32_t    max_entries,
-        const ds4_streaming_hotlist_priority_policy *priority_policy,
         int32_t     experts[DS4_MAX_LAYER][DS4_MAX_EXPERT],
         uint32_t    priorities[DS4_MAX_LAYER][DS4_MAX_EXPERT],
         uint32_t    counts[DS4_MAX_LAYER],
@@ -21573,14 +21497,9 @@ static bool metal_graph_streaming_expert_hotlist_load_file(
         unsigned long long hits = strtoull(p, &end, 10);
         if (end == p || errno != 0) goto bad_line;
         if (hits == 0) continue;
-        const uint32_t legacy_priority =
-            hits > UINT32_MAX ? UINT32_MAX : (uint32_t)hits;
-        const uint32_t priority =
-            metal_graph_streaming_expert_hotlist_initial_priority(
-                priority_policy, legacy_priority);
         if (!metal_graph_streaming_expert_hotlist_add((uint32_t)layer,
                                                       (uint32_t)expert,
-                                                      priority,
+                                                      1u,
                                                       experts,
                                                       priorities,
                                                       counts,
@@ -21617,7 +21536,6 @@ bad_line:
 
 static bool metal_graph_streaming_expert_hotlist_load_default(
         uint32_t    max_entries,
-        const ds4_streaming_hotlist_priority_policy *priority_policy,
         int32_t     experts[DS4_MAX_LAYER][DS4_MAX_EXPERT],
         uint32_t    priorities[DS4_MAX_LAYER][DS4_MAX_EXPERT],
         uint32_t    counts[DS4_MAX_LAYER],
@@ -21648,8 +21566,7 @@ static bool metal_graph_streaming_expert_hotlist_load_default(
         if (!metal_graph_streaming_expert_hotlist_add(
                 hotlist[i][0],
                 hotlist[i][1],
-                metal_graph_streaming_expert_hotlist_initial_priority(
-                    priority_policy, max_entries - loaded),
+                1u,
                 experts,
                 priorities,
                 counts,
@@ -21776,7 +21693,6 @@ static bool metal_graph_decode_cpu_router(
         layer_hash_selected_experts(selected, model, layer, (int)token);
         layer_hash_router_weights_from_probs(weights, probs, selected);
     } else {
-        ds4_expert_prune_mask_apply_selection(il, probs, DS4_N_EXPERT);
         layer_topk_selected_experts_from_probs(selected, weights, model, layer, probs);
     }
     for (uint32_t i = 0; i < DS4_N_EXPERT_USED; i++) {
@@ -27361,15 +27277,9 @@ static bool metal_graph_seed_streaming_expert_cache_from_hotlist(
     memset(seen, 0, sizeof(seen));
 
     uint32_t loaded = 0;
-    ds4_streaming_hotlist_priority_policy priority_policy;
-    if (!metal_graph_streaming_expert_hotlist_priority_policy(
-            &priority_policy)) {
-        return false;
-    }
     if (from_file) {
         if (!metal_graph_streaming_expert_hotlist_load_file(path,
                                                            preload_count,
-                                                           &priority_policy,
                                                            experts,
                                                            priorities,
                                                            counts,
@@ -27377,13 +27287,13 @@ static bool metal_graph_seed_streaming_expert_cache_from_hotlist(
                                                            &loaded)) {
             return false;
         }
-    } else if (!metal_graph_streaming_expert_hotlist_load_default(preload_count,
-                                                                  &priority_policy,
-                                                                  experts,
-                                                                  priorities,
-                                                                  counts,
-                                                                  seen,
-                                                                  &loaded)) {
+    } else if (!metal_graph_streaming_expert_hotlist_load_default(
+                   preload_count,
+                   experts,
+                   priorities,
+                   counts,
+                   seen,
+                   &loaded)) {
         return false;
     }
     if (loaded == 0) return true;
@@ -27437,20 +27347,13 @@ static bool metal_graph_seed_streaming_expert_cache_from_hotlist(
         } else {
             source_name = "built-in";
         }
-        const char *priority_mode =
-            priority_policy.mode == DS4_STREAMING_HOTLIST_PRIORITY_LEGACY ?
-                "legacy" :
-            priority_policy.mode == DS4_STREAMING_HOTLIST_PRIORITY_FIXED ?
-                "fixed" : "adaptive";
         fprintf(stderr,
-                "ds4: Metal streaming expert hotlist seed source=%s preload=%u loaded=%u layers=%u experts=%u priority=%s:%u time=%.3f ms\n",
+                "ds4: Metal streaming expert hotlist seed source=%s preload=%u loaded=%u layers=%u experts=%u priority=adaptive:1 time=%.3f ms\n",
                 source_name,
                 preload_count,
                 loaded,
                 seeded_layers,
                 seeded_experts,
-                priority_mode,
-                priority_policy.priority,
                 (now_sec() - t0) * 1000.0);
     }
     return true;
@@ -37195,7 +37098,6 @@ static int glm_metal_graph_test(ds4_engine *e, const ds4_tokens *prompt) {
                                           cpu_router_weights,
                                           model,
                                           sparse_layer,
-                                          sparse_il,
                                           cpu_sparse_norm);
 
         ok = ds4_gpu_tensor_write(ffn_norm, 0, cpu_sparse_norm, emb_bytes) != 0;
@@ -38786,14 +38688,11 @@ static bool ds4_engine_qwen35_metal_options_valid(
         getenv("DS4_METAL_STREAMING_EXPERT_HOTLIST");
     const char *streaming_hotlist_profile =
         getenv("DS4_METAL_STREAMING_EXPERT_HOTLIST_PROFILE");
-    const char *streaming_hotlist_priority =
-        getenv("DS4_METAL_STREAMING_EXPERT_HOTLIST_PRIORITY");
     if ((opt->expert_profile_path && opt->expert_profile_path[0]) ||
         (expert_profile && expert_profile[0]) ||
         (expert_hotlist && expert_hotlist[0]) ||
         (streaming_hotlist && streaming_hotlist[0]) ||
-        (streaming_hotlist_profile && streaming_hotlist_profile[0]) ||
-        (streaming_hotlist_priority && streaming_hotlist_priority[0])) {
+        (streaming_hotlist_profile && streaming_hotlist_profile[0])) {
         fprintf(stderr,
                 "ds4: Qwen Metal inference does not support "
                 "expert profiles or hotlists yet\n");
@@ -39528,20 +39427,6 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
                 "ds4: %s backend requested but it is unavailable in this build\n",
                 ds4_backend_name(opt->backend));
         return 1;
-    }
-    const char *hotlist_priority_env =
-        getenv("DS4_METAL_STREAMING_EXPERT_HOTLIST_PRIORITY");
-    if (opt->backend == DS4_BACKEND_METAL &&
-        hotlist_priority_env && hotlist_priority_env[0]) {
-        ds4_streaming_hotlist_priority_policy hotlist_priority;
-        if (!ds4_parse_streaming_hotlist_priority_policy(
-                hotlist_priority_env, &hotlist_priority)) {
-            fprintf(stderr,
-                    "ds4: invalid DS4_METAL_STREAMING_EXPERT_HOTLIST_PRIORITY=%s; "
-                    "expected adaptive, legacy, or a positive integer\n",
-                    hotlist_priority_env);
-            return 1;
-        }
     }
     fprintf(stderr,
             "ds4: build git=%s compiled=%s-%s runtime=%s\n",

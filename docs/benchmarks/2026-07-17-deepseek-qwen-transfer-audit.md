@@ -117,8 +117,9 @@ general adaptive-policy gain in this session.  The deterministic I/O reduction
 is promoted; a precise throughput percentage still requires a fresh mirrored
 cold/warm campaign.
 
-The final flag integration received a separate model-backed functional smoke
-after the parser, help text, and rollback path were added. On binary SHA-256
+The historical flag integration at commit `ba2a729` received a separate
+model-backed functional smoke after the parser, help text, and rollback path
+were added. On binary SHA-256
 `6301541dce570c80660e78c61f46a1e4dfbe68220dbfa7d04a8f0022e2f8f70b`, a
 768-token native-AUTO request seeded 259 entries under both the omitted/default
 `adaptive` policy and explicit `legacy`. The logs reported
@@ -126,9 +127,9 @@ after the parser, help text, and rollback path were added. On binary SHA-256
 with zero new swapout and produced byte-identical frontier files with SHA-256
 `99ba046837ba10d1ff7a1ba555d8a48299d696d1d09c32b92bb959c86b5596ff`.
 Live pressure selected different post-prefill cache budgets, so their timings
-are deliberately not compared. Invalid policy values fail startup, and the
-model-free suite covers the default, legacy, fixed-positive, overflow, zero,
-and malformed parser cases.
+are deliberately not compared. In that build, invalid policy values failed
+startup, and the model-free suite covered the default, legacy, fixed-positive,
+overflow, zero, and malformed parser cases.
 
 ## Practical path to larger gains
 
@@ -143,12 +144,12 @@ DS4_METAL_STREAMING_EXPERT_HOTLIST=/tmp/deepseek-hotlist.txt \
 ./build/metal-arm64/bin/ds4-server ...
 ```
 
-The production default treats that file as an ordered preload prior and seeds
-every entry at priority one. Set
-`DS4_METAL_STREAMING_EXPERT_HOTLIST_PRIORITY=legacy` only to reproduce the raw
-hit-count behavior measured by the workload-trained upper-bound row above, or
-set a positive integer to test a bounded uniform prior. Invalid values fail
-startup rather than silently selecting another policy.
+The production path treats that file as an ordered preload prior and seeds
+every entry at priority one. This record's tested binary also exposed
+`DS4_METAL_STREAMING_EXPERT_HOTLIST_PRIORITY=legacy|N` for its A/B arms. The
+current runtime has elided that experiment switch; reproduce those historical
+arms from commit `ba2a729` rather than carrying their policy into release
+inference.
 
 Do not train and report on the same prompt as a production claim.  The next
 qualification campaign should aggregate representative DSBox conversations,

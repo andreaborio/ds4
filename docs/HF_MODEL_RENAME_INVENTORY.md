@@ -4,9 +4,8 @@
 - Move status: all three in-place moves completed and verified on 2026-07-22
 - Namespace: `andreaborio`
 - Visibility: all three repositories are public and ungated
-- Purpose: establish a reviewable baseline for the in-place DS4-to-Hebrus
-  repository moves described in
-  [`REBRAND_ROLLOUT_PLAN.md`](REBRAND_ROLLOUT_PLAN.md)
+- Purpose: preserve the reviewable baseline for the completed in-place
+  DS4-to-Hebrus repository moves
 
 This snapshot is the pre-move baseline used for the completed operations. The
 post-move comparison covered revisions, full sibling inventories, file sizes,
@@ -15,7 +14,7 @@ redirects, and ranged reads through each old repository ID.
 
 ## Repository baseline
 
-| Current ID | Planned ID | Main revision | Downloads | Likes | Files |
+| Previous ID | Canonical ID | Main revision | Downloads | Likes | Files |
 | --- | --- | --- | ---: | ---: | ---: |
 | `andreaborio/DeepSeek-V4-Flash-DS4-GGUF` | `andreaborio/DeepSeek-V4-Flash-Hebrus-GGUF` | `2ba412c5d8048f8adfb24446e776015133aed9e0` | 319 | 0 | 5 |
 | `andreaborio/GLM-5.2-DS4-GGUF` | `andreaborio/GLM-5.2-Hebrus-GGUF` | `0182407316ad8a3cf6cb676dad9ae298af8e091a` | 98 | 0 | 19 |
@@ -35,22 +34,22 @@ Content`; old and new Git URLs returned the same recorded HEAD for every model.
 
 The Qwen repository also contains historical/canonical comparison artifacts;
 the GLM repository contains the archived multipart experimental tree. The move
-must preserve every sibling and LFS/Xet object, not only the three qualified
-files above. No GGUF filename, byte count, SHA-256, revision, manifest tensor
-identifier, or historical directory is a branding rename target.
+preserved every sibling and LFS/Xet object, not only the three qualified files
+above. No GGUF filename, byte count, SHA-256, revision, manifest tensor
+identifier, or historical directory changed for branding.
 
-## Collection and move checks
+## Collection and move verification
 
 The public baseline was collected from the official Hub model API with
-`blobs=true`. Before each authenticated move, save the complete JSON response
-and Git refs, then compare after the move:
+`blobs=true`. The complete JSON response and Git refs saved before each move
+were compared with the canonical repository afterward:
 
 ```sh
 curl --fail --location \
   "https://huggingface.co/api/models/andreaborio/REPOSITORY?blobs=true"
 ```
 
-Post-move verification must prove:
+Post-move verification proved:
 
 1. the new ID resolves the exact recorded main revision;
 2. the old page, API, Git, and `resolve` URLs redirect;

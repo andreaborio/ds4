@@ -21,9 +21,9 @@ the only capacity boundary.
 > The engine is published at
 > [`andreaborio/hebrus`](https://github.com/andreaborio/hebrus), with
 > [`Hebrus Studio`](https://github.com/andreaborio/hebrus-studio) as its
-> companion macOS application. Durable `ds4` and `DSBox` identifiers remain
-> only where changing their bytes would break model, application, or user-data
-> compatibility; see
+> companion macOS application. Legacy `ds4` and `DSBox` identifiers remain
+> where required for command compatibility, persisted or serialized data, and
+> historical provenance; see
 > [ADR 0005](docs/adr/0005-hebrus-naming-and-compatibility-boundary.md).
 
 > [!IMPORTANT]
@@ -245,12 +245,6 @@ A short-context best is not substituted for the long-context gate.
 
 ### Project and community
 
-- [Cross-repository rebrand rollout plan](docs/REBRAND_ROLLOUT_PLAN.md) —
-  current engine, Studio, and website status; non-breaking rename order; CI,
-  compatibility, repository, release, and launch gates.
-- [Hebrus bridge launch-candidate notes](docs/releases/hebrus-bridge-launch-candidate.md) —
-  implemented scope, preserved compatibility, release evidence, and external
-  gates that remain pending.
 - [Contribution guide](CONTRIBUTING.md)
 - [Security policy](SECURITY.md)
 - [Code of conduct](CODE_OF_CONDUCT.md)

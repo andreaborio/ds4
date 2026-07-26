@@ -149,16 +149,23 @@ DeepSeek decode regression is fixed.
 - GLM 5.2 gold: the dedicated GLM line, Metal + SSD, with only independently
   verified family-specific winners enabled.
 
-The GLM gold profile is allowed to enable:
+The fixed GLM gold profile enables exactly:
 
 - indexed-prefill next-layer prepare;
 - router-ahead advisory mode level 1;
 - disabling redundant expert-miss readahead only for GLM.
 
-It must not change the DeepSeek defaults.  Router install mode, QoS/subchunk,
-single-command-buffer splitting, `F_NOCACHE`, virtual full layers, MTP, and
-oversized GLM caches remain experimental or rejected because measurements were
-neutral or negative.
+These choices are selected from the model family and resolved residency, not
+from runtime A/B environment switches. They do not change the DeepSeek or Qwen
+defaults. Historical override values remain in the dated evidence and Git
+history only. Router install mode, QoS/subchunk, single-command-buffer
+splitting, `F_NOCACHE`, virtual full layers, MTP, and oversized GLM caches
+remain experimental or rejected because measurements were neutral or negative.
+
+Built-in and file-supplied DeepSeek/GLM hotlists seed every entry with adaptive
+LFU priority one, allowing live routing to take ownership immediately. The
+legacy hit-count and fixed-priority A/B modes are not production runtime
+policies.
 
 ## Gold gates
 

@@ -9,8 +9,6 @@
 /hebrus-eval
 /hebrus-agent
 /ds4-qwen-pack
-/ds4_native
-/ds4_server_test
 /ds4_test
 /ds4_agent_test
 /tests/test_q4k_dot

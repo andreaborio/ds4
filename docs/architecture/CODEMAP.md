@@ -10,8 +10,8 @@ below that is relevant to the task. Historical benchmark notes are evidence,
 not architecture specifications. The production-backend boundary is recorded
 in [`ADR 0002`](../adr/0002-apple-metal-production-runtime.md). Qwen's
 RAM/working-set adaptation is isolated in
-[`ADR 0004`](../adr/0004-qwen-metal-hardware-memory-policy.md). The proposed
-Hebrus public-name migration and its immutable compatibility boundary are
+[`ADR 0004`](../adr/0004-qwen-metal-hardware-memory-policy.md). The accepted
+Hebrus public name and its immutable compatibility boundary are
 recorded in [`ADR 0005`](../adr/0005-hebrus-naming-and-compatibility-boundary.md).
 For the runtime data and admission path at a glance, see the accessible
 [`mmap → ExpertMajor → AUTO → Metal/SSD flow`](hebrus-runtime-flow.svg).
@@ -45,7 +45,7 @@ not acquire tensor, ExpertMajor, or Metal-kernel ownership.
 | `ds4.c` | Model profiles; GGUF parsing/mapping; quant blocks and CPU reference kernels; tensor binding; tokenizer/chat rendering; model-family dispatch; common Metal graph scheduling; ExpertMajor/SSD orchestration; engine/session implementation; diagnostic paths |
 | `ds4_expert_store.[ch]` | Embedded ExpertMajor store metadata, validation, and indexed range access |
 | `ds4_ssd.[ch]` | SSD residency and read-policy support shared with the runtime |
-| `ds4_profile.[ch]` | Metal/SSD profiling records and summaries |
+| `ds4_profile.[ch]` | Fixed family selection for the default Metal/SSD profile and the qualified GLM Gold profile |
 | `ds4_kvstore.[ch]` | Disk-backed server/agent KV checkpoint store |
 | `ds4_help.[ch]` | Shared structured command help and centralized rejection of retired CLI flags |
 

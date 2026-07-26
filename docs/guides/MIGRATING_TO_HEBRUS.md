@@ -1,8 +1,8 @@
 # Migrating From DS4 To Hebrus
 
-Status: bridge-release guide. The bridge is implemented in source but is not a
-published release yet. Use the version, tag, repository URL, and checksums from
-the eventual release announcement rather than guessing them from this guide.
+Status: migration guide for the unreleased command bridge. Use the exact
+version, tag, and checksums from its release notes; the canonical repository
+has already been renamed in place to `andreaborio/hebrus`.
 
 > [!IMPORTANT]
 > Hebrus began as a fork of
@@ -30,7 +30,7 @@ then move human-facing scripts to the canonical Hebrus names.
 | Benchmark | `hebrus-bench` | `ds4-bench` remains a symlink to the same benchmark binary |
 | Evaluation | `hebrus-eval` | `ds4-eval` remains a symlink to the same evaluation binary |
 | Structured identity | `engine_id: "hebrus"` | Legacy invocation reports `engine_id: "ds4"` |
-| Companion app | Hebrus Studio is the selected public name | The bridge preserves its existing bundle ID, data root, and `DSBOX_*` configuration namespace |
+| Companion app | Hebrus Studio is the public name | The bridge preserves its existing bundle ID, data root, and `DSBOX_*` configuration namespace |
 
 The invoked command name may change help headings, prompts, build labels, and
 `engine_id`. Options, defaults, exit codes, protocols, generated tokens, model
@@ -159,8 +159,8 @@ from executable filenames alone.
 
 ## 5. Migrate the companion application without moving its data
 
-Hebrus Studio is the selected public name for the companion application. Its
-engine bridge should:
+Hebrus Studio is the public name for the companion application. Its engine
+bridge must:
 
 1. resolve `hebrus-server` before `ds4-server`;
 2. validate schema-1 capability JSON and accept both bridge `engine_id` values;
@@ -213,21 +213,20 @@ still owns the control port, quit Hebrus Studio and stop the upgrade. Do not
 merge two profile directories or launch DSBox to “repair” state while Hebrus
 Studio is running.
 
-## 7. Handle the repository rename only after an announcement
+## 6. Update an existing clone after the repository rename
 
-No repository rename is implied by this guide. Existing clones continue to use
-their current remote. After maintainers announce and verify an administrative
-rename, inspect the redirect and then update `origin` to the exact URL in that
-announcement:
+The repository was renamed in place to `andreaborio/hebrus`; the previous URL
+continues to redirect. Existing clones may keep using that verified redirect or
+update `origin` to the canonical URL:
 
 ```sh
 git remote get-url origin
+git remote set-url origin https://github.com/andreaborio/hebrus.git
 git fetch origin
 ```
 
 Do not create a history-less replacement repository, reuse the old repository
-name for another project, rewrite historical links, or change remotes to an
-unreserved guessed namespace.
+name for another project, or rewrite historical links.
 
 ## Rollback
 
@@ -278,7 +277,7 @@ notes and backup procedure take precedence over this bridge rollback.
 - [ ] Hebrus Studio can admit the canonical server and fall back to the legacy
       server without weakening validation.
 - [ ] Rollback has been tested without copying or deleting user data.
-- [ ] Remote URLs were changed only after an authoritative rename announcement.
+- [ ] The remote uses the canonical URL or the verified old-URL redirect.
 
 The normative compatibility rules are in
 [`BRAND_COMPATIBILITY.md`](../contracts/BRAND_COMPATIBILITY.md); the supported

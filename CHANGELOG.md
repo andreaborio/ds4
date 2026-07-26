@@ -22,9 +22,8 @@ not represent a published release.
 - Added model-free tests for capability-schema determinism, cross-executable
   consistency, command aliases, build-profile isolation, and canonical/legacy
   output parity.
-- Added Proposed ADR 0005 to document the intended Hebrus naming and
-  compatibility boundary without changing durable model, cache, or historical
-  identifiers.
+- Added ADR 0005, now Accepted, to define the Hebrus naming and compatibility
+  boundary without changing durable model, cache, or historical identifiers.
 - Added the maintainer-supplied Hebrus logo as a hash-frozen, unchanged RGBA
   master shared with Hebrus Studio. Repository tests reject pixel or encoding
   drift; web presentation effects remain CSS-only.
@@ -43,11 +42,31 @@ not represent a published release.
   Hebrus commands first and links an explicit brand compatibility contract.
   Canonical CLI/agent/evaluation prompts and new benchmark evidence use the
   invoked Hebrus identity; legacy aliases preserve their existing labels.
+- Removed the completed rollout and temporary launch-candidate documents after
+  promoting their durable naming, compatibility, migration, and model-repository
+  facts into the accepted ADR and canonical contracts.
+- Moved the three qualified model repositories in place to their canonical
+  `*-Hebrus-GGUF` identities. Previous repository IDs continue to redirect;
+  revisions, filenames, bytes, hashes, and embedded identifiers are unchanged.
+
+### Removed
+
+- Removed the default-off expert-pruning mask, full-ranking hook, and GLM
+  masked-router fallback. They were research instrumentation outside the
+  supported runtime; the compact top-16 profiler and qualified hardware routing
+  paths remain.
+- Removed an unregistered GLM long-context wrapper whose default canonical
+  artifact is outside the ExpertMajor v2 runtime contract. The qualified GLM
+  long-prefill and decode gates remain in `QA_BEFORE_RELEASES.md`.
+- Removed two unreferenced benchmark SVG copies that remain reproducible from
+  their tracked CSV inputs, plus an exercise-only reuse sampler that was not
+  fail-closed. Its historical measurements remain in `FORK_NOTES.md`.
 
 ### Compatibility
 
-- The repository remains at <https://github.com/andreaborio/ds4> until an
-  administrative rename is actually performed.
+- The repository was renamed in place to
+  <https://github.com/andreaborio/hebrus>; the previous URL remains a
+  compatibility redirect.
 - Existing `DS4_*` environment variables and `ds4`-owned serialized identifiers
   remain unchanged. This bridge does not introduce `HEBRUS_*` environment
   aliases or rename source-level C symbols.

@@ -97,23 +97,6 @@ CPU_CORE_OBJS := $(addprefix $(CPU_OBJDIR)/,ds4.o ds4_build.o ds4_ssd.o ds4_prof
 METAL_BINS := $(addprefix $(METAL_BINDIR)/,$(PROGRAMS))
 CPU_BINS := $(addprefix $(CPU_BINDIR)/,$(PROGRAMS))
 
-METAL_TEST_BINS := \
-	$(METAL_BINDIR)/ds4_test \
-	$(METAL_BINDIR)/ds4_agent_test \
-	$(METAL_BINDIR)/test_q4k_dot \
-	$(METAL_BINDIR)/test_q4k_top8 \
-	$(METAL_BINDIR)/test_qwen_session \
-	$(METAL_BINDIR)/test_qwen_gdn_ref \
-	$(METAL_BINDIR)/test_qwen_attention_ref \
-	$(METAL_BINDIR)/test_qwen_state \
-	$(METAL_BINDIR)/test_qwen_unicode \
-	$(METAL_BINDIR)/test_qwen_tokenizer \
-	$(METAL_BINDIR)/test_qwen_expert_group \
-	$(METAL_BINDIR)/test_expert_store \
-	$(METAL_BINDIR)/test_metal_ssd_profile \
-	$(METAL_BINDIR)/test_ssd_residency \
-	$(METAL_BINDIR)/test_visible_identity
-
 all: metal
 
 help:
@@ -682,23 +665,8 @@ ds4_qwen_unicode.o: ds4_qwen_unicode.c ds4_qwen_unicode.h \
 		ds4_qwen_unicode_data.inc
 	$(CC) $(CFLAGS) -c -o $@ ds4_qwen_unicode.c
 
-ds4_cli.o: ds4_cli.c ds4.h ds4_ssd.h ds4_help.h hebrus_identity.h linenoise.h
-	$(CC) $(CFLAGS) -c -o $@ ds4_cli.c
-
 ds4_help.o: ds4_help.c ds4_help.h hebrus_identity.h
 	$(CC) $(CFLAGS) -c -o $@ ds4_help.c
-
-ds4_server.o: ds4_server.c ds4.h ds4_ssd.h ds4_help.h ds4_kvstore.h rax.h
-	$(CC) $(CFLAGS) -c -o $@ ds4_server.c
-
-ds4_bench.o: ds4_bench.c ds4.h ds4_ssd.h ds4_help.h hebrus_identity.h
-	$(CC) $(CFLAGS) -c -o $@ ds4_bench.c
-
-ds4_eval.o: ds4_eval.c ds4.h ds4_ssd.h ds4_help.h hebrus_identity.h
-	$(CC) $(CFLAGS) -c -o $@ ds4_eval.c
-
-ds4_agent.o: ds4_agent.c ds4.h ds4_ssd.h ds4_help.h hebrus_identity.h ds4_kvstore.h ds4_web.h linenoise.h
-	$(CC) $(CFLAGS) -c -o $@ ds4_agent.c
 
 ds4_web.o: ds4_web.c ds4_web.h
 	$(CC) $(CFLAGS) -c -o $@ ds4_web.c
@@ -1018,8 +986,8 @@ install-test: $(INSTALL_SOURCE_PROGRAMS) tests/test_install.sh \
 clean:
 	rm -rf "$(BUILD_ROOT)"
 	rm -f hebrus hebrus-server hebrus-bench hebrus-eval hebrus-agent \
-		ds4 ds4-server ds4-bench ds4-eval ds4-agent ds4_cpu ds4_native \
-		ds4_server_test ds4_test ds4_agent_test tests/test_q4k_dot \
+		ds4 ds4-server ds4-bench ds4-eval ds4-agent \
+		ds4_test ds4_agent_test tests/test_q4k_dot \
 		tests/test_q4k_top8 \
 		tests/test_qwen_session \
 		tests/test_qwen_tokenizer \

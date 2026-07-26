@@ -35,7 +35,7 @@ const char *ds4_residency_reason_name(ds4_residency_reason reason) {
     case DS4_RESIDENCY_REASON_EXPLICIT_SSD:
         return "explicit SSD override";
     case DS4_RESIDENCY_REASON_NON_METAL_AUTO:
-        return "AUTO currently preserves resident mode outside Metal";
+        return "AUTO preserves resident mode outside Metal";
     case DS4_RESIDENCY_REASON_METAL_FITS:
         return "estimated Metal residency plan fits the conservative budget";
     case DS4_RESIDENCY_REASON_METAL_EXCEEDS:
@@ -254,33 +254,6 @@ bool ds4_parse_streaming_cache_experts_arg(const char *s,
     if (errno != 0 || v == 0 || v > UINT32_MAX) return false;
 
     *experts = (uint32_t)v;
-    return true;
-}
-
-bool ds4_parse_streaming_hotlist_priority_policy(
-        const char                            *s,
-        ds4_streaming_hotlist_priority_policy *out) {
-    if (!out) return false;
-    *out = (ds4_streaming_hotlist_priority_policy){
-        .mode = DS4_STREAMING_HOTLIST_PRIORITY_ADAPTIVE,
-        .priority = 1u,
-    };
-    if (!s || !s[0] || strcmp(s, "adaptive") == 0) return true;
-    if (strcmp(s, "legacy") == 0) {
-        out->mode = DS4_STREAMING_HOTLIST_PRIORITY_LEGACY;
-        out->priority = 0;
-        return true;
-    }
-
-    const size_t len = strlen(s);
-    for (size_t i = 0; i < len; i++) {
-        if (!isdigit((unsigned char)s[i])) return false;
-    }
-    errno = 0;
-    const unsigned long value = strtoul(s, NULL, 10);
-    if (errno != 0 || value == 0 || value > UINT32_MAX) return false;
-    out->mode = DS4_STREAMING_HOTLIST_PRIORITY_FIXED;
-    out->priority = (uint32_t)value;
     return true;
 }
 

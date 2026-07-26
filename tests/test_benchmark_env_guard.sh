@@ -228,13 +228,13 @@ HOME_DIR=${HOME:-$TMP_ROOT}
 # non-runner DS4_* flag remains forbidden.
 run_and_capture \
     PATH="$COMMON_PATH" HOME="$HOME_DIR" \
-    DS4_GLM_STREAMING_DECODE_FULL_LAYER_MAP=1 \
+    DS4_METAL_GRAPH_TRACE_LAYERS=1 \
     DS4_M5_CACHE_STATE=warm \
     "$RUNNER" env-guard-acceptance auto 128
 [ "$STATUS" -eq 2 ] ||
     fail "acceptance arm with a hidden GLM flag exited $STATUS instead of 2"
 assert_contains "$OUTPUT" "acceptance arm refuses unexpected DS4 runtime environment:"
-assert_contains "$OUTPUT" "DS4_GLM_STREAMING_DECODE_FULL_LAYER_MAP"
+assert_contains "$OUTPUT" "DS4_METAL_GRAPH_TRACE_LAYERS"
 
 PROBE_PREFIX=$TMP_ROOT/telemetry-probe
 TELEMETRY_PROBE=$PROBE_PREFIX.qwen-telemetry.jsonl
@@ -301,13 +301,13 @@ assert_contains "$OUTPUT" "refusing to append to existing Qwen telemetry"
 
 run_and_capture \
     PATH="$COMMON_PATH" HOME="$HOME_DIR" \
-    DS4_GLM_STREAMING_DECODE_FULL_LAYER_MAP=1 \
+    DS4_METAL_GRAPH_TRACE_LAYERS=1 \
     DS4_M5_EXPLORATORY=1 \
     "$RUNNER" env-guard-exploratory auto 128
 [ "$STATUS" -eq 2 ] ||
     fail "model-free exploratory probe exited $STATUS instead of 2"
 assert_contains "$OUTPUT" "exploratory arm records unexpected DS4 runtime environment:"
-assert_contains "$OUTPUT" "DS4_GLM_STREAMING_DECODE_FULL_LAYER_MAP"
+assert_contains "$OUTPUT" "DS4_METAL_GRAPH_TRACE_LAYERS"
 assert_contains "$OUTPUT" "set DS4_M5_MODEL to the ExpertMajor v2 GGUF path"
 
 # A one-shot full-hash preparation fails closed on mismatch, reports the actual

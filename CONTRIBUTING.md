@@ -190,10 +190,10 @@ continuations.
 
 ## Speed Regression Tests
 
-Use `ds4-bench` for throughput regressions. It reports instantaneous prefill and
-generation speed at context frontiers, not one whole-run average. Prefill is
-incremental: each row measures only the newly processed suffix since the
-previous frontier.
+Use `hebrus-bench` (`ds4-bench` is its compatibility alias) for throughput
+regressions. It reports instantaneous prefill and generation speed at context
+frontiers, not one whole-run average. Prefill is incremental: each row measures
+only the newly processed suffix since the previous frontier.
 
 ### Performance acceptance matrix
 

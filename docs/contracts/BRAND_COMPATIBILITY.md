@@ -1,6 +1,6 @@
 # Hebrus Brand Compatibility Contract
 
-Status: bridge contract for the unreleased Hebrus naming transition.
+Status: accepted compatibility contract for the Hebrus naming bridge.
 
 This document defines which public names are canonical, which historical names
 remain accepted, and which identifiers must never be rewritten merely for
@@ -21,8 +21,8 @@ not bake shadows, text, color changes, crops, or other edits into this master.
 Every command pair resolves to one real executable and one object graph. The
 name used to invoke the executable controls its help/build identity, public
 prompt identity, and `engine_id`; it does not select a different runtime.
-Runtime diagnostic prefixes remain in the legacy namespace during this bridge
-phase.
+Runtime diagnostic prefixes remain in the legacy namespace while the
+compatibility commands are supported.
 
 | Canonical command | Compatibility command | Capability `engine_id` |
 | --- | --- | --- |
@@ -77,8 +77,8 @@ identifiers do not change.
 
 ## Environment variables and paths
 
-`DS4_*` environment variables remain the accepted runtime namespace in the
-bridge release. `HEBRUS_*` aliases are deferred until a central resolver can
+`DS4_*` environment variables remain the accepted runtime namespace.
+`HEBRUS_*` aliases are deferred until a central resolver can
 enforce one policy consistently. When aliases are introduced, conflicting old
 and new values must fail closed; a textual mass replacement is not permitted.
 
@@ -93,8 +93,10 @@ consumers accept both the previous `andreaborio/ds4` identity and the canonical
 identity over HTTPS or SSH. No history-less replacement was created, and the
 old repository name must not be reused.
 
-The companion application's public name is **Hebrus Studio**. Its persisted
-DSBox identity remains a compatibility boundary for the bridge release:
+The companion repository was likewise renamed in place to
+`andreaborio/hebrus-studio`; the previous `andreaborio/dsbox` identity remains
+a transport redirect. The companion application's public name is **Hebrus
+Studio**. Its persisted DSBox identity remains a compatibility boundary:
 `com.dsbox.desktop`, `$HOME/.dsbox`, `DSBOX_*`, browser storage keys, and the
 legacy Electron user-data directory do not move. The bridge application resolves
 `hebrus-server` first, falls back to `ds4-server`, accepts both structured
@@ -102,6 +104,12 @@ engine identities, and permits source/string fallback only for a legacy
 capability-less `ds4-server`. A capability-less `hebrus-server`, malformed JSON,
 unknown schema, wrong backend/role, dirty or wrong revision, and contradictory
 ExpertMajor fields fail closed.
+
+The three qualified model repositories use their canonical `*-Hebrus-GGUF`
+identities. Their previous identities remain transport redirects; the moves do
+not change a model revision, filename, byte count, hash, or embedded identifier.
+Exact move evidence is retained in
+[`HF_MODEL_RENAME_INVENTORY.md`](../HF_MODEL_RENAME_INVENTORY.md).
 
 ## Migration rules for maintainers
 
@@ -113,9 +121,8 @@ ExpertMajor fields fail closed.
 4. Run the complete model-free gates for identity-only work and the canonical
    model-backed release gates for any change that can affect code generation or
    inference behavior.
-5. Do not begin internal file/symbol migration until the Hebrus Studio bridge is
-   published and the Qwen MLX-affine baseline is qualified.
+5. Do not begin internal file/symbol migration until a published Hebrus Studio
+   release has proven the persisted-data and rollback contract.
 
-The architectural rationale and the acceptance conditions for the rename are
-recorded in
+The accepted architectural decision and rationale are recorded in
 [`ADR 0005`](../adr/0005-hebrus-naming-and-compatibility-boundary.md).

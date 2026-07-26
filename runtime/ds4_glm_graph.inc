@@ -603,9 +603,6 @@ static bool glm_graph_stream_map_decode_layer(
         uint32_t           il) {
     if (!g || !g->ssd_streaming) return true;
     g->streaming_static_decode_map_current = false;
-    if (getenv("DS4_GLM_STREAMING_DECODE_FULL_LAYER_MAP") != NULL) {
-        return metal_graph_stream_map_layer(model, weights, il);
-    }
     if (weights && il < DS4_N_LAYER &&
         glm_graph_stream_layer_expert_cache_supported(weights,
                                                       &weights->layer[il],
@@ -1966,89 +1963,6 @@ static bool glm_router_ahead_prefetch_enabled(
     return g && g->glm_router_ahead == DS4_GLM_ROUTER_AHEAD_ADVISORY;
 }
 
-/* CPU router selection from GPU logits with the prune mask applied.  Mirrors
- * the GLM select kernel math (sigmoid probs, +bias selection score, top-k,
- * weights normalized from probs and scaled): only near-tie float rounding can
- * differ.  Ends the open command buffer to read the logits, writes the
- * selection back, and reopens the buffer. */
-static bool glm_graph_cpu_masked_router_select_batch(
-        ds4_gpu_tensor          *logits_t,
-        ds4_gpu_tensor          *selected_t,
-        ds4_gpu_tensor          *weights_t,
-        ds4_gpu_tensor          *probs_t,
-        const ds4_model         *model,
-        const ds4_layer_weights *l,
-        uint32_t                 il,
-        uint32_t                 n_tokens) {
-    if (!logits_t || !selected_t || !weights_t || !model || !l ||
-        il >= DS4_MAX_LAYER || n_tokens == 0) {
-        return false;
-    }
-    const uint64_t logits_elems = (uint64_t)n_tokens * DS4_N_EXPERT;
-    float *logits = malloc(logits_elems * sizeof(float));
-    if (!logits) return false;
-    bool ok = ds4_gpu_end_commands() != 0;
-    if (ok) {
-        ok = ds4_gpu_tensor_read(logits_t,
-                                 0,
-                                 logits,
-                                 logits_elems * sizeof(float)) != 0;
-    }
-    const float *bias = ok ? tensor_data(model, l->ffn_exp_probs_b) : NULL;
-    if (ok && !bias) ok = false;
-
-    for (uint32_t t = 0; ok && t < n_tokens; t++) {
-        const float *tl = logits + (uint64_t)t * DS4_N_EXPERT;
-        float probs[DS4_MAX_EXPERT];
-        float selection[DS4_MAX_EXPERT];
-        for (uint32_t i = 0; i < DS4_N_EXPERT; i++) {
-            probs[i] = sigmoid_stable(tl[i]);
-            selection[i] = probs[i] + bias[i];
-        }
-        ds4_expert_prune_mask_apply_selection(il, selection, DS4_N_EXPERT);
-        int selected[DS4_MAX_EXPERT_USED];
-        topk_desc(selection, (int)DS4_N_EXPERT, (int)DS4_N_EXPERT_USED, selected);
-        float weights[DS4_MAX_EXPERT_USED];
-        int32_t selected_i32[DS4_MAX_EXPERT_USED];
-        float sum = 0.0f;
-        for (uint32_t i = 0; ok && i < DS4_N_EXPERT_USED; i++) {
-            if (selected[i] < 0 || (uint32_t)selected[i] >= DS4_N_EXPERT) {
-                ok = false;
-                break;
-            }
-            weights[i] = probs[selected[i]];
-            sum += weights[i];
-        }
-        if (!ok) break;
-        if (sum < 6.103515625e-5f) sum = 6.103515625e-5f;
-        for (uint32_t i = 0; i < DS4_N_EXPERT_USED; i++) {
-            weights[i] = weights[i] / sum * DS4_EXPERT_WEIGHT_SCALE;
-            selected_i32[i] = (int32_t)selected[i];
-        }
-        ok = ds4_gpu_tensor_write(selected_t,
-                                  (uint64_t)t * DS4_N_EXPERT_USED *
-                                      sizeof(int32_t),
-                                  selected_i32,
-                                  sizeof(selected_i32)) != 0 &&
-             ds4_gpu_tensor_write(weights_t,
-                                  (uint64_t)t * DS4_N_EXPERT_USED *
-                                      sizeof(float),
-                                  weights,
-                                  sizeof(weights)) != 0;
-        if (ok && probs_t) {
-            ok = ds4_gpu_tensor_write(probs_t,
-                                      (uint64_t)t * DS4_N_EXPERT *
-                                          sizeof(float),
-                                      probs,
-                                      (uint64_t)DS4_N_EXPERT *
-                                          sizeof(float)) != 0;
-        }
-    }
-    free(logits);
-    if (ok) ok = ds4_gpu_begin_commands() != 0;
-    return ok;
-}
-
 /* Advisory mode: how many layers ahead the worker predicts and warms.
  * 1 gives the OS ~one layer of readahead runway, 2 doubles it at a small
  * prediction-accuracy cost (the gating-input proxy drifts with distance). */
@@ -2078,7 +1992,6 @@ static void *glm_router_ahead_worker(void *arg) {
                                           expert_weight,
                                           job.model,
                                           l,
-                                          job.il,
                                           job.x);
         uint64_t gate_in = 0, gate_out = 0, gate_row_bytes = 0;
         uint64_t down_in = 0, down_out = 0, down_row_bytes = 0;
@@ -2190,17 +2103,7 @@ static bool glm_graph_encode_sparse_ffn_one(
                                               DS4_N_EXPERT,
                                               ffn_norm,
                                               1);
-    ds4_expert_prune_mask_ensure();
-    if (ok && g_expert_prune_mask_state == 1) {
-        ok = glm_graph_cpu_masked_router_select_batch(g->router_logits,
-                                                      g->router_selected,
-                                                      g->router_weights,
-                                                      g->router_probs,
-                                                      model,
-                                                      l,
-                                                      il,
-                                                      1);
-    } else if (ok) {
+    if (ok) {
         ok = ds4_gpu_glm_router_select_tensor(g->router_selected,
                                               g->router_weights,
                                               g->router_probs,
@@ -3152,20 +3055,7 @@ static bool glm_graph_encode_sparse_ffn_indexed_batch_routed_moe(
                                                  DS4_N_EXPERT,
                                                  g->batch_ffn_norm,
                                                  n_tokens);
-    ds4_expert_prune_mask_ensure();
-    const bool masked_router_select = g_expert_prune_mask_state == 1;
-    if (ok && masked_router_select) {
-        ok = glm_graph_cpu_masked_router_select_batch(g->batch_router_logits,
-                                                      g->batch_router_selected,
-                                                      g->batch_router_weights,
-                                                      g->batch_router_probs,
-                                                      model,
-                                                      l,
-                                                      il,
-                                                      n_tokens);
-    }
     const bool use_batch_router_select =
-        !masked_router_select &&
         glm_graph_indexed_prefill_batch_router_select();
     if (ok && use_batch_router_select) {
         ok = ds4_gpu_glm_router_select_batch_tensor(g->batch_router_selected,
@@ -3181,8 +3071,7 @@ static bool glm_graph_encode_sparse_ffn_indexed_batch_routed_moe(
                                                     n_tokens) != 0;
     }
     for (uint32_t t = 0;
-         ok && !masked_router_select && !use_batch_router_select &&
-         t < n_tokens;
+         ok && !use_batch_router_select && t < n_tokens;
          t++) {
         ds4_gpu_tensor *logits_view =
             glm_graph_tensor_row_view_strided(g->batch_router_logits,
@@ -3615,17 +3504,7 @@ static bool glm_graph_encode_ffn_batch(
                                          DS4_N_EXPERT,
                                          g->batch_ffn_norm,
                                          n_tokens);
-    ds4_expert_prune_mask_ensure();
-    if (ok && g_expert_prune_mask_state == 1) {
-        ok = glm_graph_cpu_masked_router_select_batch(g->batch_router_logits,
-                                                      g->batch_router_selected,
-                                                      g->batch_router_weights,
-                                                      g->batch_router_probs,
-                                                      model,
-                                                      l,
-                                                      il,
-                                                      n_tokens);
-    } else if (ok) {
+    if (ok) {
         ok = ds4_gpu_glm_router_select_batch_tensor(g->batch_router_selected,
                                                     g->batch_router_weights,
                                                     g->batch_router_probs,

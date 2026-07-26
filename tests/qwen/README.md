@@ -22,7 +22,6 @@ release lane remains
 | `qwen36_gdn_golden.inc` | Scalar Gated DeltaNet state/output oracle | `make qwen-reference-test` |
 | `qwen36_attention_golden.inc` | Scalar full-attention and causal-prefix oracle | `make qwen-reference-test` |
 | `test_v_tiling_contract.py` | Converter V-side permutation contract | `make qwen-reference-test` |
-| `test_compare_logits.py` | Offline logits-comparator validation | `python3 tests/qwen/test_compare_logits.py -v` |
 
 The JSON fixture records its model revision and source identity. It covers
 byte-BPE splitting, Unicode, whitespace, code, trusted controls, thinking
@@ -92,7 +91,6 @@ make qwen-metadata-test \
      qwen-unicode-test \
      qwen-tokenizer-test \
      qwen-expert-group-test
-python3 tests/qwen/test_compare_logits.py -v
 ./ds4_test --metal-kernels
 ```
 
@@ -101,10 +99,6 @@ The scalar fixtures prove numeric and tokenizer invariants; they do not qualify
 a model artifact or a production inference mode. Metal Qwen cases in
 `test_qwen35_metal.m` additionally cover resident/SSD top-8 equivalence,
 malformed-route fail-closed behavior, cache accounting, and slab growth.
-
-`compare_logits.py` remains an offline evidence checker. Its unit test validates
-identity checks, padding exclusion, top-k metrics, and malformed-input failure.
-It is not a substitute for the current ExpertMajor v2 model-backed lane.
 
 ## Qualified ExpertMajor v2 artifact
 

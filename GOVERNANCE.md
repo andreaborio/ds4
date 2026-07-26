@@ -42,9 +42,7 @@ the validation required by the repository guides.
 Accepted records under [`docs/adr/`](docs/adr/) define architectural decisions.
 [`docs/contracts/RUNTIME_SUPPORT.md`](docs/contracts/RUNTIME_SUPPORT.md) defines
 the current production support boundary. Proposed ADRs describe proposals, not
-active policy. In particular,
-[`ADR 0005`](docs/adr/0005-hebrus-naming-and-compatibility-boundary.md) remains
-Proposed until its acceptance conditions are met.
+active policy.
 
 When normative documents disagree, the contradiction must be resolved in the
 same change. A PR description, benchmark note, or temporary handoff cannot

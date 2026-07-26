@@ -17,10 +17,6 @@ typedef struct {
     bool streaming_expert_readahead;
 } ds4_metal_ssd_profile;
 
-bool ds4_profile_toggle_parse(const char *value, bool *out);
-bool ds4_profile_router_ahead_parse(
-        const char *value,
-        ds4_glm_router_ahead_mode *out);
 void ds4_metal_ssd_profile_resolve(
         bool is_metal,
         bool is_glm,

@@ -1,7 +1,8 @@
 # ADR 0005: Hebrus Naming And Compatibility Boundary
 
-- Status: Proposed
+- Status: Accepted
 - Date: 2026-07-21
+- Accepted: 2026-07-24
 
 ## Context
 
@@ -22,25 +23,29 @@ admitting an ExpertMajor runtime.
 
 ## Decision
 
-After namespace and legal screening is complete, the public engine name will be
-**Hebrus**. The existing GitHub fork will be renamed rather than copied, and the
-README will continue to identify `antirez/ds4` prominently as the origin of the
-fork and of substantial implementation work. Acknowledgments will also name
-ggml, llama.cpp, MLX, and other material sources with precise links and scope.
+The public engine name is **Hebrus**. The existing GitHub fork is renamed in
+place rather than copied, and the README continues to identify `antirez/ds4`
+prominently as the origin of the fork and of substantial implementation work.
+Acknowledgments also name ggml, llama.cpp, MLX, and other material sources with
+precise links and scope.
+
+This record decides the software naming and compatibility boundary. It is not a
+trademark opinion or a record of legal clearance; the maintainer's use of the
+name is an external project decision.
 
 The migration separates public brand from compatibility identity:
 
-- canonical executable names become `hebrus`, `hebrus-server`,
+- canonical executable names are `hebrus`, `hebrus-server`,
   `hebrus-agent`, `hebrus-bench`, and `hebrus-eval`;
-- all current `ds4` executable names remain aliases to the same object graph
+- all current `ds4` executable names are aliases to the same object graph
   through at least the complete 1.x release line;
 - new `HEBRUS_*` environment aliases may be introduced only through one
   resolver; existing `DS4_*` variables remain accepted, and conflicting values
   fail closed;
-- the companion application must consume a versioned, model-free capability
+- the companion application consumes the versioned, model-free capability
   document before internal source names move. Legacy source/binary probe markers
-  remain a temporary compatibility shim, not the new admission API;
-- source, header, symbol, and compile-time macro renames occur later in
+  are a temporary compatibility shim, not the admission API;
+- source, header, symbol, and compile-time macro renames may occur later in
   mechanical subsystem-sized changes with no inference or performance change.
 
 The following identifiers do not change as part of the brand migration:
@@ -61,9 +66,8 @@ both command brands. Model-format lifecycle remains governed by ADR 0003.
 
 ## Consequences
 
-- A Hebrus Studio bridge release must precede internal source renaming; its
-  visible rebrand may ship in that same bridge release once persisted identity
-  and rollback tests are green.
+- A published Hebrus Studio bridge release with green persisted-identity and
+  rollback tests must precede internal source renaming.
 - Every remaining DS4 identifier must be classified as serialized, historical,
   compatibility-owned, or erroneous; unclassified additions fail a repository
   check.
@@ -71,8 +75,27 @@ both command brands. Model-format lifecycle remains governed by ADR 0003.
   protocols, deterministic output, resolved runtime plan, and performance.
 - Existing installations, checkouts, models, caches, and application data do
   not need to be copied or rewritten for branding.
-- The GitHub repository rename happens only after the compatibility application
-  recognizes both old and new remote identities.
-- This ADR becomes Accepted only after the Hebrus identity is reserved, the
-  machine-readable capability contract is merged, the Hebrus Studio bridge is proven,
-  and the pre-rebrand release baseline is green.
+- The GitHub repository was renamed in place only after the compatibility
+  application recognized both old and new remote identities.
+
+## Acceptance evidence
+
+Technical acceptance is anchored by the machine-readable capability contract
+(`f0c8502648adb63e2d18062360cfabba393cd508`), the engine bridge merge
+(`7686f70ac0d4e0de0319a9fe30555924d6ac2b82`), and the verified in-place
+repository rename record
+(`8796cff5fec8ac8ad63c36999bd1a640e4c8b793`). The companion bridge was merged
+in [`andreaborio/hebrus-studio#11`](https://github.com/andreaborio/hebrus-studio/pull/11)
+at `dd13cb5`; its dual engine identity, persisted DSBox state, and rollback
+boundary were verified together.
+
+The pre-rebrand v0.2.0 evidence commit
+`57acfd408a3154851a0c59be432904300abb3b6c` is the historical runtime baseline
+for this decision, not the current support contract.
+
+Acceptance of this architecture does not publish an engine or application
+release. Engine release qualification, artifact checksums, and model-backed
+evidence remain governed by
+[`QA_BEFORE_RELEASES.md`](../../QA_BEFORE_RELEASES.md). Companion signing,
+notarization, stapling, and clean-machine verification belong to the Hebrus
+Studio release process and are outside this repository's authority.
