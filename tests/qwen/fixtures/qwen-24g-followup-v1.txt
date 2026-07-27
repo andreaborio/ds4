@@ -1,0 +1,2 @@
+Rispondi con una sola frase breve che confermi che il server è ancora operativo
+dopo la richiesta precedente.

@@ -15,7 +15,7 @@ and Qwen's lower-memory extension in
 | Model family | Minimum unified memory | Qualified Metal modes | Release startup |
 | --- | ---: | --- | --- |
 | DeepSeek V4 Flash | 64 GiB | AUTO resolving to resident or SSD; explicit resident and SSD according to the artifact gate | `./hebrus -m DEEPSEEK-DS4-ExpertMajor-v2.gguf` |
-| Qwen3.6-35B-A3B | 16 GiB | AUTO resolving to resident or SSD; explicit resident and SSD according to the Qwen admission gates | `./hebrus -m Qwen3.6-35B-A3B-DS4-ExpertMajor-v2-MLX-Affine4-G64.gguf` |
+| Qwen3.6-35B-A3B | 16 GiB | 16 GiB is qualified with guarded SSD. The allocation-time release candidate extends deterministic guarded SSD through 24 GiB; above 24 GiB AUTO may resolve to resident or SSD according to the Qwen admission gates | `./hebrus -m Qwen3.6-35B-A3B-DS4-ExpertMajor-v2-MLX-Affine4-G64.gguf` |
 | GLM 5.2 | 64 GiB | AUTO resolving to SSD streaming only; resident is rejected | `./hebrus -m GLM-DS4-ExpertMajor-v2.gguf --ctx 8192` |
 
 All rows require Apple Metal and a validated embedded `ds4.expert_major.v2`
@@ -27,20 +27,33 @@ rather than an additional qualified startup contract. Detailed planners and gate
 Qwen has named 16/24/32/36/48/64/96/128 GiB policy profiles, but selection uses
 the active device's exact physical RAM, `recommendedMaxWorkingSetSize`, context
 runtime, and live pressure. The current 20.81 GB MLX affine4/group-64 artifact
-necessarily uses SSD on 16 GiB. A 32 GiB host may use resident for shorter
-contexts when both gates pass and falls back to SSD otherwise. The retired
+is qualified at the established 16 GiB floor only in guarded SSD mode. The
+allocation-time hardening candidate applies the same deterministic
+SSD-only rule through 24 GiB: AUTO resolves to SSD and an explicit resident
+request is rejected on that tier. It must not be described as release-qualified
+on 24 GiB until the physical sustained Studio gate passes and the managed
+runtime pin advances. A 32 GiB host may use resident for shorter contexts when
+both gates pass and falls back to SSD otherwise. The retired
 Q4_K_S payload is rejected rather than decoded through a compatibility path.
 The named policy is unit-tested at every cut; performance claims remain limited
 to the physical hosts and exact workloads in the release evidence.
 
 Qwen SSD plans on 16 and 24 GiB are guarded tiers. They require an affirmative
 normal-pressure signal at admission and every prefill/decode phase entry,
-including entries where the configured budget is unchanged but lazy slabs can
-still populate, and cap the routed-expert cache at 3,521 experts (about
-5.80 GiB for the published artifact). This prevents a sustained decode from
-turning an optimistic warm file-cache snapshot into unsafe wired slab growth.
-A higher 24 GiB ceiling may replace it only after the complete physical
-context/cache safety matrix passes; the current support boundary is unchanged.
+including entries where the configured budget is unchanged. Immediately before
+every proposed new Metal slab, normally up to 321 experts but possibly smaller
+for the final target tail, the runtime also rechecks live reclaimable memory,
+pressure, and the device working-set ceiling. A denied allocation
+freezes the effective cache at its already allocated slab capacity and reuses
+those slots; it cannot escape through a fresh combined or per-expert buffer.
+The routed-expert target remains capped at 3,521 experts (about 5.80 GiB for
+the published artifact). A denial before the minimum route floor exists fails
+the request closed.
+
+The allocation-time amendment described above is a publication candidate, not
+yet a new physical-hardware qualification claim. The 21 GiB planner
+fixture and real-Metal fault injection prove policy mechanics. A physical
+24 GiB Mac must still pass the versioned five-request gate before release.
 
 The lower-memory extension is Qwen-specific. Hosts below 64 GiB remain outside
 the DeepSeek and GLM production contract. Do not infer support for another
@@ -53,7 +66,11 @@ runnable Qwen store is the `published`
 `dd17266185833a9f05531ce366fd7284ddca1ed64aa3dcf06e321e8c72c9ea3d`.
 `download_model.sh qwen-v2` pins immutable repository revision
 `7bf9c3f7f6136aeb2599d75ee61c0cc2f18e2b02`; its manifest requires runtime
-commit `73a332fef82a0bcdd567d17e0de17aa004cad85d` or a compatible descendant. The
+commit `73a332fef82a0bcdd567d17e0de17aa004cad85d` as its artifact-format
+compatibility floor. That field does not qualify an older descendant for the
+current hardware policy. A release runtime must also contain the current
+accepted safety fixes; the Studio/runtime pin for the 24 GiB lane must advance
+to the eventual published commit containing this allocation-time hardening. The
 older `Qwen3.6-35B-A3B-DS4-ExpertMajor-v2-Q4_K_S.gguf` store is
 `negative-only`, not a downloadable runtime fallback. The machine-readable
 [Qwen release contract](qwen-release.json) is the canonical identity record.

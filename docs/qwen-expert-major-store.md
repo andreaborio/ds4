@@ -38,17 +38,24 @@ make -j8
 Use the same model with `./hebrus-server` for the local API. The legacy
 `./ds4` and `./ds4-server` names remain aliases to the same build. Normal startup does
 not need an experimental guard, explicit Metal selection, a sidecar path,
-payload hashes, cache geometry, `--resident`, or `--ssd-streaming`. AUTO chooses
-resident mapping when the full working set fits its Metal and host-memory
-budgets; otherwise it selects the SSD expert cache. Explicit residency flags
-remain diagnostics, not release instructions.
+payload hashes, cache geometry, `--resident`, or `--ssd-streaming`. Through
+24 GiB, AUTO always selects guarded SSD streaming and an explicit resident
+request is rejected. On larger qualified hosts, AUTO chooses resident mapping
+when the full working set fits its Metal and host-memory budgets; otherwise it
+selects the SSD expert cache. Explicit residency flags remain diagnostics, not
+release instructions.
 
-When AUTO selects SSD on a 16 or 24 GiB host, the cache plan is guarded. It
+On a 16 or 24 GiB host, the AUTO SSD cache plan is guarded. It
 requires an affirmative normal-pressure signal at admission and before
 every prefill/decode phase entry, including an unchanged configured budget
-whose lazy slabs can still populate, and caps the routed cache at 3,521 experts
-(about 5.80 GiB for this artifact). This is intentionally below the byte target
-that a warm 24 GiB snapshot could otherwise expose during a long decode.
+whose lazy slabs can still populate, and caps the routed target at 3,521
+experts (about 5.80 GiB for this artifact). Before each proposed new slab (up
+to 321 experts; the final target tail can be smaller), a fresh snapshot must
+also admit the exact allocation. Denial freezes the cache
+at the slab capacity already allocated and forces eviction/reuse; no fresh
+combined or per-expert allocation can bypass it. This is intentionally below
+the byte target that a warm 24 GiB snapshot could otherwise expose during a
+long decode.
 
 In resident mode each complete expert-major layer is exposed as a read-only
 Metal buffer with the manifest record size as its expert stride. Only
@@ -120,9 +127,12 @@ not contain a second copy of the routed weights.
 
 These exact bytes and their matching manifest are published at immutable
 repository revision `7bf9c3f7f6136aeb2599d75ee61c0cc2f18e2b02`.
-The manifest requires runtime commit
-`73a332fef82a0bcdd567d17e0de17aa004cad85d` or a compatible descendant;
-`download_model.sh qwen-v2` pins that revision and validates this relationship.
+The manifest's `runtimeCommit`
+`73a332fef82a0bcdd567d17e0de17aa004cad85d` proves compatibility with this
+physical store format; it is not a hardware-safety floor.
+`download_model.sh qwen-v2` validates that relationship. Release builds must
+also include the current runtime policy, including the published commit that
+will carry the 2026-07-27 24 GiB allocation-time hardening.
 The older Q4_K_S object is incompatible with the current runtime contract and
 is retained only for fail-closed testing.
 

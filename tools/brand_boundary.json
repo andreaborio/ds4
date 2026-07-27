@@ -236,14 +236,14 @@
       "location": "content",
       "token": "ds4",
       "classification": "compatibility",
-      "maximum": 495
+      "maximum": 503
     },
     {
       "path": "Makefile",
       "location": "content",
       "token": "DS4",
       "classification": "compatibility",
-      "maximum": 43
+      "maximum": 44
     },
     {
       "path": "ONEDGE_IMATRIX.md",
@@ -271,7 +271,7 @@
       "location": "content",
       "token": "DS4",
       "classification": "compatibility",
-      "maximum": 12
+      "maximum": 13
     },
     {
       "path": "README.md",
@@ -628,7 +628,14 @@
       "location": "content",
       "token": "ds4",
       "classification": "historical-attribution",
-      "maximum": 1
+      "maximum": 3
+    },
+    {
+      "path": "docs/benchmarks/2026-07-24-qwen-24g-cache-guard.md",
+      "location": "content",
+      "token": "DS4",
+      "classification": "compatibility",
+      "maximum": 4
     },
     {
       "path": "docs/benchmarks/README.md",
@@ -824,14 +831,14 @@
       "location": "content",
       "token": "ds4",
       "classification": "migration-pending",
-      "maximum": 5237
+      "maximum": 5252
     },
     {
       "path": "ds4.c",
       "location": "content",
       "token": "DS4",
       "classification": "migration-pending",
-      "maximum": 4473
+      "maximum": 4482
     },
     {
       "path": "ds4.h",
@@ -1013,7 +1020,7 @@
       "location": "content",
       "token": "ds4",
       "classification": "migration-pending",
-      "maximum": 726
+      "maximum": 727
     },
     {
       "path": "ds4_gpu.h",
@@ -1118,14 +1125,14 @@
       "location": "content",
       "token": "ds4",
       "classification": "migration-pending",
-      "maximum": 6662
+      "maximum": 6704
     },
     {
       "path": "ds4_metal.m",
       "location": "content",
       "token": "DS4",
       "classification": "migration-pending",
-      "maximum": 1070
+      "maximum": 1103
     },
     {
       "path": "ds4_profile.c",
@@ -1363,14 +1370,14 @@
       "location": "content",
       "token": "ds4",
       "classification": "migration-pending",
-      "maximum": 74
+      "maximum": 81
     },
     {
       "path": "ds4_ssd.c",
       "location": "content",
       "token": "DS4",
       "classification": "migration-pending",
-      "maximum": 84
+      "maximum": 97
     },
     {
       "path": "ds4_ssd.h",
@@ -1384,14 +1391,14 @@
       "location": "content",
       "token": "ds4",
       "classification": "migration-pending",
-      "maximum": 76
+      "maximum": 83
     },
     {
       "path": "ds4_ssd.h",
       "location": "content",
       "token": "DS4",
       "classification": "migration-pending",
-      "maximum": 17
+      "maximum": 18
     },
     {
       "path": "ds4_streaming_hotlist.inc",
@@ -2070,7 +2077,7 @@
       "location": "content",
       "token": "ds4",
       "classification": "migration-pending",
-      "maximum": 812
+      "maximum": 846
     },
     {
       "path": "tests/ds4_test.c",
@@ -2175,7 +2182,7 @@
       "location": "content",
       "token": "DS4",
       "classification": "migration-pending",
-      "maximum": 3
+      "maximum": 4
     },
     {
       "path": "tests/qwen/UNICODE_DATA_PROVENANCE.md",
@@ -2588,14 +2595,14 @@
       "location": "content",
       "token": "ds4",
       "classification": "migration-pending",
-      "maximum": 244
+      "maximum": 268
     },
     {
       "path": "tests/test_ssd_residency.c",
       "location": "content",
       "token": "DS4",
       "classification": "migration-pending",
-      "maximum": 53
+      "maximum": 70
     },
     {
       "path": "tests/test_visible_identity.c",

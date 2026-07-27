@@ -59,6 +59,9 @@ int main(void) {
     assert(strcmp(ds4_residency_reason_name(
                       DS4_RESIDENCY_REASON_MODEL_REQUIRES_SSD),
                   "the model family is qualified only for SSD streaming") == 0);
+    assert(strcmp(ds4_residency_reason_name(
+                      DS4_RESIDENCY_REASON_HARDWARE_REQUIRES_SSD),
+                  "this hardware tier is qualified only for SSD streaming") == 0);
 
     /* GLM ExpertMajor v2 applies this policy after the generic planner has
      * populated its memory accounting. AUTO is deterministic even when a
@@ -738,6 +741,33 @@ int main(void) {
     assert(ds4_ssd_qwen_guarded_cache_policy(16 * GIB));
     assert(ds4_ssd_qwen_guarded_cache_policy(24 * GIB));
     assert(!ds4_ssd_qwen_guarded_cache_policy(24 * GIB + 1u));
+    ds4_residency_plan qwen_guarded_residency = {
+        .requested = DS4_RESIDENCY_AUTO,
+        .resolved = DS4_RESIDENCY_RESIDENT,
+        .reason = DS4_RESIDENCY_REASON_METAL_FITS,
+    };
+    assert(ds4_residency_plan_apply_qwen_guarded_ssd_only(
+        21 * GIB, DS4_RESIDENCY_AUTO, &qwen_guarded_residency));
+    assert(qwen_guarded_residency.requested == DS4_RESIDENCY_AUTO);
+    assert(qwen_guarded_residency.resolved == DS4_RESIDENCY_SSD);
+    assert(qwen_guarded_residency.reason ==
+           DS4_RESIDENCY_REASON_HARDWARE_REQUIRES_SSD);
+    assert(!ds4_residency_plan_apply_qwen_guarded_ssd_only(
+        24 * GIB, DS4_RESIDENCY_RESIDENT, &qwen_guarded_residency));
+    qwen_guarded_residency.resolved = DS4_RESIDENCY_RESIDENT;
+    qwen_guarded_residency.reason = DS4_RESIDENCY_REASON_METAL_FITS;
+    assert(ds4_residency_plan_apply_qwen_guarded_ssd_only(
+        24 * GIB + 1u, DS4_RESIDENCY_AUTO, &qwen_guarded_residency));
+    assert(qwen_guarded_residency.resolved == DS4_RESIDENCY_RESIDENT);
+    assert(qwen_guarded_residency.reason ==
+           DS4_RESIDENCY_REASON_METAL_FITS);
+    assert(!ds4_residency_plan_apply_qwen_guarded_ssd_only(
+        0, DS4_RESIDENCY_AUTO, &qwen_guarded_residency));
+    assert(!ds4_residency_plan_apply_qwen_guarded_ssd_only(
+        21 * GIB, (ds4_residency_mode)(DS4_RESIDENCY_SSD + 1),
+        &qwen_guarded_residency));
+    assert(!ds4_residency_plan_apply_qwen_guarded_ssd_only(
+        21 * GIB, DS4_RESIDENCY_AUTO, NULL));
     const bool qwen_16g_guarded =
         ds4_ssd_qwen_guarded_cache_policy(16 * GIB);
     const bool qwen_32g_guarded =
@@ -754,6 +784,120 @@ int main(void) {
         assert(ds4_ssd_qwen_phase_pressure_allowed(
             qwen_32g_guarded, changed != 0, false, false, false));
     }
+
+    /* A synthetic 21 GiB host exercises the 24 GiB containing profile without
+     * pretending that process limits reproduce physical unified memory. The
+     * incremental guard charges one proposed 321-expert slab against live host
+     * headroom and reconstructs the complete fixed Metal envelope. */
+    const uint64_t qwen_slab_bytes =
+        UINT64_C(321) * qwen_expert_bytes;
+    ds4_ssd_host_memory qwen_21g_memory = {
+        .physical_bytes = 21 * GIB,
+        .recommended_bytes = 16 * GIB,
+        .free_bytes = 6 * GIB,
+        .purgeable_bytes = 2 * GIB,
+        .inactive_bytes = 3 * GIB,
+        .file_backed_bytes = 3 * GIB,
+        .pressure_status_available = true,
+        .pressure_normal = true,
+    };
+    ds4_ssd_qwen_slab_growth_plan qwen_21g_growth = {0};
+    assert(ds4_ssd_qwen_guarded_cache_policy(21 * GIB));
+    assert(ds4_ssd_qwen_slab_growth_plan_make(
+        &qwen_21g_memory, 2 * GIB, 5 * GIB / 2u, 5 * GIB,
+        qwen_slab_bytes,
+        &qwen_21g_growth));
+    assert(qwen_21g_growth.pressure_normal);
+    assert(qwen_21g_growth.host_fits);
+    assert(qwen_21g_growth.platform_fits);
+    assert(qwen_21g_growth.allowed);
+    assert(qwen_21g_growth.slab_bytes == qwen_slab_bytes);
+
+    /* Equality is admitted: the guard rejects only an actual overrun. */
+    const uint64_t qwen_21g_equal_host =
+        qwen_21g_growth.host_required_bytes;
+    const uint64_t qwen_21g_equal_metal =
+        qwen_21g_growth.platform_required_bytes;
+    qwen_21g_memory.recommended_bytes = qwen_21g_equal_metal;
+    qwen_21g_memory.free_bytes = qwen_21g_equal_host;
+    qwen_21g_memory.purgeable_bytes = 0;
+    qwen_21g_memory.inactive_bytes = 0;
+    qwen_21g_memory.file_backed_bytes = 0;
+    assert(ds4_ssd_qwen_slab_growth_plan_make(
+        &qwen_21g_memory, 2 * GIB, 5 * GIB / 2u, 5 * GIB,
+        qwen_slab_bytes,
+        &qwen_21g_growth));
+    assert(qwen_21g_growth.host_required_bytes ==
+           qwen_21g_memory.free_bytes);
+    assert(qwen_21g_growth.platform_required_bytes ==
+           qwen_21g_memory.recommended_bytes);
+    assert(qwen_21g_growth.allowed);
+
+    qwen_21g_memory.recommended_bytes = 16 * GIB;
+    qwen_21g_memory.free_bytes = 6 * GIB;
+    qwen_21g_memory.purgeable_bytes = 2 * GIB;
+    qwen_21g_memory.inactive_bytes = 3 * GIB;
+    qwen_21g_memory.file_backed_bytes = 3 * GIB;
+    qwen_21g_memory.pressure_normal = false;
+    assert(ds4_ssd_qwen_slab_growth_plan_make(
+        &qwen_21g_memory, 2 * GIB, 5 * GIB / 2u, 5 * GIB,
+        qwen_slab_bytes,
+        &qwen_21g_growth));
+    assert(!qwen_21g_growth.allowed);
+    qwen_21g_memory.pressure_status_available = false;
+    qwen_21g_memory.pressure_normal = true;
+    assert(ds4_ssd_qwen_slab_growth_plan_make(
+        &qwen_21g_memory, 2 * GIB, 5 * GIB / 2u, 5 * GIB,
+        qwen_slab_bytes,
+        &qwen_21g_growth));
+    assert(!qwen_21g_growth.allowed);
+
+    qwen_21g_memory.pressure_status_available = true;
+    qwen_21g_memory.free_bytes = 2 * GIB;
+    qwen_21g_memory.purgeable_bytes = 0;
+    qwen_21g_memory.inactive_bytes = 0;
+    qwen_21g_memory.file_backed_bytes = 0;
+    assert(ds4_ssd_qwen_slab_growth_plan_make(
+        &qwen_21g_memory, 2 * GIB, 5 * GIB / 2u, 5 * GIB,
+        qwen_slab_bytes,
+        &qwen_21g_growth));
+    assert(!qwen_21g_growth.host_fits);
+    assert(!qwen_21g_growth.allowed);
+
+    qwen_21g_memory.free_bytes = 6 * GIB;
+    qwen_21g_memory.recommended_bytes = 10 * GIB;
+    assert(ds4_ssd_qwen_slab_growth_plan_make(
+        &qwen_21g_memory, 2 * GIB, 5 * GIB / 2u, 5 * GIB,
+        qwen_slab_bytes,
+        &qwen_21g_growth));
+    assert(qwen_21g_growth.host_fits);
+    assert(!qwen_21g_growth.platform_fits);
+    assert(!qwen_21g_growth.allowed);
+
+    qwen_21g_memory.recommended_bytes = UINT64_MAX;
+    assert(ds4_ssd_qwen_slab_growth_plan_make(
+        &qwen_21g_memory, UINT64_MAX, 5 * GIB / 2u, 5 * GIB,
+        qwen_slab_bytes,
+        &qwen_21g_growth));
+    assert(qwen_21g_growth.platform_required_bytes == UINT64_MAX);
+    assert(!qwen_21g_growth.platform_fits);
+    assert(!qwen_21g_growth.allowed);
+    assert(!ds4_ssd_qwen_slab_growth_plan_make(
+        NULL, 2 * GIB, 5 * GIB / 2u, 5 * GIB, qwen_slab_bytes,
+        &qwen_21g_growth));
+    assert(!ds4_ssd_qwen_slab_growth_plan_make(
+        &qwen_21g_memory, 0, 5 * GIB / 2u, 5 * GIB,
+        qwen_slab_bytes, &qwen_21g_growth));
+    assert(!ds4_ssd_qwen_slab_growth_plan_make(
+        &qwen_21g_memory, 2 * GIB, 0, 5 * GIB,
+        qwen_slab_bytes, &qwen_21g_growth));
+    assert(!ds4_ssd_qwen_slab_growth_plan_make(
+        &qwen_21g_memory, 2 * GIB, 5 * GIB / 2u, 5 * GIB,
+        0, &qwen_21g_growth));
+    assert(!ds4_ssd_qwen_slab_growth_plan_make(
+        &qwen_21g_memory, 2 * GIB, 5 * GIB / 2u, 5 * GIB,
+        qwen_slab_bytes, NULL));
+
     assert(!ds4_ssd_static_pin_host_supported(0));
     assert(!ds4_ssd_static_pin_host_supported(16 * GIB));
     assert(!ds4_ssd_static_pin_host_supported(64 * GIB - 1u));

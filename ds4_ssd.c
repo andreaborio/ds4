@@ -46,6 +46,8 @@ const char *ds4_residency_reason_name(ds4_residency_reason reason) {
         return "Metal recommended working-set budget is unavailable";
     case DS4_RESIDENCY_REASON_MODEL_REQUIRES_SSD:
         return "the model family is qualified only for SSD streaming";
+    case DS4_RESIDENCY_REASON_HARDWARE_REQUIRES_SSD:
+        return "this hardware tier is qualified only for SSD streaming";
     case DS4_RESIDENCY_REASON_INSPECT_ONLY:
         return "model inspection defers runtime residency selection";
     }
@@ -354,6 +356,25 @@ bool ds4_ssd_qwen_guarded_cache_policy(uint64_t physical_bytes) {
     return physical_bytes != 0 && physical_bytes <= 24u * DS4_GIB;
 }
 
+bool ds4_residency_plan_apply_qwen_guarded_ssd_only(
+        uint64_t             physical_bytes,
+        ds4_residency_mode   requested,
+        ds4_residency_plan  *plan) {
+    if (!plan || physical_bytes == 0 ||
+        requested < DS4_RESIDENCY_AUTO ||
+        requested > DS4_RESIDENCY_SSD) {
+        return false;
+    }
+    plan->requested = requested;
+    if (!ds4_ssd_qwen_guarded_cache_policy(physical_bytes)) return true;
+    if (requested == DS4_RESIDENCY_RESIDENT) return false;
+    if (requested == DS4_RESIDENCY_AUTO) {
+        plan->resolved = DS4_RESIDENCY_SSD;
+        plan->reason = DS4_RESIDENCY_REASON_HARDWARE_REQUIRES_SSD;
+    }
+    return true;
+}
+
 bool ds4_ssd_qwen_phase_pressure_allowed(
         bool guarded,
         bool cache_budget_changed,
@@ -365,6 +386,86 @@ bool ds4_ssd_qwen_phase_pressure_allowed(
            (snapshot_available &&
             pressure_status_available &&
             pressure_normal);
+}
+
+bool ds4_ssd_qwen_slab_growth_plan_make(
+        const ds4_ssd_host_memory     *memory,
+        uint64_t                       runtime_bytes,
+        uint64_t                       static_page_bytes,
+        uint64_t                       current_cache_capacity_bytes,
+        uint64_t                       slab_bytes,
+        ds4_ssd_qwen_slab_growth_plan *out) {
+    if (!out) return false;
+    memset(out, 0, sizeof(*out));
+    if (!memory ||
+        memory->physical_bytes == 0 ||
+        memory->recommended_bytes == 0 ||
+        runtime_bytes == 0 ||
+        slab_bytes == 0 ||
+        static_page_bytes == 0) {
+        return false;
+    }
+
+    out->slab_bytes = slab_bytes;
+    out->static_page_bytes = static_page_bytes;
+    out->runtime_bytes = runtime_bytes;
+    out->current_cache_capacity_bytes = current_cache_capacity_bytes;
+    out->recommended_bytes = memory->recommended_bytes;
+    out->pressure_normal =
+        memory->pressure_status_available && memory->pressure_normal;
+
+    const uint64_t file_inactive_bytes =
+        memory->inactive_bytes < memory->file_backed_bytes ?
+            memory->inactive_bytes : memory->file_backed_bytes;
+    const uint64_t reclaimable_working_set =
+        memory->purgeable_bytes > file_inactive_bytes ?
+            memory->purgeable_bytes : file_inactive_bytes;
+    out->reclaimable_bytes =
+        saturating_add_u64(memory->free_bytes, reclaimable_working_set);
+    if (out->reclaimable_bytes > memory->physical_bytes) {
+        out->reclaimable_bytes = memory->physical_bytes;
+    }
+
+    uint64_t ordinary_headroom = memory->physical_bytes / 16u;
+    if (ordinary_headroom < 2u * DS4_GIB) {
+        ordinary_headroom = 2u * DS4_GIB;
+    }
+    uint64_t pressure_margin = memory->physical_bytes / 64u;
+    if (pressure_margin < DS4_GIB / 4u) {
+        pressure_margin = DS4_GIB / 4u;
+    }
+    out->host_reserve_bytes =
+        saturating_add_u64(ordinary_headroom, pressure_margin);
+    if (out->host_reserve_bytes < static_page_bytes) {
+        out->host_reserve_bytes = static_page_bytes;
+    }
+    out->host_required_bytes =
+        saturating_add_u64(out->host_reserve_bytes, slab_bytes);
+    out->host_fits =
+        out->host_required_bytes != UINT64_MAX &&
+        out->host_required_bytes <= out->reclaimable_bytes;
+
+    out->platform_headroom_bytes = memory->physical_bytes / 8u;
+    if (out->platform_headroom_bytes < 2u * DS4_GIB) {
+        out->platform_headroom_bytes = 2u * DS4_GIB;
+    }
+    if (out->platform_headroom_bytes < static_page_bytes) {
+        out->platform_headroom_bytes = static_page_bytes;
+    }
+    out->platform_required_bytes =
+        saturating_add_u64(runtime_bytes, out->platform_headroom_bytes);
+    out->platform_required_bytes =
+        saturating_add_u64(out->platform_required_bytes,
+                           current_cache_capacity_bytes);
+    out->platform_required_bytes =
+        saturating_add_u64(out->platform_required_bytes, slab_bytes);
+    out->platform_fits =
+        out->platform_required_bytes != UINT64_MAX &&
+        out->platform_required_bytes <= memory->recommended_bytes;
+
+    out->allowed =
+        out->pressure_normal && out->host_fits && out->platform_fits;
+    return true;
 }
 
 bool ds4_ssd_resident_pressure_plan_make(

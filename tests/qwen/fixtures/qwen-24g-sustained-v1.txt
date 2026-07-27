@@ -1,0 +1,8 @@
+Produci una lista numerata di 2000 micro-note autonome per preparare e
+documentare un lungo viaggio di ricerca nei Balcani. Ogni elemento deve
+contenere una sola frase completa, concreta e diversa dalle precedenti. Usa il
+formato esatto "0001. testo", "0002. testo" e così via. Non inserire titoli,
+introduzioni, riepiloghi o conclusioni e non interrompere volontariamente la
+lista prima dell'elemento 2000. Se un tema si esaurisce, continua con logistica,
+storia, architettura, lingua, cucina, geografia, etica della memoria,
+fotografia, trasporti e gestione degli appunti.

@@ -38317,9 +38317,45 @@ static bool ds4_engine_resolve_residency(ds4_engine               *e,
                 DS4_RESIDENCY_SSD : DS4_RESIDENCY_RESIDENT;
             e->residency_plan.reason = DS4_RESIDENCY_REASON_INSPECT_ONLY;
         }
+        bool qwen_inspect_policy_resolved = false;
+#ifndef DS4_NO_GPU
+        const bool qwen_metal_inspection =
+            e->backend == DS4_BACKEND_METAL &&
+            e->model.family == DS4_MODEL_FAMILY_QWEN35_MOE;
+        if (qwen_metal_inspection &&
+            e->residency_requested != DS4_RESIDENCY_SSD) {
+            ds4_ssd_host_memory qwen_inspect_memory = {0};
+            if (!ds4_gpu_host_memory_snapshot(&qwen_inspect_memory)) {
+                if (e->residency_requested == DS4_RESIDENCY_RESIDENT) {
+                    fprintf(stderr,
+                            "ds4: refusing explicit Qwen resident mode "
+                            "without a host-memory snapshot\n");
+                    return false;
+                }
+                e->residency_plan.resolved = DS4_RESIDENCY_SSD;
+                e->residency_plan.reason =
+                    DS4_RESIDENCY_REASON_METAL_CURRENT_PRESSURE;
+                qwen_inspect_policy_resolved = true;
+            } else if (ds4_ssd_qwen_guarded_cache_policy(
+                           qwen_inspect_memory.physical_bytes)) {
+                if (!ds4_residency_plan_apply_qwen_guarded_ssd_only(
+                        qwen_inspect_memory.physical_bytes,
+                        e->residency_requested,
+                        &e->residency_plan)) {
+                    fprintf(stderr,
+                            "ds4: refusing explicit Qwen resident mode: "
+                            "hosts at or below 24 GiB are qualified only "
+                            "for guarded SSD streaming\n");
+                    return false;
+                }
+                qwen_inspect_policy_resolved = true;
+            }
+        }
+#endif
         e->residency = e->residency_plan.resolved;
         e->ssd_streaming = e->residency == DS4_RESIDENCY_SSD;
-        if (glm_expert_major_v2_ssd_only) {
+        if (glm_expert_major_v2_ssd_only ||
+            qwen_inspect_policy_resolved) {
             fprintf(stderr,
                     "ds4: residency requested=%s resolved=%s: %s\n",
                     ds4_residency_mode_name(e->residency_requested),
@@ -38412,6 +38448,24 @@ static bool ds4_engine_resolve_residency(ds4_engine               *e,
     qwen_hardware_policy_available =
         ds4_engine_apply_qwen35_metal_hardware_policy(
             e, &qwen_residency_memory);
+
+    const bool qwen_guarded_ssd_only =
+        e->backend == DS4_BACKEND_METAL &&
+        e->model.family == DS4_MODEL_FAMILY_QWEN35_MOE &&
+        qwen_hardware_policy_available &&
+        ds4_ssd_qwen_guarded_cache_policy(
+            qwen_residency_memory.physical_bytes);
+    if (qwen_guarded_ssd_only &&
+        !ds4_residency_plan_apply_qwen_guarded_ssd_only(
+            qwen_residency_memory.physical_bytes,
+            e->residency_requested,
+            &e->residency_plan)) {
+        fprintf(stderr,
+                "ds4: refusing explicit Qwen resident mode: hosts at or "
+                "below 24 GiB are qualified only for guarded SSD "
+                "streaming\n");
+        return false;
+    }
 #endif
 
     if (glm_expert_major_v2_ssd_only &&
@@ -38425,6 +38479,7 @@ static bool ds4_engine_resolve_residency(ds4_engine               *e,
 #ifndef DS4_NO_GPU
     if (e->backend == DS4_BACKEND_METAL &&
         e->model.family == DS4_MODEL_FAMILY_QWEN35_MOE &&
+        !qwen_guarded_ssd_only &&
         e->residency_requested != DS4_RESIDENCY_SSD) {
         const bool fixed_budget_fits =
             e->residency_plan.recommended_bytes != 0 &&
@@ -39278,6 +39333,23 @@ static bool ds4_engine_configure_qwen35_metal_streaming(ds4_engine *e) {
     ds4_gpu_set_streaming_expert_cache_slab_target_bytes(
         geometry.minimum_cache_bytes);
     ds4_gpu_set_streaming_expert_cache_budget(initial_cache_experts);
+    uint64_t growth_runtime_bytes = e->residency_plan.runtime_bytes;
+    const uint64_t growth_workspace_bytes =
+        e->qwen35_prefill_workspace_bytes >
+                e->qwen35_decode_workspace_bytes ?
+            e->qwen35_prefill_workspace_bytes :
+            e->qwen35_decode_workspace_bytes;
+    if (!qwen35_u64_add(growth_runtime_bytes,
+                        growth_workspace_bytes,
+                        &growth_runtime_bytes)) {
+        fprintf(stderr,
+                "ds4: Qwen SSD slab-growth runtime accounting overflowed\n");
+        return false;
+    }
+    ds4_gpu_set_streaming_expert_cache_growth_guard(
+        e->qwen35_pressure_gate_required,
+        growth_runtime_bytes,
+        static_page_coverage_bytes);
     if (!ds4_gpu_set_model_fd(e->model.fd)) {
         fprintf(stderr,
                 "ds4: Qwen SSD streaming failed to install the GGUF file descriptor\n");
@@ -39343,7 +39415,8 @@ static bool ds4_engine_configure_qwen35_metal_streaming(ds4_engine *e) {
             "decode cap %u), macro %u tokens / %.2f MiB total prefill "
             "phase workspace, model "
             "slab target %" PRIu64 " experts (%.2f GiB; "
-            "DS4_METAL_STREAMING_EXPERT_SLAB_MB overrides when set)\n",
+            "DS4_METAL_STREAMING_EXPERT_SLAB_MB overrides only outside "
+            "guarded tiers)\n",
             (double)static_payload_bytes / 1073741824.0,
             (double)static_page_coverage_bytes / 1073741824.0,
             exact_span_count,
@@ -39412,6 +39485,7 @@ static bool ds4_engine_configure_qwen35_metal_resident(
     ds4_gpu_set_streaming_expert_cache_required_floor(0);
     ds4_gpu_set_streaming_expert_cache_expert_bytes(0);
     ds4_gpu_set_streaming_expert_cache_slab_target_bytes(0);
+    ds4_gpu_set_streaming_expert_cache_growth_guard(false, 0, 0);
     (void)ds4_gpu_set_model_fd(-1);
     if (!e->model.native_expert_store_v2) {
         fprintf(stderr,
@@ -39663,6 +39737,10 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
     if (e->model.family == DS4_MODEL_FAMILY_QWEN35_MOE) {
         qwen35_weights_bind(&e->qwen35_weights, &e->model);
         if (opt->inspect_only) {
+            if (!ds4_engine_resolve_residency(e, opt)) {
+                ds4_engine_close(e);
+                return 1;
+            }
             *out = e;
             return 0;
         }
@@ -41306,24 +41384,41 @@ static int ds4_session_qwen35_metal_finish_prefill_cache(
         }
         return 1;
     }
+    const uint32_t effective =
+        ds4_gpu_stream_expert_cache_configured_count();
+    if (effective < current) {
+        if (errlen) {
+            snprintf(err, errlen,
+                     "Qwen SSD cache growth reduced its safe capacity");
+        }
+        return 1;
+    }
+    const bool effective_changed = effective > current;
     if (report_phase_budget) {
         qwen35_telemetry_emit(
             s->engine, "phase_budget",
-            "\"phase\":\"decode\",\"from_experts\":%u,"
-            "\"to_experts\":%u,\"changed\":true",
-            current, target);
+                "\"phase\":\"decode\",\"from_experts\":%u,"
+                "\"requested_experts\":%u,\"to_experts\":%u,"
+                "\"changed\":%s,\"growth_capped\":%s",
+                current, target, effective,
+                effective_changed ? "true" : "false",
+                effective < target ? "true" : "false");
     }
     qwen35_telemetry_emit(
         s->engine, "cache_phase",
-        "\"phase\":\"decode\",\"from_experts\":%u,"
-        "\"to_experts\":%u",
-        current, target);
+            "\"phase\":\"decode\",\"from_experts\":%u,"
+            "\"requested_experts\":%u,\"to_experts\":%u,"
+            "\"growth_capped\":%s",
+            current, target, effective,
+            effective < target ? "true" : "false");
     if (getenv("DS4_METAL_MEMORY_REPORT") != NULL) {
         fprintf(stderr,
-                "ds4: Qwen SSD cache budget grew in-place from %u to %u "
-                "experts after prefill\n",
+                "ds4: Qwen SSD cache budget changed in-place from %u to %u "
+                "experts after prefill (requested %u%s)\n",
                 current,
-                target);
+                effective,
+                target,
+                effective < target ? ", guarded growth cap active" : "");
     }
     return 0;
 }

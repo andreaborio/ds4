@@ -2,7 +2,7 @@
 
 - Status: Accepted
 - Date: 2026-07-21
-- Amended: 2026-07-24
+- Amended: 2026-07-24, 2026-07-27
 
 ## Context
 
@@ -53,12 +53,16 @@ AUTO selects resident only when both independent gates pass:
    plan.
 
 An explicit resident request also requires both gates. Failure selects bounded
-SSD streaming for AUTO and rejects an explicit resident request. The current
-19.37 GiB routed tensor payload alone exceeds 16 GiB, so that profile
-necessarily uses SSD. A 24 GiB device is decided from its actual Metal
-working-set report rather than an assumed ratio. The 32 GiB profile may use
-resident for shorter contexts when current pressure allows it and falls back
-to SSD otherwise.
+SSD streaming for AUTO and rejects an explicit resident request. In addition,
+the allocation-time release candidate is deterministic through 24 GiB: AUTO selects
+guarded SSD streaming and an explicit resident request is rejected. The current
+19.37 GiB routed payload leaves too little robust room for the context,
+recurrent state, transient workspaces, and ordinary host use at that tier.
+The established 16 GiB floor remains qualified; the allocation-time amendment
+must pass the physical 24 GiB gate and advance the Studio runtime pin before
+that tier is release-qualified.
+The 32 GiB profile may use resident for shorter contexts when current pressure
+allows it and falls back to SSD otherwise.
 
 For Qwen SSD streaming, pageable static weights share the larger ordinary
 headroom envelope but remain fully charged. While macOS reports normal pressure,
@@ -69,7 +73,14 @@ guarded 16 and 24 GiB SSD profiles additionally require an affirmative
 normal-pressure signal at admission and every phase entry, including an
 unchanged configured budget whose lazy slabs can still populate. The result is
 capped independently by live reclaimable memory and Metal's recommended working
-set, then rounded down to complete `1 + 320*k` routing cycles. The
+set, then rounded down to complete `1 + 320*k` routing cycles. Immediately
+before allocating each proposed new Metal slab (up to 321 experts; the final
+target tail can be smaller), the backend takes another host snapshot and admits
+the exact proposed bytes against both limits. A denial
+sets a monotonic cap at the already allocated slab capacity; subsequent misses
+evict and reuse those slots instead of allocating a combined, per-component, or
+mmap-backed fallback. If no minimum route slab exists, the operation fails
+closed. The
 guarded profiles have a ceiling of eleven cycles plus the in-flight slot: 3,521
 experts for this 40-layer, top-8 model, about 5.80 GiB for the qualified
 artifact. On 16 GiB this retains the measured zero-swap tier and rejects the
@@ -81,13 +92,19 @@ treat compact MLX affine4/group-64 storage as F32.
 
 ## Consequences
 
-- AUTO adapts to RAM, context length, Metal's device-specific working-set
-  recommendation, and current memory pressure instead of selecting by RAM
-  label alone.
+- Above 24 GiB, AUTO resident selection adapts to RAM, context length, Metal's
+  device-specific working-set recommendation, and current memory pressure.
+  SSD cache sizing remains continuous inside every profile. The 16/24 GiB
+  release boundary is deliberately deterministic.
 - A larger nominal memory profile cannot receive a smaller cache solely because
   its GGUF pages are warm rather than cold.
 - Resident is a complete mapped-tensor execution mode, not proof that every
   mmap page remains physically resident after later system pressure changes.
+- The deterministic 16/24 GiB SSD-only boundary avoids making release behavior
+  depend on a temporarily optimistic point-in-time resident snapshot.
+- Synthetic 21 GiB planner fixtures and Metal allocation fault injection test
+  the boundary and fallback prohibition. They do not replace physical 24 GiB
+  pressure, swap, sustained-decode, and throughput qualification.
 - The named profile matrix is policy-tested on every cut. Performance claims
   remain tied to the exact physical hosts recorded in benchmark evidence.
 - Physical 16/32/64 GiB validation and the retained split-K controls are

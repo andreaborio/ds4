@@ -255,23 +255,29 @@ Start with AUTO residency and the automatic cache budget:
 ./hebrus -m /absolute/path/to/QUALIFIED-DEEPSEEK-OR-QWEN-DS4-ExpertMajor-v2.gguf
 ```
 
-For DeepSeek and Qwen qualification, use `--ssd-streaming` to force streaming
-or `--resident` to request the full-model mapped mode. Startup logs report the
+For DeepSeek, and for Qwen above 24 GiB, qualification may use
+`--ssd-streaming` to force streaming or `--resident` to request the full-model
+mapped mode. Qwen through 24 GiB rejects resident mode. Startup logs report the
 resolved mode and memory-plan reason. GLM release startup remains flag-free
 AUTO; `--resident` is rejected and explicit SSD/cache controls are diagnostics,
 not alternate startup instructions.
 
 The supported `qwen35moe` release contract is the normalized
 Qwen3.6-35B-A3B ExpertMajor v2 MLX affine4/group-64 artifact. It remains a
-single GGUF with the standard v2 container and activates automatically in both
-resident and SSD modes. The former v2 GGML/Q4 payload is rejected. AUTO requires both the
+single GGUF with the standard v2 container and activates automatically. The
+former v2 GGML/Q4 payload is rejected. Through 24 GiB, AUTO selects guarded SSD
+and an explicit resident request fails. On larger hosts AUTO requires both the
 normal working-set calculation and a live unified-memory pressure snapshot; if
 either cannot admit resident mode, it uses bounded SSD streaming. Qwen's cache
 planner charges its complete non-routed page set separately and grows cache
-storage in 321-expert (about 0.529 GiB) slabs. Its 16 and 24 GiB SSD tiers
+storage in slabs of up to 321 experts (about 0.529 GiB at the full target; the
+final target tail can be smaller). Its 16 and 24 GiB SSD tiers
 require an affirmative normal-pressure signal at admission and every phase
 entry, including an unchanged configured budget because lazy slabs can still
-populate, and stop at 3,521 experts (about 5.80 GiB for the published artifact).
+populate, and stop at a 3,521-expert target (about 5.80 GiB for the published
+artifact). Immediately before each new slab, a fresh snapshot admits the exact
+bytes against host and Metal limits. Denial freezes at allocated slab capacity
+and forces eviction/reuse without allocating a fresh fallback buffer.
 The DeepSeek resident/SSD planner and GLM SSD-only planner remain independent.
 Exact artifact and validation details live in
 [`qwen-expert-major-store.md`](qwen-expert-major-store.md) and the consolidated
@@ -280,9 +286,8 @@ Exact artifact and validation details live in
 Qwen numerical inference is currently Metal-only. AUTO exposes named
 16/24/32/36/48/64/96/128 GiB profiles but sizes resident headroom and SSD cache
 from exact physical RAM, Metal's reported working-set limit, context runtime,
-and current pressure. The 16 GiB profile is necessarily SSD for the current
-19.37 GiB tensor payload; 32 GiB can be resident for shorter contexts when both
-admission gates pass. The CPU performs tokenizer,
+and current pressure. The 16 and 24 GiB profiles are SSD-only; 32 GiB can be
+resident for shorter contexts when both admission gates pass. The CPU performs tokenizer,
 sampling, selected-route readback, cache bookkeeping, and GGUF I/O in streamed
 mode; there is no CPU/GPU split of neural layers or routed experts.  Resident
 mode disables DS4's expert-cache `pread`, but Metal's residency request remains

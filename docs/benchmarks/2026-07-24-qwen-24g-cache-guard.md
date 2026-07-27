@@ -1,17 +1,27 @@
 # Qwen 24 GiB sustained-decode cache guard — 2026-07-24
 
-Status: safety fix implemented; physical M5 24 GiB confirmation pending.
+Status: publication safety candidate implemented and model-free verified;
+physical M5 24 GiB confirmation and managed-runtime pin advance pending.
 
-Decision: treat Qwen SSD plans through 24 GiB as guarded. Require affirmative
-normal memory pressure at admission and every prefill/decode phase entry,
-including an unchanged configured budget whose lazy slabs can still populate,
-and cap the routed-expert cache at 3,521 experts. This is a correctness and
+Decision candidate: Qwen through 24 GiB must use guarded SSD mode. AUTO resolves
+to SSD and an explicit resident request is rejected. The established 16 GiB
+floor remains qualified; this 24 GiB allocation-time amendment remains
+unreleased and requires the physical gate and Studio runtime-pin advance
+before release.
+Require
+affirmative normal memory pressure at admission and every prefill/decode phase
+entry, including an unchanged configured budget whose lazy slabs can still
+populate. Before every proposed new slab (up to 321 experts; the final target
+tail may be smaller), admit its exact bytes against a fresh host-pressure
+snapshot and the Metal working-set ceiling. Denial freezes
+the cache at already allocated slab capacity and forces eviction/reuse. The
+planned routed-expert ceiling remains 3,521 experts. This is a correctness and
 safety change, not a throughput claim.
 
-Supersedes only the uncapped 24 GiB SSD-cache portion of
-`2026-07-21-qwen-split-k-hardware-policy.md`. The named hardware profiles,
-resident admission formula, 16/32/64 GiB evidence, and split-K results remain
-unchanged.
+Supersedes the uncapped 24 GiB SSD-cache portion and the 24 GiB resident-mode
+eligibility in `2026-07-21-qwen-split-k-hardware-policy.md`. The resident
+reserve formula itself, named hardware profiles, 16/32/64 GiB evidence, and
+split-K results remain unchanged.
 
 ## Reported incident
 
@@ -46,11 +56,51 @@ arithmetic; it is not hardware throughput evidence.
 | Policy identity | Cache experts | Cache bytes | Delta vs pre-fix `main` | Delta vs previous |
 | --- | ---: | ---: | ---: | ---: |
 | `main` `d61a6d73f5c38e92e433beb9e404d06d79b153b1`, uncapped 24 GiB calculation | 8,641 | 14.24 GiB | baseline | N/A |
-| working-tree guard, 16/24 GiB ceiling | 3,521 | 5.80 GiB | -59.3% experts; -8.44 GiB | -59.3% experts; -8.44 GiB |
+| working-tree guard, 16/24 GiB target ceiling | 3,521 | 5.80 GiB | -59.3% experts; -8.44 GiB | -59.3% experts; -8.44 GiB |
 
 The cap is expressed as eleven complete 320-expert routing cycles plus the
 in-flight slot. Byte admission still uses the artifact's exact per-expert size.
 Hosts above 24 GiB retain the continuous byte planner.
+
+## 2026-07-27 allocation-time hardening
+
+The phase-entry gate alone could not prove that memory was still safe at the
+later instant when a lazy slab became real Metal storage. The hardened path
+therefore separates the requested cache target from a monotonic effective
+growth cap:
+
+1. AUTO cannot enter resident mode through 24 GiB, even if a transient
+   point-in-time snapshot appears optimistic.
+2. Every new slab is charged as exact bytes against live reclaimable memory,
+   affirmative normal pressure, the complete runtime/static/cache envelope,
+   and `recommendedMaxWorkingSetSize`.
+3. On denial, already allocated slabs remain valid, the effective cache cap is
+   frozen at their slot capacity, and misses evict/reuse slots. Combined,
+   per-component, and mmap-backed fresh-buffer fallbacks are not available.
+4. A denial before the minimum 321-expert route slab exists fails before expert
+   I/O.
+
+Hebrus Studio now reapplies its hardware token profile at every managed Qwen
+launch and command preview, so an older version-2 configuration requesting 32K
+on a 21/24 GiB Mac is launched at 16K context and 8K maximum output without
+silently rewriting the stored values. Managed ExpertMajor launches also remove
+all inherited or configured `DS4_*` tuning variables except the documented
+memory-report and Qwen-telemetry diagnostics.
+
+The synthetic 21 GiB fixture is deliberately not a process memory limit. It
+feeds the planner an explicit physical-memory, Metal-budget, reclaimable-page,
+and pressure snapshot. A separate real-Metal fault injection denies slab growth
+at the allocation boundary. Together they make the safety mechanics
+deterministic in CI; neither can reproduce macOS unified-memory contention or
+qualify physical 24 GiB throughput.
+
+The artifact manifest's `runtimeCommit=73a332f...` remains the physical-format
+compatibility floor and predates this safety policy. The hardened source is a
+publication candidate, not a released policy. Before release, land it, advance
+Hebrus Studio's minimum managed runtime pin to that commit (or a reviewed
+descendant), and rerun the gates below. Until then the Studio release runtime
+is not qualified for this 24 GiB policy even though it can decode the artifact
+format.
 
 ## Model-free evidence
 
@@ -69,6 +119,9 @@ gate.
 | 2026-07-24T13:02:05+02:00 | guarded unchanged-budget phase check | server compile; `test_ssd_residency`; `test_qwen_session`; runner fixture; `git diff --check` | PASS — 16 GiB guarded changed/unchanged pressure decisions, 32 GiB unguarded isolation, Qwen session contract, and runner fail-closed cases |
 | 2026-07-24T13:03:46+02:00 | same phase check plus alias timestamp normalization | command-alias profile lane and complete install test | PASS — canonical and compatibility aliases compare semantic diagnostics without a wall-clock race |
 | 2026-07-24T13:09:29+02:00 | final reviewed working-tree candidate | `make premerge` with Apple M5 Pro Metal access | PASS — complete repository, documentation, brand, build-isolation, model-free Metal, runner, alias, and install gates |
+| 2026-07-27T09:43:29+02:00 | `main` `595301760cda5ebc368636876a992ff68fc6d95e` plus dirty allocation-time candidate | build `test_ssd_residency` and `ds4_test`; `make qwen-24g-fixture-test`; run SSD resolver; `git diff --check` | PASS — synthetic 21 GiB equality, pressure, host, Metal and overflow cases; fixture hashes/order/runner syntax; clean diff |
+| 2026-07-27T09:43:44+02:00 | same local candidate | `build/metal-arm64/bin/ds4_test --metal-kernels` on Apple M5 Pro | PASS — real Metal admitted one test slab, denied the next and reused slots without a new buffer; denial before the first slab remained at cap zero across a second attempt with no SSD I/O or fallback |
+| 2026-07-27T09:50:34+02:00 | same local candidate | `make premerge` with Apple M5 Pro Metal access | PASS — complete repository, documentation, contracts, brand, fixture, build-isolation, model-free Metal, benchmark guard, alias and install gates |
 
 ## Local M5 Pro model-backed context checks
 
@@ -139,33 +192,61 @@ decode-evidence content SHA-256 is
 Hebrus Studio remains a separate worktree. Its regression uses the 24 GiB
 defaults, selects the canonical `hebrus-server` binary even when the persistent
 compatibility alias is present, and verifies that resident/SSD/cache overrides
-cannot escape canonical Qwen AUTO. It does not simulate macOS memory pressure
-or replace the physical gate.
+cannot escape canonical Qwen AUTO. The 2026-07-27 extension also launches an
+oversized persisted Qwen configuration through a synthetic 21 GiB profile,
+asserts effective 16K/8K limits without rewriting it, and strips active DS4
+tuning variables while preserving documented diagnostics. It does not simulate
+macOS memory pressure or replace the physical gate.
 
 | Timestamp | Revision / experiment | Command / lane | Result |
 | --- | --- | --- | --- |
 | 2026-07-24T11:33:52+02:00 | Studio `5720685d415c` plus pre-existing user worktree and Qwen regression | `npm test` | PARTIAL — 500/502 tests passed; two unrelated web-search middleware tests in the pre-existing dirty worktree expected a different control-header spelling |
 | 2026-07-24T11:38:25+02:00 | same Studio state | `npm test -- tests/runtime.test.ts --configLoader runner --no-cache`; `npm run typecheck`; `npm run check:brand` | PASS — 70/70 targeted runtime tests, both TypeScript projects, and brand boundary |
+| 2026-07-27T09:44:22+02:00 | Studio `main` `c6c48825de219ee0f980adc4789cec349a6fa4c0` plus dirty Qwen integration candidate and unrelated user worktree | `npm test -- tests/runtime.test.ts tests/config.test.ts` | PASS — 80/80; synthetic 21 GiB launch clamps persisted 32K/32K to 16K/8K without rewriting storage and strips non-allowlisted tuning environment |
+| 2026-07-27T09:45:33+02:00 | same Studio state | `npm run check:brand`; `git diff --check` | PASS — exact compatibility groups classified; clean diff |
+| 2026-07-27T09:45:39+02:00 | same Studio state | `npm run typecheck` | FAIL outside this candidate — unrelated untracked artifact/research qualification files require type exports and runtime-build helpers absent from the shared worktree |
+| 2026-07-27T09:45:47+02:00 | same Studio state | strict targeted `tsc --noEmit` over `hardware-profile`, engine arguments, config, and runtime | PASS — no TypeScript error in the modified launch-policy modules |
 
 ## Required physical confirmation
 
 On the reported M5 24 GiB host, verify the published affine artifact by byte
-size and SHA-256, then use the same Hebrus Studio persistent streaming endpoint.
-The original context allocation and seed were not captured; use Studio's
-configured 16,384-token candidate context and record the seed:
+size and SHA-256, then use the same Hebrus Studio persistent streaming endpoint
+and the five requests, in order, from
+`tests/qwen/fixtures/qwen-24g-release-v1.json`. The original incident prompt,
+context allocation, and seed were not captured. The checked-in Sarajevo prompt
+is therefore a qualitative reconstruction, not a byte-identical replay; the
+separate deterministic companions provide the quantitative sustained-decode
+gate.
 
-1. run the Sarajevo travel prompt with thinking `medium` through a normal final
-   stream, treating an ordinary EOS as successful completion;
-2. repeat with thinking `high`;
-3. for each thinking setting, run a deterministic sustained-decode companion
-   past 1,719 generated tokens;
-4. complete another request in the same Hebrus Server process.
+| Prompt | SHA-256 | Purpose |
+| --- | --- | --- |
+| `qwen-24g-sarajevo-v1.txt` | `39f8f9bcfcc5f99b5fcc6a6d7ca303322db2d7a02ddb702e6485e570f6b63ba6` | Natural medium/high completion, ordinary EOS required |
+| `qwen-24g-sustained-v1.txt` | `6942d59a685679dc5e404bdc4b51cc2ae97f3b3a79b5aabf0effe44a358d30b2` | Medium/high length stop after at least 1,720 generated tokens |
+| `qwen-24g-followup-v1.txt` | `833c43d43d72d6e66ec778a66ccb22dfcfe8464be2501fbd8dbd0059ba71024e` | Same-process post-guard liveness |
 
-Record the resolved AUTO plan, 3,521-expert ceiling, pressure at admission and
-every phase entry, `buffer_allocs`, task physical footprint, system swap,
-prompt and generation counts, prefill/decode throughput, and TPOT p50/p95. Any
-pressure `WARNING`, new swapout, watchdog `SIGTERM`, stream error, changed
-resolved plan, or competing inference process invalidates the cohort.
+With Hebrus Studio already running on the physical host, execute the sequence
+with the checked-in loopback-only runner:
+
+```sh
+HEBRUS_API_KEY=... python3 tests/qwen/run_24g_release_gate.py \
+  --output-dir /absolute/private/path/qwen-24g-release-evidence
+```
+
+The output directory must not already exist. It contains raw model responses;
+treat it as potentially sensitive evidence and do not commit it.
+
+Require AUTO to resolve to SSD and a separate explicit-resident launch to fail.
+Record the resolved AUTO plan, requested decode target (never above 3,521),
+every proposed/admitted or denied slab, the monotonic effective cap, allocated
+slab capacity, pressure at admission, every phase entry and every slab decision,
+`buffer_allocs`, task physical footprint, system swap, prompt and generation
+counts, prefill/decode throughput, and TPOT p50/p95. Run with
+`DS4_METAL_MEMORY_REPORT=1` so successful allocation-time decisions are
+observable. Confirm Studio launches an oversized persisted configuration at
+16,384 context / 8,192 output and removes every non-allowlisted `DS4_*`
+variable. Any pressure `WARNING`, new swapout, watchdog `SIGTERM`, stream error,
+changed resolved plan, fresh-buffer cap bypass, or competing inference process
+invalidates the cohort.
 
 Until those rows exist, this record does not claim that the original physical
 failure is closed or that performance on 24 GiB has been measured.

@@ -100,7 +100,12 @@ python3 tests/qwen/test_compare_logits.py -v
 The scalar fixtures prove numeric and tokenizer invariants; they do not qualify
 a model artifact or a production inference mode. Metal Qwen cases in
 `test_qwen35_metal.m` additionally cover resident/SSD top-8 equivalence,
-malformed-route fail-closed behavior, cache accounting, and slab growth.
+malformed-route fail-closed behavior, cache accounting, and slab growth. The
+incremental-growth case admits one slab, denies the next, and proves reuse
+without a new buffer; a second case denies the first slab and proves no expert
+I/O or allocation fallback. `test_ssd_residency` includes the synthetic 21 GiB
+host snapshot. `make qwen-24g-fixture-test` validates the versioned physical
+request manifest and prompt hashes.
 
 `compare_logits.py` remains an offline evidence checker. Its unit test validates
 identity checks, padding exclusion, top-k metrics, and malformed-input failure.
@@ -150,8 +155,10 @@ QWEN_V2=/absolute/path/to/Qwen3.6-35B-A3B-DS4-ExpertMajor-v2-MLX-Affine4-G64.ggu
 ```
 
 Record the admission inputs, resolved residency, cache tier, physical footprint,
-and system swap before, during, and after the run. AUTO may choose resident or
-SSD according to the current memory and pressure gates.
+and system swap before, during, and after the run. Through 24 GiB, AUTO must
+choose guarded SSD and an explicit resident request must fail. On larger hosts,
+AUTO may choose resident or SSD according to the current memory and pressure
+gates.
 
 The policy suite covers named 16/24/32/36/48/64/96/128 GiB profiles. Model-backed
 release evidence must additionally identify the real Metal device and its
@@ -160,25 +167,39 @@ evidence. At minimum, validate the available lower-memory lanes as follows:
 
 - 16 GiB: AUTO resolves to SSD, pressure is explicitly normal, and swap does
   not increase;
-- 24 GiB: AUTO resolves according to the two resident gates; when it resolves
-  to SSD, the logged prefill/decode plan requires normal pressure and never
-  exceeds 3,521 experts (about 5.80 GiB for this artifact). Each phase entry,
-  including one whose configured budget is unchanged, must carry a fresh
-  normal-pressure signal. Repeat the reported Sarajevo travel prompt through
-  the same Hebrus Studio persistent streaming endpoint with thinking `medium`
-  and `high` under the configured 16,384-token candidate context and record the
-  seed. Each natural response must finish normally; separately run a
-  deterministic sustained-decode companion past 1,719 generated tokens for
-  each setting, then require a subsequent request to complete in the same
-  Hebrus Server process, with no pressure `WARNING`, new swapout, or watchdog
-  `SIGTERM`;
+- 24 GiB: AUTO resolves to SSD, an explicit resident request fails, and the
+  logged prefill/decode target never exceeds 3,521 experts (about 5.80 GiB for
+  this artifact). Each phase entry, including one whose configured budget is
+  unchanged, must carry a fresh normal-pressure signal. Every proposed new
+  slab (up to 321 experts; the final target tail may be smaller) must receive a
+  separate live host/pressure/Metal admission; denied
+  growth must freeze at current slab capacity and use eviction/reuse without a
+  fresh-buffer fallback. Run the five ordered, hash-verified requests in
+  `fixtures/qwen-24g-release-v1.json`. The Sarajevo prompt is a versioned
+  qualitative reconstruction, not the missing original incident text. Each
+  medium/high natural response must finish normally; each sustained companion
+  must generate at least 1,720 tokens, and the final follow-up must complete in
+  the same Hebrus Server process. Studio must clamp an oversized persisted
+  profile to 16K/8K and remove every non-allowlisted `DS4_*` variable. Require
+  no pressure `WARNING`, new swapout, or watchdog `SIGTERM`;
 - 32 GiB: AUTO resolves to resident when both logged budgets pass, and falls
   back to SSD rather than forcing residency when either gate fails;
 - 64 GiB reference: preserve the existing resident/SSD correctness lanes.
 
+With Hebrus Studio already running on the physical 24 GiB host, execute the
+checked-in sequence without putting credentials on the command line:
+
+```sh
+HEBRUS_API_KEY=... python3 tests/qwen/run_24g_release_gate.py \
+  --output-dir /absolute/private/path/qwen-24g-release-evidence
+```
+
+The output directory must not already exist. It contains raw model responses,
+so treat it as potentially sensitive evidence and do not commit it.
+
 Explicit modes are qualification controls, not the release startup command. On
-a host where resident admission succeeds, run the same deterministic prompt in
-both modes:
+a host above 24 GiB where resident admission succeeds, run the same
+deterministic prompt in both modes:
 
 ```sh
 ./hebrus -m "$QWEN_V2" --ctx 8192 --resident \

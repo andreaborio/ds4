@@ -45,7 +45,8 @@ SERVER_ALIAS_PORT ?= 0
 	imatrix-dataset-check prompt-fixture-check cpu FORCE \
 	metal build-isolation-test q4k-dot-test qwen-metadata-test \
 	qwen-reference-test qwen-unicode-test qwen-tokenizer-test \
-	qwen-expert-group-test expert-store-test metal-ssd-profile-test \
+	qwen-expert-group-test qwen-24g-fixture-test \
+	expert-store-test metal-ssd-profile-test \
 	download-model-test capabilities-test command-alias-test \
 	visible-identity-test server-alias-model-unit-test \
 	server-alias-model-test \
@@ -66,6 +67,14 @@ release-contract: tools/qwen_release_contract.py \
 release-contract-test: release-contract tools/qwen_release_contract.py \
 		tests/test_qwen_release_contract.py
 	python3 tests/test_qwen_release_contract.py
+
+qwen-24g-fixture-test: tests/qwen/test_24g_release_fixture.py \
+		tests/qwen/run_24g_release_gate.py \
+		tests/qwen/fixtures/qwen-24g-release-v1.json \
+		tests/qwen/fixtures/qwen-24g-sarajevo-v1.txt \
+		tests/qwen/fixtures/qwen-24g-sustained-v1.txt \
+		tests/qwen/fixtures/qwen-24g-followup-v1.txt
+	python3 tests/qwen/test_24g_release_fixture.py
 
 brand-boundary-audit: tools/brand_boundary_audit.py tools/brand_boundary.json
 	python3 tools/brand_boundary_audit.py --check
@@ -92,6 +101,8 @@ INSTALL_BACKEND := metal
 METAL_LDLIBS := $(LDLIBS) -framework Foundation -framework Metal
 
 METAL_CORE_OBJS := $(addprefix $(METAL_OBJDIR)/,ds4.o ds4_build.o ds4_ssd.o ds4_profile.o ds4_expert_store.o ds4_qwen.o ds4_qwen_unicode.o ds4_qwen_expert_group.o ds4_metal.o)
+METAL_TEST_CORE_OBJS := $(filter-out $(METAL_OBJDIR)/ds4_metal.o,$(METAL_CORE_OBJS)) \
+	$(METAL_OBJDIR)/ds4_metal_test.o
 CPU_CORE_OBJS := $(addprefix $(CPU_OBJDIR)/,ds4.o ds4_build.o ds4_ssd.o ds4_profile.o ds4_expert_store.o ds4_qwen.o ds4_qwen_unicode.o)
 
 METAL_BINS := $(addprefix $(METAL_BINDIR)/,$(PROGRAMS))
@@ -293,6 +304,12 @@ $(METAL_OBJDIR)/ds4_metal.o: ds4_metal.m ds4_gpu.h \
 	@mkdir -p "$(@D)"
 	$(CC) $(OBJCFLAGS) $(DEPFLAGS) -c -o $@ ds4_metal.m
 
+$(METAL_OBJDIR)/ds4_metal_test.o: ds4_metal.m ds4_gpu.h \
+		ds4_qwen_expert_group.h runtime/ds4_metal_glm.inc $(METAL_SRCS)
+	@mkdir -p "$(@D)"
+	$(CC) $(OBJCFLAGS) $(DEPFLAGS) -DDS4_TEST_HOOKS \
+		-c -o $@ ds4_metal.m
+
 # These white-box implementation objects deliberately omit normal entrypoints
 # or GPU consumers. Keep unused-only suppression scoped to the implementation
 # variants until the remaining server/Qwen seams remove this coupling debt.
@@ -382,7 +399,8 @@ $(METAL_OBJDIR)/ds4_qwen_ref.o: ds4_qwen_ref.c ds4_qwen_ref.h
 
 $(METAL_BINDIR)/ds4_test: \
 	$(METAL_OBJDIR)/ds4_test.o $(METAL_OBJDIR)/ds4_help.o \
-	$(METAL_OBJDIR)/ds4_kvstore.o $(METAL_OBJDIR)/rax.o $(METAL_CORE_OBJS)
+	$(METAL_OBJDIR)/ds4_kvstore.o $(METAL_OBJDIR)/rax.o \
+	$(METAL_TEST_CORE_OBJS)
 	@mkdir -p "$(@D)"
 	$(CC) $(CFLAGS) -o $@ $^ $(METAL_LDLIBS)
 
@@ -550,6 +568,7 @@ model-free-test: metal ds4_test ds4_agent_test $(METAL_BINDIR)/test_q4k_dot \
 		$(METAL_BINDIR)/test_expert_store \
 		$(METAL_BINDIR)/test_metal_ssd_profile \
 		$(METAL_BINDIR)/test_ssd_residency download-model-test \
+		qwen-24g-fixture-test \
 		visible-identity-test \
 		server-alias-model-unit-test \
 		tests/test_capabilities.py tests/test_command_aliases.py
@@ -768,7 +787,8 @@ model-free-test: $(PROGRAMS) ds4_test ds4_agent_test q4k-dot-test \
 		tests/test_qwen_expert_group \
 		tests/test_expert_store \
 		tests/test_metal_ssd_profile \
-		tests/test_ssd_residency download-model-test visible-identity-test \
+		tests/test_ssd_residency download-model-test qwen-24g-fixture-test \
+		visible-identity-test \
 		server-alias-model-unit-test \
 		tests/test_capabilities.py \
 		tests/test_command_aliases.py

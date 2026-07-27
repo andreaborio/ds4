@@ -1,9 +1,10 @@
 # Gold Metal + SSD contract
 
 This fork treats Apple Metal as the production runtime. The normal policy is
-`AUTO`, interpreted by model family: DeepSeek and Qwen may resolve to the
-qualified full-model mapped path or SSD streaming, while GLM always resolves to
-its qualified SSD-streaming path.
+`AUTO`, interpreted by model family: DeepSeek and Qwen above 24 GiB may resolve
+to the qualified full-model mapped path or SSD streaming, Qwen through 24 GiB
+resolves to guarded SSD, and GLM always resolves to its qualified SSD-streaming
+path.
 
 ## User-facing contract
 
@@ -25,12 +26,13 @@ converter inputs; ExpertMajor v1, external sidecars, CPU, CUDA, ROCm, and
 distributed inference fail closed. Normal startup requires no ExpertMajor,
 sidecar, backend, cache, preload, or power flag.
 
-For DeepSeek and Qwen, `--resident` (also `--no-ssd-streaming`) and
-`--ssd-streaming` are explicit qualification overrides. Cache, cold-streaming,
-or preload options imply SSD mode and are rejected when combined with
-`--resident`. GLM release startup is AUTO-only: AUTO selects SSD streaming and
-an explicit resident request is rejected. GLM SSD/cache controls remain
-diagnostic rather than alternate release commands.
+For DeepSeek and Qwen above 24 GiB, `--resident` (also
+`--no-ssd-streaming`) and `--ssd-streaming` are explicit qualification
+overrides. Qwen through 24 GiB is SSD-only and rejects a resident request.
+Cache, cold-streaming, or preload options imply SSD mode and are rejected when
+combined with `--resident`. GLM release startup is AUTO-only: AUTO selects SSD
+streaming and an explicit resident request is rejected. GLM SSD/cache controls
+remain diagnostic rather than alternate release commands.
 
 On macOS, `make cpu` writes reference/debug binaries only to
 `build/cpu-<arch>/bin/` and never replaces the Metal root binaries. CUDA and
@@ -89,8 +91,9 @@ class visible, but the byte calculation is continuous and always uses the live
 Metal device values. The Qwen live-pressure gate uses the same reserve as the
 fixed gate.
 
-For DeepSeek and Qwen, `required <= budget` may resolve to resident; otherwise
-AUTO resolves to SSD. Model-specific pressure and artifact gates may still
+For DeepSeek, and for Qwen above 24 GiB, `required <= budget` may resolve to
+resident; otherwise AUTO resolves to SSD. Qwen through 24 GiB always resolves
+AUTO to guarded SSD. Model-specific pressure and artifact gates may still
 reject resident mode. GLM applies its family override and resolves AUTO to SSD
 regardless of the generic resident calculation. The resolved mode, reason,
 components, and cache plan are printed at startup. There is no non-Metal AUTO
@@ -105,10 +108,10 @@ Every supported MoE family uses the same self-describing ExpertMajor v2 storage
 contract and its own qualified Metal consumer:
 
 - DeepSeek AUTO may select its artifact-qualified resident or SSD path.
-- Qwen3.6-35B-A3B AUTO admits the complete mapped-tensor path only when both the
-  fixed working-set plan and a point-in-time live-memory pressure check pass;
-  otherwise it selects SSD streaming. Explicit `--resident` fails unless both
-  checks pass.
+- Qwen3.6-35B-A3B through 24 GiB uses guarded SSD streaming and rejects
+  explicit `--resident`. Above that boundary, AUTO admits the complete
+  mapped-tensor path only when both the fixed working-set plan and a
+  point-in-time live-memory pressure check pass; otherwise it selects SSD.
 - GLM 5.2 AUTO always selects the qualified SSD path. Resident mode is not a
   capacity-dependent fallback and is rejected even on larger hosts.
 
@@ -121,14 +124,18 @@ pages may share the larger ordinary reserve but are never omitted. Under normal
 macOS pressure, equivalent free and bounded file-backed pages receive equal
 credit on every Qwen profile, so warming the GGUF cannot by itself shrink AUTO.
 The planner then chooses a complete `1 + 320*k` expert tier and grows Metal
-storage in 321-expert slabs (about 0.529 GiB) instead of the generic 4 GiB slab.
+storage in slabs of up to 321 experts (about 0.529 GiB at the full target)
+instead of the generic 4 GiB slab; the final target tail can be smaller.
 On 16 and 24 GiB hosts, Qwen's SSD plan is additionally guarded: it requires
 an affirmative normal-pressure signal at admission and before each prefill or
 decode cache phase, including when the configured budget is unchanged, and
-caps the cache at 3,521 experts (about 5.80 GiB for the published artifact).
-The unchanged-budget check matters because later requests can still populate
-lazy expert slabs. Hebrus Studio's watchdog remains a last-resort safety
-boundary, not the cache-sizing mechanism.
+caps the target at 3,521 experts (about 5.80 GiB for the published artifact).
+The backend separately admits the exact bytes immediately before every
+proposed new slab. If live host headroom, pressure, or the Metal working-set limit
+denies growth, the cache freezes at its existing slab capacity and serves
+future misses by eviction and slot reuse; fresh allocation fallbacks are
+forbidden. Hebrus Studio's watchdog remains a last-resort safety boundary, not
+the cache-sizing mechanism.
 DeepSeek retains its independently qualified resident/SSD planners. GLM retains
 its independent SSD-only planner and schedule.
 

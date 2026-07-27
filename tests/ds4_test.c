@@ -2426,7 +2426,11 @@ extern uint64_t ds4_gpu_internal_stream_expert_timing_selected_calls(void);
 extern uint32_t ds4_gpu_internal_stream_expert_cache_required_floor(void);
 extern uint32_t ds4_gpu_internal_stream_expert_cache_slab_count(void);
 extern uint64_t ds4_gpu_internal_stream_expert_cache_slab_capacity_bytes(void);
+extern uint32_t ds4_gpu_internal_stream_expert_cache_growth_budget_cap(void);
+extern uint64_t ds4_gpu_internal_stream_expert_cache_buffer_allocs(void);
 extern void ds4_gpu_internal_stream_expert_cache_fail_mlock_after(
+    int64_t calls);
+extern void ds4_gpu_internal_stream_expert_cache_fail_growth_guard_after(
     int64_t calls);
 extern int ds4_gpu_internal_moe_selected_trace_inspect(
     const char *path, uint32_t requested_width, uint32_t *file_width,
@@ -3204,6 +3208,109 @@ static void test_metal_q4_selected_slots_runtime_count(void) {
         unlink(trace_path);
     }
     test_metal_selected_trace_legacy_parser();
+
+    /* Guarded Qwen growth is admitted once per fresh slab. The first route
+     * fills one eight-slot test slab; denying the next slab must freeze the
+     * effective budget at eight and service a disjoint route by eviction and
+     * slot reuse, without allocating a combined/per-expert fallback buffer. */
+    ds4_gpu_set_streaming_expert_cache_required_floor(8);
+    ds4_gpu_set_streaming_expert_cache_slab_target_bytes(
+        8u * test_slot_bytes);
+    ds4_gpu_set_streaming_expert_cache_budget(16);
+    ds4_gpu_set_streaming_expert_cache_growth_guard(true, 1, 1);
+    ds4_gpu_internal_stream_expert_cache_fail_growth_guard_after(1);
+    const uint64_t guarded_allocs_before =
+        ds4_gpu_internal_stream_expert_cache_buffer_allocs();
+    test_metal_qwen_top8_result guarded_first = {0};
+    TEST_ASSERT(test_metal_qwen_top8_case(
+        model_map, model_size,
+        gate_offset, up_offset, down_offset,
+        gate_expert_bytes, down_expert_bytes,
+        router_selected[0], router_weights[0], router_logits[0],
+        true, &guarded_first));
+    TEST_ASSERT(guarded_first.misses == 8);
+    TEST_ASSERT(guarded_first.current_entries == 8);
+    TEST_ASSERT(ds4_gpu_internal_stream_expert_cache_slab_count() == 1);
+    TEST_ASSERT(ds4_gpu_internal_stream_expert_cache_slab_capacity_bytes() ==
+                8u * test_slot_bytes);
+    const uint64_t guarded_allocs_after_first =
+        ds4_gpu_internal_stream_expert_cache_buffer_allocs();
+    TEST_ASSERT(guarded_allocs_after_first == guarded_allocs_before + 1u);
+
+    test_metal_qwen_top8_result guarded_reuse = {0};
+    TEST_ASSERT(test_metal_qwen_top8_case(
+        model_map, model_size,
+        gate_offset, up_offset, down_offset,
+        gate_expert_bytes, down_expert_bytes,
+        router_selected[1], router_weights[1], router_logits[1],
+        true, &guarded_reuse));
+    TEST_ASSERT(guarded_reuse.misses == 16);
+    TEST_ASSERT(guarded_reuse.current_entries == 8);
+    TEST_ASSERT(ds4_gpu_internal_stream_expert_cache_slab_count() == 1);
+    TEST_ASSERT(ds4_gpu_internal_stream_expert_cache_slab_capacity_bytes() ==
+                8u * test_slot_bytes);
+    TEST_ASSERT(ds4_gpu_internal_stream_expert_cache_growth_budget_cap() == 8);
+    TEST_ASSERT(ds4_gpu_stream_expert_cache_configured_count() == 8);
+    TEST_ASSERT(ds4_gpu_internal_stream_expert_cache_buffer_allocs() ==
+                guarded_allocs_after_first);
+    const float guarded_expected =
+        test_metal_qwen_top8_expected(
+            router_selected[1], router_weights[1]);
+    for (uint32_t row = 0; row < OUT_DIM; row++) {
+        TEST_ASSERT(isfinite(guarded_reuse.out[row]));
+        TEST_ASSERT(fabsf(guarded_reuse.out[row] -
+                          guarded_expected) < 0.1f);
+    }
+
+    /* A denial before the minimum slab exists fails before SSD I/O and does
+     * not escape through a fresh combined or per-component Metal buffer. */
+    ds4_gpu_set_streaming_expert_cache_growth_guard(false, 0, 0);
+    ds4_gpu_set_streaming_expert_cache_budget(8);
+    ds4_gpu_set_streaming_expert_cache_growth_guard(true, 1, 1);
+    ds4_gpu_internal_stream_expert_cache_fail_growth_guard_after(0);
+    const uint64_t first_guard_allocs_before =
+        ds4_gpu_internal_stream_expert_cache_buffer_allocs();
+    test_metal_qwen_top8_result first_guard_reject = {0};
+    TEST_ASSERT(test_metal_qwen_top8_case(
+        model_map, model_size,
+        gate_offset, up_offset, down_offset,
+        gate_expert_bytes, down_expert_bytes,
+        router_selected[0], router_weights[0], router_logits[0],
+        false, &first_guard_reject));
+    TEST_ASSERT(ds4_gpu_internal_stream_expert_cache_growth_budget_cap() == 0);
+    TEST_ASSERT(ds4_gpu_stream_expert_cache_configured_count() == 0);
+    TEST_ASSERT(ds4_gpu_internal_stream_expert_cache_slab_count() == 0);
+    TEST_ASSERT(ds4_gpu_internal_stream_expert_cache_buffer_allocs() ==
+                first_guard_allocs_before);
+    TEST_ASSERT(first_guard_reject.hits == 0);
+    TEST_ASSERT(first_guard_reject.misses == 0);
+    TEST_ASSERT(first_guard_reject.pread_bytes == 0);
+    TEST_ASSERT(first_guard_reject.current_entries == 0);
+    TEST_ASSERT(first_guard_reject.decode_tokens == 0);
+
+    /* The zero cap is a monotonic allocator invariant, not just a caller-side
+     * check: a second direct attempt must not retry admission or allocation. */
+    test_metal_qwen_top8_result first_guard_retry = {0};
+    TEST_ASSERT(test_metal_qwen_top8_case(
+        model_map, model_size,
+        gate_offset, up_offset, down_offset,
+        gate_expert_bytes, down_expert_bytes,
+        router_selected[0], router_weights[0], router_logits[0],
+        false, &first_guard_retry));
+    TEST_ASSERT(ds4_gpu_internal_stream_expert_cache_growth_budget_cap() == 0);
+    TEST_ASSERT(ds4_gpu_stream_expert_cache_configured_count() == 0);
+    TEST_ASSERT(ds4_gpu_internal_stream_expert_cache_slab_count() == 0);
+    TEST_ASSERT(ds4_gpu_internal_stream_expert_cache_buffer_allocs() ==
+                first_guard_allocs_before);
+    TEST_ASSERT(first_guard_retry.hits == 0);
+    TEST_ASSERT(first_guard_retry.misses == 0);
+    TEST_ASSERT(first_guard_retry.pread_bytes == 0);
+    TEST_ASSERT(first_guard_retry.current_entries == 0);
+    TEST_ASSERT(first_guard_retry.decode_tokens == 0);
+    ds4_gpu_internal_stream_expert_cache_fail_growth_guard_after(-1);
+    ds4_gpu_set_streaming_expert_cache_growth_guard(false, 0, 0);
+    ds4_gpu_set_streaming_expert_cache_required_floor(0);
+    ds4_gpu_set_streaming_expert_cache_slab_target_bytes(0);
 
     /* Budget rejection happens after the router readback but before SSD I/O,
      * cache/token accounting, or any output writes. */

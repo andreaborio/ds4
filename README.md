@@ -72,7 +72,7 @@ ExpertMajor v2. AUTO is the normal startup mode.
 | --- | ---: | --- | --- |
 | DeepSeek V4 Flash | 64 GiB | AUTO resolving to resident or SSD; explicit modes for qualification | Published ExpertMajor v2 artifact; `download_model.sh deepseek-v2` |
 | GLM 5.2 | 64 GiB | AUTO resolving to SSD streaming only; resident requests are rejected | Published ExpertMajor v2 artifact; `download_model.sh glm-v2` |
-| Qwen3.6-35B-A3B | 16 GiB | AUTO resolving to resident or SSD; 16 GiB necessarily uses SSD | Published MLX affine4/group-64 artifact; `download_model.sh qwen-v2` |
+| Qwen3.6-35B-A3B | 16 GiB | Guarded SSD is qualified at 16 GiB; the 24 GiB extension remains pending its physical gate; larger hosts may resolve to resident or SSD | Published MLX affine4/group-64 artifact; `download_model.sh qwen-v2` |
 
 The canonical machine-readable
 [Qwen release contract](docs/contracts/qwen-release.json) records the current
@@ -81,8 +81,12 @@ artifact as `published`. The release is exactly
 20,808,566,880 bytes, SHA-256
 `dd17266185833a9f05531ce366fd7284ddca1ed64aa3dcf06e321e8c72c9ea3d`.
 It is pinned to immutable repository revision
-`7bf9c3f7f6136aeb2599d75ee61c0cc2f18e2b02` and requires runtime commit
-`73a332fef82a0bcdd567d17e0de17aa004cad85d` or a compatible descendant. The
+`7bf9c3f7f6136aeb2599d75ee61c0cc2f18e2b02`. Its `runtimeCommit`
+`73a332fef82a0bcdd567d17e0de17aa004cad85d` is the artifact-format
+compatibility floor, not a safety qualification for every hardware tier. A
+release runtime must also contain every policy required by the current support
+contract; in particular, the 24 GiB pin must advance to the published
+allocation-time hardening commit before release. The
 older `Qwen3.6-35B-A3B-DS4-ExpertMajor-v2-Q4_K_S.gguf` store is incompatible
 with the current runtime and remains `negative-only`, never a download or
 inference fallback.

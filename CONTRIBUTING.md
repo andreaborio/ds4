@@ -119,8 +119,10 @@ bytes, SHA-256
 `dd17266185833a9f05531ce366fd7284ddca1ed64aa3dcf06e321e8c72c9ea3d`.
 It is published at immutable repository revision
 `7bf9c3f7f6136aeb2599d75ee61c0cc2f18e2b02`, and
-its manifest requires runtime commit
-`73a332fef82a0bcdd567d17e0de17aa004cad85d` or a compatible descendant.
+its manifest records artifact-format compatibility floor
+`73a332fef82a0bcdd567d17e0de17aa004cad85d`. That field proves the runtime can
+read the store; it does not supersede later hardware-safety policy. The release
+runtime must also contain every fix required by `RUNTIME_SUPPORT.md`.
 `download_model.sh qwen-v2` must pin and validate that exact identity. The older
 `Qwen3.6-35B-A3B-DS4-ExpertMajor-v2-Q4_K_S.gguf` object is `negative-only`, not
 a runnable fallback. See

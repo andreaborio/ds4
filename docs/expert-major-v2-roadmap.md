@@ -62,7 +62,8 @@ layout.
   `dd17266185833a9f05531ce366fd7284ddca1ed64aa3dcf06e321e8c72c9ea3d`.
   The immutable repository revision is
   `7bf9c3f7f6136aeb2599d75ee61c0cc2f18e2b02`; its manifest requires runtime
-  commit `73a332fef82a0bcdd567d17e0de17aa004cad85d` or a compatible descendant.
+  artifact-format floor `73a332fef82a0bcdd567d17e0de17aa004cad85d`;
+  release safety still requires the current runtime-support policy.
   The former Q4_K_S artifact is retained only as a fail-closed negative case.
 
 ### DeepSeek V4

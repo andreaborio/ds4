@@ -30,7 +30,7 @@ target, or an artifact whose complete output hash is missing.
 | `DEEPSEEK_V2` | `DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix-DS4-ExpertMajor-v2.gguf`; 86,720,114,272 bytes; SHA-256 `8378080263eb9224f7228d72e2afa4ac3cf74a116023fdec2c596ff228a33e3f` |
 | `DEEPSEEK_MIXED_V2` | Non-applicable until a mixed-quant DeepSeek ExpertMajor v2 artifact has a publication record with exact filename, bytes, and complete output SHA-256; do not resolve or use this variable before qualification |
 | `GLM_V2` | `GLM-5.2-DS4-ExpertMajor-v2-Q2_K.gguf`; 262,147,193,504 bytes; SHA-256 `7f5017e3076e706c78f2a5322b035a9e2f6519c65ff5b6be8b2d91aeff61505d` |
-| `QWEN_V2` | Status `published`; `Qwen3.6-35B-A3B-DS4-ExpertMajor-v2-MLX-Affine4-G64.gguf`; immutable repository revision `7bf9c3f7f6136aeb2599d75ee61c0cc2f18e2b02`; 20,808,566,880 bytes; SHA-256 `dd17266185833a9f05531ce366fd7284ddca1ed64aa3dcf06e321e8c72c9ea3d`; MLX affine4/group-64 routed storage; minimum compatible runtime commit `73a332fef82a0bcdd567d17e0de17aa004cad85d` |
+| `QWEN_V2` | Status `published`; `Qwen3.6-35B-A3B-DS4-ExpertMajor-v2-MLX-Affine4-G64.gguf`; immutable repository revision `7bf9c3f7f6136aeb2599d75ee61c0cc2f18e2b02`; 20,808,566,880 bytes; SHA-256 `dd17266185833a9f05531ce366fd7284ddca1ed64aa3dcf06e321e8c72c9ea3d`; MLX affine4/group-64 routed storage; artifact-format compatibility floor `73a332fef82a0bcdd567d17e0de17aa004cad85d` |
 | `QWEN_RETIRED_Q4_NEGATIVE` | Status `negative-only`; rejection-only input `Qwen3.6-35B-A3B-DS4-ExpertMajor-v2-Q4_K_S.gguf`; 20,808,566,880 bytes; SHA-256 `d7c43a6388ec20e6fe5530850350f96fdb0ac37c5ce36d3e5f92b172c447f56b`; it must fail before inference |
 
 The machine-readable
@@ -44,7 +44,12 @@ network routes in this checklist.
 
 The Qwen runtime and downloader paths must both resolve the exact `QWEN_V2`
 identity above. The immutable revision, filename, byte count, complete output
-SHA-256, manifest contract, and compatible runtime commit are one release gate.
+SHA-256, manifest contract, and artifact-format compatibility floor are one
+release gate. They do not prove that an older format-compatible runtime has the
+current hardware-safety policy. The runtime revision shipped by the release
+must separately contain every accepted fix in `RUNTIME_SUPPORT.md`; the
+published Studio pin must advance past the 2026-07-27 Qwen allocation-time
+hardening before the 24 GiB lane can pass.
 
 ## 1. Repository And Build Sanity
 
@@ -249,30 +254,48 @@ canonical, v1, sidecar, and community GGUFs are not equivalent inputs.
 - Run `make model-free-test` and `./ds4_test --metal-kernels`. The latter must
   retain resident/SSD top-8 output equivalence, zero resident cache/`pread`
   accounting, malformed-route fail-closed behavior, and slab-growth checks.
+  The model-free lane must include a synthetic 21 GiB host snapshot; the Metal
+  lane must inject a denial after one slab and prove slot reuse with no new
+  buffer, then inject denial before the first slab and prove fail-closed before
+  SSD I/O. These simulations validate mechanics, not physical memory behavior.
+  `make qwen-24g-fixture-test` must also validate the prompt hashes, fixed
+  sampler/seed, request order, and >1,719-token companion threshold in
+  `tests/qwen/fixtures/qwen-24g-release-v1.json`.
 - Run `./ds4 -m "$QWEN_V2" --ctx 8192` for the normal flag-free
   AUTO smoke.
 - Run AUTO with the normal flag-free startup command; record both admission plans,
-  their point-in-time inputs, resolved mode, cache tier, configured 321-expert
-  slab target, cache `buffer_allocs`, task physical footprint, and system swap
+  their point-in-time inputs, resolved mode, cache tier, configured target slab
+  size (up to 321 experts), cache `buffer_allocs`, task physical footprint, and
+  system swap
   before/during/after. Exact slab count/capacity is asserted by the Metal
   kernel test; it is not a public runtime counter.
 - Never bypass a failed resident admission to obtain a benchmark. On a host
   where both checks pass, compare the same deterministic prompt and logits in
   model-backed resident and forced-SSD modes.
-- In SSD mode, verify the first route allocates one 321-expert slab (about
-  0.529 GiB), later growth remains within the admitted cache budget, and no new
-  swap appears. Separate warm page-cache evidence from cold device-I/O evidence.
+- In SSD mode, verify the first route allocates one full 321-expert slab (about
+  0.529 GiB), every later slab receives a fresh normal-pressure/host/Metal
+  admission, denied growth freezes the effective budget at current slab
+  capacity, and no fresh combined or per-expert buffer bypasses that cap.
+  Require no new swap. Separate warm page-cache evidence from cold device-I/O
+  evidence.
 - On a physical 24 GiB Mac, exercise Hebrus Studio's persistent streaming
-  server with the Sarajevo travel reproducer and thinking `medium` and `high`
-  under the configured 16,384-token candidate context. Record the seed and
-  require each natural response to end normally; an ordinary EOS is not a
-  failure. For each thinking setting, also run a deterministic sustained-decode
-  companion past 1,719 generated tokens in the same server process. When AUTO
-  resolves to SSD, require the guarded 3,521-expert decode ceiling and an
-  affirmative normal-pressure signal at admission and every phase entry,
-  including unchanged-budget entries on a subsequent request, then complete
-  that request. Any pressure `WARNING`, new swapout, watchdog `SIGTERM`, or
-  client-stream failure blocks release.
+  server with the five ordered requests in
+  `tests/qwen/fixtures/qwen-24g-release-v1.json` under its 16,384-token context.
+  The natural Sarajevo requests are a versioned qualitative reconstruction
+  because the original incident prompt and seed were never captured; do not
+  describe them as byte-identical replay. Require medium and high natural
+  responses to end normally, and their deterministic companions to produce at
+  least 1,720 tokens before the length stop, in the same process. Require
+  AUTO to resolve to SSD and an explicit resident request to fail. Require the
+  requested guarded decode target to remain at or below 3,521 experts, an
+  affirmative normal-pressure signal at admission and every phase entry, and a
+  live admission before every new slab, including unchanged-budget entries on
+  the final follow-up request. Record requested, effective, and allocated
+  capacities separately. Verify that Hebrus Studio clamps a persisted oversized Qwen
+  context/output pair to the 24 GiB profile and strips all `DS4_*` tuning
+  variables while retaining only its documented diagnostic allowlist. Any
+  pressure `WARNING`, new swapout, watchdog `SIGTERM`, or client-stream failure
+  blocks release.
 - Resident mode proves complete model mapping and full-tensor Metal execution,
   not that every mapped GGUF page remained physically resident. Measure the
   stronger claim separately if it is used in release language.

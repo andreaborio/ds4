@@ -22,6 +22,7 @@ typedef enum {
     DS4_RESIDENCY_REASON_METAL_CURRENT_PRESSURE,
     DS4_RESIDENCY_REASON_METAL_BUDGET_UNAVAILABLE,
     DS4_RESIDENCY_REASON_MODEL_REQUIRES_SSD,
+    DS4_RESIDENCY_REASON_HARDWARE_REQUIRES_SSD,
     DS4_RESIDENCY_REASON_INSPECT_ONLY,
 } ds4_residency_reason;
 
@@ -60,6 +61,27 @@ typedef struct {
     uint64_t effective_cache_bytes;
     uint32_t cache_experts;
 } ds4_ssd_cache_plan;
+
+/* Incremental admission for one new Qwen expert slab. The live host budget
+ * charges only new growth because existing cache is already reflected in the
+ * snapshot; the fixed Metal budget reconstructs the complete runtime,
+ * pageable-static reserve, current slab capacity, and proposed slab. */
+typedef struct {
+    uint64_t slab_bytes;
+    uint64_t static_page_bytes;
+    uint64_t runtime_bytes;
+    uint64_t current_cache_capacity_bytes;
+    uint64_t recommended_bytes;
+    uint64_t reclaimable_bytes;
+    uint64_t host_reserve_bytes;
+    uint64_t host_required_bytes;
+    uint64_t platform_headroom_bytes;
+    uint64_t platform_required_bytes;
+    bool pressure_normal;
+    bool host_fits;
+    bool platform_fits;
+    bool allowed;
+} ds4_ssd_qwen_slab_growth_plan;
 
 /* Initial LFU policy for the streaming expert hotlist. Adaptive keeps every
  * ordered seed at priority one so live selections take over immediately.
@@ -269,6 +291,12 @@ bool ds4_ssd_low_ram_cache_policy(uint64_t physical_bytes);
  * storage.  Keep this separate from the generic <=16 GiB policy because the
  * latter also controls DeepSeek-specific behavior. */
 bool ds4_ssd_qwen_guarded_cache_policy(uint64_t physical_bytes);
+/* The release contract is deterministic on guarded Qwen hosts: AUTO uses SSD
+ * and an explicit resident request is rejected before model configuration. */
+bool ds4_residency_plan_apply_qwen_guarded_ssd_only(
+        uint64_t             physical_bytes,
+        ds4_residency_mode   requested,
+        ds4_residency_plan  *plan);
 /* A guarded Qwen phase rechecks pressure even when its configured cache budget
  * is unchanged: lazy expert slabs can still become physically populated during
  * later work. `cache_budget_changed` is explicit so tests keep both paths
@@ -279,6 +307,17 @@ bool ds4_ssd_qwen_phase_pressure_allowed(
         bool snapshot_available,
         bool pressure_status_available,
         bool pressure_normal);
+/* Guarded Qwen hosts re-evaluate both live host headroom and the Metal
+ * working-set ceiling immediately before allocating each additional slab.
+ * A valid plan can still deny growth; invalid or missing snapshots fail
+ * closed at the caller. */
+bool ds4_ssd_qwen_slab_growth_plan_make(
+        const ds4_ssd_host_memory          *memory,
+        uint64_t                            runtime_bytes,
+        uint64_t                            static_page_bytes,
+        uint64_t                            current_cache_capacity_bytes,
+        uint64_t                            slab_bytes,
+        ds4_ssd_qwen_slab_growth_plan      *out);
 bool ds4_ssd_static_pin_host_supported(uint64_t physical_bytes);
 bool ds4_ssd_working_set_after_reserve(uint64_t  recommended_bytes,
                                        uint64_t  runtime_bytes,

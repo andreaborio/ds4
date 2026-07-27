@@ -1,0 +1,74 @@
+{
+  "schemaVersion": 1,
+  "description": "Deterministic Qwen 24 GiB Hebrus Studio release requests; this is a versioned reconstruction, not the missing original incident prompt.",
+  "endpoint": "/v1/chat/completions",
+  "model": "qwen3.6-35b-a3b",
+  "stream": true,
+  "hostProfile": {
+    "physicalGiB": 24,
+    "contextTokens": 16384,
+    "maxOutputTokens": 8192
+  },
+  "sampling": {
+    "temperature": 0,
+    "topP": 1,
+    "minP": 0,
+    "seed": 20260727
+  },
+  "prompts": {
+    "sarajevo": {
+      "path": "qwen-24g-sarajevo-v1.txt",
+      "sha256": "39f8f9bcfcc5f99b5fcc6a6d7ca303322db2d7a02ddb702e6485e570f6b63ba6"
+    },
+    "sustained": {
+      "path": "qwen-24g-sustained-v1.txt",
+      "sha256": "6942d59a685679dc5e404bdc4b51cc2ae97f3b3a79b5aabf0effe44a358d30b2"
+    },
+    "followup": {
+      "path": "qwen-24g-followup-v1.txt",
+      "sha256": "833c43d43d72d6e66ec778a66ccb22dfcfe8464be2501fbd8dbd0059ba71024e"
+    }
+  },
+  "requests": [
+    {
+      "id": "sarajevo-medium",
+      "prompt": "sarajevo",
+      "reasoningEffort": "medium",
+      "maxTokens": 8192,
+      "minimumGeneratedTokens": 1,
+      "acceptedFinishReasons": ["stop"]
+    },
+    {
+      "id": "sustained-medium",
+      "prompt": "sustained",
+      "reasoningEffort": "medium",
+      "maxTokens": 2048,
+      "minimumGeneratedTokens": 1720,
+      "acceptedFinishReasons": ["length"]
+    },
+    {
+      "id": "sarajevo-high",
+      "prompt": "sarajevo",
+      "reasoningEffort": "high",
+      "maxTokens": 8192,
+      "minimumGeneratedTokens": 1,
+      "acceptedFinishReasons": ["stop"]
+    },
+    {
+      "id": "sustained-high",
+      "prompt": "sustained",
+      "reasoningEffort": "high",
+      "maxTokens": 2048,
+      "minimumGeneratedTokens": 1720,
+      "acceptedFinishReasons": ["length"]
+    },
+    {
+      "id": "post-guard-followup",
+      "prompt": "followup",
+      "reasoningEffort": "none",
+      "maxTokens": 64,
+      "minimumGeneratedTokens": 1,
+      "acceptedFinishReasons": ["stop"]
+    }
+  ]
+}
