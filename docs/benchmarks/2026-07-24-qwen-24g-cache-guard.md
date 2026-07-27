@@ -1,7 +1,8 @@
 # Qwen 24 GiB sustained-decode cache guard — 2026-07-24
 
-Status: publication safety candidate implemented and model-free verified;
-physical M5 24 GiB confirmation and managed-runtime pin advance pending.
+Status: draft-publication candidate implemented; exact-commit Qwen and DeepSeek
+smokes plus model-free gates pass. Physical M5 24 GiB confirmation and the
+managed-runtime pin advance remain pending.
 
 Decision candidate: Qwen through 24 GiB must use guarded SSD mode. AUTO resolves
 to SSD and an explicit resident request is rejected. The established 16 GiB
@@ -122,6 +123,62 @@ gate.
 | 2026-07-27T09:43:29+02:00 | `main` `595301760cda5ebc368636876a992ff68fc6d95e` plus dirty allocation-time candidate | build `test_ssd_residency` and `ds4_test`; `make qwen-24g-fixture-test`; run SSD resolver; `git diff --check` | PASS — synthetic 21 GiB equality, pressure, host, Metal and overflow cases; fixture hashes/order/runner syntax; clean diff |
 | 2026-07-27T09:43:44+02:00 | same local candidate | `build/metal-arm64/bin/ds4_test --metal-kernels` on Apple M5 Pro | PASS — real Metal admitted one test slab, denied the next and reused slots without a new buffer; denial before the first slab remained at cap zero across a second attempt with no SSD I/O or fallback |
 | 2026-07-27T09:50:34+02:00 | same local candidate | `make premerge` with Apple M5 Pro Metal access | PASS — complete repository, documentation, contracts, brand, fixture, build-isolation, model-free Metal, benchmark guard, alias and install gates |
+| 2026-07-27T11:06:47+02:00 | immutable candidate `51a0e0e3df18c1b6fd9640f81546137b91c75dae`; clean detached worktree | `make premerge` with Apple M5 Pro Metal access | PASS — exact-commit repository, documentation, contracts, brand, fixture, build-isolation, model-free Metal, benchmark guard, alias and install gates |
+
+## Immutable draft-publication smokes
+
+These short arms verify Qwen and the shared DeepSeek SSD path on the exact
+allocation-time hardening commit intended for a draft pull request. They are
+correctness and isolation smokes, not a promotion cohort: there is no matching
+clean-`main` baseline, no medium/large/long context matrix, and no physical
+24 GiB host in this cohort.
+
+Shared identity:
+
+| Field | Value |
+| --- | --- |
+| Host | Apple M5 Pro, 64 GiB unified memory, macOS build `25F84`, AC power |
+| Source | clean commit `51a0e0e3df18c1b6fd9640f81546137b91c75dae`; empty tracked diff and zero untracked files |
+| Source-state SHA-256 | `b6085995b88d05c1d0605c876e621ab1061476ba7de1e4cea0816f1e1adb62e5` |
+| Executable SHA-256 | `79dc56edd0ba2c541e7cda816b55776993f3d6a33c4e341d2066e38842668afb` |
+| Metal file-set SHA-256 | `5274486a015b61eb0e385b5ef793565267dc3113338e1bac7330e7b27e490b60` |
+| Prompt | `tests/long_context_security_prompt.txt`, SHA-256 `e7c1a2cadf781d274cc26bd251d532fe1b9e632080da97e3eb4684741e7cc308` |
+| Runner policy | warm cache state; no new swapout allowed; no competing inference process allowed |
+
+Artifact and launch identity:
+
+| Model | Artifact | Residency / allocation |
+| --- | --- | --- |
+| Qwen3.6-35B-A3B | 20,808,566,880 bytes; SHA-256 `dd17266185833a9f05531ce366fd7284ddca1ed64aa3dcf06e321e8c72c9ea3d` | explicit SSD, preload omitted, 8,192-token context allocation |
+| DeepSeek V4 Flash | 86,720,114,272 bytes; SHA-256 `8378080263eb9224f7228d72e2afa4ac3cf74a116023fdec2c596ff228a33e3f` | explicit SSD, 4,096-expert preload, adaptive cache 4,387 experts / 28.92 GiB, 32,768-token context allocation |
+
+The most recent comparable references used for the previous-experiment deltas
+were the 2026-07-27T10:44:36+02:00 Qwen arm and the
+2026-07-27T10:45:09+02:00 DeepSeek arm. Both used `main`
+`595301760cda5ebc368636876a992ff68fc6d95e` plus tracked-diff SHA-256
+`7c34359fee3ba83cd2bb406416bbf41506dac77b9023ef813dd354f1d077115d`,
+source-state SHA-256
+`4063adfc59e6fff91929df084738d3d85d1ef5b724701035e1b57dbcb9a0ee54`,
+and executable SHA-256
+`84c561d5415b33f0a75b05702878dc08f87a041bf65b0e42d82134e1fdd5369f`
+under otherwise matching model, prompt, residency, cache-state and frontier
+conditions.
+
+| Timestamp | Revision / model | Prompt frontier | Prefill | Decode | TPOT p50 / p95 | Delta vs `main` | Delta vs previous experiment | Result |
+| --- | --- | ---: | ---: | ---: | ---: | --- | --- | --- |
+| 2026-07-27T11:10:14+02:00 | `51a0e0e3df18`; Qwen explicit SSD | 128 + 128 generated | 66.72 t/s | 28.21 t/s | 32.326 / 54.812 ms | N/A — no matching clean-`main` arm | prefill -1.62%; decode +1.84%; p50 -0.73%; p95 +0.75% vs 2026-07-27T10:44:36+02:00 | PASS — `rc=0`, zero swapout, pressure 90%→minimum 70%→90%, peak RSS 9,850 MiB, peak wired 16,095 MiB, no competitor, 32,426 valid telemetry records |
+| 2026-07-27T11:11:20+02:00 | `51a0e0e3df18`; DeepSeek explicit SSD | 128 + 128 generated | 19.30 t/s | 11.51 t/s | 65.923 / 89.296 ms | N/A — no matching clean-`main` arm | prefill +4.66%; decode -0.60%; p50 -1.25%; p95 +0.53% vs 2026-07-27T10:45:09+02:00 | PASS — `rc=0`, zero swapout, pressure 90%→minimum 24%→84%, peak RSS 29,689 MiB, peak wired 42,561 MiB, no competitor |
+
+| Model | Resolved-plan SHA-256 | Telemetry SHA-256 | Frontier-logits content SHA-256 | Decode-evidence content SHA-256 |
+| --- | --- | --- | --- | --- |
+| Qwen | `c97262c14544ccff3ea48989fb47fedb5e8cf7cf9d2a068b2dcacf0e7237093a` | `eda66c5cdfbcccede330a8599c6ab4a0c2c46ebc7e2cebda8764125d6f9bc4f9` | `b6821f4cd32c1d6c2a00ce5048683ec81d2bd86f5ba8856e5a84610e95ab520d` | `c26eec8b5a52283383e509dadc282f5f891fb8f05bd1af1008d0b3db91e69061` |
+| DeepSeek | `af3c10b93269b2fe34ec80147c43106917f65df7cdc3bb5a5ae9cf1f5b115caf` | N/A — DeepSeek does not emit Qwen telemetry | `e5528272f265a8d8e5b7462ff16e8500f9ee48dc56a7ca039296a4c251b8747f` | `a6e232d06f43e280b8dba70b1053e74136839cd14ee0c254be1e8024c2969c2b` |
+
+Both models reproduced the same frontier-logits and decode-evidence content
+hashes as their immediately preceding comparable arms. The short Qwen arm ran
+on a 64 GiB host and therefore does not exercise or qualify the guarded
+24 GiB allocation policy; that remains covered mechanically by the real-Metal
+fault test and pending on the required physical sustained gate.
 
 ## Local M5 Pro model-backed context checks
 
