@@ -1,7 +1,8 @@
 {
-  "schemaVersion": 1,
+  "schemaVersion": 2,
   "modelFamily": "Qwen3.6-35B-A3B",
   "downloadTarget": "qwen-v2",
+  "betaDownloadTarget": "qwen-q2-beta",
   "repository": "andreaborio/Qwen3.6-35B-A3B-Hebrus-GGUF",
   "publishedArtifact": {
     "status": "published",
@@ -12,6 +13,22 @@
     "runtimeCommit": "73a332fef82a0bcdd567d17e0de17aa004cad85d",
     "storage": "mlx-affine4",
     "groupSize": 64
+  },
+  "betaArtifact": {
+    "status": "published-beta",
+    "filename": "Qwen3.6-35B-A3B-DS4-ExpertMajor-v2-Q2_K_XL.gguf",
+    "revision": "bdb363efaeb227bfd702c9145cb224fffa456891",
+    "bytes": 12290632032,
+    "sha256": "30c22f70aff0f05986b517ee4ad8fef554a1b5aab6971c9ca09f999566d30143",
+    "embeddedPayloadSha256": "ccc3fbc2405d1dd73f8ac15741b0277514de4f46b80818531297ea9ffa0c6a3c",
+    "runtimeCommit": "42e2fec2a7dbb14a42e7a5612dfec00e33d443ca",
+    "storage": "ggml",
+    "groupSize": 0,
+    "profile": "q2-k-xl",
+    "qualifiedContextTokens": 32768,
+    "minimumMemoryGiB": 64,
+    "fullWindowQualified": false,
+    "recommended": false
   },
   "negativeArtifact": {
     "status": "negative-only",

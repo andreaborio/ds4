@@ -6,8 +6,8 @@ Qwen weight profiles inside that container:
 
 | Profile | Routed storage | Product role |
 | --- | --- | --- |
-| `MLX_AFFINE4_G64` | MLX affine4, group 64 | Published higher-quality profile |
-| `Q2_K_XL` | Exact GGML IQ2_XS/IQ3_XXS/IQ4_XS layer inventory | Smaller performance-per-weight profile; publication pending |
+| `MLX_AFFINE4_G64` | MLX affine4, group 64 | Stable/recommended higher-quality profile |
+| `Q2_K_XL` | Exact GGML IQ2_XS/IQ3_XXS/IQ4_XS layer inventory | Opt-in Beta performance-per-weight profile; 64 GiB and 32K qualified boundary |
 
 Both artifacts store every routed weight exactly once, in physical
 expert-major order:
@@ -74,10 +74,10 @@ make -j8
   --ctx 8192
 ```
 
-The first command uses the published artifact. The second is valid only for the
-exact implementation-validated Q2_K_XL bytes below; its 262K endpoint and
-immutable distribution revision are still pending. `download_model.sh qwen-v2`
-intentionally continues to download Affine4.
+The first command uses the Stable/recommended artifact. The second is valid only
+for the exact published Beta Q2_K_XL bytes below; its 262K endpoint remains
+pending. `download_model.sh qwen-v2` intentionally continues to download
+Affine4, while `download_model.sh qwen-q2-beta` opts into Q2_K_XL.
 
 Normal startup needs no experimental guard, explicit Metal selection, sidecar,
 payload hash flag, cache geometry, `--resident`, or `--ssd-streaming`. Through
@@ -137,7 +137,7 @@ development output and must never be used for publication.
 
 ## Release identity
 
-The currently published release identity remains:
+The published Stable, Beta, and rejection-only identities are:
 
 | Item | Value |
 | --- | --- |
@@ -149,28 +149,33 @@ The currently published release identity remains:
 | Immutable revision | `7bf9c3f7f6136aeb2599d75ee61c0cc2f18e2b02` |
 | Minimum compatible runtime commit | `73a332fef82a0bcdd567d17e0de17aa004cad85d` |
 | Storage | `mlx-affine4/group-64` |
+| Beta publication state | `published-beta` |
+| Beta download target | `qwen-q2-beta` |
+| Beta artifact | `Qwen3.6-35B-A3B-DS4-ExpertMajor-v2-Q2_K_XL.gguf` |
+| Beta artifact bytes | 12,290,632,032 |
+| Beta artifact SHA-256 | `30c22f70aff0f05986b517ee4ad8fef554a1b5aab6971c9ca09f999566d30143` |
+| Beta embedded payload SHA-256 | `ccc3fbc2405d1dd73f8ac15741b0277514de4f46b80818531297ea9ffa0c6a3c` |
+| Beta immutable revision | `bdb363efaeb227bfd702c9145cb224fffa456891` |
+| Beta minimum compatible runtime commit | `42e2fec2a7dbb14a42e7a5612dfec00e33d443ca` |
+| Beta storage | `ggml/group-0` |
+| Beta profile | `q2-k-xl` |
+| Beta qualified context tokens | 32768 |
+| Beta minimum unified memory GiB | 64 |
+| Beta full-window qualified | `false` |
+| Beta recommended | `false` |
+| Beta canonical source bytes | 12,290,628,576 |
+| Beta canonical source SHA-256 | `96b9c0af5c77a4ecaabe3983175112b5ece763261c1ece12b2494b692a70dad7` |
 | Negative fixture state | `negative-only` |
 | Negative fixture | `Qwen3.6-35B-A3B-DS4-ExpertMajor-v2-Q4_K_S.gguf` |
 | Negative fixture bytes | 20,808,566,880 |
 | Negative fixture SHA-256 | `d7c43a6388ec20e6fe5530850350f96fdb0ac37c5ce36d3e5f92b172c447f56b` |
 
-The accepted Q2_K_XL implementation identity is:
-
-| Item | Value |
-| --- | --- |
-| Publication state | `implementation-validated; 262K endpoint and immutable publication revision pending` |
-| Canonical source bytes | 12,290,628,576 |
-| Canonical source SHA-256 | `96b9c0af5c77a4ecaabe3983175112b5ece763261c1ece12b2494b692a70dad7` |
-| Native artifact | `Qwen3.6-35B-A3B-DS4-ExpertMajor-v2-Q2_K_XL.gguf` |
-| Native artifact bytes | 12,290,632,032 |
-| Native artifact SHA-256 | `30c22f70aff0f05986b517ee4ad8fef554a1b5aab6971c9ca09f999566d30143` |
-| Embedded payload SHA-256 | `ccc3fbc2405d1dd73f8ac15741b0277514de4f46b80818531297ea9ffa0c6a3c` |
-| Storage | `ggml-block`, exact Q2_K_XL inventory |
-
 The machine-readable
 [Qwen release contract](contracts/qwen-release.json) remains canonical for
-downloadable artifacts. It still names Affine4 only; Q2_K_XL must not be added
-to the downloader until its immutable revision and runtime pin exist.
+downloadable artifacts. Q2_K_XL is intentionally marked Beta, nonrecommended,
+64 GiB minimum, and qualified through 32K only. Its smaller bytes do not inherit
+Affine4's lower-memory qualification, and the near-262K endpoint remains
+mandatory before Stable/full-window promotion.
 
 ## Qualification
 

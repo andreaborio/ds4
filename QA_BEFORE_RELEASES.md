@@ -31,17 +31,16 @@ target, or an artifact whose complete output hash is missing.
 | `DEEPSEEK_MIXED_V2` | Non-applicable until a mixed-quant DeepSeek ExpertMajor v2 artifact has a publication record with exact filename, bytes, and complete output SHA-256; do not resolve or use this variable before qualification |
 | `GLM_V2` | `GLM-5.2-DS4-ExpertMajor-v2-Q2_K.gguf`; 262,147,193,504 bytes; SHA-256 `7f5017e3076e706c78f2a5322b035a9e2f6519c65ff5b6be8b2d91aeff61505d` |
 | `QWEN_V2` | Status `published`; `Qwen3.6-35B-A3B-DS4-ExpertMajor-v2-MLX-Affine4-G64.gguf`; immutable repository revision `7bf9c3f7f6136aeb2599d75ee61c0cc2f18e2b02`; 20,808,566,880 bytes; SHA-256 `dd17266185833a9f05531ce366fd7284ddca1ed64aa3dcf06e321e8c72c9ea3d`; MLX affine4/group-64 routed storage; artifact-format compatibility floor `73a332fef82a0bcdd567d17e0de17aa004cad85d` |
-| `QWEN_Q2_V2` | Status `implementation-validated`, full-window qualification and publication pending; `Qwen3.6-35B-A3B-DS4-ExpertMajor-v2-Q2_K_XL.gguf`; 12,290,632,032 bytes; SHA-256 `30c22f70aff0f05986b517ee4ad8fef554a1b5aab6971c9ca09f999566d30143`; embedded payload SHA-256 `ccc3fbc2405d1dd73f8ac15741b0277514de4f46b80818531297ea9ffa0c6a3c`; exact mixed-GGML Q2_K_XL inventory; do not resolve from a public downloader until the endpoint lane, immutable revision, and runtime pin are recorded |
+| `QWEN_Q2_V2` | Status `published-beta`, nonrecommended and not full-window qualified; `Qwen3.6-35B-A3B-DS4-ExpertMajor-v2-Q2_K_XL.gguf`; explicit selector `qwen-q2-beta`; immutable repository revision `bdb363efaeb227bfd702c9145cb224fffa456891`; 12,290,632,032 bytes; SHA-256 `30c22f70aff0f05986b517ee4ad8fef554a1b5aab6971c9ca09f999566d30143`; embedded payload SHA-256 `ccc3fbc2405d1dd73f8ac15741b0277514de4f46b80818531297ea9ffa0c6a3c`; exact mixed-GGML Q2_K_XL inventory; minimum runtime commit `42e2fec2a7dbb14a42e7a5612dfec00e33d443ca`; minimum 64 GiB and qualified through exactly 32768 context tokens; near-262K remains a Stable/full-window gate |
 | `QWEN_RETIRED_Q4_NEGATIVE` | Status `negative-only`; rejection-only input `Qwen3.6-35B-A3B-DS4-ExpertMajor-v2-Q4_K_S.gguf`; 20,808,566,880 bytes; SHA-256 `d7c43a6388ec20e6fe5530850350f96fdb0ac37c5ce36d3e5f92b172c447f56b`; it must fail before inference |
 
 The machine-readable
 [Qwen release contract](docs/contracts/qwen-release.json) is the canonical
-source for the published Affine4 and negative-only Qwen rows.
-`make release-contract` rejects drift in those identities, the public
+source for the published Affine4, published Q2 Beta, and negative-only Qwen
+rows. `make release-contract` rejects drift in those identities, the public
 documentation, the downloader, and its model-free tests. The dated
 [Q2_K_XL decision](docs/benchmarks/2026-07-28-qwen-q2-k-xl-performance-weight.md)
-is authoritative for `QWEN_Q2_V2` until publication extends the release
-contract.
+remains authoritative for its measured performance and pending endpoint.
 
 Record the test machine by hardware model, unified memory, OS build, and power
 state in the release evidence. Do not encode local hostnames, addresses, or
@@ -56,11 +55,13 @@ must separately contain every accepted fix in `RUNTIME_SUPPORT.md`; the
 published Studio pin must advance past the 2026-07-27 Qwen allocation-time
 hardening before the 24 GiB lane can pass.
 
-Q2_K_XL is additive, not a replacement release. Before publishing it, rerun
-the complete Qwen gate on both `QWEN_V2` and `QWEN_Q2_V2`, preserve the
-Affine4 contract, add a separate explicit downloader selector, and record the
-Q2 immutable revision plus minimum runtime commit. A local Q2 file with the
-right filename but no complete hash match is not release evidence.
+Q2_K_XL is additive, not a replacement release. The Beta publication preserves
+the Affine4 contract, uses a separate explicit downloader selector, and records
+the Q2 immutable revision plus minimum runtime commit. It may be exercised only
+on the recorded 64 GiB tier and through its 32K qualified boundary. Before
+Stable/full-window promotion, rerun the complete Qwen gate on both `QWEN_V2`
+and `QWEN_Q2_V2` and complete both near-262K endpoint arms. A local Q2 file with
+the right filename but no complete hash match is not release evidence.
 
 ## 1. Repository And Build Sanity
 
@@ -466,9 +467,11 @@ The agent is the most stateful component.  Test it manually, not only by build.
 
 - Test `download_model.sh` in a temporary directory so local weights are not
   overwritten.
-- Verify `deepseek-v2`, `glm-v2`, and `qwen-v2` resolve to their exact qualified
-  repository, immutable revision, and ExpertMajor v2 filename. Qwen must pin
-  revision `7bf9c3f7f6136aeb2599d75ee61c0cc2f18e2b02` and must not resolve to the
+- Verify `deepseek-v2`, `glm-v2`, `qwen-v2`, and `qwen-q2-beta` resolve to their
+  exact qualified repository, immutable revision, and ExpertMajor v2 filename.
+  Stable Qwen must pin revision
+  `7bf9c3f7f6136aeb2599d75ee61c0cc2f18e2b02`; Q2 Beta must pin
+  `bdb363efaeb227bfd702c9145cb224fffa456891`. Neither may resolve to the
   retired Q4_K_S object.
 - Treat every `offline-*` target as a converter input, not a runnable artifact.
   Verify resume and file naming without launching inference from the source.
@@ -499,7 +502,8 @@ Do not sign off until:
   model-backed lanes with the residency modes defined by
   `docs/contracts/RUNTIME_SUPPORT.md`.
 - The Qwen immutable publication record and downloader gate matched the same
-  exact affine artifact used by the runtime lane.
+  exact Affine4 and, when included in the release, Q2 Beta artifacts used by
+  their runtime lanes.
 - The retired Qwen Q4_K_S store remained fail-closed and was not presented as a
   runnable or downloadable fallback.
 - CUDA source/tests/build targets were confirmed absent and recorded as frozen;

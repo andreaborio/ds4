@@ -263,16 +263,17 @@ AUTO; `--resident` is rejected and explicit SSD/cache controls are diagnostics,
 not alternate startup instructions.
 
 The supported `qwen35moe` runtime has one model/session/graph path and two exact
-ExpertMajor v2 weight profiles: the published MLX affine4/group-64 artifact and
-the implementation-validated, endpoint-pending Q2_K_XL mixed-GGML artifact.
+ExpertMajor v2 weight profiles: the Stable MLX affine4/group-64 artifact and
+the opt-in Q2_K_XL mixed-GGML Beta.
 Gated DeltaNet, attention, KV,
 routing, cache ownership, resident/SSD scheduling, and output execution are
 shared. Profile binding happens once from the complete tensor, tokenizer, and
 storage inventory; only physical Affine4 versus IQ/Q weight decoding is
 specialized. Affine2, generic GGML inventories, and the former v2 Q4_K_S
-payload are rejected. The release downloader continues to resolve Affine4
-until Q2_K_XL has valid near-262K endpoint evidence and an immutable
-publication revision.
+payload are rejected. `qwen-v2` continues to resolve Stable/recommended
+Affine4; `qwen-q2-beta` resolves the immutable Q2 artifact separately with a
+64 GiB minimum and 32K qualified context boundary. Near-262K evidence remains
+required before Q2 can become Stable or claim the model's full window.
 
 Through 24 GiB, the published Affine4 policy selects guarded SSD and an
 explicit resident request fails. On larger qualified hosts AUTO requires both

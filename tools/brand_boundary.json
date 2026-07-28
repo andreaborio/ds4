@@ -152,7 +152,7 @@
       "location": "content",
       "token": "DS4",
       "classification": "migration-pending",
-      "maximum": 11
+      "maximum": 12
     },
     {
       "path": "EXPERT_PRUNE.md",
@@ -285,7 +285,7 @@
       "location": "content",
       "token": "DS4",
       "classification": "migration-pending",
-      "maximum": 5
+      "maximum": 6
     },
     {
       "path": "SSD_STREAMING_VERIFICATION.md",
@@ -677,14 +677,14 @@
       "location": "content",
       "token": "DS4",
       "classification": "compatibility",
-      "maximum": 5
+      "maximum": 7
     },
     {
       "path": "docs/contracts/qwen-release.json",
       "location": "content",
       "token": "DS4",
       "classification": "serialized/permanent",
-      "maximum": 2
+      "maximum": 3
     },
     {
       "path": "docs/deepseek-expert-major-v2.md",
@@ -824,7 +824,7 @@
       "location": "content",
       "token": "DS4",
       "classification": "migration-pending",
-      "maximum": 7
+      "maximum": 8
     },
     {
       "path": "ds4.c",

@@ -15,7 +15,7 @@ and Qwen's lower-memory extension in
 | Model family | Minimum unified memory | Qualified Metal modes | Release startup |
 | --- | ---: | --- | --- |
 | DeepSeek V4 Flash | 64 GiB | AUTO resolving to resident or SSD; explicit resident and SSD according to the artifact gate | `./hebrus -m DEEPSEEK-DS4-ExpertMajor-v2.gguf` |
-| Qwen3.6-35B-A3B | 16 GiB for the published Affine4 profile; Q2_K_XL lower-memory tiers pending physical qualification | 16 GiB Affine4 is qualified with guarded SSD. The allocation-time release candidate extends deterministic guarded SSD through 24 GiB; above 24 GiB AUTO may resolve to resident or SSD according to the Qwen admission gates. Q2_K_XL has recorded 64 GiB resident/SSD implementation evidence through 32K; its full-window endpoint qualification is pending | `./hebrus -m Qwen3.6-35B-A3B-DS4-ExpertMajor-v2-MLX-Affine4-G64.gguf` |
+| Qwen3.6-35B-A3B | 16 GiB for Stable Affine4; 64 GiB for Q2_K_XL Beta | 16 GiB Affine4 is qualified with guarded SSD. The allocation-time release candidate extends deterministic guarded SSD through 24 GiB; above 24 GiB AUTO may resolve to resident or SSD according to the Qwen admission gates. Q2_K_XL Beta has recorded 64 GiB resident/SSD evidence through 32768 tokens; near-262K/full-window qualification is pending | Stable: `./hebrus -m Qwen3.6-35B-A3B-DS4-ExpertMajor-v2-MLX-Affine4-G64.gguf`; Beta: `./hebrus -m Qwen3.6-35B-A3B-DS4-ExpertMajor-v2-Q2_K_XL.gguf` |
 | GLM 5.2 | 64 GiB | AUTO resolving to SSD streaming only; resident is rejected | `./hebrus -m GLM-DS4-ExpertMajor-v2.gguf --ctx 8192` |
 
 All rows require Apple Metal and a validated embedded `ds4.expert_major.v2`
@@ -25,8 +25,8 @@ rather than an additional qualified startup contract. Detailed planners and gate
 [`GOLD_METAL_SSD.md`](../../GOLD_METAL_SSD.md) and the family documents.
 
 Qwen has one model/session/graph runtime and two exact weight profiles:
-the published MLX affine4/group-64 inventory and the admitted,
-publication-pending Q2_K_XL mixed-GGML inventory. Attention, Gated DeltaNet, KV, routing,
+the published MLX affine4/group-64 inventory and the opt-in `published-beta`
+Q2_K_XL mixed-GGML inventory. Attention, Gated DeltaNet, KV, routing,
 resident/SSD scheduling, cache ownership, and output execution are shared.
 Only physical weight decoding and the corresponding dense/routed primitives
 differ. The binding is fail-closed and happens once from the complete tensor,
@@ -72,7 +72,7 @@ the DeepSeek and GLM production contract. Do not infer support for another
 family from Qwen's successful admission.
 
 Runtime support and public artifact distribution are separate gates. The
-downloadable Qwen store remains the `published`
+Stable/recommended Qwen store remains the `published`
 `Qwen3.6-35B-A3B-DS4-ExpertMajor-v2-MLX-Affine4-G64.gguf`, a
 20,808,566,880-byte MLX affine4/group-64 artifact with SHA-256
 `dd17266185833a9f05531ce366fd7284ddca1ed64aa3dcf06e321e8c72c9ea3d`.
@@ -87,15 +87,18 @@ older `Qwen3.6-35B-A3B-DS4-ExpertMajor-v2-Q4_K_S.gguf` store is
 `negative-only`, not a downloadable runtime fallback. The machine-readable
 [Qwen release contract](qwen-release.json) is the canonical identity record.
 
-The runtime additionally admits the exact endpoint-pending Q2_K_XL implementation
-artifact: 12,290,632,032 bytes, SHA-256
+The runtime additionally admits the exact opt-in `published-beta` Q2_K_XL
+artifact `Qwen3.6-35B-A3B-DS4-ExpertMajor-v2-Q2_K_XL.gguf`:
+12,290,632,032 bytes, SHA-256
 `30c22f70aff0f05986b517ee4ad8fef554a1b5aab6971c9ca09f999566d30143`,
 with embedded payload SHA-256
 `ccc3fbc2405d1dd73f8ac15741b0277514de4f46b80818531297ea9ffa0c6a3c`.
-It is not yet downloadable or a `qwen-v2` replacement. Publication requires
-the near-262K endpoint lane, an immutable repository revision, and a compatible
-runtime commit to be added to the release contract while preserving the
-Affine4 entry.
+`download_model.sh qwen-q2-beta` pins immutable repository revision
+`bdb363efaeb227bfd702c9145cb224fffa456891` and requires runtime commit
+`42e2fec2a7dbb14a42e7a5612dfec00e33d443ca`. It is nonrecommended, has a
+64 GiB minimum, and is qualified only through exactly 32768 context tokens.
+It is not a `qwen-v2` replacement and makes no full-window claim. The near-262K
+endpoint lane remains mandatory before Stable/full-window promotion.
 
 ## Model Artifact Admission
 

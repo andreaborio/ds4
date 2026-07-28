@@ -20,6 +20,7 @@ import sys
 with open(sys.argv[1], encoding="utf-8") as handle:
     contract = json.load(handle)
 published = contract["publishedArtifact"]
+beta = contract["betaArtifact"]
 negative = contract["negativeArtifact"]
 values = {
     "QWEN_STATUS": published["status"],
@@ -29,6 +30,15 @@ values = {
     "QWEN_SHA256": published["sha256"],
     "QWEN_REVISION": published["revision"],
     "QWEN_RUNTIME_COMMIT": published["runtimeCommit"],
+    "QWEN_Q2_STATUS": beta["status"],
+    "QWEN_Q2_REPOSITORY": contract["repository"],
+    "QWEN_Q2_FILE": beta["filename"],
+    "QWEN_Q2_BYTES": str(beta["bytes"]),
+    "QWEN_Q2_SHA256": beta["sha256"],
+    "QWEN_Q2_REVISION": beta["revision"],
+    "QWEN_Q2_RUNTIME_COMMIT": beta["runtimeCommit"],
+    "QWEN_Q2_QUALIFIED_CONTEXT": str(beta["qualifiedContextTokens"]),
+    "QWEN_Q2_MIN_MEMORY_GIB": str(beta["minimumMemoryGiB"]),
     "QWEN_NEGATIVE_FILE": negative["filename"],
     "QWEN_NEGATIVE_SHA256": negative["sha256"],
 }
@@ -96,7 +106,18 @@ assert_exact_line "RUNTIME_QWEN_BYTES=$QWEN_BYTES"
 assert_exact_line "RUNTIME_QWEN_SHA256=\"$QWEN_SHA256\""
 assert_exact_line "RUNTIME_QWEN_REVISION=\"$QWEN_REVISION\""
 assert_exact_line "RUNTIME_QWEN_MIN_RUNTIME_COMMIT=\"$QWEN_RUNTIME_COMMIT\""
+assert_exact_line "RUNTIME_QWEN_Q2_STATUS=\"$QWEN_Q2_STATUS\""
+assert_exact_line "RUNTIME_QWEN_Q2_REPO=\"$QWEN_Q2_REPOSITORY\""
+assert_exact_line "RUNTIME_QWEN_Q2_FILE=\"$QWEN_Q2_FILE\""
+assert_exact_line "RUNTIME_QWEN_Q2_BYTES=$QWEN_Q2_BYTES"
+assert_exact_line "RUNTIME_QWEN_Q2_SHA256=\"$QWEN_Q2_SHA256\""
+assert_exact_line "RUNTIME_QWEN_Q2_REVISION=\"$QWEN_Q2_REVISION\""
+assert_exact_line "RUNTIME_QWEN_Q2_MIN_RUNTIME_COMMIT=\"$QWEN_Q2_RUNTIME_COMMIT\""
+assert_exact_line "RUNTIME_QWEN_Q2_QUALIFIED_CONTEXT=$QWEN_Q2_QUALIFIED_CONTEXT"
+assert_exact_line "RUNTIME_QWEN_Q2_MIN_MEMORY_GIB=$QWEN_Q2_MIN_MEMORY_GIB"
 [ "$QWEN_STATUS" = published ] || fail "canonical Qwen artifact is not published"
+[ "$QWEN_Q2_STATUS" = published-beta ] ||
+    fail "canonical Qwen Q2 artifact is not a published Beta"
 if grep -Fq -- "$QWEN_NEGATIVE_FILE" "$SCRIPT" ||
         grep -Fq -- "$QWEN_NEGATIVE_SHA256" "$SCRIPT"; then
     fail "negative-only Qwen artifact is exposed by the downloader"
@@ -114,6 +135,11 @@ assert_case_assignment qwen-v2 'MODEL_FILE=$RUNTIME_QWEN_FILE'
 assert_case_assignment qwen-v2 'MODEL_REVISION=$RUNTIME_QWEN_REVISION'
 assert_case_assignment qwen-v2 'MODEL_BYTES=$RUNTIME_QWEN_BYTES'
 assert_case_assignment qwen-v2 'MODEL_SHA256=$RUNTIME_QWEN_SHA256'
+assert_case_assignment qwen-q2-beta 'MODEL_REPO=$RUNTIME_QWEN_Q2_REPO'
+assert_case_assignment qwen-q2-beta 'MODEL_FILE=$RUNTIME_QWEN_Q2_FILE'
+assert_case_assignment qwen-q2-beta 'MODEL_REVISION=$RUNTIME_QWEN_Q2_REVISION'
+assert_case_assignment qwen-q2-beta 'MODEL_BYTES=$RUNTIME_QWEN_Q2_BYTES'
+assert_case_assignment qwen-q2-beta 'MODEL_SHA256=$RUNTIME_QWEN_Q2_SHA256'
 sh -n "$SCRIPT" || fail "download_model.sh has invalid shell syntax"
 
 # Exercise the real downloader logic without a production identity override.
@@ -130,6 +156,8 @@ sed \
     -e "s/^RUNTIME_GLM_SHA256=.*/RUNTIME_GLM_SHA256=\"$FIXTURE_SHA256\"/" \
     -e "s/^RUNTIME_QWEN_BYTES=.*/RUNTIME_QWEN_BYTES=$FIXTURE_BYTES/" \
     -e "s/^RUNTIME_QWEN_SHA256=.*/RUNTIME_QWEN_SHA256=\"$FIXTURE_SHA256\"/" \
+    -e "s/^RUNTIME_QWEN_Q2_BYTES=.*/RUNTIME_QWEN_Q2_BYTES=$FIXTURE_BYTES/" \
+    -e "s/^RUNTIME_QWEN_Q2_SHA256=.*/RUNTIME_QWEN_Q2_SHA256=\"$FIXTURE_SHA256\"/" \
     "$SCRIPT" >"$TEST_SCRIPT"
 chmod +x "$TEST_SCRIPT"
 
@@ -227,6 +255,11 @@ run_runtime_success \
     "$QWEN_REPOSITORY" \
     "$QWEN_FILE" \
     "$QWEN_REVISION"
+run_runtime_success \
+    qwen-q2-beta \
+    "$QWEN_Q2_REPOSITORY" \
+    "$QWEN_Q2_FILE" \
+    "$QWEN_Q2_REVISION"
 
 CORRUPT_DIR="$TMP_ROOT/corrupt-existing"
 CORRUPT_FILE="$CORRUPT_DIR/GLM-5.2-DS4-ExpertMajor-v2-Q2_K.gguf"

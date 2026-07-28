@@ -58,11 +58,14 @@ layout.
   [`ADR 0006`](adr/0006-qwen-dual-weight-codecs.md).
 - **Qualified and published:** MLX affine4/group-64 resident and SSD execution
   on the hardware lanes recorded in the current benchmark index.
-- **Qualified implementation, publication pending:** exact Q2_K_XL
+- **Published Beta:** exact Q2_K_XL
   mixed-GGML inventory, 12,290,632,032 bytes, SHA-256
   `30c22f70aff0f05986b517ee4ad8fef554a1b5aab6971c9ca09f999566d30143`.
-  The immutable distribution revision and release-contract entry remain
-  pending; the Affine4 release is preserved.
+  The immutable Beta revision is
+  `bdb363efaeb227bfd702c9145cb224fffa456891`; it is opt-in, nonrecommended,
+  limited to 64 GiB and the completed 32K context lane, and preserves the
+  Affine4 release. Near-262K remains pending before Stable/full-window
+  promotion.
 - **Correctness:** the final resident and SSD lane retains deterministic token
   and logit comparisons with no new swapout in the recorded qualification.
 - **Release artifact:**

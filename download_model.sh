@@ -18,6 +18,15 @@ RUNTIME_QWEN_REVISION="7bf9c3f7f6136aeb2599d75ee61c0cc2f18e2b02"
 # Artifact-format compatibility floor; release safety is gated separately by
 # docs/contracts/RUNTIME_SUPPORT.md and QA_BEFORE_RELEASES.md.
 RUNTIME_QWEN_MIN_RUNTIME_COMMIT="73a332fef82a0bcdd567d17e0de17aa004cad85d"
+RUNTIME_QWEN_Q2_STATUS="published-beta"
+RUNTIME_QWEN_Q2_REPO="andreaborio/Qwen3.6-35B-A3B-Hebrus-GGUF"
+RUNTIME_QWEN_Q2_FILE="Qwen3.6-35B-A3B-DS4-ExpertMajor-v2-Q2_K_XL.gguf"
+RUNTIME_QWEN_Q2_BYTES=12290632032
+RUNTIME_QWEN_Q2_SHA256="30c22f70aff0f05986b517ee4ad8fef554a1b5aab6971c9ca09f999566d30143"
+RUNTIME_QWEN_Q2_REVISION="bdb363efaeb227bfd702c9145cb224fffa456891"
+RUNTIME_QWEN_Q2_MIN_RUNTIME_COMMIT="42e2fec2a7dbb14a42e7a5612dfec00e33d443ca"
+RUNTIME_QWEN_Q2_QUALIFIED_CONTEXT=32768
+RUNTIME_QWEN_Q2_MIN_MEMORY_GIB=64
 RUNTIME_REVISION="ds4-v0.2.0"
 
 OFFLINE_DEEPSEEK_REPO="antirez/deepseek-v4-gguf"
@@ -42,6 +51,7 @@ Usage:
   ./download_model.sh deepseek-v2 [--token TOKEN]
   ./download_model.sh glm-v2 [--token TOKEN]
   ./download_model.sh qwen-v2 [--token TOKEN]
+  ./download_model.sh qwen-q2-beta [--token TOKEN]
   ./download_model.sh offline-deepseek-flash-q2 [--token TOKEN]
   ./download_model.sh offline-deepseek-flash-q2-q4 [--token TOKEN]
   ./download_model.sh offline-deepseek-flash-q4 [--token TOKEN]
@@ -50,7 +60,9 @@ Usage:
 Runtime targets:
   deepseek-v2  Qualified DeepSeek V4 Flash ExpertMajor v2 artifact.
   glm-v2       Qualified GLM 5.2 ExpertMajor v2 artifact.
-  qwen-v2      Qualified Qwen3.6-35B-A3B affine4/group-64 artifact.
+  qwen-v2      Stable/recommended Qwen3.6-35B-A3B affine4/group-64 artifact.
+  qwen-q2-beta Qwen3.6-35B-A3B Q2_K_XL Beta: 64 GiB minimum, qualified
+                through 32K; 262K/full-window qualification is pending.
 
 Offline-only targets:
   offline-deepseek-flash-q2
@@ -108,6 +120,13 @@ case "$TARGET" in
         MODEL_REVISION=$RUNTIME_QWEN_REVISION
         MODEL_BYTES=$RUNTIME_QWEN_BYTES
         MODEL_SHA256=$RUNTIME_QWEN_SHA256
+        ;;
+    qwen-q2-beta)
+        MODEL_REPO=$RUNTIME_QWEN_Q2_REPO
+        MODEL_FILE=$RUNTIME_QWEN_Q2_FILE
+        MODEL_REVISION=$RUNTIME_QWEN_Q2_REVISION
+        MODEL_BYTES=$RUNTIME_QWEN_Q2_BYTES
+        MODEL_SHA256=$RUNTIME_QWEN_Q2_SHA256
         ;;
     offline-deepseek-flash-q2)
         MODEL_REPO=$OFFLINE_DEEPSEEK_REPO

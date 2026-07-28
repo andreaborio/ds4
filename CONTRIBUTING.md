@@ -127,6 +127,22 @@ runtime must also contain every fix required by `RUNTIME_SUPPORT.md`.
 `Qwen3.6-35B-A3B-DS4-ExpertMajor-v2-Q4_K_S.gguf` object is `negative-only`, not
 a runnable fallback. See
 [`docs/qwen-expert-major-store.md`](docs/qwen-expert-major-store.md).
+
+The additive Q2_K_XL artifact is `published-beta` and must remain opt-in through
+`download_model.sh qwen-q2-beta`; it never replaces `qwen-v2`. Its exact
+identity is
+`Qwen3.6-35B-A3B-DS4-ExpertMajor-v2-Q2_K_XL.gguf`, 12,290,632,032 bytes,
+SHA-256
+`30c22f70aff0f05986b517ee4ad8fef554a1b5aab6971c9ca09f999566d30143`,
+embedded payload SHA-256
+`ccc3fbc2405d1dd73f8ac15741b0277514de4f46b80818531297ea9ffa0c6a3c`.
+It is pinned at immutable revision
+`bdb363efaeb227bfd702c9145cb224fffa456891` with minimum compatible runtime
+commit `42e2fec2a7dbb14a42e7a5612dfec00e33d443ca`. A Beta publication may expose
+only its measured boundary: minimum 64 GiB, 32768 qualified context tokens,
+nonrecommended, and explicitly not full-window qualified. The near-262K lane
+remains blocking before Stable/full-window promotion.
+
 Change the JSON contract first, update every intentional human-readable mirror,
 then run `make release-contract release-contract-test`; do not update a mirror
 as an independent release authority.
@@ -236,13 +252,15 @@ hardware/mode plan, peak memory pressure, and swapout delta.
 The currently validated Qwen3.6 metadata declares a 262,144-token context, so
 full-window qualification requires a near-262K endpoint arm in addition to the
 standard matrix and the 65,536/100,000-token diagnostic arms where applicable.
-An additive implementation may merge with that arm explicitly pending only if
-it does not replace the published artifact/downloader, makes no full-window
-qualification claim, and records the endpoint as a blocking publication and
-release gate. If a qualified hardware or residency profile cannot safely
-complete the context endpoint it advertises, either fix the runtime or narrow
-that profile's public context contract and fail larger requests closed. Never
-silently substitute 32K/100K evidence for the release endpoint.
+An additive profile may merge or be distributed as an explicitly labelled,
+nonrecommended Beta while that arm is pending only if it does not replace the
+Stable artifact/downloader, pins an immutable exact identity, advertises no
+context beyond its completed long-context lane, and records the endpoint as a
+blocking Stable/full-window gate. If a qualified hardware or residency profile
+cannot safely complete the context endpoint it advertises, either fix the
+runtime or narrow that profile's public context contract and fail larger
+requests closed. Never silently substitute 32K/100K evidence for the release
+endpoint.
 
 Routing, expert-cache, residency, and expert-I/O changes must also complete one
 second 32,768-token diagnostic lane from a different prompt domain. Use

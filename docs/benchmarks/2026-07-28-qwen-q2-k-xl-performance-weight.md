@@ -2,9 +2,10 @@
 
 Date: 2026-07-28
 
-Status: accepted dual-profile runtime and performance decision; Q2_K_XL
-publication identity pending the reviewed runtime commit and immutable artifact
-revision.
+Status: accepted dual-profile runtime and performance decision; Q2_K_XL is
+published as an opt-in Beta at immutable revision
+`bdb363efaeb227bfd702c9145cb224fffa456891`, with 64 GiB/32K scope and
+near-262K Stable/full-window qualification pending.
 
 Decision: select the exact 12,290,632,032-byte Hebrus-native Q2_K_XL
 ExpertMajor v2 representation. It is 40.93 percent smaller than the previous
@@ -291,9 +292,10 @@ runner. The Q2_K_XL endpoint arm was not started.
 | N/A; not started | Q2_K_XL resident endpoint | NOT RUN | No endpoint evidence |
 
 Under the endpoint-pending merge rule in `CONTRIBUTING.md`, this permits the
-additive implementation to merge without changing the published Affine4
-download or making a full-window claim. Both endpoint arms remain blocking
-before Q2_K_XL publication or the next full-window release qualification.
+additive implementation and a separately labelled Beta artifact without
+changing the Stable Affine4 download or making a full-window claim. Both
+endpoint arms remain blocking before Q2_K_XL Stable/full-window promotion or
+the next release qualification that advertises the model's full window.
 
 ## Speculative decoding decision
 
@@ -366,17 +368,19 @@ EOS 248046, padding 248055, and its 8,057-byte template. Runtime admission binds
 each tokenizer contract to its exact tensor and storage profile; neither is a
 fallback for the other.
 
-Q2_K_XL publication must:
+The Beta publication completed the non-endpoint identity gates:
 
-1. merge the reviewed dual-profile runtime while preserving Affine4;
-2. complete and retain valid Affine4 and Q2_K_XL near-262K endpoint arms;
-3. publish and independently hash the exact Q2_K_XL native artifact;
-4. pin its immutable repository revision, bytes, hash, and runtime commit in
-   the machine-readable Qwen release contract without deleting the Affine4
-   identity;
-5. add a separate explicit download selector for Q2_K_XL rather than silently
-   changing what `download_model.sh qwen-v2` returns.
+1. the reviewed dual-profile runtime merged while preserving Affine4;
+2. the exact Q2_K_XL native artifact was published and independently hashed;
+3. immutable revision
+   `bdb363efaeb227bfd702c9145cb224fffa456891`, bytes, hash, and runtime commit
+   were pinned in the machine-readable Qwen release contract without deleting
+   the Affine4 identity;
+4. the separate `download_model.sh qwen-q2-beta` selector was added rather than
+   changing what `qwen-v2` returns;
+5. the public Beta boundary was restricted to nonrecommended, minimum 64 GiB,
+   qualified through 32K, and explicitly not full-window qualified.
 
-Until those steps complete, Q2_K_XL is an implementation-validated,
-endpoint-pending identity, not an already downloadable or full-window-qualified
-artifact. Affine4 remains the published release.
+Before Stable/full-window promotion, complete and retain valid Affine4 and
+Q2_K_XL near-262K endpoint arms, then update the release contract and public
+claims from that evidence. Affine4 remains the Stable/recommended release.

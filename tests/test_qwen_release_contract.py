@@ -91,15 +91,17 @@ class QwenReleaseContractTests(unittest.TestCase):
     def test_every_human_surface_is_bound_to_the_manifest(self) -> None:
         contract = self.fixture.contract()
         published = contract["publishedArtifact"]
+        beta = contract["betaArtifact"]
         negative = contract["negativeArtifact"]
         assert isinstance(published, dict)
+        assert isinstance(beta, dict)
         assert isinstance(negative, dict)
         cases = (
             ("README.md", published["filename"], "Qwen3.6-DRIFT.gguf"),
-            ("CONTRIBUTING.md", published["revision"], "a" * 40),
+            ("CONTRIBUTING.md", beta["revision"], "a" * 40),
             (
                 "docs/contracts/RUNTIME_SUPPORT.md",
-                published["runtimeCommit"],
+                beta["runtimeCommit"],
                 "b" * 40,
             ),
             ("QA_BEFORE_RELEASES.md", negative["sha256"], "c" * 64),
@@ -128,6 +130,14 @@ class QwenReleaseContractTests(unittest.TestCase):
         self.fixture.replace_once("download_model.sh", old, "RUNTIME_QWEN_BYTES=1")
         self.assert_fails_with("download_model.sh: RUNTIME_QWEN_BYTES")
 
+    def test_beta_downloader_assignment_drift_fails(self) -> None:
+        contract = self.fixture.contract()
+        beta = contract["betaArtifact"]
+        assert isinstance(beta, dict)
+        old = f"RUNTIME_QWEN_Q2_BYTES={beta['bytes']}"
+        self.fixture.replace_once("download_model.sh", old, "RUNTIME_QWEN_Q2_BYTES=1")
+        self.assert_fails_with("download_model.sh: RUNTIME_QWEN_Q2_BYTES")
+
     def test_negative_artifact_cannot_become_downloadable(self) -> None:
         contract = self.fixture.contract()
         negative = contract["negativeArtifact"]
@@ -149,6 +159,7 @@ class QwenReleaseContractTests(unittest.TestCase):
     def test_manifest_statuses_fail_closed(self) -> None:
         for mutation, expected in (
             (("publishedArtifact", "status", "candidate"), "must be published"),
+            (("betaArtifact", "status", "stable"), "must be published-beta"),
             (("negativeArtifact", "status", "retired"), "must be negative-only"),
         ):
             with self.subTest(mutation=mutation):
@@ -179,7 +190,7 @@ class QwenReleaseContractTests(unittest.TestCase):
                 try:
                     document = fixture.contract()
                     if mutation == "unknown-key":
-                        document["notes"] = "not part of schema 1"
+                        document["notes"] = "not part of schema 2"
                     else:
                         published = document["publishedArtifact"]
                         assert isinstance(published, dict)

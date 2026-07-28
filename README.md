@@ -72,11 +72,11 @@ ExpertMajor v2. AUTO is the normal startup mode.
 | --- | ---: | --- | --- |
 | DeepSeek V4 Flash | 64 GiB | AUTO resolving to resident or SSD; explicit modes for qualification | Published ExpertMajor v2 artifact; `download_model.sh deepseek-v2` |
 | GLM 5.2 | 64 GiB | AUTO resolving to SSD streaming only; resident requests are rejected | Published ExpertMajor v2 artifact; `download_model.sh glm-v2` |
-| Qwen3.6-35B-A3B | 16 GiB for the published Affine4 profile | One shared runtime supports exact MLX Affine4 G64 and Q2_K_XL weight profiles. Guarded SSD is qualified for Affine4 at 16 GiB; Q2_K_XL has recorded 64 GiB resident/SSD implementation evidence through 32K, with full-window qualification pending | Affine4 is published through `download_model.sh qwen-v2`; Q2_K_XL publication is pending |
+| Qwen3.6-35B-A3B | 16 GiB for Stable Affine4; 64 GiB for Q2_K_XL Beta | One shared runtime supports exact MLX Affine4 G64 and Q2_K_XL weight profiles. Guarded SSD is qualified for Affine4 at 16 GiB; Q2_K_XL Beta has resident/SSD evidence through 32K, while 262K/full-window qualification remains pending | Stable/recommended Affine4: `download_model.sh qwen-v2`; opt-in Q2_K_XL Beta: `download_model.sh qwen-q2-beta` |
 
 The canonical machine-readable
 [Qwen release contract](docs/contracts/qwen-release.json) records the current
-artifact as `published`. The release is exactly
+Stable artifact as `published`. The release is exactly
 `Qwen3.6-35B-A3B-DS4-ExpertMajor-v2-MLX-Affine4-G64.gguf`,
 20,808,566,880 bytes, SHA-256
 `dd17266185833a9f05531ce366fd7284ddca1ed64aa3dcf06e321e8c72c9ea3d`.
@@ -91,14 +91,23 @@ older `Qwen3.6-35B-A3B-DS4-ExpertMajor-v2-Q4_K_S.gguf` store is incompatible
 with the current runtime and remains `negative-only`, never a download or
 inference fallback.
 
-The second admitted Qwen profile is the exact 12,290,632,032-byte Q2_K_XL
-ExpertMajor v2 artifact, SHA-256
+The second admitted Qwen profile is `published-beta`, is not recommended, and
+is available only through the explicit `qwen-q2-beta` selector. It is the exact
+`Qwen3.6-35B-A3B-DS4-ExpertMajor-v2-Q2_K_XL.gguf` artifact:
+12,290,632,032 bytes, SHA-256
 `30c22f70aff0f05986b517ee4ad8fef554a1b5aab6971c9ca09f999566d30143`.
+Its embedded payload SHA-256 is
+`ccc3fbc2405d1dd73f8ac15741b0277514de4f46b80818531297ea9ffa0c6a3c`.
+The immutable repository revision is
+`bdb363efaeb227bfd702c9145cb224fffa456891`, and the minimum compatible
+runtime commit is `42e2fec2a7dbb14a42e7a5612dfec00e33d443ca`.
 It is 40.93% smaller than the published Affine4 file and uses the same Qwen
 session, attention, Gated DeltaNet, KV, cache, resident, and SSD pipeline.
-Only the physical weight decoders differ. Its immutable distribution revision
-is not published yet, so `qwen-v2` deliberately continues to download
-Affine4. See the
+Only the physical weight decoders differ. The Beta contract has a 64 GiB
+minimum and is qualified through exactly 32768 context tokens; it is not
+full-window qualified because the near-262K endpoint was not run. `qwen-v2`
+therefore deliberately continues to download the Stable Affine4 artifact. See
+the
 [dual-codec decision](docs/adr/0006-qwen-dual-weight-codecs.md) and the
 [Q2_K_XL evidence](docs/benchmarks/2026-07-28-qwen-q2-k-xl-performance-weight.md).
 
@@ -224,10 +233,10 @@ Sources:
 Performance acceptance requires isolated short, medium, large, and 32K
 long-context lanes. Attention, KV, cache, RoPE, allocation, and context changes
 also require 65K and 100K. Full-window Qwen publication/release qualification
-requires the near-262K endpoint admitted by validated metadata; this Q2_K_XL
-implementation has not completed that endpoint and remains publication-pending.
-A short-context best is not substituted for a credible long-context or
-endpoint claim.
+requires the near-262K endpoint admitted by validated metadata. Q2_K_XL is
+published only as an opt-in Beta constrained to its measured 32K boundary; it
+does not make a full-window or lower-memory claim. A short-context best is not
+substituted for a credible long-context or endpoint claim.
 
 ## Documentation
 
