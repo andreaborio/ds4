@@ -42,6 +42,24 @@ typedef struct {
 } qwen35_split_args;
 
 typedef struct {
+    uint32_t n_token;
+    uint32_t n_query_head;
+    uint32_t head_dim;
+    uint32_t reserved;
+    uint64_t projection_token_stride;
+    uint64_t projection_head_stride;
+    uint64_t projection_dim_stride;
+    uint64_t query_token_stride;
+    uint64_t query_head_stride;
+    uint64_t query_dim_stride;
+    uint64_t gate_token_stride;
+    uint64_t gate_head_stride;
+    uint64_t gate_dim_stride;
+    float    eps;
+    uint32_t reserved_tail;
+} qwen35_split_rms_norm_args;
+
+typedef struct {
     uint64_t n_value;
     uint64_t input_stride;
     uint64_t gate_stride;
@@ -96,6 +114,35 @@ typedef struct {
 } qwen35_delta_args;
 
 typedef struct {
+    uint32_t n_token;
+    uint32_t n_key_head;
+    uint32_t n_value_head;
+    uint32_t key_dim;
+    uint32_t value_dim;
+    uint32_t reserved;
+    uint64_t projection_token_stride;
+    uint64_t query_offset;
+    uint64_t key_offset;
+    uint64_t value_offset;
+    uint64_t query_head_stride;
+    uint64_t query_dim_stride;
+    uint64_t key_head_stride;
+    uint64_t key_dim_stride;
+    uint64_t value_head_stride;
+    uint64_t value_dim_stride;
+    uint64_t log_decay_token_stride;
+    uint64_t log_decay_head_stride;
+    uint64_t beta_token_stride;
+    uint64_t beta_head_stride;
+    uint64_t state_head_stride;
+    uint64_t state_value_stride;
+    uint64_t state_key_stride;
+    uint64_t output_token_stride;
+    uint64_t output_head_stride;
+    uint64_t output_dim_stride;
+} qwen35_delta_sequence_args;
+
+typedef struct {
     uint32_t n_vector;
     uint32_t dim;
     float epsilon;
@@ -123,13 +170,40 @@ typedef struct {
 } qwen35_embedding_args;
 
 typedef struct {
+    uint32_t n_token;
+    uint32_t n_row;
+    uint32_t n_embd;
+    uint32_t block_size;
+    uint64_t source_row_stride;
+    uint64_t source_block_stride;
+    uint64_t source_scale_offset;
+    uint64_t source_quant_offset;
+    uint64_t source_quant_stride;
+    uint64_t token_id_stride;
+    uint64_t output_token_stride;
+    uint64_t output_dim_stride;
+} qwen35_embedding_batch_args;
+
+typedef struct {
+    uint16_t d;
+    uint16_t dmin;
+    uint8_t scales[12];
+    uint8_t qh[32];
+    uint8_t qs[128];
+} qwen35_block_q5_k;
+
+typedef struct {
+    uint32_t n_token;
     uint32_t n_value_head;
-    uint32_t reserved;
+    uint64_t alpha_logit_token_stride;
     uint64_t alpha_logit_head_stride;
+    uint64_t beta_logit_token_stride;
     uint64_t beta_logit_head_stride;
     uint64_t ssm_a_head_stride;
     uint64_t dt_bias_head_stride;
+    uint64_t log_decay_token_stride;
     uint64_t log_decay_head_stride;
+    uint64_t beta_token_stride;
     uint64_t beta_head_stride;
 } qwen35_controls_args;
 
@@ -161,9 +235,14 @@ _Static_assert(sizeof(qwen35_sigmoid_mul_args) == 32, "sigmoid ABI drift");
 _Static_assert(sizeof(qwen35_rope_args) == 80, "RoPE ABI drift");
 _Static_assert(sizeof(qwen35_conv_args) == 56, "conv ABI drift");
 _Static_assert(sizeof(qwen35_delta_args) == 120, "DeltaNet ABI drift");
+_Static_assert(sizeof(qwen35_delta_sequence_args) == 184,
+               "DeltaNet sequence ABI drift");
 _Static_assert(sizeof(qwen35_norm_args) == 72, "RMSNorm ABI drift");
 _Static_assert(sizeof(qwen35_embedding_args) == 64, "embedding ABI drift");
-_Static_assert(sizeof(qwen35_controls_args) == 56, "controls ABI drift");
+_Static_assert(sizeof(qwen35_embedding_batch_args) == 80,
+               "batched embedding ABI drift");
+_Static_assert(sizeof(qwen35_block_q5_k) == 176, "Q5_K block ABI drift");
+_Static_assert(sizeof(qwen35_controls_args) == 88, "controls ABI drift");
 _Static_assert(sizeof(qwen35_gqa_args) == 96, "GQA ABI drift");
 _Static_assert(sizeof(qwen35_router_top8_args) == 24, "router top-8 ABI drift");
 
@@ -266,6 +345,83 @@ static bool dispatch_kernel(
     return true;
 }
 
+static bool dispatch_gated_delta_sequence(
+        id<MTLDevice>                    device,
+        id<MTLCommandQueue>              queue,
+        id<MTLLibrary>                   library,
+        NSString                        *sequence_name,
+        const qwen35_delta_sequence_args *args,
+        id<MTLBuffer>                    projection,
+        id<MTLBuffer>                    decay,
+        id<MTLBuffer>                    beta,
+        id<MTLBuffer>                    state,
+        id<MTLBuffer>                    output) {
+    id<MTLFunction> normalize_function = [library
+        newFunctionWithName:@"kernel_qwen35_normalize_qk_sequence_128_f32"];
+    id<MTLFunction> sequence_function =
+        [library newFunctionWithName:sequence_name];
+    if (!normalize_function || !sequence_function) {
+        fprintf(stderr, "missing Metal GDN sequence function %s\n",
+                sequence_name.UTF8String);
+        return false;
+    }
+    NSError *error = nil;
+    id<MTLComputePipelineState> normalize_pipeline =
+        [device newComputePipelineStateWithFunction:normalize_function
+                                              error:&error];
+    if (!normalize_pipeline) {
+        fprintf(stderr, "normalize GDN pipeline: %s\n",
+                error.localizedDescription.UTF8String);
+        return false;
+    }
+    error = nil;
+    id<MTLComputePipelineState> sequence_pipeline =
+        [device newComputePipelineStateWithFunction:sequence_function
+                                              error:&error];
+    if (!sequence_pipeline) {
+        fprintf(stderr, "GDN sequence pipeline %s: %s\n",
+                sequence_name.UTF8String,
+                error.localizedDescription.UTF8String);
+        return false;
+    }
+    if (normalize_pipeline.maxTotalThreadsPerThreadgroup < 32u ||
+        sequence_pipeline.maxTotalThreadsPerThreadgroup < 128u) {
+        fprintf(stderr, "unsupported GDN sequence threadgroup geometry\n");
+        return false;
+    }
+
+    id<MTLCommandBuffer> command = [queue commandBuffer];
+    id<MTLComputeCommandEncoder> encoder = [command computeCommandEncoder];
+    [encoder setComputePipelineState:normalize_pipeline];
+    [encoder setBytes:args length:sizeof(*args) atIndex:0];
+    [encoder setBuffer:projection offset:0 atIndex:1];
+    [encoder dispatchThreadgroups:
+         MTLSizeMake(args->n_token, args->n_key_head, 1u)
+         threadsPerThreadgroup:MTLSizeMake(32u, 1u, 1u)];
+
+    [encoder setComputePipelineState:sequence_pipeline];
+    [encoder setBytes:args length:sizeof(*args) atIndex:0];
+    [encoder setBuffer:projection offset:0 atIndex:1];
+    [encoder setBuffer:decay offset:0 atIndex:2];
+    [encoder setBuffer:beta offset:0 atIndex:3];
+    [encoder setBuffer:state offset:0 atIndex:4];
+    [encoder setBuffer:output offset:0 atIndex:5];
+    [encoder dispatchThreadgroups:
+         MTLSizeMake((args->value_dim + 3u) / 4u,
+                     args->n_value_head, 1u)
+         threadsPerThreadgroup:MTLSizeMake(32u, 4u, 1u)];
+    [encoder endEncoding];
+    [command commit];
+    [command waitUntilCompleted];
+    if (command.status == MTLCommandBufferStatusError) {
+        fprintf(stderr, "GDN sequence %s: %s\n",
+                sequence_name.UTF8String,
+                command.error.localizedDescription.UTF8String);
+        return false;
+    }
+    return true;
+}
+
 static bool check_f32(
         const char  *name,
         const float *actual,
@@ -301,6 +457,38 @@ static float f16_bits_to_f32(uint16_t bits) {
     _Float16 half_value = 0;
     memcpy(&half_value, &bits, sizeof(bits));
     return (float)half_value;
+}
+
+static void q5_k_scale_min(
+        uint32_t group,
+        const uint8_t scales[12],
+        uint8_t *scale,
+        uint8_t *minimum) {
+    if (group < 4u) {
+        *scale = scales[group] & 63u;
+        *minimum = scales[group + 4u] & 63u;
+    } else {
+        *scale = (scales[group + 4u] & 0x0fu) |
+                 ((scales[group - 4u] & 0xc0u) >> 2);
+        *minimum = (scales[group + 4u] >> 4) |
+                   ((scales[group] & 0xc0u) >> 2);
+    }
+}
+
+static float q5_k_value(
+        const qwen35_block_q5_k *block,
+        uint32_t within_block) {
+    const uint32_t group = within_block / 32u;
+    const uint32_t lane = within_block - group * 32u;
+    uint8_t scale = 0;
+    uint8_t minimum = 0;
+    q5_k_scale_min(group, block->scales, &scale, &minimum);
+    const uint32_t ql_base = (group >> 1u) * 32u + lane;
+    const uint32_t shift = (group & 1u) * 4u;
+    uint32_t quant = (block->qs[ql_base] >> shift) & 0x0fu;
+    if ((block->qh[lane] & (uint8_t)(1u << group)) != 0u) quant += 16u;
+    return f16_bits_to_f32(block->d) * (float)scale * (float)quant -
+           f16_bits_to_f32(block->dmin) * (float)minimum;
 }
 
 static void host_store_f32(uint8_t *base, size_t offset, float value) {
@@ -586,52 +774,67 @@ static bool test_router_softmax_top8(
     return true;
 }
 
-static bool test_embedding_q8_0(
+static bool test_embedding_q5_k(
         id<MTLDevice> device,
         id<MTLCommandQueue> queue,
         id<MTLLibrary> library) {
     enum {
-        N_EMBD = 2048,
-        Q8_BLOCK = 32,
-        BLOCK_COUNT = N_EMBD / Q8_BLOCK,
-        BLOCK_STRIDE = 40,
-        ROW_STRIDE = BLOCK_COUNT * BLOCK_STRIDE + 16,
-        ROW_COUNT = 2,
+        N_EMBD = 512,
+        Q5_BLOCK = 256,
+        BLOCK_COUNT = N_EMBD / Q5_BLOCK,
+        ROW_COUNT = 3,
+        ROW_PADDING = 16,
+        ROW_STRIDE = BLOCK_COUNT * sizeof(qwen35_block_q5_k) + ROW_PADDING,
         OUTPUT_STRIDE = 8,
+        BATCH_TOKEN_COUNT = 2,
+        TOKEN_ID_STRIDE = 8,
+        OUTPUT_TOKEN_PADDING = 16,
+        OUTPUT_TOKEN_STRIDE = N_EMBD * OUTPUT_STRIDE + OUTPUT_TOKEN_PADDING,
     };
     uint8_t *encoded = calloc(ROW_COUNT, ROW_STRIDE);
     float *expected = malloc(N_EMBD * sizeof(expected[0]));
     float *actual = malloc(N_EMBD * sizeof(actual[0]));
-    if (!encoded || !expected || !actual) {
+    float *batch_expected =
+        malloc(BATCH_TOKEN_COUNT * N_EMBD * sizeof(batch_expected[0]));
+    float *batch_actual =
+        malloc(BATCH_TOKEN_COUNT * N_EMBD * sizeof(batch_actual[0]));
+    if (!encoded || !expected || !actual || !batch_expected || !batch_actual) {
         free(encoded);
         free(expected);
         free(actual);
+        free(batch_expected);
+        free(batch_actual);
         return false;
     }
 
-    static const float scale_pattern[] = {
-        0.125f, -0.25f, 0.5f, -0.75f, 1.0f, -1.5f, 2.0f,
-    };
     for (uint32_t row = 0; row < ROW_COUNT; row++) {
         for (uint32_t block = 0; block < BLOCK_COUNT; block++) {
-            const float requested_scale =
-                scale_pattern[(block + 2u * row) %
-                              (sizeof(scale_pattern) / sizeof(scale_pattern[0]))];
-            const uint16_t scale_bits = f32_to_f16_bits(requested_scale);
-            const size_t block_offset =
-                (size_t)row * ROW_STRIDE + (size_t)block * BLOCK_STRIDE;
-            memcpy(encoded + block_offset, &scale_bits, sizeof(scale_bits));
-            const float stored_scale = f16_bits_to_f32(scale_bits);
-            for (uint32_t item = 0; item < Q8_BLOCK; item++) {
-                const uint32_t dim = block * Q8_BLOCK + item;
-                const int32_t quant_value =
-                    (int32_t)((dim * 37u + row * 19u) % 255u) - 127;
-                const int8_t quant = (int8_t)quant_value;
-                memcpy(encoded + block_offset + 2u + item,
-                       &quant, sizeof(quant));
-                if (row == 1u) expected[dim] = stored_scale * (float)quant;
+            qwen35_block_q5_k *encoded_block =
+                (qwen35_block_q5_k *)(encoded + (size_t)row * ROW_STRIDE) +
+                block;
+            encoded_block->d =
+                f32_to_f16_bits(0.03125f * (float)(1u + row + block));
+            encoded_block->dmin =
+                f32_to_f16_bits(0.015625f * (float)(1u + 2u * row + block));
+            for (uint32_t index = 0; index < 12u; index++) {
+                encoded_block->scales[index] =
+                    (uint8_t)(11u + row * 41u + block * 23u + index * 17u);
+            }
+            for (uint32_t index = 0; index < 32u; index++) {
+                encoded_block->qh[index] =
+                    (uint8_t)(5u + row * 31u + block * 13u + index * 29u);
+            }
+            for (uint32_t index = 0; index < 128u; index++) {
+                encoded_block->qs[index] =
+                    (uint8_t)(7u + row * 19u + block * 43u + index * 37u);
             }
         }
+    }
+    const qwen35_block_q5_k *direct_row =
+        (const qwen35_block_q5_k *)(encoded + ROW_STRIDE);
+    for (uint32_t dim = 0; dim < N_EMBD; dim++) {
+        expected[dim] =
+            q5_k_value(direct_row + dim / Q5_BLOCK, dim % Q5_BLOCK);
     }
 
     id<MTLBuffer> embedding = buffer_with_bytes(
@@ -644,53 +847,103 @@ static bool test_embedding_q8_0(
         free(encoded);
         free(expected);
         free(actual);
+        free(batch_expected);
+        free(batch_actual);
         return false;
     }
     memset(output.contents, 0xa5, output_bytes);
     qwen35_embedding_args args = {
         .row_index = 1,
         .n_embd = N_EMBD,
-        .block_size = Q8_BLOCK,
+        .block_size = Q5_BLOCK,
         .source_row_stride = ROW_STRIDE,
-        .source_block_stride = BLOCK_STRIDE,
-        .source_scale_offset = 0,
-        .source_quant_offset = 2,
-        .source_quant_stride = 1,
+        .source_block_stride = sizeof(qwen35_block_q5_k),
         .output_dim_stride = OUTPUT_STRIDE,
     };
     bool ok = dispatch_kernel(
         device, queue, library,
-        @"kernel_qwen35_dequant_embedding_q8_0_f32",
+        @"kernel_qwen35_dequant_embedding_q5_K_f32",
         &args, sizeof(args), @[embedding, output], @[],
         N_EMBD, 64, false, 0, 0);
     if (ok) {
         const uint8_t *bytes = output.contents;
         for (size_t dim = 0; dim < N_EMBD; dim++) {
             actual[dim] = host_load_f32(bytes, dim * OUTPUT_STRIDE);
-            for (size_t padding = sizeof(float); padding < OUTPUT_STRIDE;
-                 padding++) {
-                if (dim + 1u == N_EMBD) break;
-                if (bytes[dim * OUTPUT_STRIDE + padding] != 0xa5u) {
-                    fprintf(stderr, "embedding output padding overwritten\n");
-                    ok = false;
-                    break;
-                }
-            }
-            if (!ok) break;
         }
+        ok = check_strided_guard(
+            "Q5_K embedding output", bytes, output_bytes,
+            0, OUTPUT_STRIDE, sizeof(float), N_EMBD, 0xa5u);
     }
     if (ok) {
-        ok = check_f32("Q8_0 embedding row", actual, expected,
-                       N_EMBD, 0.0f, 0.0f);
+        ok = check_f32(
+            "Q5_K embedding row", actual, expected, N_EMBD, 1.0e-6f, 1.0e-6f);
+    }
+
+    uint8_t token_ids[BATCH_TOKEN_COUNT * TOKEN_ID_STRIDE];
+    memset(token_ids, 0x5a, sizeof(token_ids));
+    const int32_t rows[BATCH_TOKEN_COUNT] = {2, 0};
+    for (uint32_t token = 0; token < BATCH_TOKEN_COUNT; token++) {
+        memcpy(token_ids + token * TOKEN_ID_STRIDE,
+               &rows[token], sizeof(rows[token]));
+        const qwen35_block_q5_k *row =
+            (const qwen35_block_q5_k *)(
+                encoded + (size_t)rows[token] * ROW_STRIDE);
+        for (uint32_t dim = 0; dim < N_EMBD; dim++) {
+            batch_expected[(size_t)token * N_EMBD + dim] =
+                q5_k_value(row + dim / Q5_BLOCK, dim % Q5_BLOCK);
+        }
+    }
+    const NSUInteger batch_output_bytes =
+        (BATCH_TOKEN_COUNT - 1u) * OUTPUT_TOKEN_STRIDE +
+        (N_EMBD - 1u) * OUTPUT_STRIDE + sizeof(float);
+    id<MTLBuffer> token_buffer =
+        buffer_with_bytes(device, token_ids, sizeof(token_ids));
+    id<MTLBuffer> batch_output =
+        [device newBufferWithLength:batch_output_bytes
+                            options:MTLResourceStorageModeShared];
+    if (ok && (!token_buffer || !batch_output)) ok = false;
+    if (ok) {
+        memset(batch_output.contents, 0xa5, batch_output_bytes);
+        qwen35_embedding_batch_args batch_args = {
+            .n_token = BATCH_TOKEN_COUNT,
+            .n_row = ROW_COUNT,
+            .n_embd = N_EMBD,
+            .block_size = Q5_BLOCK,
+            .source_row_stride = ROW_STRIDE,
+            .source_block_stride = sizeof(qwen35_block_q5_k),
+            .token_id_stride = TOKEN_ID_STRIDE,
+            .output_token_stride = OUTPUT_TOKEN_STRIDE,
+            .output_dim_stride = OUTPUT_STRIDE,
+        };
+        ok = dispatch_kernel(
+            device, queue, library,
+            @"kernel_qwen35_dequant_embedding_q5_K_batch_f32",
+            &batch_args, sizeof(batch_args),
+            @[embedding, token_buffer, batch_output], @[],
+            BATCH_TOKEN_COUNT * N_EMBD, 64, false, 0, 0);
+    }
+    if (ok) {
+        const uint8_t *bytes = batch_output.contents;
+        for (size_t token = 0; token < BATCH_TOKEN_COUNT; token++) {
+            for (size_t dim = 0; dim < N_EMBD; dim++) {
+                batch_actual[token * N_EMBD + dim] = host_load_f32(
+                    bytes, token * OUTPUT_TOKEN_STRIDE + dim * OUTPUT_STRIDE);
+            }
+        }
+        ok = check_f32(
+            "batched Q5_K embedding", batch_actual, batch_expected,
+            BATCH_TOKEN_COUNT * N_EMBD, 1.0e-6f, 1.0e-6f);
     }
     if (ok && memcmp(embedding.contents, encoded,
                      ROW_COUNT * ROW_STRIDE) != 0) {
-        fprintf(stderr, "embedding dequant mutated its source row\n");
+        fprintf(stderr, "Q5_K embedding dequant mutated its source rows\n");
         ok = false;
     }
     free(encoded);
     free(expected);
     free(actual);
+    free(batch_expected);
+    free(batch_actual);
     return ok;
 }
 
@@ -712,37 +965,164 @@ static bool test_gated_delta_controls(
     if (!alpha || !beta_logit || !ssm_a || !dt_bias || !log_decay || !beta) {
         return false;
     }
+    const NSUInteger row_bytes = QWEN_REF_N_VALUE_HEAD * sizeof(float);
     qwen35_controls_args args = {
+        .n_token = QWEN_REF_N_TOKEN,
         .n_value_head = QWEN_REF_N_VALUE_HEAD,
+        .alpha_logit_token_stride = row_bytes,
         .alpha_logit_head_stride = sizeof(float),
+        .beta_logit_token_stride = row_bytes,
         .beta_logit_head_stride = sizeof(float),
         .ssm_a_head_stride = sizeof(float),
         .dt_bias_head_stride = sizeof(float),
+        .log_decay_token_stride = row_bytes,
         .log_decay_head_stride = sizeof(float),
+        .beta_token_stride = row_bytes,
         .beta_head_stride = sizeof(float),
     };
-    const NSUInteger row_bytes = QWEN_REF_N_VALUE_HEAD * sizeof(float);
-    for (NSUInteger token = 0; token < QWEN_REF_N_TOKEN; token++) {
-        NSArray<NSNumber *> *offsets = @[
-            @(token * row_bytes), @(token * row_bytes), @0, @0,
-            @(token * row_bytes), @(token * row_bytes)
-        ];
-        if (!dispatch_kernel(
-                device, queue, library,
-                @"kernel_qwen35_gated_delta_controls_f32",
-                &args, sizeof(args),
-                @[alpha, beta_logit, ssm_a, dt_bias, log_decay, beta],
-                offsets, QWEN_REF_N_VALUE_HEAD, 32, false, 0, 0)) {
-            return false;
-        }
+    const NSUInteger count =
+        QWEN_REF_N_TOKEN * QWEN_REF_N_VALUE_HEAD;
+    if (!dispatch_kernel(
+            device, queue, library,
+            @"kernel_qwen35_gated_delta_controls_f32",
+            &args, sizeof(args),
+            @[alpha, beta_logit, ssm_a, dt_bias, log_decay, beta],
+            @[], count, 32, false, 0, 0)) {
+        return false;
     }
-    return check_f32("DeltaNet log-decay", log_decay.contents,
-                     qwen_ref_log_decay,
-                     sizeof(qwen_ref_log_decay) / sizeof(float),
-                     3.0e-6f, 3.0e-6f) &&
-           check_f32("DeltaNet beta", beta.contents, qwen_ref_beta,
-                     sizeof(qwen_ref_beta) / sizeof(float),
-                     2.0e-6f, 2.0e-6f);
+    return check_f32(
+               "DeltaNet log-decay", log_decay.contents,
+               qwen_ref_log_decay, count, 3.0e-6f, 3.0e-6f) &&
+           check_f32(
+               "DeltaNet beta", beta.contents, qwen_ref_beta,
+               count, 2.0e-6f, 2.0e-6f);
+}
+
+static bool test_gated_delta_sequence(
+        id<MTLDevice> device,
+        id<MTLCommandQueue> queue,
+        id<MTLLibrary> library) {
+    enum {
+        N_TOKEN = QWEN_REF_N_TOKEN,
+        N_KEY_HEAD = QWEN_REF_N_KEY_HEAD,
+        N_VALUE_HEAD = QWEN_REF_N_VALUE_HEAD,
+        KEY_DIM = 128,
+        VALUE_DIM = 128,
+        PROJECTION_ROW =
+            2 * N_KEY_HEAD * KEY_DIM + N_VALUE_HEAD * VALUE_DIM,
+        PROJECTION_COUNT = N_TOKEN * PROJECTION_ROW,
+        STATE_COUNT = N_VALUE_HEAD * VALUE_DIM * KEY_DIM,
+        OUTPUT_COUNT = N_TOKEN * N_VALUE_HEAD * VALUE_DIM,
+        CONTROL_COUNT = N_TOKEN * N_VALUE_HEAD,
+    };
+    float *projection_host = malloc(
+        (size_t)PROJECTION_COUNT * sizeof(projection_host[0]));
+    float *state_host = malloc((size_t)STATE_COUNT * sizeof(state_host[0]));
+    if (!projection_host || !state_host) {
+        free(projection_host);
+        free(state_host);
+        return false;
+    }
+    for (size_t i = 0; i < PROJECTION_COUNT; i++) {
+        projection_host[i] =
+            ((float)((i * 17u + 11u) % 101u) - 50.0f) / 127.0f;
+    }
+    for (size_t i = 0; i < STATE_COUNT; i++) {
+        state_host[i] =
+            ((float)((i * 29u + 7u) % 97u) - 48.0f) / 251.0f;
+    }
+
+    id<MTLBuffer> alpha = buffer_with_bytes(
+        device, qwen_ref_alpha_logit, sizeof(qwen_ref_alpha_logit));
+    id<MTLBuffer> beta_logit = buffer_with_bytes(
+        device, qwen_ref_beta_logit, sizeof(qwen_ref_beta_logit));
+    id<MTLBuffer> ssm_a = buffer_with_bytes(
+        device, qwen_ref_ssm_a, sizeof(qwen_ref_ssm_a));
+    id<MTLBuffer> dt_bias = buffer_with_bytes(
+        device, qwen_ref_dt_bias, sizeof(qwen_ref_dt_bias));
+    id<MTLBuffer> log_decay = zero_buffer(
+        device, CONTROL_COUNT * sizeof(float));
+    id<MTLBuffer> beta = zero_buffer(
+        device, CONTROL_COUNT * sizeof(float));
+    id<MTLBuffer> projection0 = buffer_with_bytes(
+        device, projection_host, PROJECTION_COUNT * sizeof(float));
+    id<MTLBuffer> state0 = buffer_with_bytes(
+        device, state_host, STATE_COUNT * sizeof(float));
+    id<MTLBuffer> output0 = zero_buffer(
+        device, OUTPUT_COUNT * sizeof(float));
+    free(projection_host);
+    free(state_host);
+    if (!alpha || !beta_logit || !ssm_a || !dt_bias || !log_decay ||
+        !beta || !projection0 || !state0 || !output0) {
+        return false;
+    }
+
+    const uint64_t control_row =
+        (uint64_t)N_VALUE_HEAD * sizeof(float);
+    qwen35_controls_args controls = {
+        .n_token = N_TOKEN,
+        .n_value_head = N_VALUE_HEAD,
+        .alpha_logit_token_stride = control_row,
+        .alpha_logit_head_stride = sizeof(float),
+        .beta_logit_token_stride = control_row,
+        .beta_logit_head_stride = sizeof(float),
+        .ssm_a_head_stride = sizeof(float),
+        .dt_bias_head_stride = sizeof(float),
+        .log_decay_token_stride = control_row,
+        .log_decay_head_stride = sizeof(float),
+        .beta_token_stride = control_row,
+        .beta_head_stride = sizeof(float),
+    };
+    if (!dispatch_kernel(
+            device, queue, library,
+            @"kernel_qwen35_gated_delta_controls_f32",
+            &controls, sizeof(controls),
+            @[alpha, beta_logit, ssm_a, dt_bias, log_decay, beta],
+            @[], CONTROL_COUNT, 32, false, 0, 0)) {
+        return false;
+    }
+
+    const uint64_t query_bytes =
+        (uint64_t)N_KEY_HEAD * KEY_DIM * sizeof(float);
+    const uint64_t key_bytes = query_bytes;
+    qwen35_delta_sequence_args args = {
+        .n_token = N_TOKEN,
+        .n_key_head = N_KEY_HEAD,
+        .n_value_head = N_VALUE_HEAD,
+        .key_dim = KEY_DIM,
+        .value_dim = VALUE_DIM,
+        .projection_token_stride =
+            (uint64_t)PROJECTION_ROW * sizeof(float),
+        .query_offset = 0,
+        .key_offset = query_bytes,
+        .value_offset = query_bytes + key_bytes,
+        .query_head_stride = KEY_DIM * sizeof(float),
+        .query_dim_stride = sizeof(float),
+        .key_head_stride = KEY_DIM * sizeof(float),
+        .key_dim_stride = sizeof(float),
+        .value_head_stride = VALUE_DIM * sizeof(float),
+        .value_dim_stride = sizeof(float),
+        .log_decay_token_stride = control_row,
+        .log_decay_head_stride = sizeof(float),
+        .beta_token_stride = control_row,
+        .beta_head_stride = sizeof(float),
+        .state_head_stride =
+            (uint64_t)VALUE_DIM * KEY_DIM * sizeof(float),
+        .state_value_stride = KEY_DIM * sizeof(float),
+        .state_key_stride = sizeof(float),
+        .output_token_stride =
+            (uint64_t)N_VALUE_HEAD * VALUE_DIM * sizeof(float),
+        .output_head_stride = VALUE_DIM * sizeof(float),
+        .output_dim_stride = sizeof(float),
+    };
+    if (!dispatch_gated_delta_sequence(
+            device, queue, library,
+            @"kernel_qwen35_gated_delta_sequence_128_normalized_f32",
+            &args, projection0, log_decay, beta, state0, output0)) {
+        return false;
+    }
+    puts("ok DeltaNet batched controls-to-sequence path");
+    return true;
 }
 
 static bool cpu_gqa_reference(
@@ -1068,6 +1448,100 @@ static bool test_split_q_gate(
                      count, 0.0f, 0.0f);
 }
 
+static bool test_split_q_gate_rms_norm(
+        id<MTLDevice> device,
+        id<MTLCommandQueue> queue,
+        id<MTLLibrary> library) {
+    enum {
+        FUSED_N_TOKEN = 2,
+        FUSED_N_QUERY_HEAD = 2,
+        FUSED_HEAD_DIM = 256,
+        FUSED_ROWS = FUSED_N_TOKEN * FUSED_N_QUERY_HEAD,
+        FUSED_VALUES = FUSED_ROWS * FUSED_HEAD_DIM,
+    };
+    float projection_host[2 * FUSED_VALUES];
+    float norm_weight[FUSED_HEAD_DIM];
+    float expected_query[FUSED_VALUES];
+    float expected_gate[FUSED_VALUES];
+    for (NSUInteger dim = 0; dim < FUSED_HEAD_DIM; dim++) {
+        norm_weight[dim] =
+            0.75f + (float)((int)(dim % 17u) - 8) * 0.03125f;
+    }
+    for (NSUInteger row = 0; row < FUSED_ROWS; row++) {
+        const NSUInteger projection_base = row * 2u * FUSED_HEAD_DIM;
+        const NSUInteger output_base = row * FUSED_HEAD_DIM;
+        for (NSUInteger dim = 0; dim < FUSED_HEAD_DIM; dim++) {
+            const float q =
+                (float)((int)((row * 29u + dim * 7u) % 53u) - 26) /
+                13.0f;
+            const float g =
+                (float)((int)((row * 11u + dim * 5u) % 47u) - 23) /
+                17.0f;
+            projection_host[projection_base + dim] = q;
+            projection_host[projection_base + FUSED_HEAD_DIM + dim] = g;
+            expected_gate[output_base + dim] = g;
+        }
+    }
+    const NSUInteger rows = FUSED_ROWS;
+    for (NSUInteger row = 0; row < rows; row++) {
+        const NSUInteger projection_base = row * 2u * FUSED_HEAD_DIM;
+        const NSUInteger output_base = row * FUSED_HEAD_DIM;
+        float sum = 0.0f;
+        for (NSUInteger dim = 0; dim < FUSED_HEAD_DIM; dim++) {
+            const float value = projection_host[projection_base + dim];
+            sum += value * value;
+        }
+        const float scale =
+            1.0f / sqrtf(sum / FUSED_HEAD_DIM + 1.0e-6f);
+        for (NSUInteger dim = 0; dim < FUSED_HEAD_DIM; dim++) {
+            expected_query[output_base + dim] =
+                (projection_host[projection_base + dim] * scale) *
+                norm_weight[dim];
+        }
+    }
+
+    id<MTLBuffer> projection = buffer_with_bytes(
+        device, projection_host, sizeof(projection_host));
+    id<MTLBuffer> weight = buffer_with_bytes(
+        device, norm_weight, sizeof(norm_weight));
+    id<MTLBuffer> query = zero_buffer(device, sizeof(expected_query));
+    id<MTLBuffer> gate = zero_buffer(device, sizeof(expected_gate));
+    if (!projection || !weight || !query || !gate) return false;
+
+    qwen35_split_rms_norm_args args = {
+        .n_token = FUSED_N_TOKEN,
+        .n_query_head = FUSED_N_QUERY_HEAD,
+        .head_dim = FUSED_HEAD_DIM,
+        .projection_token_stride =
+            FUSED_N_QUERY_HEAD * 2u * FUSED_HEAD_DIM * sizeof(float),
+        .projection_head_stride =
+            2u * FUSED_HEAD_DIM * sizeof(float),
+        .projection_dim_stride = sizeof(float),
+        .query_token_stride =
+            FUSED_N_QUERY_HEAD * FUSED_HEAD_DIM * sizeof(float),
+        .query_head_stride = FUSED_HEAD_DIM * sizeof(float),
+        .query_dim_stride = sizeof(float),
+        .gate_token_stride =
+            FUSED_N_QUERY_HEAD * FUSED_HEAD_DIM * sizeof(float),
+        .gate_head_stride = FUSED_HEAD_DIM * sizeof(float),
+        .gate_dim_stride = sizeof(float),
+        .eps = 1.0e-6f,
+    };
+    const NSUInteger count = FUSED_VALUES;
+    if (!dispatch_kernel(
+            device, queue, library,
+            @"kernel_qwen35_split_q_gate_rms_norm_f32",
+            &args, sizeof(args),
+            @[projection, weight, query, gate], @[],
+            rows, 64u, true, 0u, 32u)) {
+        return false;
+    }
+    return check_f32("fused split normalized query", query.contents,
+                     expected_query, count, 5.0e-6f, 5.0e-6f) &&
+           check_f32("fused split gate", gate.contents, expected_gate,
+                     count, 0.0f, 0.0f);
+}
+
 static bool test_sigmoid_mul(
         id<MTLDevice> device,
         id<MTLCommandQueue> queue,
@@ -1346,11 +1820,33 @@ int main(int argc, const char *argv[]) {
             puts("Qwen Metal GQA fixtures passed");
             return 0;
         }
+        if (getenv("DS4_TEST_QWEN_EMBEDDING_Q5_ONLY") != NULL) {
+            const bool ok = test_embedding_q5_k(device, queue, library);
+            if (!ok) return 1;
+            puts("Qwen Metal Q5_K embedding fixtures passed");
+            return 0;
+        }
+        if (getenv("DS4_TEST_QWEN_GDN_CONTROLS_ONLY") != NULL) {
+            const bool ok =
+                test_gated_delta_controls(device, queue, library) &&
+                test_gated_delta_sequence(device, queue, library);
+            if (!ok) return 1;
+            puts("Qwen Metal GDN control fixtures passed");
+            return 0;
+        }
+        if (getenv("DS4_TEST_QWEN_FUSED_SPLIT_Q_NORM_ONLY") != NULL) {
+            const bool ok =
+                test_split_q_gate_rms_norm(device, queue, library);
+            if (!ok) return 1;
+            puts("Qwen Metal fused split Q/gate RMSNorm fixture passed");
+            return 0;
+        }
         const bool ok =
             test_router_softmax_top8(device, queue, library) &&
-            test_embedding_q8_0(device, queue, library) &&
+            test_embedding_q5_k(device, queue, library) &&
             test_gated_delta_controls(device, queue, library) &&
             test_split_q_gate(device, queue, library) &&
+            test_split_q_gate_rms_norm(device, queue, library) &&
             test_sigmoid_mul(device, queue, library) &&
             test_rope(device, queue, library) &&
             test_conv(device, queue, library) &&

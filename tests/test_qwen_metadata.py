@@ -29,6 +29,10 @@ TENSOR_F16 = 1
 TENSOR_Q8_0 = 8
 TENSOR_Q4_K = 12
 TENSOR_Q5_K = 13
+TENSOR_Q6_K = 14
+TENSOR_IQ2_XS = 17
+TENSOR_IQ3_XXS = 18
+TENSOR_IQ4_XS = 23
 TENSOR_I8 = 24
 
 EXPERT_STORE_TENSOR = "ds4.expert_major.v2"
@@ -43,7 +47,11 @@ EXPERT_STORE_MANIFEST_DIGEST_OFFSET = 168
 QWEN_CHAT_TEMPLATE_PATH = (
     Path(__file__).with_name("qwen") / "qwen36_chat_template.jinja"
 )
-QWEN_CHAT_TEMPLATE = QWEN_CHAT_TEMPLATE_PATH.read_text(encoding="utf-8")
+# Text fixtures carry the repository newline; the GGUF metadata string does
+# not. Strip exactly that terminator so the synthetic file remains byte-exact.
+QWEN_CHAT_TEMPLATE = QWEN_CHAT_TEMPLATE_PATH.read_text(
+    encoding="utf-8"
+).removesuffix("\n")
 QWEN_TOKENIZER_FIXTURE_PATH = (
     Path(__file__).with_name("qwen") / "qwen36_tokenizer_fixture.inc"
 )
@@ -170,7 +178,7 @@ def qwen_metadata() -> OrderedDict[str, tuple[int, object]]:
             ),
             ("tokenizer.ggml.merges", (ARRAY, RepeatedArray(STRING, 247587, ""))),
             ("tokenizer.ggml.bos_token_id", (UINT32, 248044)),
-            ("tokenizer.ggml.padding_token_id", (UINT32, 248044)),
+            ("tokenizer.ggml.padding_token_id", (UINT32, 248055)),
             ("tokenizer.ggml.eos_token_id", (UINT32, 248046)),
             ("tokenizer.ggml.add_bos_token", (BOOL, False)),
             (
@@ -183,46 +191,91 @@ def qwen_metadata() -> OrderedDict[str, tuple[int, object]]:
 
 def qwen_tensors() -> list[Tensor]:
     tensors = [
-        Tensor("token_embd.weight", (2048, 248320), TENSOR_Q8_0),
+        Tensor("token_embd.weight", (2048, 248320), TENSOR_Q5_K),
         Tensor("output_norm.weight", (2048,), TENSOR_F32),
-        Tensor("output.weight", (2048, 248320), TENSOR_Q8_0),
+        Tensor("output.weight", (2048, 248320), TENSOR_Q4_K),
     ]
     for layer in range(40):
         prefix = f"blk.{layer}."
+        routed_gate_type = (
+            TENSOR_IQ3_XXS if layer == 1 else TENSOR_IQ2_XS
+        )
+        routed_down_type = (
+            TENSOR_IQ4_XS
+            if layer in (1, 34, 38, 39)
+            else TENSOR_IQ3_XXS
+        )
+        shared_gate_type = TENSOR_Q6_K if layer == 1 else TENSOR_Q5_K
+        shared_down_type = TENSOR_Q8_0 if layer == 1 else TENSOR_Q6_K
         tensors += [
             Tensor(prefix + "attn_norm.weight", (2048,), TENSOR_F32),
             Tensor(prefix + "post_attention_norm.weight", (2048,), TENSOR_F32),
         ]
         if (layer + 1) % 4 == 0:
             tensors += [
-                Tensor(prefix + "attn_q.weight", (2048, 8192), TENSOR_Q8_0),
-                Tensor(prefix + "attn_k.weight", (2048, 512), TENSOR_Q8_0),
-                Tensor(prefix + "attn_v.weight", (2048, 512), TENSOR_Q8_0),
-                Tensor(prefix + "attn_output.weight", (4096, 2048), TENSOR_Q8_0),
+                Tensor(prefix + "attn_q.weight", (2048, 8192), TENSOR_Q5_K),
+                Tensor(prefix + "attn_k.weight", (2048, 512), TENSOR_Q6_K),
+                Tensor(prefix + "attn_v.weight", (2048, 512), TENSOR_Q6_K),
+                Tensor(prefix + "attn_output.weight", (4096, 2048), TENSOR_Q5_K),
                 Tensor(prefix + "attn_q_norm.weight", (256,), TENSOR_F32),
                 Tensor(prefix + "attn_k_norm.weight", (256,), TENSOR_F32),
             ]
         else:
+            recurrent_dense_type = (
+                TENSOR_Q6_K if layer == 1 else TENSOR_Q5_K
+            )
             tensors += [
-                Tensor(prefix + "attn_gate.weight", (2048, 4096), TENSOR_Q8_0),
-                Tensor(prefix + "attn_qkv.weight", (2048, 8192), TENSOR_Q8_0),
+                Tensor(
+                    prefix + "attn_gate.weight",
+                    (2048, 4096),
+                    recurrent_dense_type,
+                ),
+                Tensor(
+                    prefix + "attn_qkv.weight",
+                    (2048, 8192),
+                    recurrent_dense_type,
+                ),
                 Tensor(prefix + "ssm_a", (32,), TENSOR_F32),
                 Tensor(prefix + "ssm_alpha.weight", (2048, 32), TENSOR_F32),
                 Tensor(prefix + "ssm_beta.weight", (2048, 32), TENSOR_F32),
                 Tensor(prefix + "ssm_conv1d.weight", (4, 8192), TENSOR_F32),
                 Tensor(prefix + "ssm_dt.bias", (32,), TENSOR_F32),
                 Tensor(prefix + "ssm_norm.weight", (128,), TENSOR_F32),
-                Tensor(prefix + "ssm_out.weight", (4096, 2048), TENSOR_Q8_0),
+                Tensor(prefix + "ssm_out.weight", (4096, 2048), TENSOR_Q6_K),
             ]
         tensors += [
             Tensor(prefix + "ffn_gate_inp.weight", (2048, 256), TENSOR_F32),
-            Tensor(prefix + "ffn_gate_exps.weight", (2048, 512, 256), TENSOR_Q4_K),
-            Tensor(prefix + "ffn_up_exps.weight", (2048, 512, 256), TENSOR_Q4_K),
-            Tensor(prefix + "ffn_down_exps.weight", (512, 2048, 256), TENSOR_Q4_K),
+            Tensor(
+                prefix + "ffn_gate_exps.weight",
+                (2048, 512, 256),
+                routed_gate_type,
+            ),
+            Tensor(
+                prefix + "ffn_up_exps.weight",
+                (2048, 512, 256),
+                routed_gate_type,
+            ),
+            Tensor(
+                prefix + "ffn_down_exps.weight",
+                (512, 2048, 256),
+                routed_down_type,
+            ),
             Tensor(prefix + "ffn_gate_inp_shexp.weight", (2048,), TENSOR_F32),
-            Tensor(prefix + "ffn_gate_shexp.weight", (2048, 512), TENSOR_Q8_0),
-            Tensor(prefix + "ffn_up_shexp.weight", (2048, 512), TENSOR_Q8_0),
-            Tensor(prefix + "ffn_down_shexp.weight", (512, 2048), TENSOR_Q8_0),
+            Tensor(
+                prefix + "ffn_gate_shexp.weight",
+                (2048, 512),
+                shared_gate_type,
+            ),
+            Tensor(
+                prefix + "ffn_up_shexp.weight",
+                (2048, 512),
+                shared_gate_type,
+            ),
+            Tensor(
+                prefix + "ffn_down_shexp.weight",
+                (512, 2048),
+                shared_down_type,
+            ),
         ]
     assert len(tensors) == 733
     return tensors
@@ -238,6 +291,10 @@ def tensor_bytes(tensor: Tensor) -> int:
         TENSOR_Q8_0: (32, 34),
         TENSOR_Q4_K: (256, 144),
         TENSOR_Q5_K: (256, 176),
+        TENSOR_Q6_K: (256, 210),
+        TENSOR_IQ2_XS: (256, 74),
+        TENSOR_IQ3_XXS: (256, 98),
+        TENSOR_IQ4_XS: (256, 136),
         TENSOR_I8: (1, 1),
     }[tensor.value_type]
     return ((elements + block_elems - 1) // block_elems) * block_bytes
@@ -264,12 +321,33 @@ def qwen_v2_store() -> tuple[Tensor, bytes]:
         (512, 2048, expert_count),
     )
     for layer in range(layer_count):
+        component_types = (
+            (
+                TENSOR_IQ3_XXS,
+                TENSOR_IQ3_XXS,
+                TENSOR_IQ4_XS,
+            )
+            if layer == 1
+            else (
+                TENSOR_IQ2_XS,
+                TENSOR_IQ2_XS,
+                TENSOR_IQ4_XS,
+            )
+            if layer in (34, 38, 39)
+            else (
+                TENSOR_IQ2_XS,
+                TENSOR_IQ2_XS,
+                TENSOR_IQ3_XXS,
+            )
+        )
         cursor = align_up(cursor, EXPERT_STORE_ALIGNMENT)
         entry = bytearray(EXPERT_STORE_LAYER_BYTES)
         record_bytes = 0
         component_bytes: list[int] = []
-        for dims in component_dims:
-            one_expert = Tensor("", (dims[0], dims[1], 1), TENSOR_Q4_K)
+        for dims, component_type in zip(component_dims, component_types):
+            one_expert = Tensor(
+                "", (dims[0], dims[1], 1), component_type
+            )
             component_bytes.append(tensor_bytes(one_expert))
             record_bytes += component_bytes[-1]
         layer_bytes = record_bytes * expert_count
@@ -278,14 +356,14 @@ def qwen_v2_store() -> tuple[Tensor, bytes]:
             layer, expert_count, record_bytes, cursor, layer_bytes,
         )
         record_offset = 0
-        for role, (dims, expert_bytes) in enumerate(
-            zip(component_dims, component_bytes)
+        for role, (dims, component_type, expert_bytes) in enumerate(
+            zip(component_dims, component_types, component_bytes)
         ):
             struct.pack_into(
                 "<IIIIQQQQQ", entry,
                 EXPERT_STORE_COMPONENT_OFFSET +
                 role * EXPERT_STORE_COMPONENT_BYTES,
-                role, TENSOR_Q4_K, 3, 256,
+                role, component_type, 3, 256,
                 dims[0], dims[1], dims[2], expert_bytes, record_offset,
             )
             record_offset += expert_bytes
@@ -419,10 +497,10 @@ def compiled_backend(binary: Path) -> str:
 
 
 def check_frozen_reference() -> None:
-    template = QWEN_CHAT_TEMPLATE_PATH.read_bytes()
-    assert len(template) == 7764
+    template = QWEN_CHAT_TEMPLATE.encode("utf-8")
+    assert len(template) == 8057
     assert hashlib.sha256(template).hexdigest() == (
-        "e84f32a23fdda27689f868aa4a1a5621f41133e51a48d7f3efcbea2839574259"
+        "55d4931433fe502b794226ee7f4d206a6bdd436ac9f80eb7d8ebb4c639f9ea0c"
     )
     path = Path(__file__).with_name("qwen") / "qwen36_tokenizer_chat_golden.json"
     raw = path.read_bytes()
@@ -704,7 +782,8 @@ def main() -> int:
         check(
             "unsupported-community-down-quant",
             None,
-            "blk.0.ffn_down_exps.weight has type q5_k, expected q4_k",
+            "blk.0.ffn_down_exps.weight has type q5_k, expected iq3_xxs "
+            "in the selected Qwen routed layout",
             tensor_mutate=lambda tensors: replace_tensor(
                 tensors, "blk.0.ffn_down_exps.weight", value_type=TENSOR_Q5_K
             ),

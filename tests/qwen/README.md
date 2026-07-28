@@ -40,7 +40,7 @@ separate so a fixture cannot accidentally turn untrusted content into syntax.
 Unicode provenance, source hashes, licenses, and the pinned version split are
 recorded in [`UNICODE_DATA_PROVENANCE.md`](UNICODE_DATA_PROVENANCE.md). The chat
 template SHA-256 is
-`e84f32a23fdda27689f868aa4a1a5621f41133e51a48d7f3efcbea2839574259`.
+`55d4931433fe502b794226ee7f4d206a6bdd436ac9f80eb7d8ebb4c639f9ea0c`.
 
 ## Refresh and verification
 
@@ -91,7 +91,11 @@ make qwen-metadata-test \
      qwen-reference-test \
      qwen-unicode-test \
      qwen-tokenizer-test \
-     qwen-expert-group-test
+     qwen-expert-group-test \
+     qwen-iq-metal-kernel-test \
+     qwen-q5-metal-kernel-test \
+     qwen-gdn-controls-metal-kernel-test \
+     qwen-fused-split-q-norm-metal-kernel-test
 python3 tests/qwen/test_compare_logits.py -v
 ./ds4_test --metal-kernels
 ```
@@ -101,7 +105,10 @@ The scalar fixtures prove numeric and tokenizer invariants; they do not qualify
 a model artifact or a production inference mode. Metal Qwen cases in
 `test_qwen35_metal.m` additionally cover resident/SSD top-8 equivalence,
 malformed-route fail-closed behavior, cache accounting, and slab growth. The
-incremental-growth case admits one slab, denies the next, and proves reuse
+focused Q5_K lane compares both one-row and batched embedding gathers against a
+CPU oracle. `test_qwen35_iq_metal.m` independently compares resident and
+six-slot SSD matvecs for IQ2_XS, IQ3_XXS, and IQ4_XS against decoded CPU values.
+The incremental-growth case admits one slab, denies the next, and proves reuse
 without a new buffer; a second case denies the first slab and proves no expert
 I/O or allocation fallback. `test_ssd_residency` includes the synthetic 21 GiB
 host snapshot. `make qwen-24g-fixture-test` validates the versioned physical

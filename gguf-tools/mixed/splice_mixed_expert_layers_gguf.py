@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
-"""Build a mixed DeepSeek V4 Flash GGUF by splicing routed-expert layers.
+"""Build a mixed GGUF by splicing tensors from a shape-compatible donor.
 
 The base GGUF supplies metadata and all tensors by default.  For selected layer
 IDs, this copies the routed expert tensors from a donor GGUF, rewriting the GGUF
 tensor directory and streaming tensor payloads without dequantizing or
-requantizing.
+requantizing.  ``--all-base-tensors`` instead copies every tensor named by the
+base, which can remove donor-only tails while preserving every selected payload
+byte.
 """
 
 from __future__ import annotations
@@ -59,7 +61,14 @@ GGML_QUANT_SIZES = {
     8: (32, 34, "Q8_0"),
     10: (256, 84, "Q2_K"),
     12: (256, 144, "Q4_K"),
+    13: (256, 176, "Q5_K"),
+    14: (256, 210, "Q6_K"),
     16: (256, 66, "IQ2_XXS"),
+    17: (256, 74, "IQ2_XS"),
+    18: (256, 98, "IQ3_XXS"),
+    21: (256, 110, "IQ3_S"),
+    22: (256, 82, "IQ2_S"),
+    23: (256, 136, "IQ4_XS"),
     26: (1, 4, "I32"),
 }
 
@@ -212,6 +221,9 @@ def parse_gguf(path: Path) -> GGUFInfo:
         n_bytes = tensor_nbytes(dims, ggml_type)
         tensors.append(TensorInfo(name, dims, ggml_type, rel_offset, data_start + rel_offset, n_bytes))
 
+    tensor_by_name = {t.name: t for t in tensors}
+    if len(tensor_by_name) != len(tensors):
+        raise ValueError(f"{path} contains duplicate tensor names")
     return GGUFInfo(
         path=path,
         version=version,
@@ -220,7 +232,7 @@ def parse_gguf(path: Path) -> GGUFInfo:
         kv_blob=kv_blob,
         alignment=alignment,
         tensors=tensors,
-        tensor_by_name={t.name: t for t in tensors},
+        tensor_by_name=tensor_by_name,
     )
 
 
@@ -253,11 +265,13 @@ def qtype_name(ggml_type: int) -> str:
     return GGML_QUANT_SIZES.get(ggml_type, (0, 0, f"type_{ggml_type}"))[2]
 
 
-def build_plan(base: GGUFInfo, donor: GGUFInfo, q4_layers: set[int]) -> list[SplicePlan]:
+def build_plan(
+        base: GGUFInfo,
+        donor: GGUFInfo,
+        q4_layers: set[int],
+        all_base_tensors: bool = False) -> list[SplicePlan]:
     if base.version != donor.version:
         raise ValueError(f"GGUF version mismatch: base={base.version} donor={donor.version}")
-    if base.tensor_count != donor.tensor_count:
-        raise ValueError(f"tensor count mismatch: base={base.tensor_count} donor={donor.tensor_count}")
     if base.alignment != donor.alignment:
         raise ValueError(f"alignment mismatch: base={base.alignment} donor={donor.alignment}")
 
@@ -269,7 +283,9 @@ def build_plan(base: GGUFInfo, donor: GGUFInfo, q4_layers: set[int]) -> list[Spl
             raise ValueError(f"donor is missing tensor {base_tensor.name}")
         if base_tensor.dims != donor_tensor.dims:
             raise ValueError(f"shape mismatch for {base_tensor.name}: {base_tensor.dims} vs {donor_tensor.dims}")
-        use_donor = should_take_donor(base_tensor.name, q4_layers)
+        use_donor = all_base_tensors or should_take_donor(
+            base_tensor.name, q4_layers
+        )
         source_tensor = donor_tensor if use_donor else base_tensor
         plan.append(SplicePlan(
             name=base_tensor.name,
@@ -369,11 +385,18 @@ def summarize(base: GGUFInfo, donor: GGUFInfo, plan: list[SplicePlan]) -> None:
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Splice selected DeepSeek V4 Flash routed-expert layers from a donor GGUF.")
+    parser = argparse.ArgumentParser(
+        description="Splice shape-compatible tensors from a donor GGUF."
+    )
     parser.add_argument("--base", required=True, type=Path, help="base GGUF used for metadata and default tensors")
     parser.add_argument("--donor", required=True, type=Path, help="donor GGUF used for selected routed expert layers")
     parser.add_argument("--out", required=True, type=Path, help="output mixed GGUF")
     parser.add_argument("--q4-layers", required=True, help="comma-separated layer IDs/ranges to take from donor, e.g. 37-42")
+    parser.add_argument(
+        "--all-base-tensors",
+        action="store_true",
+        help="copy every base-named tensor from donor, excluding donor-only tensors",
+    )
     parser.add_argument("--dry-run", action="store_true", help="print the plan without writing the output")
     parser.add_argument("--force", action="store_true", help="overwrite --out if it already exists")
     args = parser.parse_args()
@@ -383,7 +406,7 @@ def main() -> int:
 
     base = parse_gguf(args.base)
     donor = parse_gguf(args.donor)
-    plan = build_plan(base, donor, q4_layers)
+    plan = build_plan(base, donor, q4_layers, args.all_base_tensors)
     summarize(base, donor, plan)
 
     if args.dry_run:

@@ -24,6 +24,24 @@ struct ds4_metal_args_qwen35_split_q_gate {
     uint64_t gate_dim_stride;
 };
 
+struct ds4_metal_args_qwen35_split_q_gate_rms_norm {
+    uint32_t n_token;
+    uint32_t n_query_head;
+    uint32_t head_dim;
+    uint32_t reserved;
+    uint64_t projection_token_stride;
+    uint64_t projection_head_stride;
+    uint64_t projection_dim_stride;
+    uint64_t query_token_stride;
+    uint64_t query_head_stride;
+    uint64_t query_dim_stride;
+    uint64_t gate_token_stride;
+    uint64_t gate_head_stride;
+    uint64_t gate_dim_stride;
+    float    eps;
+    uint32_t reserved_tail;
+};
+
 struct ds4_metal_args_qwen35_sigmoid_mul {
     uint64_t n_value;
     uint64_t input_stride;
@@ -146,7 +164,7 @@ struct ds4_metal_args_qwen35_rmsnorm_gated {
     uint64_t output_dim_stride;
 };
 
-struct ds4_metal_args_qwen35_embedding_q8_0 {
+struct ds4_metal_args_qwen35_embedding {
     uint32_t row_index;
     uint32_t n_embd;
     uint32_t block_size;
@@ -159,7 +177,7 @@ struct ds4_metal_args_qwen35_embedding_q8_0 {
     uint64_t output_dim_stride;
 };
 
-struct ds4_metal_args_qwen35_embedding_q8_0_batch {
+struct ds4_metal_args_qwen35_embedding_batch {
     uint32_t n_token;
     uint32_t n_row;
     uint32_t n_embd;
@@ -173,6 +191,42 @@ struct ds4_metal_args_qwen35_embedding_q8_0_batch {
     uint64_t output_token_stride;
     uint64_t output_dim_stride;
 };
+
+struct ds4_qwen35_block_q5_K {
+    half  d;
+    half  dmin;
+    uchar scales[12];
+    uchar qh[32];
+    uchar qs[128];
+};
+
+static inline uchar2 ds4_qwen35_q5_scale_min(
+        uint group,
+        device const uchar *scales) {
+    const int j = (int)group;
+    return j < 4
+        ? uchar2{uchar(scales[j] & 63u),
+                 uchar(scales[j + 4] & 63u)}
+        : uchar2{
+              uchar((scales[j + 4] & 0x0fu) |
+                    ((scales[j - 4] & 0xc0u) >> 2)),
+              uchar((scales[j + 4] >> 4) |
+                    ((scales[j] & 0xc0u) >> 2))};
+}
+
+static inline float ds4_qwen35_q5_K_value(
+        device const ds4_qwen35_block_q5_K *block,
+        uint within_block) {
+    const uint group = within_block / 32u;
+    const uint lane = within_block - group * 32u;
+    const uchar2 sm = ds4_qwen35_q5_scale_min(group, block->scales);
+    const uint ql_base = (group >> 1u) * 32u + lane;
+    const uint shift = (group & 1u) * 4u;
+    uint q = (block->qs[ql_base] >> shift) & 0x0fu;
+    q += (block->qh[lane] & uchar(1u << group)) ? 16u : 0u;
+    return (float)block->d * (float)sm.x * (float)q -
+           (float)block->dmin * (float)sm.y;
+}
 
 struct ds4_metal_args_qwen35_gated_delta_controls {
     uint32_t n_token;
@@ -569,43 +623,35 @@ kernel void kernel_qwen35_router_softmax_top8_f32(
     }
 }
 
-// Dequantizes one token-embedding row from GGUF Q8_0 blocks.  The standard
-// encoding has block_size=32, a two-byte F16 scale, then 32 signed bytes.  All
-// physical offsets and strides are explicit so padded rows remain valid.
-kernel void kernel_qwen35_dequant_embedding_q8_0_f32(
-        constant ds4_metal_args_qwen35_embedding_q8_0 &args [[buffer(0)]],
-        device const char *embedding [[buffer(1)]],
-        device       char *output    [[buffer(2)]],
+kernel void kernel_qwen35_dequant_embedding_q5_K_f32(
+        constant ds4_metal_args_qwen35_embedding &args [[buffer(0)]],
+        device const ds4_qwen35_block_q5_K *embedding [[buffer(1)]],
+        device char *output [[buffer(2)]],
         uint dim [[thread_position_in_grid]]) {
-    if (dim >= args.n_embd || args.block_size != 32u) return;
-    const uint block = dim / args.block_size;
-    const uint within_block = dim - block * args.block_size;
-    const uint64_t block_offset =
-        (uint64_t)args.row_index * args.source_row_stride +
-        (uint64_t)block * args.source_block_stride;
-    const half scale = *((device const half *)(
-        embedding + block_offset + args.source_scale_offset));
-    const int8_t quant = *((device const int8_t *)(
-        embedding + block_offset + args.source_quant_offset +
-        (uint64_t)within_block * args.source_quant_stride));
+    if (dim >= args.n_embd || args.block_size != 256u) return;
+    const uint block = dim / 256u;
+    const uint within_block = dim - block * 256u;
+    device const ds4_qwen35_block_q5_K *row =
+        (device const ds4_qwen35_block_q5_K *)(
+            (device const char *)embedding +
+            (uint64_t)args.row_index * args.source_row_stride);
     qwen35_metal_store_f32(
-        output, (uint64_t)dim * args.output_dim_stride,
-        (float)scale * (float)quant);
+        output,
+        (uint64_t)dim * args.output_dim_stride,
+        ds4_qwen35_q5_K_value(row + block, within_block));
 }
 
-// Batched embedding gather.  Token IDs remain device-owned so one prompt
-// chunk needs one dispatch instead of one model-range binding per row.
-kernel void kernel_qwen35_dequant_embedding_q8_0_batch_f32(
-        constant ds4_metal_args_qwen35_embedding_q8_0_batch &args
+kernel void kernel_qwen35_dequant_embedding_q5_K_batch_f32(
+        constant ds4_metal_args_qwen35_embedding_batch &args
             [[buffer(0)]],
         device const char *embedding [[buffer(1)]],
         device const char *token_ids [[buffer(2)]],
-        device       char *output    [[buffer(3)]],
+        device char *output [[buffer(3)]],
         uint gid32 [[thread_position_in_grid]]) {
     const uint64_t gid = (uint64_t)gid32;
     const uint64_t total =
         (uint64_t)args.n_token * (uint64_t)args.n_embd;
-    if (gid >= total || args.n_embd == 0u || args.block_size != 32u) return;
+    if (gid >= total || args.n_embd == 0u || args.block_size != 256u) return;
 
     const uint64_t token = gid / (uint64_t)args.n_embd;
     const uint dim = (uint)(gid - token * (uint64_t)args.n_embd);
@@ -613,27 +659,22 @@ kernel void kernel_qwen35_dequant_embedding_q8_0_batch_f32(
         token_ids + token * args.token_id_stride));
     if (row_index < 0 || (uint32_t)row_index >= args.n_row) return;
 
-    const uint block = dim / args.block_size;
-    const uint within_block = dim - block * args.block_size;
-    const uint64_t block_offset =
-        (uint64_t)(uint32_t)row_index * args.source_row_stride +
-        (uint64_t)block * args.source_block_stride;
-    const half scale = *((device const half *)(
-        embedding + block_offset + args.source_scale_offset));
-    const int8_t quant = *((device const int8_t *)(
-        embedding + block_offset + args.source_quant_offset +
-        (uint64_t)within_block * args.source_quant_stride));
+    const uint block = dim / 256u;
+    const uint within_block = dim - block * 256u;
+    device const ds4_qwen35_block_q5_K *row =
+        (device const ds4_qwen35_block_q5_K *)(
+            embedding +
+            (uint64_t)(uint32_t)row_index * args.source_row_stride);
     qwen35_metal_store_f32(
         output,
         token * args.output_token_stride +
             (uint64_t)dim * args.output_dim_stride,
-        (float)scale * (float)quant);
+        ds4_qwen35_q5_K_value(row + block, within_block));
 }
 
 // Gated DeltaNet control transform.  GGUF stores ssm_a as -exp(A_log), so it
 // is multiplied directly by the positive softplus timestep.  A one-token
 // decode is the n_token=1 special case of the same packed-row contract.
-template<bool store_decay>
 kernel void kernel_qwen35_gated_delta_controls_f32(
         constant ds4_metal_args_qwen35_gated_delta_controls &args
             [[buffer(0)]],
@@ -667,22 +708,13 @@ kernel void kernel_qwen35_gated_delta_controls_f32(
         log_decay,
         (uint64_t)token * args.log_decay_token_stride +
             (uint64_t)head * args.log_decay_head_stride,
-        store_decay ? exp(log_decay_value) : log_decay_value);
+        log_decay_value);
     qwen35_metal_store_f32(
         beta,
         (uint64_t)token * args.beta_token_stride +
             (uint64_t)head * args.beta_head_stride,
         beta_value);
 }
-
-typedef decltype(kernel_qwen35_gated_delta_controls_f32<false>)
-    qwen35_gated_delta_controls_f32_t;
-template [[host_name("kernel_qwen35_gated_delta_controls_f32")]]
-kernel qwen35_gated_delta_controls_f32_t
-kernel_qwen35_gated_delta_controls_f32<false>;
-template [[host_name("kernel_qwen35_gated_delta_controls_decay_f32")]]
-kernel qwen35_gated_delta_controls_f32_t
-kernel_qwen35_gated_delta_controls_f32<true>;
 
 // Projection layout is [token][head][Q then gate].  One grid thread copies one
 // element to each output.  Dispatch at least n_token*n_query_head*head_dim
@@ -721,6 +753,77 @@ kernel void kernel_qwen35_split_q_gate_f32(
             ((uint64_t)args.head_dim + dim) * args.projection_dim_stride);
     qwen35_metal_store_f32(query, query_offset, q);
     qwen35_metal_store_f32(gate, gate_offset, g);
+}
+
+// Resident prefill immediately RMS-normalizes every 256-wide Q head after
+// splitting the interleaved Q/gate projection.  Fuse those two memory passes
+// while retaining the exact float4 reduction and scale/multiply order used by
+// kernel_rms_norm_mul_f32_4.  One threadgroup owns one [token, head] row.
+kernel void kernel_qwen35_split_q_gate_rms_norm_f32(
+        constant ds4_metal_args_qwen35_split_q_gate_rms_norm &args [[buffer(0)]],
+        device const char  *projection  [[buffer(1)]],
+        device const float4 *norm_weight [[buffer(2)]],
+        device       char  *query       [[buffer(3)]],
+        device       char  *gate        [[buffer(4)]],
+        threadgroup float  *shmem_f32   [[threadgroup(0)]],
+        uint3 tgpig [[threadgroup_position_in_grid]],
+        ushort3 tpitg [[thread_position_in_threadgroup]],
+        ushort sgitg [[simdgroup_index_in_threadgroup]],
+        ushort tiisg [[thread_index_in_simdgroup]],
+        ushort3 ntg [[threads_per_threadgroup]]) {
+    const uint64_t rows =
+        (uint64_t)args.n_token * (uint64_t)args.n_query_head;
+    if ((uint64_t)tgpig.x >= rows || args.head_dim == 0 ||
+        (args.head_dim & 3u) != 0 || args.n_query_head == 0) {
+        return;
+    }
+
+    if (sgitg == 0) {
+        shmem_f32[tiisg] = 0.0f;
+    }
+
+    const uint64_t token = (uint64_t)tgpig.x / args.n_query_head;
+    const uint64_t head =
+        (uint64_t)tgpig.x - token * args.n_query_head;
+    const uint64_t projection_base =
+        token * args.projection_token_stride +
+        head * args.projection_head_stride;
+    const uint64_t query_base =
+        token * args.query_token_stride +
+        head * args.query_head_stride;
+    const uint64_t gate_base =
+        token * args.gate_token_stride +
+        head * args.gate_head_stride;
+
+    device const float4 *x = (device const float4 *)(
+        projection + projection_base);
+    device const float4 *g = (device const float4 *)(
+        projection + projection_base +
+        (uint64_t)args.head_dim * args.projection_dim_stride);
+    device float4 *q_out = (device float4 *)(query + query_base);
+    device float4 *g_out = (device float4 *)(gate + gate_base);
+    const uint n4 = args.head_dim / 4u;
+
+    float sumf = 0.0f;
+    for (uint i = tpitg.x; i < n4; i += ntg.x) {
+        sumf += dot(x[i], x[i]);
+        g_out[i] = g[i];
+    }
+    sumf = simd_sum(sumf);
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tiisg == 0) {
+        shmem_f32[sgitg] = sumf;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    sumf = shmem_f32[tiisg];
+    sumf = simd_sum(sumf);
+    const float mean = sumf / args.head_dim;
+    const float scale = 1.0f / sqrt(mean + args.eps);
+    for (uint i = tpitg.x; i < n4; i += ntg.x) {
+        q_out[i] = (x[i] * scale) * norm_weight[i];
+    }
 }
 
 // Elementwise output = input * sigmoid(gate_logit).  This is the full-
@@ -1333,8 +1436,8 @@ kernel void kernel_qwen35_gated_delta_sequence_128_f32(
     }
 }
 
-// MLX-style prompt path: normalize the shared Q/K heads once per token before
-// launching the recurrent rows.  The legacy sequence kernel recomputes these
+// Normalize the shared Q/K heads once per token before launching the recurrent
+// rows. The legacy sequence kernel recomputes these
 // two reductions for every value row group (32 times for Qwen3.6), even though
 // all those rows consume the same normalized head vectors.
 kernel void kernel_qwen35_normalize_qk_sequence_128_f32(
@@ -1394,10 +1497,56 @@ kernel void kernel_qwen35_normalize_qk_sequence_128_f32(
     }
 }
 
+// Fixed-geometry counterpart used by the only admitted Qwen3.6 model.  The
+// arithmetic and reduction order match the generic kernel above; only address
+// formation is specialized so the token loop below does not carry dynamic
+// byte strides through every recurrent row.
+kernel void kernel_qwen35_normalize_qk_sequence_128_model_f32(
+        constant ds4_metal_args_qwen35_gated_delta_sequence &args
+            [[buffer(0)]],
+        device float *projection [[buffer(1)]],
+        uint2 group [[threadgroup_position_in_grid]],
+        ushort lane [[thread_index_in_simdgroup]]) {
+    constexpr uint dims_per_lane = 4u;
+    constexpr uint n_key_head = 16u;
+    constexpr uint key_dim = 128u;
+    constexpr uint qk_values = n_key_head * key_dim;
+    constexpr uint projection_values = 2u * qk_values + 32u * key_dim;
+    const uint token = group.x;
+    const uint key_head = group.y;
+    if (token >= args.n_token || key_head >= n_key_head) return;
+
+    device float *query_ptr =
+        projection + (uint64_t)token * projection_values +
+        (uint64_t)key_head * key_dim;
+    device float *key_ptr = query_ptr + qk_values;
+    float query[dims_per_lane];
+    float key[dims_per_lane];
+    float query_square = 0.0f;
+    float key_square = 0.0f;
+    for (uint j = 0u; j < dims_per_lane; j++) {
+        const uint dim = (uint)lane * dims_per_lane + j;
+        query[j] = query_ptr[dim];
+        key[j] = key_ptr[dim];
+        query_square += query[j] * query[j];
+        key_square += key[j] * key[j];
+    }
+    query_square = simd_sum(query_square);
+    key_square = simd_sum(key_square);
+    const float query_inverse =
+        (1.0f / sqrt((float)args.key_dim)) /
+        sqrt(query_square + 1.0e-6f);
+    const float key_inverse = 1.0f / sqrt(key_square + 1.0e-6f);
+    for (uint j = 0u; j < dims_per_lane; j++) {
+        const uint dim = (uint)lane * dims_per_lane + j;
+        query_ptr[dim] = query[j] * query_inverse;
+        key_ptr[dim] = key[j] * key_inverse;
+    }
+}
+
 // Recurrent half of the pre-normalized prompt path.  Each SIMD group owns one
 // value row exactly as before, but there is no cross-SIMD shared norm or pair
 // of threadgroup barriers in the serial token loop.
-template<bool decay_is_precomputed>
 kernel void kernel_qwen35_gated_delta_sequence_128_normalized_f32(
         constant ds4_metal_args_qwen35_gated_delta_sequence &args
             [[buffer(0)]],
@@ -1441,12 +1590,10 @@ kernel void kernel_qwen35_gated_delta_sequence_128_normalized_f32(
         const uint64_t key_base =
             projection_base + args.key_offset +
             (uint64_t)key_head * args.key_head_stride;
-        const float decay_value = qwen35_metal_load_f32(
+        const float decay = exp(qwen35_metal_load_f32(
             log_decay,
             (uint64_t)token * args.log_decay_token_stride +
-                (uint64_t)value_head * args.log_decay_head_stride);
-        const float decay =
-            decay_is_precomputed ? decay_value : exp(decay_value);
+                (uint64_t)value_head * args.log_decay_head_stride));
         const float step = qwen35_metal_load_f32(
             beta,
             (uint64_t)token * args.beta_token_stride +
@@ -1499,17 +1646,91 @@ kernel void kernel_qwen35_gated_delta_sequence_128_normalized_f32(
     }
 }
 
-typedef decltype(
-    kernel_qwen35_gated_delta_sequence_128_normalized_f32<false>)
-    qwen35_gated_delta_sequence_128_normalized_f32_t;
-template [[host_name(
-    "kernel_qwen35_gated_delta_sequence_128_normalized_f32")]]
-kernel qwen35_gated_delta_sequence_128_normalized_f32_t
-kernel_qwen35_gated_delta_sequence_128_normalized_f32<false>;
-template [[host_name(
-    "kernel_qwen35_gated_delta_sequence_128_normalized_decay_f32")]]
-kernel qwen35_gated_delta_sequence_128_normalized_f32_t
-kernel_qwen35_gated_delta_sequence_128_normalized_f32<true>;
+kernel void kernel_qwen35_gated_delta_sequence_128_normalized_model_f32(
+        constant ds4_metal_args_qwen35_gated_delta_sequence &args
+            [[buffer(0)]],
+        device const float *projection [[buffer(1)]],
+        device const float *log_decay  [[buffer(2)]],
+        device const float *beta       [[buffer(3)]],
+        device       float *state      [[buffer(4)]],
+        device       float *output     [[buffer(5)]],
+        uint3 group [[threadgroup_position_in_grid]],
+        ushort3 thread_pos [[thread_position_in_threadgroup]],
+        ushort lane [[thread_index_in_simdgroup]]) {
+    constexpr uint dims_per_lane = 4u;
+    constexpr uint rows_per_group = 4u;
+    constexpr uint n_key_head = 16u;
+    constexpr uint n_value_head = 32u;
+    constexpr uint key_dim = 128u;
+    constexpr uint value_dim_count = 128u;
+    constexpr uint qk_values = n_key_head * key_dim;
+    constexpr uint value_values = n_value_head * value_dim_count;
+    constexpr uint projection_values = 2u * qk_values + value_values;
+    const uint value_head = group.y;
+    const uint value_dim =
+        group.x * rows_per_group + (uint)thread_pos.y;
+    if (value_head >= n_value_head || value_dim >= value_dim_count ||
+        args.n_token == 0u) {
+        return;
+    }
+
+    const uint key_head = value_head & (n_key_head - 1u);
+    const uint lane_dim = (uint)lane * dims_per_lane;
+    device float *state_ptr =
+        state +
+        ((uint64_t)value_head * value_dim_count + value_dim) * key_dim +
+        lane_dim;
+    device const float *query_ptr =
+        projection + (uint64_t)key_head * key_dim + lane_dim;
+    device const float *key_ptr = query_ptr + qk_values;
+    device const float *value_ptr =
+        projection + 2u * qk_values +
+        (uint64_t)value_head * value_dim_count + value_dim;
+    device const float *decay_ptr = log_decay + value_head;
+    device const float *beta_ptr = beta + value_head;
+    device float *output_ptr =
+        output + (uint64_t)value_head * value_dim_count + value_dim;
+
+    float state_value[dims_per_lane];
+    for (uint j = 0u; j < dims_per_lane; j++) {
+        state_value[j] = state_ptr[j];
+    }
+
+    for (uint token = 0u; token < args.n_token; token++) {
+        const float decay = exp(*decay_ptr);
+        const float step = *beta_ptr;
+        float normalized_key[dims_per_lane];
+        float normalized_query[dims_per_lane];
+        float memory_partial = 0.0f;
+        for (uint j = 0u; j < dims_per_lane; j++) {
+            normalized_key[j] = key_ptr[j];
+            normalized_query[j] = query_ptr[j];
+            state_value[j] *= decay;
+            memory_partial += state_value[j] * normalized_key[j];
+        }
+
+        const float memory = simd_sum(memory_partial);
+        const float delta = (*value_ptr - memory) * step;
+        float result_partial = 0.0f;
+        for (uint j = 0u; j < dims_per_lane; j++) {
+            state_value[j] += normalized_key[j] * delta;
+            result_partial += state_value[j] * normalized_query[j];
+        }
+        const float result = simd_sum(result_partial);
+        if (lane == 0u) *output_ptr = result;
+
+        query_ptr += projection_values;
+        key_ptr += projection_values;
+        value_ptr += projection_values;
+        decay_ptr += n_value_head;
+        beta_ptr += n_value_head;
+        output_ptr += value_values;
+    }
+
+    for (uint j = 0u; j < dims_per_lane; j++) {
+        state_ptr[j] = state_value[j];
+    }
+}
 
 // One-token causal grouped-query attention over separate F32 K/V caches with
 // layout [token][kv_head][head_dim].  One threadgroup owns one query head.  A

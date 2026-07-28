@@ -91,7 +91,6 @@ def validate(binary: pathlib.Path, backend: str, role: str) -> dict[str, object]
         fail(f"{binary}: invalid ExpertMajor tensor")
     expected_storage = [
         {"id": "ggml", "wire_value": 0, "group_sizes": []},
-        {"id": "mlx-affine4", "wire_value": 1, "group_sizes": [64]},
     ]
     if expert["storage_formats"] != expected_storage:
         fail(f"{binary}: invalid ExpertMajor storage formats")

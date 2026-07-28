@@ -235,6 +235,16 @@ static void test_fill_q8_0_weights(uint8_t *weights,
     }
 }
 
+typedef struct {
+    uint8_t ql[128];
+    uint8_t qh[64];
+    int8_t scales[16];
+    uint16_t d;
+} test_dense_q6_k_block;
+
+_Static_assert(sizeof(test_dense_q6_k_block) == 210,
+               "Q6_K dense test block ABI drift");
+
 static void test_metal_f16_matvec_fast_nr0_4(void) {
     /*
      * This is the short regression for the long-context repetition failure.
@@ -618,6 +628,125 @@ static void test_metal_q8_0_prefill_matmul(void) {
     free(weights_raw);
 }
 
+static void test_metal_q6_k_prefill_matmul(void) {
+    enum {
+        IN_DIM = 256,
+        OUT_DIM = 64,
+        N_TOKEN = 128,
+        GGML_TYPE_Q6_K = 14,
+    };
+    const uint64_t row_bytes = sizeof(test_dense_q6_k_block);
+    const uint64_t weight_bytes = (uint64_t)OUT_DIM * row_bytes;
+    const uint64_t weight_alloc =
+        test_round_up_u64(weight_bytes, (uint64_t)getpagesize());
+    const uint64_t x_bytes =
+        (uint64_t)N_TOKEN * IN_DIM * sizeof(float);
+    const uint64_t out_bytes =
+        (uint64_t)N_TOKEN * OUT_DIM * sizeof(float);
+
+    void *weights_raw = NULL;
+    TEST_ASSERT(posix_memalign(
+                    &weights_raw,
+                    (size_t)getpagesize(),
+                    (size_t)weight_alloc) == 0);
+    if (!weights_raw) return;
+
+    memset(weights_raw, 0, (size_t)weight_alloc);
+    test_dense_q6_k_block *weights = weights_raw;
+    for (uint32_t row = 0; row < OUT_DIM; row++) {
+        memset(weights[row].scales, 1, sizeof(weights[row].scales));
+        weights[row].d = test_float_to_f16(1.0f / 256.0f);
+    }
+
+    ds4_gpu_tensor *x = ds4_gpu_tensor_alloc(x_bytes);
+    ds4_gpu_tensor *out = ds4_gpu_tensor_alloc(out_bytes);
+    TEST_ASSERT(x != NULL);
+    TEST_ASSERT(out != NULL);
+    if (!x || !out) {
+        ds4_gpu_tensor_free(x);
+        ds4_gpu_tensor_free(out);
+        free(weights_raw);
+        return;
+    }
+
+    float *x_host = malloc((size_t)x_bytes);
+    float *out_host = malloc((size_t)out_bytes);
+    TEST_ASSERT(x_host != NULL);
+    TEST_ASSERT(out_host != NULL);
+    if (!x_host || !out_host) {
+        free(x_host);
+        free(out_host);
+        ds4_gpu_tensor_free(x);
+        ds4_gpu_tensor_free(out);
+        free(weights_raw);
+        return;
+    }
+
+    for (uint32_t token = 0; token < N_TOKEN; token++) {
+        for (uint32_t dim = 0; dim < IN_DIM; dim++) {
+            const int value =
+                (int)((token * 11u + dim * 17u + (token ^ dim)) % 79u) - 39;
+            x_host[(uint64_t)token * IN_DIM + dim] =
+                (float)value / 96.0f;
+        }
+    }
+    for (uint32_t index = 0; index < N_TOKEN * OUT_DIM; index++) {
+        out_host[index] = 12345.0f;
+    }
+
+    TEST_ASSERT(ds4_gpu_tensor_write(x, 0, x_host, x_bytes) != 0);
+    TEST_ASSERT(ds4_gpu_tensor_write(out, 0, out_host, out_bytes) != 0);
+    TEST_ASSERT(ds4_gpu_set_model_map(
+                    weights_raw, weight_alloc) != 0);
+    ds4_gpu_set_quality(false);
+    TEST_ASSERT(ds4_gpu_matmul_ggml_k_tensor(
+                    out,
+                    weights_raw,
+                    weight_alloc,
+                    0,
+                    weight_bytes,
+                    GGML_TYPE_Q6_K,
+                    IN_DIM,
+                    OUT_DIM,
+                    x,
+                    N_TOKEN) != 0);
+    TEST_ASSERT(ds4_gpu_tensor_read(
+                    out, 0, out_host, out_bytes) != 0);
+
+    float max_abs = 0.0f;
+    float rms = 0.0f;
+    const float weight_value = -32.0f / 256.0f;
+    for (uint32_t token = 0; token < N_TOKEN; token++) {
+        float reference = 0.0f;
+        for (uint32_t dim = 0; dim < IN_DIM; dim++) {
+            reference += weight_value *
+                         x_host[(uint64_t)token * IN_DIM + dim];
+        }
+        for (uint32_t row = 0; row < OUT_DIM; row++) {
+            const float got =
+                out_host[(uint64_t)token * OUT_DIM + row];
+            TEST_ASSERT(isfinite(got));
+            const float error = fabsf(got - reference);
+            if (error > max_abs) max_abs = error;
+            rms += error * error;
+        }
+    }
+    rms = sqrtf(rms / (float)(N_TOKEN * OUT_DIM));
+    fprintf(stderr,
+            "ds4-test: Qwen dense Q6_K prefill "
+            "max_abs=%.3g rms=%.3g\n",
+            max_abs,
+            rms);
+    TEST_ASSERT(max_abs < 0.02f);
+    TEST_ASSERT(rms < 0.005f);
+
+    free(x_host);
+    free(out_host);
+    ds4_gpu_tensor_free(x);
+    ds4_gpu_tensor_free(out);
+    free(weights_raw);
+}
+
 static void test_metal_glm_compact_indexer_warmup_mapping(void) {
     const uint64_t page = (uint64_t)getpagesize();
     const uint64_t model_size = 4u * page;
@@ -879,8 +1008,6 @@ extern bool ds4_internal_qwen35_gpu_graph_layer_state(
     ds4_gpu_tensor **state);
 extern void ds4_internal_qwen35_gpu_graph_free(
     void *storage, size_t storage_bytes);
-extern bool ds4_internal_qwen35_prefill_expert_group_request_test(void);
-
 static bool test_metal_tensor_view_partition(
         ds4_gpu_tensor       *parent,
         ds4_gpu_tensor *const *views,
@@ -981,8 +1108,6 @@ static bool test_metal_tensor_is_all_zero(
 }
 
 static void test_metal_qwen35_graph_state(void) {
-    TEST_ASSERT(ds4_internal_qwen35_prefill_expert_group_request_test());
-
     /* Three rows are enough to prove the context term without turning this
      * model-free lifetime test into a real long-context allocation. */
     const uint32_t ctx_capacity = 3;
@@ -1206,10 +1331,6 @@ static void test_metal_qwen35_graph_state(void) {
 
 static void test_metal_qwen35_primitives(void) {
     enum {
-        EMB_N = 64,
-        EMB_ROWS = 3,
-        EMB_ROW_BYTES = (EMB_N / 32) * 34,
-        EMB_OFFSET = 0,
         CONV_CHANNEL = 5,
         CONV_KERNEL = 4,
         CONV_OFFSET = 256,
@@ -1229,7 +1350,6 @@ static void test_metal_qwen35_primitives(void) {
     uint8_t *model = model_raw;
     memset(model, 0, (size_t)model_size);
 
-    test_fill_q8_0_weights(model + EMB_OFFSET, EMB_N, EMB_ROWS);
     float *conv_weight = (float *)(model + CONV_OFFSET);
     for (size_t i = 0; i < CONV_CHANNEL * CONV_KERNEL; i++) {
         conv_weight[i] = (float)((int)((i * 13u + 5u) % 29u) - 14) / 37.0f;
@@ -1246,35 +1366,6 @@ static void test_metal_qwen35_primitives(void) {
     }
 
     TEST_ASSERT(ds4_gpu_set_model_map(model_raw, model_size) != 0);
-
-    /* Q8_0 token embedding row dequantization from the page-aligned map. */
-    {
-        const uint32_t row_index = 1;
-        float expected[EMB_N];
-        float actual[EMB_N];
-        const uint8_t *row = model + EMB_OFFSET + row_index * EMB_ROW_BYTES;
-        for (size_t block = 0; block < EMB_N / 32; block++) {
-            uint16_t scale_bits = 0;
-            memcpy(&scale_bits, row + block * 34u, sizeof(scale_bits));
-            const float scale = test_f16_to_f32(scale_bits);
-            const int8_t *quant =
-                (const int8_t *)(row + block * 34u + 2u);
-            for (size_t i = 0; i < 32; i++) {
-                expected[block * 32u + i] = scale * (float)quant[i];
-            }
-        }
-        ds4_gpu_tensor *out = ds4_gpu_tensor_alloc(sizeof(actual));
-        TEST_ASSERT(out != NULL);
-        if (out) {
-            TEST_ASSERT(ds4_gpu_qwen35_dequant_embedding_q8_0_tensor(
-                out, model_raw, model_size, EMB_OFFSET, row_index, EMB_N));
-            if (test_metal_read_f32(out, actual, EMB_N)) {
-                test_metal_qwen35_close("Qwen Q8_0 embedding", actual,
-                                        expected, EMB_N, 1.0e-7f, 1.0e-7f);
-            }
-        }
-        ds4_gpu_tensor_free(out);
-    }
 
     /* DeltaNet control transform, including both F32 model-map vectors. */
     {
@@ -1718,6 +1809,135 @@ static void test_metal_qwen35_primitives(void) {
         ds4_gpu_tensor_free(out_gpu);
     }
 
+    /* The product-geometry specialization must remain bit-identical to the
+     * established stride-generic pre-normalized sequence path. */
+    {
+        enum {
+            N_TOKEN = 3,
+            N_KEY_HEAD = 16,
+            N_VALUE_HEAD = 32,
+            KEY_DIM = 128,
+            VALUE_DIM = 128,
+            QK_N = N_KEY_HEAD * KEY_DIM,
+            VALUE_N = N_VALUE_HEAD * VALUE_DIM,
+            PROJECTION_N = 2 * QK_N + VALUE_N,
+            CONTROL_N = N_TOKEN * N_VALUE_HEAD,
+            STATE_N = N_VALUE_HEAD * VALUE_DIM * KEY_DIM,
+            OUTPUT_N = N_TOKEN * VALUE_N,
+        };
+        float *projection = malloc(
+            (size_t)N_TOKEN * PROJECTION_N * sizeof(projection[0]));
+        float *log_decay = malloc(
+            (size_t)CONTROL_N * sizeof(log_decay[0]));
+        float *beta = malloc((size_t)CONTROL_N * sizeof(beta[0]));
+        float *initial_state = malloc(
+            (size_t)STATE_N * sizeof(initial_state[0]));
+        float *specialized_state = malloc(
+            (size_t)STATE_N * sizeof(specialized_state[0]));
+        float *generic_state = malloc(
+            (size_t)STATE_N * sizeof(generic_state[0]));
+        float *specialized_out = malloc(
+            (size_t)OUTPUT_N * sizeof(specialized_out[0]));
+        float *generic_out = malloc(
+            (size_t)OUTPUT_N * sizeof(generic_out[0]));
+        float *zero = calloc((size_t)OUTPUT_N, sizeof(zero[0]));
+        TEST_ASSERT(projection && log_decay && beta && initial_state &&
+                    specialized_state && generic_state &&
+                    specialized_out && generic_out && zero);
+        if (projection && log_decay && beta && initial_state &&
+            specialized_state && generic_state &&
+            specialized_out && generic_out && zero) {
+            for (size_t i = 0;
+                 i < (size_t)N_TOKEN * PROJECTION_N; i++) {
+                projection[i] =
+                    0.17f * sinf((float)(i + 1u) * 0.0031f) -
+                    0.09f * cosf((float)(i + 19u) * 0.0023f);
+            }
+            for (size_t i = 0; i < CONTROL_N; i++) {
+                log_decay[i] =
+                    -0.02f - 0.0003f * (float)(i % N_VALUE_HEAD);
+                beta[i] = 0.21f + 0.005f * (float)(i % N_VALUE_HEAD);
+            }
+            for (size_t i = 0; i < STATE_N; i++) {
+                initial_state[i] =
+                    (float)((int)(i * 29u % 103u) - 51) / 2048.0f;
+            }
+
+            ds4_gpu_tensor *projection_specialized =
+                test_metal_tensor_from_f32(
+                    projection, (size_t)N_TOKEN * PROJECTION_N);
+            ds4_gpu_tensor *projection_generic =
+                test_metal_tensor_from_f32(
+                    projection, (size_t)N_TOKEN * PROJECTION_N);
+            ds4_gpu_tensor *decay_gpu =
+                test_metal_tensor_from_f32(log_decay, CONTROL_N);
+            ds4_gpu_tensor *beta_gpu =
+                test_metal_tensor_from_f32(beta, CONTROL_N);
+            ds4_gpu_tensor *state_specialized =
+                test_metal_tensor_from_f32(initial_state, STATE_N);
+            ds4_gpu_tensor *state_generic =
+                test_metal_tensor_from_f32(initial_state, STATE_N);
+            ds4_gpu_tensor *out_specialized =
+                test_metal_tensor_from_f32(zero, OUTPUT_N);
+            ds4_gpu_tensor *out_generic =
+                test_metal_tensor_from_f32(zero, OUTPUT_N);
+            TEST_ASSERT(projection_specialized && projection_generic &&
+                        decay_gpu && beta_gpu &&
+                        state_specialized && state_generic &&
+                        out_specialized && out_generic);
+            if (projection_specialized && projection_generic &&
+                decay_gpu && beta_gpu &&
+                state_specialized && state_generic &&
+                out_specialized && out_generic) {
+                unsetenv("DS4_TEST_FORCE_QWEN_GDN_GENERIC");
+                TEST_ASSERT(ds4_gpu_qwen35_gated_delta_sequence_128_tensor(
+                    out_specialized, state_specialized,
+                    projection_specialized, decay_gpu, beta_gpu,
+                    N_TOKEN, N_KEY_HEAD, N_VALUE_HEAD));
+                TEST_ASSERT(
+                    setenv("DS4_TEST_FORCE_QWEN_GDN_GENERIC", "1", 1) == 0);
+                TEST_ASSERT(ds4_gpu_qwen35_gated_delta_sequence_128_tensor(
+                    out_generic, state_generic, projection_generic,
+                    decay_gpu, beta_gpu,
+                    N_TOKEN, N_KEY_HEAD, N_VALUE_HEAD));
+                unsetenv("DS4_TEST_FORCE_QWEN_GDN_GENERIC");
+                if (test_metal_read_f32(
+                        state_specialized, specialized_state, STATE_N) &&
+                    test_metal_read_f32(
+                        state_generic, generic_state, STATE_N) &&
+                    test_metal_read_f32(
+                        out_specialized, specialized_out, OUTPUT_N) &&
+                    test_metal_read_f32(
+                        out_generic, generic_out, OUTPUT_N)) {
+                    TEST_ASSERT(memcmp(
+                        specialized_state, generic_state,
+                        (size_t)STATE_N * sizeof(specialized_state[0])) == 0);
+                    TEST_ASSERT(memcmp(
+                        specialized_out, generic_out,
+                        (size_t)OUTPUT_N * sizeof(specialized_out[0])) == 0);
+                }
+            }
+            ds4_gpu_tensor_free(projection_specialized);
+            ds4_gpu_tensor_free(projection_generic);
+            ds4_gpu_tensor_free(decay_gpu);
+            ds4_gpu_tensor_free(beta_gpu);
+            ds4_gpu_tensor_free(state_specialized);
+            ds4_gpu_tensor_free(state_generic);
+            ds4_gpu_tensor_free(out_specialized);
+            ds4_gpu_tensor_free(out_generic);
+        }
+        unsetenv("DS4_TEST_FORCE_QWEN_GDN_GENERIC");
+        free(zero);
+        free(generic_out);
+        free(specialized_out);
+        free(generic_state);
+        free(specialized_state);
+        free(initial_state);
+        free(beta);
+        free(log_decay);
+        free(projection);
+    }
+
     /* Per-value-head gated RMS normalization with F32 model weight. */
     {
         enum { N_VALUE = RMS_VECTOR * RMS_DIM };
@@ -1846,15 +2066,11 @@ static void test_metal_qwen35_primitives(void) {
             ds4_gpu_tensor *out_gpu =
                 test_metal_tensor_from_f32(zero, QUERY_N);
             if (query_gpu && key_gpu && value_gpu && out_gpu) {
-                char *saved = test_save_env(
-                    "DS4_QWEN_DISABLE_SPLIT_K_GQA_DECODE");
-                unsetenv("DS4_QWEN_DISABLE_SPLIT_K_GQA_DECODE");
                 int reuse_used = -1;
                 TEST_ASSERT(ds4_gpu_qwen35_gqa_decode_select_tensor(
                     out_gpu, query_gpu, key_gpu, value_gpu, N_KV,
                     N_QUERY_HEAD, N_KV_HEAD, HEAD_DIM, 1, &reuse_used));
                 TEST_ASSERT(reuse_used == 1);
-                test_restore_env("DS4_QWEN_DISABLE_SPLIT_K_GQA_DECODE", saved);
                 if (test_metal_read_f32(out_gpu, actual, QUERY_N)) {
                     test_metal_qwen35_close(
                         "Qwen split-K F32 GQA decode", actual, expected,
@@ -2443,8 +2659,23 @@ typedef struct {
     uint8_t qs[128];
 } test_metal_q4_k_block;
 
+typedef struct {
+    uint16_t d;
+    uint16_t qs[32];
+    uint8_t scales[8];
+} test_metal_iq2_xs_block;
+
+typedef struct {
+    uint16_t d;
+    uint8_t qs[96];
+} test_metal_iq3_xxs_block;
+
 _Static_assert(sizeof(test_metal_q4_k_block) == 144,
                "Q4_K test block ABI drift");
+_Static_assert(sizeof(test_metal_iq2_xs_block) == 74,
+               "IQ2_XS test block ABI drift");
+_Static_assert(sizeof(test_metal_iq3_xxs_block) == 98,
+               "IQ3_XXS test block ABI drift");
 
 typedef struct {
     uint8_t  magic[8];
@@ -2562,6 +2793,28 @@ static void test_metal_q4_k_fill_constant(
     }
     memset(block->qs, (int)(value | (uint8_t)(value << 4)),
            sizeof(block->qs));
+}
+
+static void test_metal_iq2_xs_fill_constant(
+        test_metal_iq2_xs_block *block,
+        float                    value) {
+    memset(block, 0, sizeof(*block));
+    /*
+     * Codebook entry zero is eight copies of 8. With scale nibble zero,
+     * IQ2_XS decodes each value as d * (0.5 * 0.25) * 8 == d.
+     */
+    block->d = test_float_to_f16(value);
+}
+
+static void test_metal_iq3_xxs_fill_constant(
+        test_metal_iq3_xxs_block *block,
+        float                     value) {
+    memset(block, 0, sizeof(*block));
+    /*
+     * Codebook entry zero is four copies of 4 and the packed scale/sign
+     * auxiliary word is zero. The 0.25 scale makes each decoded value d.
+     */
+    block->d = test_float_to_f16(value);
 }
 
 static bool test_metal_q4_selected_slots_case(
@@ -2691,9 +2944,11 @@ static bool test_metal_qwen_top8_case(
         HALF_EXPERT = 4,
         ROUTED_EXPERT = 8,
         ROUTER_EXPERT = 256,
-        GGML_TYPE_Q4_K = 12,
+        GGML_TYPE_IQ2_XS = 17,
+        GGML_TYPE_IQ3_XXS = 18,
     };
-    const uint64_t row_bytes = sizeof(test_metal_q4_k_block);
+    const uint64_t gate_row_bytes = sizeof(test_metal_iq2_xs_block);
+    const uint64_t down_row_bytes = sizeof(test_metal_iq3_xxs_block);
     const uint64_t mid_bytes =
         (uint64_t)ROUTED_EXPERT * MID_DIM * sizeof(float);
     const uint64_t expert_out_bytes =
@@ -2775,9 +3030,9 @@ static bool test_metal_qwen_top8_case(
             out, partial0, partial1, gate, up, mid, experts,
             model_map, model_size,
             gate_offset, up_offset, down_offset,
-            GGML_TYPE_Q4_K, GGML_TYPE_Q4_K,
-            gate_expert_bytes, row_bytes,
-            down_expert_bytes, row_bytes,
+            GGML_TYPE_IQ2_XS, GGML_TYPE_IQ3_XXS,
+            gate_expert_bytes, gate_row_bytes,
+            down_expert_bytes, down_row_bytes,
             IN_DIM, MID_DIM, OUT_DIM,
             selected, weights,
             selected_half0, selected_half1, weights_half0, weights_half1,
@@ -2862,24 +3117,32 @@ cleanup:
     return ok;
 }
 
-static void test_metal_q4_selected_slots_runtime_count(void) {
+static void test_metal_selected_slots_runtime_count(void) {
     enum {
         MID_DIM = 256,
         OUT_DIM = 2,
         TOTAL_EXPERT = 128,
         ROUTER_EXPERT = 256,
     };
-    const uint64_t row_bytes = sizeof(test_metal_q4_k_block);
-    const uint64_t gate_expert_bytes = MID_DIM * row_bytes;
-    const uint64_t down_expert_bytes = OUT_DIM * row_bytes;
-    const uint64_t gate_tensor_bytes = TOTAL_EXPERT * gate_expert_bytes;
-    const uint64_t down_tensor_bytes = TOTAL_EXPERT * down_expert_bytes;
-    const uint64_t gate_offset = 0;
-    const uint64_t up_offset = gate_tensor_bytes;
-    const uint64_t down_offset = gate_tensor_bytes * 2u;
-    const uint64_t model_size = down_offset + down_tensor_bytes;
+    const uint64_t q4_row_bytes = sizeof(test_metal_q4_k_block);
+    const uint64_t q4_gate_expert_bytes = MID_DIM * q4_row_bytes;
+    const uint64_t q4_down_expert_bytes = OUT_DIM * q4_row_bytes;
+    const uint64_t q4_gate_tensor_bytes =
+        TOTAL_EXPERT * q4_gate_expert_bytes;
+    const uint64_t q4_down_tensor_bytes =
+        TOTAL_EXPERT * q4_down_expert_bytes;
+    const uint64_t gate_expert_bytes =
+        MID_DIM * sizeof(test_metal_iq2_xs_block);
+    const uint64_t down_expert_bytes =
+        OUT_DIM * sizeof(test_metal_iq3_xxs_block);
     const uint64_t per_expert_bytes =
         gate_expert_bytes * 2u + down_expert_bytes;
+    const uint64_t q4_per_expert_bytes =
+        q4_gate_expert_bytes * 2u + q4_down_expert_bytes;
+    const uint64_t gate_offset = 0;
+    const uint64_t up_offset = q4_gate_tensor_bytes;
+    const uint64_t down_offset = q4_gate_tensor_bytes * 2u;
+    const uint64_t model_size = down_offset + q4_down_tensor_bytes;
     char path[] = "/tmp/ds4-q4-slots-XXXXXX";
     int fd = mkstemp(path);
     TEST_ASSERT(fd >= 0);
@@ -2905,20 +3168,20 @@ static void test_metal_q4_selected_slots_runtime_count(void) {
         for (uint32_t row = 0; row < MID_DIM; row++) {
             test_metal_q4_k_fill_constant(
                 (test_metal_q4_k_block *)(base + gate_offset +
-                    (uint64_t)expert * gate_expert_bytes +
-                    (uint64_t)row * row_bytes),
+                    (uint64_t)expert * q4_gate_expert_bytes +
+                    (uint64_t)row * q4_row_bytes),
                 1u);
             test_metal_q4_k_fill_constant(
                 (test_metal_q4_k_block *)(base + up_offset +
-                    (uint64_t)expert * gate_expert_bytes +
-                    (uint64_t)row * row_bytes),
+                    (uint64_t)expert * q4_gate_expert_bytes +
+                    (uint64_t)row * q4_row_bytes),
                 value);
         }
         for (uint32_t row = 0; row < OUT_DIM; row++) {
             test_metal_q4_k_fill_constant(
                 (test_metal_q4_k_block *)(base + down_offset +
-                    (uint64_t)expert * down_expert_bytes +
-                    (uint64_t)row * row_bytes),
+                    (uint64_t)expert * q4_down_expert_bytes +
+                    (uint64_t)row * q4_row_bytes),
                 value);
         }
     }
@@ -2955,7 +3218,7 @@ static void test_metal_q4_selected_slots_runtime_count(void) {
 
     ds4_gpu_set_quality(false);
     ds4_gpu_set_model_fd(fd);
-    ds4_gpu_set_streaming_expert_cache_expert_bytes(per_expert_bytes);
+    ds4_gpu_set_streaming_expert_cache_expert_bytes(q4_per_expert_bytes);
     ds4_gpu_set_streaming_expert_cache_budget(6);
     ds4_gpu_set_ssd_streaming(true);
     TEST_ASSERT(ds4_gpu_internal_stream_expert_cache_required_floor() == 0);
@@ -2964,11 +3227,11 @@ static void test_metal_q4_selected_slots_runtime_count(void) {
     TEST_ASSERT(test_metal_q4_selected_slots_case(
         model_map, model_size,
         gate_offset, up_offset, down_offset,
-        gate_expert_bytes, down_expert_bytes,
+        q4_gate_expert_bytes, q4_down_expert_bytes,
         4, true, &top4));
     TEST_ASSERT(top4.hits == 0);
     TEST_ASSERT(top4.misses == 4);
-    TEST_ASSERT(top4.pread_bytes == 4u * per_expert_bytes);
+    TEST_ASSERT(top4.pread_bytes == 4u * q4_per_expert_bytes);
     TEST_ASSERT(top4.current_entries == 4);
 
     ds4_gpu_set_streaming_expert_cache_budget(6);
@@ -2976,11 +3239,11 @@ static void test_metal_q4_selected_slots_runtime_count(void) {
     TEST_ASSERT(test_metal_q4_selected_slots_case(
         model_map, model_size,
         gate_offset, up_offset, down_offset,
-        gate_expert_bytes, down_expert_bytes,
+        q4_gate_expert_bytes, q4_down_expert_bytes,
         6, false, &top6));
     TEST_ASSERT(top6.hits == 0);
     TEST_ASSERT(top6.misses == 6);
-    TEST_ASSERT(top6.pread_bytes == 6u * per_expert_bytes);
+    TEST_ASSERT(top6.pread_bytes == 6u * q4_per_expert_bytes);
     TEST_ASSERT(top6.current_entries == 6);
 
     const float silu_one = 1.0f / (1.0f + expf(-1.0f));
@@ -2990,6 +3253,36 @@ static void test_metal_q4_selected_slots_runtime_count(void) {
         TEST_ASSERT(fabsf(top4.out[row] - expected) < 0.1f);
         TEST_ASSERT(fabsf(top6.out[row] - top4.out[row]) < 1.0e-4f);
     }
+
+    /*
+     * Reuse the deliberately over-sized mapped ranges for the selected Qwen
+     * layout. Changing the configured per-expert geometry clears the Q4 cache,
+     * and the unequal IQ2_XS/IQ3_XXS component sizes exercise slab relayout.
+     */
+    for (uint32_t expert = 0; expert < TOTAL_EXPERT; expert++) {
+        const float value = (float)(expert % 15u + 1u);
+        for (uint32_t row = 0; row < MID_DIM; row++) {
+            test_metal_iq2_xs_fill_constant(
+                (test_metal_iq2_xs_block *)(base + gate_offset +
+                    (uint64_t)expert * gate_expert_bytes +
+                    (uint64_t)row * sizeof(test_metal_iq2_xs_block)),
+                1.0f);
+            test_metal_iq2_xs_fill_constant(
+                (test_metal_iq2_xs_block *)(base + up_offset +
+                    (uint64_t)expert * gate_expert_bytes +
+                    (uint64_t)row * sizeof(test_metal_iq2_xs_block)),
+                value);
+        }
+        for (uint32_t row = 0; row < OUT_DIM; row++) {
+            test_metal_iq3_xxs_fill_constant(
+                (test_metal_iq3_xxs_block *)(base + down_offset +
+                    (uint64_t)expert * down_expert_bytes +
+                    (uint64_t)row * sizeof(test_metal_iq3_xxs_block)),
+                value);
+        }
+    }
+    TEST_ASSERT(msync(model_map, (size_t)model_size, MS_SYNC) == 0);
+    ds4_gpu_set_streaming_expert_cache_expert_bytes(per_expert_bytes);
 
     const float top8_weights[8] = {
         0.05f, 0.10f, 0.15f, 0.20f,
@@ -3435,29 +3728,15 @@ static void test_metal_q4_selected_slots_runtime_count(void) {
         TEST_ASSERT(fabsf(floor_accept.out[row] - floor_expected) < 0.1f);
     }
 
-    /* An explicitly disabled selected-slot implementation must fail before
-     * SSD reads, cache mutation, or accounting rather than entering the
-     * generic executor and rejecting after side effects. */
-    TEST_ASSERT(setenv("DS4_METAL_DISABLE_Q4_SELECTED_EXPERT_VIEWS",
-                       "1", 1) == 0);
-    test_metal_qwen_top8_result disabled_selected = {0};
-    TEST_ASSERT(test_metal_qwen_top8_case(
-        model_map, model_size,
-        gate_offset, up_offset, down_offset,
-        gate_expert_bytes, down_expert_bytes,
-        unique_top8, top8_weights, NULL, false, &disabled_selected));
-    unsetenv("DS4_METAL_DISABLE_Q4_SELECTED_EXPERT_VIEWS");
-
-    /* The resident compatibility path maps the complete tensor payload and
-     * executes the two top-4 halves without cache allocation or pread.  This
-     * remains available to host-authored routes and trace/replay tooling. */
+    /* The selected resident path maps the complete tensor payload and
+     * executes the two top-4 halves without cache allocation or pread. */
     ds4_gpu_set_ssd_streaming(false);
     ds4_gpu_set_streaming_expert_cache_budget(0);
     ds4_gpu_set_streaming_expert_cache_required_floor(0);
     ds4_gpu_set_streaming_expert_cache_expert_bytes(0);
     ds4_gpu_set_model_fd(-1);
     TEST_ASSERT(ds4_gpu_set_model_map_range(
-        model_map, model_size, 0, model_size, gate_tensor_bytes));
+        model_map, model_size, 0, model_size, q4_gate_tensor_bytes));
 
     test_metal_qwen_top8_result resident_top8 = {0};
     TEST_ASSERT(test_metal_qwen_top8_case(
@@ -3625,7 +3904,7 @@ static void test_metal_q4_selected_slots_runtime_count(void) {
     close(fd);
 }
 #else
-static void test_metal_q4_selected_slots_runtime_count(void) {
+static void test_metal_selected_slots_runtime_count(void) {
 }
 #endif
 
@@ -3636,15 +3915,15 @@ static void test_metal_kernel_group(void) {
     test_metal_f16_prefill_matmul();
     test_metal_f32_router_prefill_matmul();
     test_metal_q8_0_prefill_matmul();
+    test_metal_q6_k_prefill_matmul();
     test_metal_glm_compact_indexer_warmup_mapping();
     test_metal_qwen35_primitives();
     TEST_ASSERT(ds4_gpu_internal_qwen35_expert_group_test() != 0);
-    test_metal_q4_selected_slots_runtime_count();
+    test_metal_selected_slots_runtime_count();
 }
 
 static void test_metal_qwen35_expert_pack(void) {
     TEST_ASSERT(ds4_gpu_internal_qwen35_expert_pack_test() != 0);
-    TEST_ASSERT(ds4_gpu_internal_qwen35_affine_resident_short_test() != 0);
     TEST_ASSERT(ds4_gpu_internal_expert_store_v2_kernel_test() != 0);
 }
 

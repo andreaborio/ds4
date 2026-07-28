@@ -200,6 +200,9 @@ static bool quant_layout(uint32_t type, uint32_t *elements, uint32_t *bytes) {
     case 13: *elements = 256; *bytes = 176; return true; /* Q5_K */
     case 14: *elements = 256; *bytes = 210; return true; /* Q6_K */
     case 16: *elements = 256; *bytes = 66; return true;  /* IQ2_XXS */
+    case 17: *elements = 256; *bytes = 74; return true;  /* IQ2_XS */
+    case 18: *elements = 256; *bytes = 98; return true;  /* IQ3_XXS */
+    case 23: *elements = 256; *bytes = 136; return true; /* IQ4_XS */
     default: return false;
     }
 }
@@ -264,11 +267,8 @@ bool ds4_expert_store_open_embedded(
     const uint32_t storage_format = load_u32_le(header + 160);
     const uint32_t group_size = load_u32_le(header + 164);
     const bool storage_valid =
-        (storage_format == DS4_EXPERT_STORE_STORAGE_GGML &&
-         group_size == 0u) ||
-        (storage_format == DS4_EXPERT_STORE_STORAGE_MLX_AFFINE4 &&
-         group_size == 64u &&
-         family == DS4_EXPERT_STORE_FAMILY_QWEN35_MOE);
+        storage_format == DS4_EXPERT_STORE_STORAGE_GGML &&
+        group_size == 0u;
 
     uint64_t want_descriptor_bytes = 0;
     uint64_t descriptors_end = 0;
@@ -363,9 +363,6 @@ bool ds4_expert_store_open_embedded(
             if (out_component->role != role || ndim != 3 ||
                 !quant_layout(out_component->ggml_type,
                               &block_elements, &block_bytes) ||
-                (storage_format ==
-                     DS4_EXPERT_STORE_STORAGE_MLX_AFFINE4 &&
-                 out_component->ggml_type != 12u) ||
                 out_component->block_elements != block_elements ||
                 out_component->dim[0] == 0 ||
                 out_component->dim[0] % block_elements != 0 ||

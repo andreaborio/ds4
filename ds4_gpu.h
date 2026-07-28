@@ -266,12 +266,16 @@ int ds4_gpu_stream_batch_abort(uint64_t generation);
 /* Compatibility names retained for the integrated Qwen exact-stack API. */
 typedef ds4_gpu_stream_io_ticket ds4_gpu_qwen35_stream_io_ticket;
 
-int ds4_gpu_qwen35_stream_io_overlap_capable(void);
+int ds4_gpu_qwen35_stream_io_overlap_capable(
+        uint32_t gate_type,
+        uint32_t down_type);
 int ds4_gpu_qwen35_stream_batch_route_ready(
         const ds4_gpu_stream_expert_table *table,
         const ds4_gpu_tensor              *selected,
         uint32_t                           n_tokens,
         uint32_t                           n_selected,
+        uint32_t                           gate_type,
+        uint32_t                           down_type,
         ds4_gpu_qwen35_stream_io_ticket   *ticket);
 /* Select variant used by the integrated Qwen scheduler.  When expert grouping
  * is requested, the backend builds the stable expert-major permutation from
@@ -282,6 +286,8 @@ int ds4_gpu_qwen35_stream_batch_route_ready_select(
         const ds4_gpu_tensor              *selected,
         uint32_t                           n_tokens,
         uint32_t                           n_selected,
+        uint32_t                           gate_type,
+        uint32_t                           down_type,
         int                                request_expert_group,
         ds4_gpu_qwen35_stream_io_ticket   *ticket);
 /* Called immediately after shared-expert encoding, finish() flushes that
@@ -429,6 +435,18 @@ int ds4_gpu_matmul_q8_0_tensor(
         const void             *model_map,
         uint64_t                model_size,
         uint64_t                weight_offset,
+        uint64_t                in_dim,
+        uint64_t                out_dim,
+        const ds4_gpu_tensor *x,
+        uint64_t                n_tok);
+
+int ds4_gpu_matmul_ggml_k_tensor(
+        ds4_gpu_tensor       *out,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                weight_offset,
+        uint64_t                weight_bytes,
+        uint32_t                weight_type,
         uint64_t                in_dim,
         uint64_t                out_dim,
         const ds4_gpu_tensor *x,
@@ -751,6 +769,18 @@ int ds4_gpu_qwen35_split_q_gate_batch_tensor(
         uint32_t              n_query_head,
         uint32_t              head_dim);
 
+int ds4_gpu_qwen35_split_q_gate_rms_norm_batch_tensor(
+        ds4_gpu_tensor       *query,
+        ds4_gpu_tensor       *gate,
+        const ds4_gpu_tensor *projection,
+        const void           *model_map,
+        uint64_t              model_size,
+        uint64_t              norm_weight_offset,
+        uint32_t              n_token,
+        uint32_t              n_query_head,
+        uint32_t              head_dim,
+        float                 eps);
+
 int ds4_gpu_qwen35_sigmoid_mul_tensor(
         ds4_gpu_tensor       *out,
         const ds4_gpu_tensor *input,
@@ -845,7 +875,7 @@ int ds4_gpu_qwen35_rmsnorm_gated_tensor(
         uint32_t              dim,
         float                 epsilon);
 
-int ds4_gpu_qwen35_dequant_embedding_q8_0_tensor(
+int ds4_gpu_qwen35_dequant_embedding_q5_k_tensor(
         ds4_gpu_tensor *out,
         const void     *model_map,
         uint64_t        model_size,
@@ -853,7 +883,7 @@ int ds4_gpu_qwen35_dequant_embedding_q8_0_tensor(
         uint32_t        row_index,
         uint32_t        n_embd);
 
-int ds4_gpu_qwen35_dequant_embedding_q8_0_batch_tensor(
+int ds4_gpu_qwen35_dequant_embedding_q5_k_batch_tensor(
         ds4_gpu_tensor       *out,
         const ds4_gpu_tensor *token_ids,
         const void           *model_map,
@@ -1580,18 +1610,6 @@ int ds4_gpu_routed_moe_batch_tensor(
         uint32_t                n_tokens,
         bool                   *mid_is_f16);
 
-/* Expert-major scheduling for Qwen's fixed Q4 top-8 geometry.  Capability and
- * request are deliberately separate: policy remains in ds4.c, while Metal
- * reports expert_group_used only after it encoded a genuinely expert-major
- * path.  SSD uses the stable CPU permutation captured at router-ready and
- * scatters route intermediates back to canonical token/slot rows.  Resident
- * mode reuses the existing GPU mm_id expert-major map and canonical scatter. */
-int ds4_gpu_qwen35_expert_group_capable(
-        uint32_t n_total_expert,
-        uint32_t n_expert,
-        uint32_t gate_type,
-        uint32_t down_type);
-
 /* Family-neutral scheduling request bits.  GROUP asks for the stable
  * expert-major permutation; ROUTE_TILE additionally asks a compatible backend
  * to batch consecutive routes for the same expert.  Callers may combine bits;
@@ -1671,8 +1689,6 @@ int ds4_gpu_internal_qwen35_expert_group_test(void);
 /* Model-free source-translation/fail-closed regression used by
  * --metal-expert-pack. */
 int ds4_gpu_internal_qwen35_expert_pack_test(void);
-/* Model-free resident MLX-affine regression across the routed-MM threshold. */
-int ds4_gpu_internal_qwen35_affine_resident_short_test(void);
 /* Canonical-vs-embedded GLM Q2 regression for direct and grouped execution. */
 int ds4_gpu_internal_expert_store_v2_kernel_test(void);
 

@@ -34,8 +34,9 @@ enum {
     QWEN35_FULL_ATTENTION_LAYER_COUNT = 10,
     QWEN35_RECURRENT_LAYER_COUNT      = 30,
     QWEN35_CONTEXT_LENGTH             = 262144,
-    QWEN35_BOS_PAD_ID                 = 248044,
+    QWEN35_BOS_ID                     = 248044,
     QWEN35_EOS_ID                     = 248046,
+    QWEN35_PAD_ID                     = 248055,
     QWEN35_MODEL_ID                   = 2,
 };
 
