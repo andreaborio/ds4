@@ -44,14 +44,23 @@ EXPERT_STORE_COMPONENT_OFFSET = 32
 EXPERT_STORE_ALIGNMENT = 4096
 EXPERT_STORE_MANIFEST_DIGEST_OFFSET = 168
 
-QWEN_CHAT_TEMPLATE_PATH = (
+QWEN_Q2_CHAT_TEMPLATE_PATH = (
     Path(__file__).with_name("qwen") / "qwen36_chat_template.jinja"
+)
+QWEN_AFFINE4_CHAT_TEMPLATE_PATH = (
+    Path(__file__).with_name("qwen") /
+    "qwen36_chat_template_affine4.jinja"
 )
 # Text fixtures carry the repository newline; the GGUF metadata string does
 # not. Strip exactly that terminator so the synthetic file remains byte-exact.
-QWEN_CHAT_TEMPLATE = QWEN_CHAT_TEMPLATE_PATH.read_text(
+QWEN_Q2_CHAT_TEMPLATE = QWEN_Q2_CHAT_TEMPLATE_PATH.read_text(
     encoding="utf-8"
 ).removesuffix("\n")
+QWEN_AFFINE4_CHAT_TEMPLATE = QWEN_AFFINE4_CHAT_TEMPLATE_PATH.read_text(
+    encoding="utf-8"
+).removesuffix("\n")
+QWEN_PROFILE_Q2 = "q2-k-xl"
+QWEN_PROFILE_AFFINE4 = "affine4-g64"
 QWEN_TOKENIZER_FIXTURE_PATH = (
     Path(__file__).with_name("qwen") / "qwen36_tokenizer_fixture.inc"
 )
@@ -126,10 +135,19 @@ def pack_value(value_type: int, value: object) -> bytes:
     )
 
 
-def qwen_metadata() -> OrderedDict[str, tuple[int, object]]:
+def qwen_metadata(
+    profile: str = QWEN_PROFILE_Q2,
+) -> OrderedDict[str, tuple[int, object]]:
     # These values are pinned to Qwen/Qwen3.6-35B-A3B.  The large tokenizer
     # arrays contain empty test strings: this test validates metadata shape and
     # family dispatch, while tokenizer byte-for-byte goldens live separately.
+    if profile not in (QWEN_PROFILE_Q2, QWEN_PROFILE_AFFINE4):
+        raise AssertionError(f"unsupported Qwen fixture profile: {profile}")
+    affine = profile == QWEN_PROFILE_AFFINE4
+    padding_id = 248044 if affine else 248055
+    chat_template = (
+        QWEN_AFFINE4_CHAT_TEMPLATE if affine else QWEN_Q2_CHAT_TEMPLATE
+    )
     return OrderedDict(
         [
             ("general.architecture", (STRING, "qwen35moe")),
@@ -178,50 +196,68 @@ def qwen_metadata() -> OrderedDict[str, tuple[int, object]]:
             ),
             ("tokenizer.ggml.merges", (ARRAY, RepeatedArray(STRING, 247587, ""))),
             ("tokenizer.ggml.bos_token_id", (UINT32, 248044)),
-            ("tokenizer.ggml.padding_token_id", (UINT32, 248055)),
+            ("tokenizer.ggml.padding_token_id", (UINT32, padding_id)),
             ("tokenizer.ggml.eos_token_id", (UINT32, 248046)),
             ("tokenizer.ggml.add_bos_token", (BOOL, False)),
             (
                 "tokenizer.chat_template",
-                (STRING, QWEN_CHAT_TEMPLATE),
+                (STRING, chat_template),
             ),
         ]
     )
 
 
-def qwen_tensors() -> list[Tensor]:
+def qwen_tensors(profile: str = QWEN_PROFILE_Q2) -> list[Tensor]:
+    if profile not in (QWEN_PROFILE_Q2, QWEN_PROFILE_AFFINE4):
+        raise AssertionError(f"unsupported Qwen fixture profile: {profile}")
+    affine = profile == QWEN_PROFILE_AFFINE4
     tensors = [
-        Tensor("token_embd.weight", (2048, 248320), TENSOR_Q5_K),
+        Tensor(
+            "token_embd.weight", (2048, 248320),
+            TENSOR_Q8_0 if affine else TENSOR_Q5_K,
+        ),
         Tensor("output_norm.weight", (2048,), TENSOR_F32),
-        Tensor("output.weight", (2048, 248320), TENSOR_Q4_K),
+        Tensor(
+            "output.weight", (2048, 248320),
+            TENSOR_Q8_0 if affine else TENSOR_Q4_K,
+        ),
     ]
     for layer in range(40):
         prefix = f"blk.{layer}."
         routed_gate_type = (
+            TENSOR_Q4_K if affine else
             TENSOR_IQ3_XXS if layer == 1 else TENSOR_IQ2_XS
         )
         routed_down_type = (
-            TENSOR_IQ4_XS
+            TENSOR_Q4_K if affine else TENSOR_IQ4_XS
             if layer in (1, 34, 38, 39)
             else TENSOR_IQ3_XXS
         )
-        shared_gate_type = TENSOR_Q6_K if layer == 1 else TENSOR_Q5_K
-        shared_down_type = TENSOR_Q8_0 if layer == 1 else TENSOR_Q6_K
+        shared_gate_type = (
+            TENSOR_Q8_0 if affine else
+            TENSOR_Q6_K if layer == 1 else TENSOR_Q5_K
+        )
+        shared_down_type = (
+            TENSOR_Q8_0 if affine or layer == 1 else TENSOR_Q6_K
+        )
         tensors += [
             Tensor(prefix + "attn_norm.weight", (2048,), TENSOR_F32),
             Tensor(prefix + "post_attention_norm.weight", (2048,), TENSOR_F32),
         ]
         if (layer + 1) % 4 == 0:
+            q_type = TENSOR_Q8_0 if affine else TENSOR_Q5_K
+            kv_type = TENSOR_Q8_0 if affine else TENSOR_Q6_K
             tensors += [
-                Tensor(prefix + "attn_q.weight", (2048, 8192), TENSOR_Q5_K),
-                Tensor(prefix + "attn_k.weight", (2048, 512), TENSOR_Q6_K),
-                Tensor(prefix + "attn_v.weight", (2048, 512), TENSOR_Q6_K),
-                Tensor(prefix + "attn_output.weight", (4096, 2048), TENSOR_Q5_K),
+                Tensor(prefix + "attn_q.weight", (2048, 8192), q_type),
+                Tensor(prefix + "attn_k.weight", (2048, 512), kv_type),
+                Tensor(prefix + "attn_v.weight", (2048, 512), kv_type),
+                Tensor(prefix + "attn_output.weight", (4096, 2048), q_type),
                 Tensor(prefix + "attn_q_norm.weight", (256,), TENSOR_F32),
                 Tensor(prefix + "attn_k_norm.weight", (256,), TENSOR_F32),
             ]
         else:
             recurrent_dense_type = (
+                TENSOR_Q8_0 if affine else
                 TENSOR_Q6_K if layer == 1 else TENSOR_Q5_K
             )
             tensors += [
@@ -241,7 +277,10 @@ def qwen_tensors() -> list[Tensor]:
                 Tensor(prefix + "ssm_conv1d.weight", (4, 8192), TENSOR_F32),
                 Tensor(prefix + "ssm_dt.bias", (32,), TENSOR_F32),
                 Tensor(prefix + "ssm_norm.weight", (128,), TENSOR_F32),
-                Tensor(prefix + "ssm_out.weight", (4096, 2048), TENSOR_Q6_K),
+                Tensor(
+                    prefix + "ssm_out.weight", (4096, 2048),
+                    TENSOR_Q8_0 if affine else TENSOR_Q6_K,
+                ),
             ]
         tensors += [
             Tensor(prefix + "ffn_gate_inp.weight", (2048, 256), TENSOR_F32),
@@ -304,11 +343,16 @@ def align_up(value: int, alignment: int) -> int:
     return (value + alignment - 1) // alignment * alignment
 
 
-def qwen_v2_store() -> tuple[Tensor, bytes]:
+def qwen_v2_store(
+    profile: str = QWEN_PROFILE_Q2,
+) -> tuple[Tensor, bytes]:
+    if profile not in (QWEN_PROFILE_Q2, QWEN_PROFILE_AFFINE4):
+        raise AssertionError(f"unsupported Qwen fixture profile: {profile}")
+    affine = profile == QWEN_PROFILE_AFFINE4
     layer_count = 40
     expert_count = 256
     expert_used_count = 8
-    source_tensor_count = len(qwen_tensors())
+    source_tensor_count = len(qwen_tensors(profile))
     data_offset = align_up(
         EXPERT_STORE_HEADER_BYTES + layer_count * EXPERT_STORE_LAYER_BYTES,
         EXPERT_STORE_ALIGNMENT,
@@ -322,6 +366,9 @@ def qwen_v2_store() -> tuple[Tensor, bytes]:
     )
     for layer in range(layer_count):
         component_types = (
+            (TENSOR_Q4_K, TENSOR_Q4_K, TENSOR_Q4_K)
+            if affine
+            else
             (
                 TENSOR_IQ3_XXS,
                 TENSOR_IQ3_XXS,
@@ -381,6 +428,7 @@ def qwen_v2_store() -> tuple[Tensor, bytes]:
         store_size - data_offset, store_size,
     )
     struct.pack_into("<Q", header, 88, 1)
+    struct.pack_into("<II", header, 160, 1 if affine else 0, 64 if affine else 0)
     manifest_header = bytearray(header)
     manifest_header[
         EXPERT_STORE_MANIFEST_DIGEST_OFFSET:
@@ -395,9 +443,12 @@ def qwen_v2_store() -> tuple[Tensor, bytes]:
         bytes(header + descriptors)
 
 
-def qwen_native_tensors(version: int) -> tuple[list[Tensor], dict[str, bytes]]:
+def qwen_native_tensors(
+    version: int,
+    profile: str = QWEN_PROFILE_Q2,
+) -> tuple[list[Tensor], dict[str, bytes]]:
     non_routed = [
-        tensor for tensor in qwen_tensors()
+        tensor for tensor in qwen_tensors(profile)
         if not tensor.name.endswith((
             ".ffn_gate_exps.weight",
             ".ffn_up_exps.weight",
@@ -405,7 +456,7 @@ def qwen_native_tensors(version: int) -> tuple[list[Tensor], dict[str, bytes]]:
         ))
     ]
     if version == 2:
-        store, manifest = qwen_v2_store()
+        store, manifest = qwen_v2_store(profile)
         return non_routed + [store], {store.name: manifest}
     if version == 1:
         store = Tensor(EXPERT_STORE_V1_TENSOR, (1,), TENSOR_I8)
@@ -497,10 +548,15 @@ def compiled_backend(binary: Path) -> str:
 
 
 def check_frozen_reference() -> None:
-    template = QWEN_CHAT_TEMPLATE.encode("utf-8")
-    assert len(template) == 8057
-    assert hashlib.sha256(template).hexdigest() == (
+    q2_template = QWEN_Q2_CHAT_TEMPLATE.encode("utf-8")
+    assert len(q2_template) == 8057
+    assert hashlib.sha256(q2_template).hexdigest() == (
         "55d4931433fe502b794226ee7f4d206a6bdd436ac9f80eb7d8ebb4c639f9ea0c"
+    )
+    affine4_template = QWEN_AFFINE4_CHAT_TEMPLATE.encode("utf-8")
+    assert len(affine4_template) == 7764
+    assert hashlib.sha256(affine4_template).hexdigest() == (
+        "e84f32a23fdda27689f868aa4a1a5621f41133e51a48d7f3efcbea2839574259"
     )
     path = Path(__file__).with_name("qwen") / "qwen36_tokenizer_chat_golden.json"
     raw = path.read_bytes()
@@ -645,11 +701,13 @@ def main() -> int:
             success: bool = False,
             inspect: bool = True,
             tensor_mutate: Callable[[list[Tensor]], None] | None = None,
+            profile: str = QWEN_PROFILE_Q2,
+            metadata_profile: str | None = None,
         ) -> None:
-            metadata = qwen_metadata()
+            metadata = qwen_metadata(metadata_profile or profile)
             if mutate is not None:
                 mutate(metadata)
-            tensors = qwen_tensors()
+            tensors = qwen_tensors(profile)
             if tensor_mutate is not None:
                 tensor_mutate(tensors)
             model = tmp / f"{name}.gguf"
@@ -662,6 +720,24 @@ def main() -> int:
 
         check("valid", None, "arch:  qwen35moe", success=True)
         check("valid-summary", None, "experts: count=256 used=8", success=True)
+        check(
+            "valid-affine4", None, "arch:  qwen35moe",
+            success=True, profile=QWEN_PROFILE_AFFINE4,
+        )
+        check(
+            "crossed-q2-metadata-affine4-tensors",
+            None,
+            "Qwen affine4-g64/mlx profile tokenizer contract mismatch",
+            profile=QWEN_PROFILE_AFFINE4,
+            metadata_profile=QWEN_PROFILE_Q2,
+        )
+        check(
+            "crossed-affine4-metadata-q2-tensors",
+            None,
+            "Qwen q2-k-xl/ggml profile tokenizer contract mismatch",
+            profile=QWEN_PROFILE_Q2,
+            metadata_profile=QWEN_PROFILE_AFFINE4,
+        )
         check(
             "unknown-family",
             lambda m: m.__setitem__("general.architecture", (STRING, "qwen35moe_typo")),
@@ -722,7 +798,8 @@ def main() -> int:
         check(
             "wrong-chat-template",
             lambda m: m.__setitem__(
-                "tokenizer.chat_template", (STRING, QWEN_CHAT_TEMPLATE + "\n")
+                "tokenizer.chat_template",
+                (STRING, QWEN_Q2_CHAT_TEMPLATE + "\n"),
             ),
             "chat_template does not match the pinned canonical template",
         )
@@ -833,6 +910,33 @@ def main() -> int:
                 "Qwen native v2 inspect failed", v2_inspect)
         require("arch:  qwen35moe" in v2_inspect.stdout + v2_inspect.stderr,
                 "Qwen native v2 inspect summary is missing", v2_inspect)
+
+        affine_v2_tensors, affine_v2_payloads = qwen_native_tensors(
+            2, QWEN_PROFILE_AFFINE4
+        )
+        affine_v2_model = tmp / "v2-affine4-admission.gguf"
+        write_gguf(
+            affine_v2_model,
+            qwen_metadata(QWEN_PROFILE_AFFINE4),
+            affine_v2_tensors,
+            affine_v2_payloads,
+        )
+        affine_v2_inspect = run_ds4(
+            binary, affine_v2_model,
+            tmp / "v2-affine4-inspect.lock", inspect=True,
+        )
+        require(
+            affine_v2_inspect.returncode == 0,
+            "Qwen Affine4 native v2 inspect failed",
+            affine_v2_inspect,
+        )
+        require(
+            "arch:  qwen35moe" in
+            affine_v2_inspect.stdout + affine_v2_inspect.stderr,
+            "Qwen Affine4 native v2 inspect summary is missing",
+            affine_v2_inspect,
+        )
+        affine_v2_model.unlink()
 
         v2_cpu = run_ds4(
             binary, v2_model, tmp / "v2-cpu.lock", inspect=False

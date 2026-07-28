@@ -418,39 +418,63 @@ int main(void) {
     assert(floor.working_set_experts == 330);
     assert(floor.minimum_cache_experts == 331);
 
-    /* The selected Q2_K_XL artifact has three routed layer classes. Size the
-     * single SSD slab for the largest IQ3_XXS/IQ4_XS expert so every layer is
-     * cacheable: gate/up are 2048x512 with 98-byte blocks and down is
-     * 512x2048 with 136-byte blocks. One complete token route spans 40 layers
-     * x top-8; the extra cache slot prevents the first load of the next token
-     * from evicting a still-live expert in the current route. */
-    const uint64_t qwen_iq3_xxs_block_bytes = 98u;
-    const uint64_t qwen_iq4_xs_block_bytes = 136u;
+    /* Q2_K_XL has three routed layer classes. The common planner sizes its
+     * single slab for the largest IQ3_XXS/IQ4_XS record. This verifies the new
+     * profile without replacing the published Affine4 policy fixture below. */
+    const uint64_t qwen_q2_gate_row_bytes =
+        (QWEN35_N_EMBD / 256u) * UINT64_C(98);
+    const uint64_t qwen_q2_down_row_bytes =
+        (QWEN35_N_FF_EXP / 256u) * UINT64_C(136);
+    const uint64_t qwen_q2_gate_expert_bytes =
+        qwen_q2_gate_row_bytes * QWEN35_N_FF_EXP;
+    const uint64_t qwen_q2_down_expert_bytes =
+        qwen_q2_down_row_bytes * QWEN35_N_EMBD;
+    const uint64_t qwen_q2_expert_bytes =
+        2u * qwen_q2_gate_expert_bytes + qwen_q2_down_expert_bytes;
+    const uint64_t qwen_max_cacheable =
+        (uint64_t)QWEN35_N_LAYER * QWEN35_N_EXPERT;
+    assert(qwen_q2_gate_row_bytes == UINT64_C(784));
+    assert(qwen_q2_down_row_bytes == UINT64_C(272));
+    assert(qwen_q2_gate_expert_bytes == UINT64_C(401408));
+    assert(qwen_q2_down_expert_bytes == UINT64_C(557056));
+    assert(qwen_q2_expert_bytes == UINT64_C(1359872));
+    assert(qwen_max_cacheable == UINT64_C(10240));
+    assert(ds4_ssd_expert_cache_floor_make(QWEN35_N_LAYER,
+                                            QWEN35_N_EXPERT_USED,
+                                            qwen_q2_expert_bytes,
+                                            &floor));
+    assert(floor.working_set_experts == 320);
+    assert(floor.minimum_cache_experts == 321);
+    assert(floor.minimum_cache_bytes == UINT64_C(436518912));
+    assert(floor.warning_cache_experts == 640);
+
+    /* The qualified MLX affine4/group-64 artifact retains Q4_K logical tensor
+     * geometry while execution reads its embedded affine store. Keep these
+     * bytes as the hardware-policy fixture because Affine4, unlike Q2_K_XL,
+     * is physically qualified at the 16 GiB product floor. */
+    const uint64_t qwen_q4_k_block_bytes = 144u;
     const uint64_t qwen_gate_row_bytes =
-        (QWEN35_N_EMBD / 256u) * qwen_iq3_xxs_block_bytes;
+        (QWEN35_N_EMBD / 256u) * qwen_q4_k_block_bytes;
     const uint64_t qwen_down_row_bytes =
-        (QWEN35_N_FF_EXP / 256u) * qwen_iq4_xs_block_bytes;
+        (QWEN35_N_FF_EXP / 256u) * qwen_q4_k_block_bytes;
     const uint64_t qwen_gate_expert_bytes =
         qwen_gate_row_bytes * QWEN35_N_FF_EXP;
     const uint64_t qwen_down_expert_bytes =
         qwen_down_row_bytes * QWEN35_N_EMBD;
     const uint64_t qwen_expert_bytes =
         2u * qwen_gate_expert_bytes + qwen_down_expert_bytes;
-    const uint64_t qwen_max_cacheable =
-        (uint64_t)QWEN35_N_LAYER * QWEN35_N_EXPERT;
-    assert(qwen_gate_row_bytes == UINT64_C(784));
-    assert(qwen_down_row_bytes == UINT64_C(272));
-    assert(qwen_gate_expert_bytes == UINT64_C(401408));
-    assert(qwen_down_expert_bytes == UINT64_C(557056));
-    assert(qwen_expert_bytes == UINT64_C(1359872));
-    assert(qwen_max_cacheable == UINT64_C(10240));
+    assert(qwen_gate_row_bytes == UINT64_C(1152));
+    assert(qwen_down_row_bytes == UINT64_C(288));
+    assert(qwen_gate_expert_bytes == UINT64_C(589824));
+    assert(qwen_down_expert_bytes == UINT64_C(589824));
+    assert(qwen_expert_bytes == UINT64_C(1769472));
     assert(ds4_ssd_expert_cache_floor_make(QWEN35_N_LAYER,
                                             QWEN35_N_EXPERT_USED,
                                             qwen_expert_bytes,
                                             &floor));
     assert(floor.working_set_experts == 320);
     assert(floor.minimum_cache_experts == 321);
-    assert(floor.minimum_cache_bytes == UINT64_C(436518912));
+    assert(floor.minimum_cache_bytes == UINT64_C(568000512));
     assert(floor.warning_cache_experts == 640);
 
     /* GLM ExpertMajor keeps one complete route plus its in-flight safety slot
@@ -570,7 +594,7 @@ int main(void) {
 
     /* Physical M1 Pro 16 GiB snapshot captured after the original Qwen AUTO
      * launch was rejected despite green pressure. With normal pressure, full
-     * bounded file-backed credit admits four complete Q2_K_XL working-set
+     * bounded file-backed credit admits three complete Affine4 working-set
      * cycles plus the safety slot. The same page counts must still fail closed
      * when the pressure signal is elevated or unavailable, even if the
      * arithmetic budget alone could hold the minimum tier. */
@@ -604,9 +628,9 @@ int main(void) {
            floor.minimum_cache_bytes);
     assert(qwen_m1_normal.low_ram_shared_static_headroom_active);
     assert(!qwen_m1_normal.low_ram_floor_ceiling_active);
-    assert(qwen_m1_normal.cache_experts == 1281);
+    assert(qwen_m1_normal.cache_experts == 961);
     assert(qwen_m1_normal.cache_bytes ==
-           UINT64_C(1281) * qwen_expert_bytes);
+           UINT64_C(961) * qwen_expert_bytes);
 
     qwen_memory.pressure_normal = false;
     ds4_ssd_adaptive_cache_plan qwen_m1_elevated = {0};

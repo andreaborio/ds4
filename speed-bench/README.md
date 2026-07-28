@@ -31,7 +31,7 @@ frontier that leaves one bookkeeping slot and 128 decode tokens is 262,015:
 DS4_M5_CTX_START=262015 \
 DS4_M5_CTX_MAX=262015 \
 DS4_M5_CTX_ALLOC=262144 \
-DS4_M5_MAX_SECONDS=1800 \
+DS4_M5_MAX_SECONDS=7200 \
 speed-bench/run_m5_dsflash_arm.sh qwen-endpoint auto 128
 ```
 

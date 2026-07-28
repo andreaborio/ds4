@@ -236,14 +236,14 @@
       "location": "content",
       "token": "ds4",
       "classification": "compatibility",
-      "maximum": 503
+      "maximum": 506
     },
     {
       "path": "Makefile",
       "location": "content",
       "token": "DS4",
       "classification": "compatibility",
-      "maximum": 44
+      "maximum": 50
     },
     {
       "path": "ONEDGE_IMATRIX.md",
@@ -271,7 +271,7 @@
       "location": "content",
       "token": "DS4",
       "classification": "compatibility",
-      "maximum": 13
+      "maximum": 14
     },
     {
       "path": "README.md",
@@ -397,7 +397,7 @@
       "location": "content",
       "token": "ds4",
       "classification": "migration-pending",
-      "maximum": 47
+      "maximum": 48
     },
     {
       "path": "docs/architecture/CODEMAP.md",
@@ -638,6 +638,13 @@
       "maximum": 4
     },
     {
+      "path": "docs/benchmarks/2026-07-28-qwen-q2-k-xl-performance-weight.md",
+      "location": "content",
+      "token": "ds4",
+      "classification": "historical-attribution",
+      "maximum": 3
+    },
+    {
       "path": "docs/benchmarks/README.md",
       "location": "content",
       "token": "ds4",
@@ -740,14 +747,14 @@
       "location": "content",
       "token": "ds4",
       "classification": "migration-pending",
-      "maximum": 8
+      "maximum": 7
     },
     {
       "path": "docs/qwen-expert-major-store.md",
       "location": "content",
       "token": "DS4",
       "classification": "migration-pending",
-      "maximum": 8
+      "maximum": 10
     },
     {
       "path": "docs/releases/hebrus-bridge-launch-candidate.md",
@@ -831,14 +838,14 @@
       "location": "content",
       "token": "ds4",
       "classification": "migration-pending",
-      "maximum": 5252
+      "maximum": 5204
     },
     {
       "path": "ds4.c",
       "location": "content",
       "token": "DS4",
       "classification": "migration-pending",
-      "maximum": 4482
+      "maximum": 4542
     },
     {
       "path": "ds4.h",
@@ -978,14 +985,14 @@
       "location": "content",
       "token": "ds4",
       "classification": "migration-pending",
-      "maximum": 31
+      "maximum": 34
     },
     {
       "path": "ds4_expert_store.c",
       "location": "content",
       "token": "DS4",
       "classification": "migration-pending",
-      "maximum": 13
+      "maximum": 16
     },
     {
       "path": "ds4_expert_store.h",
@@ -1020,7 +1027,7 @@
       "location": "content",
       "token": "ds4",
       "classification": "migration-pending",
-      "maximum": 727
+      "maximum": 736
     },
     {
       "path": "ds4_gpu.h",
@@ -1125,14 +1132,14 @@
       "location": "content",
       "token": "ds4",
       "classification": "migration-pending",
-      "maximum": 6704
+      "maximum": 6863
     },
     {
       "path": "ds4_metal.m",
       "location": "content",
       "token": "DS4",
       "classification": "migration-pending",
-      "maximum": 1103
+      "maximum": 1164
     },
     {
       "path": "ds4_profile.c",
@@ -1534,6 +1541,13 @@
       "maximum": 5
     },
     {
+      "path": "gguf-tools/generate_qwen35_iq_metal.py",
+      "location": "content",
+      "token": "ds4",
+      "classification": "migration-pending",
+      "maximum": 3
+    },
+    {
       "path": "gguf-tools/imatrix/README.md",
       "location": "content",
       "token": "ds4",
@@ -1818,14 +1832,14 @@
       "location": "content",
       "token": "ds4",
       "classification": "migration-pending",
-      "maximum": 231
+      "maximum": 237
     },
     {
       "path": "metal/moe.metal",
       "location": "content",
       "token": "DS4",
       "classification": "migration-pending",
-      "maximum": 11
+      "maximum": 17
     },
     {
       "path": "metal/norm.metal",
@@ -1846,7 +1860,7 @@
       "location": "content",
       "token": "ds4",
       "classification": "migration-pending",
-      "maximum": 42
+      "maximum": 60
     },
     {
       "path": "metal/qwen35.metal",
@@ -1854,6 +1868,13 @@
       "token": "DS4",
       "classification": "migration-pending",
       "maximum": 2
+    },
+    {
+      "path": "metal/qwen35_iq_tables.metal.inc",
+      "location": "content",
+      "token": "ds4",
+      "classification": "migration-pending",
+      "maximum": 3
     },
     {
       "path": "metal/repeat.metal",
@@ -2021,7 +2042,7 @@
       "location": "content",
       "token": "DS4",
       "classification": "compatibility",
-      "maximum": 14
+      "maximum": 18
     },
     {
       "path": "speed-bench/build_long_context_prompt.py",
@@ -2077,14 +2098,14 @@
       "location": "content",
       "token": "ds4",
       "classification": "migration-pending",
-      "maximum": 846
+      "maximum": 875
     },
     {
       "path": "tests/ds4_test.c",
       "location": "content",
       "token": "DS4",
       "classification": "migration-pending",
-      "maximum": 151
+      "maximum": 150
     },
     {
       "path": "tests/gen_qwen_unicode.py",
@@ -2175,14 +2196,14 @@
       "location": "content",
       "token": "ds4",
       "classification": "migration-pending",
-      "maximum": 4
+      "maximum": 5
     },
     {
       "path": "tests/qwen/README.md",
       "location": "content",
       "token": "DS4",
       "classification": "migration-pending",
-      "maximum": 4
+      "maximum": 7
     },
     {
       "path": "tests/qwen/UNICODE_DATA_PROVENANCE.md",
@@ -2220,6 +2241,20 @@
       "maximum": 39
     },
     {
+      "path": "tests/qwen/test_qwen35_iq_metal.m",
+      "location": "content",
+      "token": "ds4",
+      "classification": "migration-pending",
+      "maximum": 1
+    },
+    {
+      "path": "tests/qwen/test_qwen35_iq_metal.m",
+      "location": "content",
+      "token": "DS4",
+      "classification": "migration-pending",
+      "maximum": 2
+    },
+    {
       "path": "tests/qwen/test_qwen35_metal.m",
       "location": "content",
       "token": "ds4",
@@ -2231,7 +2266,7 @@
       "location": "content",
       "token": "DS4",
       "classification": "migration-pending",
-      "maximum": 2
+      "maximum": 5
     },
     {
       "path": "tests/test-vectors/README.md",
@@ -2437,6 +2472,13 @@
       "maximum": 19
     },
     {
+      "path": "tests/test_mixed_gguf_splice.py",
+      "location": "content",
+      "token": "ds4",
+      "classification": "migration-pending",
+      "maximum": 2
+    },
+    {
       "path": "tests/test_q4k_dot.c",
       "location": "content",
       "token": "ds4",
@@ -2490,7 +2532,7 @@
       "location": "content",
       "token": "ds4",
       "classification": "migration-pending",
-      "maximum": 10
+      "maximum": 11
     },
     {
       "path": "tests/test_qwen_metadata.py",
@@ -2504,14 +2546,14 @@
       "location": "content",
       "token": "ds4",
       "classification": "migration-pending",
-      "maximum": 171
+      "maximum": 172
     },
     {
       "path": "tests/test_qwen_session.c",
       "location": "content",
       "token": "DS4",
       "classification": "migration-pending",
-      "maximum": 62
+      "maximum": 77
     },
     {
       "path": "tests/test_qwen_state.c",
@@ -2595,7 +2637,7 @@
       "location": "content",
       "token": "ds4",
       "classification": "migration-pending",
-      "maximum": 268
+      "maximum": 269
     },
     {
       "path": "tests/test_ssd_residency.c",

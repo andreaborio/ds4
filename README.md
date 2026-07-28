@@ -72,7 +72,7 @@ ExpertMajor v2. AUTO is the normal startup mode.
 | --- | ---: | --- | --- |
 | DeepSeek V4 Flash | 64 GiB | AUTO resolving to resident or SSD; explicit modes for qualification | Published ExpertMajor v2 artifact; `download_model.sh deepseek-v2` |
 | GLM 5.2 | 64 GiB | AUTO resolving to SSD streaming only; resident requests are rejected | Published ExpertMajor v2 artifact; `download_model.sh glm-v2` |
-| Qwen3.6-35B-A3B | 16 GiB | Guarded SSD is qualified at 16 GiB; the 24 GiB extension remains pending its physical gate; larger hosts may resolve to resident or SSD | Published MLX affine4/group-64 artifact; `download_model.sh qwen-v2` |
+| Qwen3.6-35B-A3B | 16 GiB for the published Affine4 profile | One shared runtime supports exact MLX Affine4 G64 and Q2_K_XL weight profiles. Guarded SSD is qualified for Affine4 at 16 GiB; Q2_K_XL has recorded 64 GiB resident/SSD implementation evidence through 32K, with full-window qualification pending | Affine4 is published through `download_model.sh qwen-v2`; Q2_K_XL publication is pending |
 
 The canonical machine-readable
 [Qwen release contract](docs/contracts/qwen-release.json) records the current
@@ -90,6 +90,17 @@ allocation-time hardening commit before release. The
 older `Qwen3.6-35B-A3B-DS4-ExpertMajor-v2-Q4_K_S.gguf` store is incompatible
 with the current runtime and remains `negative-only`, never a download or
 inference fallback.
+
+The second admitted Qwen profile is the exact 12,290,632,032-byte Q2_K_XL
+ExpertMajor v2 artifact, SHA-256
+`30c22f70aff0f05986b517ee4ad8fef554a1b5aab6971c9ca09f999566d30143`.
+It is 40.93% smaller than the published Affine4 file and uses the same Qwen
+session, attention, Gated DeltaNet, KV, cache, resident, and SSD pipeline.
+Only the physical weight decoders differ. Its immutable distribution revision
+is not published yet, so `qwen-v2` deliberately continues to download
+Affine4. See the
+[dual-codec decision](docs/adr/0006-qwen-dual-weight-codecs.md) and the
+[Q2_K_XL evidence](docs/benchmarks/2026-07-28-qwen-q2-k-xl-performance-weight.md).
 
 DeepSeek V4 PRO has no qualified runtime artifact in the current contract.
 Canonical model files are converter inputs, not inference fallbacks. CPU is a
@@ -198,19 +209,25 @@ commands, hashes, invalidations, and memory telemetry.
 
 | Path | Evidence lane | Measured result |
 | --- | --- | --- |
-| Qwen3.6 MLX affine4/group-64 | 32K pure prefill; separate 128+16 decode, resident and forced SSD | Resident: 877.34 prefill t/s and 57.43 decode t/s. Forced SSD: 83.69 prefill t/s and 23.94 decode t/s. |
+| Qwen3.6 MLX affine4/group-64 | Final shared-runtime resident A/B/B/A, 8K and 32K with 128 decode tokens | Versus tested `main`: +11.20% / +4.22% prefill/decode at 8K and +8.20% / +5.27% at 32K; exact frontier and generated-token evidence at 2K/8K/32K |
+| Qwen3.6 Q2_K_XL | Resident 8K and 32K with 128 decode tokens | 874.68 / 66.30 prefill/decode t/s at 8K; cooled two-run 32K mean 584.82 / 43.53 t/s; exact artifact hash, byte-identical evidence, and zero swapout |
 | DeepSeek V4 Flash ExpertMajor v2 | 32K prose + 128 decode, Metal SSD | 164.43 prefill t/s and 7.27 decode t/s, with zero swapout. |
 | GLM 5.2 ExpertMajor v2 | 32K prose + 128 decode, AUTO resolving to SSD | 44.73 prefill t/s and 1.87 overall decode t/s, with zero swapout. |
 
 Sources:
 
 - [Qwen unified affine AUTO and SSD promotion](docs/benchmarks/2026-07-21-qwen-unified-affine-auto-ssd.md)
+- [Qwen Q2_K_XL and shared-runtime decision](docs/benchmarks/2026-07-28-qwen-q2-k-xl-performance-weight.md)
 - [DeepSeek and GLM long-context Metal stack](docs/benchmarks/2026-07-20-long-context-metal-stack.md)
 - [Benchmark evidence index](docs/benchmarks/README.md)
 
 Performance acceptance requires isolated short, medium, large, and 32K
-long-context lanes; memory-sensitive changes may require 65K and 100K as well.
-A short-context best is not substituted for the long-context gate.
+long-context lanes. Attention, KV, cache, RoPE, allocation, and context changes
+also require 65K and 100K. Full-window Qwen publication/release qualification
+requires the near-262K endpoint admitted by validated metadata; this Q2_K_XL
+implementation has not completed that endpoint and remains publication-pending.
+A short-context best is not substituted for a credible long-context or
+endpoint claim.
 
 ## Documentation
 
@@ -233,7 +250,7 @@ A short-context best is not substituted for the long-context gate.
 - [ExpertMajor v2 roadmap](docs/expert-major-v2-roadmap.md)
 - [DeepSeek ExpertMajor v2](docs/deepseek-expert-major-v2.md)
 - [GLM 5.2 ExpertMajor v2](docs/glm52-expert-major-v2.md)
-- [Qwen ExpertMajor v2 MLX-affine store](docs/qwen-expert-major-store.md)
+- [Qwen ExpertMajor v2 Affine4 and Q2_K_XL profiles](docs/qwen-expert-major-store.md)
 - [GGUF and quantization tools](gguf-tools/README.md)
 
 ### Architecture and evidence

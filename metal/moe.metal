@@ -5,7 +5,6 @@
 #define N_R0_GLM_Q2_PAIR2_K 1
 #define N_R0_Q4_K 2
 #define N_R0_MLX_AFFINE4 4
-#define N_R0_QWEN_AFFINE2 4
 #define N_R0_GLM_Q4_PAIR2_K 1
 #define N_R0_GLM_Q4_PAIR_K 4
 #define N_R0_Q5_PAIR_K 4
@@ -122,14 +121,6 @@ struct block_q4_K {
 // MLX affine 4-bit, group size 64.
 struct block_mlx_affine4_64 {
     uchar qs[32];
-    ushort scale_bf16;
-    ushort bias_bf16;
-};
-
-// Qwen affine 2-bit, group size 32. Gate and up prefix every expert with the
-// same BF16 input multiplier vector so both cache components have one shape.
-struct block_qwen_affine2_32 {
-    uchar qs[8];
     ushort scale_bf16;
     ushort bias_bf16;
 };
@@ -2875,25 +2866,6 @@ void dequantize_mlx_affine4_64(
 }
 
 template <typename type4x4>
-void dequantize_qwen_affine2_32(
-        device const block_qwen_affine2_32 *xb,
-        short il,
-        thread type4x4 &reg) {
-    const float scale =
-        as_type<float>((uint)xb->scale_bf16 << 16u);
-    const float bias =
-        as_type<float>((uint)xb->bias_bf16 << 16u);
-    const uint value_base = (uint)il * 16u;
-    FOR_UNROLL (short i = 0; i < 16; i++) {
-        const uint value = value_base + (uint)i;
-        const uint shift = (value & 3u) * 2u;
-        const uint q =
-            ((uint)xb->qs[value >> 2u] >> shift) & 3u;
-        reg[i/4][i%4] = scale * (float)q + bias;
-    }
-}
-
-template <typename type4x4>
 void dequantize_q5_K(device const block_q5_K *xb, short il, thread type4x4 &reg) {
     const short group = il / 2;
     const short l0 = (il & 1) * 16;
@@ -5216,92 +5188,6 @@ static inline void kernel_mul_mv_mlx_affine4_64_pair_swiglu_f32_impl(
     }
 }
 
-static inline void kernel_mul_mv_qwen_affine2_32_pair_swiglu_f32_impl(
-        constant ds4_metal_args_mul_mv_id &args,
-        constant ds4_metal_dsv4_moe_swiglu_weight_args &act,
-        device const char *src0_gate,
-        device const char *src0_up,
-        device const char *src1,
-        device       char *dst_gate,
-        device       char *dst_up,
-        device       char *dst_mid,
-        device const float *route_weight,
-        uint3 tgpig,
-        ushort tiisg,
-        ushort sgitg) {
-    const short NSG = FC_mul_mv_nsg;
-    const int first_row =
-        (tgpig.x * NSG + sgitg) * N_R0_QWEN_AFFINE2;
-    device const ushort *equalizer =
-        (device const ushort *)src0_gate;
-    device const char *gate_matrix =
-        src0_gate + (uint64_t)args.ne00 * sizeof(ushort);
-    device const char *up_matrix =
-        src0_up + (uint64_t)args.ne00 * sizeof(ushort);
-    device const float *y = (device const float *)src1;
-    device float *gate_f32 = (device float *)dst_gate;
-    device float *up_f32 = (device float *)dst_up;
-    device float *mid_f32 = (device float *)dst_mid;
-    const int groups = args.ne00 / 32;
-    float sumg[N_R0_QWEN_AFFINE2] = {0.f};
-    float sumu[N_R0_QWEN_AFFINE2] = {0.f};
-
-    for (int group = 0; group < groups; group++) {
-        const uint value = (uint)group * 32u + (uint)tiisg;
-        const float multiplier =
-            as_type<float>((uint)equalizer[value] << 16u);
-        const float input = y[value] * multiplier;
-        for (short row = 0; row < N_R0_QWEN_AFFINE2; row++) {
-            if (first_row + row >= args.ne0) break;
-            device const block_qwen_affine2_32 *gate_blocks =
-                (device const block_qwen_affine2_32 *)(
-                    gate_matrix +
-                    (uint64_t)(first_row + row) * args.nb01);
-            device const block_qwen_affine2_32 *up_blocks =
-                (device const block_qwen_affine2_32 *)(
-                    up_matrix +
-                    (uint64_t)(first_row + row) * args.nb01);
-            device const block_qwen_affine2_32 *gate_block =
-                gate_blocks + group;
-            device const block_qwen_affine2_32 *up_block = up_blocks + group;
-            const uint shift = ((uint)tiisg & 3u) * 2u;
-            const uint gate_q =
-                ((uint)gate_block->qs[(uint)tiisg >> 2u] >> shift) & 3u;
-            const uint up_q =
-                ((uint)up_block->qs[(uint)tiisg >> 2u] >> shift) & 3u;
-            const float gate_scale =
-                as_type<float>((uint)gate_block->scale_bf16 << 16u);
-            const float gate_bias =
-                as_type<float>((uint)gate_block->bias_bf16 << 16u);
-            const float up_scale =
-                as_type<float>((uint)up_block->scale_bf16 << 16u);
-            const float up_bias =
-                as_type<float>((uint)up_block->bias_bf16 << 16u);
-            sumg[row] +=
-                (gate_scale * (float)gate_q + gate_bias) * input;
-            sumu[row] +=
-                (up_scale * (float)up_q + up_bias) * input;
-        }
-    }
-
-    const float c = act.clamp_value;
-    for (short row = 0;
-         row < N_R0_QWEN_AFFINE2 && first_row + row < args.ne0;
-         row++) {
-        const float gate = simd_sum(sumg[row]);
-        const float up = simd_sum(sumu[row]);
-        if (tiisg == 0) {
-            const uint out_row = first_row + row;
-            const float g = c > 1.0e-6f ? min(gate, c) : gate;
-            const float u = c > 1.0e-6f ? clamp(up, -c, c) : up;
-            gate_f32[out_row] = gate;
-            up_f32[out_row] = up;
-            mid_f32[out_row] =
-                (g / (1.0f + exp(-g))) * u * route_weight[0];
-        }
-    }
-}
-
 #define DS4_DEFINE_AFFINE_PAIR_ID_KERNEL(NAME, IMPL)                         \
 kernel void NAME(                                                            \
         constant ds4_metal_args_mul_mv_id &args,                             \
@@ -5386,12 +5272,6 @@ DS4_DEFINE_AFFINE_PAIR_ID_KERNEL(
 DS4_DEFINE_AFFINE_PAIR_ADDR_KERNEL(
     kernel_mul_mv_addr_mlx_affine4_64_pair_swiglu_f32,
     kernel_mul_mv_mlx_affine4_64_pair_swiglu_f32_impl)
-DS4_DEFINE_AFFINE_PAIR_ID_KERNEL(
-    kernel_mul_mv_id_qwen_affine2_32_pair_swiglu_f32,
-    kernel_mul_mv_qwen_affine2_32_pair_swiglu_f32_impl)
-DS4_DEFINE_AFFINE_PAIR_ADDR_KERNEL(
-    kernel_mul_mv_addr_qwen_affine2_32_pair_swiglu_f32,
-    kernel_mul_mv_qwen_affine2_32_pair_swiglu_f32_impl)
 
 #undef DS4_DEFINE_AFFINE_PAIR_ID_KERNEL
 #undef DS4_DEFINE_AFFINE_PAIR_ADDR_KERNEL
@@ -9318,8 +9198,7 @@ kernel void kernel_mul_mm_id_addr(
 
 template<short NR1, short NL, typename block_q,
          void (*dequantize_func)(device const block_q *, short,
-                                 thread half4x4 &),
-         bool QWEN_AFFINE2_EQUALIZED = false>
+                                 thread half4x4 &)>
 kernel void kernel_mul_mm_id_pair_swiglu_f16(
         constant ds4_metal_args_mul_mm_id & args,
         constant ds4_metal_dsv4_moe_swiglu_weight_args & act,
@@ -9378,19 +9257,13 @@ kernel void kernel_mul_mm_id_pair_swiglu_f16(
 
     const uint64_t offset0 = im*args.nb02 + i13*args.nb03;
     const short    offset1 = il0/NL;
-    const uint64_t equalizer_bytes =
-        QWEN_AFFINE2_EQUALIZED
-            ? (uint64_t)args.ne00 * sizeof(ushort)
-            : 0u;
-    device const ushort *equalizer =
-        (device const ushort *)(src0_gate + offset0);
 
     device const block_q * xg =
-        (device const block_q *)(src0_gate + equalizer_bytes +
+        (device const block_q *)(src0_gate +
                                  args.nb01*(r0 + lr0) + offset0) +
         offset1;
     device const block_q * xu =
-        (device const block_q *)(src0_up + equalizer_bytes +
+        (device const block_q *)(src0_up +
                                  args.nb01*(r0 + lr0) + offset0) +
         offset1;
 
@@ -9420,25 +9293,8 @@ kernel void kernel_mul_mm_id_pair_swiglu_f16(
             const short sy_b = rhs_row/8;
             const short ly_b = rhs_row%8;
             const short ib_b = RHS_BLOCKS*sx_b + sy_b;
-            if (QWEN_AFFINE2_EQUALIZED) {
-                half2x4 scaled_rhs;
-                FOR_UNROLL (short i = 0; i < 8; i++) {
-                    const uint value =
-                        (uint)loop_k + (uint)iy + (uint)i;
-                    const float multiplier =
-                        value < (uint)args.ne00
-                            ? as_type<float>(
-                                  (uint)equalizer[value] << 16u)
-                            : 0.0f;
-                    scaled_rhs[i/4][i%4] =
-                        (half)(y[i] * multiplier);
-                }
-                *(threadgroup half2x4 *)(sb + 64*ib_b + 8*ly_b) =
-                    scaled_rhs;
-            } else {
-                *(threadgroup half2x4 *)(sb + 64*ib_b + 8*ly_b) =
-                    (half2x4)(*((device float2x4 *) y));
-            }
+            *(threadgroup half2x4 *)(sb + 64*ib_b + 8*ly_b) =
+                (half2x4)(*((device float2x4 *) y));
         }
 
         half4x4 temp_gate;
@@ -9751,12 +9607,6 @@ typedef decltype(kernel_mul_mm_id_pair_swiglu_f16<
 typedef decltype(kernel_mul_mm_id_pair_swiglu_f16<
     16, 4, block_mlx_affine4_64, dequantize_mlx_affine4_64>)
     mul_mm_id_mlx_affine4_64_pair_swiglu_f16_n16_t;
-typedef decltype(kernel_mul_mm_id_pair_swiglu_f16<
-    32, 2, block_qwen_affine2_32, dequantize_qwen_affine2_32, true>)
-    mul_mm_id_qwen_affine2_32_pair_swiglu_f16_n32_t;
-typedef decltype(kernel_mul_mm_id_pair_swiglu_f16<
-    16, 2, block_qwen_affine2_32, dequantize_qwen_affine2_32, true>)
-    mul_mm_id_qwen_affine2_32_pair_swiglu_f16_n16_t;
 template [[host_name("kernel_mul_mm_id_iq2_xxs_pair_swiglu_f16")]]
 kernel mul_mm_id_iq2_xxs_pair_swiglu_f16_n32_t
 kernel_mul_mm_id_pair_swiglu_f16<
@@ -9781,14 +9631,6 @@ template [[host_name("kernel_mul_mm_id_mlx_affine4_64_pair_swiglu_f16_n16")]]
 kernel mul_mm_id_mlx_affine4_64_pair_swiglu_f16_n16_t
 kernel_mul_mm_id_pair_swiglu_f16<
     16, 4, block_mlx_affine4_64, dequantize_mlx_affine4_64>;
-template [[host_name("kernel_mul_mm_id_qwen_affine2_32_pair_swiglu_f16")]]
-kernel mul_mm_id_qwen_affine2_32_pair_swiglu_f16_n32_t
-kernel_mul_mm_id_pair_swiglu_f16<
-    32, 2, block_qwen_affine2_32, dequantize_qwen_affine2_32, true>;
-template [[host_name("kernel_mul_mm_id_qwen_affine2_32_pair_swiglu_f16_n16")]]
-kernel mul_mm_id_qwen_affine2_32_pair_swiglu_f16_n16_t
-kernel_mul_mm_id_pair_swiglu_f16<
-    16, 2, block_qwen_affine2_32, dequantize_qwen_affine2_32, true>;
 typedef decltype(kernel_mul_mm_id<32, half, half4x4, simdgroup_half8x8, half, half2x4, simdgroup_half8x8, block_q2_K, QK_NL, dequantize_q2_K, float, float4x4, float, float2x4>) mul_mm_id;
 typedef decltype(kernel_mul_mm_id<32, half, half4x4, simdgroup_half8x8, half, half2x4, simdgroup_half8x8, block_q2_K, QK_NL, dequantize_q2_K, half, half4x4, half, half2x4>) mul_mm_id_f16_rhs;
 typedef decltype(kernel_mul_mm_id<32, float, float4x4, simdgroup_float8x8, float, float2x4, simdgroup_float8x8, block_q2_K, QK_NL, dequantize_q2_K, float, float4x4, float, float2x4>) mul_mm_id_ff32;

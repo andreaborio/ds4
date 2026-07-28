@@ -4266,9 +4266,8 @@ static bool qwen35_routed_expert_matrix_bytes(
     }
     /* MLX affine4 keeps Q4_K as its graph identity: the routed executors need
      * that logical extent while the ExpertMajor codec supplies its physical
-     * component geometry separately. The mixed-IQ and Affine2 profiles use
-     * their virtual component extent directly for cache planning and address
-     * translation. */
+     * component geometry separately. The mixed-IQ profile uses its virtual
+     * component extent directly for cache planning and address translation. */
     *expert_bytes_out = t->type == DS4_TENSOR_Q4_K
         ? logical_expert_bytes
         : t->bytes / QWEN35_N_EXPERT;
@@ -38837,11 +38836,8 @@ static bool ds4_engine_install_expert_store_v2(ds4_engine *e) {
     }
     const bool qwen_q2_storage =
         is_qwen &&
-        ((manifest->storage_format == DS4_EXPERT_STORE_STORAGE_GGML &&
-          manifest->group_size == 0u) ||
-         (manifest->storage_format ==
-              DS4_EXPERT_STORE_STORAGE_QWEN_AFFINE2_G32_IQ_DOWN &&
-          manifest->group_size == 32u));
+        manifest->storage_format == DS4_EXPERT_STORE_STORAGE_GGML &&
+        manifest->group_size == 0u;
     const bool qwen_affine4_storage =
         is_qwen &&
         manifest->storage_format ==
@@ -38911,10 +38907,8 @@ static bool ds4_engine_install_expert_store_v2(ds4_engine *e) {
                 tensor[role]->dim[0] != component->dim[0] ||
                 tensor[role]->dim[1] != component->dim[1] ||
                 tensor[role]->dim[2] != component->dim[2] ||
-                (manifest->storage_format !=
-                     DS4_EXPERT_STORE_STORAGE_QWEN_AFFINE2_G32_IQ_DOWN &&
-                 tensor[role]->bytes !=
-                     component->expert_bytes * manifest->expert_count)) {
+                tensor[role]->bytes !=
+                    component->expert_bytes * manifest->expert_count) {
                 fprintf(stderr,
                         "ds4: native %s store geometry differs from logical layer %u role %u\n",
                         family_name, layer, role);
@@ -38975,10 +38969,7 @@ static bool ds4_engine_install_expert_store_v2(ds4_engine *e) {
     const char *storage_name =
         manifest->storage_format == DS4_EXPERT_STORE_STORAGE_MLX_AFFINE4
             ? "mlx-affine4-g64"
-            : manifest->storage_format ==
-                      DS4_EXPERT_STORE_STORAGE_QWEN_AFFINE2_G32_IQ_DOWN
-                  ? "qwen-affine2-g32-iq-down"
-                  : "ggml-block";
+            : "ggml-block";
     fprintf(stderr,
             "ds4: %s embedded expert-major store active: v%u/%s, %u routed layers x %u experts, %.2f GiB payload, %s mode\n",
             family_name, manifest->version, storage_name,
@@ -39009,7 +39000,7 @@ static bool ds4_engine_configure_qwen35_metal_streaming(ds4_engine *e) {
             &e->qwen35_weights, &geometry)) {
         fprintf(stderr,
                 "ds4: Qwen SSD streaming cache geometry does not match the "
-                "selected Q2_K_XL artifact\n");
+                "selected quantization profile\n");
         return false;
     }
     if (geometry.minimum_cache_experts > UINT32_MAX) {

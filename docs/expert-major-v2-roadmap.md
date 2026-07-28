@@ -52,8 +52,17 @@ layout.
 - **Implemented:** distinct `qwen35moe` family ID, 40-layer fail-closed
   geometry, generic v2 conversion, logical reconstruction, resident mapping,
   and SSD translation.
-- **Qualified and published:** MLX affine4/group-64 resident and SSD execution on
-  the hardware lanes recorded in the current benchmark index.
+- **One runtime, two codecs:** model/session state, Gated DeltaNet, attention,
+  KV, routing, cache, resident/SSD policy, and scheduling are shared. Only the
+  Affine4 and routed-IQ physical weight primitives differ, as required by
+  [`ADR 0006`](adr/0006-qwen-dual-weight-codecs.md).
+- **Qualified and published:** MLX affine4/group-64 resident and SSD execution
+  on the hardware lanes recorded in the current benchmark index.
+- **Qualified implementation, publication pending:** exact Q2_K_XL
+  mixed-GGML inventory, 12,290,632,032 bytes, SHA-256
+  `30c22f70aff0f05986b517ee4ad8fef554a1b5aab6971c9ca09f999566d30143`.
+  The immutable distribution revision and release-contract entry remain
+  pending; the Affine4 release is preserved.
 - **Correctness:** the final resident and SSD lane retains deterministic token
   and logit comparisons with no new swapout in the recorded qualification.
 - **Release artifact:**
@@ -65,6 +74,8 @@ layout.
   artifact-format floor `73a332fef82a0bcdd567d17e0de17aa004cad85d`;
   release safety still requires the current runtime-support policy.
   The former Q4_K_S artifact is retained only as a fail-closed negative case.
+  Experimental Affine2 was rejected and removed rather than becoming a third
+  storage codec.
 
 ### DeepSeek V4
 
@@ -104,8 +115,9 @@ The common format removes layout fallbacks; performance remains
 family-specific. Every new optimization is measured alone and in combination
 with the current stack.
 
-1. Qwen: preserve paired gate/up and parallel decode while checking resident
-   first-token page behavior at 2K, 8K, and 16K.
+1. Qwen: preserve the shared graph and profile-specific weight decoders; focus
+   next on exact Affine4 SSD decode and long-prefill work reduction without
+   introducing a third codec or permanent selector.
 2. DeepSeek: qualify each published v2 artifact and retain the measured
    three-task SSD decode schedule unless a storage-specific A/B wins.
 3. GLM: evaluate protected-hot/second-hit cache admission, then reduce host

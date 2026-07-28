@@ -5,7 +5,9 @@ runtime examples use the public `hebrus` executable.
 
 This directory contains frozen Qwen3.6 reference data, reproducible fixture
 collectors, and narrow offline checks. Current production inference accepts
-only the qualified embedded ExpertMajor v2 artifact on Apple Metal. The support
+only the two exact qualified embedded ExpertMajor v2 weight profiles on Apple
+Metal: published MLX Affine4 G64 and Q2_K_XL. They share the Qwen graph and
+session runtime while retaining codec-specific numeric fixtures. The support
 boundary is defined by
 [`RUNTIME_SUPPORT.md`](../../docs/contracts/RUNTIME_SUPPORT.md); the complete
 release lane remains
@@ -17,7 +19,8 @@ release lane remains
 | --- | --- | --- |
 | `qwen36_tokenizer_chat_golden.json` | Pinned official tokenizer and rendered-chat vectors | consumed by the collectors and tokenizer tests |
 | `qwen36_tokenizer_fixture.inc` | Compact C closure of required symbols, ranked merge candidates, and expected IDs | `make qwen-tokenizer-test` |
-| `qwen36_chat_template.jinja` | Byte-exact canonical chat template | `make qwen-metadata-test` |
+| `qwen36_chat_template.jinja` | Byte-exact Q2_K_XL chat template | `make qwen-metadata-test` |
+| `qwen36_chat_template_affine4.jinja` | Byte-exact published Affine4 chat template | `make qwen-metadata-test` |
 | `qwen_unicode_ucd_cache.txt` | Frozen Unicode normalization and property data | `make qwen-unicode-test` |
 | `qwen36_gdn_golden.inc` | Scalar Gated DeltaNet state/output oracle | `make qwen-reference-test` |
 | `qwen36_attention_golden.inc` | Scalar full-attention and causal-prefix oracle | `make qwen-reference-test` |
@@ -118,9 +121,9 @@ request manifest and prompt hashes.
 identity checks, padding exclusion, top-k metrics, and malformed-input failure.
 It is not a substitute for the current ExpertMajor v2 model-backed lane.
 
-## Qualified ExpertMajor v2 artifact
+## Qualified ExpertMajor v2 artifacts
 
-Use this exact release identity for every Qwen model-backed gate:
+Use the published Affine4 identity for release and lower-memory gates:
 
 | Field | Value |
 | --- | --- |
@@ -130,6 +133,18 @@ Use this exact release identity for every Qwen model-backed gate:
 | SHA-256 | `dd17266185833a9f05531ce366fd7284ddca1ed64aa3dcf06e321e8c72c9ea3d` |
 | Routed storage | MLX affine4, group size 64 |
 | Hugging Face | [`andreaborio/Qwen3.6-35B-A3B-Hebrus-GGUF`](https://huggingface.co/andreaborio/Qwen3.6-35B-A3B-Hebrus-GGUF) |
+
+Use this exact Q2_K_XL identity for the second profile's 64 GiB gates:
+
+| Field | Value |
+| --- | --- |
+| Publication state | Qualified implementation; immutable publication revision pending |
+| File | `Qwen3.6-35B-A3B-DS4-ExpertMajor-v2-Q2_K_XL.gguf` |
+| Bytes | `12,290,632,032` |
+| SHA-256 | `30c22f70aff0f05986b517ee4ad8fef554a1b5aab6971c9ca09f999566d30143` |
+| Routed storage | Exact IQ2_XS/IQ3_XXS/IQ4_XS Q2_K_XL inventory |
+| Canonical source SHA-256 | `96b9c0af5c77a4ecaabe3983175112b5ece763261c1ece12b2494b692a70dad7` |
+| Embedded payload SHA-256 | `ccc3fbc2405d1dd73f8ac15741b0277514de4f46b80818531297ea9ffa0c6a3c` |
 
 The v2 file contains one routed-weight copy inside its checksummed embedded
 store. Canonical Qwen GGUFs are offline converter inputs, not inference
@@ -145,18 +160,28 @@ python3 gguf-tools/ds4-expert-major.py inspect CANONICAL-QWEN.gguf
 python3 gguf-tools/ds4-expert-major.py verify \
   CANONICAL-QWEN.gguf \
   Qwen3.6-35B-A3B-DS4-ExpertMajor-v2-MLX-Affine4-G64.gguf
+
+python3 gguf-tools/ds4-expert-major.py verify \
+  CANONICAL-Q2-K-XL.gguf \
+  Qwen3.6-35B-A3B-DS4-ExpertMajor-v2-Q2_K_XL.gguf
 ```
 
 Never use `--skip-verify` for a release artifact.
 
 ## Model-backed Metal gate
 
-Resolve `QWEN_V2` to the absolute path whose size and complete SHA-256 match the
-table above. Normal startup is flag-free AUTO:
+Resolve `QWEN_V2` to the published Affine4 path and `QWEN_Q2_V2` to the exact
+Q2_K_XL path; verify each size and complete SHA-256 against the tables above.
+Normal startup is flag-free AUTO:
 
 ```sh
 QWEN_V2=/absolute/path/to/Qwen3.6-35B-A3B-DS4-ExpertMajor-v2-MLX-Affine4-G64.gguf
+QWEN_Q2_V2=/absolute/path/to/Qwen3.6-35B-A3B-DS4-ExpertMajor-v2-Q2_K_XL.gguf
 ./hebrus -m "$QWEN_V2" --ctx 8192 \
+  -n 32 --temp 0 \
+  -p 'Scrivi solo una breve funzione Python che somma due interi.'
+
+./hebrus -m "$QWEN_Q2_V2" --ctx 8192 \
   -n 32 --temp 0 \
   -p 'Scrivi solo una breve funzione Python che somma due interi.'
 ```
@@ -170,7 +195,9 @@ gates.
 The policy suite covers named 16/24/32/36/48/64/96/128 GiB profiles. Model-backed
 release evidence must additionally identify the real Metal device and its
 `recommendedMaxWorkingSetSize`; a simulated profile is not hardware throughput
-evidence. At minimum, validate the available lower-memory lanes as follows:
+evidence. The lower-memory requirements below currently qualify Affine4 only;
+Q2_K_XL must not inherit them from its smaller byte count. At minimum, validate
+the available Affine4 lower-memory lanes as follows:
 
 - 16 GiB: AUTO resolves to SSD, pressure is explicitly normal, and swap does
   not increase;

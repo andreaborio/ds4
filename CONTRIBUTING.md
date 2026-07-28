@@ -224,22 +224,25 @@ allocation strictly larger than the frontier plus generated tokens; 131,072 is
 the standard allocation for the 65,536- and 100,000-token lanes.
 
 Long context is a primary product workload, not an edge case. The 32,768-token
-row is the minimum long-context screen, not the model-window qualification
-endpoint. Every surviving model-backed inference-performance candidate must
-also run an isolated endpoint arm at the largest admitted prompt frontier that
-leaves room for at least 128 greedy decode tokens and runtime bookkeeping.
-Derive that limit from the locally validated artifact metadata and the runtime's
-admission result, not from a model card. Record the declared context length,
-the exact prompt frontier, context allocation, generated-token count, resolved
+row is the minimum merge screen, not the model-window qualification endpoint.
+Full-window publication and release qualification additionally require an
+isolated endpoint arm at the largest admitted prompt frontier that leaves room
+for at least 128 greedy decode tokens and runtime bookkeeping. Derive that
+limit from the locally validated artifact metadata and the runtime's admission
+result, not from a model card. Record the declared context length, the exact
+prompt frontier, context allocation, generated-token count, resolved
 hardware/mode plan, peak memory pressure, and swapout delta.
 
-The currently validated Qwen3.6 metadata declares a 262,144-token context, so a
-Qwen promotion requires a near-262K endpoint arm in addition to the standard
-matrix and the 65,536/100,000-token diagnostic arms where applicable. If a
-qualified hardware or residency profile cannot safely complete the context
-endpoint it advertises, either fix the runtime or narrow that profile's public
-context contract and fail larger requests closed. Do not waive the endpoint
-arm or silently substitute 32K/100K evidence.
+The currently validated Qwen3.6 metadata declares a 262,144-token context, so
+full-window qualification requires a near-262K endpoint arm in addition to the
+standard matrix and the 65,536/100,000-token diagnostic arms where applicable.
+An additive implementation may merge with that arm explicitly pending only if
+it does not replace the published artifact/downloader, makes no full-window
+qualification claim, and records the endpoint as a blocking publication and
+release gate. If a qualified hardware or residency profile cannot safely
+complete the context endpoint it advertises, either fix the runtime or narrow
+that profile's public context contract and fail larger requests closed. Never
+silently substitute 32K/100K evidence for the release endpoint.
 
 Routing, expert-cache, residency, and expert-I/O changes must also complete one
 second 32,768-token diagnostic lane from a different prompt domain. Use
@@ -280,6 +283,14 @@ Performance comparisons must also follow these rules:
   process invalidates the entire cohort, including already completed arms.
   Recover or stabilize the host, correct the unsafe policy when applicable,
   then restart from the first A arm; do not retain a convenient retry.
+- Inspect application descendants, not only their visible parent processes,
+  when isolating a benchmark host. Suspending an Electron application parent
+  does not necessarily suspend its renderer or Node helpers. Record a
+  process/load snapshot before the cohort, and treat a helper consuming
+  material CPU/GPU or two byte-identical arms drifting beyond the control
+  ceiling as host contamination. After a sustained long-context arm, require
+  an idle cooldown before the next comparable arm unless active thermal
+  control and its restoration are both recorded.
 - Make acceptance environments hermetic. The bounded M5 runner rejects
   inherited `DS4_*` runtime flags outside its own controls and records every
   admitted `DS4_*` variable. The exact `DS4_QWEN_TELEMETRY_JSONL` sink is the
