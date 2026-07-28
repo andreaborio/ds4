@@ -42,19 +42,6 @@
 {%- if not messages %}
     {{- raise_exception('No messages provided.') }}
 {%- endif %}
-{%- set num_sys = 0 %}
-{%- set merged_system = '' %}
-{%- if messages[0].role == 'system' or messages[0].role == 'developer' %}
-    {%- set first = render_content(messages[0].content, false, true)|trim %}
-    {%- if messages|length > 1 and (messages[1].role == 'system' or messages[1].role == 'developer') %}
-        {%- set second = render_content(messages[1].content, false, true)|trim %}
-        {%- set merged_system = first + '\n' + second %}
-        {%- set num_sys = 2 %}
-    {%- else %}
-        {%- set merged_system = first %}
-        {%- set num_sys = 1 %}
-    {%- endif %}
-{%- endif %}
 {%- if tools and tools is iterable and tools is not mapping %}
     {{- '<|im_start|>system\n' }}
     {{- "# Tools\n\nYou have access to the following functions:\n\n<tools>" }}
@@ -64,13 +51,17 @@
     {%- endfor %}
     {{- "\n</tools>" }}
     {{- '\n\nIf you choose to call a function ONLY reply in the following format with NO suffix:\n\n<tool_call>\n<function=example_function_name>\n<parameter=example_parameter_1>\nvalue_1\n</parameter>\n<parameter=example_parameter_2>\nThis is the value for the second parameter\nthat can span\nmultiple lines\n</parameter>\n</function>\n</tool_call>\n\n<IMPORTANT>\nReminder:\n- Function calls MUST follow the specified format: an inner <function=...></function> block must be nested within <tool_call></tool_call> XML tags\n- Required parameters MUST be specified\n- You may provide optional reasoning for your function call in natural language BEFORE the function call, but NOT after\n- If there is no function call available, answer the question like normal with your current knowledge and do not tell the user about function calls\n</IMPORTANT>' }}
-    {%- if merged_system %}
-        {{- '\n\n' + merged_system }}
+    {%- if messages[0].role == 'system' %}
+        {%- set content = render_content(messages[0].content, false, true)|trim %}
+        {%- if content %}
+            {{- '\n\n' + content }}
+        {%- endif %}
     {%- endif %}
     {{- '<|im_end|>\n' }}
 {%- else %}
-    {%- if merged_system %}
-        {{- '<|im_start|>system\n' + merged_system + '<|im_end|>\n' }}
+    {%- if messages[0].role == 'system' %}
+        {%- set content = render_content(messages[0].content, false, true)|trim %}
+        {{- '<|im_start|>system\n' + content + '<|im_end|>\n' }}
     {%- endif %}
 {%- endif %}
 {%- set ns = namespace(multi_step_tool=true, last_query_index=messages|length - 1) %}
@@ -84,10 +75,16 @@
         {%- endif %}
     {%- endif %}
 {%- endfor %}
+{%- if ns.multi_step_tool %}
+    {{- raise_exception('No user query found in messages.') }}
+{%- endif %}
 {%- for message in messages %}
-    {%- if loop.index0 >= num_sys and message.role != "system" and message.role != "developer" %}
     {%- set content = render_content(message.content, true)|trim %}
-    {%- if message.role == "user" %}
+    {%- if message.role == "system" %}
+        {%- if not loop.first %}
+            {{- raise_exception('System message must be at the beginning.') }}
+        {%- endif %}
+    {%- elif message.role == "user" %}
         {{- '<|im_start|>' + message.role + '\n' + content + '<|im_end|>' + '\n' }}
     {%- elif message.role == "assistant" %}
         {%- set reasoning_content = '' %}
@@ -119,11 +116,10 @@
                 {%- else %}
                     {{- '\n<tool_call>\n<function=' + tool_call.name + '>\n' }}
                 {%- endif %}
-                {%- if tool_call.arguments is mapping %}
-                    {%- for args_name in tool_call.arguments %}
-                        {%- set args_value = tool_call.arguments[args_name] %}
+                {%- if tool_call.arguments is defined %}
+                    {%- for args_name, args_value in tool_call.arguments|items %}
                         {{- '<parameter=' + args_name + '>\n' }}
-                        {%- set args_value = args_value | tojson | safe if args_value is mapping or (args_value is sequence and args_value is not string) else args_value | string %}
+                        {%- set args_value = args_value | string if args_value is string else args_value | tojson | safe %}
                         {{- args_value }}
                         {{- '\n</parameter>\n' }}
                     {%- endfor %}
@@ -144,7 +140,8 @@
         {%- elif loop.last %}
             {{- '<|im_end|>\n' }}
         {%- endif %}
-    {%- endif %}
+    {%- else %}
+        {{- raise_exception('Unexpected message role.') }}
     {%- endif %}
 {%- endfor %}
 {%- if add_generation_prompt %}
@@ -155,4 +152,3 @@
         {{- '<think>\n' }}
     {%- endif %}
 {%- endif %}
-{#- Unsloth fixes - developer role, tool calling #}

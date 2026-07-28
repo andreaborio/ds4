@@ -131,10 +131,40 @@ A short-context run may reject an inference optimization for correctness,
 safety, or a clear regression, but it may never promote the change or
 generalize a speed claim. Apply the canonical short/medium/large/long matrix in
 `CONTRIBUTING.md`, keep its frontiers separate, and require the 32K long-context
-lane for every surviving promotion candidate. Include the final
-baseline-versus-combined-stack comparison in the durable benchmark record; an
-abort, swapout, changed resolved plan, or competing inference process
-invalidates the complete comparison cohort.
+lane for every surviving promotion candidate.
+
+Long context is a primary product workload, not an edge case. The 32K lane is
+only the minimum merge screen. Full-window qualification additionally requires
+an isolated endpoint lane at the largest admitted prompt frontier that leaves
+room for at least 128 greedy decode tokens and runtime bookkeeping. Derive the
+limit from the locally validated artifact metadata and runtime admission, not
+a model-card claim. For Qwen3.6, whose validated metadata declares a
+262,144-token context, publication and release qualification therefore require
+a near-262K endpoint lane.
+
+An additive implementation may merge before that endpoint only when its status
+is explicitly endpoint-pending, it does not replace the published artifact or
+downloader default, and no full-window qualification claim is made. The missing
+endpoint remains a blocking publication/release gate and must be recorded in
+the durable benchmark decision. If a qualified hardware/mode profile cannot
+complete its advertised endpoint safely, either fix the runtime or narrow the
+public context contract; do not waive the release lane. A win at a smaller
+frontier may never hide a regression at a larger or endpoint frontier.
+
+For context-sensitive inference work, start performance exploration at 8K;
+use shorter frontiers as secondary correctness, safety, and low-context-cost
+checks. At exact-output parity and with no measured regression in any qualified
+lane, prefer an implementation with demonstrably lower asymptotic work, memory
+traffic, dispatch count, synchronization, or bounded resource use even when
+the current host's wall-clock difference is inside measurement noise. This is
+a tie-breaker for a singular production path, not permission to retain a
+parallel kernel, flag, or merely theoretical optimization whose cost reduction
+has not been demonstrated.
+
+The durable benchmark record must include the final
+baseline-versus-combined-stack comparison. An abort, swapout, changed resolved
+plan, or competing inference process invalidates the complete comparison
+cohort.
 
 Every merge candidate needs a review of the full diff from its merge base. The
 reviewer should be independent of the implementer when practical and must look

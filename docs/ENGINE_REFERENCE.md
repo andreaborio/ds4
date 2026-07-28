@@ -262,26 +262,37 @@ resolved mode and memory-plan reason. GLM release startup remains flag-free
 AUTO; `--resident` is rejected and explicit SSD/cache controls are diagnostics,
 not alternate startup instructions.
 
-The supported `qwen35moe` release contract is the normalized
-Qwen3.6-35B-A3B ExpertMajor v2 MLX affine4/group-64 artifact. It remains a
-single GGUF with the standard v2 container and activates automatically. The
-former v2 GGML/Q4 payload is rejected. Through 24 GiB, AUTO selects guarded SSD
-and an explicit resident request fails. On larger hosts AUTO requires both the
-normal working-set calculation and a live unified-memory pressure snapshot; if
-either cannot admit resident mode, it uses bounded SSD streaming. Qwen's cache
-planner charges its complete non-routed page set separately and grows cache
-storage in slabs of up to 321 experts (about 0.529 GiB at the full target; the
-final target tail can be smaller). Its 16 and 24 GiB SSD tiers
+The supported `qwen35moe` runtime has one model/session/graph path and two exact
+ExpertMajor v2 weight profiles: the published MLX affine4/group-64 artifact and
+the implementation-validated, endpoint-pending Q2_K_XL mixed-GGML artifact.
+Gated DeltaNet, attention, KV,
+routing, cache ownership, resident/SSD scheduling, and output execution are
+shared. Profile binding happens once from the complete tensor, tokenizer, and
+storage inventory; only physical Affine4 versus IQ/Q weight decoding is
+specialized. Affine2, generic GGML inventories, and the former v2 Q4_K_S
+payload are rejected. The release downloader continues to resolve Affine4
+until Q2_K_XL has valid near-262K endpoint evidence and an immutable
+publication revision.
+
+Through 24 GiB, the published Affine4 policy selects guarded SSD and an
+explicit resident request fails. On larger qualified hosts AUTO requires both
+the normal working-set calculation and a live unified-memory pressure snapshot;
+if either cannot admit resident mode, it uses bounded SSD streaming. Qwen's
+cache planner charges the selected profile's complete non-routed page set and
+exact per-expert geometry separately, and grows cache storage in slabs of up to
+321 experts (about 0.529 GiB at the full Affine4 target; the final target tail
+can be smaller). Its 16 and 24 GiB Affine4 SSD tiers
 require an affirmative normal-pressure signal at admission and every phase
 entry, including an unchanged configured budget because lazy slabs can still
 populate, and stop at a 3,521-expert target (about 5.80 GiB for the published
-artifact). Immediately before each new slab, a fresh snapshot admits the exact
+Affine4 artifact). Immediately before each new slab, a fresh snapshot admits the exact
 bytes against host and Metal limits. Denial freezes at allocated slab capacity
 and forces eviction/reuse without allocating a fresh fallback buffer.
 The DeepSeek resident/SSD planner and GLM SSD-only planner remain independent.
 Exact artifact and validation details live in
-[`qwen-expert-major-store.md`](qwen-expert-major-store.md) and the consolidated
-[`affine AUTO/SSD gate`](benchmarks/2026-07-21-qwen-unified-affine-auto-ssd.md).
+[`qwen-expert-major-store.md`](qwen-expert-major-store.md), the
+[`dual-codec decision`](adr/0006-qwen-dual-weight-codecs.md), and the
+[`Q2_K_XL evidence`](benchmarks/2026-07-28-qwen-q2-k-xl-performance-weight.md).
 
 Qwen numerical inference is currently Metal-only. AUTO exposes named
 16/24/32/36/48/64/96/128 GiB profiles but sizes resident headroom and SSD cache

@@ -79,7 +79,7 @@ def write_fixture(path: Path, architecture: str, *,
             metadata_u32("qwen35moe.expert_used_count", 2),
         )
         routed_layers = (0, 1)
-        types = ((12, 12, 12), (12, 12, 12))
+        types = ((17, 17, 18), (18, 18, 23))
     else:
         raise AssertionError(f"unsupported fixture architecture: {architecture}")
     metadata_items = tuple(
@@ -192,19 +192,20 @@ def main() -> int:
             )
             assert rejected.returncode != 0, "C reader accepted corrupt manifest"
 
-        bad_reserved = tmp_path / "bad-reserved.gguf"
-        shutil.copyfile(native, bad_reserved)
-        with bad_reserved.open("r+b") as file:
+        bad_storage = tmp_path / "bad-storage.gguf"
+        shutil.copyfile(native, bad_storage)
+        with bad_storage.open("r+b") as file:
             file.seek(store.abs_offset + 160)
             file.write(b"\x01")
-        run("verify", str(source), str(bad_reserved), ok=False)
+        run("verify", str(source), str(bad_storage), ok=False)
         if probe:
             rejected = subprocess.run(
-                [probe, str(bad_reserved), str(store.abs_offset),
+                [probe, str(bad_storage), str(store.abs_offset),
                  str(store.size), str(tool.STORE_FAMILY_DEEPSEEK4)],
                 stdout=subprocess.PIPE, stderr=subprocess.PIPE,
             )
-            assert rejected.returncode != 0, "C reader accepted reserved header bits"
+            assert rejected.returncode != 0, \
+                "C reader accepted an unsupported storage format"
 
         bad_payload = tmp_path / "bad-payload.gguf"
         shutil.copyfile(native, bad_payload)
@@ -253,7 +254,9 @@ def main() -> int:
         assert "layers: 2" in qwen_inspected.stdout
         assert "layer_ids: 0..1" in qwen_inspected.stdout
         assert "experts: 3" in qwen_inspected.stdout
-        assert "Q4_K" in qwen_inspected.stdout
+        assert "IQ2_XS" in qwen_inspected.stdout
+        assert "IQ3_XXS" in qwen_inspected.stdout
+        assert "IQ4_XS" in qwen_inspected.stdout
         run("build", "--reserve-bytes", "0", str(qwen_source),
             str(qwen_native))
         run("verify", str(qwen_source), str(qwen_native))

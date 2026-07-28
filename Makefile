@@ -44,6 +44,11 @@ SERVER_ALIAS_PORT ?= 0
 	release-contract release-contract-test \
 	imatrix-dataset-check prompt-fixture-check cpu FORCE \
 	metal build-isolation-test q4k-dot-test qwen-metadata-test \
+	qwen-iq-metal-tables-check \
+	qwen-iq-metal-kernel-test \
+	qwen-q5-metal-kernel-test \
+	qwen-gdn-controls-metal-kernel-test \
+	qwen-fused-split-q-norm-metal-kernel-test \
 	qwen-reference-test qwen-unicode-test qwen-tokenizer-test \
 	qwen-expert-group-test qwen-24g-fixture-test \
 	expert-store-test metal-ssd-profile-test \
@@ -85,6 +90,11 @@ brand-boundary-test: tools/brand_boundary_audit.py tests/test_brand_boundary_aud
 brand-asset-test: tests/test_brand_asset.py docs/media/hebrus-typographic.png README.md
 	python3 tests/test_brand_asset.py
 
+qwen-iq-metal-tables-check: gguf-tools/generate_qwen35_iq_metal.py \
+		gguf-tools/vendor/qwen35-iq-ggml-common.h \
+		metal/qwen35_iq_tables.metal.inc
+	python3 gguf-tools/generate_qwen35_iq_metal.py --check
+
 ifeq ($(UNAME_S),Darwin)
 
 # A build profile owns every object and binary it produces.  In particular, a
@@ -120,6 +130,8 @@ METAL_TEST_BINS := \
 	$(METAL_BINDIR)/test_qwen_unicode \
 	$(METAL_BINDIR)/test_qwen_tokenizer \
 	$(METAL_BINDIR)/test_qwen_expert_group \
+	$(METAL_BINDIR)/test_qwen35_iq_metal \
+	$(METAL_BINDIR)/test_qwen35_metal \
 	$(METAL_BINDIR)/test_expert_store \
 	$(METAL_BINDIR)/test_metal_ssd_profile \
 	$(METAL_BINDIR)/test_ssd_residency \
@@ -300,12 +312,14 @@ $(METAL_OBJDIR)/ds4_test_core.o: ds4.c ds4.h ds4_ssd.h ds4_profile.h \
 		-c -o $@ $<
 
 $(METAL_OBJDIR)/ds4_metal.o: ds4_metal.m ds4_gpu.h \
-		ds4_qwen_expert_group.h runtime/ds4_metal_glm.inc $(METAL_SRCS)
+		ds4_qwen_expert_group.h runtime/ds4_metal_glm.inc \
+		metal/qwen35_iq_tables.metal.inc $(METAL_SRCS)
 	@mkdir -p "$(@D)"
 	$(CC) $(OBJCFLAGS) $(DEPFLAGS) -c -o $@ ds4_metal.m
 
 $(METAL_OBJDIR)/ds4_metal_test.o: ds4_metal.m ds4_gpu.h \
-		ds4_qwen_expert_group.h runtime/ds4_metal_glm.inc $(METAL_SRCS)
+		ds4_qwen_expert_group.h runtime/ds4_metal_glm.inc \
+		metal/qwen35_iq_tables.metal.inc $(METAL_SRCS)
 	@mkdir -p "$(@D)"
 	$(CC) $(OBJCFLAGS) $(DEPFLAGS) -DDS4_TEST_HOOKS \
 		-c -o $@ ds4_metal.m
@@ -493,6 +507,22 @@ $(METAL_BINDIR)/test_qwen_expert_group: \
 	@mkdir -p "$(@D)"
 	$(CC) $(CFLAGS) -o $@ $^ $(LDLIBS)
 
+$(METAL_BINDIR)/test_qwen35_iq_metal: \
+		tests/qwen/test_qwen35_iq_metal.m \
+		gguf-tools/vendor/qwen35-iq-ggml-common.h \
+		metal/dense.metal metal/qwen35_iq_tables.metal.inc metal/moe.metal
+	@mkdir -p "$(@D)"
+	$(CC) $(OBJCFLAGS) -o $@ tests/qwen/test_qwen35_iq_metal.m \
+		$(METAL_LDLIBS)
+
+$(METAL_BINDIR)/test_qwen35_metal: \
+		tests/qwen/test_qwen35_metal.m ds4_qwen.c ds4_qwen.h \
+		metal/qwen35.metal tests/qwen/qwen36_attention_golden.inc \
+		tests/qwen/qwen36_gdn_golden.inc
+	@mkdir -p "$(@D)"
+	$(CC) $(OBJCFLAGS) $(QWEN_CFLAGS) -I. -o $@ \
+		tests/qwen/test_qwen35_metal.m ds4_qwen.c $(METAL_LDLIBS)
+
 $(METAL_BINDIR)/test_expert_store: \
 		$(METAL_OBJDIR)/test_expert_store.o \
 		$(METAL_OBJDIR)/ds4_expert_store.o
@@ -507,6 +537,19 @@ $(METAL_BINDIR)/test_metal_ssd_profile: \
 
 qwen-expert-group-test: $(METAL_BINDIR)/test_qwen_expert_group
 	$<
+
+qwen-iq-metal-kernel-test: $(METAL_BINDIR)/test_qwen35_iq_metal
+	$<
+
+qwen-q5-metal-kernel-test: $(METAL_BINDIR)/test_qwen35_metal
+	DS4_TEST_QWEN_EMBEDDING_Q5_ONLY=1 $<
+
+qwen-fused-split-q-norm-metal-kernel-test: \
+		$(METAL_BINDIR)/test_qwen35_metal
+	DS4_TEST_QWEN_FUSED_SPLIT_Q_NORM_ONLY=1 $<
+
+qwen-gdn-controls-metal-kernel-test: $(METAL_BINDIR)/test_qwen35_metal
+	DS4_TEST_QWEN_GDN_CONTROLS_ONLY=1 $<
 
 expert-store-test: $(METAL_BINDIR)/test_expert_store
 	DS4_EXPERT_STORE_PROBE=$(METAL_BINDIR)/test_expert_store \
@@ -565,6 +608,8 @@ model-free-test: metal ds4_test ds4_agent_test $(METAL_BINDIR)/test_q4k_dot \
 		$(METAL_BINDIR)/test_qwen_unicode \
 		$(METAL_BINDIR)/test_qwen_tokenizer \
 		$(METAL_BINDIR)/test_qwen_expert_group \
+		$(METAL_BINDIR)/test_qwen35_iq_metal \
+		$(METAL_BINDIR)/test_qwen35_metal \
 		$(METAL_BINDIR)/test_expert_store \
 		$(METAL_BINDIR)/test_metal_ssd_profile \
 		$(METAL_BINDIR)/test_ssd_residency download-model-test \
@@ -591,6 +636,13 @@ model-free-test: metal ds4_test ds4_agent_test $(METAL_BINDIR)/test_q4k_dot \
 	$(METAL_BINDIR)/test_qwen_unicode
 	$(METAL_BINDIR)/test_qwen_tokenizer
 	$(METAL_BINDIR)/test_qwen_expert_group
+	$(METAL_BINDIR)/test_qwen35_iq_metal
+	DS4_TEST_QWEN_EMBEDDING_Q5_ONLY=1 \
+		$(METAL_BINDIR)/test_qwen35_metal
+	DS4_TEST_QWEN_GDN_CONTROLS_ONLY=1 \
+		$(METAL_BINDIR)/test_qwen35_metal
+	DS4_TEST_QWEN_FUSED_SPLIT_Q_NORM_ONLY=1 \
+		$(METAL_BINDIR)/test_qwen35_metal
 	DS4_EXPERT_STORE_PROBE=$(METAL_BINDIR)/test_expert_store \
 		python3 tests/test_expert_major.py
 	$(METAL_BINDIR)/test_metal_ssd_profile
@@ -621,7 +673,8 @@ prompt-fixture-check:
 # only after it completes even when an agent invokes `make -j premerge`.
 premerge: context-audit doc-links brand-boundary-audit brand-boundary-test brand-asset-test \
 	release-contract release-contract-test \
-	imatrix-dataset-check prompt-fixture-check build-isolation-test
+	imatrix-dataset-check prompt-fixture-check qwen-iq-metal-tables-check \
+	build-isolation-test
 	$(MAKE) model-free-test
 	$(MAKE) install-test
 	git diff --check
@@ -846,7 +899,8 @@ prompt-fixture-check:
 
 premerge: context-audit doc-links brand-boundary-audit brand-boundary-test brand-asset-test \
 	release-contract release-contract-test \
-	imatrix-dataset-check prompt-fixture-check model-free-test
+	imatrix-dataset-check prompt-fixture-check qwen-iq-metal-tables-check \
+	model-free-test
 	$(MAKE) install-test
 	git diff --check
 

@@ -73,10 +73,13 @@ TYPE_LAYOUT = {
     25: (1, 2), 26: (1, 4), 27: (1, 8), 28: (1, 8),
     29: (256, 56), 30: (1, 2),
 }
-ROUTED_TYPES = {10, 12, 13, 14, 16}  # Q2_K, Q4_K, Q5_K, Q6_K, IQ2_XXS
+ROUTED_TYPES = {
+    10, 12, 13, 14, 16, 17, 18, 23,
+}  # Q2_K, Q4_K, Q5_K, Q6_K, and the admitted IQ2/IQ3/IQ4 variants
 TYPE_NAME = {
     10: "Q2_K", 12: "Q4_K", 13: "Q5_K", 14: "Q6_K",
-    16: "IQ2_XXS", 24: "I8",
+    16: "IQ2_XXS", 17: "IQ2_XS", 18: "IQ3_XXS", 23: "IQ4_XS",
+    24: "I8",
 }
 ROLE_NAME = ("gate", "up", "down")
 ROUTED_RE = re.compile(r"^blk\.(\d+)\.ffn_(gate|up|down)_exps\.weight$")
@@ -208,6 +211,7 @@ class Component:
     tensor: Tensor
     expert_bytes: int
     record_offset: int
+    block_elements: int | None = None
 
 
 @dataclasses.dataclass
@@ -521,7 +525,12 @@ def pack_layer(layer: Layer) -> bytes:
     struct.pack_into("<IIQQQ", result, 0, layer.index, layer.expert_count,
                      layer.record_bytes, layer.data_offset, layer.data_size)
     for component in layer.components:
-        block_elements, _ = TYPE_LAYOUT[component.tensor.ggml_type]
+        logical_block_elements, _ = TYPE_LAYOUT[component.tensor.ggml_type]
+        block_elements = (
+            component.block_elements
+            if component.block_elements is not None
+            else logical_block_elements
+        )
         offset = STORE_COMPONENT_OFFSET + component.role * STORE_COMPONENT_BYTES
         struct.pack_into(
             "<IIIIQQQQQ", result, offset,
@@ -817,22 +826,44 @@ def parse_store(native: GGUF, tensor: Tensor) -> tuple[dict[str, object], list[L
              expert_bytes, record_offset) = struct.unpack_from(
                 "<IIIIQQQQQ", entry, offset
             )
-            if (entry_role != role or ndim != 3 or ggml_type not in ROUTED_TYPES or
-                    (storage_format == STORE_STORAGE_MLX_AFFINE4 and
-                     ggml_type != 12) or
-                    TYPE_LAYOUT[ggml_type][0] != block_elements or
+            if (entry_role != role or ndim != 3 or
+                    ggml_type not in ROUTED_TYPES or
                     d2 != expert_count or record_offset != record_cursor):
                 raise FormatError(f"invalid component descriptor at layer {il} role {role}")
-            expected = tensor_nbytes(ggml_type, (d0, d1, 1))
+            if storage_format == STORE_STORAGE_GGML:
+                descriptor_valid = (
+                    TYPE_LAYOUT[ggml_type][0] == block_elements
+                )
+                expected = tensor_nbytes(ggml_type, (d0, d1, 1))
+            elif storage_format == STORE_STORAGE_MLX_AFFINE4:
+                descriptor_valid = (
+                    ggml_type == 12 and
+                    TYPE_LAYOUT[ggml_type][0] == block_elements
+                )
+                expected = tensor_nbytes(ggml_type, (d0, d1, 1))
+            else:
+                raise FormatError("unsupported expert-store storage format")
+            if not descriptor_valid:
+                raise FormatError(
+                    f"invalid physical codec descriptor at layer {il} "
+                    f"role {role}"
+                )
             if expert_bytes != expected:
                 raise FormatError(f"component byte size mismatch at layer {il} role {role}")
             synthetic = Tensor(
                 f"blk.{layer_index}.ffn_{ROLE_NAME[role]}_exps.weight",
                                (d0, d1, d2), ggml_type, 0,
                                expert_bytes * expert_count)
-            components.append(Component(role, synthetic, expert_bytes,
-                                        record_offset))
+            components.append(Component(
+                role, synthetic, expert_bytes, record_offset, block_elements
+            ))
             record_cursor += expert_bytes
+        gate, up, down = (component.tensor for component in components)
+        if (gate.dims != up.dims or gate.ggml_type != up.ggml_type or
+                gate.dims[0] != down.dims[1] or
+                gate.dims[1] != down.dims[0] or
+                down.dims[2] != expert_count):
+            raise FormatError(f"component geometry mismatch at layer {il}")
         if (layer_index <= previous_layer_index or
                 layer_index > STORE_MAX_MODEL_LAYER or
                 (family in (STORE_FAMILY_DEEPSEEK4,

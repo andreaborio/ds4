@@ -15,7 +15,7 @@ and Qwen's lower-memory extension in
 | Model family | Minimum unified memory | Qualified Metal modes | Release startup |
 | --- | ---: | --- | --- |
 | DeepSeek V4 Flash | 64 GiB | AUTO resolving to resident or SSD; explicit resident and SSD according to the artifact gate | `./hebrus -m DEEPSEEK-DS4-ExpertMajor-v2.gguf` |
-| Qwen3.6-35B-A3B | 16 GiB | 16 GiB is qualified with guarded SSD. The allocation-time release candidate extends deterministic guarded SSD through 24 GiB; above 24 GiB AUTO may resolve to resident or SSD according to the Qwen admission gates | `./hebrus -m Qwen3.6-35B-A3B-DS4-ExpertMajor-v2-MLX-Affine4-G64.gguf` |
+| Qwen3.6-35B-A3B | 16 GiB for the published Affine4 profile; Q2_K_XL lower-memory tiers pending physical qualification | 16 GiB Affine4 is qualified with guarded SSD. The allocation-time release candidate extends deterministic guarded SSD through 24 GiB; above 24 GiB AUTO may resolve to resident or SSD according to the Qwen admission gates. Q2_K_XL has recorded 64 GiB resident/SSD implementation evidence through 32K; its full-window endpoint qualification is pending | `./hebrus -m Qwen3.6-35B-A3B-DS4-ExpertMajor-v2-MLX-Affine4-G64.gguf` |
 | GLM 5.2 | 64 GiB | AUTO resolving to SSD streaming only; resident is rejected | `./hebrus -m GLM-DS4-ExpertMajor-v2.gguf --ctx 8192` |
 
 All rows require Apple Metal and a validated embedded `ds4.expert_major.v2`
@@ -23,6 +23,15 @@ store. Explicit residency options are controlled qualification tools; normal
 release startup uses AUTO. GLM's explicit SSD/cache controls are diagnostic
 rather than an additional qualified startup contract. Detailed planners and gates are in
 [`GOLD_METAL_SSD.md`](../../GOLD_METAL_SSD.md) and the family documents.
+
+Qwen has one model/session/graph runtime and two exact weight profiles:
+the published MLX affine4/group-64 inventory and the admitted,
+publication-pending Q2_K_XL mixed-GGML inventory. Attention, Gated DeltaNet, KV, routing,
+resident/SSD scheduling, cache ownership, and output execution are shared.
+Only physical weight decoding and the corresponding dense/routed primitives
+differ. The binding is fail-closed and happens once from the complete tensor,
+tokenizer, and ExpertMajor storage inventory; it is not a runtime flag. See
+[`ADR 0006`](../adr/0006-qwen-dual-weight-codecs.md).
 
 Qwen has named 16/24/32/36/48/64/96/128 GiB policy profiles, but selection uses
 the active device's exact physical RAM, `recommendedMaxWorkingSetSize`, context
@@ -35,8 +44,11 @@ on 24 GiB until the physical sustained Studio gate passes and the managed
 runtime pin advances. A 32 GiB host may use resident for shorter contexts when
 both gates pass and falls back to SSD otherwise. The retired
 Q4_K_S payload is rejected rather than decoded through a compatibility path.
-The named policy is unit-tested at every cut; performance claims remain limited
-to the physical hosts and exact workloads in the release evidence.
+Q2_K_XL uses the same policy arithmetic with its exact smaller non-routed,
+per-component, and per-expert byte geometry; it does not inherit Affine4's
+physical lower-memory qualification. The named policy is unit-tested at every
+cut; performance claims remain limited to the physical hosts, artifact, and
+exact workloads in the release evidence.
 
 Qwen SSD plans on 16 and 24 GiB are guarded tiers. They require an affirmative
 normal-pressure signal at admission and every prefill/decode phase entry,
@@ -59,8 +71,8 @@ The lower-memory extension is Qwen-specific. Hosts below 64 GiB remain outside
 the DeepSeek and GLM production contract. Do not infer support for another
 family from Qwen's successful admission.
 
-Runtime support and public artifact distribution are separate gates. The only
-runnable Qwen store is the `published`
+Runtime support and public artifact distribution are separate gates. The
+downloadable Qwen store remains the `published`
 `Qwen3.6-35B-A3B-DS4-ExpertMajor-v2-MLX-Affine4-G64.gguf`, a
 20,808,566,880-byte MLX affine4/group-64 artifact with SHA-256
 `dd17266185833a9f05531ce366fd7284ddca1ed64aa3dcf06e321e8c72c9ea3d`.
@@ -75,6 +87,16 @@ older `Qwen3.6-35B-A3B-DS4-ExpertMajor-v2-Q4_K_S.gguf` store is
 `negative-only`, not a downloadable runtime fallback. The machine-readable
 [Qwen release contract](qwen-release.json) is the canonical identity record.
 
+The runtime additionally admits the exact endpoint-pending Q2_K_XL implementation
+artifact: 12,290,632,032 bytes, SHA-256
+`30c22f70aff0f05986b517ee4ad8fef554a1b5aab6971c9ca09f999566d30143`,
+with embedded payload SHA-256
+`ccc3fbc2405d1dd73f8ac15741b0277514de4f46b80818531297ea9ffa0c6a3c`.
+It is not yet downloadable or a `qwen-v2` replacement. Publication requires
+the near-262K endpoint lane, an immutable repository revision, and a compatible
+runtime commit to be added to the release contract while preserving the
+Affine4 entry.
+
 ## Model Artifact Admission
 
 Production inference accepts the qualified embedded ExpertMajor v2 artifact for
@@ -84,7 +106,9 @@ each supported family. It must fail closed for:
 - ExpertMajor v1;
 - external sidecars;
 - missing, malformed, or mismatched ExpertMajor v2 metadata;
-- Qwen ExpertMajor v2 stores whose routed payload is not MLX affine4/group-64;
+- Qwen ExpertMajor v2 stores whose logical tensor inventory, tokenizer
+  metadata, and routed payload do not match either exact MLX
+  affine4/group-64 or Q2_K_XL profile;
 - artifact/model combinations that have not passed their family gates.
 
 Normal startup has no ExpertMajor admission bypass and needs no sidecar,

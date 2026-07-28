@@ -17,7 +17,7 @@ enum {
 };
 
 typedef enum {
-    /* Existing GGML block payloads such as Q4_K, Q2_K, and IQ2_XXS. */
+    /* GGML block payloads such as Q2_K, IQ2_XS, IQ3_XXS, and IQ4_XS. */
     DS4_EXPERT_STORE_STORAGE_GGML = 0,
     /* MLX affine 4-bit groups, physically interleaved as
      * [32 packed bytes | BF16 scale | BF16 bias] for every 64 weights.

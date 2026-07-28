@@ -22,7 +22,25 @@ Multi-frontier sweeps are useful for exploratory curves, but their later rows
 process incremental suffixes and inherit session/cache state. They are not the
 final short/medium/large/long acceptance comparison. Changes to attention, KV,
 cache, RoPE, allocation, or context scaling also require the isolated 65,536-
-and 100,000-token lanes defined in `CONTRIBUTING.md`.
+and 100,000-token lanes defined in `CONTRIBUTING.md`. Every surviving
+model-backed performance candidate also requires the model-window endpoint
+lane. For the current Qwen3.6 metadata (`context_length=262144`), the largest
+frontier that leaves one bookkeeping slot and 128 decode tokens is 262,015:
+
+```
+DS4_M5_CTX_START=262015 \
+DS4_M5_CTX_MAX=262015 \
+DS4_M5_CTX_ALLOC=262144 \
+DS4_M5_MAX_SECONDS=7200 \
+speed-bench/run_m5_dsflash_arm.sh qwen-endpoint auto 128
+```
+
+Use the model, hash-evidence, residency, cache-state, result-prefix, and
+telemetry variables required by the selected Qwen hardware/mode profile. The
+runner deterministically expands the prompt for this frontier and records both
+source and generated hashes. A hardware profile that cannot safely complete
+its advertised endpoint must narrow its public context contract rather than
+substituting a smaller benchmark.
 
 On the qualified M5 lane, `run_m5_dsflash_arm.sh` extends an undersized prompt
 deterministically for frontiers above 32,768 tokens. The generated prompt, its

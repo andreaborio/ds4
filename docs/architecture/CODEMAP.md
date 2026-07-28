@@ -13,6 +13,8 @@ RAM/working-set adaptation is isolated in
 [`ADR 0004`](../adr/0004-qwen-metal-hardware-memory-policy.md). The proposed
 Hebrus public-name migration and its immutable compatibility boundary are
 recorded in [`ADR 0005`](../adr/0005-hebrus-naming-and-compatibility-boundary.md).
+Qwen's shared runtime and dual weight-codec boundary are recorded in
+[`ADR 0006`](../adr/0006-qwen-dual-weight-codecs.md).
 For the runtime data and admission path at a glance, see the accessible
 [`mmap → ExpertMajor → AUTO → Metal/SSD flow`](hebrus-runtime-flow.svg).
 
@@ -58,7 +60,7 @@ helpers remain in the same translation unit while agents can load one family.
 
 | Path | Primary responsibility |
 | --- | --- |
-| `ds4_qwen.[ch]` | Qwen state, metadata, shapes, and model-specific helpers |
+| `ds4_qwen.[ch]` | Qwen state, metadata, shapes, and model-specific helpers; the runtime profile binding remains beside the complete tensor inventory in `ds4.c` |
 | `ds4_qwen_expert_group.[ch]` | Qwen expert grouping and slab planning |
 | `ds4_qwen_ref.[ch]` | Qwen numeric reference implementations used by tests |
 | `ds4_qwen_unicode.[ch]` | Qwen Unicode/tokenizer data access |
@@ -83,8 +85,8 @@ prove codegen identity for move-only edits before behavior work continues.
 | Path | Primary responsibility |
 | --- | --- |
 | `ds4_gpu.h` | Shared GPU-facing interface used by core graph scheduling |
-| `ds4_metal.m` | Metal device/runtime state, buffers, generic command encoding, tensor transfers, ExpertMajor resident/SSD paths, and non-partitioned model-family wrappers |
-| `metal/*.metal` | Metal compute kernels grouped by operation or model family |
+| `ds4_metal.m` | Metal device/runtime state, buffers, generic command encoding, tensor transfers, ExpertMajor resident/SSD paths, non-partitioned model-family wrappers, and one-time Qwen codec dispatch |
+| `metal/*.metal` | Metal compute kernels grouped by operation or model family, including separate Affine4 and routed-IQ weight decoders under the shared Qwen graph |
 
 `ds4_metal.m` is the second refactor hotspot. Keep Objective-C runtime calls
 there. Before moving hot functions across translation units, compare generated

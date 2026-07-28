@@ -416,9 +416,18 @@ static ds4_tensor *qwen35_ssd_fixture_add(
     return tensor;
 }
 
-static bool qwen35_ssd_fixture_make(qwen35_ssd_fixture *fixture) {
-    if (!fixture) return false;
+static bool qwen35_ssd_fixture_make(
+        qwen35_ssd_fixture       *fixture,
+        ds4_qwen35_quant_profile  profile) {
+    if (!fixture ||
+        (profile != QWEN35_QUANT_PROFILE_Q2_K_XL &&
+         profile != QWEN35_QUANT_PROFILE_MLX_AFFINE4_G64)) {
+        return false;
+    }
     memset(fixture, 0, sizeof(*fixture));
+    fixture->weights.profile = profile;
+    const bool affine =
+        profile == QWEN35_QUANT_PROFILE_MLX_AFFINE4_G64;
     const long page_long = sysconf(_SC_PAGESIZE);
     if (page_long <= 0) return false;
     fixture->page = (uint64_t)page_long;
@@ -439,7 +448,8 @@ static bool qwen35_ssd_fixture_make(qwen35_ssd_fixture *fixture) {
     if (!(dst_)) return false;                                       \
 } while (0)
 
-    FIXTURE_ADD(fixture->weights.token_embd, DS4_TENSOR_Q8_0, 2,
+    FIXTURE_ADD(fixture->weights.token_embd,
+                affine ? DS4_TENSOR_Q8_0 : DS4_TENSOR_Q5_K, 2,
                 QWEN35_N_EMBD, QWEN35_N_VOCAB, 0);
     for (uint32_t il = 0; il < QWEN35_N_LAYER; il++) {
         ds4_qwen35_layer_weights *layer = &fixture->weights.layer[il];
@@ -448,22 +458,29 @@ static bool qwen35_ssd_fixture_make(qwen35_ssd_fixture *fixture) {
         FIXTURE_ADD(layer->post_attention_norm, DS4_TENSOR_F32, 1,
                     QWEN35_N_EMBD, 0, 0);
         if (ds4_qwen35_layer_is_full_attention(il)) {
-            FIXTURE_ADD(layer->attn_q, DS4_TENSOR_Q8_0, 2,
+            FIXTURE_ADD(layer->attn_q,
+                        affine ? DS4_TENSOR_Q8_0 : DS4_TENSOR_Q5_K, 2,
                         QWEN35_N_EMBD, 8192, 0);
-            FIXTURE_ADD(layer->attn_k, DS4_TENSOR_Q8_0, 2,
+            FIXTURE_ADD(layer->attn_k,
+                        affine ? DS4_TENSOR_Q8_0 : DS4_TENSOR_Q6_K, 2,
                         QWEN35_N_EMBD, 512, 0);
-            FIXTURE_ADD(layer->attn_v, DS4_TENSOR_Q8_0, 2,
+            FIXTURE_ADD(layer->attn_v,
+                        affine ? DS4_TENSOR_Q8_0 : DS4_TENSOR_Q6_K, 2,
                         QWEN35_N_EMBD, 512, 0);
-            FIXTURE_ADD(layer->attn_output, DS4_TENSOR_Q8_0, 2,
+            FIXTURE_ADD(layer->attn_output,
+                        affine ? DS4_TENSOR_Q8_0 : DS4_TENSOR_Q5_K, 2,
                         4096, QWEN35_N_EMBD, 0);
             FIXTURE_ADD(layer->attn_q_norm, DS4_TENSOR_F32, 1,
                         QWEN35_N_HEAD_DIM, 0, 0);
             FIXTURE_ADD(layer->attn_k_norm, DS4_TENSOR_F32, 1,
                         QWEN35_N_HEAD_DIM, 0, 0);
         } else {
-            FIXTURE_ADD(layer->attn_gate, DS4_TENSOR_Q8_0, 2,
+            const uint32_t recurrent_dense_type = affine
+                ? DS4_TENSOR_Q8_0
+                : (il == 1u ? DS4_TENSOR_Q6_K : DS4_TENSOR_Q5_K);
+            FIXTURE_ADD(layer->attn_gate, recurrent_dense_type, 2,
                         QWEN35_N_EMBD, 4096, 0);
-            FIXTURE_ADD(layer->attn_qkv, DS4_TENSOR_Q8_0, 2,
+            FIXTURE_ADD(layer->attn_qkv, recurrent_dense_type, 2,
                         QWEN35_N_EMBD, 8192, 0);
             FIXTURE_ADD(layer->ssm_a, DS4_TENSOR_F32, 1,
                         QWEN35_SSM_VALUE_HEAD, 0, 0);
@@ -478,32 +495,51 @@ static bool qwen35_ssd_fixture_make(qwen35_ssd_fixture *fixture) {
                         QWEN35_SSM_DT_RANK, 0, 0);
             FIXTURE_ADD(layer->ssm_norm, DS4_TENSOR_F32, 1,
                         QWEN35_SSM_STATE, 0, 0);
-            FIXTURE_ADD(layer->ssm_out, DS4_TENSOR_Q8_0, 2,
+            FIXTURE_ADD(layer->ssm_out,
+                        affine ? DS4_TENSOR_Q8_0 : DS4_TENSOR_Q6_K, 2,
                         QWEN35_SSM_INNER, QWEN35_N_EMBD, 0);
         }
         FIXTURE_ADD(layer->ffn_gate_inp, DS4_TENSOR_F32, 2,
                     QWEN35_N_EMBD, QWEN35_N_EXPERT, 0);
-        FIXTURE_ADD(layer->ffn_gate_exps, DS4_TENSOR_Q4_K, 3,
+        uint32_t routed_gate_type =
+            affine ? DS4_TENSOR_Q4_K : DS4_TENSOR_IQ2_XS;
+        uint32_t routed_down_type =
+            affine ? DS4_TENSOR_Q4_K : DS4_TENSOR_IQ3_XXS;
+        if (!affine && il == 1u) {
+            routed_gate_type = DS4_TENSOR_IQ3_XXS;
+            routed_down_type = DS4_TENSOR_IQ4_XS;
+        } else if (!affine &&
+                   (il == 34u || il == 38u || il == 39u)) {
+            routed_down_type = DS4_TENSOR_IQ4_XS;
+        }
+        FIXTURE_ADD(layer->ffn_gate_exps, routed_gate_type, 3,
                     QWEN35_N_EMBD, QWEN35_N_FF_EXP,
                     QWEN35_N_EXPERT);
-        FIXTURE_ADD(layer->ffn_up_exps, DS4_TENSOR_Q4_K, 3,
+        FIXTURE_ADD(layer->ffn_up_exps, routed_gate_type, 3,
                     QWEN35_N_EMBD, QWEN35_N_FF_EXP,
                     QWEN35_N_EXPERT);
-        FIXTURE_ADD(layer->ffn_down_exps, DS4_TENSOR_Q4_K, 3,
+        FIXTURE_ADD(layer->ffn_down_exps, routed_down_type, 3,
                     QWEN35_N_FF_EXP, QWEN35_N_EMBD,
                     QWEN35_N_EXPERT);
         FIXTURE_ADD(layer->ffn_gate_inp_shexp, DS4_TENSOR_F32, 1,
                     QWEN35_N_EMBD, 0, 0);
-        FIXTURE_ADD(layer->ffn_gate_shexp, DS4_TENSOR_Q8_0, 2,
+        const uint32_t shared_gate_type = affine
+            ? DS4_TENSOR_Q8_0
+            : (il == 1u ? DS4_TENSOR_Q6_K : DS4_TENSOR_Q5_K);
+        const uint32_t shared_down_type = affine
+            ? DS4_TENSOR_Q8_0
+            : (il == 1u ? DS4_TENSOR_Q8_0 : DS4_TENSOR_Q6_K);
+        FIXTURE_ADD(layer->ffn_gate_shexp, shared_gate_type, 2,
                     QWEN35_N_EMBD, QWEN35_N_FF_SHARED, 0);
-        FIXTURE_ADD(layer->ffn_up_shexp, DS4_TENSOR_Q8_0, 2,
+        FIXTURE_ADD(layer->ffn_up_shexp, shared_gate_type, 2,
                     QWEN35_N_EMBD, QWEN35_N_FF_SHARED, 0);
-        FIXTURE_ADD(layer->ffn_down_shexp, DS4_TENSOR_Q8_0, 2,
+        FIXTURE_ADD(layer->ffn_down_shexp, shared_down_type, 2,
                     QWEN35_N_FF_SHARED, QWEN35_N_EMBD, 0);
     }
     FIXTURE_ADD(fixture->weights.output_norm, DS4_TENSOR_F32, 1,
                 QWEN35_N_EMBD, 0, 0);
-    FIXTURE_ADD(fixture->weights.output, DS4_TENSOR_Q8_0, 2,
+    FIXTURE_ADD(fixture->weights.output,
+                affine ? DS4_TENSOR_Q8_0 : DS4_TENSOR_Q4_K, 2,
                 QWEN35_N_EMBD, QWEN35_N_VOCAB, 0);
 #undef FIXTURE_ADD
 
@@ -562,7 +598,8 @@ static void test_qwen35_ssd_static_contract(void) {
     qwen35_ssd_fixture *fixture = calloc(1, sizeof(*fixture));
     CHECK(fixture != NULL);
     if (!fixture) return;
-    CHECK(qwen35_ssd_fixture_make(fixture));
+    CHECK(qwen35_ssd_fixture_make(
+              fixture, QWEN35_QUANT_PROFILE_Q2_K_XL));
     if (fixture->next_tensor != QWEN35_N_TENSOR) {
         free(fixture);
         return;
@@ -575,16 +612,16 @@ static void test_qwen35_ssd_static_contract(void) {
     CHECK(!qwen35_streaming_cache_geometry_make(&fixture->weights, NULL));
     CHECK(qwen35_streaming_cache_geometry_make(
               &fixture->weights, &geometry));
-    CHECK(geometry.gate_expert_bytes == UINT64_C(589824));
-    CHECK(geometry.up_expert_bytes == UINT64_C(589824));
-    CHECK(geometry.down_expert_bytes == UINT64_C(589824));
-    CHECK(geometry.per_expert_bytes == UINT64_C(1769472));
+    CHECK(geometry.gate_expert_bytes == UINT64_C(401408));
+    CHECK(geometry.up_expert_bytes == UINT64_C(401408));
+    CHECK(geometry.down_expert_bytes == UINT64_C(557056));
+    CHECK(geometry.per_expert_bytes == UINT64_C(1359872));
     CHECK(geometry.cacheable_layers == 40);
     CHECK(geometry.experts_per_layer == 256);
     CHECK(geometry.selected_per_layer == 8);
     CHECK(geometry.working_set_experts == 320);
     CHECK(geometry.minimum_cache_experts == 321);
-    CHECK(geometry.minimum_cache_bytes == UINT64_C(568000512));
+    CHECK(geometry.minimum_cache_bytes == UINT64_C(436518912));
     CHECK(geometry.warning_cache_experts == 640);
     CHECK(geometry.max_cacheable_experts == 10240);
 
@@ -632,8 +669,8 @@ static void test_qwen35_ssd_static_contract(void) {
     uint64_t payload = 0;
     CHECK(qwen35_weights_model_map_non_routed_spans(
               &fixture->model, &fixture->weights, &spans, &payload));
-    CHECK(payload == QWEN35_NON_ROUTED_PAYLOAD_BYTES);
-    CHECK(payload == UINT64_C(2678180352));
+    CHECK(payload == QWEN35_Q2_NON_ROUTED_PAYLOAD_BYTES);
+    CHECK(payload == UINT64_C(1751935488));
     CHECK(model_map_span_vec_total_bytes(&spans) == payload);
     CHECK(spans.len != 0);
     CHECK(spans.v[0].off == fixture->weights.token_embd->abs_offset);
@@ -745,6 +782,36 @@ static void test_qwen35_ssd_static_contract(void) {
     CHECK(spans.v == NULL && page_payload == 0 && page_coverage == 0);
     fixture->model.map = saved_map;
 
+    free(fixture);
+
+    /* Affine4 and Q2 share this planner, so replacing the old fixture with
+     * the smaller profile would silently drop coverage of the published
+     * artifact's larger physical slab and non-routed map. */
+    fixture = calloc(1, sizeof(*fixture));
+    CHECK(fixture != NULL);
+    if (!fixture) return;
+    CHECK(qwen35_ssd_fixture_make(
+              fixture, QWEN35_QUANT_PROFILE_MLX_AFFINE4_G64));
+    memset(&geometry, 0, sizeof(geometry));
+    CHECK(qwen35_streaming_cache_geometry_make(
+              &fixture->weights, &geometry));
+    CHECK(geometry.gate_expert_bytes == UINT64_C(589824));
+    CHECK(geometry.up_expert_bytes == UINT64_C(589824));
+    CHECK(geometry.down_expert_bytes == UINT64_C(589824));
+    CHECK(geometry.per_expert_bytes == UINT64_C(1769472));
+    CHECK(geometry.minimum_cache_experts == 321);
+    CHECK(geometry.minimum_cache_bytes == UINT64_C(568000512));
+    CHECK(geometry.warning_cache_experts == 640);
+    CHECK(geometry.max_cacheable_experts == 10240);
+
+    memset(&spans, 0, sizeof(spans));
+    payload = 0;
+    CHECK(qwen35_weights_model_map_non_routed_spans(
+              &fixture->model, &fixture->weights, &spans, &payload));
+    CHECK(payload == QWEN35_AFFINE_NON_ROUTED_PAYLOAD_BYTES);
+    CHECK(payload == UINT64_C(2678180352));
+    CHECK(model_map_span_vec_total_bytes(&spans) == payload);
+    free(spans.v);
     free(fixture);
 }
 

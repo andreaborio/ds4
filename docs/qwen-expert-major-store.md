@@ -1,106 +1,146 @@
-# Qwen ExpertMajor v2 GGUF on Hebrus
+# Qwen ExpertMajor v2 weight profiles on Hebrus
 
-Qwen3.6-35B-A3B uses the same self-describing `ds4.expert_major.v2` container
-as DeepSeek and GLM. The optimized Mac artifact stores every routed weight
-exactly once, inside the GGUF, in the physical expert-major order consumed by
-Metal resident and SSD execution. Its payload is sourced from the local MLX
-4-bit/group-64 model rather than the retired GGML Q4 blocks.
+Qwen3.6-35B-A3B uses the same self-describing
+`ds4.expert_major.v2` container as DeepSeek and GLM. Hebrus admits two exact
+Qwen weight profiles inside that container:
+
+| Profile | Routed storage | Product role |
+| --- | --- | --- |
+| `MLX_AFFINE4_G64` | MLX affine4, group 64 | Published higher-quality profile |
+| `Q2_K_XL` | Exact GGML IQ2_XS/IQ3_XXS/IQ4_XS layer inventory | Smaller performance-per-weight profile; publication pending |
+
+Both artifacts store every routed weight exactly once, in physical
+expert-major order:
 
 ```text
-record(layer, expert) = gate affine4-g64 | up affine4-g64 | down affine4-g64
-affine4-g64 group = 32 packed bytes | BF16 scale | BF16 bias
+record(layer, expert) = gate bytes | up bytes | down bytes
 ```
 
+For Affine4, every 64-value group is:
+
+```text
+32 packed bytes | BF16 scale | BF16 bias
+```
+
+For Q2_K_XL, each component keeps its admitted GGML block encoding. Thirty-six
+layers use IQ2_XS gate/up and IQ3_XXS down; layer 1 uses IQ3_XXS gate/up and
+IQ4_XS down; layers 34, 38, and 39 use IQ2_XS gate/up and IQ4_XS down. Dense
+weights retain their exact Q4_K/Q5_K/Q6_K/Q8_0 inventory.
+
 The 120 physical canonical gate/up/down tensors are replaced by one opaque I8
-tensor plus a checksummed manifest. At startup DS4 validates the Qwen family ID,
-40-layer inventory, expert geometry, component types, offsets, alignment, and
-manifest digest before initializing Metal. It then reconstructs canonical
-logical tensor names only as graph and cache identities. Every physical mapping
-or read is translated through the validated v2 descriptor.
+tensor plus a checksummed manifest. At startup Hebrus validates the Qwen family
+ID, 40-layer inventory, complete tensor and tokenizer profile, component types,
+offsets, alignment, and manifest digest before initializing Metal. Logical
+tensor names are reconstructed only as graph and cache identities; every
+physical map or read is translated through the validated v2 descriptor.
 
 > [!IMPORTANT]
-> The current runtime contract is intentionally v2 plus MLX affine4/group-64
-> only. Qwen canonical GGUFs, v2 GGML/Q4 payloads, `ds4.expert_major.v1`,
-> `.experts.pack` sidecars, and CPU, CUDA, ROCm, or distributed inference are
-> rejected. There is no slower inference fallback or migration window.
+> This is a closed two-profile contract, not generic quantization support.
+> Canonical/community GGUFs, Affine2, the former v2 Q4_K_S payload,
+> `ds4.expert_major.v1`, sidecars, and non-Metal inference are rejected. There
+> is no slower compatibility fallback.
+
+## One runtime, two physical codecs
+
+The quantization profiles are not parallel model implementations. Hebrus binds
+the profile once from the complete tensor inventory, tokenizer metadata, and
+ExpertMajor storage marker. The rest of the runtime is shared:
+
+| Shared Qwen path | Codec-specific boundary |
+| --- | --- |
+| Model/session state and chat/tokenizer orchestration | Exact tensor-inventory validation |
+| Gated DeltaNet and full-attention graph | Affine4 scale/bias weight decoding |
+| KV state, RoPE, router, sampling, and output sequencing | IQ2/IQ3/IQ4 and Q4/Q5/Q6/Q8 weight decoding |
+| Resident/SSD planning, cache ownership, I/O, and scheduling | Codec-appropriate Metal matvec/grouped-MM primitive |
+
+Dispatch selects the physical primitive outside its inner loop. There is no
+per-block codec branch, user flag, or duplicated Qwen graph. This boundary is
+normative in
+[`ADR 0006`](adr/0006-qwen-dual-weight-codecs.md).
 
 ## Runtime behavior
 
-A valid Qwen v2 file activates automatically:
+A valid profile activates automatically:
 
 ```sh
 make -j8
+
 ./hebrus \
   -m /absolute/path/to/Qwen3.6-35B-A3B-DS4-ExpertMajor-v2-MLX-Affine4-G64.gguf \
   --ctx 8192
+
+./hebrus \
+  -m /absolute/path/to/Qwen3.6-35B-A3B-DS4-ExpertMajor-v2-Q2_K_XL.gguf \
+  --ctx 8192
 ```
 
-Use the same model with `./hebrus-server` for the local API. The legacy
-`./ds4` and `./ds4-server` names remain aliases to the same build. Normal startup does
-not need an experimental guard, explicit Metal selection, a sidecar path,
-payload hashes, cache geometry, `--resident`, or `--ssd-streaming`. Through
-24 GiB, AUTO always selects guarded SSD streaming and an explicit resident
-request is rejected. On larger qualified hosts, AUTO chooses resident mapping
-when the full working set fits its Metal and host-memory budgets; otherwise it
-selects the SSD expert cache. Explicit residency flags remain diagnostics, not
-release instructions.
+The first command uses the published artifact. The second is valid only for the
+exact implementation-validated Q2_K_XL bytes below; its 262K endpoint and
+immutable distribution revision are still pending. `download_model.sh qwen-v2`
+intentionally continues to download Affine4.
 
-On a 16 or 24 GiB host, the AUTO SSD cache plan is guarded. It
-requires an affirmative normal-pressure signal at admission and before
-every prefill/decode phase entry, including an unchanged configured budget
-whose lazy slabs can still populate, and caps the routed target at 3,521
-experts (about 5.80 GiB for this artifact). Before each proposed new slab (up
-to 321 experts; the final target tail can be smaller), a fresh snapshot must
-also admit the exact allocation. Denial freezes the cache
-at the slab capacity already allocated and forces eviction/reuse; no fresh
-combined or per-expert allocation can bypass it. This is intentionally below
-the byte target that a warm 24 GiB snapshot could otherwise expose during a
-long decode.
+Normal startup needs no experimental guard, explicit Metal selection, sidecar,
+payload hash flag, cache geometry, `--resident`, or `--ssd-streaming`. Through
+24 GiB, the published Affine4 hardware policy selects guarded SSD and rejects
+explicit resident mode. On larger qualified hosts AUTO chooses resident when
+the complete artifact-specific working set passes both Metal and live-memory
+gates; otherwise it uses the bounded SSD expert cache.
 
-In resident mode each complete expert-major layer is exposed as a read-only
-Metal buffer with the manifest record size as its expert stride. Only
-non-routed GGUF spans and those 40 layer buffers are registered for residency;
-there is no token-time host lookup, repack, or duplicate routed mapping.
+Cache byte accounting is derived from the selected profile's exact static,
+component, record, and slab geometry. The 3,521-expert guarded target is about
+5.80 GiB for Affine4 and is not reused as a hard-coded Q2 byte estimate. Before
+each proposed new slab, live host pressure and Metal working-set limits admit
+the exact allocation. Denial freezes the cache at its allocated capacity and
+uses eviction/reuse; a new combined, per-component, or mmap fallback cannot
+bypass it.
 
-In SSD mode the runtime keeps logical tensor identities as cache keys but
-translates a selected expert to its adjacent gate/up/down record. Selected-
-address affine grouped-MM kernels consume those records directly. A RAM-planned
-macro scheduler processes bounded 2,048-token micro batches layer-major so long
-prefills can read each routed expert once instead of once per macro tile.
+In resident mode every expert-major layer is exposed as one read-only Metal
+buffer with the manifest record size as expert stride. In SSD mode logical
+tensor identities remain cache keys, while selected experts translate to their
+adjacent gate/up/down records. The common layer-major scheduler processes
+bounded micro-batches so long prefills can reuse selected records without
+token-time repacking.
 
 ## Build and verify
 
-The generic converter recognizes `general.architecture=qwen35moe` and requires
-complete routed layers `0..39`, complete Qwen geometry metadata, and a supported
-quant layout. It writes a same-filesystem temporary output, performs full
-verification by default, fsyncs it, and installs it atomically.
+The generic converter recognizes `general.architecture=qwen35moe`, requires
+complete routed layers `0..39`, validates the supported profile inventory, and
+writes the embedded store atomically. Build the selected GGML Q2_K_XL source
+directly:
 
 ```sh
-python3 gguf-tools/ds4-expert-major.py inspect CANONICAL.gguf
+python3 gguf-tools/ds4-expert-major.py inspect CANONICAL-Q2-K-XL.gguf
 python3 gguf-tools/ds4-expert-major.py build \
-  CANONICAL.gguf QWEN-DS4-EXPERT-MAJOR-V2.gguf
+  CANONICAL-Q2-K-XL.gguf \
+  Qwen3.6-35B-A3B-DS4-ExpertMajor-v2-Q2_K_XL.gguf
 python3 gguf-tools/ds4-expert-major.py verify \
-  CANONICAL.gguf QWEN-DS4-EXPERT-MAJOR-V2.gguf
+  CANONICAL-Q2-K-XL.gguf \
+  Qwen3.6-35B-A3B-DS4-ExpertMajor-v2-Q2_K_XL.gguf
+```
+
+The published Affine4 artifact additionally repacks the routed payload from the
+pinned MLX source:
+
+```sh
+python3 gguf-tools/ds4-expert-major.py build \
+  CANONICAL-QWEN.gguf QWEN-DS4-EXPERT-MAJOR-V2.gguf
 python3 gguf-tools/ds4-expert-major.py repack-mlx-affine \
-  QWEN-DS4-EXPERT-MAJOR-V2.gguf /path/to/mlx-community-Qwen3.6-35B-A3B-4bit \
+  QWEN-DS4-EXPERT-MAJOR-V2.gguf \
+  /path/to/mlx-community-Qwen3.6-35B-A3B-4bit \
   Qwen3.6-35B-A3B-DS4-ExpertMajor-v2-MLX-Affine4-G64.gguf
 ```
 
-`verify` checks:
-
-- the canonical source identity stored in the manifest;
-- byte-identical metadata and non-routed tensors;
-- every routed component against the canonical expert bytes;
-- Qwen family identity, all 40 layer descriptors, and quant geometry;
-- the complete ExpertMajor payload digest, including alignment padding.
-
-`--skip-verify` exists only for disposable development output and must never be
-used for publication.
+`verify` checks source provenance, byte-identical metadata and non-routed
+tensors, every routed component, all 40 descriptors, and the complete payload
+digest including alignment padding. `--skip-verify` is for disposable
+development output and must never be used for publication.
 
 ## Release identity
 
+The currently published release identity remains:
+
 | Item | Value |
-|---|---|
+| --- | --- |
 | Publication state | `published` |
 | Repository | `andreaborio/Qwen3.6-35B-A3B-Hebrus-GGUF` |
 | Artifact | `Qwen3.6-35B-A3B-DS4-ExpertMajor-v2-MLX-Affine4-G64.gguf` |
@@ -113,39 +153,42 @@ used for publication.
 | Negative fixture | `Qwen3.6-35B-A3B-DS4-ExpertMajor-v2-Q4_K_S.gguf` |
 | Negative fixture bytes | 20,808,566,880 |
 | Negative fixture SHA-256 | `d7c43a6388ec20e6fe5530850350f96fdb0ac37c5ce36d3e5f92b172c447f56b` |
-| Canonical source bytes | 20,808,563,424 |
-| Canonical source SHA-256 | `c33efb67bde86c9ba1f9e79c2dc42627170963bef0e915ab9b91a55cfb6d0fcd` |
-| Storage marker | `MLX_AFFINE4`, group size 64 |
+
+The accepted Q2_K_XL implementation identity is:
+
+| Item | Value |
+| --- | --- |
+| Publication state | `implementation-validated; 262K endpoint and immutable publication revision pending` |
+| Canonical source bytes | 12,290,628,576 |
+| Canonical source SHA-256 | `96b9c0af5c77a4ecaabe3983175112b5ece763261c1ece12b2494b692a70dad7` |
+| Native artifact | `Qwen3.6-35B-A3B-DS4-ExpertMajor-v2-Q2_K_XL.gguf` |
+| Native artifact bytes | 12,290,632,032 |
+| Native artifact SHA-256 | `30c22f70aff0f05986b517ee4ad8fef554a1b5aab6971c9ca09f999566d30143` |
+| Embedded payload SHA-256 | `ccc3fbc2405d1dd73f8ac15741b0277514de4f46b80818531297ea9ffa0c6a3c` |
+| Storage | `ggml-block`, exact Q2_K_XL inventory |
 
 The machine-readable
-[Qwen release contract](contracts/qwen-release.json) is canonical for the
-repository, publication states, artifact identities, revision, and runtime
-compatibility floor in this table.
-
-The v2 output is 3,456 bytes larger than its canonical converter input. It does
-not contain a second copy of the routed weights.
-
-These exact bytes and their matching manifest are published at immutable
-repository revision `7bf9c3f7f6136aeb2599d75ee61c0cc2f18e2b02`.
-The manifest's `runtimeCommit`
-`73a332fef82a0bcdd567d17e0de17aa004cad85d` proves compatibility with this
-physical store format; it is not a hardware-safety floor.
-`download_model.sh qwen-v2` validates that relationship. Release builds must
-also include the current runtime policy, including the published commit that
-will carry the 2026-07-27 24 GiB allocation-time hardening.
-The older Q4_K_S object is incompatible with the current runtime contract and
-is retained only for fail-closed testing.
+[Qwen release contract](contracts/qwen-release.json) remains canonical for
+downloadable artifacts. It still names Affine4 only; Q2_K_XL must not be added
+to the downloader until its immutable revision and runtime pin exist.
 
 ## Qualification
 
-On an M5 Pro with 64 GiB, final resident prefill measured 1,661.18 t/s at 2K,
-1,421.90 t/s at 8K, and 877.34 t/s at 32K. Forced SSD measured 551.57, 269.10,
-and 83.69 t/s. At 32K the adaptive macro read 16.875 GiB of expert data once,
-72.2% less than the multi-tile control, for a 0.63% throughput reduction. The
-same artifact produced identical resident/SSD greedy IDs in the final 128+16
-decode lane. Full tables, logit comparisons, context-max allocation, and test
-scope are recorded in
-[`benchmarks/2026-07-21-qwen-unified-affine-auto-ssd.md`](benchmarks/2026-07-21-qwen-unified-affine-auto-ssd.md).
+On the same M5 Pro 64 GiB host and exact Affine4 artifact, the final shared
+runtime improved the tested `main` mean by 11.20% prefill and 4.22% decode at
+8K, and by 8.20% prefill and 5.27% decode at 32K. Control drift stayed below 3%,
+2K/8K/32K output evidence matched, and the 65,536- and 100,000-token stability
+lanes completed with zero swapout.
+
+Q2_K_XL is 40.93% smaller than Affine4 by exact native file bytes. Its
+three-domain pinned llama.cpp quality gate measured 2.53% geometric-mean PPL
+above the Q4 control and 8.20% below IQ2_M. The final resident and cold-SSD
+128/2K/8K/32K matrices retained matching greedy IDs; the exact generic
+short-context comparison reached decode parity with pinned llama.cpp.
+
+Complete commands, invalidations, TPOT, hashes, and rejected Affine2/TensorOps
+experiments are recorded in
+[`benchmarks/2026-07-28-qwen-q2-k-xl-performance-weight.md`](benchmarks/2026-07-28-qwen-q2-k-xl-performance-weight.md).
 
 ## Lifecycle and failure policy
 
@@ -154,8 +197,8 @@ read-only wrappers over private mappings of the same file. Shutdown fences GPU
 work, releases wrappers and residency sets, unmaps their bytes, drains page-in
 workers, and then closes the descriptor.
 
-Unknown format versions, wrong family IDs, canonical routed tensors beside the
-opaque store, missing layers, unsupported types, inconsistent dimensions,
-overlapping extents, reserved bits, and manifest corruption all fail before
-inference. Because a v2 artifact deliberately contains no canonical routed
-copy, any store-install failure is fatal.
+Unknown versions, wrong family IDs, canonical routed tensors beside the opaque
+store, missing layers, unsupported profile/type combinations, inconsistent
+dimensions, tokenizer/profile mismatches, overlapping extents, reserved bits,
+and manifest corruption fail before inference. Because a v2 artifact contains
+no canonical routed copy, any store-install failure is fatal.
