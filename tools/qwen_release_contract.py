@@ -15,7 +15,7 @@ from typing import Any
 
 DEFAULT_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_MANIFEST = "docs/contracts/qwen-release.json"
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 HEX40_RE = re.compile(r"^[0-9a-f]{40}$")
 HEX64_RE = re.compile(r"^[0-9a-f]{64}$")
 HEADING_RE = re.compile(r"^(#{1,6})[ \t]+(.+?)[ \t]*$", re.MULTILINE)
@@ -37,14 +37,22 @@ class Artifact:
     runtime_commit: str | None = None
     storage: str | None = None
     group_size: int | None = None
+    embedded_payload_sha256: str | None = None
+    profile: str | None = None
+    qualified_context_tokens: int | None = None
+    minimum_memory_gib: int | None = None
+    full_window_qualified: bool | None = None
+    recommended: bool | None = None
 
 
 @dataclass(frozen=True)
 class Contract:
     model_family: str
     download_target: str
+    beta_download_target: str
     repository: str
     published: Artifact
+    beta: Artifact
     negative: Artifact
 
 
@@ -105,8 +113,10 @@ def load_contract(path: Path) -> Contract:
             "schemaVersion",
             "modelFamily",
             "downloadTarget",
+            "betaDownloadTarget",
             "repository",
             "publishedArtifact",
+            "betaArtifact",
             "negativeArtifact",
         },
         "contract",
@@ -125,14 +135,28 @@ def load_contract(path: Path) -> Contract:
     download_target = require_string(document["downloadTarget"], "downloadTarget")
     if download_target != "qwen-v2":
         raise ContractError("downloadTarget must be qwen-v2")
+    beta_download_target = require_string(
+        document["betaDownloadTarget"], "betaDownloadTarget"
+    )
+    if beta_download_target != "qwen-q2-beta":
+        raise ContractError("betaDownloadTarget must be qwen-q2-beta")
+    if beta_download_target == download_target:
+        raise ContractError("stable and beta download targets must differ")
     repository = require_string(document["repository"], "repository")
     if re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", repository) is None:
         raise ContractError("repository must be an owner/name identifier")
 
     published_raw = document["publishedArtifact"]
+    beta_raw = document["betaArtifact"]
     negative_raw = document["negativeArtifact"]
-    if not isinstance(published_raw, dict) or not isinstance(negative_raw, dict):
-        raise ContractError("publishedArtifact and negativeArtifact must be objects")
+    if (
+        not isinstance(published_raw, dict)
+        or not isinstance(beta_raw, dict)
+        or not isinstance(negative_raw, dict)
+    ):
+        raise ContractError(
+            "publishedArtifact, betaArtifact, and negativeArtifact must be objects"
+        )
     require_exact_keys(
         published_raw,
         {
@@ -148,12 +172,34 @@ def load_contract(path: Path) -> Contract:
         "publishedArtifact",
     )
     require_exact_keys(
+        beta_raw,
+        {
+            "status",
+            "filename",
+            "revision",
+            "bytes",
+            "sha256",
+            "embeddedPayloadSha256",
+            "runtimeCommit",
+            "storage",
+            "groupSize",
+            "profile",
+            "qualifiedContextTokens",
+            "minimumMemoryGiB",
+            "fullWindowQualified",
+            "recommended",
+        },
+        "betaArtifact",
+    )
+    require_exact_keys(
         negative_raw,
         {"status", "filename", "bytes", "sha256"},
         "negativeArtifact",
     )
     if published_raw["status"] != "published":
         raise ContractError("publishedArtifact.status must be published")
+    if beta_raw["status"] != "published-beta":
+        raise ContractError("betaArtifact.status must be published-beta")
     if negative_raw["status"] != "negative-only":
         raise ContractError("negativeArtifact.status must be negative-only")
     if published_raw["storage"] != "mlx-affine4":
@@ -162,6 +208,26 @@ def load_contract(path: Path) -> Contract:
         published_raw["groupSize"], bool
     ):
         raise ContractError("publishedArtifact.groupSize must be 64")
+    if beta_raw["storage"] != "ggml":
+        raise ContractError("betaArtifact.storage must be ggml")
+    if beta_raw["groupSize"] != 0 or isinstance(beta_raw["groupSize"], bool):
+        raise ContractError("betaArtifact.groupSize must be 0")
+    if beta_raw["profile"] != "q2-k-xl":
+        raise ContractError("betaArtifact.profile must be q2-k-xl")
+    if (
+        beta_raw["qualifiedContextTokens"] != 32768
+        or isinstance(beta_raw["qualifiedContextTokens"], bool)
+    ):
+        raise ContractError("betaArtifact.qualifiedContextTokens must be 32768")
+    if (
+        beta_raw["minimumMemoryGiB"] != 64
+        or isinstance(beta_raw["minimumMemoryGiB"], bool)
+    ):
+        raise ContractError("betaArtifact.minimumMemoryGiB must be 64")
+    if beta_raw["fullWindowQualified"] is not False:
+        raise ContractError("betaArtifact.fullWindowQualified must be false")
+    if beta_raw["recommended"] is not False:
+        raise ContractError("betaArtifact.recommended must be false")
 
     published = Artifact(
         status="published",
@@ -181,6 +247,28 @@ def load_contract(path: Path) -> Contract:
         storage="mlx-affine4",
         group_size=64,
     )
+    beta = Artifact(
+        status="published-beta",
+        filename=require_filename(beta_raw["filename"], "betaArtifact.filename"),
+        revision=require_hex(beta_raw["revision"], HEX40_RE, "betaArtifact.revision"),
+        bytes=require_positive_int(beta_raw["bytes"], "betaArtifact.bytes"),
+        sha256=require_hex(beta_raw["sha256"], HEX64_RE, "betaArtifact.sha256"),
+        embedded_payload_sha256=require_hex(
+            beta_raw["embeddedPayloadSha256"],
+            HEX64_RE,
+            "betaArtifact.embeddedPayloadSha256",
+        ),
+        runtime_commit=require_hex(
+            beta_raw["runtimeCommit"], HEX40_RE, "betaArtifact.runtimeCommit"
+        ),
+        storage="ggml",
+        group_size=0,
+        profile="q2-k-xl",
+        qualified_context_tokens=32768,
+        minimum_memory_gib=64,
+        full_window_qualified=False,
+        recommended=False,
+    )
     negative = Artifact(
         status="negative-only",
         filename=require_filename(negative_raw["filename"], "negativeArtifact.filename"),
@@ -189,11 +277,21 @@ def load_contract(path: Path) -> Contract:
             negative_raw["sha256"], HEX64_RE, "negativeArtifact.sha256"
         ),
     )
-    if published.filename == negative.filename:
-        raise ContractError("published and negative-only filenames must differ")
-    if published.sha256 == negative.sha256:
-        raise ContractError("published and negative-only SHA-256 values must differ")
-    return Contract(model_family, download_target, repository, published, negative)
+    filenames = {published.filename, beta.filename, negative.filename}
+    if len(filenames) != 3:
+        raise ContractError("published, beta, and negative-only filenames must differ")
+    digests = {published.sha256, beta.sha256, negative.sha256}
+    if len(digests) != 3:
+        raise ContractError("published, beta, and negative-only SHA-256 values must differ")
+    return Contract(
+        model_family,
+        download_target,
+        beta_download_target,
+        repository,
+        published,
+        beta,
+        negative,
+    )
 
 
 def read_text(root: Path, relative: str) -> str:
@@ -298,6 +396,7 @@ def check_prose_surface(
 ) -> None:
     section = markdown_section(root, relative, heading)
     published = contract.published
+    beta = contract.beta
     negative = contract.negative
     require_contract_link(root, relative, section, manifest_path)
     require_tokens(
@@ -306,18 +405,30 @@ def check_prose_surface(
         [
             contract.model_family,
             contract.download_target,
+            contract.beta_download_target,
             published.status,
             published.filename,
             f"{published.bytes:,}",
             published.sha256,
             published.revision or "",
             published.runtime_commit or "",
+            beta.status,
+            beta.filename,
+            f"{beta.bytes:,}",
+            beta.sha256,
+            beta.embedded_payload_sha256 or "",
+            beta.revision or "",
+            beta.runtime_commit or "",
+            str(beta.qualified_context_tokens),
+            str(beta.minimum_memory_gib),
             negative.status,
             negative.filename,
         ],
     )
     require_qwen_filenames(
-        f"{relative}#{heading}", section, {published.filename, negative.filename}
+        f"{relative}#{heading}",
+        section,
+        {published.filename, beta.filename, negative.filename},
     )
 
 
@@ -336,10 +447,13 @@ def check_qa(root: Path, manifest_path: Path, contract: Contract) -> None:
     require_contract_link(root, relative, section, manifest_path)
     rows = parse_table(section, relative)
     published = require_table_row(rows, "Variable", "QWEN_V2", relative)
+    beta = require_table_row(rows, "Variable", "QWEN_Q2_V2", relative)
     negative = require_table_row(rows, "Variable", "QWEN_RETIRED_Q4_NEGATIVE", relative)
     published_text = published.get("Required identity", "")
+    beta_text = beta.get("Required identity", "")
     negative_text = negative.get("Required identity", "")
     p = contract.published
+    b = contract.beta
     n = contract.negative
     require_tokens(
         f"{relative}:QWEN_V2",
@@ -352,6 +466,23 @@ def check_qa(root: Path, manifest_path: Path, contract: Contract) -> None:
             p.sha256,
             p.runtime_commit or "",
             "MLX affine4/group-64",
+        ],
+    )
+    require_tokens(
+        f"{relative}:QWEN_Q2_V2",
+        beta_text,
+        [
+            b.status,
+            b.filename,
+            b.revision or "",
+            f"{b.bytes:,}",
+            b.sha256,
+            b.embedded_payload_sha256 or "",
+            b.runtime_commit or "",
+            "mixed-GGML Q2_K_XL",
+            str(b.qualified_context_tokens),
+            str(b.minimum_memory_gib),
+            contract.beta_download_target,
         ],
     )
     require_tokens(
@@ -385,6 +516,7 @@ def check_qwen_store(root: Path, manifest_path: Path, contract: Contract) -> Non
     require_contract_link(root, relative, section, manifest_path)
     items = rows_by_item(parse_table(section, relative), relative)
     p = contract.published
+    b = contract.beta
     n = contract.negative
     require_exact_item(items, "Publication state", p.status, relative)
     require_exact_item(items, "Repository", contract.repository, relative)
@@ -396,6 +528,44 @@ def check_qwen_store(root: Path, manifest_path: Path, contract: Contract) -> Non
         items, "Minimum compatible runtime commit", p.runtime_commit or "", relative
     )
     require_exact_item(items, "Storage", f"{p.storage}/group-{p.group_size}", relative)
+    require_exact_item(items, "Beta publication state", b.status, relative)
+    require_exact_item(items, "Beta download target", contract.beta_download_target, relative)
+    require_exact_item(items, "Beta artifact", b.filename, relative)
+    require_exact_item(items, "Beta artifact bytes", f"{b.bytes:,}", relative)
+    require_exact_item(items, "Beta artifact SHA-256", b.sha256, relative)
+    require_exact_item(
+        items,
+        "Beta embedded payload SHA-256",
+        b.embedded_payload_sha256 or "",
+        relative,
+    )
+    require_exact_item(items, "Beta immutable revision", b.revision or "", relative)
+    require_exact_item(
+        items,
+        "Beta minimum compatible runtime commit",
+        b.runtime_commit or "",
+        relative,
+    )
+    require_exact_item(items, "Beta storage", f"{b.storage}/group-{b.group_size}", relative)
+    require_exact_item(items, "Beta profile", b.profile or "", relative)
+    require_exact_item(
+        items,
+        "Beta qualified context tokens",
+        str(b.qualified_context_tokens),
+        relative,
+    )
+    require_exact_item(
+        items, "Beta minimum unified memory GiB", str(b.minimum_memory_gib), relative
+    )
+    require_exact_item(
+        items,
+        "Beta full-window qualified",
+        str(b.full_window_qualified).lower(),
+        relative,
+    )
+    require_exact_item(
+        items, "Beta recommended", str(b.recommended).lower(), relative
+    )
     require_exact_item(items, "Negative fixture state", n.status, relative)
     require_exact_item(items, "Negative fixture", n.filename, relative)
     require_exact_item(items, "Negative fixture bytes", f"{n.bytes:,}", relative)
@@ -440,6 +610,7 @@ def check_downloader(root: Path, contract: Contract) -> None:
     text = read_text(root, relative)
     assignments = parse_shell_assignments(text, relative)
     p = contract.published
+    b = contract.beta
     expected = {
         "RUNTIME_QWEN_STATUS": p.status,
         "RUNTIME_QWEN_REPO": contract.repository,
@@ -450,6 +621,22 @@ def check_downloader(root: Path, contract: Contract) -> None:
         "RUNTIME_QWEN_MIN_RUNTIME_COMMIT": p.runtime_commit or "",
     }
     for name, value in expected.items():
+        if assignments.get(name) != value:
+            raise ContractError(
+                f"{relative}: {name} must be {value!r}, got {assignments.get(name)!r}"
+            )
+    beta_expected = {
+        "RUNTIME_QWEN_Q2_STATUS": b.status,
+        "RUNTIME_QWEN_Q2_REPO": contract.repository,
+        "RUNTIME_QWEN_Q2_FILE": b.filename,
+        "RUNTIME_QWEN_Q2_BYTES": str(b.bytes),
+        "RUNTIME_QWEN_Q2_SHA256": b.sha256,
+        "RUNTIME_QWEN_Q2_REVISION": b.revision or "",
+        "RUNTIME_QWEN_Q2_MIN_RUNTIME_COMMIT": b.runtime_commit or "",
+        "RUNTIME_QWEN_Q2_QUALIFIED_CONTEXT": str(b.qualified_context_tokens),
+        "RUNTIME_QWEN_Q2_MIN_MEMORY_GIB": str(b.minimum_memory_gib),
+    }
+    for name, value in beta_expected.items():
         if assignments.get(name) != value:
             raise ContractError(
                 f"{relative}: {name} must be {value!r}, got {assignments.get(name)!r}"
@@ -467,6 +654,23 @@ def check_downloader(root: Path, contract: Contract) -> None:
         missing = sorted(required_wiring - wiring)
         raise ContractError(
             f"{relative}: {contract.download_target} is missing wiring: {missing!r}"
+        )
+    beta_block = case_block(text, contract.beta_download_target, relative)
+    beta_required_wiring = {
+        "MODEL_REPO=$RUNTIME_QWEN_Q2_REPO",
+        "MODEL_FILE=$RUNTIME_QWEN_Q2_FILE",
+        "MODEL_REVISION=$RUNTIME_QWEN_Q2_REVISION",
+        "MODEL_BYTES=$RUNTIME_QWEN_Q2_BYTES",
+        "MODEL_SHA256=$RUNTIME_QWEN_Q2_SHA256",
+    }
+    beta_wiring = {
+        line.strip() for line in beta_block.splitlines() if line.strip()
+    }
+    if not beta_required_wiring.issubset(beta_wiring):
+        missing = sorted(beta_required_wiring - beta_wiring)
+        raise ContractError(
+            f"{relative}: {contract.beta_download_target} is missing wiring: "
+            f"{missing!r}"
         )
     if contract.negative.filename in text or contract.negative.sha256 in text:
         raise ContractError(
@@ -490,6 +694,15 @@ def check_download_test(root: Path, manifest_path: Path, contract: Contract) -> 
             "RUNTIME_QWEN_SHA256",
             "RUNTIME_QWEN_REVISION",
             "RUNTIME_QWEN_MIN_RUNTIME_COMMIT",
+            "RUNTIME_QWEN_Q2_STATUS",
+            "RUNTIME_QWEN_Q2_REPO",
+            "RUNTIME_QWEN_Q2_FILE",
+            "RUNTIME_QWEN_Q2_BYTES",
+            "RUNTIME_QWEN_Q2_SHA256",
+            "RUNTIME_QWEN_Q2_REVISION",
+            "RUNTIME_QWEN_Q2_MIN_RUNTIME_COMMIT",
+            "RUNTIME_QWEN_Q2_QUALIFIED_CONTEXT",
+            "RUNTIME_QWEN_Q2_MIN_MEMORY_GIB",
             "QWEN_NEGATIVE_FILE",
             "QWEN_NEGATIVE_SHA256",
         ],
@@ -502,6 +715,11 @@ def check_download_test(root: Path, manifest_path: Path, contract: Contract) -> 
             contract.published.sha256,
             contract.published.revision or "",
             contract.published.runtime_commit or "",
+            contract.beta.filename,
+            contract.beta.sha256,
+            contract.beta.revision or "",
+            contract.beta.runtime_commit or "",
+            contract.beta.embedded_payload_sha256 or "",
             contract.negative.filename,
             contract.negative.sha256,
         )
@@ -554,6 +772,7 @@ def main() -> int:
     print(
         "Qwen release contract: PASS "
         f"({contract.published.status} {contract.published.filename}; "
+        f"{contract.beta.status} {contract.beta.filename}; "
         f"{contract.negative.status} {contract.negative.filename})"
     )
     return 0

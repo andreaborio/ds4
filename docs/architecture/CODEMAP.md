@@ -116,7 +116,7 @@ not validated.
 | `tests/test_install.sh` | Temporary-root install/uninstall layout, path portability, capability, and explicit-removal checks |
 | `tools/brand_boundary.json` + `tools/brand_boundary_audit.py` | Exact canonical, bridged, and permanently preserved identity contract plus explicit per-file legacy `ds4`/`DS4`/`DwarfStar` classification and monotonic count ceilings; `--check` rejects contract drift, new groups, and increases, while `--refresh` requires exact authorizations before widening a ceiling |
 | `tests/test_brand_boundary_audit.py` | Fail-closed fixtures for new files and tokens, increases, reductions, deterministic refresh, and invalid manifests |
-| `docs/contracts/qwen-release.json` + `tools/qwen_release_contract.py` | Canonical published/negative-only Qwen artifact identity and the model-free gate that parses its documentation, downloader, and test surfaces for drift |
+| `docs/contracts/qwen-release.json` + `tools/qwen_release_contract.py` | Canonical Stable, opt-in Beta, and negative-only Qwen artifact identities plus the model-free gate that parses their documentation, downloader, and test surfaces for drift |
 | `tests/test_qwen_release_contract.py` | Fail-closed fixtures for prose, table, downloader, schema, status, and negative-only Qwen release-contract drift |
 | `tests/qwen/` | Qwen fixtures, provenance, reference collectors, and model-specific gates |
 | `tests/test-vectors/` | Official and local continuation vectors plus provenance |

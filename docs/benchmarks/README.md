@@ -7,7 +7,7 @@ because their numbers remain useful.
 
 | Record | Status | Scope |
 | --- | --- | --- |
-| [`2026-07-28-qwen-q2-k-xl-performance-weight.md`](2026-07-28-qwen-q2-k-xl-performance-weight.md) | Accepted dual-profile implementation; 262K endpoint and Q2_K_XL publication pending | Q2_K_XL quality/performance-per-weight decision, shared Qwen runtime, Affine4 A/B/B/A, evidence through 100K/32K, rejected Affine2 and speculative paths |
+| [`2026-07-28-qwen-q2-k-xl-performance-weight.md`](2026-07-28-qwen-q2-k-xl-performance-weight.md) | Accepted dual-profile implementation; Q2_K_XL published Beta at 64 GiB/32K, 262K Stable/full-window endpoint pending | Q2_K_XL quality/performance-per-weight decision, shared Qwen runtime, Affine4 A/B/B/A, evidence through 100K/32K, rejected Affine2 and speculative paths |
 | [`2026-07-24-qwen-24g-cache-guard.md`](2026-07-24-qwen-24g-cache-guard.md) | Local safety candidate implemented; physical M5 24 GiB confirmation pending | Qwen 24 GiB sustained-decode watchdog incident, guarded cache policy, model-free regression, and versioned five-request Hebrus Studio physical gate |
 | [`2026-07-22-qwen-kv-pair-blit.md`](2026-07-22-qwen-kv-pair-blit.md) | Owner-authorized merge; full release matrix incomplete, SSD speed effect within noise | Qwen K/V cache pair-blit on M5 resident/SSD and M1 Pro 16/32 GiB, including invalid 16 GiB timing evidence |
 | [`2026-07-22-qwen-ssd-flash-prefill.md`](2026-07-22-qwen-ssd-flash-prefill.md) | Directional candidate; battery cohort, promotion pending | Qwen implicit-causal FlashAttention transfer to SSD, memory accounting, and first 2K/8K A/B |

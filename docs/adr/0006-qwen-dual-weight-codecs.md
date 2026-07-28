@@ -50,9 +50,12 @@ The affine2 implementation and its experiment controls are removed.
 
 Artifact publication is independent from runtime implementation. The existing
 affine4 immutable release and `download_model.sh qwen-v2` remain unchanged.
-Q2_K_XL becomes downloadable only after its exact native bytes, immutable
-repository revision, and compatible runtime commit are added to the
-machine-readable release contract.
+Q2_K_XL is published separately as an opt-in, nonrecommended Beta through
+`download_model.sh qwen-q2-beta` after its exact native bytes, immutable
+repository revision, and compatible runtime commit were added to the
+machine-readable release contract. Its public boundary is limited to the
+completed 64 GiB/32K evidence; the near-262K endpoint remains mandatory before
+Stable/full-window promotion.
 
 ## Consequences
 
