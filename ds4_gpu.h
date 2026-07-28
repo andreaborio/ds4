@@ -883,7 +883,25 @@ int ds4_gpu_qwen35_dequant_embedding_q5_k_tensor(
         uint32_t        row_index,
         uint32_t        n_embd);
 
+int ds4_gpu_qwen35_dequant_embedding_q8_0_tensor(
+        ds4_gpu_tensor *out,
+        const void     *model_map,
+        uint64_t        model_size,
+        uint64_t        embedding_offset,
+        uint32_t        row_index,
+        uint32_t        n_embd);
+
 int ds4_gpu_qwen35_dequant_embedding_q5_k_batch_tensor(
+        ds4_gpu_tensor       *out,
+        const ds4_gpu_tensor *token_ids,
+        const void           *model_map,
+        uint64_t              model_size,
+        uint64_t              embedding_offset,
+        uint32_t              n_token,
+        uint32_t              n_row,
+        uint32_t              n_embd);
+
+int ds4_gpu_qwen35_dequant_embedding_q8_0_batch_tensor(
         ds4_gpu_tensor       *out,
         const ds4_gpu_tensor *token_ids,
         const void           *model_map,

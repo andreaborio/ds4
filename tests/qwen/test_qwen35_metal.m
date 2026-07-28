@@ -774,6 +774,204 @@ static bool test_router_softmax_top8(
     return true;
 }
 
+static bool test_embedding_q8_0(
+        id<MTLDevice> device,
+        id<MTLCommandQueue> queue,
+        id<MTLLibrary> library) {
+    enum {
+        N_EMBD = 2048,
+        Q8_BLOCK = 32,
+        BLOCK_COUNT = N_EMBD / Q8_BLOCK,
+        BLOCK_STRIDE = 40,
+        ROW_STRIDE = BLOCK_COUNT * BLOCK_STRIDE + 16,
+        ROW_COUNT = 3,
+        OUTPUT_STRIDE = 8,
+        BATCH_TOKEN_COUNT = 2,
+        TOKEN_ID_STRIDE = 8,
+        OUTPUT_TOKEN_PADDING = 16,
+        OUTPUT_TOKEN_STRIDE = N_EMBD * OUTPUT_STRIDE + OUTPUT_TOKEN_PADDING,
+    };
+    uint8_t *encoded = calloc(ROW_COUNT, ROW_STRIDE);
+    float *expected = malloc(N_EMBD * sizeof(expected[0]));
+    float *actual = malloc(N_EMBD * sizeof(actual[0]));
+    float *batch_expected =
+        malloc(BATCH_TOKEN_COUNT * N_EMBD * sizeof(batch_expected[0]));
+    float *batch_actual =
+        malloc(BATCH_TOKEN_COUNT * N_EMBD * sizeof(batch_actual[0]));
+    if (!encoded || !expected || !actual || !batch_expected || !batch_actual) {
+        free(encoded);
+        free(expected);
+        free(actual);
+        free(batch_expected);
+        free(batch_actual);
+        return false;
+    }
+
+    static const float scale_pattern[] = {
+        0.125f, -0.25f, 0.5f, -0.75f, 1.0f, -1.5f, 2.0f,
+    };
+    for (uint32_t row = 0; row < ROW_COUNT; row++) {
+        for (uint32_t block = 0; block < BLOCK_COUNT; block++) {
+            const float requested_scale =
+                scale_pattern[(block + 2u * row) %
+                              (sizeof(scale_pattern) /
+                               sizeof(scale_pattern[0]))];
+            const uint16_t scale_bits = f32_to_f16_bits(requested_scale);
+            const size_t block_offset =
+                (size_t)row * ROW_STRIDE + (size_t)block * BLOCK_STRIDE;
+            memcpy(encoded + block_offset, &scale_bits, sizeof(scale_bits));
+            for (uint32_t item = 0; item < Q8_BLOCK; item++) {
+                const uint32_t dim = block * Q8_BLOCK + item;
+                const int8_t quant = (int8_t)(
+                    (int32_t)((dim * 37u + row * 19u) % 255u) - 127);
+                memcpy(encoded + block_offset + 2u + item,
+                       &quant, sizeof(quant));
+            }
+        }
+    }
+
+    const uint32_t direct_row = 1u;
+    for (uint32_t block = 0; block < BLOCK_COUNT; block++) {
+        const size_t block_offset =
+            (size_t)direct_row * ROW_STRIDE +
+            (size_t)block * BLOCK_STRIDE;
+        uint16_t scale_bits = 0;
+        memcpy(&scale_bits, encoded + block_offset, sizeof(scale_bits));
+        const float scale = f16_bits_to_f32(scale_bits);
+        for (uint32_t item = 0; item < Q8_BLOCK; item++) {
+            int8_t quant = 0;
+            memcpy(&quant, encoded + block_offset + 2u + item,
+                   sizeof(quant));
+            expected[block * Q8_BLOCK + item] = scale * (float)quant;
+        }
+    }
+
+    id<MTLBuffer> embedding = buffer_with_bytes(
+        device, encoded, ROW_COUNT * ROW_STRIDE);
+    const NSUInteger output_bytes =
+        (N_EMBD - 1u) * OUTPUT_STRIDE + sizeof(float);
+    id<MTLBuffer> output = [device newBufferWithLength:output_bytes
+                                               options:MTLResourceStorageModeShared];
+    if (!embedding || !output) {
+        free(encoded);
+        free(expected);
+        free(actual);
+        free(batch_expected);
+        free(batch_actual);
+        return false;
+    }
+    memset(output.contents, 0xa5, output_bytes);
+    qwen35_embedding_args args = {
+        .row_index = direct_row,
+        .n_embd = N_EMBD,
+        .block_size = Q8_BLOCK,
+        .source_row_stride = ROW_STRIDE,
+        .source_block_stride = BLOCK_STRIDE,
+        .source_scale_offset = 0,
+        .source_quant_offset = 2,
+        .source_quant_stride = 1,
+        .output_dim_stride = OUTPUT_STRIDE,
+    };
+    bool ok = dispatch_kernel(
+        device, queue, library,
+        @"kernel_qwen35_dequant_embedding_q8_0_f32",
+        &args, sizeof(args), @[embedding, output], @[],
+        N_EMBD, 64, false, 0, 0);
+    if (ok) {
+        const uint8_t *bytes = output.contents;
+        for (size_t dim = 0; dim < N_EMBD; dim++) {
+            actual[dim] = host_load_f32(bytes, dim * OUTPUT_STRIDE);
+        }
+        ok = check_strided_guard(
+            "Q8_0 embedding output", bytes, output_bytes,
+            0, OUTPUT_STRIDE, sizeof(float), N_EMBD, 0xa5u);
+    }
+    if (ok) {
+        ok = check_f32(
+            "Q8_0 embedding row", actual, expected, N_EMBD, 0.0f, 0.0f);
+    }
+
+    uint8_t token_ids[BATCH_TOKEN_COUNT * TOKEN_ID_STRIDE];
+    memset(token_ids, 0x5a, sizeof(token_ids));
+    const int32_t rows[BATCH_TOKEN_COUNT] = {2, 0};
+    for (uint32_t token = 0; token < BATCH_TOKEN_COUNT; token++) {
+        memcpy(token_ids + token * TOKEN_ID_STRIDE,
+               &rows[token], sizeof(rows[token]));
+        for (uint32_t block = 0; block < BLOCK_COUNT; block++) {
+            const size_t block_offset =
+                (size_t)rows[token] * ROW_STRIDE +
+                (size_t)block * BLOCK_STRIDE;
+            uint16_t scale_bits = 0;
+            memcpy(&scale_bits, encoded + block_offset, sizeof(scale_bits));
+            const float scale = f16_bits_to_f32(scale_bits);
+            for (uint32_t item = 0; item < Q8_BLOCK; item++) {
+                int8_t quant = 0;
+                memcpy(&quant, encoded + block_offset + 2u + item,
+                       sizeof(quant));
+                batch_expected[(size_t)token * N_EMBD +
+                               block * Q8_BLOCK + item] =
+                    scale * (float)quant;
+            }
+        }
+    }
+    const NSUInteger batch_output_bytes =
+        (BATCH_TOKEN_COUNT - 1u) * OUTPUT_TOKEN_STRIDE +
+        (N_EMBD - 1u) * OUTPUT_STRIDE + sizeof(float);
+    id<MTLBuffer> token_buffer =
+        buffer_with_bytes(device, token_ids, sizeof(token_ids));
+    id<MTLBuffer> batch_output =
+        [device newBufferWithLength:batch_output_bytes
+                            options:MTLResourceStorageModeShared];
+    if (ok && (!token_buffer || !batch_output)) ok = false;
+    if (ok) {
+        memset(batch_output.contents, 0xa5, batch_output_bytes);
+        qwen35_embedding_batch_args batch_args = {
+            .n_token = BATCH_TOKEN_COUNT,
+            .n_row = ROW_COUNT,
+            .n_embd = N_EMBD,
+            .block_size = Q8_BLOCK,
+            .source_row_stride = ROW_STRIDE,
+            .source_block_stride = BLOCK_STRIDE,
+            .source_scale_offset = 0,
+            .source_quant_offset = 2,
+            .source_quant_stride = 1,
+            .token_id_stride = TOKEN_ID_STRIDE,
+            .output_token_stride = OUTPUT_TOKEN_STRIDE,
+            .output_dim_stride = OUTPUT_STRIDE,
+        };
+        ok = dispatch_kernel(
+            device, queue, library,
+            @"kernel_qwen35_dequant_embedding_q8_0_batch_f32",
+            &batch_args, sizeof(batch_args),
+            @[embedding, token_buffer, batch_output], @[],
+            BATCH_TOKEN_COUNT * N_EMBD, 64, false, 0, 0);
+    }
+    if (ok) {
+        const uint8_t *bytes = batch_output.contents;
+        for (size_t token = 0; token < BATCH_TOKEN_COUNT; token++) {
+            for (size_t dim = 0; dim < N_EMBD; dim++) {
+                batch_actual[token * N_EMBD + dim] = host_load_f32(
+                    bytes, token * OUTPUT_TOKEN_STRIDE +
+                               dim * OUTPUT_STRIDE);
+            }
+        }
+        ok = check_f32(
+            "batched Q8_0 embedding", batch_actual, batch_expected,
+            BATCH_TOKEN_COUNT * N_EMBD, 0.0f, 0.0f);
+    }
+    if (ok && memcmp(embedding.contents, encoded,
+                     ROW_COUNT * ROW_STRIDE) != 0) {
+        fprintf(stderr, "Q8_0 embedding dequant mutated its source rows\n");
+        ok = false;
+    }
+    free(encoded);
+    free(expected);
+    free(actual);
+    free(batch_expected);
+    free(batch_actual);
+    return ok;
+}
+
 static bool test_embedding_q5_k(
         id<MTLDevice> device,
         id<MTLCommandQueue> queue,
@@ -1821,9 +2019,11 @@ int main(int argc, const char *argv[]) {
             return 0;
         }
         if (getenv("DS4_TEST_QWEN_EMBEDDING_Q5_ONLY") != NULL) {
-            const bool ok = test_embedding_q5_k(device, queue, library);
+            const bool ok =
+                test_embedding_q8_0(device, queue, library) &&
+                test_embedding_q5_k(device, queue, library);
             if (!ok) return 1;
-            puts("Qwen Metal Q5_K embedding fixtures passed");
+            puts("Qwen Metal Q8_0/Q5_K embedding fixtures passed");
             return 0;
         }
         if (getenv("DS4_TEST_QWEN_GDN_CONTROLS_ONLY") != NULL) {
@@ -1843,6 +2043,7 @@ int main(int argc, const char *argv[]) {
         }
         const bool ok =
             test_router_softmax_top8(device, queue, library) &&
+            test_embedding_q8_0(device, queue, library) &&
             test_embedding_q5_k(device, queue, library) &&
             test_gated_delta_controls(device, queue, library) &&
             test_split_q_gate(device, queue, library) &&

@@ -29,6 +29,8 @@ STORE_FAMILY_DEEPSEEK4 = 1
 STORE_FAMILY_GLM_DSA = 2
 STORE_FAMILY_QWEN35_MOE = 3
 STORE_STORAGE_GGML = 0
+STORE_STORAGE_MLX_AFFINE4 = 1
+STORE_STORAGE_QWEN_AFFINE2_G32_IQ_DOWN = 2
 STORE_FAMILIES = {
     STORE_FAMILY_DEEPSEEK4,
     STORE_FAMILY_GLM_DSA,
@@ -208,6 +210,7 @@ class Component:
     tensor: Tensor
     expert_bytes: int
     record_offset: int
+    block_elements: int | None = None
 
 
 @dataclasses.dataclass
@@ -445,7 +448,12 @@ def pack_layer(layer: Layer) -> bytes:
     struct.pack_into("<IIQQQ", result, 0, layer.index, layer.expert_count,
                      layer.record_bytes, layer.data_offset, layer.data_size)
     for component in layer.components:
-        block_elements, _ = TYPE_LAYOUT[component.tensor.ggml_type]
+        logical_block_elements, _ = TYPE_LAYOUT[component.tensor.ggml_type]
+        block_elements = (
+            component.block_elements
+            if component.block_elements is not None
+            else logical_block_elements
+        )
         offset = STORE_COMPONENT_OFFSET + component.role * STORE_COMPONENT_BYTES
         struct.pack_into(
             "<IIIIQQQQQ", result, offset,
@@ -704,7 +712,12 @@ def parse_store(native: GGUF, tensor: Tensor) -> tuple[dict[str, object], list[L
         source_size = struct.unpack_from("<Q", header, 88)[0]
         storage_format, group_size = struct.unpack_from("<II", header, 160)
         storage_valid = (
-            storage_format == STORE_STORAGE_GGML and group_size == 0
+            (storage_format == STORE_STORAGE_GGML and group_size == 0) or
+            (storage_format == STORE_STORAGE_MLX_AFFINE4 and
+             group_size == 64 and family == STORE_FAMILY_QWEN35_MOE) or
+            (storage_format ==
+             STORE_STORAGE_QWEN_AFFINE2_G32_IQ_DOWN and
+             group_size == 32 and family == STORE_FAMILY_QWEN35_MOE)
         )
         if (version != STORE_VERSION or header_bytes != STORE_HEADER_BYTES or
                 family not in STORE_FAMILIES or
@@ -739,20 +752,64 @@ def parse_store(native: GGUF, tensor: Tensor) -> tuple[dict[str, object], list[L
              expert_bytes, record_offset) = struct.unpack_from(
                 "<IIIIQQQQQ", entry, offset
             )
-            if (entry_role != role or ndim != 3 or ggml_type not in ROUTED_TYPES or
-                    TYPE_LAYOUT[ggml_type][0] != block_elements or
+            if (entry_role != role or ndim != 3 or
+                    ggml_type not in ROUTED_TYPES or
                     d2 != expert_count or record_offset != record_cursor):
                 raise FormatError(f"invalid component descriptor at layer {il} role {role}")
-            expected = tensor_nbytes(ggml_type, (d0, d1, 1))
+            if storage_format == STORE_STORAGE_GGML:
+                descriptor_valid = (
+                    TYPE_LAYOUT[ggml_type][0] == block_elements
+                )
+                expected = tensor_nbytes(ggml_type, (d0, d1, 1))
+            elif storage_format == STORE_STORAGE_MLX_AFFINE4:
+                descriptor_valid = (
+                    ggml_type == 12 and
+                    TYPE_LAYOUT[ggml_type][0] == block_elements
+                )
+                expected = tensor_nbytes(ggml_type, (d0, d1, 1))
+            else:
+                if role < 2:
+                    if ggml_type == 17:
+                        descriptor_valid = (
+                            block_elements == 32 and d0 % 32 == 0
+                        )
+                        affine_bytes = d0 * d1 // 32 * 12
+                        expected = affine_bytes + d0 * 2
+                    else:
+                        descriptor_valid = (
+                            ggml_type == 18 and
+                            TYPE_LAYOUT[ggml_type][0] == block_elements
+                        )
+                        expected = tensor_nbytes(
+                            ggml_type, (d0, d1, 1)
+                        )
+                else:
+                    descriptor_valid = (
+                        ggml_type in (18, 23) and
+                        TYPE_LAYOUT[ggml_type][0] == block_elements
+                    )
+                    expected = tensor_nbytes(ggml_type, (d0, d1, 1))
+            if not descriptor_valid:
+                raise FormatError(
+                    f"invalid physical codec descriptor at layer {il} "
+                    f"role {role}"
+                )
             if expert_bytes != expected:
                 raise FormatError(f"component byte size mismatch at layer {il} role {role}")
             synthetic = Tensor(
                 f"blk.{layer_index}.ffn_{ROLE_NAME[role]}_exps.weight",
                                (d0, d1, d2), ggml_type, 0,
                                expert_bytes * expert_count)
-            components.append(Component(role, synthetic, expert_bytes,
-                                        record_offset))
+            components.append(Component(
+                role, synthetic, expert_bytes, record_offset, block_elements
+            ))
             record_cursor += expert_bytes
+        gate, up, down = (component.tensor for component in components)
+        if (gate.dims != up.dims or gate.ggml_type != up.ggml_type or
+                gate.dims[0] != down.dims[1] or
+                gate.dims[1] != down.dims[0] or
+                down.dims[2] != expert_count):
+            raise FormatError(f"component geometry mismatch at layer {il}")
         if (layer_index <= previous_layer_index or
                 layer_index > STORE_MAX_MODEL_LAYER or
                 (family in (STORE_FAMILY_DEEPSEEK4,

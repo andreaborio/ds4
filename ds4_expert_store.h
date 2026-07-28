@@ -19,6 +19,18 @@ enum {
 typedef enum {
     /* GGML block payloads such as Q2_K, IQ2_XS, IQ3_XXS, and IQ4_XS. */
     DS4_EXPERT_STORE_STORAGE_GGML = 0,
+    /* MLX affine 4-bit groups, physically interleaved as
+     * [32 packed bytes | BF16 scale | BF16 bias] for every 64 weights.
+     * The logical component type remains Q4_K because the byte geometry is
+     * identical (36 bytes per 64 values / 144 bytes per 256 values). */
+    DS4_EXPERT_STORE_STORAGE_MLX_AFFINE4 = 1,
+    /* Qwen hybrid storage. IQ2_XS gate/up components are physically Affine2
+     * group-32 blocks [8 packed bytes | BF16 scale | BF16 bias]. Both
+     * components begin with the same BF16 input multiplier vector so resident
+     * and SSD caches retain one shared gate/up geometry. Protected IQ3_XXS
+     * gate/up layers and all IQ3_XXS/IQ4_XS down components remain ordinary
+     * GGML blocks. */
+    DS4_EXPERT_STORE_STORAGE_QWEN_AFFINE2_G32_IQ_DOWN = 2,
 } ds4_expert_store_storage;
 
 typedef enum {

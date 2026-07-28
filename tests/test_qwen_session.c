@@ -419,6 +419,7 @@ static ds4_tensor *qwen35_ssd_fixture_add(
 static bool qwen35_ssd_fixture_make(qwen35_ssd_fixture *fixture) {
     if (!fixture) return false;
     memset(fixture, 0, sizeof(*fixture));
+    fixture->weights.profile = QWEN35_QUANT_PROFILE_Q2_K_XL;
     const long page_long = sysconf(_SC_PAGESIZE);
     if (page_long <= 0) return false;
     fixture->page = (uint64_t)page_long;
@@ -646,7 +647,7 @@ static void test_qwen35_ssd_static_contract(void) {
     uint64_t payload = 0;
     CHECK(qwen35_weights_model_map_non_routed_spans(
               &fixture->model, &fixture->weights, &spans, &payload));
-    CHECK(payload == QWEN35_NON_ROUTED_PAYLOAD_BYTES);
+    CHECK(payload == QWEN35_Q2_NON_ROUTED_PAYLOAD_BYTES);
     CHECK(payload == UINT64_C(1751935488));
     CHECK(model_map_span_vec_total_bytes(&spans) == payload);
     CHECK(spans.len != 0);

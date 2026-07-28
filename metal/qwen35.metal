@@ -623,6 +623,64 @@ kernel void kernel_qwen35_router_softmax_top8_f32(
     }
 }
 
+// Q8_0 remains the published Affine4 embedding profile. Keep it beside the
+// Q5_K gather used by Q2_K_XL so both artifact profiles share one graph.
+kernel void kernel_qwen35_dequant_embedding_q8_0_f32(
+        constant ds4_metal_args_qwen35_embedding &args [[buffer(0)]],
+        device const char *embedding [[buffer(1)]],
+        device char *output [[buffer(2)]],
+        uint dim [[thread_position_in_grid]]) {
+    if (dim >= args.n_embd || args.block_size != 32u) return;
+    const uint block = dim / args.block_size;
+    const uint within_block = dim - block * args.block_size;
+    const uint64_t block_offset =
+        (uint64_t)args.row_index * args.source_row_stride +
+        (uint64_t)block * args.source_block_stride;
+    const half scale = *((device const half *)(
+        embedding + block_offset + args.source_scale_offset));
+    const int8_t quant = *((device const int8_t *)(
+        embedding + block_offset + args.source_quant_offset +
+        (uint64_t)within_block * args.source_quant_stride));
+    qwen35_metal_store_f32(
+        output, (uint64_t)dim * args.output_dim_stride,
+        (float)scale * (float)quant);
+}
+
+kernel void kernel_qwen35_dequant_embedding_q8_0_batch_f32(
+        constant ds4_metal_args_qwen35_embedding_batch &args
+            [[buffer(0)]],
+        device const char *embedding [[buffer(1)]],
+        device const char *token_ids [[buffer(2)]],
+        device char *output [[buffer(3)]],
+        uint gid32 [[thread_position_in_grid]]) {
+    const uint64_t gid = (uint64_t)gid32;
+    const uint64_t total =
+        (uint64_t)args.n_token * (uint64_t)args.n_embd;
+    if (gid >= total || args.n_embd == 0u || args.block_size != 32u) return;
+
+    const uint64_t token = gid / (uint64_t)args.n_embd;
+    const uint dim = (uint)(gid - token * (uint64_t)args.n_embd);
+    const int32_t row_index = *((device const int32_t *)(
+        token_ids + token * args.token_id_stride));
+    if (row_index < 0 || (uint32_t)row_index >= args.n_row) return;
+
+    const uint block = dim / args.block_size;
+    const uint within_block = dim - block * args.block_size;
+    const uint64_t block_offset =
+        (uint64_t)(uint32_t)row_index * args.source_row_stride +
+        (uint64_t)block * args.source_block_stride;
+    const half scale = *((device const half *)(
+        embedding + block_offset + args.source_scale_offset));
+    const int8_t quant = *((device const int8_t *)(
+        embedding + block_offset + args.source_quant_offset +
+        (uint64_t)within_block * args.source_quant_stride));
+    qwen35_metal_store_f32(
+        output,
+        token * args.output_token_stride +
+            (uint64_t)dim * args.output_dim_stride,
+        (float)scale * (float)quant);
+}
+
 kernel void kernel_qwen35_dequant_embedding_q5_K_f32(
         constant ds4_metal_args_qwen35_embedding &args [[buffer(0)]],
         device const ds4_qwen35_block_q5_K *embedding [[buffer(1)]],

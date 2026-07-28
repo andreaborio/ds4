@@ -267,8 +267,15 @@ bool ds4_expert_store_open_embedded(
     const uint32_t storage_format = load_u32_le(header + 160);
     const uint32_t group_size = load_u32_le(header + 164);
     const bool storage_valid =
-        storage_format == DS4_EXPERT_STORE_STORAGE_GGML &&
-        group_size == 0u;
+        (storage_format == DS4_EXPERT_STORE_STORAGE_GGML &&
+         group_size == 0u) ||
+        (storage_format == DS4_EXPERT_STORE_STORAGE_MLX_AFFINE4 &&
+         group_size == 64u &&
+         family == DS4_EXPERT_STORE_FAMILY_QWEN35_MOE) ||
+        (storage_format ==
+             DS4_EXPERT_STORE_STORAGE_QWEN_AFFINE2_G32_IQ_DOWN &&
+         group_size == 32u &&
+         family == DS4_EXPERT_STORE_FAMILY_QWEN35_MOE);
 
     uint64_t want_descriptor_bytes = 0;
     uint64_t descriptors_end = 0;
@@ -359,19 +366,49 @@ bool ds4_expert_store_open_embedded(
             out_component->record_offset = load_u64_le(component + 48);
 
             uint32_t block_elements = 0, block_bytes = 0;
+            uint32_t physical_block_elements = 0, physical_block_bytes = 0;
             uint64_t row_blocks = 0, row_bytes = 0, expert_bytes = 0;
+            uint64_t prefix_bytes = 0;
+            bool codec_valid = true;
+            if (!quant_layout(out_component->ggml_type,
+                              &block_elements, &block_bytes)) {
+                codec_valid = false;
+            }
+            physical_block_elements = block_elements;
+            physical_block_bytes = block_bytes;
+            if (storage_format == DS4_EXPERT_STORE_STORAGE_MLX_AFFINE4) {
+                codec_valid = codec_valid &&
+                    out_component->ggml_type == 12u;
+            } else if (
+                    storage_format ==
+                        DS4_EXPERT_STORE_STORAGE_QWEN_AFFINE2_G32_IQ_DOWN) {
+                if (role < 2u && out_component->ggml_type == 17u) {
+                    physical_block_elements = 32u;
+                    physical_block_bytes = 12u;
+                    if (!mul_u64(out_component->dim[0], 2u,
+                                 &prefix_bytes)) {
+                        codec_valid = false;
+                    }
+                } else if (role < 2u) {
+                    codec_valid = codec_valid &&
+                        out_component->ggml_type == 18u;
+                } else {
+                    codec_valid = codec_valid &&
+                        (out_component->ggml_type == 18u ||
+                         out_component->ggml_type == 23u);
+                }
+            }
             if (out_component->role != role || ndim != 3 ||
-                !quant_layout(out_component->ggml_type,
-                              &block_elements, &block_bytes) ||
-                out_component->block_elements != block_elements ||
+                !codec_valid ||
+                out_component->block_elements != physical_block_elements ||
                 out_component->dim[0] == 0 ||
-                out_component->dim[0] % block_elements != 0 ||
+                out_component->dim[0] % physical_block_elements != 0 ||
                 out_component->dim[1] == 0 ||
                 out_component->dim[2] != expert_count ||
-                !mul_u64(out_component->dim[0] / block_elements,
-                         block_bytes, &row_blocks) ||
+                !mul_u64(out_component->dim[0] / physical_block_elements,
+                         physical_block_bytes, &row_blocks) ||
                 !mul_u64(row_blocks, out_component->dim[1], &row_bytes) ||
-                !mul_u64(row_bytes, 1, &expert_bytes) ||
+                !add_u64(row_bytes, prefix_bytes, &expert_bytes) ||
                 out_component->expert_bytes != expert_bytes ||
                 out_component->record_offset != expected_record_offset ||
                 !add_u64(expected_record_offset, expert_bytes,
@@ -383,6 +420,26 @@ bool ds4_expert_store_open_embedded(
                           il, role);
                 return false;
             }
+        }
+        const ds4_expert_store_component *gate =
+            &layer->component[DS4_EXPERT_STORE_GATE];
+        const ds4_expert_store_component *up =
+            &layer->component[DS4_EXPERT_STORE_UP];
+        const ds4_expert_store_component *down =
+            &layer->component[DS4_EXPERT_STORE_DOWN];
+        if (gate->ggml_type != up->ggml_type ||
+            gate->dim[0] != up->dim[0] ||
+            gate->dim[1] != up->dim[1] ||
+            gate->dim[2] != up->dim[2] ||
+            gate->dim[0] != down->dim[1] ||
+            gate->dim[1] != down->dim[0] ||
+            down->dim[2] != expert_count) {
+            free(raw);
+            free(layers);
+            set_error(error, error_size,
+                      "expert manifest component relationships are invalid at layer %u",
+                      il);
+            return false;
         }
         uint64_t expected_layer_bytes = 0;
         uint64_t layer_end = 0;

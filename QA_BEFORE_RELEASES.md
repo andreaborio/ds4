@@ -134,6 +134,15 @@ large, and mandatory 32,768-token long-context arms, including exact decode
 evidence, TPOT p50/p95, memory pressure, zero new swapout, and at least 128
 greedy decode tokens per frontier. Attention, KV, cache, RoPE, allocation, and
 context-scaling changes also require isolated 65,536- and 100,000-token arms.
+Every surviving model-backed candidate also requires an isolated endpoint arm
+at the largest locally validated and admitted prompt frontier that leaves room
+for at least 128 greedy decode tokens and runtime bookkeeping. The current
+Qwen3.6 metadata declares 262,144 tokens, so its endpoint gate is near 262K,
+not 32K or 100K. Record the metadata limit and exact allocation. If an
+advertised hardware/mode profile cannot complete that endpoint without unsafe
+pressure, swapout, abort, or correctness drift, fix the runtime or narrow the
+public context contract and fail larger requests closed; do not waive the
+endpoint gate.
 
 - Use interleaved A/B/B/A comparisons and keep cold and warm cohorts separate.
   Use identical discarded warm-ups for retained warm cohorts. An abort, new

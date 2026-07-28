@@ -47,6 +47,18 @@ typedef struct {
 } block_iq4_xs;
 
 typedef struct {
+    uint8_t qs[32];
+    uint16_t scale_bf16;
+    uint16_t bias_bf16;
+} block_mlx_affine4_64;
+
+typedef struct {
+    uint8_t qs[8];
+    uint16_t scale_bf16;
+    uint16_t bias_bf16;
+} block_qwen_affine2_32;
+
+typedef struct {
     int32_t nei0;
     int32_t nei1;
     uint64_t nbi1;
@@ -69,10 +81,27 @@ typedef struct {
     int32_t nr0;
 } mul_mv_id_args;
 
+typedef struct {
+    uint32_t width;
+    uint32_t rows;
+    uint64_t gate_row_stride;
+    uint64_t up_row_stride;
+    uint64_t mid_row_stride;
+    uint64_t weight_stride;
+    uint32_t write_clamped;
+    float clamp_value;
+} moe_swiglu_weight_args;
+
 _Static_assert(sizeof(block_iq2_xs) == 74, "IQ2_XS block ABI drift");
 _Static_assert(sizeof(block_iq3_xxs) == 98, "IQ3_XXS block ABI drift");
 _Static_assert(sizeof(block_iq4_xs) == 136, "IQ4_XS block ABI drift");
+_Static_assert(sizeof(block_mlx_affine4_64) == 36,
+               "MLX Affine4 block ABI drift");
+_Static_assert(sizeof(block_qwen_affine2_32) == 12,
+               "Qwen Affine2 block ABI drift");
 _Static_assert(sizeof(mul_mv_id_args) == 120, "routed matvec ABI drift");
+_Static_assert(sizeof(moe_swiglu_weight_args) == 48,
+               "routed SwiGLU ABI drift");
 
 typedef float (*dequant_value_fn)(const void *block, uint32_t index);
 
@@ -97,6 +126,20 @@ static float f16_bits_to_f32(uint16_t bits) {
     _Float16 half_value = 0;
     memcpy(&half_value, &bits, sizeof(bits));
     return (float)half_value;
+}
+
+static uint16_t f32_to_bf16_bits(float value) {
+    uint32_t bits = 0;
+    memcpy(&bits, &value, sizeof(bits));
+    bits += 0x7fffu + ((bits >> 16u) & 1u);
+    return (uint16_t)(bits >> 16u);
+}
+
+static float bf16_bits_to_f32(uint16_t bits) {
+    uint32_t expanded = (uint32_t)bits << 16u;
+    float value = 0.0f;
+    memcpy(&value, &expanded, sizeof(value));
+    return value;
 }
 
 static uint8_t iq_sign_mask(uint32_t index) {
@@ -458,6 +501,276 @@ static bool run_case(
     return ok;
 }
 
+static float affine_fixture_value(
+        const uint8_t *expert,
+        bool affine2,
+        uint32_t input_dim,
+        uint32_t row,
+        uint32_t column) {
+    if (affine2) {
+        const block_qwen_affine2_32 *block =
+            (const block_qwen_affine2_32 *)(
+                expert + (size_t)input_dim * sizeof(uint16_t)) + row;
+        const uint32_t shift = (column & 3u) * 2u;
+        const uint32_t q = (block->qs[column >> 2u] >> shift) & 3u;
+        return bf16_bits_to_f32(block->scale_bf16) * (float)q +
+               bf16_bits_to_f32(block->bias_bf16);
+    }
+    const block_mlx_affine4_64 *block =
+        (const block_mlx_affine4_64 *)expert + row;
+    const uint32_t q = (column & 1u) != 0u
+        ? block->qs[column >> 1u] >> 4u
+        : block->qs[column >> 1u] & 0x0fu;
+    return bf16_bits_to_f32(block->scale_bf16) * (float)q +
+           bf16_bits_to_f32(block->bias_bf16);
+}
+
+static void fill_affine_fixture(
+        uint8_t *component,
+        bool affine2,
+        uint32_t input_dim,
+        size_t expert_bytes,
+        uint32_t role) {
+    for (uint32_t expert = 0; expert < N_EXPERT; expert++) {
+        uint8_t *base = component + (size_t)expert * expert_bytes;
+        if (affine2) {
+            uint16_t *equalizer = (uint16_t *)base;
+            for (uint32_t column = 0; column < input_dim; column++) {
+                const float multiplier =
+                    0.5f + 0.125f * (float)((column + expert) % 9u);
+                equalizer[column] = f32_to_bf16_bits(multiplier);
+            }
+            block_qwen_affine2_32 *blocks =
+                (block_qwen_affine2_32 *)(
+                    base + (size_t)input_dim * sizeof(uint16_t));
+            for (uint32_t row = 0; row < N_ROW; row++) {
+                block_qwen_affine2_32 *block = blocks + row;
+                block->scale_bf16 = f32_to_bf16_bits(
+                    0.015625f * (float)(1u + expert + row));
+                block->bias_bf16 = f32_to_bf16_bits(
+                    -0.0625f * (float)(1u + role + (row & 1u)));
+                for (uint32_t byte = 0; byte < sizeof(block->qs); byte++) {
+                    uint8_t packed = 0;
+                    for (uint32_t lane = 0; lane < 4u; lane++) {
+                        const uint32_t column = byte * 4u + lane;
+                        const uint32_t q =
+                            (column + 2u * row + expert + role) & 3u;
+                        packed |= (uint8_t)(q << (2u * lane));
+                    }
+                    block->qs[byte] = packed;
+                }
+            }
+        } else {
+            block_mlx_affine4_64 *blocks =
+                (block_mlx_affine4_64 *)base;
+            for (uint32_t row = 0; row < N_ROW; row++) {
+                block_mlx_affine4_64 *block = blocks + row;
+                block->scale_bf16 = f32_to_bf16_bits(
+                    0.0078125f * (float)(1u + expert + row));
+                block->bias_bf16 = f32_to_bf16_bits(
+                    -0.03125f * (float)(1u + role + (row & 1u)));
+                for (uint32_t byte = 0; byte < sizeof(block->qs); byte++) {
+                    const uint32_t column = byte * 2u;
+                    const uint8_t q0 =
+                        (uint8_t)((column + row + expert + role) & 15u);
+                    const uint8_t q1 =
+                        (uint8_t)((column + row + expert + role + 5u) & 15u);
+                    block->qs[byte] = (uint8_t)(q0 | (q1 << 4u));
+                }
+            }
+        }
+    }
+}
+
+static bool run_affine_pair_case(
+        id<MTLDevice> device,
+        id<MTLCommandQueue> queue,
+        id<MTLLibrary> library,
+        bool affine2) {
+    const uint32_t input_dim = affine2 ? 32u : 64u;
+    const size_t row_bytes = affine2
+        ? sizeof(block_qwen_affine2_32)
+        : sizeof(block_mlx_affine4_64);
+    const size_t prefix_bytes =
+        affine2 ? (size_t)input_dim * sizeof(uint16_t) : 0u;
+    const size_t expert_bytes = prefix_bytes + N_ROW * row_bytes;
+    const size_t component_bytes = N_EXPERT * expert_bytes;
+    uint8_t *gate = calloc(1, component_bytes);
+    uint8_t *up = calloc(1, component_bytes);
+    if (!gate || !up) {
+        free(gate);
+        free(up);
+        return false;
+    }
+    fill_affine_fixture(gate, affine2, input_dim, expert_bytes, 0u);
+    fill_affine_fixture(up, affine2, input_dim, expert_bytes, 1u);
+
+    float input[64] = {0};
+    for (uint32_t column = 0; column < input_dim; column++) {
+        input[column] =
+            ((int32_t)((column * 11u + 3u) % 29u) - 14) * 0.0078125f;
+    }
+    const int32_t selected[N_SELECTED] = {2, 0};
+    const float route_weights[N_SELECTED] = {0.75f, -0.5f};
+    const float clamp_value = 1.25f;
+    const size_t output_count = N_SELECTED * N_ROW;
+    const mul_mv_id_args args = {
+        .nei0 = N_SELECTED,
+        .nei1 = 1,
+        .nbi1 = sizeof(selected),
+        .ne00 = (int32_t)input_dim,
+        .ne01 = N_ROW,
+        .ne02 = N_EXPERT,
+        .nb00 = row_bytes,
+        .nb01 = row_bytes,
+        .nb02 = expert_bytes,
+        .ne10 = (int32_t)input_dim,
+        .ne11 = 1,
+        .ne12 = 1,
+        .ne13 = 1,
+        .nb10 = sizeof(float),
+        .nb11 = (uint64_t)input_dim * sizeof(float),
+        .nb12 = (uint64_t)input_dim * sizeof(float),
+        .ne0 = N_ROW,
+        .ne1 = N_SELECTED,
+        .nb1 = N_ROW * sizeof(float),
+        .nr0 = 4,
+    };
+    const moe_swiglu_weight_args act = {
+        .width = N_ROW,
+        .rows = N_SELECTED,
+        .gate_row_stride = N_ROW * sizeof(float),
+        .up_row_stride = N_ROW * sizeof(float),
+        .mid_row_stride = N_ROW * sizeof(float),
+        .weight_stride = sizeof(float),
+        .write_clamped = 0,
+        .clamp_value = clamp_value,
+    };
+
+    id<MTLBuffer> gate_buffer =
+        [device newBufferWithBytes:gate
+                            length:component_bytes
+                           options:MTLResourceStorageModeShared];
+    id<MTLBuffer> up_buffer =
+        [device newBufferWithBytes:up
+                            length:component_bytes
+                           options:MTLResourceStorageModeShared];
+    id<MTLBuffer> input_buffer =
+        [device newBufferWithBytes:input
+                            length:input_dim * sizeof(float)
+                           options:MTLResourceStorageModeShared];
+    id<MTLBuffer> selected_buffer =
+        [device newBufferWithBytes:selected
+                            length:sizeof(selected)
+                           options:MTLResourceStorageModeShared];
+    id<MTLBuffer> weight_buffer =
+        [device newBufferWithBytes:route_weights
+                            length:sizeof(route_weights)
+                           options:MTLResourceStorageModeShared];
+    id<MTLBuffer> gate_output =
+        [device newBufferWithLength:output_count * sizeof(float)
+                           options:MTLResourceStorageModeShared];
+    id<MTLBuffer> up_output =
+        [device newBufferWithLength:output_count * sizeof(float)
+                           options:MTLResourceStorageModeShared];
+    id<MTLBuffer> mid_output =
+        [device newBufferWithLength:output_count * sizeof(float)
+                           options:MTLResourceStorageModeShared];
+    const char *kernel = affine2
+        ? "kernel_mul_mv_id_qwen_affine2_32_pair_swiglu_f32"
+        : "kernel_mul_mv_id_mlx_affine4_64_pair_swiglu_f32";
+    id<MTLComputePipelineState> pipeline =
+        build_pipeline(device, library, kernel);
+    if (!gate_buffer || !up_buffer || !input_buffer || !selected_buffer ||
+        !weight_buffer || !gate_output || !up_output || !mid_output ||
+        !pipeline) {
+        free(gate);
+        free(up);
+        return false;
+    }
+
+    id<MTLCommandBuffer> command = [queue commandBuffer];
+    id<MTLComputeCommandEncoder> encoder =
+        [command computeCommandEncoder];
+    [encoder setComputePipelineState:pipeline];
+    [encoder setBytes:&args length:sizeof(args) atIndex:0];
+    [encoder setBytes:&act length:sizeof(act) atIndex:1];
+    [encoder setBuffer:gate_buffer offset:0 atIndex:2];
+    [encoder setBuffer:up_buffer offset:0 atIndex:3];
+    [encoder setBuffer:input_buffer offset:0 atIndex:4];
+    [encoder setBuffer:gate_output offset:0 atIndex:5];
+    [encoder setBuffer:up_output offset:0 atIndex:6];
+    [encoder setBuffer:mid_output offset:0 atIndex:7];
+    [encoder setBuffer:selected_buffer offset:0 atIndex:8];
+    [encoder setBuffer:weight_buffer offset:0 atIndex:9];
+    [encoder dispatchThreadgroups:MTLSizeMake(1, 1, N_SELECTED)
+             threadsPerThreadgroup:MTLSizeMake(32, 2, 1)];
+    [encoder endEncoding];
+    bool ok = finish_command(command, kernel);
+    float maximum_error = 0.0f;
+    const float *actual_gate = gate_output.contents;
+    const float *actual_up = up_output.contents;
+    const float *actual_mid = mid_output.contents;
+    for (uint32_t slot = 0; ok && slot < N_SELECTED; slot++) {
+        const uint32_t expert = (uint32_t)selected[slot];
+        const uint8_t *gate_expert =
+            gate + (size_t)expert * expert_bytes;
+        const uint8_t *up_expert =
+            up + (size_t)expert * expert_bytes;
+        const uint16_t *equalizer =
+            affine2 ? (const uint16_t *)gate_expert : NULL;
+        for (uint32_t row = 0; row < N_ROW; row++) {
+            float expected_gate = 0.0f;
+            float expected_up = 0.0f;
+            for (uint32_t column = 0; column < input_dim; column++) {
+                const float adjusted_input = input[column] *
+                    (affine2
+                         ? bf16_bits_to_f32(equalizer[column])
+                         : 1.0f);
+                expected_gate += affine_fixture_value(
+                    gate_expert, affine2, input_dim, row, column) *
+                    adjusted_input;
+                expected_up += affine_fixture_value(
+                    up_expert, affine2, input_dim, row, column) *
+                    adjusted_input;
+            }
+            const float clamped_gate =
+                fminf(expected_gate, clamp_value);
+            const float clamped_up =
+                fmaxf(-clamp_value,
+                      fminf(expected_up, clamp_value));
+            const float expected_mid =
+                clamped_gate / (1.0f + expf(-clamped_gate)) *
+                clamped_up * route_weights[slot];
+            const size_t index = (size_t)slot * N_ROW + row;
+            const float errors[3] = {
+                fabsf(actual_gate[index] - expected_gate),
+                fabsf(actual_up[index] - expected_up),
+                fabsf(actual_mid[index] - expected_mid),
+            };
+            for (uint32_t value = 0; value < 3u; value++) {
+                if (errors[value] > maximum_error) {
+                    maximum_error = errors[value];
+                }
+                if (!isfinite(errors[value]) || errors[value] > 2.0e-5f) {
+                    fprintf(stderr,
+                            "%s slot=%u row=%u value=%u error=%.9g\n",
+                            affine2 ? "Affine2" : "Affine4",
+                            slot, row, value, errors[value]);
+                    ok = false;
+                }
+            }
+        }
+    }
+    if (ok) {
+        printf("ok %-8s pair    max_abs_error=%.3g\n",
+               affine2 ? "Affine2" : "Affine4", maximum_error);
+    }
+    free(gate);
+    free(up);
+    return ok;
+}
+
 int main(void) {
     @autoreleasepool {
         id<MTLDevice> device = MTLCreateSystemDefaultDevice();
@@ -469,6 +782,10 @@ int main(void) {
         id<MTLLibrary> library = build_library(device);
         if (!queue || !library) return 1;
         printf("Qwen IQ Metal fixture on %s\n", device.name.UTF8String);
+        if (!run_affine_pair_case(device, queue, library, false) ||
+            !run_affine_pair_case(device, queue, library, true)) {
+            return 1;
+        }
         const iq_case cases[] = {
             {
                 .label = "IQ2_XS",

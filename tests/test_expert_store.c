@@ -34,9 +34,10 @@ static bool family_is_supported(uint64_t family) {
 }
 
 int main(int argc, char **argv) {
-    if (argc != 5) {
+    if (argc != 5 && argc != 7) {
         fprintf(stderr,
-                "usage: %s NATIVE.gguf STORE_OFFSET STORE_BYTES FAMILY\n",
+                "usage: %s NATIVE.gguf STORE_OFFSET STORE_BYTES FAMILY "
+                "[STORAGE_FORMAT GROUP_SIZE]\n",
                 argv[0]);
         return 2;
     }
@@ -46,6 +47,14 @@ int main(int argc, char **argv) {
     CHECK(parse_u64(argv[4], &family64));
     CHECK(family_is_supported(family64));
     const uint32_t family = (uint32_t)family64;
+    uint64_t storage64 = DS4_EXPERT_STORE_STORAGE_GGML;
+    uint64_t group64 = 0;
+    if (argc == 7) {
+        CHECK(parse_u64(argv[5], &storage64));
+        CHECK(parse_u64(argv[6], &group64));
+        CHECK(storage64 <= UINT32_MAX);
+        CHECK(group64 <= UINT32_MAX);
+    }
     const int fd = open(argv[1], O_RDONLY);
     CHECK(fd >= 0);
 
@@ -60,12 +69,14 @@ int main(int argc, char **argv) {
     CHECK(manifest != NULL);
     CHECK(manifest->version == DS4_EXPERT_STORE_V2_VERSION);
     CHECK(manifest->family == family);
-    CHECK(manifest->storage_format == DS4_EXPERT_STORE_STORAGE_GGML);
-    CHECK(manifest->group_size == 0);
-    CHECK(manifest->layer_count == 2);
-    CHECK(manifest->expert_count == 3);
-    CHECK(manifest->expert_used_count == 2);
-    CHECK(manifest->source_tensor_count == 7);
+    CHECK(manifest->storage_format == (uint32_t)storage64);
+    CHECK(manifest->group_size == (uint32_t)group64);
+    if (argc == 5) {
+        CHECK(manifest->layer_count == 2);
+        CHECK(manifest->expert_count == 3);
+        CHECK(manifest->expert_used_count == 2);
+        CHECK(manifest->source_tensor_count == 7);
+    }
     CHECK(ds4_expert_store_fd(store) >= 0);
     CHECK(ds4_expert_store_file_offset(store) == offset);
 

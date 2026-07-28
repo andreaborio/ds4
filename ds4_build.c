@@ -15,6 +15,10 @@ DS4_BUILD_STATIC_ASSERT(expert_store_v2_version,
                         DS4_EXPERT_STORE_V2_VERSION == 2);
 DS4_BUILD_STATIC_ASSERT(expert_store_ggml_wire_value,
                         DS4_EXPERT_STORE_STORAGE_GGML == 0);
+DS4_BUILD_STATIC_ASSERT(expert_store_mlx_affine4_wire_value,
+                        DS4_EXPERT_STORE_STORAGE_MLX_AFFINE4 == 1);
+DS4_BUILD_STATIC_ASSERT(expert_store_qwen_affine2_wire_value,
+                        DS4_EXPERT_STORE_STORAGE_QWEN_AFFINE2_G32_IQ_DOWN == 2);
 
 const char *ds4_build_backend(void) {
 #ifdef DS4_NO_GPU
@@ -139,11 +143,15 @@ void ds4_capabilities_print(FILE *fp, ds4_executable_role role,
             "    \"version\": %u,\n"
             "    \"tensor\": \"%s\",\n"
             "    \"storage_formats\": [\n"
-            "      {\"id\": \"ggml\", \"wire_value\": %u, \"group_sizes\": []}\n"
+            "      {\"id\": \"ggml\", \"wire_value\": %u, \"group_sizes\": []},\n"
+            "      {\"id\": \"mlx-affine4\", \"wire_value\": %u, \"group_sizes\": [64]},\n"
+            "      {\"id\": \"qwen-affine2-iq-down\", \"wire_value\": %u, \"group_sizes\": [32]}\n"
             "    ]\n"
             "  }\n"
             "}\n",
             (unsigned)DS4_EXPERT_STORE_V2_VERSION,
             DS4_EXPERT_STORE_V2_TENSOR,
-            (unsigned)DS4_EXPERT_STORE_STORAGE_GGML);
+            (unsigned)DS4_EXPERT_STORE_STORAGE_GGML,
+            (unsigned)DS4_EXPERT_STORE_STORAGE_MLX_AFFINE4,
+            (unsigned)DS4_EXPERT_STORE_STORAGE_QWEN_AFFINE2_G32_IQ_DOWN);
 }
