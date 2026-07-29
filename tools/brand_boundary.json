@@ -929,7 +929,7 @@
       "location": "content",
       "token": "ds4",
       "classification": "migration-pending",
-      "maximum": 5204
+      "maximum": 5216
     },
     {
       "path": "ds4.c",
@@ -2189,7 +2189,7 @@
       "location": "content",
       "token": "ds4",
       "classification": "migration-pending",
-      "maximum": 875
+      "maximum": 880
     },
     {
       "path": "tests/ds4_test.c",

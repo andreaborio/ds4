@@ -15044,10 +15044,12 @@ typedef enum {
     QWEN35_FEATURE_EXPERT_PACK | \
     QWEN35_FEATURE_GQA_REUSE))
 
-/* Persistent graph storage excluding context rows. The batch arena is linear
- * in its row capacity: resident inference uses a wide batch, while SSD
- * streaming keeps a bounded micro arena so a low-memory host does not pay for
- * resident-only throughput scratch. */
+/* Graph storage separates the phase-independent core from the batch arena.
+ * The arena is linear in its physical row capacity: resident inference keeps
+ * a wide arena, while SSD streaming retains only an inline decode arena and
+ * expands it around prefill. The current admission estimate below still uses
+ * the logical SSD prefill limit as a conservative upper envelope; live tensor
+ * accounting uses the arena's physical capacity. */
 #define QWEN35_METAL_GRAPH_NON_BATCH_BYTES UINT64_C(67160644)
 #define QWEN35_METAL_GRAPH_BATCH_BYTES_PER_TOKEN UINT64_C(257612)
 #define QWEN35_METAL_GRAPH_CONTEXT_BYTES_PER_TOKEN \
@@ -15075,6 +15077,7 @@ typedef enum {
 #define QWEN35_MACRO_PREFILL_MAX QWEN35_CONTEXT_LENGTH
 #define QWEN35_PREFILL_MICRO_TOKENS 2048u
 #define QWEN35_RESIDENT_PREFILL_TOKENS 8192u
+#define QWEN35_SSD_INLINE_PREFILL_TOKENS 64u
 
 /* A suffix that fits one historical micro batch must stay on that path.  In
  * particular, shrinking a warm decode cache for a 2..64 token agent/tool
@@ -15173,6 +15176,21 @@ typedef struct {
 } ds4_qwen35_telemetry;
 
 #ifndef DS4_NO_GPU
+static uint32_t qwen35_ssd_prefill_arena_capacity(
+        uint32_t prefill_limit,
+        uint32_t suffix_tokens) {
+    if (prefill_limit == 0 ||
+        prefill_limit > QWEN35_PREFILL_MICRO_TOKENS) {
+        return 0;
+    }
+    uint32_t capacity = suffix_tokens;
+    if (capacity < QWEN35_SSD_INLINE_PREFILL_TOKENS) {
+        capacity = QWEN35_SSD_INLINE_PREFILL_TOKENS;
+    }
+    if (capacity > prefill_limit) capacity = prefill_limit;
+    return capacity;
+}
+
 /*
  * Apple Metal stores the persistent attention-compressed KV cache in F16.  The
  * compressor still pools, normalizes, RoPEs, and FP8-rounds rows in F32 staging
@@ -15267,6 +15285,8 @@ typedef struct {
 
 typedef struct {
     uint32_t ctx_capacity;
+    /* Scheduler contract versus currently allocated physical rows. */
+    uint32_t prefill_limit;
     uint32_t n_tokens;
     bool state_valid;
 
@@ -15792,8 +15812,10 @@ static bool qwen35_gpu_prefill_arena_state_allocated(
 
 static bool qwen35_gpu_graph_state_allocated(
         const ds4_qwen35_gpu_graph *g) {
-    if (!g || g->ctx_capacity == 0 ||
+    if (!g || g->ctx_capacity == 0 || g->prefill_limit == 0 ||
+        g->prefill_limit > QWEN35_GPU_PREFILL_CAP ||
         !qwen35_gpu_prefill_arena_state_allocated(&g->prefill) ||
+        g->prefill.capacity > g->prefill_limit ||
         g->ctx_capacity > QWEN35_CONTEXT_LENGTH) {
         return false;
     }
@@ -15897,7 +15919,13 @@ static bool qwen35_gpu_graph_validate_macro_range(
         const ds4_qwen35_gpu_graph *g,
         uint32_t                    position,
         uint32_t                    n_token) {
-    return n_token != 0 && n_token <= QWEN35_GPU_MACRO_PREFILL_MAX &&
+    const uint32_t required_prefill_capacity =
+        g && n_token < g->prefill_limit
+            ? n_token : (g ? g->prefill_limit : 0);
+    return g && n_token != 0 &&
+           n_token <= QWEN35_GPU_MACRO_PREFILL_MAX &&
+           required_prefill_capacity != 0 &&
+           g->prefill.capacity >= required_prefill_capacity &&
            qwen35_gpu_graph_state_allocated(g) && g->state_valid &&
            position == g->n_tokens && position <= g->ctx_capacity &&
            n_token <= g->ctx_capacity - position;
@@ -16029,18 +16057,40 @@ static bool qwen35_gpu_prefill_arena_alloc(
     return true;
 }
 
+static bool qwen35_gpu_prefill_arena_resize(
+        ds4_qwen35_gpu_prefill_arena *a,
+        uint32_t                      capacity) {
+    if (!a || !qwen35_gpu_prefill_arena_state_allocated(a) ||
+        capacity == 0 || capacity > QWEN35_GPU_PREFILL_CAP) {
+        return false;
+    }
+    if (capacity == a->capacity) return true;
+
+    ds4_qwen35_gpu_prefill_arena next = {0};
+    if (!qwen35_gpu_prefill_arena_alloc(&next, capacity)) return false;
+
+    ds4_qwen35_gpu_prefill_arena previous = *a;
+    *a = next;
+    qwen35_gpu_prefill_arena_free(&previous);
+    return true;
+}
+
 static bool qwen35_gpu_graph_alloc(
         ds4_qwen35_gpu_graph *g,
         uint32_t              ctx_capacity,
-        uint32_t              prefill_cap) {
+        uint32_t              prefill_limit,
+        uint32_t              initial_prefill_capacity) {
     if (!g || g->ctx_capacity != 0 || ctx_capacity == 0 ||
-        ctx_capacity > QWEN35_CONTEXT_LENGTH || prefill_cap == 0 ||
-        prefill_cap > QWEN35_GPU_PREFILL_CAP) {
+        ctx_capacity > QWEN35_CONTEXT_LENGTH || prefill_limit == 0 ||
+        prefill_limit > QWEN35_GPU_PREFILL_CAP ||
+        initial_prefill_capacity == 0 ||
+        initial_prefill_capacity > prefill_limit) {
         return false;
     }
 
     ds4_qwen35_gpu_graph next = {0};
     next.ctx_capacity = ctx_capacity;
+    next.prefill_limit = prefill_limit;
 
 #define QWEN35_GPU_ALLOC_F32(field, d0, d1, d2, d3) \
     next.field = qwen35_gpu_tensor_alloc_shape(       \
@@ -16080,7 +16130,8 @@ static bool qwen35_gpu_graph_alloc(
     QWEN35_GPU_ALLOC_F32(attn_out, QWEN35_N_EMBD, 1, 1, 1);
     QWEN35_GPU_ALLOC_F32(attn_score, ctx_capacity, 1, 1, 1);
 
-    if (!qwen35_gpu_prefill_arena_alloc(&next.prefill, prefill_cap)) {
+    if (!qwen35_gpu_prefill_arena_alloc(
+            &next.prefill, initial_prefill_capacity)) {
         qwen35_gpu_graph_free(&next);
         return false;
     }
@@ -16190,7 +16241,8 @@ bool ds4_internal_qwen35_gpu_graph_alloc(
         uint32_t  ctx_capacity) {
     if (!storage || storage_bytes != sizeof(ds4_qwen35_gpu_graph)) return false;
     return qwen35_gpu_graph_alloc(
-        storage, ctx_capacity, QWEN35_GPU_PREFILL_CAP);
+        storage, ctx_capacity,
+        QWEN35_GPU_PREFILL_CAP, QWEN35_GPU_PREFILL_CAP);
 }
 
 bool ds4_internal_qwen35_gpu_graph_allocated_bytes(
@@ -16199,6 +16251,33 @@ bool ds4_internal_qwen35_gpu_graph_allocated_bytes(
         uint64_t   *bytes_out) {
     if (!storage || storage_bytes != sizeof(ds4_qwen35_gpu_graph)) return false;
     return qwen35_gpu_graph_allocated_bytes(storage, bytes_out);
+}
+
+bool hebrus_internal_qwen35_gpu_graph_prefill_capacity(
+        const void *storage,
+        size_t      storage_bytes,
+        uint32_t   *capacity_out) {
+    if (!storage || storage_bytes != sizeof(ds4_qwen35_gpu_graph) ||
+        !capacity_out) {
+        return false;
+    }
+    const ds4_qwen35_gpu_graph *g = storage;
+    if (!qwen35_gpu_graph_state_allocated(g)) return false;
+    *capacity_out = g->prefill.capacity;
+    return true;
+}
+
+bool hebrus_internal_qwen35_gpu_graph_resize_prefill(
+        void     *storage,
+        size_t    storage_bytes,
+        uint32_t  capacity) {
+    if (!storage || storage_bytes != sizeof(ds4_qwen35_gpu_graph)) return false;
+    ds4_qwen35_gpu_graph *g = storage;
+    if (!qwen35_gpu_graph_state_allocated(g) ||
+        capacity > g->prefill_limit) {
+        return false;
+    }
+    return qwen35_gpu_prefill_arena_resize(&g->prefill, capacity);
 }
 
 bool ds4_internal_qwen35_gpu_graph_reset(
@@ -40425,24 +40504,31 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
     s->ctx_size = ctx_size;
 #if defined(__APPLE__)
     if (qwen35) {
+        const bool qwen_ssd =
+            e->residency == DS4_RESIDENCY_SSD;
         const uint32_t qwen_prefill_cap =
-            e->residency == DS4_RESIDENCY_SSD
+            qwen_ssd
                 ? QWEN35_PREFILL_MICRO_TOKENS
                 : QWEN35_RESIDENT_PREFILL_TOKENS;
+        const uint32_t initial_prefill_capacity = qwen_ssd
+            ? qwen35_ssd_prefill_arena_capacity(
+                  qwen_prefill_cap, 0)
+            : qwen_prefill_cap;
         s->prefill_cap = qwen_prefill_cap;
         if (!qwen35_gpu_graph_alloc(
                 &s->qwen35_gpu_graph, (uint32_t)ctx_size,
-                qwen_prefill_cap)) {
+                qwen_prefill_cap, initial_prefill_capacity)) {
             fprintf(stderr,
                     "ds4: failed to allocate Qwen Metal graph for context %d\n",
                     ctx_size);
             free(s);
             return 1;
         }
-        /* The recurrent-state and logits snapshot makes a multi-tile macro
-         * sync atomic. The phase planner reserves this workspace in every
-         * paired leg. */
-        if (!qwen35_gpu_macro_transaction_workspace_alloc(
+        /* Resident sessions retain their rollback snapshot. SSD sessions
+         * construct it only around a macro-prefill transaction so decode does
+         * not carry state that cannot be consumed there. */
+        if (!qwen_ssd &&
+            !qwen35_gpu_macro_transaction_workspace_alloc(
                 &s->qwen35_macro_transaction_workspace)) {
             qwen35_gpu_graph_free(&s->qwen35_gpu_graph);
             free(s);
@@ -41069,6 +41155,7 @@ bool ds4_internal_qwen35_macro_transaction_rollback_test(void) {
     session->logits = malloc((size_t)logits_bytes);
     if (!session->logits ||
         !qwen35_gpu_graph_alloc(&session->qwen35_gpu_graph, 4u,
+                                QWEN35_PREFILL_MICRO_TOKENS,
                                 QWEN35_PREFILL_MICRO_TOKENS) ||
         !qwen35_gpu_macro_transaction_workspace_alloc(
             &session->qwen35_macro_transaction_workspace)) {
@@ -41160,6 +41247,108 @@ done:
     free(session);
     free(engine);
     return ok;
+}
+
+typedef struct {
+    bool restore_inline_arena;
+    bool release_macro_transaction;
+} qwen35_metal_prefill_resources;
+
+static bool qwen35_metal_restore_inline_prefill_arena(
+        ds4_session                         *s,
+        qwen35_metal_prefill_resources *resources) {
+    if (!s || !resources) return false;
+    if (!resources->restore_inline_arena) return true;
+    if (ds4_gpu_synchronize() == 0) return false;
+
+    const uint32_t inline_capacity =
+        qwen35_ssd_prefill_arena_capacity(
+            s->qwen35_gpu_graph.prefill_limit, 0);
+    if (inline_capacity == 0 ||
+        !qwen35_gpu_prefill_arena_resize(
+            &s->qwen35_gpu_graph.prefill, inline_capacity)) {
+        return false;
+    }
+    resources->restore_inline_arena = false;
+    return true;
+}
+
+static bool qwen35_metal_release_macro_transaction(
+        ds4_session                         *s,
+        qwen35_metal_prefill_resources *resources,
+        bool                                 commit_snapshot) {
+    if (!s || !resources) return false;
+    if (!resources->release_macro_transaction) return true;
+    if (s->qwen35_macro_transaction_workspace.macro.snapshot_valid &&
+        !commit_snapshot) {
+        return false;
+    }
+    /* Keep the snapshot valid until all preceding GPU work is known complete.
+     * A failed synchronization must remain rollback-capable. */
+    if (ds4_gpu_synchronize() == 0) return false;
+    s->qwen35_macro_transaction_workspace.macro.snapshot_valid = false;
+    qwen35_gpu_macro_transaction_workspace_free(
+        &s->qwen35_macro_transaction_workspace);
+    resources->release_macro_transaction = false;
+    return true;
+}
+
+static int qwen35_metal_prepare_prefill_resources(
+        ds4_session                         *s,
+        uint32_t                             suffix_tokens,
+        bool                                 macro_prefill,
+        qwen35_metal_prefill_resources *resources,
+        char                                *err,
+        size_t                               errlen) {
+    if (!s || !resources) return 1;
+    memset(resources, 0, sizeof(*resources));
+    if (!s->engine->ssd_streaming) return 0;
+
+    const uint32_t target_capacity =
+        qwen35_ssd_prefill_arena_capacity(
+            s->qwen35_gpu_graph.prefill_limit, suffix_tokens);
+    const uint32_t inline_capacity =
+        qwen35_ssd_prefill_arena_capacity(
+            s->qwen35_gpu_graph.prefill_limit, 0);
+    if (target_capacity == 0 || inline_capacity == 0) {
+        if (err && errlen) {
+            snprintf(err, errlen,
+                     "invalid Qwen SSD prefill arena capacity");
+        }
+        return 1;
+    }
+    if (target_capacity != s->qwen35_gpu_graph.prefill.capacity) {
+        /* The old arena may still be referenced by the final decode command
+         * buffer from the preceding call. Synchronize before replacing it. */
+        if (ds4_gpu_synchronize() == 0 ||
+            !qwen35_gpu_prefill_arena_resize(
+                &s->qwen35_gpu_graph.prefill, target_capacity)) {
+            if (err && errlen) {
+                snprintf(err, errlen,
+                         "failed to resize Qwen SSD prefill arena to %u tokens",
+                         target_capacity);
+            }
+            return 1;
+        }
+    }
+    resources->restore_inline_arena =
+        target_capacity != inline_capacity;
+
+    if (macro_prefill) {
+        if (s->qwen35_macro_transaction_workspace.logits ||
+            !qwen35_gpu_macro_transaction_workspace_alloc(
+                &s->qwen35_macro_transaction_workspace)) {
+            if (err && errlen) {
+                snprintf(err, errlen,
+                         "failed to allocate Qwen macro rollback workspace");
+            }
+            (void)qwen35_metal_restore_inline_prefill_arena(
+                s, resources);
+            return 1;
+        }
+        resources->release_macro_transaction = true;
+    }
+    return 0;
 }
 
 static int ds4_session_qwen35_metal_require_phase_pressure(
@@ -41274,29 +41463,68 @@ static int ds4_session_qwen35_metal_finish_prefill_cache(
     return 0;
 }
 
-static void ds4_session_qwen35_metal_unwind_prefill_cache(
-        ds4_session *s,
-        bool         phase_prepared,
-        bool         report_phase_budget,
-        char        *err,
-        size_t       errlen) {
-    if (!phase_prepared) return;
+static int qwen35_metal_finish_prefill_phase(
+        ds4_session                         *s,
+        qwen35_metal_prefill_resources *resources,
+        bool                                 phase_prepared,
+        bool                                 report_phase_budget,
+        bool                                 commit_macro_transaction,
+        char                                *err,
+        size_t                               errlen) {
+    if (!qwen35_metal_restore_inline_prefill_arena(
+            s, resources)) {
+        if (err && errlen) {
+            snprintf(err, errlen,
+                     "failed to restore Qwen inline prefill resources");
+        }
+        return 1;
+    }
+    const int cache_finish = phase_prepared
+        ? ds4_session_qwen35_metal_finish_prefill_cache(
+            s, err, errlen, report_phase_budget)
+        : 0;
+    if (cache_finish != 0) return cache_finish;
+
+    if (!qwen35_metal_release_macro_transaction(
+            s, resources, commit_macro_transaction)) {
+        if (err && errlen) {
+            snprintf(err, errlen,
+                     "failed to release Qwen macro rollback workspace");
+        }
+        return 1;
+    }
+    return 0;
+}
+
+static void qwen35_metal_unwind_prefill_phase(
+        ds4_session                         *s,
+        qwen35_metal_prefill_resources *resources,
+        bool                                 phase_prepared,
+        bool                                 report_phase_budget,
+        char                                *err,
+        size_t                               errlen) {
+    if (!phase_prepared &&
+        !resources->restore_inline_arena &&
+        !resources->release_macro_transaction) {
+        return;
+    }
     char restore_err[192] = {0};
-    if (ds4_session_qwen35_metal_finish_prefill_cache(
-            s, restore_err, sizeof(restore_err),
-            report_phase_budget) == 0) {
+    if (qwen35_metal_finish_prefill_phase(
+            s, resources, phase_prepared,
+            report_phase_budget, false,
+            restore_err, sizeof(restore_err)) == 0) {
         return;
     }
 
-    /* Keep the original execution failure while making the cache-restore
-     * failure visible. A later short continuation must never silently inherit
-     * the smaller prefill envelope. */
+    /* Keep the original execution failure while making phase cleanup visible.
+     * A later short continuation must never silently inherit either the large
+     * arena or the smaller prefill cache envelope. */
     char original[192] = {0};
     if (err && errlen != 0 && err[0] != '\0') {
         snprintf(original, sizeof(original), "%s", err);
     }
     if (err && errlen != 0) {
-        snprintf(err, errlen, "%s%sfailed to restore decode cache: %s",
+        snprintf(err, errlen, "%s%sfailed to restore decode phase: %s",
                  original,
                  original[0] ? "; " : "",
                  restore_err[0] ? restore_err : "unknown error");
@@ -41304,8 +41532,71 @@ static void ds4_session_qwen35_metal_unwind_prefill_cache(
     qwen35_telemetry_emit(
         s->engine, "runtime_fallback",
         "\"feature\":\"phase_budget\","
-        "\"reason\":\"decode_cache_restore_failed\","
+        "\"reason\":\"prefill_resource_or_cache_restore_failed\","
         "\"fatal\":true");
+}
+
+/* Model-free proof that the SSD phase owns only its current physical arena and
+ * macro rollback state. The graph's logical prefill limit remains unchanged. */
+bool hebrus_internal_qwen35_prefill_resource_lifecycle_test(void) {
+    ds4_engine *engine = calloc(1, sizeof(*engine));
+    ds4_session *session = calloc(1, sizeof(*session));
+    bool ok = engine && session;
+    if (!ok) goto done;
+
+    engine->ssd_streaming = true;
+    session->engine = engine;
+    const uint32_t inline_capacity =
+        qwen35_ssd_prefill_arena_capacity(
+            QWEN35_PREFILL_MICRO_TOKENS, 0);
+    ok = inline_capacity == QWEN35_SSD_INLINE_PREFILL_TOKENS &&
+         qwen35_gpu_graph_alloc(
+             &session->qwen35_gpu_graph, 4u,
+             QWEN35_PREFILL_MICRO_TOKENS, inline_capacity);
+    if (!ok) goto done;
+
+    char err[192] = {0};
+    qwen35_metal_prefill_resources resources = {0};
+    ok = qwen35_metal_prepare_prefill_resources(
+             session, inline_capacity + 1u, false,
+             &resources, err, sizeof(err)) == 0 &&
+         session->qwen35_gpu_graph.prefill.capacity ==
+             inline_capacity + 1u &&
+         resources.restore_inline_arena &&
+         !resources.release_macro_transaction &&
+         qwen35_metal_finish_prefill_phase(
+             session, &resources, false, false, false,
+             err, sizeof(err)) == 0 &&
+         session->qwen35_gpu_graph.prefill.capacity == inline_capacity &&
+         !resources.restore_inline_arena;
+    if (!ok) goto done;
+
+    ok = qwen35_metal_prepare_prefill_resources(
+             session, QWEN35_CONTEXT_LENGTH, true,
+             &resources, err, sizeof(err)) == 0 &&
+         session->qwen35_gpu_graph.prefill.capacity ==
+             QWEN35_PREFILL_MICRO_TOKENS &&
+         resources.restore_inline_arena &&
+         resources.release_macro_transaction &&
+         session->qwen35_macro_transaction_workspace.logits &&
+         qwen35_metal_finish_prefill_phase(
+             session, &resources, false, false, true,
+             err, sizeof(err)) == 0 &&
+         session->qwen35_gpu_graph.prefill.capacity == inline_capacity &&
+         !resources.restore_inline_arena &&
+         !resources.release_macro_transaction &&
+         !session->qwen35_macro_transaction_workspace.logits;
+
+done:
+    if (session) {
+        (void)ds4_gpu_synchronize();
+        qwen35_gpu_macro_transaction_workspace_free(
+            &session->qwen35_macro_transaction_workspace);
+        qwen35_gpu_graph_free(&session->qwen35_gpu_graph);
+    }
+    free(session);
+    free(engine);
+    return ok;
 }
 
 static int ds4_session_qwen35_metal_prepare_prefill_cache(
@@ -41428,6 +41719,20 @@ static int ds4_session_sync_qwen35_metal(
         getenv("DS4_MOE_RECORD_SELECTED_IDS") == NULL &&
         getenv("DS4_MOE_REPLAY_SELECTED_IDS") == NULL &&
         getenv("DS4_MOE_RECORD_SELECTED_HOTLIST") == NULL;
+    qwen35_metal_prefill_resources prefill_resources = {0};
+    if (qwen35_metal_prepare_prefill_resources(
+            s, (uint32_t)suffix_tokens, macro_prefill,
+            &prefill_resources, err, errlen) != 0) {
+        qwen35_telemetry_emit(
+            s->engine, "prefill_abort",
+            "\"start\":%d,\"frontier\":%d,"
+            "\"reason\":\"prefill_resource_prepare\"",
+            start, s->checkpoint.len);
+        qwen35_metal_unwind_prefill_phase(
+            s, &prefill_resources, phase_budget,
+            phase_feature_enabled, err, errlen);
+        return 1;
+    }
     if (macro_prefill) {
         if (!ds4_session_qwen35_metal_macro_transaction_begin(
                 s, (uint32_t)start)) {
@@ -41440,8 +41745,9 @@ static int ds4_session_sync_qwen35_metal(
                 "\"start\":%d,\"frontier\":%d,"
                 "\"reason\":\"transaction_snapshot\"",
                 start, s->checkpoint.len);
-            ds4_session_qwen35_metal_unwind_prefill_cache(
-                s, phase_budget, phase_feature_enabled, err, errlen);
+            qwen35_metal_unwind_prefill_phase(
+                s, &prefill_resources, phase_budget,
+                phase_feature_enabled, err, errlen);
             return 1;
         }
         uint32_t macro_tiles = 0;
@@ -41461,8 +41767,9 @@ static int ds4_session_sync_qwen35_metal(
                     "\"restored_start\":%s,\"reason\":\"cancelled\"",
                     start, attempted_frontier,
                     restored ? "true" : "false");
-                ds4_session_qwen35_metal_unwind_prefill_cache(
-                    s, phase_budget, phase_feature_enabled, err, errlen);
+                qwen35_metal_unwind_prefill_phase(
+                    s, &prefill_resources, phase_budget,
+                    phase_feature_enabled, err, errlen);
                 return DS4_SESSION_SYNC_INTERRUPTED;
             }
 
@@ -41508,8 +41815,9 @@ static int ds4_session_sync_qwen35_metal(
                     start, attempted_frontier,
                     restored ? "true" : "false",
                     cancelled ? "cancelled" : "macro_failure");
-                ds4_session_qwen35_metal_unwind_prefill_cache(
-                    s, phase_budget, phase_feature_enabled, err, errlen);
+                qwen35_metal_unwind_prefill_phase(
+                    s, &prefill_resources, phase_budget,
+                    phase_feature_enabled, err, errlen);
                 return cancelled ? DS4_SESSION_SYNC_INTERRUPTED : 1;
             }
 
@@ -41526,10 +41834,10 @@ static int ds4_session_sync_qwen35_metal(
                 i - (int)n_token, i, n_token);
         }
 
-        const int finish = s->engine->ssd_streaming
-            ? ds4_session_qwen35_metal_finish_prefill_cache(
-                s, err, errlen, phase_feature_enabled)
-            : 0;
+        const int finish =
+            qwen35_metal_finish_prefill_phase(
+                s, &prefill_resources, phase_budget,
+                phase_feature_enabled, true, err, errlen);
         bool restored = true;
         if (finish != 0) {
             restored = ds4_session_qwen35_metal_macro_transaction_restore(
@@ -41542,7 +41850,11 @@ static int ds4_session_sync_qwen35_metal(
                              used ? "; " : "");
                 }
             }
-        } else {
+            qwen35_metal_unwind_prefill_phase(
+                s, &prefill_resources, phase_budget,
+                phase_feature_enabled, err, errlen);
+        } else if (!s->engine->ssd_streaming) {
+            /* Resident sessions retain the workspace across phases. */
             s->qwen35_macro_transaction_workspace.macro.snapshot_valid =
                 false;
         }
@@ -41579,8 +41891,9 @@ static int ds4_session_sync_qwen35_metal(
                     snprintf(err, errlen, "interrupted%s",
                              reset ? "" : "; Qwen Metal reset failed");
                 }
-                ds4_session_qwen35_metal_unwind_prefill_cache(
-                    s, phase_budget, phase_feature_enabled, err, errlen);
+                qwen35_metal_unwind_prefill_phase(
+                    s, &prefill_resources, phase_budget,
+                    phase_feature_enabled, err, errlen);
                 return DS4_SESSION_SYNC_INTERRUPTED;
             }
 
@@ -41608,8 +41921,9 @@ static int ds4_session_sync_qwen35_metal(
                              i,
                              reset ? "" : "; reset failed");
                 }
-                ds4_session_qwen35_metal_unwind_prefill_cache(
-                    s, phase_budget, phase_feature_enabled, err, errlen);
+                qwen35_metal_unwind_prefill_phase(
+                    s, &prefill_resources, phase_budget,
+                    phase_feature_enabled, err, errlen);
                 return 1;
             }
             i += (int)n_token;
@@ -41633,10 +41947,10 @@ static int ds4_session_sync_qwen35_metal(
                     chunks,
                     s->qwen35_gpu_graph.prefill.capacity);
         }
-        const int finish = s->engine->ssd_streaming
-            ? ds4_session_qwen35_metal_finish_prefill_cache(
-                s, err, errlen, phase_feature_enabled)
-            : 0;
+        const int finish =
+            qwen35_metal_finish_prefill_phase(
+                s, &prefill_resources, phase_budget,
+                phase_feature_enabled, false, err, errlen);
         qwen35_telemetry_emit(
             s->engine, finish == 0 ? "prefill_commit" : "prefill_abort",
             "\"start\":%d,\"end\":%d,\"chunks\":%u,"
@@ -41668,8 +41982,9 @@ static int ds4_session_sync_qwen35_metal(
                 snprintf(err, errlen, "interrupted%s",
                          reset ? "" : "; Qwen Metal reset failed");
             }
-            ds4_session_qwen35_metal_unwind_prefill_cache(
-                s, phase_budget, phase_feature_enabled, err, errlen);
+            qwen35_metal_unwind_prefill_phase(
+                s, &prefill_resources, phase_budget,
+                phase_feature_enabled, err, errlen);
             return DS4_SESSION_SYNC_INTERRUPTED;
         }
         float *token_logits = i + 1 == prompt->len ? s->logits : NULL;
@@ -41693,8 +42008,9 @@ static int ds4_session_sync_qwen35_metal(
                          i,
                          reset ? "" : "; reset failed");
             }
-            ds4_session_qwen35_metal_unwind_prefill_cache(
-                s, phase_budget, phase_feature_enabled, err, errlen);
+            qwen35_metal_unwind_prefill_phase(
+                s, &prefill_resources, phase_budget,
+                phase_feature_enabled, err, errlen);
             return 1;
         }
         if (queue_resident_prefill && !finish_commands) {
@@ -41708,8 +42024,9 @@ static int ds4_session_sync_qwen35_metal(
                              i,
                              reset ? "" : "; reset failed");
                 }
-                ds4_session_qwen35_metal_unwind_prefill_cache(
-                    s, phase_budget, phase_feature_enabled, err, errlen);
+                qwen35_metal_unwind_prefill_phase(
+                    s, &prefill_resources, phase_budget,
+                    phase_feature_enabled, err, errlen);
                 return 1;
             }
             queued_command_buffers++;
@@ -41725,8 +42042,9 @@ static int ds4_session_sync_qwen35_metal(
                                  i,
                                  reset ? "" : "; reset failed");
                     }
-                    ds4_session_qwen35_metal_unwind_prefill_cache(
-                        s, phase_budget, phase_feature_enabled, err, errlen);
+                    qwen35_metal_unwind_prefill_phase(
+                        s, &prefill_resources, phase_budget,
+                        phase_feature_enabled, err, errlen);
                     return 1;
                 }
                 commands_preopened = false;
@@ -41747,10 +42065,10 @@ static int ds4_session_sync_qwen35_metal(
                 intermediate_fences,
                 max_pending_command_buffers);
     }
-    const int finish = s->engine->ssd_streaming
-        ? ds4_session_qwen35_metal_finish_prefill_cache(
-            s, err, errlen, phase_feature_enabled)
-        : 0;
+    const int finish =
+        qwen35_metal_finish_prefill_phase(
+            s, &prefill_resources, phase_budget,
+            phase_feature_enabled, false, err, errlen);
     qwen35_telemetry_emit(
         s->engine, finish == 0 ? "prefill_commit" : "prefill_abort",
         "\"start\":%d,\"end\":%d,\"chunks\":%d,"

@@ -71,6 +71,13 @@ helpers remain in the same translation unit while agents can load one family.
 | `runtime/ds4_glm_graph.inc` | GLM Metal graph state, allocation, prefill/decode scheduling, routed MoE/SSD orchestration, and GLM generation; textually included by `ds4.c` |
 | `runtime/ds4_metal_glm.inc` | GLM-specific Metal encoders and tensor wrappers; textually included by `ds4_metal.m` |
 
+Qwen keeps one Metal graph and scheduler across its two accepted weight codecs.
+The graph separates session-lifetime core/KV/logits from the SSD prefill arena
+and macro rollback workspace, which are owned only by an active prefill phase;
+resident mode retains its wide arena and rollback workspace for the session.
+SSD admission remains conservative at the logical prefill limit, while live
+tensor accounting follows the arena's current physical capacity.
+
 DeepSeek and non-graph GLM binding/reference/session support still live directly
 in `ds4.c`; this is current-state debt, not permission to add another family
 there without an explicit decision.

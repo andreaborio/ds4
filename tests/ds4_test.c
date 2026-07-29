@@ -992,6 +992,12 @@ extern bool ds4_internal_qwen35_gpu_graph_alloc(
     void *storage, size_t storage_bytes, uint32_t ctx_capacity);
 extern bool ds4_internal_qwen35_gpu_graph_allocated_bytes(
     const void *storage, size_t storage_bytes, uint64_t *bytes_out);
+extern bool hebrus_internal_qwen35_gpu_graph_prefill_capacity(
+    const void *storage, size_t storage_bytes, uint32_t *capacity_out);
+extern bool hebrus_internal_qwen35_gpu_graph_resize_prefill(
+    void *storage, size_t storage_bytes, uint32_t capacity);
+extern bool ds4_internal_qwen35_macro_transaction_rollback_test(void);
+extern bool hebrus_internal_qwen35_prefill_resource_lifecycle_test(void);
 extern bool ds4_internal_qwen35_gpu_graph_reset(
     void *storage, size_t storage_bytes);
 extern bool ds4_internal_qwen35_gpu_graph_validate_position(
@@ -1115,6 +1121,8 @@ static void test_metal_qwen35_graph_state(void) {
     const uint32_t moe_split_count = 2;
     const uint32_t moe_split_width =
         QWEN35_N_EXPERT_USED / moe_split_count;
+    const uint32_t inline_prefill_capacity = 64;
+    const uint32_t ssd_prefill_capacity = 2048;
     const uint32_t prefill_cap = ds4_internal_qwen35_gpu_prefill_cap();
     TEST_ASSERT(QWEN35_N_EXPERT_USED == 8);
     TEST_ASSERT(moe_split_width == 4);
@@ -1197,7 +1205,7 @@ static void test_metal_qwen35_graph_state(void) {
         (uint64_t)moe_split_count * QWEN35_N_EMBD +
         QWEN35_N_EMBD + 3ull * QWEN35_N_FF_SHARED +
         QWEN35_N_EMBD + 1ull + QWEN35_N_EMBD + QWEN35_N_VOCAB;
-    expected_f32_elements += (uint64_t)prefill_cap * (
+    const uint64_t prefill_f32_elements_per_token =
         3ull * QWEN35_N_EMBD +
         QWEN35_SSM_CONV_CHANNEL +
         3ull * QWEN35_SSM_INNER +
@@ -1208,7 +1216,9 @@ static void test_metal_qwen35_graph_state(void) {
         3ull * QWEN35_N_EXPERT_USED * QWEN35_N_FF_EXP +
         (uint64_t)QWEN35_N_EXPERT_USED * QWEN35_N_EMBD +
         QWEN35_N_EMBD +
-        3ull * QWEN35_N_FF_SHARED + QWEN35_N_EMBD + 1ull);
+        3ull * QWEN35_N_FF_SHARED + QWEN35_N_EMBD + 1ull;
+    expected_f32_elements +=
+        (uint64_t)prefill_cap * prefill_f32_elements_per_token;
     expected_f32_elements +=
         2ull * QWEN35_FULL_ATTENTION_LAYER_COUNT * ctx_capacity *
             QWEN35_N_HEAD_KV * QWEN35_N_HEAD_DIM +
@@ -1216,19 +1226,65 @@ static void test_metal_qwen35_graph_state(void) {
             QWEN35_SSM_CONV_CHANNEL * (QWEN35_SSM_CONV_KERNEL - 1u) +
         (uint64_t)QWEN35_RECURRENT_LAYER_COUNT *
             QWEN35_SSM_VALUE_HEAD * QWEN35_SSM_STATE * QWEN35_SSM_STATE;
+    const uint64_t prefill_i32_elements_per_token =
+        2u + QWEN35_N_EXPERT_USED;
     const uint64_t expected_i32_elements =
         QWEN35_N_EXPERT_USED +
-        (uint64_t)prefill_cap * (2u + QWEN35_N_EXPERT_USED);
+        (uint64_t)prefill_cap * prefill_i32_elements_per_token;
     const uint64_t expected_bytes = expected_f32_elements * f32 +
         expected_i32_elements * sizeof(int32_t);
+    const uint64_t prefill_bytes_per_token =
+        prefill_f32_elements_per_token * f32 +
+        prefill_i32_elements_per_token * sizeof(int32_t);
 
     TEST_ASSERT(ds4_internal_qwen35_gpu_graph_allocated_bytes(
         graph, graph_size, &allocated));
     TEST_ASSERT(allocated == expected_bytes);
+    uint32_t current_prefill_capacity = 0;
+    TEST_ASSERT(hebrus_internal_qwen35_gpu_graph_prefill_capacity(
+        graph, graph_size, &current_prefill_capacity));
+    TEST_ASSERT(current_prefill_capacity == prefill_cap);
+    TEST_ASSERT(!hebrus_internal_qwen35_gpu_graph_resize_prefill(
+        graph, graph_size, 0));
+    TEST_ASSERT(!hebrus_internal_qwen35_gpu_graph_resize_prefill(
+        graph, graph_size, prefill_cap + 1u));
+    TEST_ASSERT(hebrus_internal_qwen35_gpu_graph_resize_prefill(
+        graph, graph_size, inline_prefill_capacity));
+    TEST_ASSERT(hebrus_internal_qwen35_gpu_graph_prefill_capacity(
+        graph, graph_size, &current_prefill_capacity));
+    TEST_ASSERT(current_prefill_capacity == inline_prefill_capacity);
+    TEST_ASSERT(ds4_internal_qwen35_gpu_graph_allocated_bytes(
+        graph, graph_size, &allocated));
+    const uint64_t inline_expected_bytes =
+        expected_bytes -
+        (uint64_t)(prefill_cap - inline_prefill_capacity) *
+            prefill_bytes_per_token;
+    TEST_ASSERT(allocated == inline_expected_bytes);
+    TEST_ASSERT(hebrus_internal_qwen35_gpu_graph_resize_prefill(
+        graph, graph_size, ssd_prefill_capacity));
+    TEST_ASSERT(ds4_internal_qwen35_gpu_graph_allocated_bytes(
+        graph, graph_size, &allocated));
+    const uint64_t ssd_expected_bytes =
+        expected_bytes -
+        (uint64_t)(prefill_cap - ssd_prefill_capacity) *
+            prefill_bytes_per_token;
+    TEST_ASSERT(allocated == ssd_expected_bytes);
+    TEST_ASSERT(hebrus_internal_qwen35_gpu_graph_resize_prefill(
+        graph, graph_size, prefill_cap));
+    TEST_ASSERT(ds4_internal_qwen35_gpu_graph_allocated_bytes(
+        graph, graph_size, &allocated));
+    TEST_ASSERT(allocated == expected_bytes);
     fprintf(stderr,
-            "ds4-test: Qwen graph ctx=%u allocated=%.2f MiB "
+            "ds4-test: Qwen graph ctx=%u resident-%u=%.2f MiB "
+            "ssd-%u=%.2f MiB inline-%u=%.2f MiB "
             "(full=%u recurrent=%u, MoE resident=%u stream=%ux%u)\n",
-            ctx_capacity, (double)allocated / (1024.0 * 1024.0),
+            ctx_capacity,
+            prefill_cap,
+            (double)allocated / (1024.0 * 1024.0),
+            ssd_prefill_capacity,
+            (double)ssd_expected_bytes / (1024.0 * 1024.0),
+            inline_prefill_capacity,
+            (double)inline_expected_bytes / (1024.0 * 1024.0),
             QWEN35_FULL_ATTENTION_LAYER_COUNT,
             QWEN35_RECURRENT_LAYER_COUNT,
             QWEN35_N_EXPERT_USED,
@@ -3911,6 +3967,8 @@ static void test_metal_selected_slots_runtime_count(void) {
 static void test_metal_kernel_group(void) {
     test_metal_tensor_copy_pair();
     test_metal_qwen35_graph_state();
+    TEST_ASSERT(ds4_internal_qwen35_macro_transaction_rollback_test());
+    TEST_ASSERT(hebrus_internal_qwen35_prefill_resource_lifecycle_test());
     test_metal_f16_matvec_fast_nr0_4();
     test_metal_f16_prefill_matmul();
     test_metal_f32_router_prefill_matmul();
