@@ -430,6 +430,15 @@ static double g_stream_expert_timing_selected_read_ms;
 static double g_stream_expert_timing_selected_sync_ms;
 static double g_stream_expert_timing_selected_copy_ms;
 static double g_stream_expert_timing_selected_bind_ms;
+static uint64_t g_stream_expert_timing_overlap_route_calls;
+static double g_stream_expert_timing_overlap_route_wait_ms;
+static double g_stream_expert_timing_overlap_route_copy_ms;
+static double g_stream_expert_timing_overlap_route_plan_ms;
+static uint64_t g_stream_expert_timing_overlap_finish_calls;
+static double g_stream_expert_timing_overlap_finish_publish_ms;
+static double g_stream_expert_timing_overlap_finish_wait_ms;
+static double g_stream_expert_timing_overlap_finish_modify_ms;
+static double g_stream_expert_timing_overlap_finish_install_ms;
 static uint64_t g_stream_expert_timing_split_layers;
 static uint64_t g_stream_expert_timing_split_resident_experts;
 static uint64_t g_stream_expert_timing_split_missing_experts;
@@ -472,6 +481,15 @@ typedef struct {
     double selected_sync_ms;
     double selected_copy_ms;
     double selected_bind_ms;
+    uint64_t overlap_route_calls;
+    double overlap_route_wait_ms;
+    double overlap_route_copy_ms;
+    double overlap_route_plan_ms;
+    uint64_t overlap_finish_calls;
+    double overlap_finish_publish_ms;
+    double overlap_finish_wait_ms;
+    double overlap_finish_modify_ms;
+    double overlap_finish_install_ms;
     uint64_t split_layers;
     uint64_t split_resident_experts;
     uint64_t split_missing_experts;
@@ -3129,6 +3147,24 @@ ds4_gpu_stream_expert_timing_current(void) {
         .selected_sync_ms = g_stream_expert_timing_selected_sync_ms,
         .selected_copy_ms = g_stream_expert_timing_selected_copy_ms,
         .selected_bind_ms = g_stream_expert_timing_selected_bind_ms,
+        .overlap_route_calls =
+            g_stream_expert_timing_overlap_route_calls,
+        .overlap_route_wait_ms =
+            g_stream_expert_timing_overlap_route_wait_ms,
+        .overlap_route_copy_ms =
+            g_stream_expert_timing_overlap_route_copy_ms,
+        .overlap_route_plan_ms =
+            g_stream_expert_timing_overlap_route_plan_ms,
+        .overlap_finish_calls =
+            g_stream_expert_timing_overlap_finish_calls,
+        .overlap_finish_publish_ms =
+            g_stream_expert_timing_overlap_finish_publish_ms,
+        .overlap_finish_wait_ms =
+            g_stream_expert_timing_overlap_finish_wait_ms,
+        .overlap_finish_modify_ms =
+            g_stream_expert_timing_overlap_finish_modify_ms,
+        .overlap_finish_install_ms =
+            g_stream_expert_timing_overlap_finish_install_ms,
         .split_layers = g_stream_expert_timing_split_layers,
         .split_resident_experts = g_stream_expert_timing_split_resident_experts,
         .split_missing_experts = g_stream_expert_timing_split_missing_experts,
@@ -3219,6 +3255,42 @@ ds4_gpu_stream_expert_timing_delta(
         .selected_bind_ms =
             ds4_gpu_stream_expert_timing_delta_f64(current.selected_bind_ms,
                                                    previous.selected_bind_ms),
+        .overlap_route_calls =
+            ds4_gpu_stream_expert_timing_delta_u64(
+                    current.overlap_route_calls,
+                    previous.overlap_route_calls),
+        .overlap_route_wait_ms =
+            ds4_gpu_stream_expert_timing_delta_f64(
+                    current.overlap_route_wait_ms,
+                    previous.overlap_route_wait_ms),
+        .overlap_route_copy_ms =
+            ds4_gpu_stream_expert_timing_delta_f64(
+                    current.overlap_route_copy_ms,
+                    previous.overlap_route_copy_ms),
+        .overlap_route_plan_ms =
+            ds4_gpu_stream_expert_timing_delta_f64(
+                    current.overlap_route_plan_ms,
+                    previous.overlap_route_plan_ms),
+        .overlap_finish_calls =
+            ds4_gpu_stream_expert_timing_delta_u64(
+                    current.overlap_finish_calls,
+                    previous.overlap_finish_calls),
+        .overlap_finish_publish_ms =
+            ds4_gpu_stream_expert_timing_delta_f64(
+                    current.overlap_finish_publish_ms,
+                    previous.overlap_finish_publish_ms),
+        .overlap_finish_wait_ms =
+            ds4_gpu_stream_expert_timing_delta_f64(
+                    current.overlap_finish_wait_ms,
+                    previous.overlap_finish_wait_ms),
+        .overlap_finish_modify_ms =
+            ds4_gpu_stream_expert_timing_delta_f64(
+                    current.overlap_finish_modify_ms,
+                    previous.overlap_finish_modify_ms),
+        .overlap_finish_install_ms =
+            ds4_gpu_stream_expert_timing_delta_f64(
+                    current.overlap_finish_install_ms,
+                    previous.overlap_finish_install_ms),
         .split_layers =
             ds4_gpu_stream_expert_timing_delta_u64(current.split_layers,
                                                    previous.split_layers),
@@ -3346,6 +3418,8 @@ ds4_gpu_stream_expert_timing_delta(
 static int ds4_gpu_stream_expert_timing_has_data(
         ds4_gpu_stream_expert_timing_snapshot s) {
     return s.selected_calls != 0 ||
+           s.overlap_route_calls != 0 ||
+           s.overlap_finish_calls != 0 ||
            s.split_layers != 0 ||
            s.load_calls != 0 ||
            s.cache_all_resident_layers != 0 ||
@@ -3367,6 +3441,29 @@ static void ds4_gpu_stream_expert_timing_print(
         selected_calls != 0.0 ? s.selected_copy_ms / selected_calls : 0.0;
     const double selected_bind_avg =
         selected_calls != 0.0 ? s.selected_bind_ms / selected_calls : 0.0;
+    const double overlap_route_calls = (double)s.overlap_route_calls;
+    const double overlap_route_wait_avg =
+        overlap_route_calls != 0.0 ?
+            s.overlap_route_wait_ms / overlap_route_calls : 0.0;
+    const double overlap_route_copy_avg =
+        overlap_route_calls != 0.0 ?
+            s.overlap_route_copy_ms / overlap_route_calls : 0.0;
+    const double overlap_route_plan_avg =
+        overlap_route_calls != 0.0 ?
+            s.overlap_route_plan_ms / overlap_route_calls : 0.0;
+    const double overlap_finish_calls = (double)s.overlap_finish_calls;
+    const double overlap_finish_publish_avg =
+        overlap_finish_calls != 0.0 ?
+            s.overlap_finish_publish_ms / overlap_finish_calls : 0.0;
+    const double overlap_finish_wait_avg =
+        overlap_finish_calls != 0.0 ?
+            s.overlap_finish_wait_ms / overlap_finish_calls : 0.0;
+    const double overlap_finish_modify_avg =
+        overlap_finish_calls != 0.0 ?
+            s.overlap_finish_modify_ms / overlap_finish_calls : 0.0;
+    const double overlap_finish_install_avg =
+        overlap_finish_calls != 0.0 ?
+            s.overlap_finish_install_ms / overlap_finish_calls : 0.0;
     const double split_resident_avg =
         split_layers != 0.0 ? s.split_resident_ms / split_layers : 0.0;
     const double split_missing_avg =
@@ -3484,6 +3581,35 @@ static void ds4_gpu_stream_expert_timing_print(
             (unsigned long long)s.cache_mixed_layers,
             cache_resident_experts_avg,
             cache_missing_experts_avg);
+    if (s.overlap_route_calls != 0 || s.overlap_finish_calls != 0) {
+        fprintf(stderr,
+                "ds4:   streaming expert overlap %s route_calls=%llu "
+                "route_wait_avg=%.3f ms route_copy_avg=%.3f ms "
+                "route_plan_avg=%.3f ms route_wait_total=%.3f ms "
+                "route_copy_total=%.3f ms route_plan_total=%.3f ms "
+                "finish_calls=%llu finish_publish_avg=%.3f ms "
+                "finish_wait_avg=%.3f ms finish_modify_avg=%.3f ms "
+                "finish_install_avg=%.3f ms "
+                "finish_publish_total=%.3f ms finish_wait_total=%.3f ms "
+                "finish_modify_total=%.3f ms finish_install_total=%.3f ms\n",
+                scope ? scope : "total",
+                (unsigned long long)s.overlap_route_calls,
+                overlap_route_wait_avg,
+                overlap_route_copy_avg,
+                overlap_route_plan_avg,
+                s.overlap_route_wait_ms,
+                s.overlap_route_copy_ms,
+                s.overlap_route_plan_ms,
+                (unsigned long long)s.overlap_finish_calls,
+                overlap_finish_publish_avg,
+                overlap_finish_wait_avg,
+                overlap_finish_modify_avg,
+                overlap_finish_install_avg,
+                s.overlap_finish_publish_ms,
+                s.overlap_finish_wait_ms,
+                s.overlap_finish_modify_ms,
+                s.overlap_finish_install_ms);
+    }
 }
 
 static void ds4_gpu_print_task_memory_report(void) {
@@ -10877,6 +11003,30 @@ static void ds4_gpu_stream_expert_timing_note_selected(
     g_stream_expert_timing_selected_bind_ms += bind_ms;
 }
 
+static void ds4_gpu_stream_expert_timing_note_overlap_route(
+        double wait_ms,
+        double copy_ms,
+        double plan_ms) {
+    if (!ds4_gpu_stream_expert_timing_summary_enabled()) return;
+    g_stream_expert_timing_overlap_route_calls++;
+    g_stream_expert_timing_overlap_route_wait_ms += wait_ms;
+    g_stream_expert_timing_overlap_route_copy_ms += copy_ms;
+    g_stream_expert_timing_overlap_route_plan_ms += plan_ms;
+}
+
+static void ds4_gpu_stream_expert_timing_note_overlap_finish(
+        double publish_ms,
+        double wait_ms,
+        double modify_ms,
+        double install_ms) {
+    if (!ds4_gpu_stream_expert_timing_summary_enabled()) return;
+    g_stream_expert_timing_overlap_finish_calls++;
+    g_stream_expert_timing_overlap_finish_publish_ms += publish_ms;
+    g_stream_expert_timing_overlap_finish_wait_ms += wait_ms;
+    g_stream_expert_timing_overlap_finish_modify_ms += modify_ms;
+    g_stream_expert_timing_overlap_finish_install_ms += install_ms;
+}
+
 static void ds4_gpu_stream_expert_timing_note_split(
         uint32_t resident_mask,
         uint32_t missing_mask,
@@ -11301,6 +11451,7 @@ typedef struct {
     ds4_gpu_stream_expert_pread_task
         tasks[DS4_METAL_QWEN35_STREAM_MAX_TASKS];
     double start_ms;
+    double publish_ms;
 } ds4_gpu_qwen35_stream_pending;
 
 static ds4_gpu_qwen35_stream_pending g_qwen35_stream_pending;
@@ -13645,6 +13796,15 @@ static void ds4_gpu_stream_expert_cache_clear_all(int reset_stats) {
         g_stream_expert_timing_selected_sync_ms = 0.0;
         g_stream_expert_timing_selected_copy_ms = 0.0;
         g_stream_expert_timing_selected_bind_ms = 0.0;
+        g_stream_expert_timing_overlap_route_calls = 0;
+        g_stream_expert_timing_overlap_route_wait_ms = 0.0;
+        g_stream_expert_timing_overlap_route_copy_ms = 0.0;
+        g_stream_expert_timing_overlap_route_plan_ms = 0.0;
+        g_stream_expert_timing_overlap_finish_calls = 0;
+        g_stream_expert_timing_overlap_finish_publish_ms = 0.0;
+        g_stream_expert_timing_overlap_finish_wait_ms = 0.0;
+        g_stream_expert_timing_overlap_finish_modify_ms = 0.0;
+        g_stream_expert_timing_overlap_finish_install_ms = 0.0;
         g_stream_expert_timing_split_layers = 0;
         g_stream_expert_timing_split_resident_experts = 0;
         g_stream_expert_timing_split_missing_experts = 0;
@@ -16909,8 +17069,14 @@ static int ds4_gpu_qwen35_stream_finish_internal(
     if (!p || p->state == DS4_QWEN35_STREAM_IO_EMPTY) return 0;
     if (p->state == DS4_QWEN35_STREAM_IO_READY) return 1;
 
+    const int overlap_timing =
+        ds4_gpu_stream_expert_timing_summary_enabled();
+    double overlap_t0 = overlap_timing ? ds4_gpu_now_ms() : 0.0;
     double elapsed_ms = 0.0;
     if (!ds4_gpu_qwen35_stream_wait_reads(p, &elapsed_ms)) return 0;
+    const double overlap_finish_wait_ms =
+        overlap_timing ? ds4_gpu_now_ms() - overlap_t0 : 0.0;
+    if (overlap_timing) overlap_t0 = ds4_gpu_now_ms();
 
     /* Workers publish bytes only.  didModifyRange and every logical cache
      * transition remain on the encoder owner, so a completion can never
@@ -16926,6 +17092,9 @@ static int ds4_gpu_qwen35_stream_finish_internal(
             didModifyRange:NSMakeRange(p->down_inners[load_i],
                                        (NSUInteger)p->down_expert_bytes)];
     }
+    const double overlap_finish_modify_ms =
+        overlap_timing ? ds4_gpu_now_ms() - overlap_t0 : 0.0;
+    if (overlap_timing) overlap_t0 = ds4_gpu_now_ms();
 
     for (uint32_t load_i = 0; load_i < p->n_loads; load_i++) {
         const uint32_t unique_i = p->load_unique[load_i];
@@ -16955,6 +17124,13 @@ static int ds4_gpu_qwen35_stream_finish_internal(
     }
     ds4_gpu_qwen35_stream_release_staging(p);
     p->state = DS4_QWEN35_STREAM_IO_READY;
+    if (overlap_timing) {
+        ds4_gpu_stream_expert_timing_note_overlap_finish(
+                p->publish_ms,
+                overlap_finish_wait_ms,
+                overlap_finish_modify_ms,
+                ds4_gpu_now_ms() - overlap_t0);
+    }
 
     if (getenv("DS4_METAL_STREAMING_EXPERT_EARLY_LOAD_PROFILE") != NULL) {
         fprintf(stderr,
@@ -17035,7 +17211,17 @@ static int ds4_gpu_qwen35_stream_consume(
      * shared expert here before blocking on I/O. */
     if (p->state == DS4_QWEN35_STREAM_IO_READING &&
         p->asynchronous &&
-        (!g_batch_cb || !ds4_gpu_flush_commands())) {
+        g_batch_cb) {
+        const int overlap_timing =
+            ds4_gpu_stream_expert_timing_summary_enabled();
+        const double publish_t0 =
+            overlap_timing ? ds4_gpu_now_ms() : 0.0;
+        if (!ds4_gpu_flush_commands()) return -1;
+        if (overlap_timing) {
+            p->publish_ms += ds4_gpu_now_ms() - publish_t0;
+        }
+    } else if (p->state == DS4_QWEN35_STREAM_IO_READING &&
+               p->asynchronous) {
         return -1;
     }
     if (!ds4_gpu_qwen35_stream_finish_internal(p)) return -1;
@@ -17145,6 +17331,21 @@ int ds4_gpu_stream_io_overlap_capable(
         down_type == DS4_METAL_TENSOR_Q2_K &&
         g_moe_mul_mv_addr_iq2_xxs_pair_swiglu_pipeline != nil &&
         g_moe_mul_mv_addr_q2_k_sum6_pipeline != nil;
+    const bool mlx_affine_store =
+        g_qwen35_expert_pack.active &&
+        g_qwen35_expert_pack.storage_format ==
+            DS4_EXPERT_STORE_STORAGE_MLX_AFFINE4 &&
+        g_qwen35_expert_pack.group_size == 64u;
+    const int qwen_affine_top8 =
+        n_total_expert == DS4_METAL_QWEN35_STREAM_MAX_EXPERT &&
+        n_selected == DS4_METAL_STREAM_SELECTED_MAX &&
+        gate_type == DS4_METAL_TENSOR_Q4_K &&
+        down_type == DS4_METAL_TENSOR_Q4_K &&
+        mlx_affine_store &&
+        ds4_gpu_get_moe_mv_pipeline(
+            "kernel_mul_mv_addr_mlx_affine4_64_pair_swiglu_f32", 2) != nil &&
+        ds4_gpu_get_moe_mv_pipeline(
+            "kernel_mul_mv_addr_mlx_affine4_64_sum8_f32", 2) != nil;
     const int qwen_iq_top8 =
         n_total_expert == DS4_METAL_QWEN35_STREAM_MAX_EXPERT &&
         n_selected == DS4_METAL_STREAM_SELECTED_MAX &&
@@ -17158,9 +17359,9 @@ int ds4_gpu_stream_io_overlap_capable(
      * the previous Qwen-only implementation did. DeepSeek overlap is prefill
      * only and therefore never widens a one-token path. */
     const uint32_t capability_tokens =
-        qwen_iq_top8 && n_tokens == 1u ?
+        (qwen_affine_top8 || qwen_iq_top8) && n_tokens == 1u ?
             2u : n_tokens;
-    return (iq2_top6 || qwen_iq_top8) &&
+    return (iq2_top6 || qwen_affine_top8 || qwen_iq_top8) &&
            g_model_fd >= 0 &&
            ds4_gpu_stream_expert_pread_pool_enabled() &&
            ds4_gpu_stream_expert_pread_thread_limit() > 1u &&
@@ -17187,6 +17388,21 @@ int ds4_gpu_stream_selected_addr_capable(
         down_type == DS4_METAL_TENSOR_Q2_K &&
         g_moe_mul_mv_addr_iq2_xxs_pair_swiglu_pipeline != nil &&
         g_moe_mul_mv_addr_q2_k_sum6_pipeline != nil;
+    const bool mlx_affine_store =
+        g_qwen35_expert_pack.active &&
+        g_qwen35_expert_pack.storage_format ==
+            DS4_EXPERT_STORE_STORAGE_MLX_AFFINE4 &&
+        g_qwen35_expert_pack.group_size == 64u;
+    const int qwen_affine_top8 =
+        n_total_expert == DS4_METAL_QWEN35_STREAM_MAX_EXPERT &&
+        n_selected == DS4_METAL_STREAM_SELECTED_MAX &&
+        gate_type == DS4_METAL_TENSOR_Q4_K &&
+        down_type == DS4_METAL_TENSOR_Q4_K &&
+        mlx_affine_store &&
+        ds4_gpu_get_moe_mv_pipeline(
+            "kernel_mul_mv_addr_mlx_affine4_64_pair_swiglu_f32", 2) != nil &&
+        ds4_gpu_get_moe_mv_pipeline(
+            "kernel_mul_mv_addr_mlx_affine4_64_sum8_f32", 2) != nil;
     const int qwen_iq_top8 =
         n_total_expert == DS4_METAL_QWEN35_STREAM_MAX_EXPERT &&
         n_selected == DS4_METAL_STREAM_SELECTED_MAX &&
@@ -17196,7 +17412,7 @@ int ds4_gpu_stream_selected_addr_capable(
          (gate_type == DS4_METAL_TENSOR_IQ3_XXS &&
           down_type == DS4_METAL_TENSOR_IQ4_XS));
     return n_tokens > 1u &&
-           (iq2_top6 || qwen_iq_top8) &&
+           (iq2_top6 || qwen_affine_top8 || qwen_iq_top8) &&
            ds4_gpu_stream_prefill_batch_selected_addr_enabled(
                n_tokens, n_total_expert, n_selected,
                gate_type, down_type);
@@ -17296,6 +17512,12 @@ int ds4_gpu_stream_batch_route_ready_select(
      * event. commit_and_wait opens buffer B immediately; the completed route
      * is now immutable while bounded workers fill staging and the caller
      * encodes the shared expert. */
+    const int overlap_timing =
+        ds4_gpu_stream_expert_timing_summary_enabled();
+    double overlap_route_wait_ms = 0.0;
+    double overlap_route_copy_ms = 0.0;
+    double overlap_route_plan_ms = 0.0;
+    double overlap_t0 = overlap_timing ? ds4_gpu_now_ms() : 0.0;
     uint64_t selected_event = 0;
     if (!ds4_gpu_signal_selected_readback_ready(&selected_event) ||
         !ds4_gpu_commit_and_wait_selected_readback(
@@ -17304,6 +17526,10 @@ int ds4_gpu_stream_batch_route_ready_select(
         fprintf(stderr,
                 "ds4: Metal routed overlap could not publish router IDs\n");
         return 0;
+    }
+    if (overlap_timing) {
+        overlap_route_wait_ms = ds4_gpu_now_ms() - overlap_t0;
+        overlap_t0 = ds4_gpu_now_ms();
     }
 
     const int retain_selected_ids =
@@ -17334,6 +17560,10 @@ int ds4_gpu_stream_batch_route_ready_select(
         !ds4_gpu_tensor_read(selected, 0, ids, selected_bytes)) {
         failure = "router ID readback";
         goto done;
+    }
+    if (overlap_timing) {
+        overlap_route_copy_ms = ds4_gpu_now_ms() - overlap_t0;
+        overlap_t0 = ds4_gpu_now_ms();
     }
 
     /* The route is already synchronized for SSD pread planning.  Build the
@@ -17518,6 +17748,13 @@ int ds4_gpu_stream_batch_route_ready_select(
     ticket->missing_experts = p->n_loads;
     ticket->max_inflight_reads = p->max_inflight_reads;
     ticket->asynchronous = p->asynchronous;
+    if (overlap_timing) {
+        overlap_route_plan_ms = ds4_gpu_now_ms() - overlap_t0;
+        ds4_gpu_stream_expert_timing_note_overlap_route(
+                overlap_route_wait_ms,
+                overlap_route_copy_ms,
+                overlap_route_plan_ms);
+    }
     ok = 1;
 
 done:
@@ -17581,11 +17818,19 @@ int ds4_gpu_stream_batch_finish(uint64_t generation) {
      * GPU/I/O overlap. The queue preserves shared-before-routed ordering, while
      * the newly opened buffer remains owned by the same encoder thread. */
     if (p->state == DS4_QWEN35_STREAM_IO_READING &&
-        p->asynchronous &&
-        (!g_batch_cb || !ds4_gpu_flush_commands())) {
-        (void)ds4_gpu_qwen35_stream_wait_reads(p, NULL);
-        hebrus_gpu_qwen35_stream_reset(p);
-        return 0;
+        p->asynchronous) {
+        const int overlap_timing =
+            ds4_gpu_stream_expert_timing_summary_enabled();
+        const double publish_t0 =
+            overlap_timing ? ds4_gpu_now_ms() : 0.0;
+        if (!g_batch_cb || !ds4_gpu_flush_commands()) {
+            (void)ds4_gpu_qwen35_stream_wait_reads(p, NULL);
+            hebrus_gpu_qwen35_stream_reset(p);
+            return 0;
+        }
+        if (overlap_timing) {
+            p->publish_ms += ds4_gpu_now_ms() - publish_t0;
+        }
     }
     if (ds4_gpu_qwen35_stream_finish_internal(p)) return 1;
     hebrus_gpu_qwen35_stream_reset(p);
@@ -36158,8 +36403,11 @@ static int ds4_gpu_routed_moe_one_tensor_impl(
                         ds4_gpu_get_moe_mv_pipeline(
                             "kernel_mul_mv_addr_mlx_affine4_64_sum8_f32",
                             2);
+                    /* Qwen executes top-8 as two four-route halves.  The
+                     * IQ2 sum6 encoder intentionally rejects that geometry;
+                     * keep affine dispatch on the 1..8-route wrapper. */
                     ok = address_sum_pipeline &&
-                        ds4_gpu_encode_mul_mv_addr_q2_sum6(
+                        ds4_gpu_encode_mul_mv_addr_q4_sum8_stream(
                             cb,
                             address_sum_pipeline,
                             &down_args,

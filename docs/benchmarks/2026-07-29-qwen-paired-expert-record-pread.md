@@ -264,6 +264,54 @@ These are commit-note candidates, not dormant release branches:
 - Diagnose generic GLM `ds4-bench` session nondeterminism separately. The
   canonical GLM Gold CLI path is exact and remains the release gate.
 
+## Post-merge Affine4 SSD correction and overlap measurement
+
+A post-merge audit found that commit `7b5a3eb6f315` accidentally narrowed two
+Qwen SSD capability classifiers to Q2_K_XL. The published Stable
+Affine4/group-64 artifact therefore lost its validated selected-address
+overlap admission. Restoring that exact Affine4 profile exposed a second
+wiring error in scalar decode: Qwen executes top-8 as two four-route halves,
+but the Affine4 down projection called the IQ2 sum6 encoder. That encoder
+correctly rejects `nei0 != 6`, so decode failed before the down kernel was
+submitted.
+
+The correction restores only the admitted Affine4/group-64 profile; it does
+not restore the retired generic Q4 path. Affine4 down dispatch now uses the
+existing 1..8-route Qwen sum8 encoder, while IQ2 remains on its six-route
+encoder. The timing summary also separates route publication/copy/planning
+from finish publication, exposed SSD wait, `didModifyRange:`, and cache
+installation. This instrumentation is observational and remains useful for
+the next expert-cache/overlap tranche.
+
+| Started (Europe/Rome) | Revision / lane | Result |
+| --- | --- | --- |
+| N/A; the failure start was not captured | clean `main` `7b5a3eb6f315`; Affine4 SSD 128 + first decode token | FAIL reproduced independently: token 128 stopped at FFN |
+| N/A; the diagnostic start was not captured | corrected classifier, wrong sum6 wrapper retained; layer-0 stage profile | FAIL after gate/up and activation; no down stage was submitted |
+| N/A; the diagnostic start was not captured | sum8 wiring correction; layer-0 stage profile | PASS: both four-route halves completed gate/up, down, and sum |
+| 2026-07-29T15:05:30+0200 | final source without temporary capability logging; Affine4 SSD 128 + 8 | PASS; full-stack overlap enabled; frontier logits and eight-token decode evidence byte-identical to the synchronous ablation |
+
+The two short arms below are a correctness diagnostic, not a promotion-speed
+cohort. Tested `main` has no comparable timing because it aborts at the first
+decode token. The final arm followed the synchronous arm on the same host, so
+its timing is retained only to expose the observed direction.
+
+| Started (Europe/Rome) | Arm | Prefill t/s | Decode t/s | TPOT p50 / p95 | Delta vs tested `main` | Delta vs previous comparable | Correctness |
+| --- | --- | ---: | ---: | --- | --- | --- | --- |
+| N/A; start was not captured (evidence file created at `2026-07-29T15:04:11+0200`) | Affine4 SSD, `io_overlap` ablated, 128 + 8 | 206.94 | 19.73 | 51.535 / 64.553 ms | N/A; `main` aborts | N/A; first successful arm | exact evidence SHA-256 `56951276…` frontier / `a9b421eb…` decode |
+| 2026-07-29T15:05:30+0200 | Affine4 SSD, final full stack, 128 + 8 | 229.86 | 20.80 | 49.448 / 60.922 ms | N/A; `main` aborts | +11.08% / +5.42%; TPOT -4.05% / -5.62% | byte-identical to synchronous arm |
+
+The measurement-first DeepSeek check remained valid because the Affine4
+classifier correction is Qwen-only:
+
+| Started (Europe/Rome) | Revision / lane | Prefill t/s | Decode t/s | TPOT p50 / p95 | Delta vs tested `main` | Delta vs previous comparable | Result |
+| --- | --- | ---: | ---: | --- | --- | --- | --- |
+| 2026-07-29T14:51:31+0200 | `7b5a3eb6f315` plus timing-only instrumentation; DeepSeek cold SSD, 2 GiB cache, pure prefill 128 | 28.26 | N/A | N/A | N/A; diagnostic-only arm | N/A; first breakdown | PASS; 4,529.033 ms wall, 2,742.252 ms exposed finish wait, 396.016 ms route-ready wait, 178.760 ms planning |
+
+On this deliberately cold, undersized-cache DeepSeek arm, exposed SSD wait was
+about 60.6% of prefill wall time and the router-ready barrier another 8.7%.
+That points the next optimization work toward whole-expert prefetch/cache
+policy and SSD/GPU overlap, not partial-expert prediction.
+
 ## Final validation
 
 | Started (Europe/Rome) | Revision / experiment | Command or lane | Result |
@@ -282,6 +330,8 @@ These are commit-note candidates, not dormant release branches:
 | 2026-07-29T06:17:58+02:00 | final source, binary `f16ede1...` | Qwen real-model 128 + 128 post-rename identity check | exact; two reads/load; zero swap; no competitor |
 | 2026-07-29T06:18:08+02:00 | final source, binary `f16ede1...` | DeepSeek deliberately undersized cache admission check | expected fail-closed before inference; zero swap; no competitor |
 | 2026-07-29T06:18:28+02:00 | final source, binary `f16ede1...` | DeepSeek real-model AUTO 128 + 128 post-rename identity check | exact; three reads/load; zero swap; no competitor |
+| 2026-07-29T15:07:23+0200 | Affine4 corrective source plus unrelated in-progress v3 prototype files | complete unrestricted `make model-free-test` | PASS; Metal kernels, ExpertMajor v2, Qwen Affine4/IQ fixtures, SSD residency, metadata, server, and repository model-free lanes |
+| 2026-07-29T15:11:30+0200 | Affine4 corrective source plus unrelated in-progress v3 prototype files | complete unrestricted `make premerge` | PASS; repository, documentation, brand boundary, build isolation, model-free Metal, install layout, and final diff checks |
 
 The full diff from merge base `572e6a6` was reviewed for correctness,
 Qwen-only gating, experimental residue, generated artifacts, and unsupported

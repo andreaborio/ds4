@@ -638,11 +638,88 @@
       "maximum": 4
     },
     {
+      "path": "docs/benchmarks/2026-07-28-qwen-dense-id-publication-reuse.md",
+      "location": "content",
+      "token": "ds4",
+      "classification": "historical-attribution",
+      "maximum": 5
+    },
+    {
+      "path": "docs/benchmarks/2026-07-28-qwen-dense-id-publication-reuse.md",
+      "location": "content",
+      "token": "DS4",
+      "classification": "historical-attribution",
+      "maximum": 1
+    },
+    {
+      "path": "docs/benchmarks/2026-07-28-qwen-layer-staleness-eviction.md",
+      "location": "content",
+      "token": "ds4",
+      "classification": "historical-attribution",
+      "maximum": 4
+    },
+    {
+      "path": "docs/benchmarks/2026-07-28-qwen-layer-staleness-eviction.md",
+      "location": "content",
+      "token": "DS4",
+      "classification": "historical-attribution",
+      "maximum": 2
+    },
+    {
       "path": "docs/benchmarks/2026-07-28-qwen-q2-k-xl-performance-weight.md",
       "location": "content",
       "token": "ds4",
       "classification": "historical-attribution",
       "maximum": 3
+    },
+    {
+      "path": "docs/benchmarks/2026-07-28-routed-overlap-scalar-id-reuse.md",
+      "location": "content",
+      "token": "ds4",
+      "classification": "historical-attribution",
+      "maximum": 2
+    },
+    {
+      "path": "docs/benchmarks/2026-07-28-routed-overlap-selected-id-reuse.md",
+      "location": "content",
+      "token": "ds4",
+      "classification": "historical-attribution",
+      "maximum": 5
+    },
+    {
+      "path": "docs/benchmarks/2026-07-28-streaming-cache-empty-layer-skip.md",
+      "location": "content",
+      "token": "ds4",
+      "classification": "historical-attribution",
+      "maximum": 2
+    },
+    {
+      "path": "docs/benchmarks/2026-07-28-streaming-cache-expert-width-bound.md",
+      "location": "content",
+      "token": "ds4",
+      "classification": "historical-attribution",
+      "maximum": 1
+    },
+    {
+      "path": "docs/benchmarks/2026-07-28-streaming-cache-occupancy-index.md",
+      "location": "content",
+      "token": "ds4",
+      "classification": "historical-attribution",
+      "maximum": 2
+    },
+    {
+      "path": "docs/benchmarks/2026-07-29-qwen-paired-expert-record-pread.md",
+      "location": "content",
+      "token": "ds4",
+      "classification": "historical-attribution",
+      "maximum": 4
+    },
+    {
+      "path": "docs/benchmarks/2026-07-29-qwen-paired-expert-record-pread.md",
+      "location": "content",
+      "token": "DS4",
+      "classification": "historical-attribution",
+      "maximum": 2
     },
     {
       "path": "docs/benchmarks/README.md",
@@ -1132,14 +1209,14 @@
       "location": "content",
       "token": "ds4",
       "classification": "migration-pending",
-      "maximum": 6863
+      "maximum": 6895
     },
     {
       "path": "ds4_metal.m",
       "location": "content",
       "token": "DS4",
       "classification": "migration-pending",
-      "maximum": 1164
+      "maximum": 1171
     },
     {
       "path": "ds4_profile.c",

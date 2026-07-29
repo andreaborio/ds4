@@ -360,6 +360,50 @@ The DeepSeek and GLM rows are model-backed structural smoke, not throughput
 promotion claims. Physical 16/24/32 GiB Qwen qualification remains outside this
 64 GiB host.
 
+## Physical 16 GiB Q2_K_XL qualification lane
+
+The Q2_K_XL runtime already uses the shared Qwen guarded-SSD planner on hosts
+at or below 24 GiB. Therefore a physical 16 GiB test does not require an
+admission bypass or a second runtime path: use explicit SSD mode and let the
+live pressure, static-page, workspace, and cache-floor checks fail closed.
+This does **not** lower the published Beta minimum from 64 GiB. That contract
+changes only after physical evidence passes.
+
+Start with the short safety/correctness arm:
+
+```sh
+./hebrus-bench --metal -m "$QWEN_Q2_V2" \
+  --ssd-streaming --ssd-streaming-cold \
+  --prompt-file tests/long_context_security_prompt.txt \
+  --ctx-start 128 --ctx-max 128 --ctx-alloc 8192 \
+  --step-mul 1 --gen-tokens 8 \
+  --dump-frontier-logits-dir /absolute/private/path/qwen-q2-16g-p128 \
+  --dump-decode-evidence-dir /absolute/private/path/qwen-q2-16g-p128 \
+  --csv /absolute/private/path/qwen-q2-16g-p128.csv
+```
+
+If it completes with normal pressure and no new swapout, run the first
+context-sensitive lane at 8K:
+
+```sh
+./hebrus-bench --metal -m "$QWEN_Q2_V2" \
+  --ssd-streaming --ssd-streaming-cold \
+  --prompt-file tests/long_context_security_prompt.txt \
+  --ctx-start 8192 --ctx-max 8192 --ctx-alloc 8321 \
+  --step-mul 1 --gen-tokens 128 \
+  --dump-frontier-logits-dir /absolute/private/path/qwen-q2-16g-p8k \
+  --dump-decode-evidence-dir /absolute/private/path/qwen-q2-16g-p8k \
+  --csv /absolute/private/path/qwen-q2-16g-p8k.csv
+```
+
+Record the physical device, exact RAM, `recommendedMaxWorkingSetSize`, resolved
+SSD plan, static page reserve, initial/target/effective cache capacities,
+prefill/decode throughput, TPOT p50/p95, process footprint, macOS pressure,
+and system swap before/during/after. Any pressure warning, cache-floor
+rejection, new swapout, watchdog termination, output drift, or incomplete
+decode rejects the 16 GiB candidate. The current status is **physical
+16 GiB pending**; no result has been manufactured from the 64 GiB host.
+
 ## Publication boundary
 
 The two upstream artifacts preserve different tokenizer metadata. Affine4 uses
