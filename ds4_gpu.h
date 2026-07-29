@@ -1704,6 +1704,11 @@ int ds4_gpu_qwen35_routed_moe_batch_select_tensor(
 
 /* Model-free ABI/permutation regression used by --metal-kernels. */
 int ds4_gpu_internal_qwen35_expert_group_test(void);
+/* Model-free ownership regression for overlap router-ID reuse. */
+int hebrus_gpu_internal_qwen35_stream_selected_ids_ownership_test(void);
+/* Model-free invariant regression for bounded/indexed expert-cache scans and
+ * the Qwen layer-staleness eviction tie-break. */
+int hebrus_gpu_internal_stream_expert_cache_scan_limit_test(void);
 /* Model-free source-translation/fail-closed regression used by
  * --metal-expert-pack. */
 int ds4_gpu_internal_qwen35_expert_pack_test(void);

@@ -3918,6 +3918,10 @@ static void test_metal_kernel_group(void) {
     test_metal_q6_k_prefill_matmul();
     test_metal_glm_compact_indexer_warmup_mapping();
     test_metal_qwen35_primitives();
+    TEST_ASSERT(
+        hebrus_gpu_internal_qwen35_stream_selected_ids_ownership_test() != 0);
+    TEST_ASSERT(
+        hebrus_gpu_internal_stream_expert_cache_scan_limit_test() != 0);
     TEST_ASSERT(ds4_gpu_internal_qwen35_expert_group_test() != 0);
     test_metal_selected_slots_runtime_count();
 }

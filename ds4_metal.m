@@ -25,6 +25,7 @@
 #include "ds4.h"
 #include "ds4_expert_store.h"
 #include "ds4_gpu.h"
+#include "ds4_qwen.h"
 #include "ds4_qwen_expert_group.h"
 
 /*
@@ -763,6 +764,26 @@ static ds4_gpu_stream_expert_cache_entry
 static ds4_gpu_stream_expert_cache_entry
     g_stream_full_expert_addr_entry[DS4_METAL_STREAM_EXPERT_CACHE_MAX_LAYER];
 static uint32_t g_stream_expert_cache_layer_count[DS4_METAL_STREAM_EXPERT_CACHE_MAX_LAYER];
+enum {
+    HEBRUS_METAL_STREAM_EXPERT_CACHE_MAX_LAYER =
+        DS4_METAL_STREAM_EXPERT_CACHE_MAX_LAYER,
+    HEBRUS_METAL_STREAM_EXPERT_CACHE_MAX_EXPERT =
+        DS4_METAL_STREAM_EXPERT_CACHE_MAX_EXPERT,
+    HEBRUS_METAL_STREAM_EXPERT_CACHE_OCCUPANCY_WORDS =
+        (sizeof(g_stream_expert_cache[0]) /
+             sizeof(g_stream_expert_cache[0][0]) + 63u) / 64u,
+};
+/* Set from the model's validated expert count only after the first successful
+ * install in a layer.  The last clear resets it; hot victim scans fail open to
+ * the compile-time maximum if the stored value is absent or out of range. */
+static uint32_t g_stream_expert_cache_layer_expert_limit
+    [HEBRUS_METAL_STREAM_EXPERT_CACHE_MAX_LAYER];
+/* Mirrors valid cache entries. Victim scans validate its population against
+ * layer_count before taking the sparse path and otherwise fall back to the
+ * exact dense traversal. */
+static uint64_t g_stream_expert_cache_layer_occupancy
+    [sizeof(g_stream_expert_cache) / sizeof(g_stream_expert_cache[0])]
+    [HEBRUS_METAL_STREAM_EXPERT_CACHE_OCCUPANCY_WORDS];
 static uint64_t g_stream_expert_cache_layer_hits[DS4_METAL_STREAM_EXPERT_CACHE_MAX_LAYER];
 static uint64_t g_stream_expert_cache_layer_misses[DS4_METAL_STREAM_EXPERT_CACHE_MAX_LAYER];
 static uint64_t g_stream_expert_cache_layer_evictions[DS4_METAL_STREAM_EXPERT_CACHE_MAX_LAYER];
@@ -11013,6 +11034,7 @@ typedef enum {
     DS4_GPU_STREAM_EXPERT_RECORD_COMPONENTS = 0,
     DS4_GPU_STREAM_EXPERT_RECORD_FULL,
     DS4_GPU_STREAM_EXPERT_RECORD_BALANCED3,
+    HEBRUS_GPU_STREAM_EXPERT_RECORD_PAIRED2,
 } ds4_gpu_stream_expert_record_read_mode;
 
 static int ds4_gpu_stream_expert_coalesced_record_pread_enabled(void) {
@@ -11025,15 +11047,34 @@ static int ds4_gpu_stream_expert_coalesced_record_pread_enabled(void) {
 
 static int ds4_gpu_stream_expert_glm_full_record_default(void) {
     /*
-     * Qwen's 6.75 MiB records benchmark best as three parallel component
-     * reads.  GLM ExpertMajor v2 has larger 11.81 MiB records and its
-     * qualified decode path used one contiguous pread per missing expert.
-     * Keep that distinction explicit instead of applying Qwen's I/O policy to
-     * every embedded-v2 store.
+     * GLM ExpertMajor v2 has 11.81 MiB records and its qualified decode path
+     * uses one contiguous pread per missing expert.  Keep that distinction
+     * explicit instead of applying another model's I/O policy to every
+     * embedded-v2 store.
      */
     return g_glm_model_mode &&
            g_qwen35_expert_pack.active &&
            g_qwen35_expert_pack.embedded_v2;
+}
+
+static int hebrus_gpu_stream_expert_qwen35_model_value(
+        int      glm_model,
+        int      active,
+        int      embedded_v2,
+        uint32_t n_layer,
+        uint32_t n_expert) {
+    return !glm_model && active && embedded_v2 &&
+           n_layer == QWEN35_N_LAYER &&
+           n_expert == QWEN35_N_EXPERT;
+}
+
+static int hebrus_gpu_stream_expert_qwen35_model(void) {
+    return hebrus_gpu_stream_expert_qwen35_model_value(
+        g_glm_model_mode,
+        g_qwen35_expert_pack.active,
+        g_qwen35_expert_pack.embedded_v2,
+        g_qwen35_expert_pack.n_layer,
+        g_qwen35_expert_pack.n_expert);
 }
 
 static ds4_gpu_stream_expert_record_read_mode
@@ -11041,6 +11082,16 @@ ds4_gpu_stream_expert_record_read_plan(void) {
     if (ds4_gpu_stream_expert_coalesced_record_pread_enabled() ||
         ds4_gpu_stream_expert_glm_full_record_default()) {
         return DS4_GPU_STREAM_EXPERT_RECORD_FULL;
+    }
+    /*
+     * Qwen's 1.30 MiB ExpertMajor v2 records benefit from joining gate+up:
+     * clean 2K/8K A/B/B/A cohorts cut pread syscall count by one third and
+     * improved end-to-end time by 7.78%/4.10%.  DeepSeek's 6.75 MiB records
+     * made the larger reads 8.68%/10.37% slower inside pread and regressed
+     * end-to-end time by 0.44%/0.40%, so retain its three-way parallel plan.
+     */
+    if (hebrus_gpu_stream_expert_qwen35_model()) {
+        return HEBRUS_GPU_STREAM_EXPERT_RECORD_PAIRED2;
     }
     /* Environment policy is immutable after process startup, like the
      * coalesced mode above.  Cache it so every expert/task planning call does
@@ -11125,6 +11176,31 @@ static int ds4_gpu_stream_expert_append_record_tasks(
         }
         return 1;
     }
+    if (record == 1 && contiguous_dst &&
+        record_mode == HEBRUS_GPU_STREAM_EXPERT_RECORD_PAIRED2) {
+        if (*n_tasks > capacity || capacity - *n_tasks < 2u ||
+            gate_bytes > UINT64_MAX - gate_bytes ||
+            source_offset > UINT64_MAX - gate_bytes * 2u) {
+            return 0;
+        }
+        tasks[(*n_tasks)++] = (ds4_gpu_stream_expert_pread_task) {
+            .offset = gate_offset,
+            .len = gate_bytes * 2u,
+            .dst = gate_dst,
+            .source_fd = source_fd,
+            .source_offset = source_offset,
+            .direct_source = 1,
+        };
+        tasks[(*n_tasks)++] = (ds4_gpu_stream_expert_pread_task) {
+            .offset = down_offset,
+            .len = down_bytes,
+            .dst = down_dst,
+            .source_fd = source_fd,
+            .source_offset = source_offset + gate_bytes * 2u,
+            .direct_source = 1,
+        };
+        return 1;
+    }
     if (*n_tasks > capacity || capacity - *n_tasks < 3u) return 0;
     tasks[(*n_tasks)++] = (ds4_gpu_stream_expert_pread_task) {
         .offset = gate_offset, .len = gate_bytes, .dst = gate_dst,
@@ -11194,6 +11270,10 @@ typedef struct {
     __strong id<MTLBuffer> selected_buffer;
     NSUInteger selected_offset;
     uint64_t selected_bytes;
+    int32_t *selected_ids;
+    uint64_t selected_id_count;
+    int32_t selected_ids_inline[8];
+    uint8_t selected_ids_heap;
     uint32_t n_unique;
     uint32_t n_loads;
     uint32_t n_tasks;
@@ -13428,8 +13508,18 @@ static void ds4_gpu_stream_expert_cache_clear_entry_internal(
     e->valid = 0;
     e->slab_backed = 0;
 
+    const int qwen_cache_index =
+        hebrus_gpu_stream_expert_qwen35_model();
+    if (qwen_cache_index) {
+        g_stream_expert_cache_layer_occupancy[layer][expert / 64u] &=
+            ~(1ull << (expert % 64u));
+    }
     if (g_stream_expert_cache_layer_count[layer] > 0) {
         g_stream_expert_cache_layer_count[layer]--;
+    }
+    if (qwen_cache_index &&
+        g_stream_expert_cache_layer_count[layer] == 0) {
+        g_stream_expert_cache_layer_expert_limit[layer] = 0;
     }
     if (g_stream_expert_cache_entry_count > 0) {
         g_stream_expert_cache_entry_count--;
@@ -13479,6 +13569,10 @@ static void ds4_gpu_stream_expert_cache_clear_all(int reset_stats) {
         }
         ds4_gpu_stream_full_expert_addr_clear_layer(layer);
         g_stream_expert_cache_layer_count[layer] = 0;
+        g_stream_expert_cache_layer_expert_limit[layer] = 0;
+        memset(g_stream_expert_cache_layer_occupancy[layer],
+               0,
+               sizeof(g_stream_expert_cache_layer_occupancy[layer]));
         id<MTLBuffer> buffers[3] = {
             g_stream_expert_cache_gate_addr_buffers[layer],
             g_stream_expert_cache_up_addr_buffers[layer],
@@ -13617,6 +13711,15 @@ static int ds4_gpu_stream_expert_cache_is_protected(
     return 0;
 }
 
+static int hebrus_gpu_stream_expert_cache_layer_occupancy_matches(
+        uint32_t layer,
+        uint32_t expert_limit);
+static uint32_t hebrus_gpu_stream_expert_cache_next(
+        uint32_t layer,
+        uint32_t expert_limit,
+        uint32_t cursor,
+        int      sparse);
+
 static void ds4_gpu_stream_expert_cache_prune_layer(
         uint32_t layer,
         uint32_t n_total_expert,
@@ -13638,7 +13741,16 @@ static void ds4_gpu_stream_expert_cache_prune_layer(
         uint32_t victim = UINT32_MAX;
         uint32_t lowest_hotness = UINT32_MAX;
         uint64_t oldest = UINT64_MAX;
-        for (uint32_t expert = 0; expert < n_total_expert; expert++) {
+        const int sparse =
+            hebrus_gpu_stream_expert_qwen35_model() &&
+            hebrus_gpu_stream_expert_cache_layer_occupancy_matches(
+                layer, n_total_expert);
+        for (uint32_t cursor = 0;;) {
+            const uint32_t expert =
+                hebrus_gpu_stream_expert_cache_next(
+                    layer, n_total_expert, cursor, sparse);
+            if (expert == UINT32_MAX) break;
+            cursor = expert + 1u;
             ds4_gpu_stream_expert_cache_entry *e =
                 &g_stream_expert_cache[layer][expert];
             if (!e->valid ||
@@ -13740,14 +13852,6 @@ static int ds4_gpu_stream_expert_reusable_buffers_relayout(
         &reuse->down_inner);
 }
 
-static int ds4_gpu_stream_expert_evict_layer_staleness_enabled(void) {
-    static int cached = -1;
-    if (cached < 0) {
-        cached = getenv("DS4_METAL_STREAM_EVICT_LAYER_STALENESS") != NULL ? 1 : 0;
-    }
-    return cached;
-}
-
 static uint32_t ds4_gpu_stream_expert_evict_fwd_distance(
         uint32_t entry_layer,
         uint32_t current_layer) {
@@ -13757,22 +13861,227 @@ static uint32_t ds4_gpu_stream_expert_evict_fwd_distance(
 }
 
 /* Returns nonzero when the candidate is a better eviction victim than the
- * incumbent.  Primary key stays route hotness.  With
- * DS4_METAL_STREAM_EVICT_LAYER_STALENESS the recency tie-break is replaced by
- * forward layer distance: decode sweeps layers in order, so an expert of a
- * just-passed layer is not needed for ~n_layers more steps, while plain LRU
- * under a cache smaller than one sweep evicts exactly the upcoming layers. */
-static int ds4_gpu_stream_expert_evict_better(
+ * incumbent.  Primary key stays route hotness.  Qwen decode replaces the
+ * recency tie-break across layers with forward layer distance: decode sweeps
+ * layers in order, so an expert of a just-passed layer is not needed for
+ * ~n_layers more steps, while plain LRU under a cache smaller than one sweep
+ * evicts exactly the upcoming layers.  Same-layer ties remain LRU. */
+static int hebrus_gpu_stream_expert_evict_better(
         uint32_t hotness_c, uint32_t layer_c, uint64_t last_c,
         uint32_t hotness_i, uint32_t layer_i, uint64_t last_i,
-        uint32_t current_layer) {
+        uint32_t current_layer,
+        int layer_staleness) {
     if (hotness_c != hotness_i) return hotness_c < hotness_i;
-    if (ds4_gpu_stream_expert_evict_layer_staleness_enabled() &&
-        layer_c != layer_i) {
+    if (layer_staleness && layer_c != layer_i) {
         return ds4_gpu_stream_expert_evict_fwd_distance(layer_c, current_layer) >
                ds4_gpu_stream_expert_evict_fwd_distance(layer_i, current_layer);
     }
     return last_c < last_i;
+}
+
+static int hebrus_gpu_stream_expert_qwen_layer_staleness(void) {
+    return hebrus_gpu_stream_expert_qwen35_model();
+}
+
+static uint32_t hebrus_gpu_stream_expert_cache_expert_capacity(void) {
+    return (uint32_t)(sizeof(g_stream_expert_cache[0]) /
+                      sizeof(g_stream_expert_cache[0][0]));
+}
+
+static uint32_t hebrus_gpu_stream_expert_cache_scan_limit_value(
+        uint32_t expert_limit) {
+    const uint32_t expert_capacity =
+        hebrus_gpu_stream_expert_cache_expert_capacity();
+    return expert_limit != 0 &&
+           expert_limit <= expert_capacity ?
+        expert_limit : expert_capacity;
+}
+
+static int hebrus_gpu_stream_expert_cache_layer_limit_matches_value(
+        uint32_t entry_count,
+        uint32_t expert_limit,
+        uint32_t n_total_expert) {
+    return entry_count == 0 || expert_limit == n_total_expert;
+}
+
+static uint32_t hebrus_gpu_stream_expert_cache_scan_limit(uint32_t layer) {
+    const uint32_t layer_capacity =
+        (uint32_t)(sizeof(g_stream_expert_cache_layer_expert_limit) /
+                   sizeof(g_stream_expert_cache_layer_expert_limit[0]));
+    if (layer >= layer_capacity) {
+        return hebrus_gpu_stream_expert_cache_expert_capacity();
+    }
+    return hebrus_gpu_stream_expert_cache_scan_limit_value(
+        g_stream_expert_cache_layer_expert_limit[layer]);
+}
+
+static uint64_t hebrus_gpu_stream_expert_cache_occupancy_mask(
+        uint32_t word,
+        uint32_t expert_limit) {
+    const uint32_t first_expert = word * 64u;
+    if (first_expert >= expert_limit) return 0;
+    const uint32_t remaining = expert_limit - first_expert;
+    return remaining >= 64u ? UINT64_MAX : (1ull << remaining) - 1ull;
+}
+
+static int hebrus_gpu_stream_expert_cache_occupancy_matches_value(
+        const uint64_t *words,
+        uint32_t        word_count,
+        uint32_t        expert_limit,
+        uint32_t        expected_count) {
+    if (!words || word_count == 0 || expert_limit == 0 ||
+        expert_limit > word_count * 64u ||
+        expected_count > expert_limit) {
+        return 0;
+    }
+    uint32_t actual_count = 0;
+    for (uint32_t word = 0; word < word_count; word++) {
+        const uint64_t allowed =
+            hebrus_gpu_stream_expert_cache_occupancy_mask(
+                word, expert_limit);
+        if ((words[word] & ~allowed) != 0) return 0;
+        const uint32_t word_count_set =
+            (uint32_t)__builtin_popcountll(words[word]);
+        if (actual_count > UINT32_MAX - word_count_set) return 0;
+        actual_count += word_count_set;
+    }
+    return actual_count == expected_count;
+}
+
+static int hebrus_gpu_stream_expert_cache_layer_occupancy_matches(
+        uint32_t layer,
+        uint32_t expert_limit) {
+    if (layer >= HEBRUS_METAL_STREAM_EXPERT_CACHE_MAX_LAYER) return 0;
+    return hebrus_gpu_stream_expert_cache_occupancy_matches_value(
+        g_stream_expert_cache_layer_occupancy[layer],
+        HEBRUS_METAL_STREAM_EXPERT_CACHE_OCCUPANCY_WORDS,
+        expert_limit,
+        g_stream_expert_cache_layer_count[layer]);
+}
+
+static uint32_t hebrus_gpu_stream_expert_cache_next_value(
+        const uint64_t *words,
+        uint32_t        word_count,
+        uint32_t        expert_limit,
+        uint32_t        cursor,
+        int             sparse) {
+    if (cursor >= expert_limit) return UINT32_MAX;
+    if (!sparse) return cursor;
+
+    uint32_t word = cursor / 64u;
+    if (!words || word >= word_count) return UINT32_MAX;
+    uint64_t candidates =
+        words[word] & (UINT64_MAX << (cursor % 64u));
+    for (;;) {
+        if (candidates != 0) {
+            const uint32_t expert =
+                word * 64u + (uint32_t)__builtin_ctzll(candidates);
+            return expert < expert_limit ? expert : UINT32_MAX;
+        }
+        word++;
+        if (word >= word_count || word * 64u >= expert_limit) {
+            return UINT32_MAX;
+        }
+        candidates = words[word];
+    }
+}
+
+static uint32_t hebrus_gpu_stream_expert_cache_next(
+        uint32_t layer,
+        uint32_t expert_limit,
+        uint32_t cursor,
+        int      sparse) {
+    if (layer >= HEBRUS_METAL_STREAM_EXPERT_CACHE_MAX_LAYER) {
+        return UINT32_MAX;
+    }
+    return hebrus_gpu_stream_expert_cache_next_value(
+        g_stream_expert_cache_layer_occupancy[layer],
+        HEBRUS_METAL_STREAM_EXPERT_CACHE_OCCUPANCY_WORDS,
+        expert_limit,
+        cursor,
+        sparse);
+}
+
+int hebrus_gpu_internal_stream_expert_cache_scan_limit_test(void) {
+    const uint32_t expert_capacity =
+        hebrus_gpu_stream_expert_cache_expert_capacity();
+    const uint64_t occupied[] = {
+        (1ull << 0u) | (1ull << 63u),
+        (1ull << 1u),
+        0,
+        (1ull << 63u),
+        0,
+        0,
+    };
+    const uint64_t outside_limit[] = {
+        0, 0, 0, 0, (1ull << 44u), 0,
+    };
+    const uint64_t partial_limit[] = {
+        0, 0, (1ull << 1u), 0, 0, 0,
+    };
+    const uint64_t outside_partial_limit[] = {
+        0, 0, (1ull << 2u), 0, 0, 0,
+    };
+    int ok =
+        hebrus_gpu_stream_expert_qwen35_model_value(
+            0, 1, 1, QWEN35_N_LAYER, QWEN35_N_EXPERT) &&
+        !hebrus_gpu_stream_expert_qwen35_model_value(
+            1, 1, 1, QWEN35_N_LAYER, QWEN35_N_EXPERT) &&
+        !hebrus_gpu_stream_expert_qwen35_model_value(
+            0, 1, 1, QWEN35_N_LAYER - 1u, QWEN35_N_EXPERT) &&
+        !hebrus_gpu_stream_expert_qwen35_model_value(
+            0, 1, 0, QWEN35_N_LAYER, QWEN35_N_EXPERT) &&
+        hebrus_gpu_stream_expert_cache_scan_limit_value(128) == 128 &&
+        hebrus_gpu_stream_expert_cache_scan_limit_value(256) == 256 &&
+        hebrus_gpu_stream_expert_cache_scan_limit_value(384) == 384 &&
+        hebrus_gpu_stream_expert_cache_scan_limit_value(0) ==
+            expert_capacity &&
+        hebrus_gpu_stream_expert_cache_scan_limit_value(
+            expert_capacity + 1u) == expert_capacity &&
+        hebrus_gpu_stream_expert_cache_layer_limit_matches_value(
+            0, 0, 256) &&
+        hebrus_gpu_stream_expert_cache_layer_limit_matches_value(
+            1, 256, 256) &&
+        !hebrus_gpu_stream_expert_cache_layer_limit_matches_value(
+            1, 128, 256) &&
+        hebrus_gpu_stream_expert_cache_occupancy_matches_value(
+            occupied, 6, 256, 4) &&
+        !hebrus_gpu_stream_expert_cache_occupancy_matches_value(
+            occupied, 6, 256, 3) &&
+        !hebrus_gpu_stream_expert_cache_occupancy_matches_value(
+            outside_limit, 6, 256, 1) &&
+        hebrus_gpu_stream_expert_cache_occupancy_matches_value(
+            partial_limit, 6, 130, 1) &&
+        !hebrus_gpu_stream_expert_cache_occupancy_matches_value(
+            outside_partial_limit, 6, 130, 1) &&
+        hebrus_gpu_stream_expert_evict_better(
+            1, 19, 200, 2, 21, 100, 20, 0) &&
+        !hebrus_gpu_stream_expert_evict_better(
+            2, 19, 50, 1, 21, 100, 20, 1) &&
+        !hebrus_gpu_stream_expert_evict_better(
+            1, 19, 200, 1, 21, 100, 20, 0) &&
+        hebrus_gpu_stream_expert_evict_better(
+            1, 19, 200, 1, 21, 100, 20, 1) &&
+        !hebrus_gpu_stream_expert_evict_better(
+            1, 21, 100, 1, 19, 200, 20, 1) &&
+        hebrus_gpu_stream_expert_evict_better(
+            1, 20, 50, 1, 20, 100, 20, 1);
+    uint32_t cursor = 0;
+    const uint32_t expected[] = { 0, 63, 65, 255 };
+    for (uint32_t i = 0;
+         ok && i < sizeof(expected) / sizeof(expected[0]);
+         i++) {
+        const uint32_t expert =
+            hebrus_gpu_stream_expert_cache_next_value(
+                occupied, 6, 256, cursor, 1);
+        ok = expert == expected[i];
+        cursor = expert + 1u;
+    }
+    return ok &&
+        hebrus_gpu_stream_expert_cache_next_value(
+            occupied, 6, 256, cursor, 1) == UINT32_MAX &&
+        hebrus_gpu_stream_expert_cache_next_value(
+            occupied, 6, 256, 17, 0) == 17;
 }
 
 static int ds4_gpu_stream_expert_cache_take_reusable(
@@ -13805,15 +14114,31 @@ retry:
     uint32_t lowest_hotness = UINT32_MAX;
     uint64_t oldest = UINT64_MAX;
     int skipped_inflight = 0;
+    const int layer_staleness =
+        hebrus_gpu_stream_expert_qwen_layer_staleness();
+    const int qwen_cache_index =
+        hebrus_gpu_stream_expert_qwen35_model();
     const int timing = ds4_gpu_stream_expert_timing_summary_enabled();
     const double scan_t0 = timing ? ds4_gpu_now_ms() : 0.0;
     uint64_t scan_entries = 0;
     for (uint32_t layer = 0;
          layer < DS4_METAL_STREAM_EXPERT_CACHE_MAX_LAYER;
          layer++) {
-        for (uint32_t expert = 0;
-             expert < DS4_METAL_STREAM_EXPERT_CACHE_MAX_EXPERT;
-             expert++) {
+        if (qwen_cache_index &&
+            g_stream_expert_cache_layer_count[layer] == 0) continue;
+        const uint32_t expert_limit = qwen_cache_index ?
+            hebrus_gpu_stream_expert_cache_scan_limit(layer) :
+            HEBRUS_METAL_STREAM_EXPERT_CACHE_MAX_EXPERT;
+        const int sparse =
+            qwen_cache_index &&
+            hebrus_gpu_stream_expert_cache_layer_occupancy_matches(
+                layer, expert_limit);
+        for (uint32_t cursor = 0;;) {
+            const uint32_t expert =
+                hebrus_gpu_stream_expert_cache_next(
+                    layer, expert_limit, cursor, sparse);
+            if (expert == UINT32_MAX) break;
+            cursor = expert + 1u;
             scan_entries++;
             ds4_gpu_stream_expert_cache_entry *e =
                 &g_stream_expert_cache[layer][expert];
@@ -13836,13 +14161,14 @@ retry:
             const uint32_t hotness =
                 g_stream_expert_cache_route_hotness[layer][expert];
             if (victim_layer == UINT32_MAX ||
-                ds4_gpu_stream_expert_evict_better(hotness,
+                hebrus_gpu_stream_expert_evict_better(hotness,
                                                    layer,
                                                    e->last_used,
                                                    lowest_hotness,
                                                    victim_layer,
                                                    oldest,
-                                                   protect_layer)) {
+                                                   protect_layer,
+                                                   layer_staleness)) {
                 lowest_hotness = hotness;
                 oldest = e->last_used;
                 victim_layer = layer;
@@ -13917,6 +14243,8 @@ static uint32_t ds4_gpu_stream_expert_cache_release_mlock_margin(
 
     const uint32_t target_release = (locked_before + 9u) / 10u;
     uint32_t released = 0;
+    const int qwen_cache_index =
+        hebrus_gpu_stream_expert_qwen35_model();
     while (released < target_release) {
         uint32_t victim_layer = UINT32_MAX;
         uint32_t victim_expert = UINT32_MAX;
@@ -13927,9 +14255,21 @@ static uint32_t ds4_gpu_stream_expert_cache_release_mlock_margin(
         for (uint32_t layer = 0;
              layer < DS4_METAL_STREAM_EXPERT_CACHE_MAX_LAYER;
              layer++) {
-            for (uint32_t expert = 0;
-                 expert < DS4_METAL_STREAM_EXPERT_CACHE_MAX_EXPERT;
-                 expert++) {
+            if (qwen_cache_index &&
+                g_stream_expert_cache_layer_count[layer] == 0) continue;
+            const uint32_t expert_limit = qwen_cache_index ?
+                hebrus_gpu_stream_expert_cache_scan_limit(layer) :
+                HEBRUS_METAL_STREAM_EXPERT_CACHE_MAX_EXPERT;
+            const int sparse =
+                qwen_cache_index &&
+                hebrus_gpu_stream_expert_cache_layer_occupancy_matches(
+                    layer, expert_limit);
+            for (uint32_t cursor = 0;;) {
+                const uint32_t expert =
+                    hebrus_gpu_stream_expert_cache_next(
+                        layer, expert_limit, cursor, sparse);
+                if (expert == UINT32_MAX) break;
+                cursor = expert + 1u;
                 ds4_gpu_stream_expert_cache_entry *e =
                     &g_stream_expert_cache[layer][expert];
                 if (!e->valid ||
@@ -14031,6 +14371,10 @@ retry:
     uint64_t victim_last_used[DS4_METAL_STREAM_EXPERT_CACHE_MAX_SELECTED];
     uint32_t victim_count = 0;
     int skipped_inflight = 0;
+    const int layer_staleness =
+        hebrus_gpu_stream_expert_qwen_layer_staleness();
+    const int qwen_cache_index =
+        hebrus_gpu_stream_expert_qwen35_model();
     const int timing = ds4_gpu_stream_expert_timing_summary_enabled();
     const double scan_t0 = timing ? ds4_gpu_now_ms() : 0.0;
     uint64_t scan_entries = 0;
@@ -14044,9 +14388,21 @@ retry:
     for (uint32_t layer = 0;
          layer < DS4_METAL_STREAM_EXPERT_CACHE_MAX_LAYER;
          layer++) {
-        for (uint32_t expert = 0;
-             expert < DS4_METAL_STREAM_EXPERT_CACHE_MAX_EXPERT;
-             expert++) {
+        if (qwen_cache_index &&
+            g_stream_expert_cache_layer_count[layer] == 0) continue;
+        const uint32_t expert_limit = qwen_cache_index ?
+            hebrus_gpu_stream_expert_cache_scan_limit(layer) :
+            HEBRUS_METAL_STREAM_EXPERT_CACHE_MAX_EXPERT;
+        const int sparse =
+            qwen_cache_index &&
+            hebrus_gpu_stream_expert_cache_layer_occupancy_matches(
+                layer, expert_limit);
+        for (uint32_t cursor = 0;;) {
+            const uint32_t expert =
+                hebrus_gpu_stream_expert_cache_next(
+                    layer, expert_limit, cursor, sparse);
+            if (expert == UINT32_MAX) break;
+            cursor = expert + 1u;
             scan_entries++;
             ds4_gpu_stream_expert_cache_entry *e =
                 &g_stream_expert_cache[layer][expert];
@@ -14081,23 +14437,25 @@ retry:
 
             uint32_t worst = 0;
             for (uint32_t i = 1; i < victim_count; i++) {
-                if (ds4_gpu_stream_expert_evict_better(victim_hotness[worst],
+                if (hebrus_gpu_stream_expert_evict_better(victim_hotness[worst],
                                                        victim_layers[worst],
                                                        victim_last_used[worst],
                                                        victim_hotness[i],
                                                        victim_layers[i],
                                                        victim_last_used[i],
-                                                       protect_layer)) {
+                                                       protect_layer,
+                                                       layer_staleness)) {
                     worst = i;
                 }
             }
-            if (ds4_gpu_stream_expert_evict_better(hotness,
+            if (hebrus_gpu_stream_expert_evict_better(hotness,
                                                    layer,
                                                    last_used,
                                                    victim_hotness[worst],
                                                    victim_layers[worst],
                                                    victim_last_used[worst],
-                                                   protect_layer)) {
+                                                   protect_layer,
+                                                   layer_staleness)) {
                 victim_layers[worst] = layer;
                 victim_experts[worst] = expert;
                 victim_hotness[worst] = hotness;
@@ -14410,6 +14768,10 @@ static void ds4_gpu_stream_expert_cache_prune_global(
         uint32_t n_protect) {
     const uint32_t budget = ds4_gpu_stream_expert_cache_configured_budget();
     if (budget == 0 || g_stream_expert_cache_entry_count <= budget) return;
+    const int layer_staleness =
+        hebrus_gpu_stream_expert_qwen_layer_staleness();
+    const int qwen_cache_index =
+        hebrus_gpu_stream_expert_qwen35_model();
 
     while (g_stream_expert_cache_entry_count > budget) {
         uint32_t victim_layer = UINT32_MAX;
@@ -14419,9 +14781,21 @@ static void ds4_gpu_stream_expert_cache_prune_global(
         for (uint32_t layer = 0;
              layer < DS4_METAL_STREAM_EXPERT_CACHE_MAX_LAYER;
              layer++) {
-            for (uint32_t expert = 0;
-                 expert < DS4_METAL_STREAM_EXPERT_CACHE_MAX_EXPERT;
-                 expert++) {
+            if (qwen_cache_index &&
+                g_stream_expert_cache_layer_count[layer] == 0) continue;
+            const uint32_t expert_limit = qwen_cache_index ?
+                hebrus_gpu_stream_expert_cache_scan_limit(layer) :
+                HEBRUS_METAL_STREAM_EXPERT_CACHE_MAX_EXPERT;
+            const int sparse =
+                qwen_cache_index &&
+                hebrus_gpu_stream_expert_cache_layer_occupancy_matches(
+                    layer, expert_limit);
+            for (uint32_t cursor = 0;;) {
+                const uint32_t expert =
+                    hebrus_gpu_stream_expert_cache_next(
+                        layer, expert_limit, cursor, sparse);
+                if (expert == UINT32_MAX) break;
+                cursor = expert + 1u;
                 ds4_gpu_stream_expert_cache_entry *e =
                     &g_stream_expert_cache[layer][expert];
                 if (!e->valid ||
@@ -14435,13 +14809,14 @@ static void ds4_gpu_stream_expert_cache_prune_global(
                 const uint32_t hotness =
                     g_stream_expert_cache_route_hotness[layer][expert];
                 if (victim_layer == UINT32_MAX ||
-                    ds4_gpu_stream_expert_evict_better(hotness,
+                    hebrus_gpu_stream_expert_evict_better(hotness,
                                                        layer,
                                                        e->last_used,
                                                        lowest_hotness,
                                                        victim_layer,
                                                        oldest,
-                                                       protect_layer)) {
+                                                       protect_layer,
+                                                       layer_staleness)) {
                     lowest_hotness = hotness;
                     oldest = e->last_used;
                     victim_layer = layer;
@@ -14525,6 +14900,7 @@ ds4_gpu_stream_expert_cache_install_loaded(
         uint64_t       model_size,
         uint32_t       layer,
         uint32_t       expert,
+        uint32_t       n_total_expert,
         uint64_t       gate_abs_offset,
         uint64_t       up_abs_offset,
         uint64_t       down_abs_offset,
@@ -14538,7 +14914,18 @@ ds4_gpu_stream_expert_cache_install_loaded(
         NSUInteger     down_inner) {
     if (!gate_buf || !up_buf || !down_buf ||
         layer >= DS4_METAL_STREAM_EXPERT_CACHE_MAX_LAYER ||
-        expert >= DS4_METAL_STREAM_EXPERT_CACHE_MAX_EXPERT) {
+        n_total_expert == 0 ||
+        n_total_expert > HEBRUS_METAL_STREAM_EXPERT_CACHE_MAX_EXPERT ||
+        expert >= n_total_expert) {
+        return NULL;
+    }
+    const int qwen_cache_index =
+        hebrus_gpu_stream_expert_qwen35_model();
+    if (qwen_cache_index &&
+        !hebrus_gpu_stream_expert_cache_layer_limit_matches_value(
+             g_stream_expert_cache_layer_count[layer],
+             g_stream_expert_cache_layer_expert_limit[layer],
+             n_total_expert)) {
         return NULL;
     }
     if (gate_expert_bytes > (UINT64_MAX - down_expert_bytes) / 2ull) {
@@ -14601,6 +14988,14 @@ ds4_gpu_stream_expert_cache_install_loaded(
         e->slab_slot = 0;
     }
     e->valid = 1;
+    if (qwen_cache_index) {
+        g_stream_expert_cache_layer_occupancy[layer][expert / 64u] |=
+            1ull << (expert % 64u);
+        if (g_stream_expert_cache_layer_count[layer] == 0) {
+            g_stream_expert_cache_layer_expert_limit[layer] =
+                n_total_expert;
+        }
+    }
     g_stream_expert_cache_layer_count[layer]++;
     if (g_stream_expert_cache_entry_count < UINT32_MAX) {
         g_stream_expert_cache_entry_count++;
@@ -14775,6 +15170,7 @@ static ds4_gpu_stream_expert_cache_entry *ds4_gpu_stream_expert_cache_get_protec
                                                       model_size,
                                                       layer,
                                                       expert,
+                                                      n_total_expert,
                                                       gate_abs_offset,
                                                       up_abs_offset,
                                                       down_abs_offset,
@@ -14885,6 +15281,7 @@ static int ds4_gpu_stream_expert_pending_load_install(
                                                        p->model_size,
                                                        p->layer,
                                                        expert,
+                                                       p->n_total_expert,
                                                        p->gate_abs_offsets[slot],
                                                        p->up_abs_offsets[slot],
                                                        p->down_abs_offsets[slot],
@@ -15956,6 +16353,7 @@ static int ds4_gpu_stream_expert_cache_load_selected_missing(
                                                        model_size,
                                                        layer,
                                                        expert,
+                                                       n_total_expert,
                                                        gate_abs_offsets[slot],
                                                        up_abs_offsets[slot],
                                                        down_abs_offsets[slot],
@@ -16105,10 +16503,14 @@ int ds4_gpu_internal_qwen35_lease_error_unwind_test(void) {
     return ok;
 }
 
-static void ds4_gpu_qwen35_stream_reset(
+static void hebrus_gpu_qwen35_stream_reset(
         ds4_gpu_qwen35_stream_pending *p) {
     if (!p) return;
     ds4_gpu_qwen35_stream_release_staging(p);
+    if (p->selected_ids_heap) free(p->selected_ids);
+    p->selected_ids = NULL;
+    p->selected_id_count = 0;
+    p->selected_ids_heap = 0;
     p->selected_buffer = nil;
     p->state = DS4_QWEN35_STREAM_IO_EMPTY;
     p->generation = 0;
@@ -16143,6 +16545,117 @@ static void ds4_gpu_qwen35_stream_reset(
     memset(p->load_installed, 0, sizeof(p->load_installed));
     memset(p->installed, 0, sizeof(p->installed));
     memset(p->tasks, 0, sizeof(p->tasks));
+}
+
+/* Hand the synchronized router IDs to the routed-MoE consumer.  Batch routes
+ * transfer their heap allocation; a scalar top-8 route copies the pending
+ * inline array into caller storage before reset.  Both paths therefore reuse
+ * the immutable host copy that already scheduled SSD reads without exposing a
+ * pointer into resettable pending state. */
+static int hebrus_gpu_qwen35_stream_take_selected_ids(
+        ds4_gpu_qwen35_stream_pending *p,
+        uint64_t                       expected_count,
+        int32_t                       *inline_ids,
+        uint64_t                       inline_capacity,
+        int32_t                      **selected_ids) {
+    if (!selected_ids) return 0;
+    *selected_ids = NULL;
+    if (!p || expected_count == 0 ||
+        p->selected_id_count != expected_count ||
+        !p->selected_ids) {
+        return 0;
+    }
+    if (p->selected_ids_heap) {
+        *selected_ids = p->selected_ids;
+    } else {
+        if (!inline_ids || inline_capacity < expected_count) return 0;
+        memcpy(inline_ids,
+               p->selected_ids,
+               (size_t)expected_count * sizeof(inline_ids[0]));
+        *selected_ids = inline_ids;
+    }
+    p->selected_ids = NULL;
+    p->selected_id_count = 0;
+    p->selected_ids_heap = 0;
+    return 1;
+}
+
+int hebrus_gpu_internal_qwen35_stream_selected_ids_ownership_test(void) {
+    ds4_gpu_qwen35_stream_pending pending = {0};
+    pending.selected_id_count = 3;
+    pending.selected_ids = malloc(
+        (size_t)pending.selected_id_count * sizeof(pending.selected_ids[0]));
+    if (!pending.selected_ids) return 0;
+    pending.selected_ids_heap = 1;
+    pending.selected_ids[0] = 17;
+    pending.selected_ids[1] = 5;
+    pending.selected_ids[2] = 17;
+
+    int32_t *taken = NULL;
+    int ok =
+        !hebrus_gpu_qwen35_stream_take_selected_ids(
+            &pending, 3, NULL, 0, NULL) &&
+        pending.selected_ids != NULL &&
+        pending.selected_id_count == 3 &&
+        hebrus_gpu_qwen35_stream_take_selected_ids(
+            &pending, 3, NULL, 0, &taken);
+    hebrus_gpu_qwen35_stream_reset(&pending);
+    ok = ok && taken &&
+         taken[0] == 17 && taken[1] == 5 && taken[2] == 17;
+    free(taken);
+
+    pending.selected_id_count = 2;
+    pending.selected_ids = malloc(
+        (size_t)pending.selected_id_count * sizeof(pending.selected_ids[0]));
+    if (!pending.selected_ids) return 0;
+    pending.selected_ids_heap = 1;
+    int32_t *mismatch = (int32_t *)(uintptr_t)1;
+    ok = ok &&
+         !hebrus_gpu_qwen35_stream_take_selected_ids(
+             &pending, 3, NULL, 0, &mismatch) &&
+         mismatch == NULL &&
+         pending.selected_ids != NULL &&
+         pending.selected_id_count == 2;
+    hebrus_gpu_qwen35_stream_reset(&pending);
+
+    pending.selected_ids = pending.selected_ids_inline;
+    pending.selected_id_count =
+        sizeof(pending.selected_ids_inline) /
+        sizeof(pending.selected_ids_inline[0]);
+    for (uint32_t i = 0; i < pending.selected_id_count; i++) {
+        pending.selected_ids_inline[i] = (int32_t)(31u - i);
+    }
+    int32_t copied_ids[8] = { 0 };
+    int32_t *inline_ids = (int32_t *)(uintptr_t)1;
+    ok = ok &&
+         hebrus_gpu_qwen35_stream_take_selected_ids(
+             &pending,
+             pending.selected_id_count,
+             copied_ids,
+             sizeof(copied_ids) / sizeof(copied_ids[0]),
+             &inline_ids) &&
+         inline_ids == copied_ids &&
+         copied_ids[0] == 31 && copied_ids[7] == 24 &&
+         pending.selected_ids == NULL &&
+         pending.selected_id_count == 0;
+    hebrus_gpu_qwen35_stream_reset(&pending);
+
+    pending.selected_ids = pending.selected_ids_inline;
+    pending.selected_id_count = 8;
+    int32_t short_ids[7] = { 0 };
+    int32_t *short_result = (int32_t *)(uintptr_t)1;
+    ok = ok &&
+         !hebrus_gpu_qwen35_stream_take_selected_ids(
+             &pending,
+             pending.selected_id_count,
+             short_ids,
+             sizeof(short_ids) / sizeof(short_ids[0]),
+             &short_result) &&
+         short_result == NULL &&
+         pending.selected_ids == pending.selected_ids_inline &&
+         pending.selected_id_count == 8;
+    hebrus_gpu_qwen35_stream_reset(&pending);
+    return ok;
 }
 
 enum {
@@ -16423,6 +16936,7 @@ static int ds4_gpu_qwen35_stream_finish_internal(
                 p->model_size,
                 p->layer,
                 expert,
+                p->n_total_expert,
                 p->gate_abs_offsets[unique_i],
                 p->up_abs_offsets[unique_i],
                 p->down_abs_offsets[unique_i],
@@ -16460,13 +16974,13 @@ static int ds4_gpu_qwen35_stream_finish_internal(
 static void ds4_gpu_qwen35_stream_batch_pending_clear(void) {
     ds4_gpu_qwen35_stream_pending *p = &g_qwen35_stream_pending;
     if (p->state == DS4_QWEN35_STREAM_IO_EMPTY) {
-        ds4_gpu_qwen35_stream_reset(p);
+        hebrus_gpu_qwen35_stream_reset(p);
         return;
     }
     if (p->state == DS4_QWEN35_STREAM_IO_READING) {
         (void)ds4_gpu_qwen35_stream_wait_reads(p, NULL);
     }
-    ds4_gpu_qwen35_stream_reset(p);
+    hebrus_gpu_qwen35_stream_reset(p);
 }
 
 static int ds4_gpu_qwen35_stream_pending_matches(
@@ -16502,8 +17016,12 @@ static int ds4_gpu_qwen35_stream_consume(
         uint32_t                           n_tokens,
         uint32_t                           n_selected,
         uint8_t                           *installed,
-        uint32_t                           installed_count) {
+        uint32_t                           installed_count,
+        int32_t                           *inline_ids,
+        uint64_t                           inline_capacity,
+        int32_t                          **selected_ids) {
     ds4_gpu_qwen35_stream_pending *p = &g_qwen35_stream_pending;
+    if (selected_ids) *selected_ids = NULL;
     if (p->state == DS4_QWEN35_STREAM_IO_EMPTY) return 0;
     if (!ds4_gpu_qwen35_stream_pending_matches(table,
                                                selected,
@@ -16527,7 +17045,20 @@ static int ds4_gpu_qwen35_stream_consume(
             DS4_METAL_QWEN35_STREAM_MAX_EXPERT;
         memcpy(installed, p->installed, n * sizeof(installed[0]));
     }
-    ds4_gpu_qwen35_stream_reset(p);
+    if (hebrus_gpu_stream_expert_qwen35_model()) {
+        const uint64_t expected_id_count =
+            (uint64_t)n_tokens * n_selected;
+        if (!hebrus_gpu_qwen35_stream_take_selected_ids(
+                p,
+                expected_id_count,
+                inline_ids,
+                inline_capacity,
+                selected_ids)) {
+            hebrus_gpu_qwen35_stream_reset(p);
+            return -1;
+        }
+    }
+    hebrus_gpu_qwen35_stream_reset(p);
     return 1;
 }
 
@@ -16775,15 +17306,32 @@ int ds4_gpu_stream_batch_route_ready_select(
         return 0;
     }
 
+    const int retain_selected_ids =
+        hebrus_gpu_stream_expert_qwen35_model();
+    ds4_gpu_qwen35_stream_pending *p = &g_qwen35_stream_pending;
+    hebrus_gpu_qwen35_stream_reset(p);
+    int32_t *ids = NULL;
+    if (retain_selected_ids) {
+        p->selected_id_count = n_ids;
+        const uint64_t inline_id_capacity =
+            sizeof(p->selected_ids_inline) /
+            sizeof(p->selected_ids_inline[0]);
+        if (p->selected_id_count <= inline_id_capacity) {
+            p->selected_ids = p->selected_ids_inline;
+        } else {
+            p->selected_ids = malloc(
+                (size_t)p->selected_id_count *
+                sizeof(p->selected_ids[0]));
+            p->selected_ids_heap = p->selected_ids != NULL;
+        }
+        ids = p->selected_ids;
+    } else {
+        ids = malloc((size_t)n_ids * sizeof(ids[0]));
+    }
     int ok = 0;
     const char *failure = "unknown";
-    int32_t *ids = malloc((size_t)n_ids * sizeof(ids[0]));
-    ds4_gpu_qwen35_stream_pending *p = &g_qwen35_stream_pending;
-    ds4_gpu_qwen35_stream_reset(p);
-    if (!ids || !ds4_gpu_tensor_read(selected,
-                                     0,
-                                     ids,
-                                     selected_bytes)) {
+    if (!ids ||
+        !ds4_gpu_tensor_read(selected, 0, ids, selected_bytes)) {
         failure = "router ID readback";
         goto done;
     }
@@ -16973,7 +17521,7 @@ int ds4_gpu_stream_batch_route_ready_select(
     ok = 1;
 
 done:
-    free(ids);
+    if (!retain_selected_ids) free(ids);
     if (!ok) {
         fprintf(stderr,
                 "ds4: Metal routed overlap preparation failed at %s "
@@ -17036,11 +17584,11 @@ int ds4_gpu_stream_batch_finish(uint64_t generation) {
         p->asynchronous &&
         (!g_batch_cb || !ds4_gpu_flush_commands())) {
         (void)ds4_gpu_qwen35_stream_wait_reads(p, NULL);
-        ds4_gpu_qwen35_stream_reset(p);
+        hebrus_gpu_qwen35_stream_reset(p);
         return 0;
     }
     if (ds4_gpu_qwen35_stream_finish_internal(p)) return 1;
-    ds4_gpu_qwen35_stream_reset(p);
+    hebrus_gpu_qwen35_stream_reset(p);
     return 0;
 }
 
@@ -17056,7 +17604,7 @@ int ds4_gpu_stream_batch_abort(uint64_t generation) {
     if (p->state == DS4_QWEN35_STREAM_IO_READING) {
         ok = ds4_gpu_qwen35_stream_wait_reads(p, NULL);
     }
-    ds4_gpu_qwen35_stream_reset(p);
+    hebrus_gpu_qwen35_stream_reset(p);
     return ok;
 }
 
@@ -17076,6 +17624,10 @@ static void ds4_gpu_stream_expert_cache_clear_layer(uint32_t layer) {
         ds4_gpu_stream_expert_cache_clear_entry(layer, expert, 0);
     }
     g_stream_expert_cache_layer_count[layer] = 0;
+    g_stream_expert_cache_layer_expert_limit[layer] = 0;
+    memset(g_stream_expert_cache_layer_occupancy[layer],
+           0,
+           sizeof(g_stream_expert_cache_layer_occupancy[layer]));
 }
 
 static int ds4_gpu_stream_expert_cache_prepare_selected_batch(
@@ -17133,24 +17685,36 @@ static int ds4_gpu_stream_expert_cache_prepare_selected_batch(
         .gate_expert_bytes = gate_expert_bytes,
         .down_expert_bytes = down_expert_bytes,
     };
+    const int reuse_selected_ids =
+        hebrus_gpu_stream_expert_qwen35_model();
+    int32_t inline_ids[DS4_METAL_STREAM_SELECTED_MAX] = { 0 };
+    int32_t *ids = NULL;
     const int overlap = ds4_gpu_qwen35_stream_consume(
         &table,
         selected,
         n_tokens,
         n_selected,
         prefetched,
-        DS4_METAL_QWEN35_STREAM_MAX_EXPERT);
+        DS4_METAL_QWEN35_STREAM_MAX_EXPERT,
+        inline_ids,
+        sizeof(inline_ids) / sizeof(inline_ids[0]),
+        &ids);
     if (overlap < 0) return 0;
-    int32_t *ids = malloc((size_t)n_ids * sizeof(ids[0]));
-    if (!ids) return 0;
 
     const bool profile =
         getenv("DS4_METAL_STREAMING_PREFILL_BATCH_SELECTED_ADDR_PROFILE") != NULL;
     const double t0 = profile ? ds4_gpu_now_ms() : 0.0;
-    int ok = ds4_gpu_tensor_read(selected,
+    int ok = 1;
+    if (overlap == 0 || !reuse_selected_ids) {
+        ids = malloc((size_t)n_ids * sizeof(ids[0]));
+        ok = ids &&
+             ds4_gpu_tensor_read(selected,
                                  0,
                                  ids,
                                  n_ids * sizeof(ids[0]));
+    } else if (!ids) {
+        ok = 0;
+    }
     const double t_read = profile ? ds4_gpu_now_ms() : 0.0;
 
     bool seen[DS4_METAL_STREAM_EXPERT_CACHE_MAX_EXPERT] = { false };
@@ -17349,7 +17913,7 @@ static int ds4_gpu_stream_expert_cache_prepare_selected_batch(
             request_expert_group)) {
         ok = 0;
     }
-    free(ids);
+    if (ids != inline_ids) free(ids);
 
     if (!ok || *n_resources == 0) {
         ds4_gpu_stream_expert_cache_clear_layer(layer);
@@ -29960,14 +30524,26 @@ int ds4_gpu_matmul_ggml_k_tensor(
         }
 
         const NSUInteger ids_bytes = (NSUInteger)n_tok * sizeof(int32_t);
+        const bool ids_buffer_grows =
+            !g_dense_quant_ids_buffer ||
+            g_dense_quant_ids_bytes < ids_bytes;
         if (!ds4_gpu_ensure_scratch_buffer(&g_dense_quant_ids_buffer,
                                            &g_dense_quant_ids_bytes,
                                            ids_bytes,
                                            "ds4_dense_quant_ids")) {
             return 0;
         }
-        memset([g_dense_quant_ids_buffer contents], 0, ids_bytes);
-        [g_dense_quant_ids_buffer didModifyRange:NSMakeRange(0, ids_bytes)];
+        /* Dense GGML-K dispatch reuses the routed kernel with one synthetic
+         * expert whose ID is always zero.  Kernels only read this buffer, so
+         * republishing the same zero before every projection adds host work
+         * without changing any dependency.  The scratch helper replaces the
+         * buffer when it grows, so initialize it only after allocation. */
+        if (!hebrus_gpu_stream_expert_qwen35_model() ||
+            ids_buffer_grows) {
+            memset([g_dense_quant_ids_buffer contents], 0, ids_bytes);
+            [g_dense_quant_ids_buffer
+                didModifyRange:NSMakeRange(0, ids_bytes)];
+        }
 
         uint64_t weight_inner = 0;
         id<MTLBuffer> weight_buffer =
@@ -36062,6 +36638,8 @@ int ds4_gpu_qwen35_routed_moe_top8_tensor(
         return 0;
     }
     uint8_t prefetched[DS4_METAL_QWEN35_STREAM_MAX_EXPERT] = { 0 };
+    int32_t selected_ids[DS4_METAL_STREAM_SELECTED_MAX] = { 0 };
+    int32_t *overlap_selected_ids = NULL;
     if (qwen_overlap_generation &&
         ds4_gpu_qwen35_stream_consume(
             &stream_table,
@@ -36069,14 +36647,20 @@ int ds4_gpu_qwen35_routed_moe_top8_tensor(
             1u,
             DS4_METAL_STREAM_SELECTED_MAX,
             prefetched,
-            DS4_METAL_QWEN35_STREAM_MAX_EXPERT) <= 0) {
+            DS4_METAL_QWEN35_STREAM_MAX_EXPERT,
+            selected_ids,
+            sizeof(selected_ids) / sizeof(selected_ids[0]),
+            &overlap_selected_ids) <= 0) {
+        return 0;
+    }
+    if (qwen_overlap_generation &&
+        overlap_selected_ids != selected_ids) {
         return 0;
     }
 
     const bool selected_timing =
         ds4_gpu_stream_expert_timing_summary_enabled();
     const double selected_t0 = selected_timing ? ds4_gpu_now_ms() : 0.0;
-    int32_t selected_ids[DS4_METAL_STREAM_SELECTED_MAX] = { 0 };
     const int replayed = ds4_gpu_moe_selected_trace_replay(
             selected_ids,
             DS4_METAL_STREAM_SELECTED_MAX);
@@ -36091,10 +36675,11 @@ int ds4_gpu_qwen35_routed_moe_top8_tensor(
             g_qwen35_resident_host_readbacks != UINT64_MAX) {
             g_qwen35_resident_host_readbacks++;
         }
-        const int read_ok = ds4_gpu_tensor_read(selected_top8,
-                                                0,
-                                                selected_ids,
-                                                top8_selected_bytes);
+        const int read_ok = qwen_overlap_generation ||
+            ds4_gpu_tensor_read(selected_top8,
+                                0,
+                                selected_ids,
+                                top8_selected_bytes);
         const int restart_ok = qwen_overlap_generation ||
             !had_batch || ds4_gpu_begin_commands() != 0;
         if (!read_ok || !restart_ok) return 0;
@@ -36694,6 +37279,43 @@ int ds4_gpu_internal_qwen35_expert_pack_test(void) {
         v2_tasks[0].successful_syscalls != 1 ||
         v2_tasks[1].successful_syscalls != 1 ||
         v2_tasks[2].successful_syscalls != 1 ||
+        memcmp(v2_record, v2_gate, sizeof(v2_gate)) != 0 ||
+        memcmp(v2_record + sizeof(v2_gate), v2_up, sizeof(v2_up)) != 0 ||
+        memcmp(v2_record + sizeof(v2_gate) + sizeof(v2_up),
+               v2_down, sizeof(v2_down)) != 0) {
+        goto cleanup;
+    }
+    memset(v2_record, 0, sizeof(v2_record));
+    memset(v2_tasks, 0, sizeof(v2_tasks));
+    v2_n_tasks = 0;
+    v2_read_bytes = 0;
+    v2_read_ms = 0.0;
+    if (!ds4_gpu_stream_expert_append_record_tasks(
+            v2_tasks, 3, &v2_n_tasks,
+            v2_gate_offset + 2u * sizeof(v2_gate),
+            v2_up_offset + 2u * sizeof(v2_up),
+            v2_down_offset + 2u * sizeof(v2_down),
+            sizeof(v2_gate), sizeof(v2_down),
+            v2_record,
+            v2_record + sizeof(v2_gate),
+            v2_record + sizeof(v2_gate) + sizeof(v2_up),
+            HEBRUS_GPU_STREAM_EXPERT_RECORD_PAIRED2) ||
+        v2_n_tasks != 2 ||
+        !v2_tasks[0].direct_source ||
+        !v2_tasks[1].direct_source ||
+        v2_tasks[0].source_offset != v2_record_offset ||
+        v2_tasks[1].source_offset !=
+            v2_record_offset + sizeof(v2_gate) + sizeof(v2_up) ||
+        v2_tasks[0].dst != v2_record ||
+        v2_tasks[1].dst !=
+            v2_record + sizeof(v2_gate) + sizeof(v2_up) ||
+        v2_tasks[0].len != sizeof(v2_gate) + sizeof(v2_up) ||
+        v2_tasks[1].len != sizeof(v2_down) ||
+        !ds4_gpu_stream_expert_pread_tasks(
+            v2_tasks, v2_n_tasks, &v2_read_bytes, &v2_read_ms) ||
+        v2_read_bytes != sizeof(v2_record) ||
+        v2_tasks[0].successful_syscalls != 1 ||
+        v2_tasks[1].successful_syscalls != 1 ||
         memcmp(v2_record, v2_gate, sizeof(v2_gate)) != 0 ||
         memcmp(v2_record + sizeof(v2_gate), v2_up, sizeof(v2_up)) != 0 ||
         memcmp(v2_record + sizeof(v2_gate) + sizeof(v2_up),
