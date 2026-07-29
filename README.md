@@ -211,10 +211,12 @@ disk-KV format remain unchanged.
 
 ## Measured results
 
-These are current durable measurements from one Apple M5 Pro with 64 GiB of
-unified memory. They are not cross-model rankings: artifacts, prompts,
-residency modes, and decode lanes differ. Follow the evidence links for exact
-commands, hashes, invalidations, and memory telemetry.
+The promotion figures in the table below are current durable measurements from
+one Apple M5 Pro with 64 GiB of unified memory. Separate additive physical
+M1 Pro 16/32 GiB records test the lower-memory AUTO boundary without changing
+the published support contract. These are not cross-model rankings: artifacts,
+prompts, residency modes, and decode lanes differ. Follow the evidence links
+for exact commands, hashes, invalidations, and memory telemetry.
 
 | Path | Evidence lane | Measured result |
 | --- | --- | --- |
@@ -227,6 +229,8 @@ Sources:
 
 - [Qwen unified affine AUTO and SSD promotion](docs/benchmarks/2026-07-21-qwen-unified-affine-auto-ssd.md)
 - [Qwen Q2_K_XL and shared-runtime decision](docs/benchmarks/2026-07-28-qwen-q2-k-xl-performance-weight.md)
+- [Qwen physical M1 Pro 16 GiB `main` evidence](docs/benchmarks/2026-07-29-qwen-m1-pro-16g-main.md)
+- [Qwen physical M1 Pro 32 GiB `main` evidence](docs/benchmarks/2026-07-29-qwen-m1-pro-32g-main.md)
 - [DeepSeek and GLM long-context Metal stack](docs/benchmarks/2026-07-20-long-context-metal-stack.md)
 - [Benchmark evidence index](docs/benchmarks/README.md)
 

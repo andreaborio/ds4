@@ -708,6 +708,20 @@
       "maximum": 2
     },
     {
+      "path": "docs/benchmarks/2026-07-29-qwen-m1-pro-16g-main.md",
+      "location": "content",
+      "token": "DS4",
+      "classification": "serialized/permanent",
+      "maximum": 2
+    },
+    {
+      "path": "docs/benchmarks/2026-07-29-qwen-m1-pro-32g-main.md",
+      "location": "content",
+      "token": "DS4",
+      "classification": "serialized/permanent",
+      "maximum": 3
+    },
+    {
       "path": "docs/benchmarks/2026-07-29-qwen-paired-expert-record-pread.md",
       "location": "content",
       "token": "ds4",
