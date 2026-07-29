@@ -15234,33 +15234,7 @@ DS4_STATIC_ASSERT(ds4_qwen35_macro_row_geometry,
                   QWEN35_MACRO_BYTES_PER_TOKEN == 16392u);
 
 typedef struct {
-    uint32_t ctx_capacity;
-    uint32_t prefill_cap;
-    uint32_t n_tokens;
-    bool state_valid;
-
-    /* Reused one-token work tensors. */
-    ds4_gpu_tensor *hidden[2];
-    ds4_gpu_tensor *norm;
-    ds4_gpu_tensor *projection;
-    ds4_gpu_tensor *gate;
-    ds4_gpu_tensor *query;
-    ds4_gpu_tensor *key;
-    ds4_gpu_tensor *value;
-    ds4_gpu_tensor *gdn_query;
-    ds4_gpu_tensor *gdn_key;
-    ds4_gpu_tensor *gdn_value;
-    ds4_gpu_tensor *alpha_logit;
-    ds4_gpu_tensor *beta_logit;
-    ds4_gpu_tensor *log_decay;
-    ds4_gpu_tensor *beta;
-    ds4_gpu_tensor *heads;
-    ds4_gpu_tensor *attn_out;
-    ds4_gpu_tensor *attn_score;
-
-    /* Resident layer-major prefill scratch.  The scheduler uses only the
-     * leading n_token rows; persistent recurrent/KV state stays shared with
-     * decode, so a prefilled session can generate immediately afterward. */
+    uint32_t capacity;
     ds4_gpu_tensor *batch_token_ids;
     ds4_gpu_tensor *batch_positions;
     ds4_gpu_tensor *batch_hidden[2];
@@ -15289,6 +15263,37 @@ typedef struct {
     ds4_gpu_tensor *batch_shared_mid;
     ds4_gpu_tensor *batch_shared_out;
     ds4_gpu_tensor *batch_shared_gate_logit;
+} ds4_qwen35_gpu_prefill_arena;
+
+typedef struct {
+    uint32_t ctx_capacity;
+    uint32_t n_tokens;
+    bool state_valid;
+
+    /* Reused one-token work tensors. */
+    ds4_gpu_tensor *hidden[2];
+    ds4_gpu_tensor *norm;
+    ds4_gpu_tensor *projection;
+    ds4_gpu_tensor *gate;
+    ds4_gpu_tensor *query;
+    ds4_gpu_tensor *key;
+    ds4_gpu_tensor *value;
+    ds4_gpu_tensor *gdn_query;
+    ds4_gpu_tensor *gdn_key;
+    ds4_gpu_tensor *gdn_value;
+    ds4_gpu_tensor *alpha_logit;
+    ds4_gpu_tensor *beta_logit;
+    ds4_gpu_tensor *log_decay;
+    ds4_gpu_tensor *beta;
+    ds4_gpu_tensor *heads;
+    ds4_gpu_tensor *attn_out;
+    ds4_gpu_tensor *attn_score;
+
+    /* Layer-major prefill scratch has independent ownership even though this
+     * first structural slice retains the historical session-long lifetime.
+     * The scheduler uses only the leading n_token rows; persistent
+     * recurrent/KV state stays in the graph so decode can begin immediately. */
+    ds4_qwen35_gpu_prefill_arena prefill;
 
     /* Exactly one state kind is live for each model layer.  Full-attention
      * rows are [context][kv_head][head_dim].  Recurrent state is
@@ -15603,38 +15608,44 @@ static bool qwen35_gpu_macro_transaction_workspace_alloc(
     return true;
 }
 
+static void qwen35_gpu_prefill_arena_free(
+        ds4_qwen35_gpu_prefill_arena *a) {
+    if (!a) return;
+    ds4_gpu_tensor_free(a->batch_shared_gate_logit);
+    ds4_gpu_tensor_free(a->batch_shared_out);
+    ds4_gpu_tensor_free(a->batch_shared_mid);
+    ds4_gpu_tensor_free(a->batch_shared_up);
+    ds4_gpu_tensor_free(a->batch_shared_gate);
+    ds4_gpu_tensor_free(a->batch_moe_out);
+    ds4_gpu_tensor_free(a->batch_routed_down);
+    ds4_gpu_tensor_free(a->batch_routed_mid);
+    ds4_gpu_tensor_free(a->batch_routed_up);
+    ds4_gpu_tensor_free(a->batch_routed_gate);
+    ds4_gpu_tensor_free(a->batch_router_weight);
+    ds4_gpu_tensor_free(a->batch_router_selected);
+    ds4_gpu_tensor_free(a->batch_router_logits);
+    ds4_gpu_tensor_free(a->batch_attn_out);
+    ds4_gpu_tensor_free(a->batch_beta);
+    ds4_gpu_tensor_free(a->batch_log_decay);
+    ds4_gpu_tensor_free(a->batch_beta_logit);
+    ds4_gpu_tensor_free(a->batch_alpha_logit);
+    ds4_gpu_tensor_free(a->batch_heads);
+    ds4_gpu_tensor_free(a->batch_value);
+    ds4_gpu_tensor_free(a->batch_key);
+    ds4_gpu_tensor_free(a->batch_query);
+    ds4_gpu_tensor_free(a->batch_gate);
+    ds4_gpu_tensor_free(a->batch_projection);
+    ds4_gpu_tensor_free(a->batch_norm);
+    ds4_gpu_tensor_free(a->batch_hidden[1]);
+    ds4_gpu_tensor_free(a->batch_hidden[0]);
+    ds4_gpu_tensor_free(a->batch_positions);
+    ds4_gpu_tensor_free(a->batch_token_ids);
+    memset(a, 0, sizeof(*a));
+}
+
 static void qwen35_gpu_graph_free(ds4_qwen35_gpu_graph *g) {
     if (!g) return;
-
-    ds4_gpu_tensor_free(g->batch_shared_gate_logit);
-    ds4_gpu_tensor_free(g->batch_shared_out);
-    ds4_gpu_tensor_free(g->batch_shared_mid);
-    ds4_gpu_tensor_free(g->batch_shared_up);
-    ds4_gpu_tensor_free(g->batch_shared_gate);
-    ds4_gpu_tensor_free(g->batch_moe_out);
-    ds4_gpu_tensor_free(g->batch_routed_down);
-    ds4_gpu_tensor_free(g->batch_routed_mid);
-    ds4_gpu_tensor_free(g->batch_routed_up);
-    ds4_gpu_tensor_free(g->batch_routed_gate);
-    ds4_gpu_tensor_free(g->batch_router_weight);
-    ds4_gpu_tensor_free(g->batch_router_selected);
-    ds4_gpu_tensor_free(g->batch_router_logits);
-    ds4_gpu_tensor_free(g->batch_attn_out);
-    ds4_gpu_tensor_free(g->batch_beta);
-    ds4_gpu_tensor_free(g->batch_log_decay);
-    ds4_gpu_tensor_free(g->batch_beta_logit);
-    ds4_gpu_tensor_free(g->batch_alpha_logit);
-    ds4_gpu_tensor_free(g->batch_heads);
-    ds4_gpu_tensor_free(g->batch_value);
-    ds4_gpu_tensor_free(g->batch_key);
-    ds4_gpu_tensor_free(g->batch_query);
-    ds4_gpu_tensor_free(g->batch_gate);
-    ds4_gpu_tensor_free(g->batch_projection);
-    ds4_gpu_tensor_free(g->batch_norm);
-    ds4_gpu_tensor_free(g->batch_hidden[1]);
-    ds4_gpu_tensor_free(g->batch_hidden[0]);
-    ds4_gpu_tensor_free(g->batch_positions);
-    ds4_gpu_tensor_free(g->batch_token_ids);
+    qwen35_gpu_prefill_arena_free(&g->prefill);
 
     ds4_gpu_tensor_free(g->logits);
     ds4_gpu_tensor_free(g->output_norm);
@@ -15696,27 +15707,44 @@ static bool qwen35_gpu_graph_add_tensor_bytes(
         *total, ds4_gpu_tensor_bytes(tensor), total);
 }
 
+static bool qwen35_gpu_prefill_arena_allocated_bytes(
+        const ds4_qwen35_gpu_prefill_arena *a,
+        uint64_t                           *bytes_out) {
+    if (!a || !bytes_out) return false;
+    uint64_t total = 0;
+    const ds4_gpu_tensor *tensors[] = {
+        a->batch_token_ids, a->batch_positions,
+        a->batch_hidden[0], a->batch_hidden[1], a->batch_norm,
+        a->batch_projection, a->batch_gate, a->batch_query,
+        a->batch_key, a->batch_value, a->batch_heads,
+        a->batch_alpha_logit, a->batch_beta_logit,
+        a->batch_log_decay, a->batch_beta, a->batch_attn_out,
+        a->batch_router_logits, a->batch_router_selected,
+        a->batch_router_weight, a->batch_routed_gate,
+        a->batch_routed_up, a->batch_routed_mid, a->batch_routed_down,
+        a->batch_moe_out, a->batch_shared_gate, a->batch_shared_up,
+        a->batch_shared_mid, a->batch_shared_out,
+        a->batch_shared_gate_logit,
+    };
+    for (size_t i = 0; i < sizeof(tensors) / sizeof(tensors[0]); i++) {
+        if (!qwen35_gpu_graph_add_tensor_bytes(&total, tensors[i])) {
+            return false;
+        }
+    }
+    *bytes_out = total;
+    return true;
+}
+
 static bool qwen35_gpu_graph_allocated_bytes(
         const ds4_qwen35_gpu_graph *g,
         uint64_t                    *bytes_out) {
     if (!g || !bytes_out) return false;
     uint64_t total = 0;
+    uint64_t prefill_bytes = 0;
     const ds4_gpu_tensor *fixed[] = {
         g->hidden[0], g->hidden[1], g->norm, g->projection, g->gate,
         g->query, g->key, g->value, g->alpha_logit, g->beta_logit,
         g->log_decay, g->beta, g->heads, g->attn_out, g->attn_score,
-        g->batch_token_ids, g->batch_positions,
-        g->batch_hidden[0], g->batch_hidden[1], g->batch_norm,
-        g->batch_projection, g->batch_gate, g->batch_query,
-        g->batch_key, g->batch_value, g->batch_heads,
-        g->batch_alpha_logit, g->batch_beta_logit,
-        g->batch_log_decay, g->batch_beta, g->batch_attn_out,
-        g->batch_router_logits, g->batch_router_selected,
-        g->batch_router_weight, g->batch_routed_gate,
-        g->batch_routed_up, g->batch_routed_mid, g->batch_routed_down,
-        g->batch_moe_out, g->batch_shared_gate, g->batch_shared_up,
-        g->batch_shared_mid, g->batch_shared_out,
-        g->batch_shared_gate_logit,
         g->router_logits, g->router_probability, g->router_selected,
         g->router_weight, g->routed_gate, g->routed_up, g->routed_mid,
         g->routed_down, g->moe_partial[0], g->moe_partial[1], g->moe_out,
@@ -15725,6 +15753,11 @@ static bool qwen35_gpu_graph_allocated_bytes(
     };
     for (size_t i = 0; i < sizeof(fixed) / sizeof(fixed[0]); i++) {
         if (!qwen35_gpu_graph_add_tensor_bytes(&total, fixed[i])) return false;
+    }
+    if (!qwen35_gpu_prefill_arena_allocated_bytes(
+            &g->prefill, &prefill_bytes) ||
+        !qwen35_gpu_checked_add_u64(total, prefill_bytes, &total)) {
+        return false;
     }
     for (uint32_t il = 0; il < QWEN35_N_LAYER; il++) {
         if (!qwen35_gpu_graph_add_tensor_bytes(&total, g->full_attn_key[il]) ||
@@ -15738,10 +15771,29 @@ static bool qwen35_gpu_graph_allocated_bytes(
     return true;
 }
 
+static bool qwen35_gpu_prefill_arena_state_allocated(
+        const ds4_qwen35_gpu_prefill_arena *a) {
+    return a && a->capacity != 0 &&
+           a->capacity <= QWEN35_GPU_PREFILL_CAP &&
+           a->batch_token_ids && a->batch_positions &&
+           a->batch_hidden[0] && a->batch_hidden[1] && a->batch_norm &&
+           a->batch_projection && a->batch_gate && a->batch_query &&
+           a->batch_key && a->batch_value && a->batch_heads &&
+           a->batch_alpha_logit && a->batch_beta_logit &&
+           a->batch_log_decay && a->batch_beta && a->batch_attn_out &&
+           a->batch_router_logits && a->batch_router_selected &&
+           a->batch_router_weight && a->batch_routed_gate &&
+           a->batch_routed_up && a->batch_routed_mid &&
+           a->batch_routed_down && a->batch_moe_out &&
+           a->batch_shared_gate && a->batch_shared_up &&
+           a->batch_shared_mid && a->batch_shared_out &&
+           a->batch_shared_gate_logit;
+}
+
 static bool qwen35_gpu_graph_state_allocated(
         const ds4_qwen35_gpu_graph *g) {
-    if (!g || g->ctx_capacity == 0 || g->prefill_cap == 0 ||
-        g->prefill_cap > QWEN35_GPU_PREFILL_CAP ||
+    if (!g || g->ctx_capacity == 0 ||
+        !qwen35_gpu_prefill_arena_state_allocated(&g->prefill) ||
         g->ctx_capacity > QWEN35_CONTEXT_LENGTH) {
         return false;
     }
@@ -15835,7 +15887,7 @@ static bool qwen35_gpu_graph_validate_range(
         const ds4_qwen35_gpu_graph *g,
         uint32_t                    position,
         uint32_t                    n_token) {
-    return g && n_token != 0 && n_token <= g->prefill_cap &&
+    return g && n_token != 0 && n_token <= g->prefill.capacity &&
            qwen35_gpu_graph_state_allocated(g) && g->state_valid &&
            position == g->n_tokens && position <= g->ctx_capacity &&
            n_token <= g->ctx_capacity - position;
@@ -15887,6 +15939,96 @@ static bool qwen35_gpu_graph_mark_state_invalid(
     return true;
 }
 
+static bool qwen35_gpu_prefill_arena_alloc(
+        ds4_qwen35_gpu_prefill_arena *a,
+        uint32_t                      capacity) {
+    if (!a || a->capacity != 0 || capacity == 0 ||
+        capacity > QWEN35_GPU_PREFILL_CAP) {
+        return false;
+    }
+
+    ds4_qwen35_gpu_prefill_arena next = {0};
+    next.capacity = capacity;
+
+#define QWEN35_PREFILL_ALLOC_F32(field, d0, d1, d2, d3) \
+    next.field = qwen35_gpu_tensor_alloc_shape(            \
+        sizeof(float), (d0), (d1), (d2), (d3))
+#define QWEN35_PREFILL_ALLOC_I32(field, d0, d1, d2, d3) \
+    next.field = qwen35_gpu_tensor_alloc_shape(            \
+        sizeof(int32_t), (d0), (d1), (d2), (d3))
+
+    QWEN35_PREFILL_ALLOC_I32(batch_token_ids, capacity, 1, 1, 1);
+    QWEN35_PREFILL_ALLOC_I32(batch_positions, capacity, 1, 1, 1);
+    QWEN35_PREFILL_ALLOC_F32(batch_hidden[0], capacity,
+                             QWEN35_N_EMBD, 1, 1);
+    QWEN35_PREFILL_ALLOC_F32(batch_hidden[1], capacity,
+                             QWEN35_N_EMBD, 1, 1);
+    QWEN35_PREFILL_ALLOC_F32(batch_norm, capacity,
+                             QWEN35_N_EMBD, 1, 1);
+    QWEN35_PREFILL_ALLOC_F32(batch_projection, capacity,
+                             QWEN35_SSM_CONV_CHANNEL, 1, 1);
+    QWEN35_PREFILL_ALLOC_F32(batch_gate, capacity,
+                             QWEN35_SSM_INNER, 1, 1);
+    QWEN35_PREFILL_ALLOC_F32(batch_query, capacity,
+                             QWEN35_N_HEAD, QWEN35_N_HEAD_DIM, 1);
+    QWEN35_PREFILL_ALLOC_F32(batch_key, capacity,
+                             QWEN35_N_HEAD_KV, QWEN35_N_HEAD_DIM, 1);
+    QWEN35_PREFILL_ALLOC_F32(batch_value, capacity,
+                             QWEN35_N_HEAD_KV, QWEN35_N_HEAD_DIM, 1);
+    QWEN35_PREFILL_ALLOC_F32(batch_heads, capacity,
+                             QWEN35_SSM_INNER, 1, 1);
+    QWEN35_PREFILL_ALLOC_F32(batch_alpha_logit, capacity,
+                             QWEN35_SSM_VALUE_HEAD, 1, 1);
+    QWEN35_PREFILL_ALLOC_F32(batch_beta_logit, capacity,
+                             QWEN35_SSM_VALUE_HEAD, 1, 1);
+    QWEN35_PREFILL_ALLOC_F32(batch_log_decay, capacity,
+                             QWEN35_SSM_VALUE_HEAD, 1, 1);
+    QWEN35_PREFILL_ALLOC_F32(batch_beta, capacity,
+                             QWEN35_SSM_VALUE_HEAD, 1, 1);
+    QWEN35_PREFILL_ALLOC_F32(batch_attn_out, capacity,
+                             QWEN35_N_EMBD, 1, 1);
+    QWEN35_PREFILL_ALLOC_F32(batch_router_logits, capacity,
+                             QWEN35_N_EXPERT, 1, 1);
+    QWEN35_PREFILL_ALLOC_I32(batch_router_selected, capacity,
+                             QWEN35_N_EXPERT_USED, 1, 1);
+    QWEN35_PREFILL_ALLOC_F32(batch_router_weight, capacity,
+                             QWEN35_N_EXPERT_USED, 1, 1);
+    QWEN35_PREFILL_ALLOC_F32(batch_routed_gate, capacity,
+                             QWEN35_N_EXPERT_USED,
+                             QWEN35_N_FF_EXP, 1);
+    QWEN35_PREFILL_ALLOC_F32(batch_routed_up, capacity,
+                             QWEN35_N_EXPERT_USED,
+                             QWEN35_N_FF_EXP, 1);
+    QWEN35_PREFILL_ALLOC_F32(batch_routed_mid, capacity,
+                             QWEN35_N_EXPERT_USED,
+                             QWEN35_N_FF_EXP, 1);
+    QWEN35_PREFILL_ALLOC_F32(batch_routed_down, capacity,
+                             QWEN35_N_EXPERT_USED,
+                             QWEN35_N_EMBD, 1);
+    QWEN35_PREFILL_ALLOC_F32(batch_moe_out, capacity,
+                             QWEN35_N_EMBD, 1, 1);
+    QWEN35_PREFILL_ALLOC_F32(batch_shared_gate, capacity,
+                             QWEN35_N_FF_SHARED, 1, 1);
+    QWEN35_PREFILL_ALLOC_F32(batch_shared_up, capacity,
+                             QWEN35_N_FF_SHARED, 1, 1);
+    QWEN35_PREFILL_ALLOC_F32(batch_shared_mid, capacity,
+                             QWEN35_N_FF_SHARED, 1, 1);
+    QWEN35_PREFILL_ALLOC_F32(batch_shared_out, capacity,
+                             QWEN35_N_EMBD, 1, 1);
+    QWEN35_PREFILL_ALLOC_F32(batch_shared_gate_logit,
+                             capacity, 1, 1, 1);
+
+#undef QWEN35_PREFILL_ALLOC_I32
+#undef QWEN35_PREFILL_ALLOC_F32
+
+    if (!qwen35_gpu_prefill_arena_state_allocated(&next)) {
+        qwen35_gpu_prefill_arena_free(&next);
+        return false;
+    }
+    *a = next;
+    return true;
+}
+
 static bool qwen35_gpu_graph_alloc(
         ds4_qwen35_gpu_graph *g,
         uint32_t              ctx_capacity,
@@ -15899,7 +16041,6 @@ static bool qwen35_gpu_graph_alloc(
 
     ds4_qwen35_gpu_graph next = {0};
     next.ctx_capacity = ctx_capacity;
-    next.prefill_cap = prefill_cap;
 
 #define QWEN35_GPU_ALLOC_F32(field, d0, d1, d2, d3) \
     next.field = qwen35_gpu_tensor_alloc_shape(       \
@@ -15939,62 +16080,10 @@ static bool qwen35_gpu_graph_alloc(
     QWEN35_GPU_ALLOC_F32(attn_out, QWEN35_N_EMBD, 1, 1, 1);
     QWEN35_GPU_ALLOC_F32(attn_score, ctx_capacity, 1, 1, 1);
 
-    QWEN35_GPU_ALLOC_I32(batch_token_ids, prefill_cap, 1, 1, 1);
-    QWEN35_GPU_ALLOC_I32(batch_positions, prefill_cap, 1, 1, 1);
-    QWEN35_GPU_ALLOC_F32(batch_hidden[0], prefill_cap,
-                         QWEN35_N_EMBD, 1, 1);
-    QWEN35_GPU_ALLOC_F32(batch_hidden[1], prefill_cap,
-                         QWEN35_N_EMBD, 1, 1);
-    QWEN35_GPU_ALLOC_F32(batch_norm, prefill_cap,
-                         QWEN35_N_EMBD, 1, 1);
-    QWEN35_GPU_ALLOC_F32(batch_projection, prefill_cap,
-                         QWEN35_SSM_CONV_CHANNEL, 1, 1);
-    QWEN35_GPU_ALLOC_F32(batch_gate, prefill_cap,
-                         QWEN35_SSM_INNER, 1, 1);
-    QWEN35_GPU_ALLOC_F32(batch_query, prefill_cap,
-                         QWEN35_N_HEAD, QWEN35_N_HEAD_DIM, 1);
-    QWEN35_GPU_ALLOC_F32(batch_key, prefill_cap,
-                         QWEN35_N_HEAD_KV, QWEN35_N_HEAD_DIM, 1);
-    QWEN35_GPU_ALLOC_F32(batch_value, prefill_cap,
-                         QWEN35_N_HEAD_KV, QWEN35_N_HEAD_DIM, 1);
-    QWEN35_GPU_ALLOC_F32(batch_heads, prefill_cap,
-                         QWEN35_SSM_INNER, 1, 1);
-    QWEN35_GPU_ALLOC_F32(batch_alpha_logit, prefill_cap,
-                         QWEN35_SSM_VALUE_HEAD, 1, 1);
-    QWEN35_GPU_ALLOC_F32(batch_beta_logit, prefill_cap,
-                         QWEN35_SSM_VALUE_HEAD, 1, 1);
-    QWEN35_GPU_ALLOC_F32(batch_log_decay, prefill_cap,
-                         QWEN35_SSM_VALUE_HEAD, 1, 1);
-    QWEN35_GPU_ALLOC_F32(batch_beta, prefill_cap,
-                         QWEN35_SSM_VALUE_HEAD, 1, 1);
-    QWEN35_GPU_ALLOC_F32(batch_attn_out, prefill_cap,
-                         QWEN35_N_EMBD, 1, 1);
-    QWEN35_GPU_ALLOC_F32(batch_router_logits, prefill_cap,
-                         QWEN35_N_EXPERT, 1, 1);
-    QWEN35_GPU_ALLOC_I32(batch_router_selected, prefill_cap,
-                         QWEN35_N_EXPERT_USED, 1, 1);
-    QWEN35_GPU_ALLOC_F32(batch_router_weight, prefill_cap,
-                         QWEN35_N_EXPERT_USED, 1, 1);
-    QWEN35_GPU_ALLOC_F32(batch_routed_gate, prefill_cap,
-                         QWEN35_N_EXPERT_USED, QWEN35_N_FF_EXP, 1);
-    QWEN35_GPU_ALLOC_F32(batch_routed_up, prefill_cap,
-                         QWEN35_N_EXPERT_USED, QWEN35_N_FF_EXP, 1);
-    QWEN35_GPU_ALLOC_F32(batch_routed_mid, prefill_cap,
-                         QWEN35_N_EXPERT_USED, QWEN35_N_FF_EXP, 1);
-    QWEN35_GPU_ALLOC_F32(batch_routed_down, prefill_cap,
-                         QWEN35_N_EXPERT_USED, QWEN35_N_EMBD, 1);
-    QWEN35_GPU_ALLOC_F32(batch_moe_out, prefill_cap,
-                         QWEN35_N_EMBD, 1, 1);
-    QWEN35_GPU_ALLOC_F32(batch_shared_gate, prefill_cap,
-                         QWEN35_N_FF_SHARED, 1, 1);
-    QWEN35_GPU_ALLOC_F32(batch_shared_up, prefill_cap,
-                         QWEN35_N_FF_SHARED, 1, 1);
-    QWEN35_GPU_ALLOC_F32(batch_shared_mid, prefill_cap,
-                         QWEN35_N_FF_SHARED, 1, 1);
-    QWEN35_GPU_ALLOC_F32(batch_shared_out, prefill_cap,
-                         QWEN35_N_EMBD, 1, 1);
-    QWEN35_GPU_ALLOC_F32(batch_shared_gate_logit,
-                         prefill_cap, 1, 1, 1);
+    if (!qwen35_gpu_prefill_arena_alloc(&next.prefill, prefill_cap)) {
+        qwen35_gpu_graph_free(&next);
+        return false;
+    }
 
     uint32_t n_full_attention = 0;
     uint32_t n_recurrent = 0;
@@ -16062,21 +16151,9 @@ static bool qwen35_gpu_graph_alloc(
                     next.value && next.gdn_query && next.gdn_key &&
                     next.gdn_value && next.alpha_logit && next.beta_logit &&
                     next.log_decay && next.beta && next.heads && next.attn_out &&
-                    next.attn_score && next.batch_token_ids &&
-                    next.batch_positions && next.batch_hidden[0] &&
-                    next.batch_hidden[1] && next.batch_norm &&
-                    next.batch_projection && next.batch_gate &&
-                    next.batch_query && next.batch_key && next.batch_value &&
-                    next.batch_heads && next.batch_alpha_logit &&
-                    next.batch_beta_logit && next.batch_log_decay &&
-                    next.batch_beta && next.batch_attn_out &&
-                    next.batch_router_logits && next.batch_router_selected &&
-                    next.batch_router_weight && next.batch_routed_gate &&
-                    next.batch_routed_up && next.batch_routed_mid &&
-                    next.batch_routed_down && next.batch_moe_out &&
-                    next.batch_shared_gate && next.batch_shared_up &&
-                    next.batch_shared_mid && next.batch_shared_out &&
-                    next.batch_shared_gate_logit && next.router_logits &&
+                    next.attn_score &&
+                    qwen35_gpu_prefill_arena_state_allocated(&next.prefill) &&
+                    next.router_logits &&
                     next.router_probability && next.router_selected &&
                     next.router_weight && next.router_selected_split[0] &&
                     next.router_selected_split[1] &&
@@ -17073,33 +17150,33 @@ static bool qwen35_gpu_encode_gdn_batch(
     } while (0)
 
     bool ok = ds4_gpu_rms_norm_weight_rows_tensor(
-                  graph->batch_norm, input, model->map, model->size,
+                  graph->prefill.batch_norm, input, model->map, model->size,
                   layer->attn_norm->abs_offset,
                   QWEN35_N_EMBD, n_token, 1.0e-6f) != 0;
     QWEN35_PROFILE_GDN_BATCH_STAGE("norm");
     if (ok) {
         ok = qwen35_gpu_matmul_dense_pair_batch(
-            graph->batch_projection, graph->batch_gate,
+            graph->prefill.batch_projection, graph->prefill.batch_gate,
             model, layer->attn_qkv, layer->attn_gate,
             QWEN35_N_EMBD, QWEN35_SSM_CONV_CHANNEL,
-            QWEN35_SSM_INNER, graph->batch_norm, n_token);
+            QWEN35_SSM_INNER, graph->prefill.batch_norm, n_token);
     }
     QWEN35_PROFILE_GDN_BATCH_STAGE("qkv_gate");
     if (ok) {
         ok = qwen35_gpu_matmul_dense_pair_batch(
-            graph->batch_alpha_logit, graph->batch_beta_logit,
+            graph->prefill.batch_alpha_logit, graph->prefill.batch_beta_logit,
             model, layer->ssm_alpha, layer->ssm_beta,
             QWEN35_N_EMBD, QWEN35_SSM_DT_RANK,
-            QWEN35_SSM_DT_RANK, graph->batch_norm, n_token);
+            QWEN35_SSM_DT_RANK, graph->prefill.batch_norm, n_token);
     }
     QWEN35_PROFILE_GDN_BATCH_STAGE("alpha_beta");
 
     if (ok) {
         *state_mutated = true;
         ok = ds4_gpu_qwen35_causal_conv_sequence_tensor(
-                 graph->batch_projection,
+                 graph->prefill.batch_projection,
                  graph->conv[layer_index],
-                 graph->batch_projection,
+                 graph->prefill.batch_projection,
                  model->map,
                  model->size,
                  layer->ssm_conv1d->abs_offset,
@@ -17110,10 +17187,10 @@ static bool qwen35_gpu_encode_gdn_batch(
     QWEN35_PROFILE_GDN_BATCH_STAGE("causal_conv");
     if (ok) {
         ok = ds4_gpu_qwen35_gated_delta_controls_batch_tensor(
-                 graph->batch_log_decay,
-                 graph->batch_beta,
-                 graph->batch_alpha_logit,
-                 graph->batch_beta_logit,
+                 graph->prefill.batch_log_decay,
+                 graph->prefill.batch_beta,
+                 graph->prefill.batch_alpha_logit,
+                 graph->prefill.batch_beta_logit,
                  model->map,
                  model->size,
                  layer->ssm_a->abs_offset,
@@ -17124,11 +17201,11 @@ static bool qwen35_gpu_encode_gdn_batch(
     QWEN35_PROFILE_GDN_BATCH_STAGE("controls");
     if (ok) {
         ok = ds4_gpu_qwen35_gated_delta_sequence_128_tensor(
-                 graph->batch_heads,
+                 graph->prefill.batch_heads,
                  graph->recurrent[layer_index],
-                 graph->batch_projection,
-                 graph->batch_log_decay,
-                 graph->batch_beta,
+                 graph->prefill.batch_projection,
+                 graph->prefill.batch_log_decay,
+                 graph->prefill.batch_beta,
                  n_token,
                  QWEN35_SSM_GROUP,
                  QWEN35_SSM_VALUE_HEAD) != 0;
@@ -17136,9 +17213,9 @@ static bool qwen35_gpu_encode_gdn_batch(
     QWEN35_PROFILE_GDN_BATCH_STAGE("recurrent");
     if (ok) {
         ok = ds4_gpu_qwen35_rmsnorm_gated_tensor(
-                 graph->batch_heads,
-                 graph->batch_heads,
-                 graph->batch_gate,
+                 graph->prefill.batch_heads,
+                 graph->prefill.batch_heads,
+                 graph->prefill.batch_gate,
                  model->map,
                  model->size,
                  layer->ssm_norm->abs_offset,
@@ -17151,7 +17228,7 @@ static bool qwen35_gpu_encode_gdn_batch(
         ok = qwen35_gpu_matmul_dense_batch(
             attention_out, model, layer->ssm_out,
             QWEN35_SSM_INNER, QWEN35_N_EMBD,
-            graph->batch_heads, n_token);
+            graph->prefill.batch_heads, n_token);
     }
 #undef QWEN35_PROFILE_GDN_BATCH_STAGE
     return ok;
@@ -17185,32 +17262,32 @@ static bool qwen35_gpu_encode_full_attention_batch(
     }
 
     bool ok = ds4_gpu_rms_norm_weight_rows_tensor(
-                  graph->batch_norm, input, model->map, model->size,
+                  graph->prefill.batch_norm, input, model->map, model->size,
                   layer->attn_norm->abs_offset,
                   QWEN35_N_EMBD, n_token, 1.0e-6f) != 0;
     if (ok) {
         ok = qwen35_gpu_matmul_dense_batch(
-            graph->batch_projection, model, layer->attn_q,
+            graph->prefill.batch_projection, model, layer->attn_q,
             QWEN35_N_EMBD,
             (uint64_t)2u * QWEN35_N_HEAD * QWEN35_N_HEAD_DIM,
-            graph->batch_norm, n_token);
+            graph->prefill.batch_norm, n_token);
     }
     if (ok) {
         ok = qwen35_gpu_matmul_dense_pair_batch(
-            graph->batch_key, graph->batch_value,
+            graph->prefill.batch_key, graph->prefill.batch_value,
             model, layer->attn_k, layer->attn_v,
             QWEN35_N_EMBD,
             (uint64_t)QWEN35_N_HEAD_KV * QWEN35_N_HEAD_DIM,
             (uint64_t)QWEN35_N_HEAD_KV * QWEN35_N_HEAD_DIM,
-            graph->batch_norm, n_token);
+            graph->prefill.batch_norm, n_token);
     }
     const bool fused_split_q_norm =
         n_token >= QWEN35_PREFILL_MICRO_TOKENS;
     if (ok && fused_split_q_norm) {
         ok = ds4_gpu_qwen35_split_q_gate_rms_norm_batch_tensor(
-                 graph->batch_query,
-                 graph->batch_gate,
-                 graph->batch_projection,
+                 graph->prefill.batch_query,
+                 graph->prefill.batch_gate,
+                 graph->prefill.batch_projection,
                  model->map,
                  model->size,
                  layer->attn_q_norm->abs_offset,
@@ -17220,17 +17297,17 @@ static bool qwen35_gpu_encode_full_attention_batch(
                  1.0e-6f) != 0;
     } else if (ok) {
         ok = ds4_gpu_qwen35_split_q_gate_batch_tensor(
-                 graph->batch_query,
-                 graph->batch_gate,
-                 graph->batch_projection,
+                 graph->prefill.batch_query,
+                 graph->prefill.batch_gate,
+                 graph->prefill.batch_projection,
                  n_token,
                  QWEN35_N_HEAD,
                  QWEN35_N_HEAD_DIM) != 0;
     }
     if (ok && !fused_split_q_norm) {
         ok = ds4_gpu_rms_norm_weight_rows_tensor(
-                 graph->batch_query,
-                 graph->batch_query,
+                 graph->prefill.batch_query,
+                 graph->prefill.batch_query,
                  model->map,
                  model->size,
                  layer->attn_q_norm->abs_offset,
@@ -17240,8 +17317,8 @@ static bool qwen35_gpu_encode_full_attention_batch(
     }
     if (ok) {
         ok = ds4_gpu_rms_norm_weight_rows_tensor(
-                 graph->batch_key,
-                 graph->batch_key,
+                 graph->prefill.batch_key,
+                 graph->prefill.batch_key,
                  model->map,
                  model->size,
                  layer->attn_k_norm->abs_offset,
@@ -17251,7 +17328,7 @@ static bool qwen35_gpu_encode_full_attention_batch(
     }
     if (ok) {
         ok = ds4_gpu_qwen35_rope_prefix_batch_tensor(
-                 graph->batch_query,
+                 graph->prefill.batch_query,
                  positions,
                  n_token,
                  QWEN35_N_HEAD,
@@ -17261,7 +17338,7 @@ static bool qwen35_gpu_encode_full_attention_batch(
     }
     if (ok) {
         ok = ds4_gpu_qwen35_rope_prefix_batch_tensor(
-                 graph->batch_key,
+                 graph->prefill.batch_key,
                  positions,
                  n_token,
                  QWEN35_N_HEAD_KV,
@@ -17279,15 +17356,15 @@ static bool qwen35_gpu_encode_full_attention_batch(
         *state_mutated = true;
         ok = ds4_gpu_tensor_copy_pair(
                  graph->full_attn_key[layer_index], cache_offset,
-                 graph->batch_key, 0, cache_bytes,
+                 graph->prefill.batch_key, 0, cache_bytes,
                  graph->full_attn_value[layer_index], cache_offset,
-                 graph->batch_value, 0, cache_bytes) != 0;
+                 graph->prefill.batch_value, 0, cache_bytes) != 0;
     }
     int gqa_reuse_used = 0;
     if (ok) {
         ok = ds4_gpu_qwen35_gqa_prefill_select_tensor(
-                 graph->batch_heads,
-                 graph->batch_query,
+                 graph->prefill.batch_heads,
+                 graph->prefill.batch_query,
                  graph->full_attn_key[layer_index],
                  graph->full_attn_value[layer_index],
                  position,
@@ -17312,9 +17389,9 @@ static bool qwen35_gpu_encode_full_attention_batch(
     }
     if (ok) {
         ok = ds4_gpu_qwen35_sigmoid_mul_tensor(
-                 graph->batch_heads,
-                 graph->batch_heads,
-                 graph->batch_gate,
+                 graph->prefill.batch_heads,
+                 graph->prefill.batch_heads,
+                 graph->prefill.batch_gate,
                  n_token * QWEN35_N_HEAD * QWEN35_N_HEAD_DIM,
                  false) != 0;
     }
@@ -17322,7 +17399,7 @@ static bool qwen35_gpu_encode_full_attention_batch(
         ok = qwen35_gpu_matmul_dense_batch(
             attention_out, model, layer->attn_output,
             (uint64_t)QWEN35_N_HEAD * QWEN35_N_HEAD_DIM,
-            QWEN35_N_EMBD, graph->batch_heads, n_token);
+            QWEN35_N_EMBD, graph->prefill.batch_heads, n_token);
     }
     return ok;
 }
@@ -17380,22 +17457,22 @@ static bool qwen35_gpu_encode_ffn_batch(
     } while (0)
 
     bool ok = ds4_gpu_rms_norm_weight_rows_tensor(
-                  graph->batch_norm, hidden, model->map, model->size,
+                  graph->prefill.batch_norm, hidden, model->map, model->size,
                   layer->post_attention_norm->abs_offset,
                   QWEN35_N_EMBD, n_token, 1.0e-6f) != 0;
     QWEN35_PROFILE_FFN_BATCH_STAGE("norm");
     if (ok) {
         ok = qwen35_gpu_matmul_dense_batch(
-            graph->batch_router_logits, model, layer->ffn_gate_inp,
+            graph->prefill.batch_router_logits, model, layer->ffn_gate_inp,
             QWEN35_N_EMBD, QWEN35_N_EXPERT,
-            graph->batch_norm, n_token);
+            graph->prefill.batch_norm, n_token);
     }
     QWEN35_PROFILE_FFN_BATCH_STAGE("router");
     if (ok) {
         ok = ds4_gpu_qwen35_router_softmax_top8_batch_tensor(
-                 graph->batch_router_selected,
-                 graph->batch_router_weight,
-                 graph->batch_router_logits,
+                 graph->prefill.batch_router_selected,
+                 graph->prefill.batch_router_weight,
+                 graph->prefill.batch_router_logits,
                  n_token) != 0;
     }
     QWEN35_PROFILE_FFN_BATCH_STAGE("router_top8");
@@ -17413,7 +17490,7 @@ static bool qwen35_gpu_encode_ffn_batch(
             .down_expert_bytes = down_expert_bytes,
         };
         ok = ds4_gpu_qwen35_stream_batch_route_ready_select(
-                 &stream_table, graph->batch_router_selected, n_token,
+                 &stream_table, graph->prefill.batch_router_selected, n_token,
                  QWEN35_N_EXPERT_USED,
                  layer->ffn_gate_exps->type,
                  layer->ffn_down_exps->type,
@@ -17439,15 +17516,15 @@ static bool qwen35_gpu_encode_ffn_batch(
     }
     if (ok) {
         ok = qwen35_gpu_matmul_dense_pair_batch(
-            graph->batch_shared_gate,
-            graph->batch_shared_up,
+            graph->prefill.batch_shared_gate,
+            graph->prefill.batch_shared_up,
             model,
             layer->ffn_gate_shexp,
             layer->ffn_up_shexp,
             QWEN35_N_EMBD,
             QWEN35_N_FF_SHARED,
             QWEN35_N_FF_SHARED,
-            graph->batch_norm,
+            graph->prefill.batch_norm,
             n_token);
         if (!ok) {
             fprintf(stderr,
@@ -17456,9 +17533,9 @@ static bool qwen35_gpu_encode_ffn_batch(
                     layer_index, n_token);
         } else {
             ok = ds4_gpu_swiglu_tensor(
-                     graph->batch_shared_mid,
-                     graph->batch_shared_gate,
-                     graph->batch_shared_up,
+                     graph->prefill.batch_shared_mid,
+                     graph->prefill.batch_shared_gate,
+                     graph->prefill.batch_shared_up,
                      n_token * QWEN35_N_FF_SHARED,
                      0.0f,
                      1.0f) != 0;
@@ -17473,27 +17550,27 @@ static bool qwen35_gpu_encode_ffn_batch(
     QWEN35_PROFILE_FFN_BATCH_STAGE("shared_gate_up");
     if (ok) {
         ok = qwen35_gpu_matmul_dense_batch(
-            graph->batch_shared_out, model, layer->ffn_down_shexp,
+            graph->prefill.batch_shared_out, model, layer->ffn_down_shexp,
             QWEN35_N_FF_SHARED, QWEN35_N_EMBD,
-            graph->batch_shared_mid, n_token);
+            graph->prefill.batch_shared_mid, n_token);
     }
     QWEN35_PROFILE_FFN_BATCH_STAGE("shared_down");
     if (ok) {
         ok = qwen35_gpu_matmul_dense_batch(
-            graph->batch_shared_gate_logit,
+            graph->prefill.batch_shared_gate_logit,
             model,
             layer->ffn_gate_inp_shexp,
             QWEN35_N_EMBD,
             1u,
-            graph->batch_norm,
+            graph->prefill.batch_norm,
             n_token);
     }
     QWEN35_PROFILE_FFN_BATCH_STAGE("shared_gate_projection");
     if (ok) {
         ok = ds4_gpu_qwen35_sigmoid_mul_rows_tensor(
-                 graph->batch_shared_out,
-                 graph->batch_shared_out,
-                 graph->batch_shared_gate_logit,
+                 graph->prefill.batch_shared_out,
+                 graph->prefill.batch_shared_out,
+                 graph->prefill.batch_shared_gate_logit,
                  n_token,
                  QWEN35_N_EMBD) != 0;
     }
@@ -17515,11 +17592,11 @@ static bool qwen35_gpu_encode_ffn_batch(
     if (ok) {
         bool mid_is_f16 = false;
         ok = ds4_gpu_qwen35_routed_moe_batch_select_tensor(
-                 graph->batch_moe_out,
-                 graph->batch_routed_gate,
-                 graph->batch_routed_up,
-                 graph->batch_routed_mid,
-                 graph->batch_routed_down,
+                 graph->prefill.batch_moe_out,
+                 graph->prefill.batch_routed_gate,
+                 graph->prefill.batch_routed_up,
+                 graph->prefill.batch_routed_mid,
+                 graph->prefill.batch_routed_down,
                  model->map,
                  model->size,
                  layer->ffn_gate_exps->abs_offset,
@@ -17534,12 +17611,12 @@ static bool qwen35_gpu_encode_ffn_batch(
                  QWEN35_N_EMBD,
                  QWEN35_N_FF_EXP,
                  QWEN35_N_EMBD,
-                 graph->batch_router_selected,
-                 graph->batch_router_weight,
+                 graph->prefill.batch_router_selected,
+                 graph->prefill.batch_router_weight,
                  QWEN35_N_EXPERT,
                  QWEN35_N_EXPERT_USED,
                  0.0f,
-                 graph->batch_norm,
+                 graph->prefill.batch_norm,
                  layer_index,
                  n_token,
                  &mid_is_f16,
@@ -17560,9 +17637,9 @@ static bool qwen35_gpu_encode_ffn_batch(
     const uint32_t hidden_values = n_token * QWEN35_N_EMBD;
     if (ok) {
         ok = ds4_gpu_add_tensor(
-                 graph->batch_attn_out,
-                 graph->batch_moe_out,
-                 graph->batch_shared_out,
+                 graph->prefill.batch_attn_out,
+                 graph->prefill.batch_moe_out,
+                 graph->prefill.batch_shared_out,
                  hidden_values) != 0;
     }
     QWEN35_PROFILE_FFN_BATCH_STAGE("expert_sum");
@@ -17570,7 +17647,7 @@ static bool qwen35_gpu_encode_ffn_batch(
         ok = ds4_gpu_add_tensor(
                  hidden,
                  hidden,
-                 graph->batch_attn_out,
+                 graph->prefill.batch_attn_out,
                  hidden_values) != 0;
     }
     QWEN35_PROFILE_FFN_BATCH_STAGE("residual");
@@ -17625,9 +17702,9 @@ static DS4_MAYBE_UNUSED bool qwen35_gpu_forward_prefill_chunk(
     const uint64_t position_bytes =
         (uint64_t)n_token * sizeof(positions[0]);
     if (ds4_gpu_tensor_write(
-            graph->batch_token_ids, 0, token_ids, token_bytes) == 0 ||
+            graph->prefill.batch_token_ids, 0, token_ids, token_bytes) == 0 ||
         ds4_gpu_tensor_write(
-            graph->batch_positions, 0, positions, position_bytes) == 0) {
+            graph->prefill.batch_positions, 0, positions, position_bytes) == 0) {
         return false;
     }
 
@@ -17636,13 +17713,13 @@ static DS4_MAYBE_UNUSED bool qwen35_gpu_forward_prefill_chunk(
     const char *failed_stage = ok ? NULL : "begin";
     if (ok) {
         ok = qwen35_gpu_embed_batch(
-                 graph->batch_hidden[0], graph->batch_token_ids,
+                 graph->prefill.batch_hidden[0], graph->prefill.batch_token_ids,
                  model, weights->token_embd, n_token);
         if (!ok) failed_stage = "batched embedding";
     }
 
-    ds4_gpu_tensor *current = graph->batch_hidden[0];
-    ds4_gpu_tensor *next = graph->batch_hidden[1];
+    ds4_gpu_tensor *current = graph->prefill.batch_hidden[0];
+    ds4_gpu_tensor *next = graph->prefill.batch_hidden[1];
     for (uint32_t layer_index = 0;
          ok && layer_index < QWEN35_N_LAYER;
          layer_index++) {
@@ -17658,14 +17735,14 @@ static DS4_MAYBE_UNUSED bool qwen35_gpu_forward_prefill_chunk(
         }
         if (ds4_qwen35_layer_is_full_attention(layer_index)) {
             ok = qwen35_gpu_encode_full_attention_batch(
-                graph, model, layer, current, graph->batch_positions,
-                graph->batch_attn_out,
+                graph, model, layer, current, graph->prefill.batch_positions,
+                graph->prefill.batch_attn_out,
                 layer_index, position, n_token, &state_mutated,
                 gqa_reuse, activity, activity_ud);
             if (!ok) failed_stage = "batched full attention";
         } else {
             ok = qwen35_gpu_encode_gdn_batch(
-                graph, model, layer, current, graph->batch_attn_out,
+                graph, model, layer, current, graph->prefill.batch_attn_out,
                 layer_index, n_token, &state_mutated);
             if (!ok) failed_stage = "batched Gated DeltaNet";
         }
@@ -17680,7 +17757,7 @@ static DS4_MAYBE_UNUSED bool qwen35_gpu_forward_prefill_chunk(
             ok = ds4_gpu_add_tensor(
                      next,
                      current,
-                     graph->batch_attn_out,
+                     graph->prefill.batch_attn_out,
                      n_token * QWEN35_N_EMBD) != 0;
             if (!ok) failed_stage = "batched attention residual";
         }
@@ -17840,7 +17917,7 @@ static DS4_MAYBE_UNUSED bool qwen35_gpu_forward_prefill_macro(
     }
 
     /* IDs and positions are uploaded once, before any command buffer can see
-     * them.  Reusing graph->batch_* with host writes per microchunk would race
+     * them.  Reusing graph->prefill.batch_* with host writes per microchunk would race
      * queued Metal work because ds4_gpu_tensor_write() is an immediate memcpy,
      * not a command-buffer operation. */
     if (ok) {
@@ -17917,7 +17994,7 @@ static DS4_MAYBE_UNUSED bool qwen35_gpu_forward_prefill_macro(
                 ok = qwen35_gpu_encode_full_attention_batch(
                     graph, model, layer, current,
                     workspace.position_view[chunk],
-                    graph->batch_attn_out,
+                    graph->prefill.batch_attn_out,
                     layer_index, position + first, rows,
                     &state_mutated, gqa_reuse,
                     activity, activity_ud);
@@ -17925,7 +18002,7 @@ static DS4_MAYBE_UNUSED bool qwen35_gpu_forward_prefill_macro(
                 failed_stage = "batched Gated DeltaNet";
                 ok = qwen35_gpu_encode_gdn_batch(
                     graph, model, layer, current,
-                    graph->batch_attn_out,
+                    graph->prefill.batch_attn_out,
                     layer_index, rows, &state_mutated);
             }
             if (ok) {
@@ -17933,7 +18010,7 @@ static DS4_MAYBE_UNUSED bool qwen35_gpu_forward_prefill_macro(
                 ok = ds4_gpu_add_tensor(
                          next,
                          current,
-                         graph->batch_attn_out,
+                         graph->prefill.batch_attn_out,
                          rows * QWEN35_N_EMBD) != 0;
             }
             if (ok) {
@@ -40805,7 +40882,7 @@ static bool ds4_session_qwen35_metal_prefill_chunk_commit(
         uint32_t     n_token,
         float       *logits) {
     if (!ds4_session_is_qwen35_metal(s) || !tokens || n_token == 0 ||
-        n_token > s->qwen35_gpu_graph.prefill_cap ||
+        n_token > s->qwen35_gpu_graph.prefill.capacity ||
         !ds4_session_qwen35_timeline_valid(s)) {
         return false;
     }
@@ -41396,7 +41473,7 @@ static int ds4_session_sync_qwen35_metal(
             const bool final_tile = i + (int)n_token == prompt->len;
             bool cancelled = false;
             const bool committed =
-                n_token <= s->qwen35_gpu_graph.prefill_cap
+                n_token <= s->qwen35_gpu_graph.prefill.capacity
                 ? ds4_session_qwen35_metal_prefill_chunk_commit(
                     s, &prompt->v[i], n_token,
                     final_tile ? s->logits : NULL)
@@ -41509,8 +41586,8 @@ static int ds4_session_sync_qwen35_metal(
 
             const uint32_t remaining = (uint32_t)(prompt->len - i);
             const uint32_t n_token =
-                remaining > s->qwen35_gpu_graph.prefill_cap
-                    ? s->qwen35_gpu_graph.prefill_cap : remaining;
+                remaining > s->qwen35_gpu_graph.prefill.capacity
+                    ? s->qwen35_gpu_graph.prefill.capacity : remaining;
             const bool final_chunk = i + (int)n_token == prompt->len;
             const bool committed = n_token == 1u ?
                 ds4_session_qwen35_metal_forward_commit(
@@ -41554,7 +41631,7 @@ static int ds4_session_sync_qwen35_metal(
                     batch_ssd_prefill ? "SSD" : "resident",
                     batched_tokens,
                     chunks,
-                    s->qwen35_gpu_graph.prefill_cap);
+                    s->qwen35_gpu_graph.prefill.capacity);
         }
         const int finish = s->engine->ssd_streaming
             ? ds4_session_qwen35_metal_finish_prefill_cache(
