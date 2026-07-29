@@ -7,6 +7,7 @@ because their numbers remain useful.
 
 | Record | Status | Scope |
 | --- | --- | --- |
+| [`2026-07-29-qwen-m1-pro-16g-main.md`](2026-07-29-qwen-m1-pro-16g-main.md) | Additive physical evidence; Affine4 clean through 16K, Q2 technical lanes clean through 8K, strict Affine4 32K arm rejected after new swapout | Post-fix `main` on a physical M1 Pro 16 GiB; AUTO guarded-SSD behavior, Q2/Affine4 profile tradeoff, context growth, and invalid manual chunk cohort |
 | [`2026-07-29-qwen-paired-expert-record-pread.md`](2026-07-29-qwen-paired-expert-record-pread.md) | Cumulative promotion record; Qwen resident/SSD matrix through the 262K endpoint passes, DeepSeek transfer rejected, GLM Gold exact | Final Qwen-only stack and baseline comparison; join contiguous gate+up components to reduce `pread` syscall count by one third while retaining DeepSeek component reads and GLM full-record reads |
 | [`2026-07-28-qwen-dense-id-publication-reuse.md`](2026-07-28-qwen-dense-id-publication-reuse.md) | Accepted via the 2026-07-29 cumulative promotion record | Qwen Q2_K_XL dense GGML-K dispatch; initialize the constant synthetic expert-ID buffer only on allocation or growth instead of before every projection |
 | [`2026-07-28-qwen-layer-staleness-eviction.md`](2026-07-28-qwen-layer-staleness-eviction.md) | Accepted via the 2026-07-29 cumulative promotion record | Qwen SSD expert-cache eviction; preserve hotness while replacing cross-layer LRU ties with forward layer staleness, with DeepSeek/GLM exclusion |

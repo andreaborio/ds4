@@ -404,6 +404,12 @@ rejection, new swapout, watchdog termination, output drift, or incomplete
 decode rejects the 16 GiB candidate. The current status is **physical
 16 GiB pending**; no result has been manufactured from the 64 GiB host.
 
+A 2026-07-29 physical M1 Pro 16 GiB technical run subsequently completed the
+short and 8K guarded-SSD arms with exact decode evidence and zero new swapout.
+It also confirmed that explicit resident mode fails closed on this tier. This
+partial evidence does not lower the Beta's published 64 GiB minimum; see
+[`2026-07-29-qwen-m1-pro-16g-main.md`](2026-07-29-qwen-m1-pro-16g-main.md).
+
 ## Publication boundary
 
 The two upstream artifacts preserve different tokenizer metadata. Affine4 uses
