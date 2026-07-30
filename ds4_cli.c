@@ -497,7 +497,7 @@ static int run_sampled_generation(ds4_engine *engine, const cli_config *cfg, con
     const double decode_s = t_decode1 - t_decode0;
     ds4_log(stderr,
             DS4_LOG_TIMING,
-            "ds4: prefill: %.2f t/s, generation: %.2f t/s\n",
+            "hebrus: prefill: %.2f t/s, generation: %.2f t/s\n",
             prefill_s > 0.0 ? (double)prompt->len / prefill_s : 0.0,
             decode_s > 0.0 ? (double)generated / decode_s : 0.0);
 
@@ -1469,7 +1469,7 @@ static int run_chat_turn(ds4_engine *engine, cli_config *cfg, repl_chat *chat, c
     if (interrupted) cli_interrupt_clear();
     ds4_log(stderr,
             DS4_LOG_TIMING,
-            "ds4: prefill: %.2f t/s, generation: %.2f t/s\n",
+            "hebrus: prefill: %.2f t/s, generation: %.2f t/s\n",
             prefill_s > 0.0 ? (double)suffix / prefill_s : 0.0,
             decode_s > 0.0 ? (double)generated / decode_s : 0.0);
     return 0;

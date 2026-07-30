@@ -72,7 +72,7 @@ ExpertMajor v2. AUTO is the normal startup mode.
 | --- | ---: | --- | --- |
 | DeepSeek V4 Flash | 64 GiB | AUTO resolving to resident or SSD; explicit modes for qualification | Published ExpertMajor v2 artifact; `download_model.sh deepseek-v2` |
 | GLM 5.2 | 64 GiB | AUTO resolving to SSD streaming only; resident requests are rejected | Published ExpertMajor v2 artifact; `download_model.sh glm-v2` |
-| Qwen3.6-35B-A3B | 16 GiB for Stable Affine4; 64 GiB for Q2_K_XL Beta | One shared runtime supports exact MLX Affine4 G64 and Q2_K_XL weight profiles. Guarded SSD is qualified for Affine4 at 16 GiB; Q2_K_XL Beta has resident/SSD evidence through 32K, while 262K/full-window qualification remains pending | Stable/recommended Affine4: `download_model.sh qwen-v2`; opt-in Q2_K_XL Beta: `download_model.sh qwen-q2-beta` |
+| Qwen3.6-35B-A3B | 16 GiB for Stable Affine4; 64 GiB for Q2_K_XL Beta | One shared runtime supports exact MLX Affine4 G64 and Q2_K_XL weight profiles. Guarded SSD is qualified for Affine4 at 16 GiB through a 128K prompt frontier plus 128 decode tokens; larger allocations require a higher-memory profile. Q2_K_XL Beta has resident/SSD evidence through 32K | Stable/recommended Affine4: `download_model.sh qwen-v2`; opt-in Q2_K_XL Beta: `download_model.sh qwen-q2-beta` |
 
 The canonical machine-readable
 [Qwen release contract](docs/contracts/qwen-release.json) records the current
@@ -221,6 +221,7 @@ for exact commands, hashes, invalidations, and memory telemetry.
 | Path | Evidence lane | Measured result |
 | --- | --- | --- |
 | Qwen3.6 MLX affine4/group-64 | Final shared-runtime resident A/B/B/A, 8K and 32K with 128 decode tokens | Versus tested `main`: +11.20% / +4.22% prefill/decode at 8K and +8.20% / +5.27% at 32K; exact frontier and generated-token evidence at 2K/8K/32K |
+| Qwen3.6 MLX affine4/group-64, physical 16 GiB | Guarded SSD stabilization candidate at the qualified 128K ceiling with 128 decode tokens | 70.06 / 4.01 prefill/decode t/s; TPOT p50/p95 233.897/278.205 ms; zero swap. Refreshed 8K/32K lanes remain pending |
 | Qwen3.6 Q2_K_XL | Resident 8K and 32K with 128 decode tokens | 874.68 / 66.30 prefill/decode t/s at 8K; cooled two-run 32K mean 584.82 / 43.53 t/s; exact artifact hash, byte-identical evidence, and zero swapout |
 | DeepSeek V4 Flash ExpertMajor v2 | 32K prose + 128 decode, Metal SSD | 164.43 prefill t/s and 7.27 decode t/s, with zero swapout. |
 | GLM 5.2 ExpertMajor v2 | 32K prose + 128 decode, AUTO resolving to SSD | 44.73 prefill t/s and 1.87 overall decode t/s, with zero swapout. |

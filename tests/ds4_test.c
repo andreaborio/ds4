@@ -998,6 +998,7 @@ extern bool hebrus_internal_qwen35_gpu_graph_resize_prefill(
     void *storage, size_t storage_bytes, uint32_t capacity);
 extern bool ds4_internal_qwen35_macro_transaction_rollback_test(void);
 extern bool hebrus_internal_qwen35_prefill_resource_lifecycle_test(void);
+extern bool hebrus_internal_qwen35_guarded_phase_planner_test(void);
 extern bool ds4_internal_qwen35_gpu_graph_reset(
     void *storage, size_t storage_bytes);
 extern bool ds4_internal_qwen35_gpu_graph_validate_position(
@@ -3969,6 +3970,7 @@ static void test_metal_kernel_group(void) {
     test_metal_qwen35_graph_state();
     TEST_ASSERT(ds4_internal_qwen35_macro_transaction_rollback_test());
     TEST_ASSERT(hebrus_internal_qwen35_prefill_resource_lifecycle_test());
+    TEST_ASSERT(hebrus_internal_qwen35_guarded_phase_planner_test());
     test_metal_f16_matvec_fast_nr0_4();
     test_metal_f16_prefill_matmul();
     test_metal_f32_router_prefill_matmul();

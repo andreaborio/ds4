@@ -15,7 +15,7 @@ and Qwen's lower-memory extension in
 | Model family | Minimum unified memory | Qualified Metal modes | Release startup |
 | --- | ---: | --- | --- |
 | DeepSeek V4 Flash | 64 GiB | AUTO resolving to resident or SSD; explicit resident and SSD according to the artifact gate | `./hebrus -m DEEPSEEK-DS4-ExpertMajor-v2.gguf` |
-| Qwen3.6-35B-A3B | 16 GiB for Stable Affine4; 64 GiB for Q2_K_XL Beta | 16 GiB Affine4 is qualified with guarded SSD. The allocation-time release candidate extends deterministic guarded SSD through 24 GiB; above 24 GiB AUTO may resolve to resident or SSD according to the Qwen admission gates. Q2_K_XL Beta has recorded 64 GiB resident/SSD evidence through 32768 tokens; near-262K/full-window qualification is pending | Stable: `./hebrus -m Qwen3.6-35B-A3B-DS4-ExpertMajor-v2-MLX-Affine4-G64.gguf`; Beta: `./hebrus -m Qwen3.6-35B-A3B-DS4-ExpertMajor-v2-Q2_K_XL.gguf` |
+| Qwen3.6-35B-A3B | 16 GiB for Stable Affine4; 64 GiB for Q2_K_XL Beta | 16 GiB Affine4 is qualified with guarded SSD through a 128K prompt frontier plus 128 decode tokens. The allocation-time release candidate extends deterministic guarded SSD through 24 GiB; above 24 GiB AUTO may resolve to resident or SSD according to the Qwen admission gates. Q2_K_XL Beta has recorded 64 GiB resident/SSD evidence through 32768 tokens | Stable: `./hebrus -m Qwen3.6-35B-A3B-DS4-ExpertMajor-v2-MLX-Affine4-G64.gguf`; Beta: `./hebrus -m Qwen3.6-35B-A3B-DS4-ExpertMajor-v2-Q2_K_XL.gguf` |
 | GLM 5.2 | 64 GiB | AUTO resolving to SSD streaming only; resident is rejected | `./hebrus -m GLM-DS4-ExpertMajor-v2.gguf --ctx 8192` |
 
 All rows require Apple Metal and a validated embedded `ds4.expert_major.v2`
@@ -61,6 +61,13 @@ those slots; it cannot escape through a fresh combined or per-expert buffer.
 The routed-expert target remains capped at 3,521 experts (about 5.80 GiB for
 the published artifact). A denial before the minimum route floor exists fails
 the request closed.
+
+The 16 GiB Stable Affine4 contract stops at a 131,072-token prompt frontier
+with 128 decode tokens and one bookkeeping slot (`--ctx 131201`). Larger
+allocations fail admission on that tier even though the artifact metadata
+declares 262,144 tokens. That larger metadata window remains available only on
+higher-memory profiles that pass their own qualified endpoint gates; it is not
+a release requirement for the 16 GiB profile.
 
 The allocation-time amendment described above is a publication candidate, not
 yet a new physical-hardware qualification claim. The 21 GiB planner

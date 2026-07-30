@@ -76,7 +76,19 @@ The graph separates session-lifetime core/KV/logits from the SSD prefill arena
 and macro rollback workspace, which are owned only by an active prefill phase;
 resident mode retains its wide arena and rollback workspace for the session.
 SSD admission remains conservative at the logical prefill limit, while live
-tensor accounting follows the arena's current physical capacity.
+tensor accounting follows the arena's current physical capacity. On guarded
+16/24 GiB tiers, macro-prefill planning also preserves arithmetic room for one
+complete additional route cycle at the next phase entry; the runtime still
+requires a fresh normal-pressure signal before decode and before every slab.
+The guarded macro frontier is capped at 32K so a hotter GGUF page cache cannot
+turn additional reclaimable credit into a larger transient allocation than the
+small-memory profile is intended to carry.
+After releasing transient prefill storage, guarded decode entry may re-sample
+pressure for at most 30 seconds; it proceeds only after macOS reports a fresh
+normal signal, otherwise it fails closed and rolls the transaction back.
+The physical 16 GiB policy admits at most a 128K prompt frontier plus 128
+decode tokens and one bookkeeping slot; higher-memory profiles retain their
+separate context contracts.
 
 DeepSeek and non-graph GLM binding/reference/session support still live directly
 in `ds4.c`; this is current-state debt, not permission to add another family
