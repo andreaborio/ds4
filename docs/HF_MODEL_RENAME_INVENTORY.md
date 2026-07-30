@@ -13,6 +13,12 @@ post-move comparison covered revisions, full sibling inventories, file sizes,
 LFS SHA-256 values, visibility, gating, downloads, likes, Git heads, legacy URL
 redirects, and ranged reads through each old repository ID.
 
+The Qwen filename row below is also a historical pre-migration snapshot.
+On 2026-07-30, ADR 0007 established byte-identical Hebrus basenames for the
+current Qwen Stable and Beta download targets at revision
+`e002665becd2db618897effb213030fdf92e7e98`. The old object paths remain
+available as history but are no longer canonical release targets.
+
 ## Repository baseline
 
 | Current ID | Planned ID | Main revision | Downloads | Likes | Files |
@@ -36,8 +42,10 @@ Content`; old and new Git URLs returned the same recorded HEAD for every model.
 The Qwen repository also contains historical/canonical comparison artifacts;
 the GLM repository contains the archived multipart experimental tree. The move
 must preserve every sibling and LFS/Xet object, not only the three qualified
-files above. No GGUF filename, byte count, SHA-256, revision, manifest tensor
-identifier, or historical directory is a branding rename target.
+files above. At the time of this repository-move snapshot no GGUF filename was
+a branding target. ADR 0007 later superseded that statement only for the Qwen
+Stable/Beta basenames while preserving their byte counts, SHA-256 values,
+manifest tensor identifiers, and historical objects.
 
 ## Collection and move checks
 

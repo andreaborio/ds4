@@ -15,7 +15,7 @@ and Qwen's lower-memory extension in
 | Model family | Minimum unified memory | Qualified Metal modes | Release startup |
 | --- | ---: | --- | --- |
 | DeepSeek V4 Flash | 64 GiB | AUTO resolving to resident or SSD; explicit resident and SSD according to the artifact gate | `./hebrus -m DEEPSEEK-DS4-ExpertMajor-v2.gguf` |
-| Qwen3.6-35B-A3B | 16 GiB for Stable Affine4; 64 GiB for Q2_K_XL Beta | 16 GiB Affine4 is qualified with guarded SSD through a 128K prompt frontier plus 128 decode tokens. The allocation-time release candidate extends deterministic guarded SSD through 24 GiB; above 24 GiB AUTO may resolve to resident or SSD according to the Qwen admission gates. Q2_K_XL Beta has recorded 64 GiB resident/SSD evidence through 32768 tokens | Stable: `./hebrus -m Qwen3.6-35B-A3B-DS4-ExpertMajor-v2-MLX-Affine4-G64.gguf`; Beta: `./hebrus -m Qwen3.6-35B-A3B-DS4-ExpertMajor-v2-Q2_K_XL.gguf` |
+| Qwen3.6-35B-A3B | 16 GiB for Stable Affine4; 64 GiB for Q2_K_XL Beta | 16 GiB Affine4 is qualified with guarded SSD through a 128K prompt frontier plus 128 decode tokens. The allocation-time release candidate extends deterministic guarded SSD through 24 GiB; above 24 GiB AUTO may resolve to resident or SSD according to the Qwen admission gates. Q2_K_XL Beta has recorded 64 GiB resident/SSD evidence through 32768 tokens | Stable: `./hebrus -m Qwen3.6-35B-A3B-Hebrus-ExpertMajor-v2-MLX-Affine4-G64.gguf`; Beta: `./hebrus -m Qwen3.6-35B-A3B-Hebrus-ExpertMajor-v2-Q2_K_XL.gguf` |
 | GLM 5.2 | 64 GiB | AUTO resolving to SSD streaming only; resident is rejected | `./hebrus -m GLM-DS4-ExpertMajor-v2.gguf --ctx 8192` |
 
 All rows require Apple Metal and a validated embedded `ds4.expert_major.v2`
@@ -80,11 +80,11 @@ family from Qwen's successful admission.
 
 Runtime support and public artifact distribution are separate gates. The
 Stable/recommended Qwen store remains the `published`
-`Qwen3.6-35B-A3B-DS4-ExpertMajor-v2-MLX-Affine4-G64.gguf`, a
+`Qwen3.6-35B-A3B-Hebrus-ExpertMajor-v2-MLX-Affine4-G64.gguf`, a
 20,808,566,880-byte MLX affine4/group-64 artifact with SHA-256
 `dd17266185833a9f05531ce366fd7284ddca1ed64aa3dcf06e321e8c72c9ea3d`.
 `download_model.sh qwen-v2` pins immutable repository revision
-`7bf9c3f7f6136aeb2599d75ee61c0cc2f18e2b02`; its manifest requires runtime
+`e002665becd2db618897effb213030fdf92e7e98`; its manifest requires runtime
 commit `73a332fef82a0bcdd567d17e0de17aa004cad85d` as its artifact-format
 compatibility floor. That field does not qualify an older descendant for the
 current hardware policy. A release runtime must also contain the current
@@ -95,13 +95,13 @@ older `Qwen3.6-35B-A3B-DS4-ExpertMajor-v2-Q4_K_S.gguf` store is
 [Qwen release contract](qwen-release.json) is the canonical identity record.
 
 The runtime additionally admits the exact opt-in `published-beta` Q2_K_XL
-artifact `Qwen3.6-35B-A3B-DS4-ExpertMajor-v2-Q2_K_XL.gguf`:
+artifact `Qwen3.6-35B-A3B-Hebrus-ExpertMajor-v2-Q2_K_XL.gguf`:
 12,290,632,032 bytes, SHA-256
 `30c22f70aff0f05986b517ee4ad8fef554a1b5aab6971c9ca09f999566d30143`,
 with embedded payload SHA-256
 `ccc3fbc2405d1dd73f8ac15741b0277514de4f46b80818531297ea9ffa0c6a3c`.
 `download_model.sh qwen-q2-beta` pins immutable repository revision
-`bdb363efaeb227bfd702c9145cb224fffa456891` and requires runtime commit
+`e002665becd2db618897effb213030fdf92e7e98` and requires runtime commit
 `42e2fec2a7dbb14a42e7a5612dfec00e33d443ca`. It is nonrecommended, has a
 64 GiB minimum, and is qualified only through exactly 32768 context tokens.
 It is not a `qwen-v2` replacement and makes no full-window claim. The near-262K

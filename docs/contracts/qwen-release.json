@@ -6,8 +6,8 @@
   "repository": "andreaborio/Qwen3.6-35B-A3B-Hebrus-GGUF",
   "publishedArtifact": {
     "status": "published",
-    "filename": "Qwen3.6-35B-A3B-DS4-ExpertMajor-v2-MLX-Affine4-G64.gguf",
-    "revision": "7bf9c3f7f6136aeb2599d75ee61c0cc2f18e2b02",
+    "filename": "Qwen3.6-35B-A3B-Hebrus-ExpertMajor-v2-MLX-Affine4-G64.gguf",
+    "revision": "e002665becd2db618897effb213030fdf92e7e98",
     "bytes": 20808566880,
     "sha256": "dd17266185833a9f05531ce366fd7284ddca1ed64aa3dcf06e321e8c72c9ea3d",
     "runtimeCommit": "73a332fef82a0bcdd567d17e0de17aa004cad85d",
@@ -16,8 +16,8 @@
   },
   "betaArtifact": {
     "status": "published-beta",
-    "filename": "Qwen3.6-35B-A3B-DS4-ExpertMajor-v2-Q2_K_XL.gguf",
-    "revision": "bdb363efaeb227bfd702c9145cb224fffa456891",
+    "filename": "Qwen3.6-35B-A3B-Hebrus-ExpertMajor-v2-Q2_K_XL.gguf",
+    "revision": "e002665becd2db618897effb213030fdf92e7e98",
     "bytes": 12290632032,
     "sha256": "30c22f70aff0f05986b517ee4ad8fef554a1b5aab6971c9ca09f999566d30143",
     "embeddedPayloadSha256": "ccc3fbc2405d1dd73f8ac15741b0277514de4f46b80818531297ea9ffa0c6a3c",

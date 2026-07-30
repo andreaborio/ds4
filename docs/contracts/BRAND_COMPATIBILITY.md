@@ -66,14 +66,33 @@ The following are data or provenance, not product copy. They remain unchanged:
 - ExpertMajor magic, version, offsets, digest semantics, and numeric wire
   values;
 - disk-KV magic, version, and payload ABI;
-- existing model filenames, immutable revisions, byte counts, and SHA-256
-  values containing `DS4`;
+- published model bytes, byte counts, SHA-256 values, and embedded identifiers;
 - historical benchmark, release, issue, and pull-request links;
 - Git history, authorship, copyright, and the fork relationship to
   [`antirez/ds4`](https://github.com/antirez/ds4).
 
 A branded display label may say “Hebrus ExpertMajor v2”; serialized bytes and
 identifiers do not change.
+
+## Published artifact filenames
+
+New canonical public artifact filenames use the Hebrus product name. A filename
+migration is permitted only when the Hub publishes a server-side, byte-identical
+copy and the same change:
+
+1. proves the original byte count and SHA-256 remain unchanged;
+2. pins the new path at an immutable repository revision;
+3. updates the machine-readable release contract, downloader, tests, and
+   current documentation together; and
+4. retains the pre-migration path only as a historical object, never as a
+   canonical download target or a second runtime format.
+
+The Qwen Stable and Beta artifacts completed this migration under
+[`ADR 0007`](../adr/0007-qwen-hebrus-artifact-filenames.md). Runtime admission
+does not depend on either basename: it validates the GGUF contents and embedded
+ExpertMajor contract. Historical benchmarks may therefore name the path that
+was actually used, but current commands and release surfaces must use the
+canonical Hebrus path.
 
 ## Environment variables and paths
 
@@ -118,4 +137,6 @@ ExpertMajor fields fail closed.
 
 The architectural rationale and the acceptance conditions for the rename are
 recorded in
-[`ADR 0005`](../adr/0005-hebrus-naming-and-compatibility-boundary.md).
+[`ADR 0005`](../adr/0005-hebrus-naming-and-compatibility-boundary.md); the
+Qwen artifact-filename decision is
+[`ADR 0007`](../adr/0007-qwen-hebrus-artifact-filenames.md).

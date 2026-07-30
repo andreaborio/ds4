@@ -114,11 +114,11 @@ The machine-readable
 [Qwen release contract](docs/contracts/qwen-release.json) is the canonical
 source for every repeated identity below. The current Qwen release is
 `published` as
-`Qwen3.6-35B-A3B-DS4-ExpertMajor-v2-MLX-Affine4-G64.gguf`, 20,808,566,880
+`Qwen3.6-35B-A3B-Hebrus-ExpertMajor-v2-MLX-Affine4-G64.gguf`, 20,808,566,880
 bytes, SHA-256
 `dd17266185833a9f05531ce366fd7284ddca1ed64aa3dcf06e321e8c72c9ea3d`.
 It is published at immutable repository revision
-`7bf9c3f7f6136aeb2599d75ee61c0cc2f18e2b02`, and
+`e002665becd2db618897effb213030fdf92e7e98`, and
 its manifest records artifact-format compatibility floor
 `73a332fef82a0bcdd567d17e0de17aa004cad85d`. That field proves the runtime can
 read the store; it does not supersede later hardware-safety policy. The release
@@ -131,13 +131,13 @@ a runnable fallback. See
 The additive Q2_K_XL artifact is `published-beta` and must remain opt-in through
 `download_model.sh qwen-q2-beta`; it never replaces `qwen-v2`. Its exact
 identity is
-`Qwen3.6-35B-A3B-DS4-ExpertMajor-v2-Q2_K_XL.gguf`, 12,290,632,032 bytes,
+`Qwen3.6-35B-A3B-Hebrus-ExpertMajor-v2-Q2_K_XL.gguf`, 12,290,632,032 bytes,
 SHA-256
 `30c22f70aff0f05986b517ee4ad8fef554a1b5aab6971c9ca09f999566d30143`,
 embedded payload SHA-256
 `ccc3fbc2405d1dd73f8ac15741b0277514de4f46b80818531297ea9ffa0c6a3c`.
 It is pinned at immutable revision
-`bdb363efaeb227bfd702c9145cb224fffa456891` with minimum compatible runtime
+`e002665becd2db618897effb213030fdf92e7e98` with minimum compatible runtime
 commit `42e2fec2a7dbb14a42e7a5612dfec00e33d443ca`. A Beta publication may expose
 only its measured boundary: minimum 64 GiB, 32768 qualified context tokens,
 nonrecommended, and explicitly not full-window qualified. The near-262K lane

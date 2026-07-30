@@ -66,11 +66,11 @@ A valid profile activates automatically:
 make -j8
 
 ./hebrus \
-  -m /absolute/path/to/Qwen3.6-35B-A3B-DS4-ExpertMajor-v2-MLX-Affine4-G64.gguf \
+  -m /absolute/path/to/Qwen3.6-35B-A3B-Hebrus-ExpertMajor-v2-MLX-Affine4-G64.gguf \
   --ctx 8192
 
 ./hebrus \
-  -m /absolute/path/to/Qwen3.6-35B-A3B-DS4-ExpertMajor-v2-Q2_K_XL.gguf \
+  -m /absolute/path/to/Qwen3.6-35B-A3B-Hebrus-ExpertMajor-v2-Q2_K_XL.gguf \
   --ctx 8192
 ```
 
@@ -112,10 +112,10 @@ directly:
 python3 gguf-tools/ds4-expert-major.py inspect CANONICAL-Q2-K-XL.gguf
 python3 gguf-tools/ds4-expert-major.py build \
   CANONICAL-Q2-K-XL.gguf \
-  Qwen3.6-35B-A3B-DS4-ExpertMajor-v2-Q2_K_XL.gguf
+  Qwen3.6-35B-A3B-Hebrus-ExpertMajor-v2-Q2_K_XL.gguf
 python3 gguf-tools/ds4-expert-major.py verify \
   CANONICAL-Q2-K-XL.gguf \
-  Qwen3.6-35B-A3B-DS4-ExpertMajor-v2-Q2_K_XL.gguf
+  Qwen3.6-35B-A3B-Hebrus-ExpertMajor-v2-Q2_K_XL.gguf
 ```
 
 The published Affine4 artifact additionally repacks the routed payload from the
@@ -123,11 +123,11 @@ pinned MLX source:
 
 ```sh
 python3 gguf-tools/ds4-expert-major.py build \
-  CANONICAL-QWEN.gguf QWEN-DS4-EXPERT-MAJOR-V2.gguf
+  CANONICAL-QWEN.gguf QWEN-HEBRUS-EXPERT-MAJOR-V2.gguf
 python3 gguf-tools/ds4-expert-major.py repack-mlx-affine \
-  QWEN-DS4-EXPERT-MAJOR-V2.gguf \
+  QWEN-HEBRUS-EXPERT-MAJOR-V2.gguf \
   /path/to/mlx-community-Qwen3.6-35B-A3B-4bit \
-  Qwen3.6-35B-A3B-DS4-ExpertMajor-v2-MLX-Affine4-G64.gguf
+  Qwen3.6-35B-A3B-Hebrus-ExpertMajor-v2-MLX-Affine4-G64.gguf
 ```
 
 `verify` checks source provenance, byte-identical metadata and non-routed
@@ -143,19 +143,19 @@ The published Stable, Beta, and rejection-only identities are:
 | --- | --- |
 | Publication state | `published` |
 | Repository | `andreaborio/Qwen3.6-35B-A3B-Hebrus-GGUF` |
-| Artifact | `Qwen3.6-35B-A3B-DS4-ExpertMajor-v2-MLX-Affine4-G64.gguf` |
+| Artifact | `Qwen3.6-35B-A3B-Hebrus-ExpertMajor-v2-MLX-Affine4-G64.gguf` |
 | Artifact bytes | 20,808,566,880 |
 | Artifact SHA-256 | `dd17266185833a9f05531ce366fd7284ddca1ed64aa3dcf06e321e8c72c9ea3d` |
-| Immutable revision | `7bf9c3f7f6136aeb2599d75ee61c0cc2f18e2b02` |
+| Immutable revision | `e002665becd2db618897effb213030fdf92e7e98` |
 | Minimum compatible runtime commit | `73a332fef82a0bcdd567d17e0de17aa004cad85d` |
 | Storage | `mlx-affine4/group-64` |
 | Beta publication state | `published-beta` |
 | Beta download target | `qwen-q2-beta` |
-| Beta artifact | `Qwen3.6-35B-A3B-DS4-ExpertMajor-v2-Q2_K_XL.gguf` |
+| Beta artifact | `Qwen3.6-35B-A3B-Hebrus-ExpertMajor-v2-Q2_K_XL.gguf` |
 | Beta artifact bytes | 12,290,632,032 |
 | Beta artifact SHA-256 | `30c22f70aff0f05986b517ee4ad8fef554a1b5aab6971c9ca09f999566d30143` |
 | Beta embedded payload SHA-256 | `ccc3fbc2405d1dd73f8ac15741b0277514de4f46b80818531297ea9ffa0c6a3c` |
-| Beta immutable revision | `bdb363efaeb227bfd702c9145cb224fffa456891` |
+| Beta immutable revision | `e002665becd2db618897effb213030fdf92e7e98` |
 | Beta minimum compatible runtime commit | `42e2fec2a7dbb14a42e7a5612dfec00e33d443ca` |
 | Beta storage | `ggml/group-0` |
 | Beta profile | `q2-k-xl` |

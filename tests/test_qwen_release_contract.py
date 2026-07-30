@@ -98,7 +98,7 @@ class QwenReleaseContractTests(unittest.TestCase):
         assert isinstance(negative, dict)
         cases = (
             ("README.md", published["filename"], "Qwen3.6-DRIFT.gguf"),
-            ("CONTRIBUTING.md", beta["revision"], "a" * 40),
+            ("CONTRIBUTING.md", beta["embeddedPayloadSha256"], "a" * 64),
             (
                 "docs/contracts/RUNTIME_SUPPORT.md",
                 beta["runtimeCommit"],

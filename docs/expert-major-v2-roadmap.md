@@ -62,18 +62,18 @@ layout.
   mixed-GGML inventory, 12,290,632,032 bytes, SHA-256
   `30c22f70aff0f05986b517ee4ad8fef554a1b5aab6971c9ca09f999566d30143`.
   The immutable Beta revision is
-  `bdb363efaeb227bfd702c9145cb224fffa456891`; it is opt-in, nonrecommended,
+  `e002665becd2db618897effb213030fdf92e7e98`; it is opt-in, nonrecommended,
   limited to 64 GiB and the completed 32K context lane, and preserves the
   Affine4 release. Near-262K remains pending before Stable/full-window
   promotion.
 - **Correctness:** the final resident and SSD lane retains deterministic token
   and logit comparisons with no new swapout in the recorded qualification.
 - **Release artifact:**
-  `Qwen3.6-35B-A3B-DS4-ExpertMajor-v2-MLX-Affine4-G64.gguf`,
+  `Qwen3.6-35B-A3B-Hebrus-ExpertMajor-v2-MLX-Affine4-G64.gguf`,
   20,808,566,880 bytes, SHA-256
   `dd17266185833a9f05531ce366fd7284ddca1ed64aa3dcf06e321e8c72c9ea3d`.
   The immutable repository revision is
-  `7bf9c3f7f6136aeb2599d75ee61c0cc2f18e2b02`; its manifest requires runtime
+  `e002665becd2db618897effb213030fdf92e7e98`; its manifest requires runtime
   artifact-format floor `73a332fef82a0bcdd567d17e0de17aa004cad85d`;
   release safety still requires the current runtime-support policy.
   The former Q4_K_S artifact is retained only as a fail-closed negative case.

@@ -127,8 +127,8 @@ Use the published Affine4 identity for release and lower-memory gates:
 
 | Field | Value |
 | --- | --- |
-| Publication state | Published at immutable revision `7bf9c3f7f6136aeb2599d75ee61c0cc2f18e2b02` |
-| File | `Qwen3.6-35B-A3B-DS4-ExpertMajor-v2-MLX-Affine4-G64.gguf` |
+| Publication state | Published at immutable revision `e002665becd2db618897effb213030fdf92e7e98` |
+| File | `Qwen3.6-35B-A3B-Hebrus-ExpertMajor-v2-MLX-Affine4-G64.gguf` |
 | Bytes | `20,808,566,880` |
 | SHA-256 | `dd17266185833a9f05531ce366fd7284ddca1ed64aa3dcf06e321e8c72c9ea3d` |
 | Routed storage | MLX affine4, group size 64 |
@@ -138,8 +138,8 @@ Use this exact Q2_K_XL identity for the second profile's 64 GiB gates:
 
 | Field | Value |
 | --- | --- |
-| Publication state | Qualified implementation; immutable publication revision pending |
-| File | `Qwen3.6-35B-A3B-DS4-ExpertMajor-v2-Q2_K_XL.gguf` |
+| Publication state | Published Beta at immutable revision `e002665becd2db618897effb213030fdf92e7e98` |
+| File | `Qwen3.6-35B-A3B-Hebrus-ExpertMajor-v2-Q2_K_XL.gguf` |
 | Bytes | `12,290,632,032` |
 | SHA-256 | `30c22f70aff0f05986b517ee4ad8fef554a1b5aab6971c9ca09f999566d30143` |
 | Routed storage | Exact IQ2_XS/IQ3_XXS/IQ4_XS Q2_K_XL inventory |
@@ -159,11 +159,11 @@ The converter's full byte-identity verifier is the artifact gate:
 python3 gguf-tools/ds4-expert-major.py inspect CANONICAL-QWEN.gguf
 python3 gguf-tools/ds4-expert-major.py verify \
   CANONICAL-QWEN.gguf \
-  Qwen3.6-35B-A3B-DS4-ExpertMajor-v2-MLX-Affine4-G64.gguf
+  Qwen3.6-35B-A3B-Hebrus-ExpertMajor-v2-MLX-Affine4-G64.gguf
 
 python3 gguf-tools/ds4-expert-major.py verify \
   CANONICAL-Q2-K-XL.gguf \
-  Qwen3.6-35B-A3B-DS4-ExpertMajor-v2-Q2_K_XL.gguf
+  Qwen3.6-35B-A3B-Hebrus-ExpertMajor-v2-Q2_K_XL.gguf
 ```
 
 Never use `--skip-verify` for a release artifact.
@@ -175,8 +175,8 @@ Q2_K_XL path; verify each size and complete SHA-256 against the tables above.
 Normal startup is flag-free AUTO:
 
 ```sh
-QWEN_V2=/absolute/path/to/Qwen3.6-35B-A3B-DS4-ExpertMajor-v2-MLX-Affine4-G64.gguf
-QWEN_Q2_V2=/absolute/path/to/Qwen3.6-35B-A3B-DS4-ExpertMajor-v2-Q2_K_XL.gguf
+QWEN_V2=/absolute/path/to/Qwen3.6-35B-A3B-Hebrus-ExpertMajor-v2-MLX-Affine4-G64.gguf
+QWEN_Q2_V2=/absolute/path/to/Qwen3.6-35B-A3B-Hebrus-ExpertMajor-v2-Q2_K_XL.gguf
 ./hebrus -m "$QWEN_V2" --ctx 8192 \
   -n 32 --temp 0 \
   -p 'Scrivi solo una breve funzione Python che somma due interi.'

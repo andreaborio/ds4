@@ -15,7 +15,7 @@ ownership harder to explain.
 
 A textual rename is unsafe. Existing installations and automation depend on
 `ds4` commands, `DS4_*` environment variables, repository URLs, C names, model
-filenames, and application paths. Published GGUFs and disk-KV files also contain
+paths, and application paths. Published GGUFs and disk-KV files also contain
 identifiers whose bytes are part of a durable format. The pre-rename DSBox release
 additionally probes exact source paths, C symbols, and diagnostic strings when
 admitting an ExpertMajor runtime.
@@ -50,10 +50,16 @@ The following identifiers do not change as part of the brand migration:
 - ExpertMajor v2 magic, version, manifest layout, offsets, digest semantics,
   storage wire values (`GGML = 0`, `MLX_AFFINE4 = 1`), and qualified Qwen group
   size (`64`);
-- published model filenames, byte counts, revisions, and SHA-256 values;
+- published model bytes, byte counts, SHA-256 values, and embedded identifiers;
 - disk-KV magic, version, and payload ABI;
 - Git history, tags, authorship, copyright, fork ancestry, and historical issue,
   PR, benchmark, and release links.
+
+Canonical artifact basenames are product-facing release metadata rather than
+serialized model identity. Any migration must preserve bytes and use the
+fail-closed publication procedure defined by the brand contract. Qwen's
+completed Stable/Beta filename migration is governed by
+[`ADR 0007`](0007-qwen-hebrus-artifact-filenames.md).
 
 Old model artifacts are not revived by this compatibility policy. In
 particular, the retired Qwen GGML/Q4 ExpertMajor store remains rejected under

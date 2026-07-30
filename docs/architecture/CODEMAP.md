@@ -15,6 +15,8 @@ Hebrus public-name migration and its immutable compatibility boundary are
 recorded in [`ADR 0005`](../adr/0005-hebrus-naming-and-compatibility-boundary.md).
 Qwen's shared runtime and dual weight-codec boundary are recorded in
 [`ADR 0006`](../adr/0006-qwen-dual-weight-codecs.md).
+Qwen's canonical, byte-identical Hebrus artifact basenames are recorded in
+[`ADR 0007`](../adr/0007-qwen-hebrus-artifact-filenames.md).
 For the runtime data and admission path at a glance, see the accessible
 [`mmap → ExpertMajor → AUTO → Metal/SSD flow`](hebrus-runtime-flow.svg).
 
@@ -135,7 +137,7 @@ not validated.
 | `tests/test_install.sh` | Temporary-root install/uninstall layout, path portability, capability, and explicit-removal checks |
 | `tools/brand_boundary.json` + `tools/brand_boundary_audit.py` | Exact canonical, bridged, and permanently preserved identity contract plus explicit per-file legacy `ds4`/`DS4`/`DwarfStar` classification and monotonic count ceilings; `--check` rejects contract drift, new groups, and increases, while `--refresh` requires exact authorizations before widening a ceiling |
 | `tests/test_brand_boundary_audit.py` | Fail-closed fixtures for new files and tokens, increases, reductions, deterministic refresh, and invalid manifests |
-| `docs/contracts/qwen-release.json` + `tools/qwen_release_contract.py` | Canonical Stable, opt-in Beta, and negative-only Qwen artifact identities plus the model-free gate that parses their documentation, downloader, and test surfaces for drift |
+| `docs/contracts/qwen-release.json` + `tools/qwen_release_contract.py` | Canonical Hebrus-named Stable, opt-in Beta, and historical negative-only Qwen artifact identities plus the model-free gate that parses their documentation, downloader, and test surfaces for drift |
 | `tests/test_qwen_release_contract.py` | Fail-closed fixtures for prose, table, downloader, schema, status, and negative-only Qwen release-contract drift |
 | `tests/qwen/` | Qwen fixtures, provenance, reference collectors, and model-specific gates |
 | `tests/test-vectors/` | Official and local continuation vectors plus provenance |

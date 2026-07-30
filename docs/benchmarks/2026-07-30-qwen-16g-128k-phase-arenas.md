@@ -64,7 +64,7 @@ stable, so this record is not sufficient to promote the implementation.
 | Candidate source | `fe495acd2342b3b700f2ba850921f4b6446072c8`; tree `4df8646c6f97838e15be2863ac34f6455d0dda17` |
 | Candidate binary | SHA-256 `e9e93da00848732c070d7b333bb3d6ce3bceae113cafad5b852777e6bacb0347` |
 | Runtime Metal source | SHA-256 `06de75f42895665f97153105c5a1de931973a551af4b29769dbce4a783c75098`; no overrides |
-| Artifact | `Qwen3.6-35B-A3B-DS4-ExpertMajor-v2-MLX-Affine4-G64.gguf`; 20,808,566,880 bytes |
+| Artifact identity | Canonical path `Qwen3.6-35B-A3B-Hebrus-ExpertMajor-v2-MLX-Affine4-G64.gguf`; 20,808,566,880 bytes. The physical run used its pre-migration local basename; the canonical Hub copy is byte-identical. |
 | Artifact SHA-256 | `dd17266185833a9f05531ce366fd7284ddca1ed64aa3dcf06e321e8c72c9ea3d` |
 | Prompt | `long_context_security_prompt.repeat4.txt`; SHA-256 `1a98e040a0057e9ddd01daa4139a239d8930b8b7fb75fb08894991e4275a9a09` |
 | Frontier | 131,072 prompt tokens; context allocation 131,201; 128 greedy decode tokens |
