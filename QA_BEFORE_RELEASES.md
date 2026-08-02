@@ -135,7 +135,12 @@ the right filename but no complete hash match is not release evidence.
 
 ## Performance Promotion Gate
 
-Apply the complete performance acceptance matrix in
+Before accepting any performance evidence, require the target declaration and
+pass/fail decision from the
+[`Product relevance gate`](CONTRIBUTING.md#product-relevance-gate). A failed
+gate blocks implementation and release promotion regardless of a forced-mode
+speedup or resource reduction. Apply the complete performance acceptance
+matrix in
 [`CONTRIBUTING.md`](CONTRIBUTING.md#performance-acceptance-matrix) to every
 release change intended to alter inference speed. Short-context results are
 smoke evidence only: they may reject a candidate for correctness, safety, or a
@@ -228,6 +233,10 @@ PRO file and do not execute an old PRO command.
 ## 5. SSD Streaming
 
 SSD streaming is a capacity path, so test both correctness and user experience.
+SSD performance promotion additionally requires a supported physical lane where
+the normal flag-free `AUTO` path selects SSD. Forced SSD on hardware where
+`AUTO` admits resident execution is a correctness, path-isolation, and
+non-regression control only; it cannot justify SSD optimization there.
 
 - Flash q2/q2-q4 streaming:
   `./ds4 -m "$DEEPSEEK_V2" --ssd-streaming --ssd-streaming-cache-experts 32GB -p "..."`
@@ -292,7 +301,9 @@ canonical, v1, sidecar, and community GGUFs are not equivalent inputs.
   kernel test; it is not a public runtime counter.
 - Never bypass a failed resident admission to obtain a benchmark. On a host
   where both checks pass, compare the same deterministic prompt and logits in
-  model-backed resident and forced-SSD modes.
+  model-backed resident and forced-SSD modes for correctness and path-isolation
+  only. When flag-free `AUTO` selects resident, that forced-SSD comparison is
+  not SSD performance-promotion evidence.
 - In SSD mode, verify the first route allocates one full 321-expert slab (about
   0.529 GiB), every later slab receives a fresh normal-pressure/host/Metal
   admission, denied growth freezes the effective budget at current slab
@@ -326,8 +337,10 @@ canonical, v1, sidecar, and community GGUFs are not equivalent inputs.
   inference; a command that produces tokens is a release blocker.
 - Physical 16 GiB measurements and normalized-vs-source research comparisons
   improve hardware and artifact characterization, but are not additional
-  release gates beyond the standard model/backend checks above. Do not claim
-  measurements for hardware or artifacts that were not actually tested.
+  release gates for changes that do not target those profiles. This does not
+  waive physical target-tier evidence for a performance candidate selected by
+  the 16 or 24 GiB `AUTO` profiles. Do not claim measurements for hardware or
+  artifacts that were not actually tested.
 
 ## 6. Frozen CUDA Reactivation Gate
 
@@ -513,5 +526,8 @@ Do not sign off until:
 - Disk KV cache was exercised.
 - Server API streaming was exercised.
 - Agent interruption and tool loops were exercised manually.
+- Every inference-performance claim passed the Product relevance gate on its
+  physical normal-`AUTO` target lane; forced or simulated controls were not
+  used as the positive result.
 - Speed is within expected variance for the same hardware and model.
 - Any skipped item is written down with the reason.

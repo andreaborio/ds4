@@ -213,6 +213,100 @@ generation speed at context frontiers, not one whole-run average. Prefill is
 incremental: each row measures only the newly processed suffix since the
 previous frontier.
 
+### Product relevance gate
+
+Pass this gate before implementing, live-tuning, or retaining an inference
+performance candidate. First record a product-target declaration in the active
+task plan or handoff. Promote the final declaration and decision to the dated
+benchmark record with the completed or rejected experiment. The declaration
+must identify:
+
+- the exact qualified model, artifact, and quantization profile; a new support
+  candidate additionally requires explicit authorization, its accepted ADR,
+  and the proposed runtime-contract change;
+- the physical Mac/chip and unified-memory tier, OS/power state, prompt and
+  context frontier, representative decode horizon, and the documented or
+  minimum admitted context allocation needed for that workload;
+- the normal `AUTO` startup command and the mode/cache plan that clean `main`
+  resolves under normal pressure on that target;
+- a measured end-to-end bottleneck or bounded capacity/safety constraint in
+  that normal path, not only a hit rate, byte counter, kernel time, or
+  forced-mode observation;
+- the candidate's conservative worst-case incremental resource bound and the
+  immediate rejection conditions.
+
+Here, normal `AUTO` means the documented product command with the required
+model, prompt/request, and context arguments, but no residency, cache, reserve,
+pressure, or tuning override. The context allocation must be the documented
+default or the minimum admitted allocation that fits the recorded prompt,
+decode horizon, and bookkeeping. Oversizing it, inflating an external reserve,
+adding background load, or inducing pressure to make `AUTO` select another
+mode invalidates the target.
+
+A mode is an optimization target only on a qualified physical lane, or on an
+explicitly authorized support-candidate physical lane following the ADR,
+runtime-contract, and physical-qualification process above. Clean `main` normal
+`AUTO` must select it for the representative workload. If a newly authorized
+artifact cannot be admitted by `main`, record the closest accepted runnable
+product baseline without manufacturing a cross-artifact delta, and use the
+support lane's approved qualification plan to establish a condition-matched
+comparator. Withhold positive support and performance claims until that
+physical qualification completes. If `AUTO` admits resident execution with
+every required reserve intact, forced SSD on that lane is correctness and
+non-regression evidence only: do not implement or promote an SSD optimization
+for it. SSD performance work requires a physical hardware/context lane where
+normal `AUTO` naturally selects SSD, including a family whose production
+contract is SSD-only.
+
+The narrow exception is a candidate whose declared purpose is to change the
+normal `AUTO` resolution itself, such as removing enough resident memory to
+make resident execution safely admissible. Treat that as a residency/admission
+policy change: compare clean-main and candidate normal `AUTO` on the same
+physical target, account for both plans, and complete every applicable
+admission, hardware-policy, support-contract, and release gate. A forced mode
+cannot establish the transition. A candidate may never create its own
+justification by adding enough footprint or pressure to make `AUTO` fall from
+resident to SSD.
+
+Explicit `--resident` or `--ssd-streaming`, cache-size overrides, tuning
+environment variables, simulated RAM or external reserves, fault injection,
+induced pressure, and manually constrained larger hosts create diagnostic
+control lanes. They may validate arithmetic, policy mechanics, correctness,
+fail-closed behavior, or path isolation after a real target is named. They may
+not define the target, supply its positive result, reproduce its unified-memory
+pressure/swap behavior, or be generalized to another physical hardware or
+mode. If the target hardware is unavailable, restrict work to offline or
+model-free hypothesis testing; do not produce a live promotion candidate or
+hardware performance claim.
+
+Before behavior code, account for baseline and candidate worst-case bytes by
+owner and lifetime: model/context state, Metal private and shared allocations,
+authoritative cache, staging or speculative storage, locked/wired memory, and
+pageable mappings. Use exact artifact geometry where known and otherwise a
+conservative proved upper bound; capture exact executed telemetry before
+promotion. Slot counts or logical bytes alone are insufficient. The candidate
+must fit the target `AUTO` plan's production admission and cache caps while
+preserving every context, runtime, pressure, and safety reserve. Exceeding
+remaining admitted headroom, exceeding the current guarded cache cap, assuming
+reclaim beyond the production planner's credited budget, relying on swap, or
+fitting only on a larger host is an immediate veto for an ordinary
+optimization. A proposed cap change is a separate hardware-policy/support
+change and must pass its applicable ADR, admission, physical-safety, and
+release gates before it can support a performance claim.
+
+For a speed claim, the positive result must be exact end-to-end evidence from
+the target's normal `AUTO` path. Report full-request wall time, prefill/TTFT,
+decode throughput and TPOT, memory pressure, swap, and the representative
+break-even horizon. A decode-only gain that loses the representative request,
+or lower SSD bytes or higher cache hit rate alone, is not a speed win. A
+resource/capacity candidate with no resolved wall-time improvement must instead
+demonstrate a user-level admission, pressure, or bounded-capacity improvement
+and be reported as such, not as a speedup. Required resident, SSD, and
+cross-model control lanes still protect shared paths, but a control cannot
+supply the win for a different target. If no product-relevant lane passes this
+gate, stop and reject the idea before implementation; retain only a concise
+decision record when it prevents repetition.
+
 ### Performance acceptance matrix
 
 Every inference-performance change must be evaluated at short, medium, large,
@@ -223,8 +317,12 @@ an experiment and may reject it immediately for a correctness failure, unsafe
 memory behavior, or an unambiguous regression. It cannot promote a change or
 generalize a speed claim on its own.
 
-Use these minimum frontiers on the qualified 64 GiB Metal host unless a model's
-record defines a larger model-specific lane:
+The table defines workload frontiers, not target hardware. Run these minimum
+frontiers on the physical target selected by the Product relevance gate unless
+the model's record defines a larger model-specific lane. A qualified 64 GiB
+host supplies positive promotion evidence only for a normal `AUTO` lane it
+naturally represents; otherwise it is an additional correctness or
+non-regression control, not a substitute for the physical target:
 
 | Tier | Prompt tokens | Greedy decode tokens | Role |
 | --- | ---: | ---: | --- |
@@ -295,12 +393,16 @@ Performance comparisons must also follow these rules:
   resolution. Otherwise the result is inconclusive. Cool or stabilize the
   machine and rerun the complete cohort.
 - Keep the hardware, OS, power state, model bytes, prompt prefix, sampling,
-  context allocation, generated-token count, backend mode, cache budget, and
-  other non-target settings identical. Record the resolved adaptive plan. An
-  abort, any new swapout, a different resolved plan, or a competing inference
-  process invalidates the entire cohort, including already completed arms.
-  Recover or stabilize the host, correct the unsafe policy when applicable,
-  then restart from the first A arm; do not retain a convenient retry.
+  context allocation, generated-token count, and every non-target setting
+  identical. Normally the backend mode, cache budget, and resolved plan must
+  also match. For a predeclared normal-`AUTO` plan-transition candidate, keep
+  the product command identical, require one stable plan across both A arms and
+  one stable intended plan across both B arms, and record the A-to-B transition
+  as the measured target rather than contamination. Any undeclared plan change,
+  abort, new swapout, or competing inference process invalidates the entire
+  cohort, including already completed arms. Recover or stabilize the host,
+  correct the unsafe policy when applicable, then restart from the first A arm;
+  do not retain a convenient retry.
 - Inspect application descendants, not only their visible parent processes,
   when isolating a benchmark host. Suspending an Electron application parent
   does not necessarily suspend its renderer or Node helpers. Record a
@@ -337,10 +439,13 @@ Performance comparisons must also follow these rules:
   valid frozen arm.
 - Compare `--dump-decode-evidence-dir` outputs at every frontier. Unexplained
   token or final-logit drift is a correctness failure, regardless of speed.
-- Evaluate adaptive choices per hardware/context lane. A candidate may be
-  selected only in lanes where it wins; preserve an exact fallback for the
+- Evaluate adaptive choices per hardware/context lane. Only a product-relevant
+  normal-`AUTO` target lane may supply positive selection evidence. Forced-mode
+  and simulated-hardware controls cannot. Preserve an exact fallback for the
   other lanes until the default policy is proven there.
-- A candidate that provably removes at least 40% of a bounded runtime resource
+- After the Product relevance gate passes, a candidate that provably removes
+  at least 40% of a bounded runtime resource that is a real capacity or safety
+  cost in the target `AUTO` lane
   (for example transferred bytes, storage reads, allocations, syscalls, or
   encoder creation) may be promoted even when its throughput effect is within
   measurement noise.  This resource-efficiency rule applies only when output
@@ -349,9 +454,13 @@ Performance comparisons must also follow these rules:
   throughput, phase wall, TTFT, and TPOT) regresses by less than 2.0% in each
   qualified lane.  Resource-specific timing remains mandatory telemetry but is
   not itself this end-to-end threshold unless it is the optimization target.
-  The rule does not waive the context matrix or permit averaging tiers to hide
-  a larger regression; record both the structural/resource reduction and the
-  complete per-tier performance table.
+  When wall time does not improve, the reduction must also demonstrate a
+  user-level admission, pressure, or bounded-capacity benefit in the target
+  workload and must be reported as a resource/capacity result, not a speedup.
+  The rule does not waive the context matrix, make an `AUTO`-unselected forced
+  path product-relevant, or permit averaging tiers to hide a larger regression;
+  record both the structural/resource reduction and the complete per-tier
+  performance table.
 - When exact outputs and every qualified end-to-end metric are at parity or
   better, use demonstrated long-term scalability as the tie-breaker. Prefer the
   implementation with lower asymptotic work, memory traffic, dispatch count,
@@ -369,8 +478,11 @@ Performance comparisons must also follow these rules:
 
 For shared Metal graph, prefill, decode, cache, or tensor changes, run this
 matrix on qualified DeepSeek, GLM, and Qwen artifacts before merge. A
-model-specific change runs the matrix on every mode and machine class that can
-select the changed path.
+model-specific change runs the matrix on every affected qualified normal-`AUTO`
+hardware/context lane, plus every explicit mode required as a correctness or
+non-regression control. An authorized new support lane completes its separate
+qualification gate. Control lanes cannot compensate for a loss or supply the
+positive win in the target lane.
 
 Run acceptance frontiers in separate processes so every row measures the full
 prompt from an equivalent initial state. For example:

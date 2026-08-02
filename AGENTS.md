@@ -58,6 +58,11 @@ not a production inference fallback.
   kernel internals.
 - Keep model loading mmap-backed. SSD expert loading, cache ownership, and
   overlap boundaries must remain explicit and measurable.
+- Before implementing or tuning an inference optimization, pass the
+  [`Product relevance gate`](CONTRIBUTING.md#product-relevance-gate): name the
+  physical normal-`AUTO` target and its user-level bottleneck first. Forced or
+  simulated lanes are controls only; if target `AUTO` is comfortably resident,
+  do not optimize forced SSD there.
 - Do not run multiple huge model processes concurrently. Use an isolated
   worktree/process lane when another agent or inference run may interfere.
 - Do not make a move-only refactor and a behavior change in the same commit.
