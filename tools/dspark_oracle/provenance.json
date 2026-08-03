@@ -74,7 +74,8 @@
         "contextKV": "each stage derives target history directly as kv_norm(Wkv(main_x(t))), applies base-theta RoPE only to the 64-wide tail at absolute target position t, and in-place E4M3FN Q/DQ only to seven 64-wide non-RoPE groups; target history does not pass through candidate HC-pre or attention norm",
         "tokenShift": "after target evaluates p, target logits provide pending y[p+1]; DSpark embeds [y[p+1], noise x4] at input positions p+1..p+5 and its five head rows propose p+2..p+6",
         "nonropeStorage": "the pinned config selects dtype=fp8 and scale_fmt=ue8m0 while ModelArgs supplies the absent scale_dtype key's fp8 default; the pinned act_quant kernel applies 64-wide in-place E4M3FN Q/DQ with amax floor 1e-4, power-of-two ceil(amax/448) scale, clamp to +/-448, FP32 dequant multiply, and BF16 store",
-        "rawCache": "each stage owns an independent 512-wide ring already committed through p before a proposal view is formed; the view is that committed history plus five transient candidate rows, with no duplicate current-main row; every accepted target-verifier row appends in order and a rejected suffix rolls back",
+        "rawCache": "each stage owns an independent 512-wide ring already committed through p before a proposal view is formed; the pinned top-k indices enumerate physical slots 0..127 once full, followed by five transient candidate rows, with no duplicate current-main row; every accepted target-verifier row appends in order and a rejected suffix rolls back",
+        "sparseAttention": "five queries see all committed physical-ring rows plus all five transient rows noncausally; online softmax advances in physical 64-row blocks with FP32 max/denominator/accumulator, BF16 exponential weights before each value GEMM, sink only in the denominator, and BF16 output",
         "officialVsAntirez": "the official direct target-history KV path, token shift, and no-duplicate-frontier ownership are semantic authority; antirez mechanics that transform/reinsert only a frontier main row are explicitly not copied",
         "hyperConnection": "four HC lanes; pre=sigmoid+eps, post=2*sigmoid, combination uses 20 alternating row/column Sinkhorn normalizations, and the final HC head is a sigmoid-weighted lane reduction"
       }
@@ -161,7 +162,7 @@
     }
   },
   "validation": {
-    "capturedAt": "2026-08-03T05:33:14+02:00",
+    "capturedAt": "2026-08-03T09:53:59+02:00",
     "hardware": "Apple M5 Pro, 64 GB unified memory",
     "os": "macOS 26.5.2 (25F84)",
     "python": "3.13.13",
@@ -182,13 +183,14 @@
       "hcSinkhornFloat32": 0.00000006646726902204136,
       "hcPreReductionFloat32": 0.00000003326538255965517,
       "hcPostExpansionFloat32": 0.00000025449105267583156,
-      "hcFinalHeadFloat32": 0.00000009989789218067813
+      "hcFinalHeadFloat32": 0.00000009989789218067813,
+      "dsparkAttentionBfloat16": 0.000244140625
     },
     "semanticAudit": {
-      "capturedAt": "2026-08-03T05:33:14+02:00",
+      "capturedAt": "2026-08-03T09:53:59+02:00",
       "deepSpecRevision": "005e03b81cec38b7da6399833d609ee89a2587f2",
-      "systemPython": "41 passed, 2 explicit optional MLX/support-file skips",
-      "mlxMetal": "42 passed, 1 explicit optional-support-file skip with mlx==0.32.0, mlx-metal==0.32.0, Device(gpu, 0)",
+      "systemPython": "43 passed, 2 explicit optional MLX/support-file skips",
+      "mlxMetal": "44 passed, 1 explicit optional-support-file skip with mlx==0.32.0, mlx-metal==0.32.0, Device(gpu, 0)",
       "findings": [
         "confidence scheduling uses the first per-position sigmoid below threshold, not cumulative survival",
         "greedy and caller-uniform sampled Markov drafts feed each selected token into the next proposal step",
@@ -199,7 +201,8 @@
         "stage zero concatenates exactly three target captures at every retained position before main_proj/main_norm and repeats pending y[p+1]/noise embeddings across four HC lanes at p+1..p+5",
         "the synthetic topology requires three ordered stage-distinct transforms while preserving one immutable shared main_x",
         "three stage-specific 128-by-512 rings use direct kv_norm(Wkv(main_x)), absolute-position RoPE on the 64-wide tail, and UE8M0-scaled E4M3FN Q/DQ on the 448-wide non-RoPE prefix",
-        "the proposal ring is already committed through p and adds only five transient candidate rows; accepted multi-row target-verifier prefixes commit atomically while rejection and zero-row rollback preserve prior storage",
+        "the proposal ring is already committed through p and adds only five transient candidate rows; the full-ring attention view preserves pinned physical slot order 0..127 rather than chronological wrap order; accepted multi-row target-verifier prefixes commit atomically while rejection and zero-row rollback preserve prior storage",
+        "five noncausal query rows attend through online 64-row blocks with FP32 max, denominator and accumulator, per-block BF16 exponential weights, denominator-only sinks and a final BF16 output boundary; the full-ring fixture changes 10,073 lanes under the rejected chronological ordering",
         "the pending target token is y[p+1], candidate inputs occupy p+1..p+5, and five DSpark head outputs propose p+2..p+6 rather than re-predicting y[p+1]",
         "the final support GGUF v3 header contains exactly 81 descriptors split 26/24/31 across stages; real-file offsets and structural size are checked without reading payload bytes"
       ]

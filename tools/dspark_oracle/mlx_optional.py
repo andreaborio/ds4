@@ -37,10 +37,18 @@ MLX_BF16_CONTEXT_NORMALIZED_MAX_ABS_DRIFT = 7.8125e-3
 MLX_BF16_CONTEXT_ROPE_MAX_ABS_DRIFT = 7.8125e-3
 MLX_BF16_CONTEXT_STORED_MAX_ABS_DRIFT = 6.25e-2
 MLX_F32_CONTEXT_SCALE_MAX_ABS_DRIFT = 0.0
+# The full attention output is BF16.  On the deterministic physical-ring
+# fixture MLX differs from the NumPy online-softmax oracle in six lanes, each
+# by at most one 2^-12 step after the final BF16 publication.
+MLX_BF16_ATTENTION_OUTPUT_MAX_ABS_DRIFT = 2.44140625e-4
 EXPECTED_MLX_VERSION = "0.32.0"
 EXPECTED_MLX_METAL_VERSION = "0.32.0"
 DSPARK_TARGET_LAYER_IDS = (40, 41, 42)
 DSPARK_RAW_CACHE_WIDTH = 512
+DSPARK_RAW_CACHE_WINDOW = 128
+DSPARK_ATTENTION_HEADS = 64
+DSPARK_ATTENTION_BLOCK = 64
+DSPARK_PROPOSAL_ROWS = 5
 
 
 @dataclass(frozen=True)
@@ -351,6 +359,108 @@ def direct_stage_context_kv(
         np.asarray(stored, dtype=np.float64),
         np.asarray(scales, dtype=np.float64),
     )
+
+
+def dspark_attention_official(
+    queries: np.ndarray,
+    committed_ring: np.ndarray,
+    committed_count: int,
+    draft_rows: np.ndarray,
+    attention_sinks: Sequence[float] | np.ndarray,
+) -> np.ndarray:
+    """Cross-check pinned physical-order sparse attention on MLX Metal.
+
+    ``committed_ring`` is one stage's physical 128-by-512 ring.  The first
+    ``committed_count`` physical slots are followed by five transient rows.
+    The online 64-row softmax and every BF16 boundary are re-expressed here
+    without importing the NumPy reference implementation.
+    """
+
+    query_source = np.asarray(queries)
+    ring_source = np.asarray(committed_ring)
+    draft_source = np.asarray(draft_rows)
+    sink_source = np.asarray(attention_sinks)
+    if query_source.shape != (
+        DSPARK_PROPOSAL_ROWS, DSPARK_ATTENTION_HEADS, DSPARK_RAW_CACHE_WIDTH
+    ):
+        raise ValueError("queries must have shape [5, 64, 512]")
+    if ring_source.shape != (DSPARK_RAW_CACHE_WINDOW, DSPARK_RAW_CACHE_WIDTH):
+        raise ValueError("committed_ring must have shape [128, 512]")
+    if (isinstance(committed_count, bool) or
+            not isinstance(committed_count, (int, np.integer)) or
+            int(committed_count) < 2 or
+            int(committed_count) > DSPARK_RAW_CACHE_WINDOW):
+        raise ValueError("committed_count must be inside [2, 128]")
+    if draft_source.shape != (DSPARK_PROPOSAL_ROWS, DSPARK_RAW_CACHE_WIDTH):
+        raise ValueError("draft_rows must have shape [5, 512]")
+    if sink_source.shape != (DSPARK_ATTENTION_HEADS,):
+        raise ValueError("attention_sinks must have shape [64]")
+    if not all(np.all(np.isfinite(item)) for item in
+               (query_source, ring_source, draft_source, sink_source)):
+        raise ValueError("DSpark attention inputs must be finite")
+    mx = _mlx()
+    query = _mlx_bfloat16_boundary(
+        mx, mx.array(query_source.astype(np.float32, copy=False))
+    )
+    ring = _mlx_bfloat16_boundary(
+        mx, mx.array(ring_source.astype(np.float32, copy=False))
+    )
+    draft = _mlx_bfloat16_boundary(
+        mx, mx.array(draft_source.astype(np.float32, copy=False))
+    )
+    sinks = mx.array(sink_source.astype(np.float32, copy=False))
+    physical = mx.concatenate((ring[:int(committed_count)], draft), axis=0)
+    running_max = mx.full(
+        (DSPARK_PROPOSAL_ROWS, DSPARK_ATTENTION_HEADS),
+        -float("inf"), dtype=mx.float32,
+    )
+    denominator = mx.zeros_like(running_max)
+    numerator = mx.zeros(
+        (DSPARK_PROPOSAL_ROWS,
+         DSPARK_ATTENTION_HEADS,
+         DSPARK_RAW_CACHE_WIDTH),
+        dtype=mx.float32,
+    )
+    flat_query = mx.reshape(
+        query,
+        (DSPARK_PROPOSAL_ROWS * DSPARK_ATTENTION_HEADS,
+         DSPARK_RAW_CACHE_WIDTH),
+    )
+    n_keys = int(committed_count) + DSPARK_PROPOSAL_ROWS
+    for first in range(0, n_keys, DSPARK_ATTENTION_BLOCK):
+        block = physical[first:min(first + DSPARK_ATTENTION_BLOCK, n_keys)]
+        scores = mx.reshape(
+            (flat_query @ mx.transpose(block))
+            * float(DSPARK_RAW_CACHE_WIDTH ** -0.5),
+            (DSPARK_PROPOSAL_ROWS, DSPARK_ATTENTION_HEADS, block.shape[0]),
+        )
+        previous_max = running_max
+        running_max = mx.maximum(previous_max, mx.max(scores, axis=-1))
+        previous_scale = mx.exp(previous_max - running_max)
+        weights = mx.exp(scores - running_max[..., None])
+        denominator = (
+            denominator * previous_scale + mx.sum(weights, axis=-1)
+        )
+        rounded_weights = _mlx_bfloat16_boundary(mx, weights)
+        block_numerator = mx.reshape(
+            mx.reshape(
+                rounded_weights,
+                (DSPARK_PROPOSAL_ROWS * DSPARK_ATTENTION_HEADS,
+                 block.shape[0]),
+            ) @ block,
+            (DSPARK_PROPOSAL_ROWS,
+             DSPARK_ATTENTION_HEADS,
+             DSPARK_RAW_CACHE_WIDTH),
+        )
+        numerator = (
+            numerator * previous_scale[..., None] + block_numerator
+        )
+    denominator = denominator + mx.exp(sinks[None, :] - running_max)
+    output = _mlx_bfloat16_boundary(
+        mx, numerator / denominator[..., None]
+    )
+    mx.eval(output)
+    return np.asarray(output, dtype=np.float64)
 
 
 def hc_split_sinkhorn(

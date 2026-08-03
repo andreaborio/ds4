@@ -51,7 +51,11 @@ not pass through the candidate HC-pre or attention-norm path.
 When a draft begins, the ring is already committed through position `p`; its
 target-derived `h[p]` row must not be appended a second time. A proposal view
 is therefore committed-through-`p` history plus five transient candidate rows
-for `p+1..p+5`. Building that view is pure. A verifier transaction validates
+for `p+1..p+5`. Once full, the pinned top-k indices enumerate physical ring
+slots `0..127`; they do not rotate the view back into chronological order.
+That distinction is observable because attention advances in 64-row blocks
+and rounds each block's exponential numerator weights to BF16. Building the
+view is pure. A verifier transaction validates
 all captured target rows before appending every row in its accepted prefix;
 rejected suffixes and zero-row rollback leave the prior ring byte-identical.
 Closed samples cover prompt truncation to 128, wrap, multi-row acceptance, and
@@ -63,6 +67,14 @@ at `1e-4`, UE8M0 power-of-two scale `2^ceil(log2(amax/448))`, E4M3FN clamp and
 nearest-even rounding, dequantization, then BF16 storage. It does not claim to
 reproduce the quantized-weight `Wkv` GEMM or Metal command ordering; those
 still require real runtime captures.
+
+The sparse-attention oracle additionally pins the final geometry and precision
+schedule: five noncausal query rows, 64 heads, 512-wide shared K/V, online
+softmax in physical 64-row blocks, FP32 running max/denominator/accumulator,
+BF16 weights before every value product, a denominator-only FP32 sink, and a
+final BF16 output. The deterministic full-ring fixture changes 10,073 output
+lanes (maximum `0.00048828125`) if a plausible chronological staging shortcut
+is substituted, so the rejected order cannot pass under a loose float bound.
 
 `schema.json` maps the pinned official Hugging Face config to the canonical
 combined-GGUF `dspark.*` records and to the standalone support header, including
@@ -138,6 +150,8 @@ uses `5e-8` (measured maximum `4.42772e-08`); main projection/norm uses `5e-8`
 (measured `4.70172e-08`); HC split uses `1e-7` (measured maximum
 `6.64673e-08`); HC mean uses `1e-7` (measured zero); and HC
 reductions/expansion/final-head use `5e-7` (measured maximum `2.54492e-07`).
+Full physical-ring attention uses a separate BF16 ceiling of
+`0.000244140625`, measured in six output lanes after the final BF16 boundary.
 HC post uses an explicit four-lane reduction:
 MLX's generic tiny matmul selected reduced-precision accumulation and produced
 `0.0024364` drift, which is not the elementwise production HC equation. The
@@ -164,7 +178,10 @@ What is validated now:
 - non-degenerate HC split, 20-step Sinkhorn, pre/post, and final-head equations;
 - ordered three-stage topology with one shared immutable `main_x`;
 - transactional three-ring `[128, 512]` ownership, accepted multi-row commit,
-  rollback, wraparound, and no duplicate current-frontier row;
+  rollback, wraparound, physical attention order, and no duplicate
+  current-frontier row;
+- five-row/64-head two-source attention with the pinned 64-row online-softmax,
+  per-block BF16 numerator weights, denominator-only sinks, and BF16 output;
 - pending `y[p+1]`, candidate inputs `p+1..p+5`, and proposed outputs
   `p+2..p+6`;
 - final-head wiring into greedy/sampled sequential Markov and per-position

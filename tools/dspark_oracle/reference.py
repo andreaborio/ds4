@@ -122,6 +122,14 @@ class RawCacheState:
     rows: np.ndarray
 
 
+@dataclass(frozen=True)
+class DSparkAttentionResult:
+    """Pinned sparse-attention output and its physical proposal KV view."""
+
+    output: np.ndarray
+    physical_kv: np.ndarray
+
+
 # These are the numerical guards in DeepSpec's pinned evaluator.  They are
 # deliberately named here: callers must not mistake them for a different
 # proposal distribution or an adjustable product policy.
@@ -131,6 +139,9 @@ DSPARK_STAGE_COUNT = 3
 DSPARK_RAW_CACHE_WINDOW = 128
 DSPARK_RAW_CACHE_WIDTH = 512
 DSPARK_TARGET_LAYER_IDS = (40, 41, 42)
+DSPARK_ATTENTION_HEADS = 64
+DSPARK_ATTENTION_BLOCK = 64
+DSPARK_PROPOSAL_ROWS = 5
 
 
 def post_layer_hc_mean(hidden_states: np.ndarray) -> np.ndarray:
@@ -1112,7 +1123,7 @@ def proposal_raw_cache_view(
     token_position: int,
     draft_rows: np.ndarray,
 ) -> np.ndarray:
-    """Expose committed-through-``p`` context plus five candidate rows.
+    """Expose the pinned kernel's physical committed view plus five drafts.
 
     The returned proposal view is temporary and does not mutate the committed
     rings.  ``token_position`` is the first candidate input position ``p+1``;
@@ -1120,6 +1131,13 @@ def proposal_raw_cache_view(
     second time would duplicate the frontier, which is the historical antirez
     behavior rather than the pinned official model.  Rejection or abandonment
     of a proposal cannot advance cache ownership.
+
+    The official ``get_dspark_topk_idxs`` enumerates physical slots ``0..127``
+    once the ring is full.  That is not interchangeable with chronological
+    order: sparse attention processes 64-row blocks and rounds each block's
+    exponential weights to BF16 before the value product.  Before the ring is
+    full, an admitted sequence starts at absolute position zero and the same
+    enumeration exposes physical slots ``0..length-1``.
     """
 
     _validate_raw_cache_state(state)
@@ -1134,14 +1152,126 @@ def proposal_raw_cache_view(
         or draft.shape[2] != width
     ):
         raise ValueError("draft_rows must have shape [3, block, 512]")
-    if draft.shape[1] != 5:
+    if draft.shape[1] != DSPARK_PROPOSAL_ROWS:
         raise ValueError("final 0731 proposal raw cache requires five draft rows")
     if token_position != state.token_start + state.length:
         raise ValueError("proposal position must equal committed cache end")
     if not np.all(np.isfinite(draft)):
         raise ValueError("proposal raw-cache rows must be finite")
-    committed = logical_raw_cache(state)
+    if state.length < state.capacity and state.token_start != 0:
+        raise ValueError(
+            "partial official raw cache must start at absolute position zero"
+        )
+    committed = np.array(state.rows[:, :state.length, :], copy=True)
     return np.concatenate((committed, draft), axis=1)
+
+
+def dspark_attention_official(
+    queries: np.ndarray,
+    state: RawCacheState,
+    draft_rows: np.ndarray,
+    attention_sinks: Sequence[float] | np.ndarray,
+    *,
+    stage: int,
+) -> DSparkAttentionResult:
+    """Reproduce final-0731 DSpark sparse attention precision and ordering.
+
+    All five queries attend non-causally to the physical committed ring plus
+    exactly five transient draft rows.  Q and KV enter as BF16 reopened in
+    float32.  The online softmax keeps max, denominator and value accumulator
+    in float32, but casts each 64-row block's exponential numerator weights to
+    BF16 before the value product.  The per-head sink contributes only to the
+    denominator, and the divided output crosses a final BF16 boundary.
+
+    This is a development oracle, not a production attention implementation.
+    NumPy's float32 matrix products cross-check the algorithm and named dtype
+    boundaries; the direct Metal test remains authoritative for device code.
+    """
+
+    _validate_raw_cache_state(state)
+    if state.length < 2:
+        raise ValueError(
+            "DSpark attention requires at least two committed target rows"
+        )
+    if (isinstance(stage, bool) or not isinstance(stage, (int, np.integer)) or
+            int(stage) < 0 or int(stage) >= DSPARK_STAGE_COUNT):
+        raise ValueError("stage must select one of the three DSpark rings")
+    query = np.asarray(queries, dtype=np.float32)
+    draft = np.asarray(draft_rows, dtype=np.float32)
+    sinks = np.asarray(attention_sinks, dtype=np.float32)
+    expected_q = (
+        DSPARK_PROPOSAL_ROWS,
+        DSPARK_ATTENTION_HEADS,
+        DSPARK_RAW_CACHE_WIDTH,
+    )
+    if query.shape != expected_q:
+        raise ValueError("queries must have shape [5, 64, 512]")
+    if draft.shape != (
+        DSPARK_STAGE_COUNT, DSPARK_PROPOSAL_ROWS, DSPARK_RAW_CACHE_WIDTH
+    ):
+        raise ValueError("draft_rows must have shape [3, 5, 512]")
+    if sinks.shape != (DSPARK_ATTENTION_HEADS,):
+        raise ValueError("attention_sinks must have shape [64]")
+    if not all(np.all(np.isfinite(item)) for item in (query, draft, sinks)):
+        raise ValueError("DSpark attention inputs must be finite")
+    physical = proposal_raw_cache_view(
+        state,
+        state.token_start + state.length,
+        draft.astype(np.float64),
+    )[int(stage)].astype(np.float32)
+    query = _round_bfloat16(query)
+    physical = _round_bfloat16(physical)
+
+    running_max = np.full(
+        (DSPARK_PROPOSAL_ROWS, DSPARK_ATTENTION_HEADS),
+        -np.inf,
+        dtype=np.float32,
+    )
+    denominator = np.zeros_like(running_max)
+    numerator = np.zeros(expected_q, dtype=np.float32)
+    scale_f32 = np.float32(DSPARK_RAW_CACHE_WIDTH ** -0.5)
+    for first in range(0, physical.shape[0], DSPARK_ATTENTION_BLOCK):
+        block = physical[first:first + DSPARK_ATTENTION_BLOCK]
+        scores = np.einsum(
+            "qhd,kd->qhk", query, block,
+            dtype=np.float32, optimize=False,
+        )
+        scores = np.asarray(scores * scale_f32, dtype=np.float32)
+        previous_max = running_max
+        running_max = np.maximum(
+            previous_max,
+            np.max(scores, axis=-1).astype(np.float32),
+        ).astype(np.float32)
+        previous_scale = np.exp(
+            previous_max - running_max, dtype=np.float32
+        )
+        weights = np.exp(
+            scores - running_max[..., None], dtype=np.float32
+        )
+        denominator = (
+            denominator * previous_scale
+            + np.sum(weights, axis=-1, dtype=np.float32)
+        ).astype(np.float32)
+        rounded_weights = _round_bfloat16(weights)
+        block_numerator = np.einsum(
+            "qhk,kd->qhd", rounded_weights, block,
+            dtype=np.float32, optimize=False,
+        )
+        numerator = (
+            numerator * previous_scale[..., None] + block_numerator
+        ).astype(np.float32)
+
+    denominator = (
+        denominator
+        + np.exp(sinks[None, :] - running_max, dtype=np.float32)
+    ).astype(np.float32)
+    output = _round_bfloat16(
+        numerator / denominator[..., None]
+    ).astype(np.float64)
+    return DSparkAttentionResult(
+        output,
+        physical.astype(np.float64),
+    )
 
 
 def commit_raw_cache_transaction(

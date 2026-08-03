@@ -34,6 +34,7 @@ from tools.dspark_oracle import (  # noqa: E402
     concatenate_target_captures,
     conditional_confidence,
     direct_stage_context_kv,
+    dspark_attention_official,
     empty_raw_cache,
     finalize_draft_head,
     hc_head,
@@ -929,6 +930,28 @@ class OracleFixtureTests(unittest.TestCase):
         )
 
     @staticmethod
+    def _dspark_attention_inputs() -> tuple[
+        object, np.ndarray, np.ndarray, np.ndarray
+    ]:
+        """Deterministic BF16-sensitive full-ring attention fixture."""
+
+        generator = np.random.default_rng(0xD54A)
+        rows = generator.standard_normal(
+            (129, DSPARK_STAGE_COUNT, DSPARK_RAW_CACHE_WIDTH),
+            dtype=np.float32,
+        ) * np.float32(0.35)
+        state = prefill_raw_cache(rows, start_position=0)
+        queries = generator.standard_normal(
+            (5, 64, DSPARK_RAW_CACHE_WIDTH), dtype=np.float32
+        ) * np.float32(0.35)
+        drafts = generator.standard_normal(
+            (DSPARK_STAGE_COUNT, 5, DSPARK_RAW_CACHE_WIDTH),
+            dtype=np.float32,
+        ) * np.float32(0.35)
+        sinks = np.linspace(-1.75, 1.25, 64, dtype=np.float32)
+        return state, queries, drafts, sinks
+
+    @staticmethod
     def _assert_raw_samples(
         array: np.ndarray,
         samples: list[dict[str, object]],
@@ -1041,11 +1064,70 @@ class OracleFixtureTests(unittest.TestCase):
             )
         np.testing.assert_array_equal(state128.rows, before)
 
+    def test_dspark_attention_pins_physical_order_and_bf16_boundaries(
+        self,
+    ) -> None:
+        state, queries, drafts, sinks = self._dspark_attention_inputs()
+        result = dspark_attention_official(
+            queries, state, drafts, sinks, stage=1
+        )
+        self.assertEqual(result.output.shape, (5, 64, 512))
+        self.assertEqual(result.physical_kv.shape, (133, 512))
+        self.assertEqual(
+            hashlib.sha256(result.output.astype("<f4").tobytes()).hexdigest(),
+            "a326474e55da66818fcc1a66d97d97501209698db8d814b8b70432dc32997de2",
+        )
+        output_bits = result.output.astype(np.float32).view(np.uint32)
+        self.assertTrue(np.all((output_bits & np.uint32(0xFFFF)) == 0))
+
+        # A chronological staging implementation looks plausible but is not
+        # pinned-kernel equivalent after wrap.  This fixture is deliberately
+        # sensitive to the official physical 0..127 block enumeration.
+        chronological_state = type(state)(
+            state.capacity,
+            state.token_start,
+            state.length,
+            logical_raw_cache(state),
+        )
+        chronological = dspark_attention_official(
+            queries, chronological_state, drafts, sinks, stage=1
+        )
+        maximum = float(np.max(np.abs(
+            result.output - chronological.output
+        )))
+        self.assertEqual(maximum, 0.00048828125)
+        self.assertGreater(
+            int(np.count_nonzero(result.output != chronological.output)),
+            10000,
+        )
+        one_row_state = type(state)(
+            state.capacity, 0, 1, np.array(state.rows, copy=True)
+        )
+        with self.assertRaisesRegex(ValueError, "at least two committed"):
+            dspark_attention_official(
+                queries, one_row_state, drafts, sinks, stage=1
+            )
+        with self.assertRaisesRegex(ValueError, r"\[2, 128\]"):
+            mlx_optional.dspark_attention_official(
+                queries, state.rows[1], 1, drafts[1], sinks
+            )
+
     def test_raw_cache_rejects_non_0731_geometry(self) -> None:
         with self.assertRaisesRegex(ValueError, "capacity must be 128"):
             empty_raw_cache(127, DSPARK_RAW_CACHE_WIDTH)
         with self.assertRaisesRegex(ValueError, "width must be 512"):
             empty_raw_cache(DSPARK_RAW_CACHE_WINDOW, 511)
+        case = self.fixture["cases"]["rawCache"]
+        partial = prefill_raw_cache(
+            self._raw_cache_rows(np.arange(3, 5, dtype=np.int64), case),
+            start_position=3,
+        )
+        with self.assertRaisesRegex(
+            ValueError, "partial official raw cache must start"
+        ):
+            proposal_raw_cache_view(
+                partial, 5, self._raw_cache_drafts(case)
+            )
 
     def test_final_head_wires_hc_markov_and_confidence(self) -> None:
         case = self.fixture["cases"]["draftHead"]
@@ -1594,6 +1676,10 @@ class OracleFixtureTests(unittest.TestCase):
             mlx_optional.MLX_F32_CONTEXT_SCALE_MAX_ABS_DRIFT,
             0.0,
         )
+        self.assertEqual(
+            mlx_optional.MLX_BF16_ATTENTION_OUTPUT_MAX_ABS_DRIFT,
+            2.44140625e-4,
+        )
         self.assertGreater(
             mlx_optional.MLX_F32_MARKOV_MATMUL_MAX_ABS_DRIFT,
             mlx_optional.MLX_F32_CONFIDENCE_MAX_ABS_DRIFT,
@@ -1919,6 +2005,29 @@ class OracleFixtureTests(unittest.TestCase):
             mlx_head,
             numpy_head,
             mlx_optional.MLX_F32_HC_OUTPUT_MAX_ABS_DRIFT,
+        )
+
+        attention_state, attention_q, attention_draft, attention_sinks = \
+            self._dspark_attention_inputs()
+        numpy_attention = dspark_attention_official(
+            attention_q,
+            attention_state,
+            attention_draft,
+            attention_sinks,
+            stage=1,
+        ).output
+        mlx_attention = mlx_optional.dspark_attention_official(
+            attention_q,
+            attention_state.rows[1],
+            attention_state.length,
+            attention_draft[1],
+            attention_sinks,
+        )
+        self.assert_max_abs_drift(
+            "MLX BF16 physical-ring online DSpark attention",
+            mlx_attention,
+            numpy_attention,
+            mlx_optional.MLX_BF16_ATTENTION_OUTPUT_MAX_ABS_DRIFT,
         )
 
     def test_runtime_capture_call_sites_match_oracle_contract(self) -> None:

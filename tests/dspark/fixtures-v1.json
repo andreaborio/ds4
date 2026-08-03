@@ -1395,19 +1395,19 @@
           {
             "dimension": 0,
             "stage": 0,
-            "value": 1000.0,
+            "value": 128000.0,
             "view": 0
           },
           {
             "dimension": 7,
             "stage": 1,
-            "value": 227007.0,
+            "value": 226007.0,
             "view": 126
           },
           {
             "dimension": 511,
             "stage": 2,
-            "value": 328511.0,
+            "value": 327511.0,
             "view": 127
           },
           {
