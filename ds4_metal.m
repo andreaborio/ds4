@@ -945,11 +945,17 @@ static uint64_t g_stream_expert_cache_pending_max_seq;
 /* The Metal backend has one encoder owner. Keep the lease process-global as
  * well: an epoch rejects stale releases, while pthread ownership prevents a
  * request/loader thread from accidentally unpinning the encoder's layer. */
-static uint64_t g_stream_expert_cache_lease_epoch;
-static uint64_t g_stream_expert_cache_lease_id;
-static pthread_t g_stream_expert_cache_lease_owner;
-static uint32_t g_stream_expert_cache_lease_layer = UINT32_MAX;
-static uint8_t g_stream_expert_cache_lease_active;
+typedef struct {
+    uint64_t epoch;
+    uint64_t id;
+    pthread_t owner;
+    uint32_t layer;
+    uint8_t active;
+} ds4_gpu_stream_expert_lease_state;
+
+static ds4_gpu_stream_expert_lease_state g_stream_expert_cache_lease = {
+    .layer = UINT32_MAX,
+};
 static id<MTLBuffer> g_stream_compact_gate_addr_buffers[DS4_METAL_STREAM_EXPERT_CACHE_MAX_LAYER];
 static id<MTLBuffer> g_stream_compact_up_addr_buffers[DS4_METAL_STREAM_EXPERT_CACHE_MAX_LAYER];
 static id<MTLBuffer> g_stream_compact_down_addr_buffers[DS4_METAL_STREAM_EXPERT_CACHE_MAX_LAYER];
@@ -4102,7 +4108,7 @@ void ds4_gpu_set_glm_model(bool enabled) {
 }
 
 void ds4_gpu_set_ssd_streaming(bool enabled) {
-    if (g_stream_expert_cache_lease_active) {
+    if (g_stream_expert_cache_lease.active) {
         fprintf(stderr,
                 "ds4: cannot change Metal SSD streaming mode while a layer lease is active\n");
         return;
@@ -4138,7 +4144,7 @@ void ds4_gpu_set_glm_streaming_prefill_full_layer(bool enabled) {
 }
 
 void ds4_gpu_set_streaming_expert_cache_budget(uint32_t experts) {
-    if (g_stream_expert_cache_lease_active) {
+    if (g_stream_expert_cache_lease.active) {
         fprintf(stderr,
                 "ds4: cannot reset Metal streaming expert cache while a layer lease is active\n");
         return;
@@ -4193,7 +4199,7 @@ void ds4_gpu_set_streaming_expert_cache_expert_bytes(uint64_t bytes) {
 }
 
 void ds4_gpu_set_streaming_expert_cache_slab_target_bytes(uint64_t bytes) {
-    if (g_stream_expert_cache_lease_active) {
+    if (g_stream_expert_cache_lease.active) {
         fprintf(stderr,
                 "ds4: cannot reset Metal streaming expert slabs while a layer lease is active\n");
         return;
@@ -4208,7 +4214,7 @@ void ds4_gpu_set_streaming_expert_cache_growth_guard(
         bool     enabled,
         uint64_t runtime_bytes,
         uint64_t static_page_bytes) {
-    if (g_stream_expert_cache_lease_active) {
+    if (g_stream_expert_cache_lease.active) {
         fprintf(stderr,
                 "ds4: cannot change Metal streaming expert growth guard "
                 "while a layer lease is active\n");
@@ -13086,7 +13092,7 @@ void ds4_gpu_stream_expert_cache_release_resident(void) {
     /* --ssd-streaming-cold drops only resident expert storage. Preserve the
      * process-wide counters so later diagnostics still describe all I/O and
      * cache activity performed by this engine. */
-    if (g_stream_expert_cache_lease_active) {
+    if (g_stream_expert_cache_lease.active) {
         fprintf(stderr,
                 "ds4: cannot release resident streaming experts while a layer lease is active\n");
         return;
@@ -13983,28 +13989,28 @@ static int ds4_gpu_stream_expert_cache_validate_selected(
 static uint64_t ds4_gpu_stream_expert_cache_lease_next_id(void) {
     /* Zero is the public invalid sentinel. A wrap is practically unreachable,
      * but skipping it keeps stale-id rejection correct by construction. */
-    g_stream_expert_cache_lease_epoch++;
-    if (g_stream_expert_cache_lease_epoch == 0) {
-        g_stream_expert_cache_lease_epoch++;
+    g_stream_expert_cache_lease.epoch++;
+    if (g_stream_expert_cache_lease.epoch == 0) {
+        g_stream_expert_cache_lease.epoch++;
     }
-    return g_stream_expert_cache_lease_epoch;
+    return g_stream_expert_cache_lease.epoch;
 }
 
 static int ds4_gpu_stream_expert_cache_lease_protects(uint32_t layer) {
-    return g_stream_expert_cache_lease_active &&
-           layer == g_stream_expert_cache_lease_layer;
+    return g_stream_expert_cache_lease.active &&
+           layer == g_stream_expert_cache_lease.layer;
 }
 
 static void ds4_gpu_stream_expert_cache_lease_invalidate(void) {
-    if (g_stream_expert_cache_lease_active) {
+    if (g_stream_expert_cache_lease.active) {
         (void)ds4_gpu_stream_expert_cache_lease_next_id();
     }
-    g_stream_expert_cache_lease_id = 0;
-    g_stream_expert_cache_lease_layer = UINT32_MAX;
-    g_stream_expert_cache_lease_active = 0;
-    memset(&g_stream_expert_cache_lease_owner,
+    g_stream_expert_cache_lease.id = 0;
+    g_stream_expert_cache_lease.layer = UINT32_MAX;
+    g_stream_expert_cache_lease.active = 0;
+    memset(&g_stream_expert_cache_lease.owner,
            0,
-           sizeof(g_stream_expert_cache_lease_owner));
+           sizeof(g_stream_expert_cache_lease.owner));
 }
 
 static void ds4_gpu_stream_expert_cache_clear_entry_internal(
@@ -15482,7 +15488,7 @@ static int ds4_gpu_dspark_support_cache_reconcile_transition(int fence) {
         g_stream_expert_cache_entry_count +
             g_dspark_support_cache_entry_count > parent_budget;
     if (fence) {
-        if (g_stream_expert_cache_lease_active ||
+        if (g_stream_expert_cache_lease.active ||
             g_stream_expert_pending_load.active ||
             g_qwen35_stream_pending.state != DS4_QWEN35_STREAM_IO_EMPTY ||
             !ds4_gpu_dspark_reconcile_synchronize() ||
@@ -15490,7 +15496,7 @@ static int ds4_gpu_dspark_support_cache_reconcile_transition(int fence) {
             !ds4_gpu_dspark_reconcile_synchronize()) {
             return 0;
         }
-    } else if (g_stream_expert_cache_lease_active ||
+    } else if (g_stream_expert_cache_lease.active ||
                g_stream_expert_pending_load.active ||
                g_qwen35_stream_pending.state !=
                    DS4_QWEN35_STREAM_IO_EMPTY) {
@@ -16220,26 +16226,26 @@ int ds4_gpu_stream_expert_cache_acquire_layer_lease(
         layer >= DS4_METAL_STREAM_EXPERT_CACHE_MAX_LAYER ||
         ds4_gpu_stream_expert_cache_configured_budget() == 0 ||
         !ds4_gpu_stream_expert_cache_required_floor_satisfied() ||
-        g_stream_expert_cache_lease_active ||
+        g_stream_expert_cache_lease.active ||
         g_stream_expert_pending_load.active ||
         g_qwen35_stream_pending.state != DS4_QWEN35_STREAM_IO_EMPTY) {
         return 0;
     }
 
     const uint64_t id = ds4_gpu_stream_expert_cache_lease_next_id();
-    g_stream_expert_cache_lease_owner = pthread_self();
-    g_stream_expert_cache_lease_layer = layer;
-    g_stream_expert_cache_lease_id = id;
-    g_stream_expert_cache_lease_active = 1;
+    g_stream_expert_cache_lease.owner = pthread_self();
+    g_stream_expert_cache_lease.id = id;
+    g_stream_expert_cache_lease.layer = layer;
+    g_stream_expert_cache_lease.active = 1;
     *lease_id = id;
     return 1;
 }
 
 int ds4_gpu_stream_expert_cache_release_layer_lease(uint64_t lease_id) {
-    if (!g_stream_expert_cache_lease_active ||
+    if (!g_stream_expert_cache_lease.active ||
         lease_id == 0 ||
-        lease_id != g_stream_expert_cache_lease_id ||
-        !pthread_equal(g_stream_expert_cache_lease_owner, pthread_self())) {
+        lease_id != g_stream_expert_cache_lease.id ||
+        !pthread_equal(g_stream_expert_cache_lease.owner, pthread_self())) {
         /* Leave the lease active on every mismatch. Releasing the wrong
          * layer is less recoverable than failing the enclosing transaction. */
         return 0;
@@ -16303,7 +16309,7 @@ int ds4_gpu_reconfigure_streaming_expert_cache_budget(uint32_t experts) {
         !target_over_budget && !support_over_budget) {
         return ds4_gpu_stream_expert_cache_required_floor_satisfied();
     }
-    if (g_stream_expert_cache_lease_active ||
+    if (g_stream_expert_cache_lease.active ||
         g_stream_expert_pending_load.active ||
         g_qwen35_stream_pending.state != DS4_QWEN35_STREAM_IO_EMPTY) {
         return 0;
@@ -17348,7 +17354,7 @@ int ds4_gpu_internal_qwen35_stream_staging_rollback_test(void) {
  * the active record; the lease must be revoked even though release reports the
  * error to its caller. */
 int ds4_gpu_internal_qwen35_lease_error_unwind_test(void) {
-    if (g_stream_expert_cache_lease_active ||
+    if (g_stream_expert_cache_lease.active ||
         g_stream_expert_pending_load.active ||
         g_qwen35_stream_pending.state != DS4_QWEN35_STREAM_IO_EMPTY ||
         g_batch_cb || [g_pending_cbs count] != 0 ||
@@ -17360,17 +17366,17 @@ int ds4_gpu_internal_qwen35_lease_error_unwind_test(void) {
         g_stream_expert_pread_pool_initialized;
     const uint64_t lease_id =
         ds4_gpu_stream_expert_cache_lease_next_id();
-    g_stream_expert_cache_lease_owner = pthread_self();
-    g_stream_expert_cache_lease_layer = 0;
-    g_stream_expert_cache_lease_id = lease_id;
-    g_stream_expert_cache_lease_active = 1;
+    g_stream_expert_cache_lease.owner = pthread_self();
+    g_stream_expert_cache_lease.id = lease_id;
+    g_stream_expert_cache_lease.layer = 0;
+    g_stream_expert_cache_lease.active = 1;
     g_stream_expert_pending_load.active = 1;
     g_stream_expert_pread_pool_initialized = 0;
 
     const int release_ok =
         ds4_gpu_stream_expert_cache_release_layer_lease(lease_id);
     const int ok = !release_ok &&
-        !g_stream_expert_cache_lease_active &&
+        !g_stream_expert_cache_lease.active &&
         !g_stream_expert_pending_load.active;
     g_stream_expert_pread_pool_initialized = saved_pool_initialized;
     return ok;
