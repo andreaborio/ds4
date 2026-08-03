@@ -170,6 +170,12 @@ DIRECT_CONTEXT_KV_FIXTURE = {
     "normEps": 1.0e-6,
     "ropeTheta": 10000.0,
     "expected": {
+        "projectedSamples": [
+            {"token": 0, "dimension": 0, "value": 1.0},
+            {"token": 0, "dimension": 3, "value": 4.0},
+            {"token": 1, "dimension": 0, "value": 2.0},
+            {"token": 1, "dimension": 3, "value": -3.0},
+        ],
         "normalizedSamples": [
             {"token": 0, "dimension": 0, "value": 0.365234375},
             {"token": 0, "dimension": 3, "value": 1.4609375},
@@ -229,6 +235,148 @@ def _dense_weight(
             values.append((zero_replacement if raw == 0 else raw) / divisor)
         matrix.append(values)
     return matrix
+
+
+def _raw_context_finalizer_fixture() -> dict[str, Any]:
+    """Declare a six-row frozen precision-boundary fixture.
+
+    The generator creates deterministic inputs but never evaluates the oracle.
+    Every expected sample and digest below is declared literally rather than
+    recomputed by this generator.  Six rows exercise the largest verifier
+    capture shape; DSpark still proposes only a five-row candidate block, and
+    row index five is verifier-only.
+    """
+
+    target_hidden: list[list[list[float]]] = []
+    for row in range(6):
+        captures: list[list[float]] = []
+        for stage in range(3):
+            values: list[float] = []
+            for dimension in range(4):
+                raw = (row * 11 + stage * 7 + dimension * 5) % 23 - 11
+                values.append((0.5 if raw == 0 else raw) / 8.0)
+            captures.append(values)
+        target_hidden.append(captures)
+    return {
+        "rowContract": {
+            "captureRows": 6,
+            "candidateBlockSize": 5,
+            "candidateRowIndices": [0, 1, 2, 3, 4],
+            "verifierOnlyRowIndex": 5,
+        },
+        "targetHidden": target_hidden,
+        "mainProjection": _dense_weight(
+            4, 12,
+            row_multiplier=7,
+            column_multiplier=5,
+            modulus=19,
+            offset=9,
+            divisor=16.0,
+            zero_replacement=0.5,
+        ),
+        "mainNormWeight": [0.75, -1.25, 1.5, 0.625],
+        "contextProjectionGenerator": {
+            "shape": [512, 4],
+            "kind": "denseModular",
+            "rowMultiplier": 13,
+            "columnMultiplier": 7,
+            "modulus": 29,
+            "offset": 14,
+            "divisor": 32.0,
+            "zeroReplacement": -0.5,
+        },
+        "contextNormWeightGenerator": {
+            "shape": [512],
+            "kind": "periodicModular",
+            "indexMultiplier": 5,
+            "modulus": 17,
+            "offset": 8,
+            "divisor": 8.0,
+            "zeroReplacement": 0.5,
+        },
+        "absolutePositions": [0, 1, 63, 127, 128, 129],
+        "normEps": 1.0e-6,
+        "ropeTheta": 10000.0,
+        "expected": {
+            "digests": {
+                "packedCapturesF64":
+                    "45354804943b2d2e9816c2c2719002c5faf066e562a1d8d11c9d878d194e7545",
+                "mainXF64":
+                    "caddef9f429db21a12606ebeb194bb4015ce07f4edcc1e3d3cc79d0cbdf50d46",
+                "projectedF32":
+                    "a5e4574551d7fae27d9ff7eab8b4140db44b327fdb4375c0bc888c798556cb56",
+                "normalizedF32":
+                    "df015eef4f9e10f963d6109f47c0d8b334175c5bbc318998d67dc84d15970e93",
+                "ropedF32":
+                    "11dcd388cc38bda691dd929cc66daf89b6279336c39b13656f5564918a88d758",
+                "storedF32":
+                    "2d3da4c6b44e9b4699684d3cc659c0dd0b827813b2d725172de305a2cb1f58da",
+                "nonropeScalesF32":
+                    "27698b689df8b2e8cc5eb8f949de8cb5691ec920668f8bd482c9b0a6b55edc58",
+            },
+            "mainX": [
+                [0.7240695287110602, -1.0030899521952585,
+                 -0.47041459827087984, 0.9531276174115867],
+                [0.2095975196365965, 0.3094058623206901,
+                 0.8743210819126597, -1.1727480265380994],
+                [-0.46593472874561326, -1.4336453192172716,
+                 1.413164671799882, 0.7424234688803728],
+                [-0.28039797488415225, -0.8340952417439972,
+                 -2.0160259460025123, -0.7926862581113164],
+                [0.19027627206247838, 1.304313155266989,
+                 0.44193198672575623, 1.0383355706635247],
+                [-0.2549585836259321, -0.8802141577561942,
+                 -1.9231161736356022, -0.8255801755506373],
+            ],
+            "projectedSamples": [
+                {"row": 0, "dimension": 0, "value": 0.11865234375},
+                {"row": 0, "dimension": 3, "value": -0.6875},
+                {"row": 1, "dimension": 17, "value": -0.0213623046875},
+                {"row": 2, "dimension": 127, "value": 0.2412109375},
+                {"row": 3, "dimension": 448, "value": 0.490234375},
+                {"row": 4, "dimension": 449, "value": -0.337890625},
+                {"row": 5, "dimension": 511, "value": -0.119140625},
+            ],
+            "normalizedSamples": [
+                {"row": 0, "dimension": 0, "value": -0.232421875},
+                {"row": 0, "dimension": 3, "value": -1.1796875},
+                {"row": 1, "dimension": 17, "value": 0.0498046875},
+                {"row": 2, "dimension": 127, "value": -0.0888671875},
+                {"row": 3, "dimension": 448, "value": 0.6328125},
+                {"row": 4, "dimension": 449, "value": 1.015625},
+                {"row": 5, "dimension": 511, "value": 0.095703125},
+            ],
+            "ropedSamples": [
+                {"row": 0, "dimension": 0, "value": -0.232421875},
+                {"row": 0, "dimension": 3, "value": -1.1796875},
+                {"row": 1, "dimension": 17, "value": 0.0498046875},
+                {"row": 2, "dimension": 127, "value": -0.0888671875},
+                {"row": 3, "dimension": 448, "value": -0.0830078125},
+                {"row": 4, "dimension": 449, "value": -1.375},
+                {"row": 5, "dimension": 511, "value": 0.080078125},
+            ],
+            "storedSamples": [
+                {"row": 0, "dimension": 0, "value": -0.234375},
+                {"row": 0, "dimension": 3, "value": -1.125},
+                {"row": 1, "dimension": 17, "value": 0.05078125},
+                {"row": 2, "dimension": 127, "value": -0.0859375},
+                {"row": 3, "dimension": 448, "value": -0.0830078125},
+                {"row": 4, "dimension": 449, "value": -1.375},
+                {"row": 5, "dimension": 511, "value": 0.080078125},
+            ],
+            "nonropeScales": [
+                [0.00390625] * 7,
+                [0.00390625] * 7,
+                [0.00390625] * 7,
+                [0.0078125, 0.0078125, 0.00390625, 0.00390625,
+                 0.00390625, 0.00390625, 0.00390625],
+                [0.0078125, 0.00390625, 0.00390625, 0.00390625,
+                 0.0078125, 0.0078125, 0.0078125],
+                [0.0078125, 0.0078125, 0.00390625, 0.00390625,
+                 0.00390625, 0.00390625, 0.00390625],
+            ],
+        },
+    }
 
 
 HC_FUNCTION = _dense_weight(
@@ -546,7 +694,7 @@ def _declared_metadata() -> dict[str, dict[str, Any]]:
 
 def build_fixture() -> dict[str, Any]:
     return {
-        "schemaVersion": 3,
+        "schemaVersion": 4,
         "profile": "deepseek-v4-flash-0731-dspark",
         "generatedBy": "tools/dspark_oracle/generate_fixtures.py",
         "numericType": "float64",
@@ -556,6 +704,7 @@ def build_fixture() -> dict[str, Any]:
             "proposalTokenLayout": PROPOSAL_TOKEN_LAYOUT_FIXTURE,
             "stageSetup": _stage_setup_fixture(),
             "directContextKV": DIRECT_CONTEXT_KV_FIXTURE,
+            "rawContextFinalizer": _raw_context_finalizer_fixture(),
             "hyperConnection": _hc_fixture(),
             "stageChain": _stage_chain_fixture(),
             "rawCache": _raw_cache_fixture(),

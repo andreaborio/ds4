@@ -78,6 +78,7 @@ class StageContextKV:
     """Direct target-derived DSpark context KV and its storage simulation."""
 
     absolute_positions: np.ndarray
+    projected: np.ndarray
     normalized: np.ndarray
     roped: np.ndarray
     stored: np.ndarray
@@ -453,6 +454,7 @@ def direct_stage_context_kv(
     stored[:, :-64], scales = _simulate_official_nope_fp8(stored[:, :-64])
     return StageContextKV(
         np.array(positions, copy=True),
+        projected.astype(np.float64),
         normalized.astype(np.float64),
         roped.astype(np.float64),
         stored.astype(np.float64),

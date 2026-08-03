@@ -7,6 +7,7 @@ Importing :mod:`tools.dspark_oracle` never imports MLX.  These helpers load
 from __future__ import annotations
 
 import importlib.util
+from dataclasses import dataclass
 from importlib import metadata as importlib_metadata
 from typing import Sequence
 
@@ -23,11 +24,56 @@ MLX_F32_MARKOV_MATMUL_MAX_ABS_DRIFT = 1.0e-4
 MLX_F32_CONFIDENCE_MAX_ABS_DRIFT = 5.0e-8
 MLX_F32_HC_MEAN_MAX_ABS_DRIFT = 1.0e-7
 MLX_F32_MAIN_PROJECTION_MAX_ABS_DRIFT = 5.0e-8
+MLX_F32_RAW_CONTEXT_MAIN_MAX_ABS_DRIFT = 1.0e-7
 MLX_F32_HC_SPLIT_MAX_ABS_DRIFT = 1.0e-7
 MLX_F32_HC_OUTPUT_MAX_ABS_DRIFT = 5.0e-7
+# The raw-context finalizer publishes BF16 at every named boundary.  These
+# measured MLX 0.32.0 / M5 Pro ceilings are intentionally separate: a one-ULP
+# RoPE difference must not be hidden behind the coarser FP8-storage allowance.
+# The final store allows one adjacent E4M3FN code step after an upstream BF16
+# difference; the exact frozen NumPy digest remains authoritative.
+MLX_BF16_CONTEXT_PROJECTED_MAX_ABS_DRIFT = 3.90625e-3
+MLX_BF16_CONTEXT_NORMALIZED_MAX_ABS_DRIFT = 7.8125e-3
+MLX_BF16_CONTEXT_ROPE_MAX_ABS_DRIFT = 7.8125e-3
+MLX_BF16_CONTEXT_STORED_MAX_ABS_DRIFT = 6.25e-2
+MLX_F32_CONTEXT_SCALE_MAX_ABS_DRIFT = 0.0
 EXPECTED_MLX_VERSION = "0.32.0"
 EXPECTED_MLX_METAL_VERSION = "0.32.0"
 DSPARK_TARGET_LAYER_IDS = (40, 41, 42)
+DSPARK_RAW_CACHE_WIDTH = 512
+
+
+@dataclass(frozen=True)
+class MLXStageContextKV:
+    """Host-visible boundaries from the independent MLX Metal finalizer."""
+
+    absolute_positions: np.ndarray
+    projected: np.ndarray
+    normalized: np.ndarray
+    roped: np.ndarray
+    stored: np.ndarray
+    nonrope_scales: np.ndarray
+
+
+def _e4m3fn_positive_values() -> np.ndarray:
+    """Build the positive finite E4M3FN codebook without NumPy-oracle reuse."""
+
+    values: list[float] = []
+    for code in range(127):
+        exponent = code >> 3
+        mantissa = code & 7
+        if exponent == 0:
+            values.append(mantissa * (2.0 ** -9))
+        else:
+            values.append((1.0 + mantissa / 8.0) * (2.0 ** (exponent - 7)))
+    return np.asarray(values, dtype=np.float32)
+
+
+_E4M3FN_POSITIVE_VALUES = _e4m3fn_positive_values()
+_E4M3FN_EVEN_CODE_PREFERENCE = np.asarray(
+    [2 if (code & 1) == 0 else 1 for code in range(127)],
+    dtype=np.int32,
+)
 
 
 def available() -> bool:
@@ -185,6 +231,126 @@ def main_project_and_norm(
     result = projected * mx.rsqrt(variance + float(eps)) * weight
     mx.eval(result)
     return np.asarray(result, dtype=np.float64)
+
+
+def _mlx_bfloat16_boundary(mx: object, value: object) -> object:
+    """Publish a BF16 boundary and reopen it as float32 for the next op."""
+
+    return value.astype(mx.bfloat16).astype(mx.float32)
+
+
+def _mlx_round_e4m3fn(mx: object, value: object) -> object:
+    """Round on MLX with clamp and nearest-even tie handling."""
+
+    codebook = mx.array(_E4M3FN_POSITIVE_VALUES, dtype=mx.float32)
+    preferences = mx.array(_E4M3FN_EVEN_CODE_PREFERENCE, dtype=mx.int32)
+    magnitude = mx.minimum(mx.abs(value), mx.array(448.0, dtype=mx.float32))
+    distances = mx.abs(magnitude[..., None] - codebook)
+    minimum = mx.min(distances, axis=-1, keepdims=True)
+    candidates = distances == minimum
+    scores = candidates.astype(mx.int32) * preferences
+    indices = mx.argmax(scores, axis=-1)
+    rounded = mx.take(codebook, indices)
+    return mx.where(value < 0.0, -rounded, rounded)
+
+
+def direct_stage_context_kv(
+    main_x: np.ndarray,
+    projection: np.ndarray,
+    norm_weight: Sequence[float] | np.ndarray,
+    absolute_positions: Sequence[int] | np.ndarray,
+    *,
+    eps: float = 1.0e-6,
+    rope_theta: float = 10000.0,
+) -> MLXStageContextKV:
+    """Cross-check the final raw-context KV boundaries on MLX Metal.
+
+    This function deliberately re-expresses the finalizer instead of calling
+    the NumPy reference.  It covers the post-Wkv BF16 boundary, RMSNorm BF16,
+    RoPE on only the final 64 dimensions, seven independent 64-wide E4M3FN /
+    UE8M0 groups over the 448-wide prefix, FP32 dequantization, and the final
+    BF16 store.
+    """
+
+    main_source = np.asarray(main_x)
+    project_source = np.asarray(projection)
+    weight_source = np.asarray(norm_weight)
+    positions_source = np.asarray(absolute_positions)
+    if main_source.ndim != 2 or main_source.shape[0] == 0:
+        raise ValueError("main_x must be a non-empty matrix")
+    if project_source.shape != (DSPARK_RAW_CACHE_WIDTH, main_source.shape[1]):
+        raise ValueError("context KV projection must have shape [512, hidden]")
+    if weight_source.shape != (DSPARK_RAW_CACHE_WIDTH,):
+        raise ValueError("context KV norm weight must have shape [512]")
+    if (positions_source.ndim != 1 or
+            positions_source.shape[0] != main_source.shape[0]):
+        raise ValueError("absolute_positions must match main_x")
+    if not np.issubdtype(positions_source.dtype, np.integer):
+        raise ValueError("absolute_positions must contain integers")
+    if np.any(positions_source < 0):
+        raise ValueError("absolute_positions must be non-negative")
+    if not all(np.all(np.isfinite(item)) for item in
+               (main_source, project_source, weight_source)):
+        raise ValueError("context KV inputs must be finite")
+    if not np.isfinite(float(eps)) or eps <= 0.0:
+        raise ValueError("context KV norm epsilon must be finite and positive")
+    if not np.isfinite(float(rope_theta)) or rope_theta <= 0.0:
+        raise ValueError("rope_theta must be finite and positive")
+
+    mx = _mlx()
+    main = mx.array(main_source.astype(np.float32, copy=False))
+    project = mx.array(project_source.astype(np.float32, copy=False))
+    weights = mx.array(weight_source.astype(np.float32, copy=False))
+    positions = mx.array(positions_source.astype(np.float32, copy=False))
+
+    projected = _mlx_bfloat16_boundary(mx, main @ mx.transpose(project))
+    variance = mx.mean(mx.square(projected), axis=-1, keepdims=True)
+    normalized = _mlx_bfloat16_boundary(
+        mx, projected * mx.rsqrt(variance + float(eps)) * weights
+    )
+
+    tail = mx.reshape(normalized[:, 448:], (main_source.shape[0], 32, 2))
+    frequency = 1.0 / mx.power(
+        mx.array(float(rope_theta), dtype=mx.float32),
+        mx.arange(0, 64, 2, dtype=mx.float32) / 64.0,
+    )
+    angles = positions[:, None] * frequency[None, :]
+    cosine = mx.cos(angles)
+    sine = mx.sin(angles)
+    first = tail[..., 0] * cosine - tail[..., 1] * sine
+    second = tail[..., 0] * sine + tail[..., 1] * cosine
+    roped_tail = _mlx_bfloat16_boundary(
+        mx, mx.reshape(mx.stack((first, second), axis=-1),
+                       (main_source.shape[0], 64))
+    )
+    roped = mx.concatenate((normalized[:, :448], roped_tail), axis=1)
+
+    grouped = mx.reshape(roped[:, :448], (main_source.shape[0], 7, 64))
+    amax = mx.maximum(
+        mx.max(mx.abs(grouped), axis=2),
+        mx.array(1.0e-4, dtype=mx.float32),
+    )
+    scales = mx.power(
+        mx.array(2.0, dtype=mx.float32),
+        mx.ceil(mx.log2(amax / mx.array(448.0, dtype=mx.float32))),
+    ).astype(mx.float32)
+    quantized = _mlx_round_e4m3fn(mx, grouped / scales[..., None])
+    stored_prefix = _mlx_bfloat16_boundary(
+        mx, quantized.astype(mx.float32) * scales[..., None]
+    )
+    stored = mx.concatenate(
+        (mx.reshape(stored_prefix, (main_source.shape[0], 448)), roped_tail),
+        axis=1,
+    )
+    mx.eval(projected, normalized, roped, stored, scales)
+    return MLXStageContextKV(
+        np.array(positions_source, dtype=np.int64, copy=True),
+        np.asarray(projected, dtype=np.float64),
+        np.asarray(normalized, dtype=np.float64),
+        np.asarray(roped, dtype=np.float64),
+        np.asarray(stored, dtype=np.float64),
+        np.asarray(scales, dtype=np.float64),
+    )
 
 
 def hc_split_sinkhorn(

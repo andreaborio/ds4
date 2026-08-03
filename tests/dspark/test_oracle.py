@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import ast
+import hashlib
 import inspect
 import json
 import os
@@ -458,12 +459,63 @@ class OracleFixtureTests(unittest.TestCase):
     @staticmethod
     def _fixture_matrix(description: object) -> np.ndarray:
         if isinstance(description, dict):
-            return np.full(
-                tuple(int(item) for item in description["shape"]),
-                float(description["fill"]),
-                dtype=np.float64,
-            )
+            shape = tuple(int(item) for item in description["shape"])
+            kind = description.get("kind")
+            if "fill" in description:
+                return np.full(shape, float(description["fill"]),
+                               dtype=np.float64)
+            if kind == "denseModular":
+                rows, columns = shape
+                result = np.empty(shape, dtype=np.float64)
+                for row in range(rows):
+                    for column in range(columns):
+                        raw = (
+                            row * int(description["rowMultiplier"])
+                            + column * int(description["columnMultiplier"])
+                        ) % int(description["modulus"]) - int(
+                            description["offset"]
+                        )
+                        replacement = float(description["zeroReplacement"])
+                        result[row, column] = (
+                            replacement if raw == 0 else raw
+                        ) / float(description["divisor"])
+                return result
+            if kind == "periodicModular":
+                if len(shape) != 1:
+                    raise AssertionError("periodicModular must be a vector")
+                result = np.empty(shape, dtype=np.float64)
+                for index in range(shape[0]):
+                    raw = (
+                        index * int(description["indexMultiplier"])
+                    ) % int(description["modulus"]) - int(
+                        description["offset"]
+                    )
+                    replacement = float(description["zeroReplacement"])
+                    result[index] = (
+                        replacement if raw == 0 else raw
+                    ) / float(description["divisor"])
+                return result
+            raise AssertionError(f"unknown fixture matrix generator: {kind}")
         return np.asarray(description, dtype=np.float64)
+
+    @staticmethod
+    def _array_digest(array: np.ndarray, dtype: str) -> str:
+        payload = np.asarray(array, dtype=np.dtype(dtype)).tobytes(order="C")
+        return hashlib.sha256(payload).hexdigest()
+
+    def _assert_frozen_samples(
+        self, array: np.ndarray, samples: list[dict[str, object]]
+    ) -> None:
+        for sample in samples:
+            self.assertEqual(
+                array[int(sample["row"]), int(sample["dimension"])],
+                sample["value"],
+                sample,
+            )
+
+    def _assert_bfloat16_boundary(self, array: np.ndarray) -> None:
+        bits = np.asarray(array, dtype=np.float32).view(np.uint32)
+        self.assertTrue(np.all((bits & np.uint32(0xFFFF)) == 0))
 
     def test_stage_zero_main_projection_norm_and_noise_layout(self) -> None:
         case = self.fixture["cases"]["stageSetup"]
@@ -543,6 +595,7 @@ class OracleFixtureTests(unittest.TestCase):
             rope_theta=case["ropeTheta"],
         )
         expected = case["expected"]
+        self.assertEqual(result.projected.shape, (2, 512))
         self.assertEqual(result.normalized.shape, (2, 512))
         self.assertEqual(result.stored.shape, (2, 512))
         self.assertEqual(result.nonrope_scales.shape, (2, 7))
@@ -550,6 +603,7 @@ class OracleFixtureTests(unittest.TestCase):
             result.absolute_positions.tolist(), case["absolutePositions"]
         )
         for field, samples in (
+            ("projected", expected["projectedSamples"]),
             ("normalized", expected["normalizedSamples"]),
             ("roped", expected["ropedSamples"]),
             ("stored", expected["storedSamples"]),
@@ -588,6 +642,120 @@ class OracleFixtureTests(unittest.TestCase):
         )
         np.testing.assert_array_equal(zero_result.stored,
                                       np.zeros((1, 512)))
+
+    def test_raw_context_finalizer_freezes_every_precision_boundary(self) -> None:
+        self.assertEqual(self.fixture["schemaVersion"], 4)
+        case = self.fixture["cases"]["rawContextFinalizer"]
+        contract = case["rowContract"]
+        self.assertEqual(contract["candidateBlockSize"], 5)
+        self.assertEqual(contract["captureRows"], 6)
+        self.assertEqual(contract["candidateRowIndices"], [0, 1, 2, 3, 4])
+        self.assertEqual(contract["verifierOnlyRowIndex"], 5)
+
+        target = np.asarray(case["targetHidden"], dtype=np.float64)
+        main_projection = np.asarray(
+            case["mainProjection"], dtype=np.float64
+        )
+        context_projection = self._fixture_matrix(
+            case["contextProjectionGenerator"]
+        )
+        context_norm = self._fixture_matrix(
+            case["contextNormWeightGenerator"]
+        )
+        packed = concatenate_target_captures(target)
+        main_x = main_project_and_norm(
+            target, main_projection, case["mainNormWeight"],
+            eps=case["normEps"],
+        )
+        expected = case["expected"]
+        np.testing.assert_allclose(
+            main_x, expected["mainX"], rtol=0.0, atol=1.0e-14
+        )
+        self.assertEqual(
+            self._array_digest(packed, "<f8"),
+            expected["digests"]["packedCapturesF64"],
+        )
+        self.assertEqual(
+            self._array_digest(main_x, "<f8"),
+            expected["digests"]["mainXF64"],
+        )
+
+        result = direct_stage_context_kv(
+            main_x,
+            context_projection,
+            context_norm,
+            case["absolutePositions"],
+            eps=case["normEps"],
+            rope_theta=case["ropeTheta"],
+        )
+        self.assertEqual(result.absolute_positions.tolist(),
+                         case["absolutePositions"])
+        for field, digest_name, samples_name in (
+            ("projected", "projectedF32", "projectedSamples"),
+            ("normalized", "normalizedF32", "normalizedSamples"),
+            ("roped", "ropedF32", "ropedSamples"),
+            ("stored", "storedF32", "storedSamples"),
+        ):
+            boundary = getattr(result, field)
+            self.assertEqual(boundary.shape, (6, 512))
+            self._assert_bfloat16_boundary(boundary)
+            self.assertEqual(
+                self._array_digest(boundary, "<f4"),
+                expected["digests"][digest_name],
+            )
+            self._assert_frozen_samples(boundary, expected[samples_name])
+        self.assertEqual(result.nonrope_scales.shape, (6, 7))
+        np.testing.assert_array_equal(
+            result.nonrope_scales, expected["nonropeScales"]
+        )
+        self.assertEqual(
+            self._array_digest(result.nonrope_scales, "<f4"),
+            expected["digests"]["nonropeScalesF32"],
+        )
+
+        # RoPE changes only the final 64 dimensions.  FP8 Q/DQ then changes
+        # only the 448-wide prefix before the final BF16 store.
+        np.testing.assert_array_equal(
+            result.normalized[:, :448], result.roped[:, :448]
+        )
+        self.assertFalse(np.array_equal(
+            result.normalized[1:, 448:], result.roped[1:, 448:]
+        ))
+        np.testing.assert_array_equal(
+            result.roped[:, 448:], result.stored[:, 448:]
+        )
+        self.assertFalse(np.array_equal(
+            result.roped[:, :448], result.stored[:, :448]
+        ))
+        mantissas, _ = np.frexp(result.nonrope_scales)
+        np.testing.assert_array_equal(
+            mantissas, np.full((6, 7), 0.5, dtype=np.float64)
+        )
+
+        # Every supported verifier/capture batch C=1..6 is row-prefix stable.
+        # C=6 does not create a sixth DSpark candidate; the fixture contract
+        # marks row index five as verifier-only above.
+        for rows in range(1, 7):
+            prefix_main = main_project_and_norm(
+                target[:rows], main_projection, case["mainNormWeight"],
+                eps=case["normEps"],
+            )
+            prefix = direct_stage_context_kv(
+                prefix_main,
+                context_projection,
+                context_norm,
+                case["absolutePositions"][:rows],
+                eps=case["normEps"],
+                rope_theta=case["ropeTheta"],
+            )
+            np.testing.assert_array_equal(prefix_main, main_x[:rows])
+            for field in ("projected", "normalized", "roped", "stored"):
+                np.testing.assert_array_equal(
+                    getattr(prefix, field), getattr(result, field)[:rows]
+                )
+            np.testing.assert_array_equal(
+                prefix.nonrope_scales, result.nonrope_scales[:rows]
+            )
 
     def test_context_kv_rejects_candidate_or_position_aliases(self) -> None:
         main = np.ones((2, 4), dtype=np.float64)
@@ -1395,12 +1563,36 @@ class OracleFixtureTests(unittest.TestCase):
             5.0e-8,
         )
         self.assertEqual(
+            mlx_optional.MLX_F32_RAW_CONTEXT_MAIN_MAX_ABS_DRIFT,
+            1.0e-7,
+        )
+        self.assertEqual(
             mlx_optional.MLX_F32_HC_SPLIT_MAX_ABS_DRIFT,
             1.0e-7,
         )
         self.assertEqual(
             mlx_optional.MLX_F32_HC_OUTPUT_MAX_ABS_DRIFT,
             5.0e-7,
+        )
+        self.assertEqual(
+            mlx_optional.MLX_BF16_CONTEXT_PROJECTED_MAX_ABS_DRIFT,
+            3.90625e-3,
+        )
+        self.assertEqual(
+            mlx_optional.MLX_BF16_CONTEXT_NORMALIZED_MAX_ABS_DRIFT,
+            7.8125e-3,
+        )
+        self.assertEqual(
+            mlx_optional.MLX_BF16_CONTEXT_ROPE_MAX_ABS_DRIFT,
+            7.8125e-3,
+        )
+        self.assertEqual(
+            mlx_optional.MLX_BF16_CONTEXT_STORED_MAX_ABS_DRIFT,
+            6.25e-2,
+        )
+        self.assertEqual(
+            mlx_optional.MLX_F32_CONTEXT_SCALE_MAX_ABS_DRIFT,
+            0.0,
         )
         self.assertGreater(
             mlx_optional.MLX_F32_MARKOV_MATMUL_MAX_ABS_DRIFT,
@@ -1530,6 +1722,136 @@ class OracleFixtureTests(unittest.TestCase):
             numpy_main,
             mlx_optional.MLX_F32_MAIN_PROJECTION_MAX_ABS_DRIFT,
         )
+
+        raw = self.fixture["cases"]["rawContextFinalizer"]
+        raw_target = np.asarray(raw["targetHidden"], dtype=np.float64)
+        raw_main_projection = np.asarray(
+            raw["mainProjection"], dtype=np.float64
+        )
+        numpy_raw_main = main_project_and_norm(
+            raw_target,
+            raw_main_projection,
+            raw["mainNormWeight"],
+            eps=raw["normEps"],
+        )
+        mlx_raw_main = mlx_optional.main_project_and_norm(
+            raw_target,
+            raw_main_projection,
+            raw["mainNormWeight"],
+            eps=raw["normEps"],
+        )
+        self.assert_max_abs_drift(
+            "MLX float32 six-row capture pack/main projection/RMSNorm",
+            mlx_raw_main,
+            numpy_raw_main,
+            mlx_optional.MLX_F32_RAW_CONTEXT_MAIN_MAX_ABS_DRIFT,
+        )
+        raw_context_projection = self._fixture_matrix(
+            raw["contextProjectionGenerator"]
+        )
+        raw_context_norm = self._fixture_matrix(
+            raw["contextNormWeightGenerator"]
+        )
+        numpy_raw_kv = direct_stage_context_kv(
+            numpy_raw_main,
+            raw_context_projection,
+            raw_context_norm,
+            raw["absolutePositions"],
+            eps=raw["normEps"],
+            rope_theta=raw["ropeTheta"],
+        )
+        mlx_raw_kv = mlx_optional.direct_stage_context_kv(
+            mlx_raw_main,
+            raw_context_projection,
+            raw_context_norm,
+            raw["absolutePositions"],
+            eps=raw["normEps"],
+            rope_theta=raw["ropeTheta"],
+        )
+        self.assertEqual(
+            mlx_raw_kv.absolute_positions.tolist(), raw["absolutePositions"]
+        )
+        for label, actual, expected_boundary, limit in (
+            (
+                "post-Wkv BF16",
+                mlx_raw_kv.projected,
+                numpy_raw_kv.projected,
+                mlx_optional.MLX_BF16_CONTEXT_PROJECTED_MAX_ABS_DRIFT,
+            ),
+            (
+                "post-RMSNorm BF16",
+                mlx_raw_kv.normalized,
+                numpy_raw_kv.normalized,
+                mlx_optional.MLX_BF16_CONTEXT_NORMALIZED_MAX_ABS_DRIFT,
+            ),
+            (
+                "post-RoPE-tail64 BF16",
+                mlx_raw_kv.roped,
+                numpy_raw_kv.roped,
+                mlx_optional.MLX_BF16_CONTEXT_ROPE_MAX_ABS_DRIFT,
+            ),
+            (
+                "post-E4M3FN-dequant BF16 store",
+                mlx_raw_kv.stored,
+                numpy_raw_kv.stored,
+                mlx_optional.MLX_BF16_CONTEXT_STORED_MAX_ABS_DRIFT,
+            ),
+            (
+                "UE8M0 seven-group scales",
+                mlx_raw_kv.nonrope_scales,
+                numpy_raw_kv.nonrope_scales,
+                mlx_optional.MLX_F32_CONTEXT_SCALE_MAX_ABS_DRIFT,
+            ),
+        ):
+            self.assert_max_abs_drift(
+                f"MLX raw-context {label}",
+                actual,
+                expected_boundary,
+                limit,
+            )
+
+        # Exercise the complete MLX pack-to-store pipeline at every admitted
+        # row count.  The full C=6 case above includes the verifier-only row;
+        # none of these shapes changes the five-row candidate block contract.
+        for rows in range(1, 6):
+            mlx_prefix_main = mlx_optional.main_project_and_norm(
+                raw_target[:rows],
+                raw_main_projection,
+                raw["mainNormWeight"],
+                eps=raw["normEps"],
+            )
+            self.assert_max_abs_drift(
+                f"MLX raw-context C={rows} main projection/RMSNorm",
+                mlx_prefix_main,
+                numpy_raw_main[:rows],
+                mlx_optional.MLX_F32_RAW_CONTEXT_MAIN_MAX_ABS_DRIFT,
+            )
+            mlx_prefix_kv = mlx_optional.direct_stage_context_kv(
+                mlx_prefix_main,
+                raw_context_projection,
+                raw_context_norm,
+                raw["absolutePositions"][:rows],
+                eps=raw["normEps"],
+                rope_theta=raw["ropeTheta"],
+            )
+            self.assertEqual(mlx_prefix_kv.projected.shape, (rows, 512))
+            for field, limit in (
+                ("projected",
+                 mlx_optional.MLX_BF16_CONTEXT_PROJECTED_MAX_ABS_DRIFT),
+                ("normalized",
+                 mlx_optional.MLX_BF16_CONTEXT_NORMALIZED_MAX_ABS_DRIFT),
+                ("roped", mlx_optional.MLX_BF16_CONTEXT_ROPE_MAX_ABS_DRIFT),
+                ("stored",
+                 mlx_optional.MLX_BF16_CONTEXT_STORED_MAX_ABS_DRIFT),
+                ("nonrope_scales",
+                 mlx_optional.MLX_F32_CONTEXT_SCALE_MAX_ABS_DRIFT),
+            ):
+                self.assert_max_abs_drift(
+                    f"MLX raw-context C={rows} {field}",
+                    getattr(mlx_prefix_kv, field),
+                    getattr(numpy_raw_kv, field)[:rows],
+                    limit,
+                )
 
         hc = self.fixture["cases"]["hyperConnection"]
         hc_hidden = np.asarray(hc["hidden"], dtype=np.float64)
