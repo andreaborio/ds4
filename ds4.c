@@ -8232,12 +8232,78 @@ static bool weights_combined_exact_non_routed_bytes(
     return true;
 }
 
+enum {
+    DS4_VERIFY_DECODE_EXACT_MAX_ROWS = 6,
+};
+
+/* Pure geometry preflight shared by the Metal verifier and model-free tests.
+ * A reversible verifier cannot replace any raw-KV row visible at its starting
+ * frontier because the speculative transaction does not copy that ring. */
+static bool ds4_verify_raw_ring_disjoint(
+        uint32_t raw_cap,
+        uint32_t raw_window,
+        uint32_t start,
+        uint32_t n_tokens) {
+    if (raw_cap == 0 || n_tokens == 0 || n_tokens > raw_cap) return false;
+
+    uint32_t live = raw_window ? raw_window : DS4_N_SWA;
+    if (live > raw_cap) live = raw_cap;
+    if (live > start) live = start;
+    const uint32_t live_start = start - live;
+
+    for (uint32_t row = 0; row < n_tokens; row++) {
+        const uint32_t write = (start + row) % raw_cap;
+        for (uint32_t prior = 0; prior < row; prior++) {
+            if ((start + prior) % raw_cap == write) return false;
+        }
+        for (uint32_t prefix = live_start; prefix < start; prefix++) {
+            if (prefix % raw_cap == write) return false;
+        }
+    }
+    return true;
+}
+
+static bool ds4_verify_decode_exact_shape_valid(
+        uint32_t raw_cap,
+        uint32_t raw_window,
+        uint32_t start,
+        uint32_t n_tokens,
+        uint32_t batch_cap) {
+    return n_tokens >= 1u &&
+           n_tokens <= DS4_VERIFY_DECODE_EXACT_MAX_ROWS &&
+           n_tokens <= DS4_DSPARK_VERIFY_CAPTURE_MAX_ROWS &&
+           n_tokens <= batch_cap &&
+           start <= UINT32_MAX - (n_tokens - 1u) &&
+           ds4_verify_raw_ring_disjoint(
+               raw_cap, raw_window, start, n_tokens);
+}
+
 #ifdef DS4_TEST_HOOKS
 /* Model-free regression for the combined page-union and AUTO accounting
  * contract. It uses sparse offsets only; no multi-gigabyte allocation or
  * model mmap is created. */
 static bool ds4_test_dspark_memory_accounting(void) {
     enum { SUPPORT_STATIC_COUNT = DS4_DSPARK_0731_STATIC_TENSOR_COUNT };
+    for (uint32_t n_tokens = 1u;
+         n_tokens <= DS4_VERIFY_DECODE_EXACT_MAX_ROWS; n_tokens++) {
+        if (!ds4_verify_decode_exact_shape_valid(
+                134u, 128u, 128u, n_tokens, 6u)) {
+            return false;
+        }
+    }
+    if (ds4_verify_decode_exact_shape_valid(134u, 128u, 128u, 0u, 6u) ||
+        ds4_verify_decode_exact_shape_valid(134u, 128u, 128u, 7u, 7u) ||
+        ds4_verify_decode_exact_shape_valid(
+            134u, 128u, UINT32_MAX, 2u, 6u) ||
+        ds4_verify_decode_exact_shape_valid(134u, 128u, 128u, 6u, 5u) ||
+        ds4_verify_decode_exact_shape_valid(133u, 128u, 128u, 6u, 6u) ||
+        ds4_verify_decode_exact_shape_valid(128u, 128u, 128u, 1u, 6u) ||
+        !ds4_verify_decode_exact_shape_valid(8u, 4u, 4u, 4u, 6u) ||
+        ds4_verify_decode_exact_shape_valid(8u, 4u, 4u, 5u, 6u) ||
+        !ds4_verify_decode_exact_shape_valid(4u, 4u, 0u, 4u, 6u) ||
+        ds4_verify_decode_exact_shape_valid(4u, 4u, 0u, 5u, 6u)) {
+        return false;
+    }
     const uint64_t page = DS4_DSPARK_METAL_PAGE_BYTES;
     const uint64_t target_exact_end =
         DS4_DSPARK_TARGET_STATIC_PAGE_BYTES_16K - UINT64_C(2988);
@@ -31897,14 +31963,169 @@ static bool metal_graph_read_spec_logits_row(ds4_gpu_graph *g, uint32_t row, flo
                                  row_bytes) != 0;
 }
 
-/* Exact N=2 target verifier for MTP.
+/* Exact autoregressive target verifier for tiny speculative suffixes.
  *
- * The generic batch prefill path is fast, but it is not a safe substitute for
- * autoregressive decode: small row-wise differences in HC/MoE/output kernels
- * are enough to flip future greedy tokens.  This verifier keeps the exact
- * decode kernels and cache update order, but encodes the two proposed tokens
- * layer-by-layer in one command stream.  It returns the exact target top after
- * token0, and exact logits after token1. */
+ * The generic batch prefill path is not an exact decode substitute.  This
+ * helper instead advances each proposed row with the existing mono-token
+ * kernels, in autoregressive row order inside every target layer.  The output
+ * head is likewise evaluated row-by-row.  N>2 is an additive implementation
+ * seam only until it has real-model numeric qualification; the production MTP
+ * scheduler below remains on the legacy N=2 wrapper. */
+static bool metal_graph_verify_decode_exact(
+        ds4_gpu_graph *g,
+        const ds4_model       *model,
+        const ds4_weights     *weights,
+        const int             *tokens,
+        uint32_t               n_tokens,
+        uint32_t               start,
+        int                   *row_tops,
+        float *const          *row_logits) {
+    if (!g) return false;
+    if (!model || !weights || !weights->token_embd || !weights->output ||
+        !tokens || !ds4_verify_decode_exact_shape_valid(
+            g->raw_cap, g->raw_window, start, n_tokens, g->prefill_cap) ||
+        (n_tokens > 1u && !row_tops) || !row_logits ||
+        !row_logits[n_tokens - 1u] || !g->batch_cur_hc ||
+        !g->batch_next_hc || !g->logits || !g->comp_selected) {
+        metal_graph_dspark_verify_capture_abort(g);
+        return false;
+    }
+
+    const uint64_t hc_dim = (uint64_t)DS4_N_HC * DS4_N_EMBD;
+    const uint64_t hc_bytes = hc_dim * sizeof(float);
+    const uint64_t batch_bytes = (uint64_t)n_tokens * hc_bytes;
+    bool ok = ds4_gpu_tensor_bytes(g->batch_cur_hc) >= batch_bytes &&
+              ds4_gpu_tensor_bytes(g->batch_next_hc) >= batch_bytes;
+    for (uint32_t il = 0; ok && il < DS4_N_LAYER; il++) {
+        ok = g->layer_raw_cache[il] != NULL;
+    }
+    for (uint32_t row = 0; ok && row < n_tokens; row++) {
+        ok = tokens[row] >= 0 && (uint64_t)tokens[row] < DS4_N_VOCAB &&
+             (uint64_t)tokens[row] < weights->token_embd->dim[1];
+    }
+
+    ds4_gpu_tensor *cur[DS4_VERIFY_DECODE_EXACT_MAX_ROWS] = {0};
+    ds4_gpu_tensor *next[DS4_VERIFY_DECODE_EXACT_MAX_ROWS] = {0};
+    ds4_gpu_tensor *cur_batch_hc = g->batch_cur_hc;
+    ds4_gpu_tensor *next_batch_hc = g->batch_next_hc;
+    for (uint32_t row = 0; ok && row < n_tokens; row++) {
+        cur[row] = metal_graph_tensor_row_view(cur_batch_hc, row, hc_dim);
+        next[row] = metal_graph_tensor_row_view(next_batch_hc, row, hc_dim);
+        ok = cur[row] && next[row];
+    }
+    if (!ok) {
+        for (uint32_t row = 0; row < n_tokens; row++) {
+            ds4_gpu_tensor_free(next[row]);
+            ds4_gpu_tensor_free(cur[row]);
+        }
+        metal_graph_dspark_verify_capture_abort(g);
+        return false;
+    }
+
+    for (uint32_t row = 0; ok && row < n_tokens; row++) {
+        ok = ds4_gpu_embed_token_hc_tensor(cur[row],
+                                             model->map,
+                                             model->size,
+                                             weights->token_embd->abs_offset,
+                                             (uint32_t)weights->token_embd->dim[1],
+                                             (uint32_t)tokens[row],
+                                             DS4_N_EMBD,
+                                             DS4_N_HC) != 0;
+    }
+    if (ok) {
+        ok = metal_graph_dspark_verify_capture_begin(g, start, n_tokens);
+    }
+    if (!ok) {
+        for (uint32_t row = 0; row < n_tokens; row++) {
+            ds4_gpu_tensor_free(next[row]);
+            ds4_gpu_tensor_free(cur[row]);
+        }
+        metal_graph_dspark_verify_capture_abort(g);
+        return false;
+    }
+
+    ds4_gpu_tensor *saved_cur = g->cur_hc;
+    ds4_gpu_tensor *saved_after = g->after_ffn_hc;
+    const bool saved_capture = g->spec_capture_prefix1;
+    g->spec_capture_prefix1 = n_tokens == 2u;
+    if (ok) ok = ds4_gpu_begin_commands() != 0;
+    for (uint32_t il = 0; ok && il < DS4_N_LAYER; il++) {
+        for (uint32_t row = 0; ok && row < n_tokens; row++) {
+            const uint32_t pos = start + row;
+            g->cur_hc = cur[row];
+            g->after_ffn_hc = next[row];
+            ok = metal_graph_encode_decode_layer(g,
+                                                 model,
+                                                 &weights->layer[il],
+                                                 il,
+                                                 pos,
+                                                 g->layer_raw_cache[il],
+                                                 g->raw_cap,
+                                                 pos % g->raw_cap,
+                                                 metal_graph_raw_span_for_batch(g, pos, 1),
+                                                 tokens[row]);
+            if (ok && row == 0u && n_tokens == 2u) {
+                ok = metal_graph_capture_prefix1_attn_state(g, il) &&
+                     metal_graph_capture_prefix1_index_state(g, il);
+            }
+        }
+        if (!ok) break;
+        ok = metal_graph_dspark_verify_capture_after_layer_batch(
+            g, il, next_batch_hc, n_tokens);
+        if (!ok) break;
+
+        for (uint32_t row = 0; row < n_tokens; row++) {
+            ds4_gpu_tensor *tmp = cur[row];
+            cur[row] = next[row];
+            next[row] = tmp;
+        }
+        ds4_gpu_tensor *tmp = cur_batch_hc;
+        cur_batch_hc = next_batch_hc;
+        next_batch_hc = tmp;
+    }
+    if (ok) ok = ds4_gpu_end_commands() != 0;
+    else (void)ds4_gpu_synchronize();
+    g->spec_capture_prefix1 = saved_capture;
+    g->cur_hc = saved_cur;
+    g->after_ffn_hc = saved_after;
+
+    for (uint32_t row = 0; ok && row < n_tokens; row++) {
+        g->cur_hc = cur[row];
+        ok = ds4_gpu_begin_commands() != 0;
+        if (ok) ok = metal_graph_encode_output_head(g, model, weights, weights->output->dim[1]);
+        if (ok && row + 1u < n_tokens) {
+            ok = ds4_gpu_argmax_tensor(g->comp_selected,
+                                       g->logits,
+                                       DS4_N_VOCAB) != 0;
+        }
+        if (ok) ok = ds4_gpu_end_commands() != 0;
+        else (void)ds4_gpu_synchronize();
+        g->cur_hc = saved_cur;
+        if (ok && row + 1u < n_tokens) {
+            ok = ds4_gpu_tensor_read(
+                     g->comp_selected, 0, &row_tops[row], sizeof(row_tops[row])) != 0;
+        }
+        if (ok && row_logits[row]) {
+            ok = ds4_gpu_tensor_read(g->logits,
+                                       0,
+                                       row_logits[row],
+                                       (uint64_t)DS4_N_VOCAB *
+                                           sizeof(row_logits[row][0])) != 0;
+        }
+    }
+    g->cur_hc = saved_cur;
+    g->after_ffn_hc = saved_after;
+    g->spec_capture_prefix1 = saved_capture;
+    if (!ok) metal_graph_dspark_verify_capture_abort(g);
+
+    for (uint32_t row = 0; row < n_tokens; row++) {
+        ds4_gpu_tensor_free(next[row]);
+        ds4_gpu_tensor_free(cur[row]);
+    }
+    return ok;
+}
+
+/* Preserve the qualified N=2 API and its sole product caller. */
 static bool metal_graph_verify_decode2_exact(
         ds4_gpu_graph *g,
         const ds4_model       *model,
@@ -31915,136 +32136,10 @@ static bool metal_graph_verify_decode2_exact(
         int                   *top0,
         float                 *logits0,
         float                 *logits1) {
-    if (!g) return false;
-    if (!model || !weights || !weights->output || !top0 || !logits1 ||
-        g->raw_cap == 0) {
-        metal_graph_dspark_capture_invalidate(g);
-        return false;
-    }
-
-    const uint64_t hc_dim = (uint64_t)DS4_N_HC * DS4_N_EMBD;
-    ds4_gpu_tensor *cur0 = metal_graph_tensor_row_view(g->batch_cur_hc, 0, hc_dim);
-    ds4_gpu_tensor *cur1 = metal_graph_tensor_row_view(g->batch_cur_hc, 1, hc_dim);
-    ds4_gpu_tensor *next0 = metal_graph_tensor_row_view(g->batch_next_hc, 0, hc_dim);
-    ds4_gpu_tensor *next1 = metal_graph_tensor_row_view(g->batch_next_hc, 1, hc_dim);
-    ds4_gpu_tensor *next_pair_hc = g->batch_next_hc;
-    ds4_gpu_tensor *cur_pair_hc = g->batch_cur_hc;
-    bool ok = cur0 && cur1 && next0 && next1;
-
-    if (ok) ok = ds4_gpu_embed_token_hc_tensor(cur0,
-                                                  model->map,
-                                                  model->size,
-                                                  weights->token_embd->abs_offset,
-                                                  (uint32_t)weights->token_embd->dim[1],
-                                                  (uint32_t)token0,
-                                                  DS4_N_EMBD,
-                                                  DS4_N_HC) != 0;
-    if (ok) ok = ds4_gpu_embed_token_hc_tensor(cur1,
-                                                  model->map,
-                                                  model->size,
-                                                  weights->token_embd->abs_offset,
-                                                  (uint32_t)weights->token_embd->dim[1],
-                                                  (uint32_t)token1,
-                                                  DS4_N_EMBD,
-                                                  DS4_N_HC) != 0;
-    if (ok) ok = metal_graph_dspark_verify_capture_begin(g, start, 2u);
-
-    ds4_gpu_tensor *saved_cur = g->cur_hc;
-    ds4_gpu_tensor *saved_after = g->after_ffn_hc;
-    const bool saved_capture = g->spec_capture_prefix1;
-    g->spec_capture_prefix1 = true;
-    if (ok) ok = ds4_gpu_begin_commands() != 0;
-    for (uint32_t il = 0; ok && il < DS4_N_LAYER; il++) {
-        const uint32_t pos0 = start;
-        const uint32_t pos1 = start + 1u;
-
-        g->cur_hc = cur0;
-        g->after_ffn_hc = next0;
-        ok = metal_graph_encode_decode_layer(g,
-                                             model,
-                                             &weights->layer[il],
-                                             il,
-                                             pos0,
-                                             g->layer_raw_cache[il],
-                                             g->raw_cap,
-                                             pos0 % g->raw_cap,
-                                             metal_graph_raw_span_for_batch(g, pos0, 1),
-                                             token0);
-        if (!ok) break;
-        ok = metal_graph_capture_prefix1_attn_state(g, il) &&
-             metal_graph_capture_prefix1_index_state(g, il);
-        if (!ok) break;
-
-        g->cur_hc = cur1;
-        g->after_ffn_hc = next1;
-        ok = metal_graph_encode_decode_layer(g,
-                                             model,
-                                             &weights->layer[il],
-                                             il,
-                                             pos1,
-                                             g->layer_raw_cache[il],
-                                             g->raw_cap,
-                                             pos1 % g->raw_cap,
-                                             metal_graph_raw_span_for_batch(g, pos1, 1),
-                                             token1);
-        if (!ok) break;
-        ok = metal_graph_dspark_verify_capture_after_layer_batch(
-            g, il, next_pair_hc, 2u);
-        if (!ok) break;
-
-        ds4_gpu_tensor *tmp = cur0; cur0 = next0; next0 = tmp;
-        tmp = cur1; cur1 = next1; next1 = tmp;
-        tmp = cur_pair_hc; cur_pair_hc = next_pair_hc; next_pair_hc = tmp;
-    }
-    if (ok) ok = ds4_gpu_end_commands() != 0;
-    else (void)ds4_gpu_synchronize();
-    g->spec_capture_prefix1 = saved_capture;
-    g->cur_hc = saved_cur;
-    g->after_ffn_hc = saved_after;
-
-    if (ok) {
-        g->cur_hc = cur0;
-        ok = ds4_gpu_begin_commands() != 0;
-        if (ok) ok = metal_graph_encode_output_head(g, model, weights, weights->output->dim[1]);
-        if (ok) ok = ds4_gpu_argmax_tensor(g->comp_selected,
-                                           g->logits,
-                                           DS4_N_VOCAB) != 0;
-        if (ok) ok = ds4_gpu_end_commands() != 0;
-        else (void)ds4_gpu_synchronize();
-        g->cur_hc = saved_cur;
-        if (ok) ok = ds4_gpu_tensor_read(g->comp_selected, 0, top0, sizeof(*top0)) != 0;
-        if (ok && logits0) {
-            ok = ds4_gpu_tensor_read(g->logits,
-                                       0,
-                                       logits0,
-                                       (uint64_t)DS4_N_VOCAB * sizeof(logits0[0])) != 0;
-        }
-    }
-
-    if (ok) {
-        g->cur_hc = cur1;
-        ok = ds4_gpu_begin_commands() != 0;
-        if (ok) ok = metal_graph_encode_output_head(g, model, weights, weights->output->dim[1]);
-        if (ok) ok = ds4_gpu_end_commands() != 0;
-        else (void)ds4_gpu_synchronize();
-        g->cur_hc = saved_cur;
-        if (ok) {
-            ok = ds4_gpu_tensor_read(g->logits,
-                                       0,
-                                       logits1,
-                                       (uint64_t)DS4_N_VOCAB * sizeof(logits1[0])) != 0;
-        }
-    }
-    g->cur_hc = saved_cur;
-    g->after_ffn_hc = saved_after;
-    g->spec_capture_prefix1 = saved_capture;
-    if (!ok) metal_graph_dspark_capture_invalidate(g);
-
-    ds4_gpu_tensor_free(next1);
-    ds4_gpu_tensor_free(next0);
-    ds4_gpu_tensor_free(cur1);
-    ds4_gpu_tensor_free(cur0);
-    return ok;
+    const int tokens[2] = {token0, token1};
+    float *row_logits[2] = {logits0, logits1};
+    return metal_graph_verify_decode_exact(
+        g, model, weights, tokens, 2u, start, top0, row_logits);
 }
 
 /* Pick a raw SWA cache size for Metal.  During batched prefill it must cover
