@@ -36967,7 +36967,68 @@ struct ds4_session {
     int ctx_size;
     bool checkpoint_valid;
     bool mtp_draft_valid;
+    uint64_t generation_last_cookie;
+    uint64_t generation_active_cookie;
+    ds4_generation_rng generation_rng_start;
+    uint64_t generation_rng_after[2];
+    uint32_t generation_count;
+    int generation_token;
+    bool generation_active;
+    bool pending_valid;
+    int pending_token;
+    ds4_generation_rng pending_rng_boundary;
 };
+
+static void ds4_session_generation_clear_active(ds4_session *s) {
+    if (!s) return;
+    s->generation_active_cookie = 0;
+    s->generation_rng_start = (ds4_generation_rng){0};
+    s->generation_rng_after[0] = 0;
+    s->generation_rng_after[1] = 0;
+    s->generation_count = 0;
+    s->generation_token = 0;
+    s->generation_active = false;
+}
+
+static void ds4_session_generation_clear_pending(ds4_session *s) {
+    if (!s) return;
+    s->pending_valid = false;
+    s->pending_token = 0;
+    s->pending_rng_boundary = (ds4_generation_rng){0};
+}
+
+static void ds4_session_generation_abort_all(ds4_session *s) {
+    if (!s) return;
+    ds4_session_generation_clear_active(s);
+    ds4_session_generation_clear_pending(s);
+}
+
+static bool ds4_session_generation_has_unsettled(const ds4_session *s) {
+    return s && (s->generation_active || s->pending_valid);
+}
+
+static int ds4_session_generation_reject_active(
+        const ds4_session *s, char *err, size_t errlen) {
+    if (!s || !s->generation_active) return 0;
+    if (err && errlen) {
+        snprintf(err, errlen, "generation block transaction is active");
+    }
+    return 1;
+}
+
+static int ds4_session_generation_reject_unsettled(
+        const ds4_session *s, char *err, size_t errlen) {
+    if (!ds4_session_generation_has_unsettled(s)) return 0;
+    if (err && errlen) {
+        snprintf(err, errlen, s->generation_active ?
+                 "generation block transaction is active" :
+                 "generation block has an unevaluated pending token");
+    }
+    return 1;
+}
+
+static int ds4_session_eval_internal(ds4_session *s, int token, bool probe_mtp,
+                                     char *err, size_t errlen);
 
 /* =========================================================================
  * Session Snapshot Payloads.
@@ -37497,6 +37558,7 @@ static bool ds4_session_qwen35_reset_timeline(ds4_session *s) {
     s->checkpoint.len = 0;
     s->checkpoint_valid = false;
     s->mtp_draft_valid = false;
+    ds4_session_generation_clear_pending(s);
     return ok;
 }
 
@@ -37705,7 +37767,9 @@ static bool spec_frontier_commit_prefix1(ds4_session *s) {
 #endif
 
 uint64_t ds4_session_payload_bytes(ds4_session *s) {
-    if (!s || !s->checkpoint_valid) return 0;
+    if (!s || !s->checkpoint_valid ||
+        s->checkpoint.len >= s->ctx_size ||
+        ds4_session_generation_has_unsettled(s)) return 0;
     if (ds4_session_is_qwen35(s)) return 0;
     if (ds4_session_is_cpu(s)) {
         uint64_t bytes = (uint64_t)DS4_SESSION_PAYLOAD_U32_FIELDS * sizeof(uint32_t);
@@ -37784,8 +37848,15 @@ int ds4_session_stage_payload(ds4_session *s, ds4_session_payload_file *out,
         return 1;
     }
     memset(out, 0, sizeof(*out));
+    if (ds4_session_generation_reject_unsettled(s, err, errlen) != 0) {
+        return 1;
+    }
     if (!s || !s->checkpoint_valid) {
         payload_set_err(err, errlen, "session has no valid checkpoint to stage");
+        return 1;
+    }
+    if (s->checkpoint.len >= s->ctx_size) {
+        payload_set_err(err, errlen, "full-context session cannot be staged");
         return 1;
     }
     if (ds4_session_is_qwen35(s)) {
@@ -37837,8 +37908,15 @@ int ds4_session_stage_payload(ds4_session *s, ds4_session_payload_file *out,
 }
 
 int ds4_session_save_payload(ds4_session *s, FILE *fp, char *err, size_t errlen) {
+    if (ds4_session_generation_reject_unsettled(s, err, errlen) != 0) {
+        return 1;
+    }
     if (!s || !fp || !s->checkpoint_valid) {
         payload_set_err(err, errlen, "session has no valid checkpoint to save");
+        return 1;
+    }
+    if (s->checkpoint.len >= s->ctx_size) {
+        payload_set_err(err, errlen, "full-context session cannot be saved");
         return 1;
     }
     if (ds4_session_is_qwen35(s)) {
@@ -38048,6 +38126,9 @@ int ds4_session_save_payload(ds4_session *s, FILE *fp, char *err, size_t errlen)
 }
 
 int ds4_session_load_payload(ds4_session *s, FILE *fp, uint64_t payload_bytes, char *err, size_t errlen) {
+    if (ds4_session_generation_reject_unsettled(s, err, errlen) != 0) {
+        return 1;
+    }
     if (!s || !fp) {
         payload_set_err(err, errlen, "invalid session payload load");
         return 1;
@@ -38614,6 +38695,9 @@ int ds4_session_load_payload(ds4_session *s, FILE *fp, uint64_t payload_bytes, c
 }
 
 int ds4_session_save_snapshot(ds4_session *s, ds4_session_snapshot *snap, char *err, size_t errlen) {
+    if (ds4_session_generation_reject_unsettled(s, err, errlen) != 0) {
+        return 1;
+    }
     if (!s || !snap) {
         payload_set_err(err, errlen, "invalid session snapshot save");
         return 1;
@@ -38653,6 +38737,9 @@ int ds4_session_save_snapshot(ds4_session *s, ds4_session_snapshot *snap, char *
 }
 
 int ds4_session_load_snapshot(ds4_session *s, const ds4_session_snapshot *snap, char *err, size_t errlen) {
+    if (ds4_session_generation_reject_unsettled(s, err, errlen) != 0) {
+        return 1;
+    }
     if (!s || !snap || !snap->ptr || snap->len == 0) {
         payload_set_err(err, errlen, "invalid session snapshot load");
         return 1;
@@ -44486,6 +44573,7 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
 
 void ds4_session_free(ds4_session *s) {
     if (!s) return;
+    ds4_session_generation_abort_all(s);
     if (ds4_session_is_qwen35_cpu(s)) {
         ds4_qwen35_cpu_cache_free(&s->qwen35_cpu_cache);
         ds4_qwen35_cpu_scratch_free(&s->qwen35_cpu_scratch);
@@ -44527,6 +44615,7 @@ int ds4_session_power(ds4_session *s) {
 
 int ds4_session_set_power(ds4_session *s, int power_percent) {
     if (!s || !s->engine || power_percent < 1 || power_percent > 100) return 1;
+    if (s->generation_active) return 1;
     if (ds4_session_is_qwen35(s)) {
         if (power_percent != 100) return 1;
         s->engine->power_percent = 100;
@@ -44576,6 +44665,7 @@ void ds4_session_report_progress(ds4_session *s, const char *event, int current,
 #ifndef DS4_NO_GPU
 int ds4_session_imatrix_enable(ds4_session *s) {
     if (!s) return 1;
+    if (s->generation_active) return 1;
     if (ds4_session_is_qwen35(s)) return 2;
     if (!s->engine || s->engine->backend != DS4_BACKEND_METAL) return 2;  /* Metal backend only: the
         collector reads Metal graph readback tensors; CPU is not wired and must be rejected */
@@ -44592,6 +44682,7 @@ int ds4_session_imatrix_enable(ds4_session *s) {
 }
 
 int ds4_session_imatrix_save(ds4_session *s, const char *path) {
+    if (s && s->generation_active) return 1;
     if (ds4_session_is_qwen35(s)) return 1;
     if (!s || !s->imatrix || !path) return 1;
     /* non-destructive snapshot (collector is const here); full-rewrite each call */
@@ -44604,6 +44695,7 @@ uint64_t ds4_session_imatrix_observed_tokens(const ds4_session *s) {
 
 void ds4_session_imatrix_disable(ds4_session *s) {
     if (!s || !s->imatrix) return;
+    if (s->generation_active) return;
     imatrix_collector_free(s->imatrix);
     free(s->imatrix);
     s->imatrix = NULL;
@@ -44645,6 +44737,13 @@ typedef bool (*ds4_qwen35_forward_fn)(
         uint32_t                      position,
         ds4_qwen35_cpu_scratch       *scratch);
 
+static int ds4_session_eval_qwen35_one_with_forward(
+        ds4_session *s, int token, char *err, size_t errlen,
+        ds4_qwen35_forward_fn forward);
+static int ds4_session_materialize_pending(
+        ds4_session *s, char *err, size_t errlen,
+        ds4_qwen35_forward_fn qwen_forward);
+
 /* Commit the token checkpoint only after the model cache advanced exactly one
  * position.  The function pointer is a narrow test seam: production always
  * supplies qwen35_cpu_forward_token, while model-free tests can exercise the
@@ -44680,10 +44779,18 @@ static int ds4_session_sync_qwen35_with_forward(
         char                   *err,
         size_t                  errlen,
         ds4_qwen35_forward_fn   forward) {
+    if (ds4_session_generation_reject_active(s, err, errlen) != 0) {
+        return 1;
+    }
     if (!ds4_session_is_qwen35_cpu(s) || !prompt || !forward ||
         prompt->len <= 0 || prompt->len >= s->ctx_size) {
         if (errlen) snprintf(err, errlen, "invalid Qwen raw-token sync");
         return 1;
+    }
+    if (ds4_session_cancelled(s)) {
+        if (!s->pending_valid) (void)ds4_session_qwen35_reset_timeline(s);
+        if (err && errlen) snprintf(err, errlen, "interrupted");
+        return DS4_SESSION_SYNC_INTERRUPTED;
     }
 
     if (!ds4_session_qwen35_timeline_valid(s)) {
@@ -44700,6 +44807,22 @@ static int ds4_session_sync_qwen35_with_forward(
                          prompt->v[i], i);
             }
             return 1;
+        }
+    }
+
+    if (s->pending_valid) {
+        const bool exact_extension =
+            s->checkpoint_valid &&
+            prompt->len > s->checkpoint.len &&
+            ds4_tokens_starts_with(prompt, &s->checkpoint) &&
+            prompt->v[s->checkpoint.len] == s->pending_token;
+        if (exact_extension) {
+            if (ds4_session_materialize_pending(
+                    s, err, errlen, forward) != 0) {
+                return 1;
+            }
+        } else {
+            ds4_session_generation_clear_pending(s);
         }
     }
 
@@ -45989,6 +46112,37 @@ static int ds4_session_sync_qwen35_metal(
 
 #include "runtime/ds4_deepseek_cache_phase.inc"
 
+static int ds4_session_materialize_pending(
+        ds4_session *s, char *err, size_t errlen,
+        ds4_qwen35_forward_fn qwen_forward) {
+    if (!s || !s->pending_valid) return 0;
+    const int pending = s->pending_token;
+    const int rc = qwen_forward ?
+        ds4_session_eval_qwen35_one_with_forward(
+            s, pending, err, errlen, qwen_forward) :
+        ds4_session_eval_internal(s, pending, true, err, errlen);
+    if (rc != 0) {
+        ds4_session_invalidate(s);
+        return 1;
+    }
+    ds4_session_generation_clear_pending(s);
+    return 0;
+}
+
+static int ds4_session_generation_prepare_sync(
+        ds4_session *s, const ds4_tokens *prompt, char *err, size_t errlen) {
+    if (!s || !s->pending_valid) return 0;
+    const bool exact_extension =
+        s->checkpoint_valid && prompt->len > s->checkpoint.len &&
+        ds4_tokens_starts_with(prompt, &s->checkpoint) &&
+        prompt->v[s->checkpoint.len] == s->pending_token;
+    if (!exact_extension) {
+        ds4_session_generation_clear_pending(s);
+        return 0;
+    }
+    return ds4_session_materialize_pending(s, err, errlen, NULL);
+}
+
 /* Bring the live backend state to exactly the supplied token prefix.
  *
  * ds4-server and the REPL are stateless at the text/API layer but stateful here:
@@ -46005,6 +46159,9 @@ static int ds4_session_sync_qwen35_metal(
  * A non-matching prompt discards the checkpoint and prefills from token zero.
  */
 int ds4_session_sync(ds4_session *s, const ds4_tokens *prompt, char *err, size_t errlen) {
+    if (ds4_session_generation_reject_active(s, err, errlen) != 0) {
+        return 1;
+    }
     if (!s || !prompt) {
         snprintf(err, errlen, "missing session or prompt");
         return 1;
@@ -46026,11 +46183,14 @@ int ds4_session_sync(ds4_session *s, const ds4_tokens *prompt, char *err, size_t
         }
     }
     if (ds4_session_cancelled(s)) {
-        if (ds4_session_is_qwen35(s)) {
+        if (ds4_session_is_qwen35(s) && !s->pending_valid) {
             (void)ds4_session_qwen35_reset_timeline(s);
         }
         snprintf(err, errlen, "interrupted");
         return DS4_SESSION_SYNC_INTERRUPTED;
+    }
+    if (ds4_session_generation_prepare_sync(s, prompt, err, errlen) != 0) {
+        return 1;
     }
     if (ds4_session_is_qwen35(s)) {
         if (ds4_session_is_qwen35_cpu(s)) {
@@ -46833,6 +46993,9 @@ bool ds4_session_rewrite_requires_rebuild(int live_len, int canonical_len, int c
 ds4_session_rewrite_result ds4_session_rewrite_from_common(
         ds4_session *s, const ds4_tokens *prompt, int common,
         char *err, size_t errlen) {
+    if (ds4_session_generation_reject_unsettled(s, err, errlen) != 0) {
+        return DS4_SESSION_REWRITE_ERROR;
+    }
     if (!s || !prompt) {
         snprintf(err, errlen, "missing session or prompt");
         return DS4_SESSION_REWRITE_ERROR;
@@ -46886,12 +47049,12 @@ int ds4_session_common_prefix(ds4_session *s, const ds4_tokens *prompt) {
 }
 
 int ds4_session_argmax(ds4_session *s) {
-    if (!s || !s->logits) return -1;
+    if (!s || !s->logits || ds4_session_generation_has_unsettled(s)) return -1;
     return sample_argmax(s->logits, ds4_session_selectable_vocab_size(s));
 }
 
 int ds4_session_argmax_excluding(ds4_session *s, int excluded_id) {
-    if (!s || !s->logits) return -1;
+    if (!s || !s->logits || ds4_session_generation_has_unsettled(s)) return -1;
     const uint32_t n_vocab = ds4_session_selectable_vocab_size(s);
     int best = -1;
     float best_logit = DS4_NEG_INF;
@@ -46914,14 +47077,14 @@ int ds4_sample_logits(const float *logits, int n_vocab, float temperature,
 }
 
 int ds4_session_sample(ds4_session *s, float temperature, int top_k, float top_p, float min_p, uint64_t *rng) {
-    if (!s || !s->logits) return -1;
+    if (!s || !s->logits || ds4_session_generation_has_unsettled(s)) return -1;
     return sample_top_p_min_p(
         s->logits, ds4_session_selectable_vocab_size(s),
         temperature, top_k, top_p, min_p, rng, NULL);
 }
 
 int ds4_session_top_logprobs(ds4_session *s, ds4_token_score *out, int k) {
-    if (!s || !out || k <= 0) return 0;
+    if (!s || !out || k <= 0 || ds4_session_generation_has_unsettled(s)) return 0;
     const uint32_t n_vocab = ds4_session_selectable_vocab_size(s);
     if (k > (int)n_vocab) k = (int)n_vocab;
     for (int i = 0; i < k; i++) {
@@ -46959,7 +47122,7 @@ int ds4_session_top_logprobs(ds4_session *s, ds4_token_score *out, int k) {
 }
 
 int ds4_session_token_logprob(ds4_session *s, int token, ds4_token_score *out) {
-    if (!s || !out) return 0;
+    if (!s || !out || ds4_session_generation_has_unsettled(s)) return 0;
     const uint32_t n_vocab = ds4_session_selectable_vocab_size(s);
     if (token < 0 || token >= (int)n_vocab) return 0;
 
@@ -46983,7 +47146,7 @@ int ds4_session_token_logprob(ds4_session *s, int token, ds4_token_score *out) {
 }
 
 int ds4_session_copy_logits(ds4_session *s, float *out, int cap) {
-    if (!s || !out) return 0;
+    if (!s || !out || ds4_session_generation_has_unsettled(s)) return 0;
     const uint32_t n_vocab = ds4_session_vocab_size(s);
     if (cap < (int)n_vocab) return 0;
     memcpy(out, s->logits, (size_t)n_vocab * sizeof(out[0]));
@@ -46991,14 +47154,14 @@ int ds4_session_copy_logits(ds4_session *s, float *out, int cap) {
 }
 
 int ds4_session_set_logits(ds4_session *s, const float *logits, int n) {
-    if (!s || !logits) return 1;
+    if (!s || !logits || ds4_session_generation_has_unsettled(s)) return 1;
     const uint32_t n_vocab = ds4_session_vocab_size(s);
     if (n != (int)n_vocab) return 1;
     memcpy(s->logits, logits, (size_t)n_vocab * sizeof(s->logits[0]));
     return 0;
 }
 
-static int ds4_session_eval_qwen35_with_forward(
+static int ds4_session_eval_qwen35_one_with_forward(
         ds4_session            *s,
         int                     token,
         char                   *err,
@@ -47037,6 +47200,28 @@ static int ds4_session_eval_qwen35_with_forward(
     }
     return 0;
 }
+
+#ifdef DS4_TEST_HOOKS
+static int ds4_session_eval_qwen35_with_forward(
+        ds4_session            *s,
+        int                     token,
+        char                   *err,
+        size_t                  errlen,
+        ds4_qwen35_forward_fn   forward) {
+    if (ds4_session_generation_reject_unsettled(s, err, errlen) != 0) {
+        return 1;
+    }
+    if (!ds4_session_is_qwen35_cpu(s) || !forward ||
+        ds4_session_reject_invalid_token(s, token, -1, err, errlen) != 0) {
+        if (err && errlen && (!s || !forward)) {
+            snprintf(err, errlen, "invalid Qwen raw-token evaluation");
+        }
+        return 1;
+    }
+    return ds4_session_eval_qwen35_one_with_forward(
+        s, token, err, errlen, forward);
+}
+#endif
 
 #if defined(__APPLE__) && !defined(DS4_NO_GPU)
 static int ds4_session_eval_qwen35_metal(
@@ -47094,7 +47279,7 @@ static int ds4_session_eval_internal(ds4_session *s, int token, bool probe_mtp,
     if (ds4_session_is_qwen35(s)) {
         (void)probe_mtp;
         if (ds4_session_is_qwen35_cpu(s)) {
-            return ds4_session_eval_qwen35_with_forward(
+            return ds4_session_eval_qwen35_one_with_forward(
                 s, token, err, errlen, qwen35_cpu_forward_token);
         }
 #if defined(__APPLE__) && !defined(DS4_NO_GPU)
@@ -47223,7 +47408,216 @@ static int ds4_session_eval_internal(ds4_session *s, int token, bool probe_mtp,
 }
 
 int ds4_session_eval(ds4_session *s, int token, char *err, size_t errlen) {
+    if (ds4_session_generation_reject_unsettled(s, err, errlen) != 0) {
+        return 1;
+    }
+    if (!s || ds4_session_reject_invalid_token(
+            s, token, -1, err, errlen) != 0) {
+        return 1;
+    }
     return ds4_session_eval_internal(s, token, true, err, errlen);
+}
+
+static int ds4_session_generation_begin_preflight(
+        const ds4_session *s,
+        const ds4_generation_block_request *request,
+        const ds4_generation_block *block,
+        char *err,
+        size_t errlen) {
+    if (!s || !request || !block) {
+        if (err && errlen) snprintf(err, errlen, "invalid generation block request");
+        return 1;
+    }
+    if (s->generation_active) {
+        if (err && errlen) snprintf(err, errlen, "generation block transaction is active");
+        return 1;
+    }
+    uint32_t temperature_bits = 0;
+    uint32_t top_p_bits = 0;
+    uint32_t min_p_bits = 0;
+    memcpy(&temperature_bits, &request->temperature, sizeof(temperature_bits));
+    memcpy(&top_p_bits, &request->top_p, sizeof(top_p_bits));
+    memcpy(&min_p_bits, &request->min_p, sizeof(min_p_bits));
+    const bool finite_policy =
+        (temperature_bits & UINT32_C(0x7f800000)) != UINT32_C(0x7f800000) &&
+        (top_p_bits & UINT32_C(0x7f800000)) != UINT32_C(0x7f800000) &&
+        (min_p_bits & UINT32_C(0x7f800000)) != UINT32_C(0x7f800000);
+    if (!finite_policy || request->max_output_tokens < 0) {
+        if (err && errlen) snprintf(err, errlen, "invalid generation sampling policy");
+        return 1;
+    }
+    if (!s->checkpoint_valid || !s->logits ||
+        ds4_session_selectable_vocab_size(s) == 0) {
+        if (err && errlen) snprintf(err, errlen, "session has no sampleable checkpoint");
+        return 1;
+    }
+    if (s->pending_valid &&
+        (!ds4_session_token_id_valid(s, s->pending_token) ||
+         s->checkpoint.len >= s->ctx_size)) {
+        if (err && errlen) snprintf(err, errlen, "invalid pending generation token");
+        return 1;
+    }
+    if (s->pending_valid &&
+        (request->rng.state != s->pending_rng_boundary.state ||
+         request->rng.position != s->pending_rng_boundary.position)) {
+        if (err && errlen) snprintf(err, errlen, "generation RNG does not match pending boundary");
+        return 1;
+    }
+    if (!s->pending_valid &&
+        (s->pending_rng_boundary.state != 0 ||
+         s->pending_rng_boundary.position != 0)) {
+        if (err && errlen) snprintf(err, errlen, "invalid pending RNG boundary");
+        return 1;
+    }
+    const uint64_t settled_frontier =
+        (uint64_t)(uint32_t)s->checkpoint.len + (s->pending_valid ? 1u : 0u);
+    const bool will_open = request->max_output_tokens > 0 &&
+        settled_frontier < (uint64_t)(uint32_t)s->ctx_size;
+    if (will_open && s->generation_last_cookie == UINT64_MAX) {
+        if (err && errlen) snprintf(err, errlen, "generation block cookie space is exhausted");
+        return 1;
+    }
+    if (will_open && request->rng.position == UINT64_MAX) {
+        if (err && errlen) snprintf(err, errlen, "generation RNG position is exhausted");
+        return 1;
+    }
+    return 0;
+}
+
+static int ds4_session_generation_block_begin_impl(
+        ds4_session *s,
+        const ds4_generation_block_request *request,
+        ds4_generation_block *block,
+        char *err,
+        size_t errlen,
+        ds4_qwen35_forward_fn qwen_forward) {
+    if (ds4_session_generation_begin_preflight(
+            s, request, block, err, errlen) != 0) {
+        return 1;
+    }
+    const bool materialized_pending = s->pending_valid;
+    if (ds4_session_materialize_pending(
+            s, err, errlen, qwen_forward) != 0) {
+        return 1;
+    }
+
+    ds4_generation_block next = {0};
+    if (request->max_output_tokens == 0 ||
+        s->checkpoint.len >= s->ctx_size) {
+        *block = next;
+        return 0;
+    }
+
+    uint64_t sampling_rng = request->rng.state;
+    const int token = sample_top_p_min_p(
+        s->logits,
+        ds4_session_selectable_vocab_size(s),
+        request->temperature,
+        request->top_k,
+        request->top_p,
+        request->min_p,
+        &sampling_rng,
+        NULL);
+    if (!ds4_session_token_id_valid(s, token)) {
+        if (err && errlen) snprintf(err, errlen, "generation sampling failed");
+        if (materialized_pending) ds4_session_invalidate(s);
+        return 1;
+    }
+
+    const uint64_t cookie = s->generation_last_cookie + 1u;
+    next.cookie = cookie;
+    next.count = 1u;
+    next.tokens[0] = token;
+    s->generation_last_cookie = cookie;
+    s->generation_active_cookie = cookie;
+    s->generation_rng_start = request->rng;
+    s->generation_rng_after[0] = request->rng.state;
+    s->generation_rng_after[1] = sampling_rng;
+    s->generation_count = 1u;
+    s->generation_token = token;
+    s->generation_active = true;
+    *block = next;
+    return 0;
+}
+
+int ds4_session_generation_block_begin(
+        ds4_session *s,
+        const ds4_generation_block_request *request,
+        ds4_generation_block *block,
+        char *err,
+        size_t errlen) {
+    return ds4_session_generation_block_begin_impl(
+        s, request, block, err, errlen, NULL);
+}
+
+/* White-box Qwen seam: production begin uses the real family dispatch above;
+ * the model-free session test supplies the same deterministic forward stub as
+ * its existing sync/eval transaction coverage. */
+#ifdef DS4_TEST_HOOKS
+static int ds4_session_generation_block_begin_qwen35_with_forward(
+        ds4_session *s,
+        const ds4_generation_block_request *request,
+        ds4_generation_block *block,
+        char *err,
+        size_t errlen,
+        ds4_qwen35_forward_fn forward) {
+    if (!forward || !ds4_session_is_qwen35_cpu(s)) {
+        if (err && errlen) snprintf(err, errlen, "invalid Qwen generation block request");
+        return 1;
+    }
+    return ds4_session_generation_block_begin_impl(
+        s, request, block, err, errlen, forward);
+}
+#endif
+
+int ds4_session_generation_block_commit(
+        ds4_session *s,
+        const ds4_generation_block_commit *commit,
+        ds4_generation_rng *rng_io,
+        char *err,
+        size_t errlen) {
+    if (!s || !commit || !rng_io || !s->generation_active ||
+        commit->cookie == 0 ||
+        commit->cookie != s->generation_active_cookie ||
+        s->generation_active_cookie != s->generation_last_cookie ||
+        s->generation_count != 1u ||
+        s->pending_valid ||
+        s->pending_rng_boundary.state != 0 ||
+        s->pending_rng_boundary.position != 0 ||
+        !ds4_session_token_id_valid(s, s->generation_token) ||
+        s->generation_rng_after[0] != s->generation_rng_start.state ||
+        commit->adopted_count > commit->observed_count ||
+        commit->observed_count > s->generation_count ||
+        (commit->mode != DS4_GENERATION_COMMIT_RETAIN &&
+         commit->mode != DS4_GENERATION_COMMIT_INVALIDATE) ||
+        (commit->mode == DS4_GENERATION_COMMIT_RETAIN &&
+         commit->observed_count > commit->adopted_count + 1u) ||
+        rng_io->state != s->generation_rng_start.state ||
+        rng_io->position != s->generation_rng_start.position) {
+        if (err && errlen) snprintf(err, errlen, "invalid generation block commit");
+        return 1;
+    }
+
+    const ds4_generation_rng rng_after = {
+        .state = s->generation_rng_after[commit->observed_count],
+        .position = s->generation_rng_start.position +
+                    commit->observed_count,
+    };
+    if (commit->mode == DS4_GENERATION_COMMIT_INVALIDATE) {
+        ds4_session_invalidate(s);
+    } else {
+        const bool keep_pending = commit->adopted_count == 1u;
+        const int pending = s->generation_token;
+        ds4_session_generation_clear_active(s);
+        ds4_session_generation_clear_pending(s);
+        if (keep_pending) {
+            s->pending_valid = true;
+            s->pending_token = pending;
+            s->pending_rng_boundary = rng_after;
+        }
+    }
+    *rng_io = rng_after;
+    return 0;
 }
 
 /* Exact greedy speculative state machine. DeepSeek uses its MTP head as the
@@ -47233,6 +47627,9 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
                                         int max_tokens, int eos_token,
                                         int *accepted, int accepted_cap,
                                         char *err, size_t errlen) {
+    if (ds4_session_generation_reject_unsettled(s, err, errlen) != 0) {
+        return -1;
+    }
     if (!s || max_tokens <= 0 || accepted_cap <= 0) return 0;
     if (ds4_session_is_qwen35(s)) {
         if (!accepted || accepted_cap <= 0) return 0;
@@ -47883,6 +48280,7 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
 
 void ds4_session_invalidate(ds4_session *s) {
     if (!s) return;
+    ds4_session_generation_abort_all(s);
     if (ds4_session_is_qwen35(s)) {
         (void)ds4_session_qwen35_reset_timeline(s);
         return;
@@ -47901,6 +48299,8 @@ void ds4_session_invalidate(ds4_session *s) {
 
 void ds4_session_rewind(ds4_session *s, int pos) {
     if (!s) return;
+    if (s->generation_active) return;
+    ds4_session_generation_clear_pending(s);
     if (pos < 0) pos = 0;
     if (pos > s->checkpoint.len) pos = s->checkpoint.len;
     if (ds4_session_is_qwen35(s)) {

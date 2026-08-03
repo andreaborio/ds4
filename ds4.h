@@ -106,6 +106,72 @@ typedef struct {
 #define DS4_DEFAULT_TOP_P 1.0f
 #define DS4_DEFAULT_MIN_P 0.05f
 
+#define DS4_GENERATION_BLOCK_MAX_TOKENS 7
+
+typedef struct {
+    uint64_t state;
+    uint64_t position;
+} ds4_generation_rng;
+
+/* One session-owned generation transaction.  Depth-zero is the first
+ * implementation: begin samples at most one token without publishing RNG or
+ * advancing the evaluated frontier; commit reports the adopted prefix and the
+ * (possibly terminal) observed prefix separately. */
+typedef struct {
+    float temperature;
+    int top_k;
+    float top_p;
+    float min_p;
+    ds4_generation_rng rng;
+    int max_output_tokens;
+} ds4_generation_block_request;
+
+typedef struct {
+    uint64_t cookie;
+    uint32_t count;
+    int tokens[DS4_GENERATION_BLOCK_MAX_TOKENS];
+} ds4_generation_block;
+
+typedef enum {
+    DS4_GENERATION_COMMIT_RETAIN = 0,
+    DS4_GENERATION_COMMIT_INVALIDATE = 1,
+} ds4_generation_commit_mode;
+
+typedef struct {
+    uint64_t cookie;
+    uint32_t adopted_count;
+    uint32_t observed_count;
+    ds4_generation_commit_mode mode;
+} ds4_generation_block_commit;
+
+/* A retained adopted token remains session-owned and unevaluated until the
+ * next generation begin or an exact sync extension.  Public eval and stale
+ * logits access fail while it is pending.  Therefore ds4_session_pos(),
+ * ds4_session_tokens(), and ds4_session_common_prefix() expose only the
+ * evaluated target frontier.  begin(max_output_tokens=0) is the explicit
+ * caller flush: it materializes such a pending token and opens no cookie.  Any
+ * successful begin with no output returns count=0 and cookie=0.  A begin while
+ * pending must present the exact RNG state+position returned by its commit;
+ * an exact sync extension may materialize the token without opening a block.
+ *
+ * Commit reports adopted C and observed O.  Both modes require
+ * C <= O <= block.count.  RETAIN additionally requires O <= C+1 and preserves
+ * the exact adopted target prefix; in the current depth-zero path its adopted
+ * token remains pending.  INVALIDATE permits a longer observed suffix, selects
+ * its RNG boundary, then invalidates the target/session state.  The
+ * RNG ticket position advances by O even when greedy or fallback sampling did
+ * not change its xorshift state.  Malformed/preflight begin rejections and all
+ * rejected commits do not mutate the session, output block, or caller RNG; a
+ * runtime failure while materializing an adopted pending token instead
+ * invalidates the session.  INVALIDATE selects the ledger entry before tearing
+ * down session state and publishes the caller RNG last.  A caller that observed
+ * block tokens must therefore commit INVALIDATE before calling
+ * ds4_session_invalidate() or ds4_session_free(), which abort without publishing
+ * an active RNG ledger.  While a cookie is active, sync/eval/rewrite,
+ * logit/sample/speculation, persistence, power and imatrix mutation fail closed,
+ * and rewind is a no-op; commit, invalidate and free are the closing operations.
+ * ds4_session_rewind() discards a retained pending token after commit. */
+
 typedef struct ds4_engine ds4_engine;
 typedef struct ds4_session ds4_session;
 
@@ -403,6 +469,12 @@ int ds4_session_token_logprob(ds4_session *s, int token, ds4_token_score *out);
 int ds4_session_copy_logits(ds4_session *s, float *out, int cap);
 int ds4_session_set_logits(ds4_session *s, const float *logits, int n);
 int ds4_session_eval(ds4_session *s, int token, char *err, size_t errlen);
+int ds4_session_generation_block_begin(
+        ds4_session *s, const ds4_generation_block_request *request,
+        ds4_generation_block *block, char *err, size_t errlen);
+int ds4_session_generation_block_commit(
+        ds4_session *s, const ds4_generation_block_commit *commit,
+        ds4_generation_rng *rng_io, char *err, size_t errlen);
 int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
                                         int max_tokens, int eos_token,
                                         int *accepted, int accepted_cap,

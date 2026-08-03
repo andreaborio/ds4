@@ -105,6 +105,11 @@ static bool cancel_after_first_forward(void *ud) {
     return stub_calls >= 1;
 }
 
+static bool cancel_always(void *ud) {
+    (void)ud;
+    return true;
+}
+
 static void fake_qwen_engine(ds4_engine *engine, bool raw_runtime) {
     static ds4_tensor routed_gate = {.type = DS4_TENSOR_Q4_K};
     static ds4_tensor output = {.type = DS4_TENSOR_Q8_0};
@@ -1252,6 +1257,529 @@ static void test_fail_closed_surfaces(ds4_session *session) {
     ds4_tokens_free(&text_tokens);
 }
 
+static void generation_test_set_logits(ds4_session *session, int best) {
+    const uint32_t n_vocab = QWEN35_N_VOCAB;
+    float *logits = malloc((size_t)n_vocab * sizeof(*logits));
+    CHECK(logits != NULL);
+    if (!logits) return;
+    for (uint32_t i = 0; i < n_vocab; i++) logits[i] = -INFINITY;
+    logits[best] = 3.0f;
+    CHECK(ds4_session_set_logits(session, logits, (int)n_vocab) == 0);
+    free(logits);
+}
+
+static void generation_test_seed_checkpoint(ds4_session *session, int token) {
+    char err[160] = {0};
+    ds4_session_invalidate(session);
+    stub_reset();
+    CHECK(ds4_session_eval_qwen35_with_forward(
+              session, token, err, sizeof(err), stub_forward) == 0);
+    CHECK(session->checkpoint_valid && session->checkpoint.len == 1);
+    CHECK(session->qwen35_cpu_cache.n_tokens == 1u);
+    generation_test_set_logits(session, 42);
+    stub_reset();
+}
+
+static ds4_generation_block_request generation_test_request(
+        float temperature, uint64_t rng, int room) {
+    return (ds4_generation_block_request){
+        .temperature = temperature,
+        .top_k = 0,
+        .top_p = 0.5f,
+        .min_p = 0.0f,
+        .rng = {.state = rng, .position = 17u},
+        .max_output_tokens = room,
+    };
+}
+
+static void test_generation_block_transaction(ds4_session *session) {
+    const uint64_t seed = UINT64_C(0x0123456789abcdef);
+    char err[160] = {0};
+    ds4_generation_block block = {0};
+    ds4_generation_block_request greedy =
+        generation_test_request(0.0f, seed, 7);
+
+    /* Begin samples only.  RETAIN C=1 keeps the adopted token pending and the
+     * next begin evaluates it exactly once before sampling again. */
+    generation_test_seed_checkpoint(session, 11);
+    CHECK(ds4_session_generation_block_begin(
+              session, &greedy, &block, err, sizeof(err)) == 0);
+    CHECK(block.cookie != 0 && block.count == 1u && block.tokens[0] == 42);
+    CHECK(session->generation_active && !session->pending_valid);
+    CHECK(ds4_session_pos(session) == 1 && stub_calls == 0);
+    ds4_generation_rng rng = greedy.rng;
+    ds4_generation_block_commit commit = {
+        .cookie = block.cookie,
+        .adopted_count = 1u,
+        .observed_count = 1u,
+        .mode = DS4_GENERATION_COMMIT_RETAIN,
+    };
+    CHECK(ds4_session_generation_block_commit(
+              session, &commit, &rng, err, sizeof(err)) == 0);
+    CHECK(rng.state == seed && rng.position == 18u &&
+          !session->generation_active && session->pending_valid);
+    CHECK(session->pending_token == 42 && ds4_session_pos(session) == 1);
+    CHECK(ds4_session_argmax(session) == -1);
+
+    ds4_session state = *session;
+    ds4_generation_block stale_block = {
+        .cookie = UINT64_C(0x12345678), .count = 7u,
+        .tokens = {7, 6, 5, 4, 3, 2, 1},
+    };
+    const ds4_generation_block stale_block_before = stale_block;
+    CHECK(ds4_session_generation_block_begin_qwen35_with_forward(
+              session, &greedy, &stale_block,
+              err, sizeof(err), stub_forward) != 0);
+    CHECK(memcmp(session, &state, sizeof(state)) == 0 && stub_calls == 0);
+    CHECK(memcmp(&stale_block, &stale_block_before, sizeof(stale_block)) == 0);
+
+    ds4_generation_block_request continuation = greedy;
+    continuation.rng = rng;
+    ds4_generation_block second = {0};
+    CHECK(ds4_session_generation_block_begin_qwen35_with_forward(
+              session, &continuation, &second,
+              err, sizeof(err), stub_forward) == 0);
+    CHECK(stub_calls == 1 && stub_position[0] == 1 && stub_token[0] == 42);
+    CHECK(ds4_session_pos(session) == 2 && !session->pending_valid);
+    CHECK(second.count == 1u && second.tokens[0] == 42);
+    CHECK(second.cookie > block.cookie);
+    rng = continuation.rng;
+    commit = (ds4_generation_block_commit){
+        .cookie = second.cookie,
+        .adopted_count = 0u,
+        .observed_count = 0u,
+        .mode = DS4_GENERATION_COMMIT_RETAIN,
+    };
+    CHECK(ds4_session_generation_block_commit(
+              session, &commit, &rng, err, sizeof(err)) == 0);
+    CHECK(rng.state == seed && rng.position == 18u &&
+          !session->pending_valid && ds4_session_pos(session) == 2);
+
+    /* A sampled terminal can be observed without entering KV. */
+    generation_test_set_logits(session, 42);
+    ds4_generation_block_request sampled =
+        generation_test_request(1.0f, 0, 1);
+    stub_reset();
+    CHECK(ds4_session_generation_block_begin(
+              session, &sampled, &block, err, sizeof(err)) == 0);
+    CHECK(block.count == 1u && block.tokens[0] == 42 && stub_calls == 0);
+    const int pos_before_terminal = ds4_session_pos(session);
+    rng = sampled.rng;
+    commit = (ds4_generation_block_commit){
+        .cookie = block.cookie,
+        .adopted_count = 0u,
+        .observed_count = 1u,
+        .mode = DS4_GENERATION_COMMIT_RETAIN,
+    };
+    CHECK(ds4_session_generation_block_commit(
+              session, &commit, &rng, err, sizeof(err)) == 0);
+    CHECK(rng.state == UINT64_C(0x03f721dffe39b342) &&
+          rng.position == 18u);
+    CHECK(ds4_session_pos(session) == pos_before_terminal && stub_calls == 0);
+    CHECK(!session->pending_valid && !session->generation_active);
+
+    /* C=O=0 is a true abort, including RNG. */
+    sampled.rng.state = seed;
+    CHECK(ds4_session_generation_block_begin(
+              session, &sampled, &block, err, sizeof(err)) == 0);
+    rng = sampled.rng;
+    commit = (ds4_generation_block_commit){
+        .cookie = block.cookie,
+        .adopted_count = 0u,
+        .observed_count = 0u,
+        .mode = DS4_GENERATION_COMMIT_RETAIN,
+    };
+    CHECK(ds4_session_generation_block_commit(
+              session, &commit, &rng, err, sizeof(err)) == 0);
+    CHECK(rng.state == seed && rng.position == 17u && !session->pending_valid);
+
+    /* Rejected begin/commit transitions are byte-identical in the session and
+     * cannot acquire the caller's RNG or output block. */
+    CHECK(ds4_session_generation_block_begin(
+              session, &sampled, &block, err, sizeof(err)) == 0);
+    state = *session;
+    ds4_generation_block untouched = {
+        .cookie = UINT64_C(0xa5a5a5a5a5a5a5a5),
+        .count = 6u,
+        .tokens = {9, 8, 7, 6, 5, 4, 3},
+    };
+    const ds4_generation_block untouched_before = untouched;
+    CHECK(ds4_session_generation_block_begin(
+              session, &sampled, &untouched, err, sizeof(err)) != 0);
+    CHECK(memcmp(session, &state, sizeof(state)) == 0);
+    CHECK(memcmp(&untouched, &untouched_before, sizeof(untouched)) == 0);
+
+    const ds4_generation_block_commit invalid_commits[] = {
+        {block.cookie + 1u, 0u, 0u, DS4_GENERATION_COMMIT_RETAIN},
+        {block.cookie, 1u, 0u, DS4_GENERATION_COMMIT_RETAIN},
+        {block.cookie, 0u, 2u, DS4_GENERATION_COMMIT_RETAIN},
+        {block.cookie, 0u, 0u, (ds4_generation_commit_mode)99},
+    };
+    for (size_t i = 0; i < sizeof(invalid_commits) / sizeof(invalid_commits[0]); i++) {
+        rng = sampled.rng;
+        CHECK(ds4_session_generation_block_commit(
+                  session, &invalid_commits[i], &rng, err, sizeof(err)) != 0);
+        CHECK(memcmp(session, &state, sizeof(state)) == 0 &&
+              rng.state == seed && rng.position == 17u);
+    }
+    commit = (ds4_generation_block_commit){
+        .cookie = block.cookie,
+        .adopted_count = 0u,
+        .observed_count = 0u,
+        .mode = DS4_GENERATION_COMMIT_RETAIN,
+    };
+    rng = sampled.rng;
+    rng.state++;
+    CHECK(ds4_session_generation_block_commit(
+              session, &commit, &rng, err, sizeof(err)) != 0);
+    CHECK(memcmp(session, &state, sizeof(state)) == 0 &&
+          rng.state == seed + 1u && rng.position == 17u);
+    rng = sampled.rng;
+    rng.position++;
+    CHECK(ds4_session_generation_block_commit(
+              session, &commit, &rng, err, sizeof(err)) != 0);
+    CHECK(memcmp(session, &state, sizeof(state)) == 0 &&
+          rng.state == seed && rng.position == 18u);
+    rng = sampled.rng;
+    CHECK(ds4_session_generation_block_commit(
+              session, &commit, &rng, err, sizeof(err)) == 0);
+    state = *session;
+    CHECK(ds4_session_generation_block_commit(
+              session, &commit, &rng, err, sizeof(err)) != 0);
+    CHECK(memcmp(session, &state, sizeof(state)) == 0 &&
+          rng.state == seed && rng.position == 17u);
+
+    const uint64_t saved_last_cookie = session->generation_last_cookie;
+    session->generation_last_cookie = UINT64_MAX;
+    state = *session;
+    untouched = untouched_before;
+    CHECK(ds4_session_generation_block_begin(
+              session, &sampled, &untouched, err, sizeof(err)) != 0);
+    CHECK(memcmp(session, &state, sizeof(state)) == 0);
+    CHECK(memcmp(&untouched, &untouched_before, sizeof(untouched)) == 0);
+    session->generation_last_cookie = saved_last_cookie;
+
+    /* Every state/logit mutation surface is closed while a transaction is
+     * active.  Error reporting and caller-owned output buffers may change, but
+     * the session, backend frontier and RNG do not. */
+    CHECK(ds4_session_generation_block_begin(
+              session, &greedy, &block, err, sizeof(err)) == 0);
+    state = *session;
+    const int active_stub_calls = stub_calls;
+    uint64_t guarded_rng = seed;
+    CHECK(ds4_session_sample(session, 1.0f, 0, 1.0f, 0.0f, &guarded_rng) == -1);
+    CHECK(guarded_rng == seed);
+    CHECK(ds4_session_argmax(session) == -1);
+    CHECK(ds4_session_argmax_excluding(session, 42) == -1);
+    ds4_token_score score = {0};
+    CHECK(ds4_session_top_logprobs(session, &score, 1) == 0);
+    CHECK(ds4_session_token_logprob(session, 42, &score) == 0);
+    float one_logit = 0.0f;
+    CHECK(ds4_session_copy_logits(session, &one_logit, 1) == 0);
+    CHECK(ds4_session_set_logits(session, &one_logit, 1) != 0);
+    CHECK(ds4_session_eval(session, 43, err, sizeof(err)) != 0);
+    const int active_pos = ds4_session_pos(session);
+    ds4_session_rewind(session, 0);
+    CHECK(ds4_session_pos(session) == active_pos);
+    const int prompt_values[] = {11, 42};
+    ds4_tokens prompt = {(int *)prompt_values, 2, 2};
+    CHECK(ds4_session_sync_qwen35_with_forward(
+              session, &prompt, err, sizeof(err), stub_forward) != 0);
+    CHECK(ds4_session_rewrite_from_common(
+              session, &prompt, session->checkpoint.len,
+              err, sizeof(err)) == DS4_SESSION_REWRITE_ERROR);
+    CHECK(ds4_session_payload_bytes(session) == 0);
+    FILE *fp = tmpfile();
+    CHECK(fp != NULL);
+    if (fp) {
+        CHECK(ds4_session_save_payload(session, fp, err, sizeof(err)) != 0);
+        rewind(fp);
+        CHECK(ds4_session_load_payload(session, fp, 0, err, sizeof(err)) != 0);
+        fclose(fp);
+    }
+    ds4_session_payload_file staged = {0};
+    CHECK(ds4_session_stage_payload(session, &staged, err, sizeof(err)) != 0);
+    CHECK(staged.path == NULL && staged.bytes == 0);
+    ds4_session_snapshot snapshot = {0};
+    CHECK(ds4_session_save_snapshot(session, &snapshot, err, sizeof(err)) != 0);
+    CHECK(ds4_session_load_snapshot(session, &snapshot, err, sizeof(err)) != 0);
+    CHECK(ds4_session_set_power(session, 100) != 0);
+    int accepted_token = -1;
+    CHECK(ds4_session_eval_speculative_argmax(
+              session, 42, 1, -1, &accepted_token, 1,
+              err, sizeof(err)) == -1);
+    CHECK(memcmp(session, &state, sizeof(state)) == 0);
+    CHECK(stub_calls == active_stub_calls);
+    commit = (ds4_generation_block_commit){
+        .cookie = block.cookie,
+        .adopted_count = 0u,
+        .observed_count = 0u,
+        .mode = DS4_GENERATION_COMMIT_RETAIN,
+    };
+    rng = greedy.rng;
+    CHECK(ds4_session_generation_block_commit(
+              session, &commit, &rng, err, sizeof(err)) == 0);
+
+    /* Pending also makes logits and persistence stale; rewind is the explicit
+     * non-destructive way to discard it. */
+    CHECK(ds4_session_generation_block_begin(
+              session, &greedy, &block, err, sizeof(err)) == 0);
+    commit = (ds4_generation_block_commit){
+        .cookie = block.cookie, .adopted_count = 1u, .observed_count = 1u,
+        .mode = DS4_GENERATION_COMMIT_RETAIN,
+    };
+    rng = greedy.rng;
+    CHECK(ds4_session_generation_block_commit(
+              session, &commit, &rng, err, sizeof(err)) == 0);
+    CHECK(session->pending_valid && ds4_session_payload_bytes(session) == 0);
+    CHECK(ds4_session_set_power(session, 100) == 0);
+    CHECK(session->pending_valid);
+    staged = (ds4_session_payload_file){0};
+    CHECK(ds4_session_stage_payload(session, &staged, err, sizeof(err)) != 0);
+    CHECK(strcmp(err, "generation block has an unevaluated pending token") == 0);
+    int rewrite_values[] = {11, 42};
+    ds4_tokens rewrite_prompt = {rewrite_values, 2, 2};
+    CHECK(ds4_session_tokens(session)->len == ds4_session_pos(session));
+    CHECK(ds4_session_common_prefix(session, &rewrite_prompt) ==
+          ds4_session_pos(session));
+    state = *session;
+    CHECK(ds4_session_rewrite_from_common(
+              session, &rewrite_prompt, session->checkpoint.len,
+              err, sizeof(err)) == DS4_SESSION_REWRITE_ERROR);
+    CHECK(memcmp(session, &state, sizeof(state)) == 0);
+    ds4_session_rewind(session, ds4_session_pos(session));
+    CHECK(!session->pending_valid);
+
+    /* Eval cannot guess whether a newly supplied token follows or replaces the
+     * adopted pending token.  It fails byte-identically; begin(0) is the
+     * explicit one-token flush. */
+    generation_test_set_logits(session, 42);
+    CHECK(ds4_session_generation_block_begin(
+              session, &greedy, &block, err, sizeof(err)) == 0);
+    commit = (ds4_generation_block_commit){
+        .cookie = block.cookie, .adopted_count = 1u, .observed_count = 1u,
+        .mode = DS4_GENERATION_COMMIT_RETAIN,
+    };
+    rng = greedy.rng;
+    CHECK(ds4_session_generation_block_commit(
+              session, &commit, &rng, err, sizeof(err)) == 0);
+    stub_reset();
+    state = *session;
+    CHECK(ds4_session_eval(session, 43, err, sizeof(err)) != 0);
+    CHECK(stub_calls == 0 && memcmp(session, &state, sizeof(state)) == 0);
+    ds4_generation_block_request flush = greedy;
+    flush.rng = rng;
+    flush.max_output_tokens = 0;
+    CHECK(ds4_session_generation_block_begin_qwen35_with_forward(
+              session, &flush, &block, err, sizeof(err), stub_forward) == 0);
+    CHECK(block.count == 0u && stub_calls == 1 && stub_token[0] == 42);
+    CHECK(!session->pending_valid);
+
+    /* Sync preserves the pending token only for an exact extension. */
+    generation_test_seed_checkpoint(session, 11);
+    CHECK(ds4_session_generation_block_begin(
+              session, &greedy, &block, err, sizeof(err)) == 0);
+    commit = (ds4_generation_block_commit){
+        .cookie = block.cookie, .adopted_count = 1u, .observed_count = 1u,
+        .mode = DS4_GENERATION_COMMIT_RETAIN,
+    };
+    rng = greedy.rng;
+    CHECK(ds4_session_generation_block_commit(
+              session, &commit, &rng, err, sizeof(err)) == 0);
+    int matching_values[] = {11, 42, 55};
+    ds4_tokens matching = {matching_values, 3, 3};
+    stub_reset();
+    session->cancel = cancel_always;
+    state = *session;
+    CHECK(ds4_session_sync(
+              session, &matching, err, sizeof(err)) ==
+          DS4_SESSION_SYNC_INTERRUPTED);
+    CHECK(memcmp(session, &state, sizeof(state)) == 0 && stub_calls == 0);
+    session->cancel = NULL;
+    CHECK(ds4_session_sync_qwen35_with_forward(
+              session, &matching, err, sizeof(err), stub_forward) == 0);
+    CHECK(stub_calls == 2 && stub_token[0] == 42 && stub_token[1] == 55);
+    CHECK(session->checkpoint.len == 3 && !session->pending_valid);
+
+    generation_test_seed_checkpoint(session, 11);
+    CHECK(ds4_session_generation_block_begin(
+              session, &greedy, &block, err, sizeof(err)) == 0);
+    commit.cookie = block.cookie;
+    rng = greedy.rng;
+    CHECK(ds4_session_generation_block_commit(
+              session, &commit, &rng, err, sizeof(err)) == 0);
+    int divergent_values[] = {11, 77};
+    ds4_tokens divergent = {divergent_values, 2, 2};
+    stub_reset();
+    CHECK(ds4_session_sync_qwen35_with_forward(
+              session, &divergent, err, sizeof(err), stub_forward) == 0);
+    CHECK(stub_calls == 1 && stub_token[0] == 77);
+    CHECK(session->checkpoint.len == 2 && !session->pending_valid);
+
+    /* Context and caller output room produce an empty successful block without
+     * opening or consuming a cookie. */
+    generation_test_seed_checkpoint(session, 11);
+    const uint64_t cookie_before_empty = session->generation_last_cookie;
+    ds4_generation_block_request no_output = greedy;
+    no_output.max_output_tokens = 0;
+    block = (ds4_generation_block){.cookie = 99, .count = 7u};
+    CHECK(ds4_session_generation_block_begin(
+              session, &no_output, &block, err, sizeof(err)) == 0);
+    CHECK(block.cookie == 0 && block.count == 0u && !session->generation_active);
+    CHECK(session->generation_last_cookie == cookie_before_empty);
+    session->generation_last_cookie = UINT64_MAX;
+    block = (ds4_generation_block){.cookie = 99, .count = 7u};
+    CHECK(ds4_session_generation_block_begin(
+              session, &no_output, &block, err, sizeof(err)) == 0);
+    CHECK(block.cookie == 0 && block.count == 0u &&
+          session->generation_last_cookie == UINT64_MAX);
+    session->generation_last_cookie = cookie_before_empty;
+    ds4_generation_block_request exhausted_position = greedy;
+    exhausted_position.rng.position = UINT64_MAX;
+    state = *session;
+    untouched = untouched_before;
+    CHECK(ds4_session_generation_block_begin(
+              session, &exhausted_position, &untouched,
+              err, sizeof(err)) != 0);
+    CHECK(memcmp(session, &state, sizeof(state)) == 0);
+    CHECK(memcmp(&untouched, &untouched_before, sizeof(untouched)) == 0);
+    ds4_generation_block_request malformed = greedy;
+    malformed.temperature = NAN;
+    state = *session;
+    CHECK(ds4_session_generation_block_begin(
+              session, &malformed, &untouched, err, sizeof(err)) != 0);
+    CHECK(memcmp(session, &state, sizeof(state)) == 0);
+
+    /* A zero-output begin is also the final pending flush.  It evaluates once,
+     * does not consume a cookie, and accepts even an exhausted next position
+     * because it opens no new block. */
+    ds4_generation_block_request near_exhausted = greedy;
+    near_exhausted.rng.position = UINT64_MAX - 1u;
+    CHECK(ds4_session_generation_block_begin(
+              session, &near_exhausted, &block, err, sizeof(err)) == 0);
+    commit = (ds4_generation_block_commit){
+        .cookie = block.cookie, .adopted_count = 1u, .observed_count = 1u,
+        .mode = DS4_GENERATION_COMMIT_RETAIN,
+    };
+    rng = near_exhausted.rng;
+    CHECK(ds4_session_generation_block_commit(
+              session, &commit, &rng, err, sizeof(err)) == 0);
+    CHECK(rng.position == UINT64_MAX);
+    const uint64_t cookie_before_flush = session->generation_last_cookie;
+    no_output.rng = rng;
+    stub_reset();
+    CHECK(ds4_session_generation_block_begin_qwen35_with_forward(
+              session, &no_output, &block, err, sizeof(err), stub_forward) == 0);
+    CHECK(block.cookie == 0 && block.count == 0u && !session->generation_active);
+    CHECK(session->generation_last_cookie == cookie_before_flush);
+    CHECK(stub_calls == 1 && stub_token[0] == 42 && !session->pending_valid);
+    while (session->checkpoint.len < session->ctx_size - 1) {
+        CHECK(ds4_session_eval_qwen35_with_forward(
+                  session, 80 + session->checkpoint.len,
+                  err, sizeof(err), stub_forward) == 0);
+    }
+    CHECK(session->checkpoint.len == session->ctx_size - 1);
+    generation_test_set_logits(session, 42);
+    CHECK(ds4_session_generation_block_begin(
+              session, &greedy, &block, err, sizeof(err)) == 0);
+    commit = (ds4_generation_block_commit){
+        .cookie = block.cookie, .adopted_count = 1u, .observed_count = 1u,
+        .mode = DS4_GENERATION_COMMIT_RETAIN,
+    };
+    rng = greedy.rng;
+    CHECK(ds4_session_generation_block_commit(
+              session, &commit, &rng, err, sizeof(err)) == 0);
+    CHECK(session->pending_valid && session->checkpoint.len == session->ctx_size - 1);
+    flush.rng = rng;
+    stub_reset();
+    CHECK(ds4_session_generation_block_begin_qwen35_with_forward(
+              session, &flush, &block, err, sizeof(err), stub_forward) == 0);
+    CHECK(block.cookie == 0 && block.count == 0u &&
+          session->checkpoint.len == session->ctx_size &&
+          stub_calls == 1 && stub_token[0] == 42);
+    block = (ds4_generation_block){.cookie = 99, .count = 7u};
+    CHECK(ds4_session_generation_block_begin(
+              session, &greedy, &block, err, sizeof(err)) == 0);
+    CHECK(block.cookie == 0 && block.count == 0u && !session->generation_active);
+    CHECK(ds4_session_payload_bytes(session) == 0);
+    staged = (ds4_session_payload_file){0};
+    CHECK(ds4_session_stage_payload(session, &staged, err, sizeof(err)) != 0);
+    CHECK(strcmp(err, "full-context session cannot be staged") == 0);
+    fp = tmpfile();
+    CHECK(fp != NULL);
+    if (fp) {
+        CHECK(ds4_session_save_payload(session, fp, err, sizeof(err)) != 0);
+        CHECK(strcmp(err, "full-context session cannot be saved") == 0);
+        fclose(fp);
+    }
+
+    /* A failed pending materialization invalidates the whole frontier instead
+     * of losing ownership of the adopted token or preserving partial KV. */
+    generation_test_seed_checkpoint(session, 11);
+    generation_test_set_logits(session, 42);
+    CHECK(ds4_session_generation_block_begin(
+              session, &greedy, &block, err, sizeof(err)) == 0);
+    commit = (ds4_generation_block_commit){
+        .cookie = block.cookie, .adopted_count = 1u, .observed_count = 1u,
+        .mode = DS4_GENERATION_COMMIT_RETAIN,
+    };
+    rng = greedy.rng;
+    CHECK(ds4_session_generation_block_commit(
+              session, &commit, &rng, err, sizeof(err)) == 0);
+    stub_reset();
+    stub_fail_on_call = 1;
+    flush.rng = rng;
+    CHECK(ds4_session_generation_block_begin_qwen35_with_forward(
+              session, &flush, &block, err, sizeof(err), stub_forward) != 0);
+    CHECK(!session->checkpoint_valid && session->checkpoint.len == 0);
+    CHECK(session->qwen35_cpu_cache.n_tokens == 0u);
+    CHECK(!session->generation_active && !session->pending_valid);
+
+    /* Sampled fallbacks and greedy sampling publish no draw. */
+    generation_test_seed_checkpoint(session, 11);
+    for (uint32_t i = 0; i < QWEN35_N_VOCAB; i++) session->logits[i] = NAN;
+    sampled.rng.state = seed;
+    CHECK(ds4_session_generation_block_begin(
+              session, &sampled, &block, err, sizeof(err)) == 0);
+    CHECK(block.tokens[0] == 0);
+    commit = (ds4_generation_block_commit){
+        .cookie = block.cookie, .adopted_count = 0u, .observed_count = 1u,
+        .mode = DS4_GENERATION_COMMIT_RETAIN,
+    };
+    rng = sampled.rng;
+    CHECK(ds4_session_generation_block_commit(
+              session, &commit, &rng, err, sizeof(err)) == 0);
+    CHECK(rng.state == seed && rng.position == 18u);
+
+    /* INVALIDATE is the stop-string/stream-failure form: observed RNG survives,
+     * but target, checkpoint, pending and active state do not. */
+    generation_test_seed_checkpoint(session, 11);
+    sampled.rng.state = 0;
+    CHECK(ds4_session_generation_block_begin(
+              session, &sampled, &block, err, sizeof(err)) == 0);
+    commit = (ds4_generation_block_commit){
+        .cookie = block.cookie, .adopted_count = 0u, .observed_count = 1u,
+        .mode = DS4_GENERATION_COMMIT_INVALIDATE,
+    };
+    rng = sampled.rng;
+    CHECK(ds4_session_generation_block_commit(
+              session, &commit, &rng, err, sizeof(err)) == 0);
+    CHECK(rng.state == UINT64_C(0x03f721dffe39b342) &&
+          rng.position == 18u);
+    CHECK(!session->checkpoint_valid && session->checkpoint.len == 0);
+    CHECK(session->qwen35_cpu_cache.n_tokens == 0u);
+    CHECK(!session->generation_active && !session->pending_valid);
+
+    /* Invalidate is also the explicit escape hatch for an abandoned active
+     * transaction. */
+    generation_test_seed_checkpoint(session, 11);
+    CHECK(ds4_session_generation_block_begin(
+              session, &greedy, &block, err, sizeof(err)) == 0);
+    ds4_session_invalidate(session);
+    CHECK(!session->generation_active && !session->pending_valid);
+    CHECK(!session->checkpoint_valid && session->checkpoint.len == 0);
+}
+
 int main(void) {
     CHECK(ds4_dspark_runtime_contract_self_check());
     CHECK(ds4_test_dspark_memory_accounting());
@@ -1280,6 +1808,7 @@ int main(void) {
         test_dynamic_logits(session);
         test_eval_transaction(session);
         test_sync_transaction(session);
+        test_generation_block_transaction(session);
         test_fail_closed_surfaces(session);
         ds4_session_free(session);
     }
