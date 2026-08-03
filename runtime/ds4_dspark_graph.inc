@@ -449,6 +449,342 @@ typedef struct {
     uint64_t candidate_start;
 } ds4_dspark_raw_context_view;
 
+/* Pure scheduler/verifier contract for one DSpark round.  This is deliberately
+ * disconnected from ds4_session and Metal execution: it fixes the token and
+ * frontier arithmetic before either path is allowed to mutate production
+ * state.
+ *
+ * At target frontier F, P is the sampled-but-unevaluated token at position F.
+ * A depth-D proposal owns q[0..D-1].  The exact target verifier evaluates
+ * [P, q0, ..., q(D-1)], hence N=D+1 rows.  If A drafts are accepted, exactly
+ * K=A+1 evaluated rows can become visible target state: P plus the accepted
+ * draft prefix.  The last emitted token is a replacement on A<D or a bonus on
+ * A=D; either way it is the next pending token and is never evaluated by this
+ * round.
+ *
+ * A full accept may retain the verifier state.  A rejection must restore the
+ * sole frontier snapshot and replay the K accepted evaluated rows exactly.
+ * Consumer-side stop/EOS/interruption can shorten either case later through
+ * ds4_dspark_verifier_consumption_make(). */
+typedef struct {
+    uint64_t frontier;
+    uint64_t verifier_frontier;
+    uint64_t committed_frontier;
+    uint32_t draft_depth;
+    uint32_t accepted_drafts;
+    uint32_t verifier_rows;
+    uint32_t committed_evaluated_rows;
+    uint32_t emitted_rows;
+    uint32_t final_pending_index;
+    uint32_t replay_rows;
+    bool full_accept;
+    bool keep_verifier_state;
+    bool restore_then_replay;
+} ds4_dspark_verifier_plan;
+
+typedef struct {
+    uint64_t committed_frontier;
+    uint32_t consumed_rows;
+    uint32_t committed_evaluated_rows;
+    uint32_t replay_rows;
+    bool final_pending_consumed;
+    bool keep_verifier_state;
+    bool restore_then_replay;
+} ds4_dspark_verifier_consumption;
+
+typedef enum {
+    DS4_DSPARK_TAIL_NO_OUTPUT = 0,
+    DS4_DSPARK_TAIL_PENDING_ONLY = 1,
+    DS4_DSPARK_TAIL_VERIFY = 2,
+} ds4_dspark_tail_kind;
+
+typedef struct {
+    ds4_dspark_tail_kind kind;
+    uint32_t available_rows;
+    uint32_t draft_depth;
+    uint32_t verifier_rows;
+    uint32_t maximum_emitted_rows;
+} ds4_dspark_tail_plan;
+
+/* A frontier snapshot does not copy the target raw-SWA ring.  Future verifier
+ * rows may therefore remain as invisible garbage after restore, but they must
+ * not wrap over any live prefix row.  live=min(F, raw_window), so reserving N
+ * distinct future slots is safe exactly when raw_cap-live >= N. */
+static bool ds4_dspark_verifier_raw_preflight(
+        uint64_t frontier,
+        uint32_t verifier_rows,
+        uint32_t raw_cap,
+        uint32_t raw_window) {
+    if (verifier_rows == 0 ||
+        verifier_rows > DS4_DSPARK_RAW_FINALIZER_MAX_ROWS ||
+        raw_cap == 0 || raw_window == 0 || raw_window > raw_cap) {
+        return false;
+    }
+    const uint32_t live = frontier < raw_window ?
+        (uint32_t)frontier : raw_window;
+    return live <= raw_cap && verifier_rows <= raw_cap - live;
+}
+
+static bool ds4_dspark_verifier_plan_make(
+        uint64_t                    frontier,
+        uint32_t                    draft_depth,
+        uint32_t                    accepted_drafts,
+        uint32_t                    raw_cap,
+        uint32_t                    raw_window,
+        ds4_dspark_verifier_plan   *out) {
+    if (!out || draft_depth > DS4_DSPARK_SUPPORT_CANDIDATE_ROWS ||
+        accepted_drafts > draft_depth) {
+        return false;
+    }
+    const uint32_t verifier_rows = draft_depth + 1u;
+    const uint32_t committed_rows = accepted_drafts + 1u;
+    if (frontier > UINT64_MAX - verifier_rows ||
+        frontier > UINT64_MAX - committed_rows ||
+        !ds4_dspark_verifier_raw_preflight(
+            frontier, verifier_rows, raw_cap, raw_window)) {
+        return false;
+    }
+    const bool full = accepted_drafts == draft_depth;
+    *out = (ds4_dspark_verifier_plan){
+        .frontier = frontier,
+        .verifier_frontier = frontier + verifier_rows,
+        .committed_frontier = frontier + committed_rows,
+        .draft_depth = draft_depth,
+        .accepted_drafts = accepted_drafts,
+        .verifier_rows = verifier_rows,
+        .committed_evaluated_rows = committed_rows,
+        .emitted_rows = committed_rows + 1u,
+        .final_pending_index = committed_rows,
+        .replay_rows = full ? 0u : committed_rows,
+        .full_accept = full,
+        .keep_verifier_state = full,
+        .restore_then_replay = !full,
+    };
+    return true;
+}
+
+/* Convert the prefix actually consumed by CLI/server/agent into target state.
+ * The final bonus/replacement is pending, so consuming it never adds another
+ * evaluated row.  Any shorter prefix forces restore-and-replay even when the
+ * model verifier originally accepted the complete draft.  consumed_rows=0 is
+ * the rollback form used when a stop token is not part of the caller's live
+ * transcript. */
+static bool ds4_dspark_verifier_consumption_make(
+        const ds4_dspark_verifier_plan *plan,
+        uint32_t                        consumed_rows,
+        ds4_dspark_verifier_consumption *out) {
+    if (!plan || !out || consumed_rows > plan->emitted_rows ||
+        plan->committed_evaluated_rows == 0 ||
+        plan->emitted_rows != plan->committed_evaluated_rows + 1u ||
+        plan->final_pending_index != plan->committed_evaluated_rows) {
+        return false;
+    }
+    const uint32_t committed =
+        consumed_rows < plan->committed_evaluated_rows ?
+            consumed_rows : plan->committed_evaluated_rows;
+    if (plan->frontier > UINT64_MAX - committed) return false;
+    const bool keep = plan->full_accept &&
+                      committed == plan->verifier_rows;
+    *out = (ds4_dspark_verifier_consumption){
+        .committed_frontier = plan->frontier + committed,
+        .consumed_rows = consumed_rows,
+        .committed_evaluated_rows = committed,
+        .replay_rows = keep ? 0u : committed,
+        .final_pending_consumed =
+            consumed_rows == plan->emitted_rows,
+        .keep_verifier_state = keep,
+        .restore_then_replay = !keep,
+    };
+    return true;
+}
+
+/* Tail selection reserves one output for P and one for the unevaluated final
+ * pending token.  With only one slot, P is emitted without advancing target
+ * state.  pending_terminal covers EOS or a caller-defined stop recognized
+ * before verification; stops discovered inside a returned block use the
+ * consumed-prefix contract above. */
+static bool ds4_dspark_tail_plan_make(
+        uint32_t              maximum_rows,
+        uint32_t              context_room,
+        uint32_t              desired_depth,
+        bool                  pending_terminal,
+        ds4_dspark_tail_plan *out) {
+    if (!out || desired_depth > DS4_DSPARK_SUPPORT_CANDIDATE_ROWS) {
+        return false;
+    }
+    const uint32_t available = maximum_rows < context_room ?
+        maximum_rows : context_room;
+    ds4_dspark_tail_plan plan = {
+        .kind = DS4_DSPARK_TAIL_NO_OUTPUT,
+        .available_rows = available,
+    };
+    if (available == 0) {
+        *out = plan;
+        return true;
+    }
+    if (available == 1u || pending_terminal) {
+        plan.kind = DS4_DSPARK_TAIL_PENDING_ONLY;
+        plan.maximum_emitted_rows = 1u;
+        *out = plan;
+        return true;
+    }
+    const uint32_t tail_depth = available - 2u;
+    plan.kind = DS4_DSPARK_TAIL_VERIFY;
+    plan.draft_depth = desired_depth < tail_depth ?
+        desired_depth : tail_depth;
+    plan.verifier_rows = plan.draft_depth + 1u;
+    plan.maximum_emitted_rows = plan.draft_depth + 2u;
+    *out = plan;
+    return true;
+}
+
+/* Exhaust the complete D=0..5, A=0..D state space and every consumer prefix.
+ * This runs inside the existing model-free runtime contract gate, so the pure
+ * plan cannot drift while the product DSpark entry remains disconnected. */
+static bool ds4_dspark_verifier_contract_self_check(void) {
+    const uint64_t frontier = UINT64_C(1000);
+    const uint32_t raw_window = DS4_DSPARK_HISTORY_ROWS;
+    const uint32_t raw_cap =
+        DS4_DSPARK_HISTORY_ROWS + DS4_DSPARK_RAW_FINALIZER_MAX_ROWS;
+    ds4_dspark_verifier_plan plan;
+    ds4_dspark_verifier_consumption consumption;
+    ds4_dspark_tail_plan tail;
+
+    for (uint32_t depth = 0;
+         depth <= DS4_DSPARK_SUPPORT_CANDIDATE_ROWS; depth++) {
+        const uint32_t verifier_rows = depth + 1u;
+        for (uint32_t accepted = 0; accepted <= depth; accepted++) {
+            const uint32_t committed = accepted + 1u;
+            const bool full = accepted == depth;
+            if (!ds4_dspark_verifier_plan_make(
+                    frontier, depth, accepted,
+                    raw_cap, raw_window, &plan) ||
+                plan.frontier != frontier ||
+                plan.draft_depth != depth ||
+                plan.accepted_drafts != accepted ||
+                plan.verifier_rows != verifier_rows ||
+                plan.verifier_frontier != frontier + verifier_rows ||
+                plan.committed_evaluated_rows != committed ||
+                plan.committed_frontier != frontier + committed ||
+                plan.emitted_rows != committed + 1u ||
+                plan.final_pending_index != committed ||
+                plan.full_accept != full ||
+                plan.keep_verifier_state != full ||
+                plan.restore_then_replay == full ||
+                plan.replay_rows != (full ? 0u : committed)) {
+                return false;
+            }
+            for (uint32_t consumed = 0;
+                 consumed <= plan.emitted_rows; consumed++) {
+                const uint32_t consumed_evaluated =
+                    consumed < committed ? consumed : committed;
+                const bool keep =
+                    full && consumed_evaluated == verifier_rows;
+                if (!ds4_dspark_verifier_consumption_make(
+                        &plan, consumed, &consumption) ||
+                    consumption.consumed_rows != consumed ||
+                    consumption.committed_evaluated_rows !=
+                        consumed_evaluated ||
+                    consumption.committed_frontier !=
+                        frontier + consumed_evaluated ||
+                    consumption.final_pending_consumed !=
+                        (consumed == plan.emitted_rows) ||
+                    consumption.keep_verifier_state != keep ||
+                    consumption.restore_then_replay == keep ||
+                    consumption.replay_rows !=
+                        (keep ? 0u : consumed_evaluated)) {
+                    return false;
+                }
+            }
+            if (ds4_dspark_verifier_consumption_make(
+                    &plan, plan.emitted_rows + 1u, &consumption)) {
+                return false;
+            }
+        }
+    }
+
+    /* Tail 0..7 maps to no output, pending-only, then depths 0..5. */
+    for (uint32_t available = 0; available <= 7u; available++) {
+        if (!ds4_dspark_tail_plan_make(
+                available, available,
+                DS4_DSPARK_SUPPORT_CANDIDATE_ROWS, false, &tail) ||
+            tail.available_rows != available) {
+            return false;
+        }
+        if (available == 0u) {
+            if (tail.kind != DS4_DSPARK_TAIL_NO_OUTPUT ||
+                tail.draft_depth != 0u || tail.verifier_rows != 0u ||
+                tail.maximum_emitted_rows != 0u) {
+                return false;
+            }
+        } else if (available == 1u) {
+            if (tail.kind != DS4_DSPARK_TAIL_PENDING_ONLY ||
+                tail.draft_depth != 0u || tail.verifier_rows != 0u ||
+                tail.maximum_emitted_rows != 1u) {
+                return false;
+            }
+        } else {
+            const uint32_t expected_depth = available - 2u;
+            if (tail.kind != DS4_DSPARK_TAIL_VERIFY ||
+                tail.draft_depth != expected_depth ||
+                tail.verifier_rows != expected_depth + 1u ||
+                tail.maximum_emitted_rows != available) {
+                return false;
+            }
+        }
+    }
+
+    /* Context room, not only the caller's generation limit, caps the tail. */
+    if (!ds4_dspark_tail_plan_make(7u, 3u, 5u, false, &tail) ||
+        tail.kind != DS4_DSPARK_TAIL_VERIFY ||
+        tail.available_rows != 3u || tail.draft_depth != 1u ||
+        tail.verifier_rows != 2u || tail.maximum_emitted_rows != 3u) {
+        return false;
+    }
+    /* EOS/known stop at P is emitted alone and never starts a verifier. */
+    for (uint32_t available = 1u; available <= 7u; available++) {
+        if (!ds4_dspark_tail_plan_make(
+                available, available, 5u, true, &tail) ||
+            tail.kind != DS4_DSPARK_TAIL_PENDING_ONLY ||
+            tail.maximum_emitted_rows != 1u ||
+            tail.draft_depth != 0u || tail.verifier_rows != 0u) {
+            return false;
+        }
+    }
+
+    /* Exact raw boundary plus one-negative controls. */
+    if (!ds4_dspark_verifier_raw_preflight(
+            frontier, DS4_DSPARK_RAW_FINALIZER_MAX_ROWS,
+            raw_cap, raw_window) ||
+        ds4_dspark_verifier_raw_preflight(
+            frontier, DS4_DSPARK_RAW_FINALIZER_MAX_ROWS,
+            raw_cap - 1u, raw_window) ||
+        !ds4_dspark_verifier_raw_preflight(3u, 3u, 6u, 6u) ||
+        ds4_dspark_verifier_raw_preflight(3u, 3u, 5u, 5u)) {
+        return false;
+    }
+
+    /* Malformed geometry, overflow, and missing outputs all fail closed. */
+    return !ds4_dspark_verifier_plan_make(
+               frontier, 0u, 0u, raw_cap, raw_window, NULL) &&
+           !ds4_dspark_verifier_plan_make(
+               frontier, 6u, 0u, raw_cap, raw_window, &plan) &&
+           !ds4_dspark_verifier_plan_make(
+               frontier, 2u, 3u, raw_cap, raw_window, &plan) &&
+           !ds4_dspark_verifier_plan_make(
+               frontier, 0u, 0u, 0u, raw_window, &plan) &&
+           !ds4_dspark_verifier_plan_make(
+               frontier, 0u, 0u, raw_cap, 0u, &plan) &&
+           !ds4_dspark_verifier_plan_make(
+               frontier, 0u, 0u, raw_window - 1u, raw_window, &plan) &&
+           !ds4_dspark_verifier_plan_make(
+               UINT64_MAX, 0u, 0u, raw_cap, raw_window, &plan) &&
+           !ds4_dspark_verifier_consumption_make(NULL, 0u, &consumption) &&
+           !ds4_dspark_verifier_consumption_make(&plan, 0u, NULL) &&
+           !ds4_dspark_tail_plan_make(1u, 1u, 0u, false, NULL) &&
+           !ds4_dspark_tail_plan_make(7u, 7u, 6u, false, &tail);
+}
+
 static const ds4_dspark_capture_contract DS4_DSPARK_CAPTURE_CONTRACT = {
     .target_layer = {40, 41, 42},
     .stage_count = DS4_DSPARK_CAPTURE_STAGE_COUNT,
@@ -1416,6 +1752,7 @@ static bool ds4_dspark_runtime_contract_self_check(void) {
            ds4_dspark_capture_state_finish(&capture_state, true) &&
            ds4_dspark_capture_state_ready_at(&capture_state, 43u) &&
            !ds4_dspark_capture_state_ready_at(&capture_state, 42u) &&
+           ds4_dspark_verifier_contract_self_check() &&
            ds4_dspark_history_state_self_check() &&
            ds4_dspark_raw_context_state_self_check() &&
            ds4_dspark_failed_blit_state_self_check() &&
