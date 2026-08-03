@@ -1754,6 +1754,8 @@ int ds4_gpu_internal_dspark_dual_store_test(void);
 int ds4_gpu_internal_dspark_support_cache_test(void);
 /* Device-only post-layer HC mean regression for the DSpark tap. */
 int ds4_gpu_internal_dspark_hc_mean_test(void);
+/* Device ring append/publication regression for DSpark capture history. */
+int ds4_gpu_internal_dspark_history_test(void);
 #endif
 
 /* =========================================================================
@@ -1789,6 +1791,32 @@ int ds4_gpu_hc_mean_tensor(
         const ds4_gpu_tensor *residual_hc,
         uint32_t                n_embd,
         uint32_t                n_hc);
+
+/* Encode one selected-stage DSpark history update. Geometry comes from the
+ * graph's checked absolute-ring plan. Single-row decode writes directly to
+ * current; multi-row prefill uses scratch for the retained HC means. */
+int ds4_gpu_dspark_capture_history_tensor(
+        ds4_gpu_tensor       *current,
+        ds4_gpu_tensor       *history,
+        ds4_gpu_tensor       *scratch,
+        const ds4_gpu_tensor *post_layer_hc,
+        uint32_t              active_tokens,
+        uint32_t              input_skip,
+        uint32_t              retained_rows,
+        uint32_t              first_physical_row,
+        uint32_t              first_rows,
+        uint32_t              second_rows);
+
+/* Publish one selected stage from verifier shadow storage. Only the accepted
+ * prefix reaches history and only its final row reaches current. */
+int ds4_gpu_dspark_publish_history_tensor(
+        ds4_gpu_tensor       *current,
+        ds4_gpu_tensor       *history,
+        const ds4_gpu_tensor *candidate,
+        uint32_t              committed_rows,
+        uint32_t              first_physical_row,
+        uint32_t              first_rows,
+        uint32_t              second_rows);
 
 int ds4_gpu_hc_weighted_sum_split_tensor(
         ds4_gpu_tensor       *out,

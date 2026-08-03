@@ -59,6 +59,169 @@
       ],
       "threshold": 0.6
     },
+    "directContextKV": {
+      "absolutePositions": [
+        0,
+        129
+      ],
+      "expected": {
+        "nonropeScales": [
+          [
+            0.00390625,
+            0.00390625,
+            0.00390625,
+            0.00390625,
+            0.00390625,
+            0.00390625,
+            0.00390625
+          ],
+          [
+            0.00390625,
+            0.00390625,
+            0.00390625,
+            0.00390625,
+            0.00390625,
+            0.00390625,
+            0.00390625
+          ]
+        ],
+        "normalizedSamples": [
+          {
+            "dimension": 0,
+            "token": 0,
+            "value": 0.365234375
+          },
+          {
+            "dimension": 3,
+            "token": 0,
+            "value": 1.4609375
+          },
+          {
+            "dimension": 0,
+            "token": 1,
+            "value": 1.0625
+          },
+          {
+            "dimension": 3,
+            "token": 1,
+            "value": -1.5859375
+          }
+        ],
+        "ropedSamples": [
+          {
+            "dimension": 448,
+            "token": 0,
+            "value": 0.365234375
+          },
+          {
+            "dimension": 511,
+            "token": 0,
+            "value": 1.4609375
+          },
+          {
+            "dimension": 448,
+            "token": 1,
+            "value": -1.1484375
+          },
+          {
+            "dimension": 449,
+            "token": 1,
+            "value": 0.31640625
+          },
+          {
+            "dimension": 510,
+            "token": 1,
+            "value": 0.29296875
+          },
+          {
+            "dimension": 511,
+            "token": 1,
+            "value": -1.578125
+          }
+        ],
+        "storedSamples": [
+          {
+            "dimension": 0,
+            "token": 0,
+            "value": 0.375
+          },
+          {
+            "dimension": 1,
+            "token": 0,
+            "value": 0.75
+          },
+          {
+            "dimension": 2,
+            "token": 0,
+            "value": 1.125
+          },
+          {
+            "dimension": 3,
+            "token": 0,
+            "value": 1.5
+          },
+          {
+            "dimension": 0,
+            "token": 1,
+            "value": 1.0
+          },
+          {
+            "dimension": 1,
+            "token": 1,
+            "value": -0.5
+          },
+          {
+            "dimension": 2,
+            "token": 1,
+            "value": 0.25
+          },
+          {
+            "dimension": 3,
+            "token": 1,
+            "value": -1.625
+          },
+          {
+            "dimension": 448,
+            "token": 1,
+            "value": -1.1484375
+          },
+          {
+            "dimension": 511,
+            "token": 1,
+            "value": -1.578125
+          }
+        ]
+      },
+      "mainX": [
+        [
+          1.0,
+          2.0,
+          3.0,
+          4.0
+        ],
+        [
+          2.0,
+          -1.0,
+          0.5,
+          -3.0
+        ]
+      ],
+      "normEps": 1e-06,
+      "normWeight": {
+        "fill": 1.0,
+        "shape": [
+          512
+        ]
+      },
+      "projectionGenerator": {
+        "kind": "repeatingIdentityRows",
+        "shape": [
+          512,
+          4
+        ]
+      },
+      "ropeTheta": 10000.0
+    },
     "draftHead": {
       "confidenceProjection": [
         0.45,
@@ -1098,6 +1261,35 @@
         4096
       ]
     },
+    "proposalTokenLayout": {
+      "blockSize": 5,
+      "expected": {
+        "inputPositions": [
+          129,
+          130,
+          131,
+          132,
+          133
+        ],
+        "inputTokenIds": [
+          17,
+          128799,
+          128799,
+          128799,
+          128799
+        ],
+        "proposedOutputPositions": [
+          130,
+          131,
+          132,
+          133,
+          134
+        ]
+      },
+      "lastTargetPosition": 128,
+      "noiseTokenId": 128799,
+      "pendingTokenId": 17
+    },
     "rawCache": {
       "draftGenerator": {
         "base": 500000.0,
@@ -1106,6 +1298,7 @@
         "stageScale": 100000.0
       },
       "expected": {
+        "acceptedRows": 3,
         "after128Samples": [
           {
             "dimension": 0,
@@ -1138,22 +1331,22 @@
             "dimension": 0,
             "logical": 0,
             "stage": 0,
-            "value": 2000.0
+            "value": 4000.0
           },
           {
             "dimension": 511,
             "logical": 127,
             "stage": 2,
-            "value": 329511.0
+            "value": 331511.0
           },
           {
             "dimension": 511,
-            "physical": 1,
+            "physical": 3,
             "stage": 2,
-            "value": 329511.0
+            "value": 331511.0
           }
         ],
-        "afterCommitTokenStart": 2,
+        "afterCommitTokenStart": 4,
         "beforeWrapLength": 128,
         "beforeWrapSamples": [
           {
@@ -1196,24 +1389,19 @@
             "view": 127
           },
           {
-            "dimension": 511,
-            "stage": 2,
-            "value": 329511.0,
-            "view": 128
-          },
-          {
             "dimension": 0,
             "stage": 0,
             "value": 500000.0,
-            "view": 129
+            "view": 128
           },
           {
             "dimension": 511,
             "stage": 2,
             "value": 704511.0,
-            "view": 133
+            "view": 132
           }
-        ]
+        ],
+        "verifierTokenCount": 4
       },
       "prefillTokenCount": 128,
       "proposalPosition": 129,
@@ -1518,12 +1706,16 @@
       ]
     },
     "stageSetup": {
-      "acceptedEmbedding": [
-        0.1,
-        0.2
-      ],
       "blockSize": 5,
       "expected": {
+        "concatenated": [
+          1.0,
+          2.0,
+          3.0,
+          4.0,
+          5.0,
+          6.0
+        ],
         "draftRows": [
           [
             0.1,
@@ -1547,36 +1739,44 @@
           ]
         ],
         "mainHidden": [
-          0.46499054240796533,
-          0.697485813611948
+          2.1181254857074348,
+          -0.0581902605963581
+        ],
+        "preNorm": [
+          91.0,
+          -5.0
         ]
       },
       "hcLanes": 4,
       "mainNormWeight": [
-        2.0,
-        0.5
+        1.5,
+        0.75
       ],
       "mainProjection": [
         [
           1.0,
-          0.0,
-          0.0,
-          0.0,
-          0.0,
-          0.0
+          2.0,
+          3.0,
+          4.0,
+          5.0,
+          6.0
         ],
         [
-          0.0,
-          0.0,
-          0.0,
-          0.0,
-          0.0,
-          1.0
+          -2.0,
+          1.0,
+          -1.0,
+          3.0,
+          2.0,
+          -4.0
         ]
       ],
       "noiseEmbedding": [
         -0.3,
         0.4
+      ],
+      "pendingEmbedding": [
+        0.1,
+        0.2
       ],
       "targetHidden": [
         [
@@ -1591,6 +1791,96 @@
           5.0,
           6.0
         ]
+      ]
+    },
+    "targetCaptureRows": {
+      "decodeStartPosition": 141,
+      "decodeTokenCount": 1,
+      "expected": {
+        "decodeAbsoluteTokenPosition": 141,
+        "decodeSamples": [
+          {
+            "dimension": 0,
+            "layer": 0,
+            "value": 752.0
+          },
+          {
+            "dimension": 128,
+            "layer": 0,
+            "value": 768.0
+          },
+          {
+            "dimension": 257,
+            "layer": 1,
+            "value": 66288.0
+          },
+          {
+            "dimension": 4095,
+            "layer": 2,
+            "value": 131854.0
+          }
+        ],
+        "decodeTokenIndex": 0,
+        "historyLength": 128,
+        "historySamples": [
+          {
+            "dimension": 0,
+            "layer": 0,
+            "logical": 0,
+            "value": 17136.0
+          },
+          {
+            "dimension": 128,
+            "layer": 1,
+            "logical": 0,
+            "value": 82688.0
+          },
+          {
+            "dimension": 4095,
+            "layer": 2,
+            "logical": 127,
+            "value": 1188622.0
+          }
+        ],
+        "historyTokenStart": 13,
+        "prefillAbsoluteTokenPosition": 140,
+        "prefillSamples": [
+          {
+            "dimension": 0,
+            "layer": 0,
+            "value": 1057520.0
+          },
+          {
+            "dimension": 128,
+            "layer": 1,
+            "value": 1123072.0
+          },
+          {
+            "dimension": 4095,
+            "layer": 2,
+            "value": 1188622.0
+          }
+        ],
+        "prefillTokenIndex": 129
+      },
+      "generator": {
+        "dimensionOffset": -128,
+        "dimensionPeriod": 257,
+        "dimensionScale": 0.125,
+        "hcScale": 512.0,
+        "layerScale": 65536.0,
+        "tokenScale": 8192.0
+      },
+      "layerIds": [
+        40,
+        41,
+        42
+      ],
+      "prefillStartPosition": 11,
+      "prefillTokenCount": 130,
+      "shapePerLayer": [
+        4,
+        4096
       ]
     }
   },

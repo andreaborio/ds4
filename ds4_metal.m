@@ -349,11 +349,15 @@ static ds4_gpu_qwen35_expert_pack_state g_qwen35_expert_pack;
 enum {
     DS4_DSPARK_SUPPORT_LAYER_COUNT = 3,
     DS4_DSPARK_SUPPORT_EXPERT_COUNT = 256,
+    DS4_DSPARK_SUPPORT_CANDIDATE_ROWS = 5,
+    DS4_DSPARK_SUPPORT_TOP_K = 6,
     DS4_DSPARK_TARGET_LAYER_COUNT = 43,
-    /* Three top-6 stages plus one in-flight record.  This reservation is
-     * charged against the same parent count as TARGET; it is never borrowed
-     * from TARGET implicitly. */
-    DS4_DSPARK_SUPPORT_CACHE_FLOOR = 19,
+    /* Stages execute serially. One stage can need five disjoint top-6 sets;
+     * keep those records pinned through its GPU work, plus one in-flight I/O
+     * record. This reservation is charged against the same parent count as
+     * TARGET and is never borrowed from TARGET implicitly. */
+    DS4_DSPARK_SUPPORT_CACHE_FLOOR =
+        DS4_DSPARK_SUPPORT_CANDIDATE_ROWS * DS4_DSPARK_SUPPORT_TOP_K + 1,
     DS4_DSPARK_TARGET_CACHE_FLOOR = 259,
     DS4_DSPARK_COMBINED_CACHE_FLOOR =
         DS4_DSPARK_TARGET_CACHE_FLOOR + DS4_DSPARK_SUPPORT_CACHE_FLOOR,
@@ -15435,7 +15439,7 @@ static void ds4_gpu_stream_expert_cache_prune_global(
 /* Reconcile a descriptor/budget transition before SUPPORT can become visible.
  * TARGET cache slots may still be referenced by queued Metal work, so a late
  * SUPPORT activation fences and drains the existing owner before pruning the
- * newly reserved 19-slot share. */
+ * newly reserved SUPPORT share. */
 static int ds4_gpu_dspark_reconcile_synchronize(void) {
 #ifdef DS4_TEST_HOOKS
     g_dspark_reconcile_synchronize_calls++;
@@ -38046,6 +38050,22 @@ static int ds4_gpu_internal_qwen35_expert_pack_pwrite_all(
 }
 
 #ifdef DS4_TEST_HOOKS
+static int ds4_gpu_dspark_capture_hc_mean_row(
+        ds4_gpu_tensor       *out,
+        const ds4_gpu_tensor *residual_hc,
+        uint32_t              active_tokens,
+        uint32_t              token_index);
+
+typedef enum {
+    DS4_GPU_DSPARK_HISTORY_TEST_FAIL_NONE = 0,
+    DS4_GPU_DSPARK_HISTORY_TEST_FAIL_CAPTURE_AFTER_FIRST_BLIT,
+    DS4_GPU_DSPARK_HISTORY_TEST_FAIL_PUBLISH_AFTER_FIRST_BLIT,
+} ds4_gpu_dspark_history_test_failure;
+
+static ds4_gpu_dspark_history_test_failure
+    g_dspark_history_test_failure =
+        DS4_GPU_DSPARK_HISTORY_TEST_FAIL_NONE;
+
 int ds4_gpu_internal_dspark_dual_store_test(void) {
     const uint64_t file_size = 16u * 1024u;
     const uint64_t model_size = 1024u * 1024u;
@@ -38393,7 +38413,7 @@ int ds4_gpu_internal_dspark_support_cache_test(void) {
     const uint64_t reconcile_sync_before_mode =
         g_dspark_reconcile_synchronize_calls;
     ds4_gpu_set_glm_model(true);
-    ds4_gpu_set_streaming_expert_cache_budget(278);
+    ds4_gpu_set_streaming_expert_cache_budget(290);
     if (ok) {
         ok = target_buffer &&
              !ds4_gpu_dspark_support_cache_combined_available() &&
@@ -38409,7 +38429,7 @@ int ds4_gpu_internal_dspark_support_cache_test(void) {
                  reconcile_sync_before_mode + 4 &&
              g_stream_expert_cache_entry_count == 259 &&
              ds4_gpu_stream_expert_cache_configured_budget() == 259 &&
-             ds4_gpu_dspark_support_cache_configured_budget() == 19 &&
+             ds4_gpu_dspark_support_cache_configured_budget() == 31 &&
              ds4_gpu_dspark_support_cache_get_for_test(0, 53) != NULL;
     }
     ds4_gpu_set_glm_model(true);
@@ -38419,7 +38439,7 @@ int ds4_gpu_internal_dspark_support_cache_test(void) {
                  reconcile_sync_before_mode + 6 &&
              g_stream_expert_cache_entry_count == 259 &&
              g_dspark_support_cache_entry_count == 0 &&
-             ds4_gpu_stream_expert_cache_configured_budget() == 278 &&
+             ds4_gpu_stream_expert_cache_configured_budget() == 290 &&
              ds4_gpu_dspark_support_cache_configured_budget() == 0;
     }
     ds4_gpu_set_glm_model(false);
@@ -38429,10 +38449,10 @@ int ds4_gpu_internal_dspark_support_cache_test(void) {
                  reconcile_sync_before_mode + 8 &&
              g_stream_expert_cache_entry_count == 259 &&
              ds4_gpu_stream_expert_cache_configured_budget() == 259 &&
-             ds4_gpu_dspark_support_cache_configured_budget() == 19;
+             ds4_gpu_dspark_support_cache_configured_budget() == 31;
     }
 
-    const uint32_t below_support_floor[] = {18, 19, 277};
+    const uint32_t below_support_floor[] = {30, 31, 289};
     for (uint32_t i = 0;
          ok && i < sizeof(below_support_floor) /
                      sizeof(below_support_floor[0]);
@@ -38447,36 +38467,36 @@ int ds4_gpu_internal_dspark_support_cache_test(void) {
     }
 
     if (ok) {
-        ds4_gpu_set_streaming_expert_cache_budget(277);
+        ds4_gpu_set_streaming_expert_cache_budget(289);
         ok = target_buffer &&
              ds4_gpu_internal_dspark_support_populate_target_for_test(
                  260, support_bytes, MODEL_SIZE, target_buffer) &&
-             !ds4_gpu_grow_streaming_expert_cache_budget(278) &&
-             g_stream_expert_cache_budget_override == 277 &&
+             !ds4_gpu_grow_streaming_expert_cache_budget(290) &&
+             g_stream_expert_cache_budget_override == 289 &&
              g_stream_expert_cache_entry_count == 260 &&
-             ds4_gpu_reconfigure_streaming_expert_cache_budget(278) &&
+             ds4_gpu_reconfigure_streaming_expert_cache_budget(290) &&
              g_stream_expert_cache_entry_count == 0 &&
-             ds4_gpu_stream_expert_cache_parent_budget(0) == 278 &&
+             ds4_gpu_stream_expert_cache_parent_budget(0) == 290 &&
              ds4_gpu_stream_expert_cache_configured_budget() == 259 &&
-             ds4_gpu_dspark_support_cache_configured_budget() == 19;
+             ds4_gpu_dspark_support_cache_configured_budget() == 31;
     }
     if (ok) {
         ok = ds4_gpu_internal_dspark_support_populate_target_for_test(
                  259, support_bytes, MODEL_SIZE, target_buffer) &&
              ds4_gpu_dspark_support_cache_get_for_test(0, 31) != NULL &&
-             ds4_gpu_reconfigure_streaming_expert_cache_budget(277) &&
+             ds4_gpu_reconfigure_streaming_expert_cache_budget(289) &&
              g_stream_expert_cache_entry_count == 259 &&
              g_dspark_support_cache_entry_count == 0 &&
              ds4_gpu_dspark_support_cache_configured_budget() == 0 &&
-             ds4_gpu_reconfigure_streaming_expert_cache_budget(278) &&
+             ds4_gpu_reconfigure_streaming_expert_cache_budget(290) &&
              g_stream_expert_cache_entry_count == 0 &&
              ds4_gpu_internal_dspark_support_populate_target_for_test(
                  259, support_bytes, MODEL_SIZE, target_buffer) &&
              ds4_gpu_grow_streaming_expert_cache_budget(320) &&
              g_stream_expert_cache_budget_override == 320 &&
              ds4_gpu_stream_expert_cache_parent_budget(0) == 320 &&
-             ds4_gpu_stream_expert_cache_configured_budget() == 301 &&
-             ds4_gpu_dspark_support_cache_configured_budget() == 19 &&
+             ds4_gpu_stream_expert_cache_configured_budget() == 289 &&
+             ds4_gpu_dspark_support_cache_configured_budget() == 31 &&
              ds4_gpu_stream_expert_cache_configured_budget() +
                  ds4_gpu_dspark_support_cache_configured_budget() == 320;
     }
@@ -38519,14 +38539,14 @@ int ds4_gpu_internal_dspark_support_cache_test(void) {
              g_stream_expert_cache[0][7].valid == target_valid_before;
     }
 
-    for (uint32_t expert = 0; ok && expert < 18; expert++) {
+    for (uint32_t expert = 0; ok && expert < 30; expert++) {
         ok = ds4_gpu_dspark_support_cache_get_for_test(2, expert) != NULL;
     }
     if (ok) {
-        ok = g_dspark_support_cache_entry_count == 19 &&
+        ok = g_dspark_support_cache_entry_count == 31 &&
              g_dspark_support_cache_evictions == 1 &&
-             g_dspark_support_cache_misses == 20 &&
-             g_dspark_support_cache_expert_loads == 20 &&
+             g_dspark_support_cache_misses == 32 &&
+             g_dspark_support_cache_expert_loads == 32 &&
              g_stream_expert_cache_entry_count +
                  g_dspark_support_cache_entry_count <=
                      ds4_gpu_stream_expert_cache_parent_budget(0) &&
@@ -38552,8 +38572,8 @@ int ds4_gpu_internal_dspark_support_cache_test(void) {
     }
 
     /* Late SUPPORT activation must fence and prune TARGET immediately; it
-     * may not wait for the first SUPPORT lookup to enforce the 259+19 split. */
-    ds4_gpu_set_streaming_expert_cache_budget(278);
+     * may not wait for the first SUPPORT lookup to enforce the 259+31 split. */
+    ds4_gpu_set_streaming_expert_cache_budget(290);
     if (ok) {
         ok = ds4_gpu_internal_dspark_support_populate_target_for_test(
                  260, support_bytes, MODEL_SIZE, target_buffer) &&
@@ -38566,7 +38586,7 @@ int ds4_gpu_internal_dspark_support_cache_test(void) {
                  MODEL_SIZE) &&
              g_stream_expert_cache_entry_count == 259 &&
              ds4_gpu_stream_expert_cache_configured_budget() == 259 &&
-             ds4_gpu_dspark_support_cache_configured_budget() == 19;
+             ds4_gpu_dspark_support_cache_configured_budget() == 31;
     }
 
     /* mlock is a TARGET cap. At 259 it must not consume SUPPORT a second
@@ -38579,8 +38599,8 @@ int ds4_gpu_internal_dspark_support_cache_test(void) {
     g_stream_expert_cache_mlock_budget_cap_active = 1;
     if (ok) {
         ok = ds4_gpu_stream_expert_cache_configured_budget() == 259 &&
-             ds4_gpu_dspark_support_cache_configured_budget() == 19 &&
-             ds4_gpu_stream_expert_cache_parent_budget(0) == 278 &&
+             ds4_gpu_dspark_support_cache_configured_budget() == 31 &&
+             ds4_gpu_stream_expert_cache_parent_budget(0) == 290 &&
              g_dspark_support_cache_entry_count == 1;
     }
     g_stream_expert_cache_mlock_budget_cap = 258;
@@ -38591,24 +38611,24 @@ int ds4_gpu_internal_dspark_support_cache_test(void) {
              ds4_gpu_stream_expert_cache_parent_budget(0) == 258 &&
              g_dspark_support_cache_entry_count == 0 &&
              g_stream_expert_cache_entry_count == 0 &&
-             !ds4_gpu_reconfigure_streaming_expert_cache_budget(278);
+             !ds4_gpu_reconfigure_streaming_expert_cache_budget(290);
     }
     g_stream_expert_cache_mlock_budget_cap = 259;
     if (ok) {
-        ok = ds4_gpu_reconfigure_streaming_expert_cache_budget(277) &&
-             g_stream_expert_cache_budget_override == 277;
+        ok = ds4_gpu_reconfigure_streaming_expert_cache_budget(289) &&
+             g_stream_expert_cache_budget_override == 289;
     }
     g_stream_expert_cache_mlock_budget_cap = 258;
     ds4_gpu_dspark_support_cache_target_cap_changed();
     if (ok) {
-        ok = !ds4_gpu_grow_streaming_expert_cache_budget(278) &&
-             g_stream_expert_cache_budget_override == 277;
+        ok = !ds4_gpu_grow_streaming_expert_cache_budget(290) &&
+             g_stream_expert_cache_budget_override == 289;
     }
     g_stream_expert_cache_mlock_budget_cap = 259;
     if (ok) {
-        ok = ds4_gpu_grow_streaming_expert_cache_budget(278) &&
+        ok = ds4_gpu_grow_streaming_expert_cache_budget(290) &&
              ds4_gpu_stream_expert_cache_configured_budget() == 259 &&
-             ds4_gpu_dspark_support_cache_configured_budget() == 19;
+             ds4_gpu_dspark_support_cache_configured_budget() == 31;
     }
 
     /* TARGET clear invalidates the pairing generation and clears SUPPORT.
@@ -38667,26 +38687,373 @@ int ds4_gpu_internal_dspark_support_cache_test(void) {
     return ok;
 }
 
+enum {
+    DS4_DSPARK_HISTORY_TEST_WIDTH = 4096,
+    DS4_DSPARK_HISTORY_TEST_HC = 4,
+    DS4_DSPARK_HISTORY_TEST_ROWS = 128,
+    DS4_DSPARK_HISTORY_TEST_SOURCE_ROWS = 140,
+    DS4_DSPARK_HISTORY_TEST_VERIFY_ROWS = 4,
+};
+
+static float ds4_gpu_dspark_history_test_expected(
+        uint64_t absolute_row,
+        uint32_t dim) {
+    return (float)absolute_row * 0.125f + 0.75f +
+           (float)((int32_t)(dim % 257u) - 128) * 0.0009765625f;
+}
+
+static void ds4_gpu_dspark_history_test_fill_hc(
+        float *out,
+        uint64_t absolute_start,
+        uint32_t rows) {
+    for (uint32_t row = 0; row < rows; row++) {
+        for (uint32_t hc = 0; hc < DS4_DSPARK_HISTORY_TEST_HC; hc++) {
+            for (uint32_t dim = 0;
+                 dim < DS4_DSPARK_HISTORY_TEST_WIDTH; dim++) {
+                out[((uint64_t)row * DS4_DSPARK_HISTORY_TEST_HC + hc) *
+                    DS4_DSPARK_HISTORY_TEST_WIDTH + dim] =
+                    ds4_gpu_dspark_history_test_expected(
+                        absolute_start + row, dim) - 0.75f +
+                    (float)hc * 0.5f;
+            }
+        }
+    }
+}
+
+static void ds4_gpu_dspark_history_test_fill_means(
+        float *out,
+        uint64_t absolute_start,
+        uint32_t rows) {
+    for (uint32_t row = 0; row < rows; row++) {
+        for (uint32_t dim = 0;
+             dim < DS4_DSPARK_HISTORY_TEST_WIDTH; dim++) {
+            out[(uint64_t)row * DS4_DSPARK_HISTORY_TEST_WIDTH + dim] =
+                ds4_gpu_dspark_history_test_expected(
+                    absolute_start + row, dim);
+        }
+    }
+}
+
+/* Invoke the exact production device helper inside one graph-shaped command
+ * batch. The helper releases its multi-row views before this fence, matching
+ * the batch_attn_cur lifetime in ds4.c. */
+static int ds4_gpu_dspark_history_test_encode_capture(
+        ds4_gpu_tensor *current,
+        ds4_gpu_tensor *history,
+        ds4_gpu_tensor *scratch,
+        ds4_gpu_tensor *source,
+        uint32_t active_tokens,
+        uint32_t input_skip,
+        uint32_t retained_rows,
+        uint32_t first_physical_row,
+        uint32_t first_rows,
+        uint32_t second_rows) {
+    int ok = ds4_gpu_begin_commands();
+    if (ok) {
+        ok = ds4_gpu_dspark_capture_history_tensor(
+            current, history, scratch, source,
+            active_tokens, input_skip, retained_rows,
+            first_physical_row, first_rows, second_rows);
+    }
+    if (ds4_gpu_commands_active()) {
+        const int end_ok = ds4_gpu_end_commands();
+        ok = end_ok && ok;
+    }
+    return ok;
+}
+
+static int ds4_gpu_dspark_history_test_encode_publication(
+        ds4_gpu_tensor *current,
+        ds4_gpu_tensor *history,
+        ds4_gpu_tensor *candidate,
+        uint32_t committed_rows,
+        uint32_t first_physical_row,
+        uint32_t first_rows,
+        uint32_t second_rows) {
+    int ok = ds4_gpu_begin_commands();
+    if (ok) {
+        ok = ds4_gpu_dspark_publish_history_tensor(
+            current, history, candidate, committed_rows,
+            first_physical_row, first_rows, second_rows);
+    }
+    if (ds4_gpu_commands_active()) {
+        const int end_ok = ds4_gpu_end_commands();
+        ok = end_ok && ok;
+    }
+    return ok;
+}
+
+static int ds4_gpu_dspark_history_test_verify(
+        ds4_gpu_tensor *ring,
+        ds4_gpu_tensor *current,
+        uint64_t frontier,
+        uint32_t count,
+        uint64_t current_absolute,
+        float *ring_host,
+        float *current_host) {
+    const uint64_t row_bytes =
+        (uint64_t)DS4_DSPARK_HISTORY_TEST_WIDTH * sizeof(float);
+    const uint64_t ring_bytes =
+        (uint64_t)DS4_DSPARK_HISTORY_TEST_ROWS * row_bytes;
+    if (!ring || !current || !ring_host || !current_host || count == 0 ||
+        count > DS4_DSPARK_HISTORY_TEST_ROWS || frontier < count ||
+        !ds4_gpu_tensor_read(ring, 0, ring_host, ring_bytes) ||
+        !ds4_gpu_tensor_read(current, 0, current_host, row_bytes)) {
+        return 0;
+    }
+    for (uint64_t absolute = frontier - count;
+         absolute < frontier; absolute++) {
+        const float *row = ring_host +
+            (absolute % DS4_DSPARK_HISTORY_TEST_ROWS) *
+                DS4_DSPARK_HISTORY_TEST_WIDTH;
+        for (uint32_t dim = 0;
+             dim < DS4_DSPARK_HISTORY_TEST_WIDTH; dim++) {
+            if (fabsf(row[dim] - ds4_gpu_dspark_history_test_expected(
+                                      absolute, dim)) > 1.0e-6f) {
+                return 0;
+            }
+        }
+    }
+    for (uint32_t dim = 0;
+         dim < DS4_DSPARK_HISTORY_TEST_WIDTH; dim++) {
+        if (fabsf(current_host[dim] -
+                  ds4_gpu_dspark_history_test_expected(
+                      current_absolute, dim)) > 1.0e-6f) {
+            return 0;
+        }
+    }
+    return 1;
+}
+
+int ds4_gpu_internal_dspark_history_test(void) {
+    const uint64_t row_values = DS4_DSPARK_HISTORY_TEST_WIDTH;
+    const uint64_t row_bytes = row_values * sizeof(float);
+    const uint64_t hc_row_values =
+        (uint64_t)DS4_DSPARK_HISTORY_TEST_HC * row_values;
+    const uint64_t source_values =
+        (uint64_t)DS4_DSPARK_HISTORY_TEST_SOURCE_ROWS * hc_row_values;
+    const uint64_t source_bytes = source_values * sizeof(float);
+    const uint64_t ring_values =
+        (uint64_t)DS4_DSPARK_HISTORY_TEST_ROWS * row_values;
+    const uint64_t ring_bytes = ring_values * sizeof(float);
+    const uint64_t verify_values =
+        (uint64_t)DS4_DSPARK_HISTORY_TEST_VERIFY_ROWS * row_values;
+    const uint64_t verify_bytes = verify_values * sizeof(float);
+    if (!g_initialized && !ds4_gpu_init()) return 0;
+
+    uint64_t live_bytes_before = 0;
+    pthread_mutex_lock(&g_tensor_mu);
+    live_bytes_before = g_tensor_alloc_live_bytes;
+    pthread_mutex_unlock(&g_tensor_mu);
+
+    float *source_host = malloc((size_t)source_bytes);
+    float *ring_host = malloc((size_t)ring_bytes);
+    float *ring_snapshot = malloc((size_t)ring_bytes);
+    float *current_host = malloc((size_t)row_bytes);
+    float *current_snapshot = malloc((size_t)row_bytes);
+    float *candidate_host = malloc((size_t)verify_bytes);
+    ds4_gpu_tensor *source = ds4_gpu_tensor_alloc(source_bytes);
+    ds4_gpu_tensor *scratch = ds4_gpu_tensor_alloc(ring_bytes);
+    ds4_gpu_tensor *ring = ds4_gpu_tensor_alloc(ring_bytes);
+    ds4_gpu_tensor *current = ds4_gpu_tensor_alloc(row_bytes);
+    ds4_gpu_tensor *candidate = ds4_gpu_tensor_alloc(verify_bytes);
+    ds4_gpu_tensor *candidate_short = ds4_gpu_tensor_alloc(
+        verify_bytes - sizeof(float));
+    int ok = source_host && ring_host && ring_snapshot && current_host &&
+             current_snapshot && candidate_host && source && scratch && ring &&
+             current && candidate && candidate_short;
+    uint64_t frontier = 0;
+
+    /* The checked production geometry for start=0,n=140 retains rows 12..139
+     * and crosses the ring boundary in two blits: physical 12..127 then 0..11. */
+    if (ok) {
+        ds4_gpu_dspark_history_test_fill_hc(
+            source_host, 0u, DS4_DSPARK_HISTORY_TEST_SOURCE_ROWS);
+        ok = ds4_gpu_tensor_write(source, 0, source_host, source_bytes) &&
+             ds4_gpu_dspark_history_test_encode_capture(
+                 current, ring, scratch, source, 140u,
+                 12u, 128u, 12u, 116u, 12u);
+        frontier = 140u;
+    }
+    if (ok) {
+        ok = ds4_gpu_dspark_history_test_verify(
+            ring, current, frontier, 128u, 139u,
+            ring_host, current_host);
+    }
+
+    /* Short chunk accumulation uses the same shared multi-row helper. */
+    if (ok) {
+        ds4_gpu_dspark_history_test_fill_hc(source_host, frontier, 3u);
+        ok = ds4_gpu_tensor_write(
+                 source, 0, source_host, 3u * hc_row_values * sizeof(float)) &&
+             ds4_gpu_dspark_history_test_encode_capture(
+                 current, ring, scratch, source, 3u,
+                 0u, 3u, 12u, 3u, 0u);
+        frontier += 3u;
+    }
+    if (ok) {
+        ok = ds4_gpu_dspark_history_test_verify(
+            ring, current, frontier, 128u, frontier - 1u,
+            ring_host, current_host);
+    }
+
+    /* Single decode uses direct HC mean into current plus one ring blit. */
+    if (ok) {
+        ds4_gpu_dspark_history_test_fill_hc(source_host, frontier, 1u);
+        ok = ds4_gpu_tensor_write(
+                 source, 0, source_host, hc_row_values * sizeof(float)) &&
+             ds4_gpu_dspark_history_test_encode_capture(
+                 current, ring, scratch, source, 1u,
+                 0u, 1u, 15u, 1u, 0u);
+        frontier += 1u;
+    }
+    if (ok) {
+        ok = ds4_gpu_dspark_history_test_verify(
+            ring, current, frontier, 128u, frontier - 1u,
+            ring_host, current_host);
+    }
+
+    /* Full and partial verifier publications call the exact production blit
+     * helper. Unaccepted rows remain only in candidate storage. */
+    if (ok) {
+        ds4_gpu_dspark_history_test_fill_means(candidate_host, frontier, 4u);
+        ok = ds4_gpu_tensor_write(candidate, 0, candidate_host, verify_bytes) &&
+             ds4_gpu_dspark_history_test_encode_publication(
+                 current, ring, candidate, 4u, 16u, 4u, 0u);
+        frontier += 4u;
+    }
+    if (ok) {
+        ok = ds4_gpu_dspark_history_test_verify(
+            ring, current, frontier, 128u, frontier - 1u,
+            ring_host, current_host);
+    }
+    if (ok) {
+        ds4_gpu_dspark_history_test_fill_means(candidate_host, frontier, 4u);
+        ok = ds4_gpu_tensor_write(candidate, 0, candidate_host, verify_bytes) &&
+             ds4_gpu_dspark_history_test_encode_publication(
+                 current, ring, candidate, 2u, 20u, 2u, 0u);
+        frontier += 2u;
+    }
+    if (ok) {
+        ok = ds4_gpu_dspark_history_test_verify(
+            ring, current, frontier, 128u, frontier - 1u,
+            ring_host, current_host);
+        if (ok) {
+            memcpy(ring_snapshot, ring_host, (size_t)ring_bytes);
+            memcpy(current_snapshot, current_host, (size_t)row_bytes);
+        }
+    }
+
+    /* Invalid geometry/resources are rejected before encoding a blit. */
+    if (ok) {
+        ok = !ds4_gpu_dspark_capture_history_tensor(
+                 current, ring, scratch, source,
+                 3u, 1u, 3u, 22u, 3u, 0u) &&
+             !ds4_gpu_dspark_publish_history_tensor(
+                 current, ring, candidate, 0u, 22u, 1u, 0u) &&
+             !ds4_gpu_dspark_publish_history_tensor(
+                 current, ring, candidate, 2u, 127u, 2u, 0u) &&
+             !ds4_gpu_dspark_publish_history_tensor(
+                 current, ring, candidate_short, 4u, 22u, 4u, 0u) &&
+             ds4_gpu_tensor_read(ring, 0, ring_host, ring_bytes) &&
+             ds4_gpu_tensor_read(current, 0, current_host, row_bytes) &&
+             memcmp(ring_host, ring_snapshot, (size_t)ring_bytes) == 0 &&
+             memcmp(current_host, current_snapshot, (size_t)row_bytes) == 0;
+    }
+
+    /* Test-only injections fire after the first valid blit. The shared helper
+     * returns failure; production host state selfchecks exercise the matching
+     * fail-closed metadata transition. Partial device bytes are not published. */
+    if (ok) {
+        ds4_gpu_dspark_history_test_fill_hc(source_host, frontier, 3u);
+        ok = ds4_gpu_tensor_write(
+                 source, 0, source_host, 3u * hc_row_values * sizeof(float)) &&
+             ds4_gpu_begin_commands();
+        g_dspark_history_test_failure =
+            DS4_GPU_DSPARK_HISTORY_TEST_FAIL_CAPTURE_AFTER_FIRST_BLIT;
+        const int capture_rejected = ok &&
+            !ds4_gpu_dspark_capture_history_tensor(
+                current, ring, scratch, source,
+                3u, 0u, 3u, 22u, 3u, 0u);
+        const int capture_sync = ds4_gpu_commands_active() ?
+            ds4_gpu_synchronize() : 0;
+        ok = ok && capture_rejected && capture_sync &&
+             g_dspark_history_test_failure ==
+                 DS4_GPU_DSPARK_HISTORY_TEST_FAIL_NONE;
+    }
+    if (ok) {
+        ds4_gpu_dspark_history_test_fill_means(candidate_host, frontier, 4u);
+        ok = ds4_gpu_tensor_write(candidate, 0, candidate_host, verify_bytes) &&
+             ds4_gpu_begin_commands();
+        g_dspark_history_test_failure =
+            DS4_GPU_DSPARK_HISTORY_TEST_FAIL_PUBLISH_AFTER_FIRST_BLIT;
+        const int publish_rejected = ok &&
+            !ds4_gpu_dspark_publish_history_tensor(
+                current, ring, candidate, 2u, 22u, 2u, 0u);
+        const int publish_sync = ds4_gpu_commands_active() ?
+            ds4_gpu_synchronize() : 0;
+        ok = ok && publish_rejected && publish_sync &&
+             g_dspark_history_test_failure ==
+                 DS4_GPU_DSPARK_HISTORY_TEST_FAIL_NONE;
+    }
+
+    ds4_gpu_tensor_free(candidate_short);
+    ds4_gpu_tensor_free(candidate);
+    ds4_gpu_tensor_free(current);
+    ds4_gpu_tensor_free(ring);
+    ds4_gpu_tensor_free(scratch);
+    ds4_gpu_tensor_free(source);
+    free(candidate_host);
+    free(current_snapshot);
+    free(current_host);
+    free(ring_snapshot);
+    free(ring_host);
+    free(source_host);
+    pthread_mutex_lock(&g_tensor_mu);
+    ok = g_tensor_alloc_live_bytes == live_bytes_before && ok;
+    pthread_mutex_unlock(&g_tensor_mu);
+    return ok;
+}
 int ds4_gpu_internal_dspark_hc_mean_test(void) {
-    enum { N_EMBD = 4096, N_HC = 4, N_TOKEN = 3 };
+    enum {
+        N_EMBD = 4096,
+        N_HC = 4,
+        N_TOKEN = 3,
+        N_STAGE = 3,
+        VIEW_PAD = 64,
+    };
     NSString *pipeline_key = @"kernel_dsv4_hc_mean";
     if ([g_pipeline_cache objectForKey:pipeline_key] != nil) return 0;
+    uint64_t live_bytes_before = 0;
+    pthread_mutex_lock(&g_tensor_mu);
+    live_bytes_before = g_tensor_alloc_live_bytes;
+    pthread_mutex_unlock(&g_tensor_mu);
 
     const uint64_t input_count = (uint64_t)N_TOKEN * N_HC * N_EMBD;
     const uint64_t output_count = (uint64_t)N_TOKEN * N_EMBD;
-    float *input = malloc((size_t)input_count * sizeof(*input));
+    const uint64_t input_row_count = (uint64_t)N_HC * N_EMBD;
+    const uint64_t input_row_bytes = input_row_count * sizeof(float);
+    const uint64_t capture_count = N_EMBD;
+    const uint64_t capture_bytes = capture_count * sizeof(float);
+    float *input = malloc((size_t)N_STAGE * input_count * sizeof(*input));
     float *output = calloc((size_t)output_count, sizeof(*output));
-    if (!input || !output) {
+    float *capture = calloc((size_t)N_STAGE * capture_count, sizeof(*capture));
+    if (!input || !output || !capture) {
+        free(capture);
         free(input);
         free(output);
         return 0;
     }
-    for (uint32_t token = 0; token < N_TOKEN; token++) {
-        for (uint32_t hc = 0; hc < N_HC; hc++) {
-            for (uint32_t dim = 0; dim < N_EMBD; dim++) {
-                input[(token * N_HC + hc) * N_EMBD + dim] =
-                    (float)token * 0.25f + (float)hc * 1.5f +
-                    ((float)((int32_t)(dim % 257u) - 128)) * 0.03125f;
+    for (uint32_t stage = 0; stage < N_STAGE; stage++) {
+        float *stage_input = input + (uint64_t)stage * input_count;
+        for (uint32_t token = 0; token < N_TOKEN; token++) {
+            for (uint32_t hc = 0; hc < N_HC; hc++) {
+                for (uint32_t dim = 0; dim < N_EMBD; dim++) {
+                    stage_input[(token * N_HC + hc) * N_EMBD + dim] =
+                        (float)stage * 17.0f + (float)token * 0.25f +
+                        (float)hc * 1.5f +
+                        ((float)((int32_t)(dim % 257u) - 128)) * 0.03125f;
+                }
             }
         }
     }
@@ -38699,12 +39066,58 @@ int ds4_gpu_internal_dspark_hc_mean_test(void) {
         ds4_gpu_tensor_view(source, 0, output_bytes) : NULL;
     ds4_gpu_tensor *undersized = ds4_gpu_tensor_alloc(input_bytes - sizeof(float));
     ds4_gpu_tensor *bad_shape = ds4_gpu_tensor_alloc(output_bytes - sizeof(float));
+    ds4_gpu_tensor *stage_storage[N_STAGE] = {NULL, NULL, NULL};
+    ds4_gpu_tensor *stage_source[N_STAGE] = {NULL, NULL, NULL};
+    ds4_gpu_tensor *stage_capture[N_STAGE] = {NULL, NULL, NULL};
+    for (uint32_t stage = 0; stage < N_STAGE; stage++) {
+        stage_storage[stage] = ds4_gpu_tensor_alloc(input_bytes + VIEW_PAD);
+        stage_source[stage] = stage_storage[stage] ?
+            ds4_gpu_tensor_view(stage_storage[stage], VIEW_PAD, input_bytes) :
+            NULL;
+        stage_capture[stage] = ds4_gpu_tensor_alloc(capture_bytes);
+    }
+    ds4_gpu_tensor *capture_alias = stage_source[0] ?
+        ds4_gpu_tensor_view(stage_source[0],
+                            (uint64_t)(N_TOKEN - 1u) * input_row_bytes,
+                            capture_bytes) : NULL;
+    ds4_gpu_tensor *capture_short = ds4_gpu_tensor_alloc(
+        capture_bytes - sizeof(float));
+    ds4_gpu_tensor *capture_long = ds4_gpu_tensor_alloc(
+        capture_bytes + sizeof(float));
+    ds4_gpu_tensor *capture_input_short = ds4_gpu_tensor_alloc(
+        input_bytes - sizeof(float));
+
     int ok = source && mean &&
-             alias && undersized && bad_shape &&
+             alias && undersized && bad_shape && capture_alias &&
+             capture_short && capture_long && capture_input_short &&
+             stage_storage[0] && stage_storage[1] && stage_storage[2] &&
+             stage_source[0] && stage_source[1] && stage_source[2] &&
+             stage_capture[0] && stage_capture[1] && stage_capture[2] &&
              ds4_gpu_tensor_write(source, 0, input, input_bytes) &&
              !ds4_gpu_hc_mean_tensor(alias, source, N_EMBD, N_HC) &&
              !ds4_gpu_hc_mean_tensor(mean, undersized, N_EMBD, N_HC) &&
              !ds4_gpu_hc_mean_tensor(bad_shape, source, N_EMBD, N_HC) &&
+             !ds4_gpu_dspark_capture_hc_mean_row(
+                 NULL, stage_source[0], N_TOKEN, N_TOKEN - 1u) &&
+             !ds4_gpu_dspark_capture_hc_mean_row(
+                 stage_capture[0], NULL, N_TOKEN, N_TOKEN - 1u) &&
+             !ds4_gpu_dspark_capture_hc_mean_row(
+                 capture_short, stage_source[0], N_TOKEN, N_TOKEN - 1u) &&
+             !ds4_gpu_dspark_capture_hc_mean_row(
+                 capture_long, stage_source[0], N_TOKEN, N_TOKEN - 1u) &&
+             !ds4_gpu_dspark_capture_hc_mean_row(
+                 stage_capture[0], capture_input_short,
+                 N_TOKEN, N_TOKEN - 1u) &&
+             !ds4_gpu_dspark_capture_hc_mean_row(
+                 capture_alias, stage_source[0], N_TOKEN, N_TOKEN - 1u) &&
+             !ds4_gpu_dspark_capture_hc_mean_row(
+                 stage_capture[0], stage_source[0], 0, 0) &&
+             !ds4_gpu_dspark_capture_hc_mean_row(
+                 stage_capture[0], stage_source[0], N_TOKEN, N_TOKEN) &&
+             !ds4_gpu_dspark_capture_hc_mean_row(
+                 stage_capture[0], stage_source[0], UINT32_MAX,
+                 UINT32_MAX - 1u) &&
+             [g_pipeline_cache objectForKey:pipeline_key] == nil &&
              ds4_gpu_hc_mean_tensor(mean, source, N_EMBD, N_HC) &&
              ds4_gpu_tensor_read(mean, 0, output, output_bytes) &&
              [g_pipeline_cache objectForKey:pipeline_key] != nil;
@@ -38719,11 +39132,94 @@ int ds4_gpu_internal_dspark_hc_mean_test(void) {
             }
         }
     }
+
+    /* Graph ownership maps completed target layers 40/41/42 to slots 0/1/2.
+     * Exercise the single-row primitive against three independent sources and
+     * a nonzero token index; production decode uses index zero, while batched
+     * prefill uses ds4_gpu_hc_mean_tensor for its retained suffix. */
+    const uint32_t target_layer[N_STAGE] = {40, 41, 42};
+    for (uint32_t stage = 0; ok && stage < N_STAGE; stage++) {
+        ok = target_layer[stage] == 40u + stage &&
+             ds4_gpu_tensor_write(
+                 stage_source[stage], 0,
+                 input + (uint64_t)stage * input_count,
+                 input_bytes);
+    }
+    if (ok) ok = ds4_gpu_begin_commands();
+    for (uint32_t stage = 0; ok && stage < N_STAGE; stage++) {
+        ok = ds4_gpu_dspark_capture_hc_mean_row(
+            stage_capture[stage], stage_source[stage],
+            N_TOKEN, N_TOKEN - 1u);
+    }
+    if (ds4_gpu_commands_active()) {
+        const int end_ok = ds4_gpu_end_commands();
+        ok = end_ok && ok;
+    }
+    for (uint32_t stage = 0; ok && stage < N_STAGE; stage++) {
+        ok = ds4_gpu_tensor_read(
+            stage_capture[stage], 0,
+            capture + (uint64_t)stage * capture_count,
+            capture_bytes);
+        for (uint32_t dim = 0; ok && dim < N_EMBD; dim++) {
+            const float expected =
+                (float)stage * 17.0f + (float)(N_TOKEN - 1u) * 0.25f +
+                2.25f +
+                ((float)((int32_t)(dim % 257u) - 128)) * 0.03125f;
+            if (fabsf(capture[(uint64_t)stage * capture_count + dim] -
+                       expected) > 1.0e-6f) {
+                ok = 0;
+            }
+        }
+    }
+
+    /* A later decode token overwrites only its selected stage row. */
+    for (uint32_t hc = 0; hc < N_HC; hc++) {
+        for (uint32_t dim = 0; dim < N_EMBD; dim++) {
+            input[(uint64_t)hc * N_EMBD + dim] =
+                -23.0f + (float)hc * 0.5f +
+                ((float)((int32_t)(dim % 193u) - 96)) * 0.015625f;
+        }
+    }
+    if (ok) {
+        ok = ds4_gpu_tensor_write(
+                 stage_source[0], 0, input, input_row_bytes) &&
+             ds4_gpu_begin_commands() &&
+             ds4_gpu_dspark_capture_hc_mean_row(
+                 stage_capture[0], stage_source[0], 1, 0);
+    }
+    if (ds4_gpu_commands_active()) {
+        const int end_ok = ds4_gpu_end_commands();
+        ok = end_ok && ok;
+    }
+    if (ok) {
+        ok = ds4_gpu_tensor_read(
+            stage_capture[0], 0, capture, capture_bytes);
+    }
+    for (uint32_t dim = 0; ok && dim < N_EMBD; dim++) {
+        const float expected =
+            -23.0f + 0.75f +
+            ((float)((int32_t)(dim % 193u) - 96)) * 0.015625f;
+        if (fabsf(capture[dim] - expected) > 1.0e-6f) ok = 0;
+    }
+
+    ds4_gpu_tensor_free(capture_input_short);
+    ds4_gpu_tensor_free(capture_long);
+    ds4_gpu_tensor_free(capture_short);
+    ds4_gpu_tensor_free(capture_alias);
+    for (uint32_t stage = 0; stage < N_STAGE; stage++) {
+        ds4_gpu_tensor_free(stage_capture[stage]);
+        ds4_gpu_tensor_free(stage_source[stage]);
+        ds4_gpu_tensor_free(stage_storage[stage]);
+    }
     ds4_gpu_tensor_free(bad_shape);
     ds4_gpu_tensor_free(undersized);
     ds4_gpu_tensor_free(alias);
     ds4_gpu_tensor_free(mean);
     ds4_gpu_tensor_free(source);
+    pthread_mutex_lock(&g_tensor_mu);
+    ok = g_tensor_alloc_live_bytes == live_bytes_before && ok;
+    pthread_mutex_unlock(&g_tensor_mu);
+    free(capture);
     free(output);
     free(input);
     return ok;
@@ -41941,37 +42437,55 @@ int ds4_gpu_hc_weighted_sum_tensor(
                                              "HC weighted sum");
 }
 
-int ds4_gpu_hc_mean_tensor(
+static int ds4_gpu_hc_mean_rows(
         ds4_gpu_tensor       *out,
         const ds4_gpu_tensor *residual_hc,
-        uint32_t                n_embd,
-        uint32_t                n_hc) {
-    if (!g_initialized && !ds4_gpu_init()) return 0;
-    if (!out || !residual_hc || n_embd == 0 || n_hc == 0 || n_hc > 16u) {
+        uint32_t              n_embd,
+        uint32_t              n_hc,
+        uint64_t              active_tokens,
+        uint64_t              first_token,
+        uint64_t              output_tokens,
+        const char           *label) {
+    if (!out || !residual_hc || n_embd == 0 || n_hc == 0 || n_hc > 16u ||
+        active_tokens == 0 || output_tokens == 0 ||
+        first_token >= active_tokens ||
+        output_tokens > active_tokens - first_token) {
         return 0;
     }
+    if (!g_initialized && !ds4_gpu_init()) return 0;
     @autoreleasepool {
         id<MTLBuffer> xbuf = ds4_gpu_tensor_buffer(residual_hc);
         id<MTLBuffer> outbuf = ds4_gpu_tensor_buffer(out);
         const uint64_t out_row_bytes = (uint64_t)n_embd * sizeof(float);
         const uint64_t out_bytes = ds4_gpu_tensor_bytes(out);
-        if (out_row_bytes == 0 || out_bytes < out_row_bytes ||
-            out_bytes % out_row_bytes != 0) {
+        if (output_tokens > UINT64_MAX / out_row_bytes ||
+            out_bytes != output_tokens * out_row_bytes) {
             fprintf(stderr,
-                    "ds4: Metal DSpark HC mean output size is not a whole token row\n");
+                    "ds4: Metal DSpark HC mean output shape is invalid\n");
             return 0;
         }
-        const uint64_t n_tokens = out_bytes / out_row_bytes;
-        const uint64_t row_values = (uint64_t)n_hc * n_embd;
-        if (n_tokens == 0 || n_tokens > INT64_MAX || row_values == 0 ||
-            row_values > UINT64_MAX / sizeof(float) ||
-            n_tokens > UINT64_MAX / (row_values * sizeof(float))) {
+        if ((uint64_t)n_hc > UINT64_MAX / n_embd) {
             fprintf(stderr, "ds4: Metal DSpark HC mean shape overflows\n");
             return 0;
         }
-        const uint64_t x_bytes = n_tokens * row_values * sizeof(float);
+        const uint64_t row_values = (uint64_t)n_hc * n_embd;
+        if (row_values > UINT64_MAX / sizeof(float)) {
+            fprintf(stderr, "ds4: Metal DSpark HC mean shape overflows\n");
+            return 0;
+        }
+        const uint64_t x_row_bytes = row_values * sizeof(float);
+        if (active_tokens > UINT64_MAX / x_row_bytes ||
+            first_token > UINT64_MAX / x_row_bytes ||
+            output_tokens > UINT64_MAX / x_row_bytes ||
+            output_tokens > INT64_MAX) {
+            fprintf(stderr, "ds4: Metal DSpark HC mean shape overflows\n");
+            return 0;
+        }
+        const uint64_t active_x_bytes = active_tokens * x_row_bytes;
+        const uint64_t first_x_byte = first_token * x_row_bytes;
+        const uint64_t selected_x_bytes = output_tokens * x_row_bytes;
         if (!xbuf || !outbuf ||
-            ds4_gpu_tensor_bytes(residual_hc) < x_bytes) {
+            ds4_gpu_tensor_bytes(residual_hc) < active_x_bytes) {
             fprintf(stderr,
                     "ds4: Metal DSpark HC mean received an undersized activation\n");
             return 0;
@@ -41979,12 +42493,21 @@ int ds4_gpu_hc_mean_tensor(
         if (xbuf == outbuf) {
             const uint64_t x_offset = ds4_gpu_tensor_offset(residual_hc);
             const uint64_t out_offset = ds4_gpu_tensor_offset(out);
-            if (x_offset < out_offset + out_bytes &&
-                out_offset < x_offset + x_bytes) {
+            if (x_offset > UINT64_MAX - active_x_bytes ||
+                out_offset > UINT64_MAX - out_bytes ||
+                (x_offset < out_offset + out_bytes &&
+                 out_offset < x_offset + active_x_bytes)) {
                 fprintf(stderr,
                         "ds4: Metal DSpark HC mean does not permit overlapping input/output\n");
                 return 0;
             }
+        }
+
+        const uint64_t x_offset = ds4_gpu_tensor_offset(residual_hc);
+        if (first_x_byte > NSUIntegerMax - x_offset ||
+            selected_x_bytes > NSUIntegerMax - (x_offset + first_x_byte)) {
+            fprintf(stderr, "ds4: Metal DSpark HC mean input offset overflows\n");
+            return 0;
         }
 
         id<MTLComputePipelineState> pipeline = nil;
@@ -41996,14 +42519,15 @@ int ds4_gpu_hc_mean_tensor(
         const ds4_gpu_hc_mean_args args = {
             .n_embd = n_embd,
             .n_hc = n_hc,
-            .n_tokens = (int64_t)n_tokens,
+            .n_tokens = (int64_t)output_tokens,
             .nb_x0 = sizeof(float),
             .nb_x1 = (uint64_t)n_embd * sizeof(float),
             .nb_x2 = (uint64_t)n_hc * n_embd * sizeof(float),
             .nb0 = sizeof(float),
             .nb1 = (uint64_t)n_embd * sizeof(float),
         };
-        const uint64_t n_elem = (uint64_t)n_embd * n_tokens;
+        if (output_tokens > UINT64_MAX / n_embd) return 0;
+        const uint64_t n_elem = (uint64_t)n_embd * output_tokens;
         if (n_elem > NSUIntegerMax) return 0;
         const NSUInteger nth = MIN((NSUInteger)256,
                                    MAX((NSUInteger)1, (NSUInteger)n_elem));
@@ -42015,15 +42539,192 @@ int ds4_gpu_hc_mean_tensor(
         [enc setComputePipelineState:pipeline];
         [enc setBytes:&args length:sizeof(args) atIndex:0];
         [enc setBuffer:xbuf
-                offset:ds4_gpu_tensor_offset(residual_hc)
+                offset:(NSUInteger)(x_offset + first_x_byte)
                atIndex:1];
         [enc setBuffer:outbuf offset:ds4_gpu_tensor_offset(out) atIndex:2];
         [enc dispatchThreadgroups:MTLSizeMake(n_tg, 1, 1)
              threadsPerThreadgroup:MTLSizeMake(nth, 1, 1)];
         ds4_gpu_end_compute_encoder(cb, enc);
         return ds4_gpu_finish_command_buffer(
-            cb, owned, "DSpark post-layer HC mean");
+            cb, owned, label ? label : "DSpark post-layer HC mean");
     }
+}
+
+int ds4_gpu_hc_mean_tensor(
+        ds4_gpu_tensor       *out,
+        const ds4_gpu_tensor *residual_hc,
+        uint32_t              n_embd,
+        uint32_t              n_hc) {
+    if (!out || n_embd == 0) return 0;
+    const uint64_t out_row_bytes = (uint64_t)n_embd * sizeof(float);
+    const uint64_t out_bytes = ds4_gpu_tensor_bytes(out);
+    if (out_row_bytes == 0 || out_bytes < out_row_bytes ||
+        out_bytes % out_row_bytes != 0) {
+        fprintf(stderr,
+                "ds4: Metal DSpark HC mean output size is not a whole token row\n");
+        return 0;
+    }
+    const uint64_t tokens = out_bytes / out_row_bytes;
+    return ds4_gpu_hc_mean_rows(out, residual_hc, n_embd, n_hc,
+                                tokens, 0, tokens,
+                                "DSpark post-layer HC mean");
+}
+
+/* Reduce one exact 4096-wide DSpark feature row directly into its persistent
+ * current tap. This TU-local helper is the decode hot path used by the public
+ * history update seam; tests exercise it through that seam and local invalid
+ * geometry checks. */
+static int ds4_gpu_dspark_capture_hc_mean_row(
+        ds4_gpu_tensor       *out,
+        const ds4_gpu_tensor *residual_hc,
+        uint32_t              active_tokens,
+        uint32_t              token_index) {
+    enum { DS4_DSPARK_HIDDEN_WIDTH = 4096, DS4_DSPARK_HC_LANES = 4 };
+    return ds4_gpu_hc_mean_rows(
+        out, residual_hc,
+        DS4_DSPARK_HIDDEN_WIDTH, DS4_DSPARK_HC_LANES,
+        active_tokens, token_index, 1,
+        "DSpark post-layer HC capture");
+}
+
+static int ds4_gpu_dspark_history_geometry_valid(
+        uint32_t retained_rows,
+        uint32_t first_physical_row,
+        uint32_t first_rows,
+        uint32_t second_rows) {
+    enum { HISTORY_ROWS = 128 };
+    if (retained_rows == 0 || retained_rows > HISTORY_ROWS ||
+        first_physical_row >= HISTORY_ROWS || first_rows == 0 ||
+        first_rows > retained_rows ||
+        second_rows != retained_rows - first_rows) {
+        return 0;
+    }
+    uint32_t expected_first = HISTORY_ROWS - first_physical_row;
+    if (expected_first > retained_rows) expected_first = retained_rows;
+    return first_rows == expected_first;
+}
+
+int ds4_gpu_dspark_capture_history_tensor(
+        ds4_gpu_tensor       *current,
+        ds4_gpu_tensor       *history,
+        ds4_gpu_tensor       *scratch,
+        const ds4_gpu_tensor *post_layer_hc,
+        uint32_t              active_tokens,
+        uint32_t              input_skip,
+        uint32_t              retained_rows,
+        uint32_t              first_physical_row,
+        uint32_t              first_rows,
+        uint32_t              second_rows) {
+    enum { WIDTH = 4096, HC = 4, HISTORY_ROWS = 128 };
+    const uint64_t row_bytes = (uint64_t)WIDTH * sizeof(float);
+    const uint64_t hc_row_bytes = (uint64_t)HC * row_bytes;
+    const uint64_t history_bytes = (uint64_t)HISTORY_ROWS * row_bytes;
+    if (!current || !history || !post_layer_hc || active_tokens == 0 ||
+        input_skip > active_tokens ||
+        retained_rows != active_tokens - input_skip ||
+        !ds4_gpu_dspark_history_geometry_valid(
+            retained_rows, first_physical_row, first_rows, second_rows) ||
+        ds4_gpu_tensor_bytes(current) != row_bytes ||
+        ds4_gpu_tensor_bytes(history) != history_bytes ||
+        active_tokens > UINT64_MAX / hc_row_bytes ||
+        ds4_gpu_tensor_bytes(post_layer_hc) <
+            (uint64_t)active_tokens * hc_row_bytes ||
+        (active_tokens != 1u &&
+         (!scratch || ds4_gpu_tensor_bytes(scratch) <
+             (uint64_t)retained_rows * row_bytes))) {
+        return 0;
+    }
+
+    ds4_gpu_tensor *selected = NULL;
+    ds4_gpu_tensor *means = NULL;
+    int ok = 0;
+    if (active_tokens == 1u) {
+        ok = input_skip == 0u && retained_rows == 1u &&
+             ds4_gpu_dspark_capture_hc_mean_row(
+                 current, post_layer_hc, 1u, 0u) &&
+             ds4_gpu_tensor_copy(
+                 history, (uint64_t)first_physical_row * row_bytes,
+                 current, 0, row_bytes);
+    } else {
+        selected = ds4_gpu_tensor_view(
+            post_layer_hc, (uint64_t)input_skip * hc_row_bytes,
+            (uint64_t)retained_rows * hc_row_bytes);
+        means = ds4_gpu_tensor_view(
+            scratch, 0, (uint64_t)retained_rows * row_bytes);
+        ok = selected && means &&
+             ds4_gpu_hc_mean_tensor(means, selected, WIDTH, HC) &&
+             ds4_gpu_tensor_copy(
+                 history, (uint64_t)first_physical_row * row_bytes,
+                 means, 0, (uint64_t)first_rows * row_bytes);
+    }
+#ifdef DS4_TEST_HOOKS
+    if (ok && g_dspark_history_test_failure ==
+                  DS4_GPU_DSPARK_HISTORY_TEST_FAIL_CAPTURE_AFTER_FIRST_BLIT) {
+        g_dspark_history_test_failure =
+            DS4_GPU_DSPARK_HISTORY_TEST_FAIL_NONE;
+        ok = 0;
+    }
+#endif
+    if (ok && active_tokens != 1u && second_rows != 0) {
+        ok = ds4_gpu_tensor_copy(
+            history, 0, means, (uint64_t)first_rows * row_bytes,
+            (uint64_t)second_rows * row_bytes);
+    }
+    if (ok && active_tokens != 1u) {
+        ok = ds4_gpu_tensor_copy(
+            current, 0, means,
+            (uint64_t)(retained_rows - 1u) * row_bytes, row_bytes);
+    }
+    ds4_gpu_tensor_free(means);
+    ds4_gpu_tensor_free(selected);
+    return ok;
+}
+
+int ds4_gpu_dspark_publish_history_tensor(
+        ds4_gpu_tensor       *current,
+        ds4_gpu_tensor       *history,
+        const ds4_gpu_tensor *candidate,
+        uint32_t              committed_rows,
+        uint32_t              first_physical_row,
+        uint32_t              first_rows,
+        uint32_t              second_rows) {
+    enum { WIDTH = 4096, HISTORY_ROWS = 128, VERIFY_ROWS = 16 };
+    const uint64_t row_bytes = (uint64_t)WIDTH * sizeof(float);
+    const uint64_t history_bytes = (uint64_t)HISTORY_ROWS * row_bytes;
+    if (!current || !history || !candidate || committed_rows == 0 ||
+        committed_rows > VERIFY_ROWS ||
+        !ds4_gpu_dspark_history_geometry_valid(
+            committed_rows, first_physical_row, first_rows, second_rows) ||
+        ds4_gpu_tensor_bytes(current) != row_bytes ||
+        ds4_gpu_tensor_bytes(history) != history_bytes ||
+        ds4_gpu_tensor_bytes(candidate) <
+            (uint64_t)committed_rows * row_bytes) {
+        return 0;
+    }
+
+    int ok = ds4_gpu_tensor_copy(
+        history, (uint64_t)first_physical_row * row_bytes,
+        candidate, 0, (uint64_t)first_rows * row_bytes);
+#ifdef DS4_TEST_HOOKS
+    if (ok && g_dspark_history_test_failure ==
+                  DS4_GPU_DSPARK_HISTORY_TEST_FAIL_PUBLISH_AFTER_FIRST_BLIT) {
+        g_dspark_history_test_failure =
+            DS4_GPU_DSPARK_HISTORY_TEST_FAIL_NONE;
+        ok = 0;
+    }
+#endif
+    if (ok && second_rows != 0) {
+        ok = ds4_gpu_tensor_copy(
+            history, 0, candidate,
+            (uint64_t)first_rows * row_bytes,
+            (uint64_t)second_rows * row_bytes);
+    }
+    if (ok) {
+        ok = ds4_gpu_tensor_copy(
+            current, 0, candidate,
+            (uint64_t)(committed_rows - 1u) * row_bytes, row_bytes);
+    }
+    return ok;
 }
 
 int ds4_gpu_hc_weighted_sum_split_tensor(

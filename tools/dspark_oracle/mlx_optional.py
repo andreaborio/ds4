@@ -27,6 +27,7 @@ MLX_F32_HC_SPLIT_MAX_ABS_DRIFT = 1.0e-7
 MLX_F32_HC_OUTPUT_MAX_ABS_DRIFT = 5.0e-7
 EXPECTED_MLX_VERSION = "0.32.0"
 EXPECTED_MLX_METAL_VERSION = "0.32.0"
+DSPARK_TARGET_LAYER_IDS = (40, 41, 42)
 
 
 def available() -> bool:
@@ -117,10 +118,52 @@ def post_layer_hc_mean(hidden_states: np.ndarray) -> np.ndarray:
     """Run the exact four-lane DSpark capture primitive on MLX Metal."""
 
     mx = _mlx()
-    hidden = mx.array(np.asarray(hidden_states, dtype=np.float32))
+    source = np.asarray(hidden_states)
+    if source.ndim != 3 or source.shape[0] == 0 or source.shape[1:] != (4, 4096):
+        raise ValueError("hidden_states must have shape [token, 4, 4096]")
+    if not np.all(np.isfinite(source)):
+        raise ValueError("hidden_states must contain only finite values")
+    hidden = mx.array(source.astype(np.float32, copy=False))
     result = mx.mean(hidden, axis=1)
     mx.eval(result)
     return np.asarray(result, dtype=np.float64)
+
+
+def capture_target_hidden_rows(
+    layer_hidden_states: Sequence[np.ndarray],
+    layer_ids: Sequence[int],
+    *,
+    phase: str,
+) -> tuple[np.ndarray, int, np.ndarray]:
+    """Cross-check frontier selection and retained history on MLX."""
+
+    if tuple(layer_ids) != DSPARK_TARGET_LAYER_IDS:
+        raise ValueError("target capture layers must be ordered 40, 41, 42")
+    states = tuple(layer_hidden_states)
+    if len(states) != 3:
+        raise ValueError("target capture requires exactly three layer tensors")
+    reduced = tuple(post_layer_hc_mean(state) for state in states)
+    token_counts = {item.shape[0] for item in reduced}
+    if len(token_counts) != 1:
+        raise ValueError("target capture layers must have the same token count")
+    token_count = next(iter(token_counts))
+    if phase == "decode":
+        if token_count != 1:
+            raise ValueError("decode target capture requires exactly one token row")
+        token_index = 0
+    elif phase == "prefill":
+        token_index = token_count - 1
+    else:
+        raise ValueError("target capture phase must be 'decode' or 'prefill'")
+    history_start = max(0, token_count - 128)
+    history = np.stack(
+        [item[history_start:] for item in reduced], axis=1
+    )
+    return (
+        np.stack([item[token_index] for item in reduced], axis=0),
+        token_index,
+        history,
+    )
 
 
 def main_project_and_norm(

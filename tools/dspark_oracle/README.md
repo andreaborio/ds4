@@ -4,8 +4,8 @@ This directory is a model-free numerical oracle for the DeepSeek V4 Flash 0731
 DSpark work. It does not participate in model loading or inference. Production
 remains the native Hebrus Metal runtime.
 
-The NumPy reference covers the complete model-free DSpark seam: capture of the
-three target hidden rows, stage-zero `main_proj` plus `main_norm`, accepted/noise
+The NumPy reference covers the complete model-free DSpark seam: ordered capture
+after target layers 40/41/42, stage-zero `main_proj` plus `main_norm`, pending/noise
 embedding layout, four-lane Hyper-Connection split/Sinkhorn/post/final-head
 equations, three independent logical raw-cache rings, the sequential Markov
 correction, the per-position confidence cutoff, and speculative-sampling
@@ -28,8 +28,12 @@ multiplied. DeepSpec does use `cumprod` elsewhere, on the binary sampling
 acceptance mask so that tokens after the first rejection cannot be committed;
 that separate operation must not be imported into confidence scheduling.
 
-The vanilla Markov head is sequential: position zero uses the accepted token
-preceding the block, and every later position uses the token sampled at the
+The official token shift is explicit. After target position `p` is evaluated,
+target logits have already sampled pending token `y[p+1]`. DSpark embeds
+`[y[p+1], noise, noise, noise, noise]` at absolute input positions
+`p+1..p+5`; its five head rows propose outputs `p+2..p+6`. It never
+re-predicts `y[p+1]`. The vanilla Markov head is sequential: position zero
+uses that pending token, and every later position uses the token sampled at the
 previous draft position. Sampled verification uses
 `min(1, p(x) / max(q(x), 1e-8))`; on rejection it samples normalized
 `max(p-q, 0)`, falling back to the target row when residual mass is at most
@@ -37,15 +41,28 @@ previous draft position. Sampled verification uses
 target row.
 
 The raw-cache oracle pins the final 0731 semantic geometry to three independent
-`[128, 512]` rings, not a backend allocation. Every stage owns a different ring
-because every stage applies a different `attn_kv` projection to the same
-`main_x`. A proposal sees the committed target window, the current
-target-derived row, and all five draft-derived rows noncausally. Building that
-view is pure: only committing the current target position advances the rings.
-Closed boundary samples cover absolute positions 0, 127, 128, and 129 without
-serializing complete matrices into the fixture. Physical FP8 packing, RoPE
-bytes, and command-buffer ordering remain runtime responsibilities and need
-separate captures.
+`[128, 512]` rings, not a backend allocation. Prompt prefill retains and
+projects every one of the last 128 target capture rows, not just the frontier
+tap. Every stage derives its own context rows directly as
+`kv_norm(Wkv(main_x(t)))`, applies RoPE to the final 64 dimensions at absolute
+position `t`, and FP8-simulates the other 448 dimensions. Target history does
+not pass through the candidate HC-pre or attention-norm path.
+
+When a draft begins, the ring is already committed through position `p`; its
+target-derived `h[p]` row must not be appended a second time. A proposal view
+is therefore committed-through-`p` history plus five transient candidate rows
+for `p+1..p+5`. Building that view is pure. A verifier transaction validates
+all captured target rows before appending every row in its accepted prefix;
+rejected suffixes and zero-row rollback leave the prior ring byte-identical.
+Closed samples cover prompt truncation to 128, wrap, multi-row acceptance, and
+rollback across absolute positions 0, 127, 128, and 129.
+
+The NumPy storage simulation follows the pinned official kernel boundaries:
+BF16 storage around RMSNorm/RoPE, seven 64-wide non-RoPE groups, `amax` floored
+at `1e-4`, UE8M0 power-of-two scale `2^ceil(log2(amax/448))`, E4M3FN clamp and
+nearest-even rounding, dequantization, then BF16 storage. It does not claim to
+reproduce the quantized-weight `Wkv` GEMM or Metal command ordering; those
+still require real runtime captures.
 
 `schema.json` maps the pinned official Hugging Face config to the canonical
 combined-GGUF `dspark.*` records and to the standalone support header, including
@@ -97,9 +114,16 @@ DS4_DSPARK_SUPPORT_GGUF=/path/to/DeepSeek-V4-Flash-0731-DSpark-support.gguf \
   python3 tests/dspark/test_oracle.py
 ```
 
-The capture fixture exercises the production geometry `[3, 4, 4096]`, checks
-that NumPy returns independent `[3, 4096]` storage, and rejects rank, HC-lane,
-and hidden-width aliases instead of silently reshaping an undersized tensor.
+The capture fixture keeps layer, token, HC, and hidden axes separate. Each of
+the three ordered taps is `[token, 4, 4096]`; decode requires exactly one token
+row. A 130-row prompt fixture separately exposes its last frontier tap and its
+complete token-major last-128 history. Only after the four-lane mean does the
+oracle stack layers 40, 41, and 42 into `[3, 4096]`; `main_proj` applies to
+every retained position in that order. Compact generators and closed samples
+avoid serializing those full matrices. The tests reject reordered or
+duplicated layer identities, mismatched token counts, decode batches, wrong
+phases, rank/HC/width aliases, frontier-only prompt seeding, and every pairwise
+stage-zero capture swap.
 
 `mlx_optional.py` can cross-check primitive equations on Apple Silicon when
 `mlx` is installed. Importing the main oracle never imports MLX, and neither
@@ -111,7 +135,7 @@ without MLX remains one explicit optional skip. Device parity uses separate
 absolute drift ceilings for each float32 operation. The Markov matmul ceiling
 is `1e-4` (measured maximum `9.765625e-05`); confidence projection plus sigmoid
 uses `5e-8` (measured maximum `4.42772e-08`); main projection/norm uses `5e-8`
-(measured `1.59703e-08`); HC split uses `1e-7` (measured maximum
+(measured `4.70172e-08`); HC split uses `1e-7` (measured maximum
 `6.64673e-08`); HC mean uses `1e-7` (measured zero); and HC
 reductions/expansion/final-head use `5e-7` (measured maximum `2.54492e-07`).
 HC post uses an explicit four-lane reduction:
@@ -132,19 +156,28 @@ What is validated now:
 
 - GGUF v3 metadata, all 81 tensor names/types/shapes, real-file offset layout,
   and structural size (but not payload identity in this oracle);
-- stage-zero capture concatenation, projection, RMSNorm, and noise layout;
+- stage-zero capture concatenation, projection, RMSNorm, and pending/noise layout;
+- distinct decode/frontier taps plus full last-128 prompt history after the
+  post-HC mean at ordered target layers 40/41/42;
+- direct per-stage context `kv_norm(Wkv(main_x))`, absolute-position RoPE tail,
+  and model-free official non-RoPE FP8 storage simulation;
 - non-degenerate HC split, 20-step Sinkhorn, pre/post, and final-head equations;
 - ordered three-stage topology with one shared immutable `main_x`;
-- transactional three-ring `[128, 512]` raw-cache ownership and wraparound;
+- transactional three-ring `[128, 512]` ownership, accepted multi-row commit,
+  rollback, wraparound, and no duplicate current-frontier row;
+- pending `y[p+1]`, candidate inputs `p+1..p+5`, and proposed outputs
+  `p+2..p+6`;
 - final-head wiring into greedy/sampled sequential Markov and per-position
   confidence;
 - NumPy expected values and MLX 0.32.0 Metal parity on synthetic inputs.
 
 Still requiring real runtime captures:
 
-- target-layer 40/41/42 values and stage-zero `main_x` from the combined model;
+- target-layer 40/41/42 decode and prompt-frontier prefill values, plus the
+  resulting stage-zero `main_x`, from the combined model with real weights;
 - every stage's quantized KV/attention, HC, router, selected experts, and output;
-- physical raw-cache slots across prefill, wrap, skip, acceptance, and rollback;
+- physical raw-cache slots and FP8 bytes across prefill, wrap, skip,
+  acceptance, and rollback;
 - final base/corrected logits and confidence against the real quantized weights;
 - exact greedy/sampled target output, SSD bytes, TPOT, and scheduler economics;
 - independent derivation of the 81-name support inventory directly from the

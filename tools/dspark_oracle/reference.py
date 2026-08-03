@@ -51,6 +51,40 @@ class StageSetup:
 
 
 @dataclass(frozen=True)
+class TargetCaptureRows:
+    """The frontier tap and retained target history consumed by DSpark."""
+
+    layer_ids: tuple[int, int, int]
+    phase: str
+    token_index: int
+    absolute_token_position: int
+    rows: np.ndarray
+    history_token_start: int
+    history_rows: np.ndarray
+
+
+@dataclass(frozen=True)
+class ProposalTokenLayout:
+    """Pending target token, DSpark input positions, and output positions."""
+
+    pending_token_id: int
+    input_token_ids: np.ndarray
+    input_positions: np.ndarray
+    proposed_output_positions: np.ndarray
+
+
+@dataclass(frozen=True)
+class StageContextKV:
+    """Direct target-derived DSpark context KV and its storage simulation."""
+
+    absolute_positions: np.ndarray
+    normalized: np.ndarray
+    roped: np.ndarray
+    stored: np.ndarray
+    nonrope_scales: np.ndarray
+
+
+@dataclass(frozen=True)
 class StageChain:
     """Outputs of three ordered synthetic stages sharing one main input."""
 
@@ -95,6 +129,7 @@ RESIDUAL_MASS_FLOOR = 1.0e-8
 DSPARK_STAGE_COUNT = 3
 DSPARK_RAW_CACHE_WINDOW = 128
 DSPARK_RAW_CACHE_WIDTH = 512
+DSPARK_TARGET_LAYER_IDS = (40, 41, 42)
 
 
 def post_layer_hc_mean(hidden_states: np.ndarray) -> np.ndarray:
@@ -114,6 +149,118 @@ def post_layer_hc_mean(hidden_states: np.ndarray) -> np.ndarray:
     if not np.all(np.isfinite(hidden)):
         raise ValueError("hidden_states must contain only finite values")
     return np.mean(hidden, axis=1)
+
+
+def capture_target_hidden_rows(
+    layer_hidden_states: Sequence[np.ndarray],
+    layer_ids: Sequence[int],
+    *,
+    phase: str,
+    start_position: int = 0,
+) -> TargetCaptureRows:
+    """Capture the frontier tap and the retained target prompt history.
+
+    Inputs are three graph taps in execution order, one after each of target
+    layers 40, 41, and 42.  Every tap uses ``[token, 4, 4096]`` and is reduced
+    across the four HC lanes.  ``rows`` is only the frontier tap used to start
+    the next draft.  ``history_rows`` is token-major and retains every row from
+    the newest 128 target positions; official prompt setup projects all of
+    those rows into each stage's context KV rather than projecting only the
+    frontier row.
+    """
+
+    ids = tuple(layer_ids)
+    if ids != DSPARK_TARGET_LAYER_IDS:
+        raise ValueError("target capture layers must be ordered 40, 41, 42")
+    states = tuple(layer_hidden_states)
+    if len(states) != DSPARK_STAGE_COUNT:
+        raise ValueError("target capture requires exactly three layer tensors")
+    reduced = tuple(post_layer_hc_mean(state) for state in states)
+    token_counts = {item.shape[0] for item in reduced}
+    if len(token_counts) != 1:
+        raise ValueError("target capture layers must have the same token count")
+    token_count = next(iter(token_counts))
+    if (isinstance(start_position, bool) or
+            not isinstance(start_position, (int, np.integer)) or
+            start_position < 0):
+        raise ValueError("start_position must be a non-negative integer")
+    if phase == "decode":
+        if token_count != 1:
+            raise ValueError("decode target capture requires exactly one token row")
+        token_index = 0
+    elif phase == "prefill":
+        token_index = token_count - 1
+    else:
+        raise ValueError("target capture phase must be 'decode' or 'prefill'")
+    retained = min(token_count, DSPARK_RAW_CACHE_WINDOW)
+    history_start_index = token_count - retained
+    history_rows = np.stack(
+        [item[history_start_index:] for item in reduced], axis=1
+    )
+    rows = np.stack(
+        [item[token_index] for item in reduced], axis=0
+    )
+    return TargetCaptureRows(
+        DSPARK_TARGET_LAYER_IDS,
+        phase,
+        token_index,
+        int(start_position) + token_index,
+        np.array(rows, copy=True),
+        int(start_position) + history_start_index,
+        np.array(history_rows, copy=True),
+    )
+
+
+def proposal_token_layout(
+    last_target_position: int,
+    pending_token_id: int,
+    noise_token_id: int,
+    *,
+    block_size: int = 5,
+) -> ProposalTokenLayout:
+    """Declare the official shift between target output and DSpark rows.
+
+    After target position ``p`` is evaluated, the sampled token ``y[p+1]`` is
+    pending.  DSpark embeds ``[y[p+1], noise, noise, noise, noise]`` at absolute
+    input positions ``p+1 .. p+5``.  Its five head rows propose outputs for
+    ``p+2 .. p+6``; it does not re-predict the pending target token.
+    """
+
+    for value, name in (
+        (last_target_position, "last_target_position"),
+        (pending_token_id, "pending_token_id"),
+        (noise_token_id, "noise_token_id"),
+    ):
+        if (isinstance(value, bool) or
+                not isinstance(value, (int, np.integer)) or value < 0):
+            raise ValueError(f"{name} must be a non-negative integer")
+    if block_size != 5:
+        raise ValueError("final 0731 requires block_size=5")
+    input_ids = np.full(block_size, int(noise_token_id), dtype=np.int64)
+    input_ids[0] = int(pending_token_id)
+    first = int(last_target_position) + 1
+    return ProposalTokenLayout(
+        int(pending_token_id),
+        input_ids,
+        np.arange(first, first + block_size, dtype=np.int64),
+        np.arange(first + 1, first + block_size + 1, dtype=np.int64),
+    )
+
+
+def concatenate_target_captures(target_hidden: np.ndarray) -> np.ndarray:
+    """Flatten target rows in the only accepted order: 40, then 41, then 42."""
+
+    target = np.asarray(target_hidden, dtype=np.float64)
+    if target.ndim < 2 or target.shape[-2] != DSPARK_STAGE_COUNT:
+        raise ValueError("target_hidden must have exactly three capture stages")
+    if target.shape[-1] == 0:
+        raise ValueError("target_hidden must have a non-empty hidden dimension")
+    if not np.all(np.isfinite(target)):
+        raise ValueError("target_hidden must be finite")
+    return np.array(
+        target.reshape(*target.shape[:-2], DSPARK_STAGE_COUNT * target.shape[-1]),
+        copy=True,
+    )
 
 
 def rms_norm(
@@ -153,22 +300,169 @@ def main_project_and_norm(
     target = np.asarray(target_hidden, dtype=np.float64)
     project = _float_matrix(projection, "main projection")
     weights = np.asarray(norm_weight, dtype=np.float64)
-    if target.ndim < 2 or target.shape[-2] != 3:
+    if target.ndim < 2 or target.shape[-2] != DSPARK_STAGE_COUNT:
         raise ValueError("target_hidden must have exactly three capture stages")
     hidden = target.shape[-1]
     if project.shape != (hidden, 3 * hidden):
         raise ValueError("main projection must have shape [hidden, 3 * hidden]")
     if weights.shape != (hidden,):
         raise ValueError("main norm weight must have shape [hidden]")
-    if not np.all(np.isfinite(target)):
-        raise ValueError("target_hidden must be finite")
-    flattened = target.reshape(*target.shape[:-2], 3 * hidden)
+    flattened = concatenate_target_captures(target)
     return rms_norm(flattened @ project.T, weights, eps=eps)
+
+
+def _round_bfloat16(value: np.ndarray) -> np.ndarray:
+    """Round finite float32 values to BF16, returned as float32 storage."""
+
+    result = np.asarray(value, dtype=np.float32)
+    if not np.all(np.isfinite(result)):
+        raise ValueError("BF16 simulation requires finite values")
+    bits = np.array(result, copy=True).view(np.uint32)
+    rounding = np.uint32(0x7FFF) + ((bits >> np.uint32(16)) & np.uint32(1))
+    rounded = (bits + rounding) & np.uint32(0xFFFF0000)
+    return rounded.view(np.float32)
+
+
+def _e4m3fn_positive_values() -> tuple[np.ndarray, np.ndarray]:
+    values: list[float] = []
+    codes: list[int] = []
+    for code in range(127):
+        exponent = code >> 3
+        mantissa = code & 7
+        if exponent == 0:
+            value = mantissa * (2.0 ** -9)
+        else:
+            value = (1.0 + mantissa / 8.0) * (2.0 ** (exponent - 7))
+        values.append(value)
+        codes.append(code)
+    return np.asarray(values, dtype=np.float64), np.asarray(codes, dtype=np.int64)
+
+
+_E4M3FN_POSITIVE_VALUES, _E4M3FN_POSITIVE_CODES = _e4m3fn_positive_values()
+
+
+def _round_float8_e4m3fn(value: np.ndarray) -> np.ndarray:
+    """Round finite values to IEEE-like E4M3FN using nearest-even ties."""
+
+    source = np.asarray(value, dtype=np.float64)
+    if not np.all(np.isfinite(source)):
+        raise ValueError("FP8 simulation requires finite values")
+    magnitude = np.minimum(np.abs(source), 448.0)
+    upper = np.searchsorted(_E4M3FN_POSITIVE_VALUES, magnitude, side="left")
+    upper = np.minimum(upper, _E4M3FN_POSITIVE_VALUES.size - 1)
+    lower = np.maximum(upper - 1, 0)
+    low_distance = magnitude - _E4M3FN_POSITIVE_VALUES[lower]
+    high_distance = _E4M3FN_POSITIVE_VALUES[upper] - magnitude
+    use_upper = high_distance < low_distance
+    ties = high_distance == low_distance
+    use_upper |= ties & ((_E4M3FN_POSITIVE_CODES[upper] & 1) == 0)
+    indices = np.where(use_upper, upper, lower)
+    rounded = _E4M3FN_POSITIVE_VALUES[indices]
+    return np.copysign(rounded, source)
+
+
+def _simulate_official_nope_fp8(value: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """Simulate official in-place E4M3FN Q/DQ over seven 64-wide groups."""
+
+    rows = np.asarray(value, dtype=np.float32)
+    if rows.ndim != 2 or rows.shape[1] != 448:
+        raise ValueError("non-RoPE KV must have shape [token, 448]")
+    grouped = rows.reshape(rows.shape[0], 7, 64)
+    amax = np.maximum(np.max(np.abs(grouped), axis=2), np.float32(1.0e-4))
+    # Pinned scale_fmt=ue8m0 rounds amax/448 upward to an exact power of two.
+    scales = np.exp2(np.ceil(np.log2(amax / np.float32(448.0)))).astype(
+        np.float32
+    )
+    quantized = _round_float8_e4m3fn(
+        grouped.astype(np.float64) / scales[..., None].astype(np.float64)
+    )
+    dequantized = _round_bfloat16(
+        quantized.astype(np.float32) * scales[..., None]
+    )
+    return dequantized.reshape(rows.shape), scales
+
+
+def direct_stage_context_kv(
+    main_x: np.ndarray,
+    projection: np.ndarray,
+    norm_weight: Sequence[float] | np.ndarray,
+    absolute_positions: Sequence[int] | np.ndarray,
+    *,
+    eps: float = 1.0e-6,
+    rope_theta: float = 10000.0,
+) -> StageContextKV:
+    """Project official target history directly into one stage's context KV.
+
+    This models ``kv_norm(Wkv(main_x))`` for all supplied target positions.
+    The last 64 of 512 dimensions receive RoPE at their absolute positions;
+    the first 448 are then quantize/dequantize simulated in seven 64-wide
+    E4M3FN groups with UE8M0 power-of-two scales.  The returned arrays expose
+    each boundary so a candidate path that incorrectly applies HC-pre or
+    attention norm to target history cannot satisfy the fixture.
+
+    NumPy cannot reproduce the quantized-weight GEMM that creates ``Wkv``.
+    It does reproduce the official post-linear BF16 storage boundaries, RoPE,
+    E4M3FN clamp/nearest-even conversion, and in-place BF16 dequantization.
+    """
+
+    main = _float_matrix(main_x, "main_x")
+    project = _float_matrix(projection, "context KV projection")
+    weights = np.asarray(norm_weight, dtype=np.float32)
+    positions = _token_vector(absolute_positions, "absolute_positions")
+    if project.shape != (DSPARK_RAW_CACHE_WIDTH, main.shape[1]):
+        raise ValueError("context KV projection must have shape [512, hidden]")
+    if weights.shape != (DSPARK_RAW_CACHE_WIDTH,):
+        raise ValueError("context KV norm weight must have shape [512]")
+    if positions.shape[0] != main.shape[0] or np.any(positions < 0):
+        raise ValueError("absolute_positions must be non-negative and match main_x")
+    if not np.all(np.isfinite(weights)):
+        raise ValueError("context KV norm weight must be finite")
+    if not np.isfinite(float(eps)) or eps <= 0.0:
+        raise ValueError("context KV norm epsilon must be finite and positive")
+    if not np.isfinite(float(rope_theta)) or rope_theta <= 0.0:
+        raise ValueError("rope_theta must be finite and positive")
+
+    projected = _round_bfloat16(main @ project.T)
+    projected_f32 = projected.astype(np.float32)
+    variance = np.mean(
+        np.square(projected_f32), axis=-1, keepdims=True, dtype=np.float32
+    )
+    normalized = _round_bfloat16(
+        projected_f32
+        * (np.float32(1.0) / np.sqrt(variance + np.float32(eps)))
+        * weights
+    )
+
+    roped = np.array(normalized, copy=True)
+    tail = roped[:, -64:].reshape(roped.shape[0], 32, 2).astype(np.float32)
+    frequency = np.float32(1.0) / np.power(
+        np.float32(rope_theta),
+        np.arange(0, 64, 2, dtype=np.float32) / np.float32(64.0),
+        dtype=np.float32,
+    )
+    angles = positions.astype(np.float32)[:, None] * frequency[None, :]
+    cosine = np.cos(angles).astype(np.float32)
+    sine = np.sin(angles).astype(np.float32)
+    first = tail[..., 0] * cosine - tail[..., 1] * sine
+    second = tail[..., 0] * sine + tail[..., 1] * cosine
+    tail[..., 0] = first
+    tail[..., 1] = second
+    roped[:, -64:] = _round_bfloat16(tail.reshape(roped.shape[0], 64))
+
+    stored = np.array(roped, copy=True)
+    stored[:, :-64], scales = _simulate_official_nope_fp8(stored[:, :-64])
+    return StageContextKV(
+        np.array(positions, copy=True),
+        normalized.astype(np.float64),
+        roped.astype(np.float64),
+        stored.astype(np.float64),
+        scales.astype(np.float64),
+    )
 
 
 def prepare_stage_zero(
     target_hidden: np.ndarray,
-    accepted_embedding: Sequence[float] | np.ndarray,
+    pending_embedding: Sequence[float] | np.ndarray,
     noise_embedding: Sequence[float] | np.ndarray,
     main_projection: np.ndarray,
     main_norm_weight: Sequence[float] | np.ndarray,
@@ -177,7 +471,12 @@ def prepare_stage_zero(
     hc_lanes: int = 4,
     eps: float = 1.0e-6,
 ) -> StageSetup:
-    """Build the exact DSpark stage-zero inputs for one proposal block."""
+    """Build stage zero from the pending target token plus four noise rows.
+
+    ``pending_embedding`` belongs to ``y[p+1]`` sampled by target logits after
+    evaluating position ``p``.  It is not an already accepted draft token and
+    DSpark does not predict it again.
+    """
 
     if block_size != 5 or hc_lanes != 4:
         raise ValueError("final 0731 requires block_size=5 and hc_lanes=4")
@@ -186,14 +485,14 @@ def prepare_stage_zero(
     )
     if main_hidden.ndim != 1:
         raise ValueError("stage-zero setup expects one target position")
-    accepted = np.asarray(accepted_embedding, dtype=np.float64)
+    pending = np.asarray(pending_embedding, dtype=np.float64)
     noise = np.asarray(noise_embedding, dtype=np.float64)
-    if accepted.shape != main_hidden.shape or noise.shape != main_hidden.shape:
-        raise ValueError("accepted/noise embeddings must match hidden width")
-    if not np.all(np.isfinite(accepted)) or not np.all(np.isfinite(noise)):
-        raise ValueError("accepted/noise embeddings must be finite")
+    if pending.shape != main_hidden.shape or noise.shape != main_hidden.shape:
+        raise ValueError("pending/noise embeddings must match hidden width")
+    if not np.all(np.isfinite(pending)) or not np.all(np.isfinite(noise)):
+        raise ValueError("pending/noise embeddings must be finite")
     draft = np.repeat(noise[None, :], block_size, axis=0)
-    draft[0] = accepted
+    draft[0] = pending
     draft_hidden = np.repeat(draft[:, None, :], hc_lanes, axis=1)
     return StageSetup(main_hidden, draft_hidden)
 
@@ -611,7 +910,7 @@ def conditional_confidence(
 
 def finalize_draft_head(
     final_hc: np.ndarray,
-    first_previous_token: int,
+    pending_token_id: int,
     output_projection: np.ndarray,
     norm_weight: Sequence[float] | np.ndarray,
     hc_function: np.ndarray,
@@ -628,8 +927,10 @@ def finalize_draft_head(
     """Evaluate the final DSpark head with sequential Markov feedback.
 
     Confidence consumes the HC-collapsed hidden rows before the final RMSNorm,
-    paired with W1 embeddings of ``[accepted, draft[0], ...]``.  Base logits
+    paired with W1 embeddings of ``[y[p+1], draft[0], ...]``.  Base logits
     consume the same rows after RMSNorm and the shared target output matrix.
+    The first Markov correction therefore consumes the pending target token;
+    the five returned tokens correspond to outputs ``p+2 .. p+6``.
     """
 
     collapsed = hc_head(
@@ -648,12 +949,12 @@ def finalize_draft_head(
     base_logits = rms_norm(collapsed, norm_weight, eps=norm_eps) @ output.T
     tokens, corrected = markov_greedy_draft(
         base_logits,
-        first_previous_token,
+        pending_token_id,
         markov_embedding,
         markov_projection,
     )
     previous = np.concatenate((
-        np.asarray([first_previous_token], dtype=np.int64),
+        np.asarray([pending_token_id], dtype=np.int64),
         tokens[:-1],
     ))
     confidence = conditional_confidence(
@@ -807,25 +1108,24 @@ def logical_raw_cache(state: RawCacheState) -> np.ndarray:
 def proposal_raw_cache_view(
     state: RawCacheState,
     token_position: int,
-    current_main_rows: np.ndarray,
     draft_rows: np.ndarray,
 ) -> np.ndarray:
-    """Expose context + current target row + noncausal draft rows per stage.
+    """Expose committed-through-``p`` context plus five candidate rows.
 
     The returned proposal view is temporary and does not mutate the committed
-    rings.  This models the production invariant that rejection/abandonment of
-    a proposal cannot advance support-cache ownership.
+    rings.  ``token_position`` is the first candidate input position ``p+1``;
+    the target-derived row for ``p`` is already in ``state``.  Supplying it a
+    second time would duplicate the frontier, which is the historical antirez
+    behavior rather than the pinned official model.  Rejection or abandonment
+    of a proposal cannot advance cache ownership.
     """
 
     _validate_raw_cache_state(state)
     if (isinstance(token_position, bool) or
             not isinstance(token_position, (int, np.integer))):
         raise ValueError("token_position must be an integer")
-    current = np.asarray(current_main_rows, dtype=np.float64)
     draft = np.asarray(draft_rows, dtype=np.float64)
     width = state.rows.shape[2]
-    if current.shape != (DSPARK_STAGE_COUNT, width):
-        raise ValueError("current_main_rows must have shape [3, 512]")
     if (
         draft.ndim != 3
         or draft.shape[0] != DSPARK_STAGE_COUNT
@@ -836,12 +1136,61 @@ def proposal_raw_cache_view(
         raise ValueError("final 0731 proposal raw cache requires five draft rows")
     if token_position != state.token_start + state.length:
         raise ValueError("proposal position must equal committed cache end")
-    if not np.all(np.isfinite(current)) or not np.all(np.isfinite(draft)):
+    if not np.all(np.isfinite(draft)):
         raise ValueError("proposal raw-cache rows must be finite")
     committed = logical_raw_cache(state)
-    return np.concatenate(
-        (committed, current[:, None, :], draft), axis=1
-    )
+    return np.concatenate((committed, draft), axis=1)
+
+
+def commit_raw_cache_transaction(
+    state: RawCacheState,
+    start_position: int,
+    target_stage_rows: np.ndarray,
+    accepted_rows: int,
+) -> RawCacheState:
+    """Atomically append every accepted target-derived verifier row.
+
+    The complete candidate batch is validated before a private copy is
+    changed.  Only its accepted prefix is appended in absolute-position order;
+    rejected rows remain transient.  Zero accepted rows is an explicit
+    rollback.  This oracle models cache ownership, not token acceptance: the
+    caller supplies rows captured from the authoritative target verifier.
+    """
+
+    _validate_raw_cache_state(state)
+    rows = np.asarray(target_stage_rows, dtype=np.float64)
+    if (
+        rows.ndim != 3
+        or rows.shape[1:] != (DSPARK_STAGE_COUNT, DSPARK_RAW_CACHE_WIDTH)
+    ):
+        raise ValueError("target_stage_rows must have shape [token, 3, 512]")
+    if not np.all(np.isfinite(rows)):
+        raise ValueError("target_stage_rows must be finite")
+    if (isinstance(start_position, bool) or
+            not isinstance(start_position, (int, np.integer)) or
+            start_position < 0):
+        raise ValueError("start_position must be a non-negative integer")
+    if (isinstance(accepted_rows, bool) or
+            not isinstance(accepted_rows, (int, np.integer)) or
+            accepted_rows < 0 or accepted_rows > rows.shape[0]):
+        raise ValueError("accepted_rows must select a valid target-row prefix")
+    expected = state.token_start + state.length
+    if int(start_position) != expected:
+        raise ValueError(
+            f"transaction start {start_position} does not follow {expected}"
+        )
+    if accepted_rows == 0:
+        return state
+
+    storage = np.array(state.rows, copy=True)
+    token_start = state.token_start
+    length = state.length
+    for offset in range(int(accepted_rows)):
+        position = int(start_position) + offset
+        storage[:, position % state.capacity, :] = rows[offset]
+        length = min(length + 1, state.capacity)
+        token_start = position - length + 1
+    return RawCacheState(state.capacity, token_start, length, storage)
 
 
 def _probability_matrix(value: object, name: str) -> np.ndarray:

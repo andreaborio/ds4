@@ -600,8 +600,8 @@ def main() -> int:
             "DSpark post-layer capture contract is missing", inspect_result,
         )
         require(
-            "dspark cache-plan: target_floor=259 support_floor=19 "
-            "combined_floor=278" in output and
+            "dspark cache-plan: target_floor=259 support_floor=31 "
+            "combined_floor=290" in output and
             "ownership=separate target_only_extra_records=0 "
             "implementation=fail-closed" in output,
             "DSpark cache floor/quota contract is missing", inspect_result,

@@ -19292,7 +19292,13 @@ static DS4_MAYBE_UNUSED bool qwen35_gpu_forward_token(
  * tensor names follow the model stages rather than generic graph nodes.
  */
 
-enum { DS4_STREAMING_PREFILL_CACHE_SEED_MAX_TOKENS = 64 };
+enum {
+    DS4_STREAMING_PREFILL_CACHE_SEED_MAX_TOKENS = 64,
+    /* The existing speculative target verifier and logits scratch are bounded
+     * to 16 rows.  Combined DSpark sessions retain the same bound for the
+     * candidate post-layer captures until the CPU accepts an exact prefix. */
+    DS4_DSPARK_VERIFY_CAPTURE_MAX_ROWS = 16,
+};
 
 typedef struct {
     /* One-token decode tensors.  These stay allocated for the life of a
@@ -19391,6 +19397,21 @@ typedef struct {
     ds4_gpu_tensor *output_embd;
     ds4_gpu_tensor *output_norm;
     ds4_gpu_tensor *logits;
+
+    /* Optional DSpark input seam.  dspark_capture owns the current published
+     * row for each selected target layer; dspark_history owns the matching
+     * 128-token device ring.  A speculative verifier first writes candidate
+     * rows to dspark_verify_capture, then appends only the accepted prefix to
+     * history and publishes its final row. */
+    ds4_gpu_tensor *dspark_capture[DS4_DSPARK_CAPTURE_STAGE_COUNT];
+    ds4_gpu_tensor *dspark_history[DS4_DSPARK_CAPTURE_STAGE_COUNT];
+    ds4_gpu_tensor *dspark_verify_capture[DS4_DSPARK_CAPTURE_STAGE_COUNT];
+    ds4_dspark_capture_state dspark_capture_state;
+    ds4_dspark_capture_state dspark_verify_capture_state;
+    ds4_dspark_history_state dspark_history_state;
+    bool dspark_verify_capture_active;
+    uint32_t dspark_verify_capture_rows;
+    uint64_t dspark_verify_capture_start;
 
     /* Optional MTP model state.  It has its own raw cache because the drafter
      * runs on speculative future tokens; target KV state is updated only after
@@ -19516,8 +19537,361 @@ static void graph_power_note_decode_token(ds4_gpu_graph *g, double elapsed_sec) 
     graph_power_sleep(g->decode_token_avg_sec, g->power_percent);
 }
 
+static void metal_graph_dspark_capture_invalidate(ds4_gpu_graph *g) {
+    if (!g) return;
+    ds4_dspark_capture_state_invalidate(&g->dspark_capture_state);
+    ds4_dspark_capture_state_invalidate(&g->dspark_verify_capture_state);
+    ds4_dspark_history_state_invalidate(&g->dspark_history_state);
+    g->dspark_verify_capture_active = false;
+    g->dspark_verify_capture_rows = 0;
+    g->dspark_verify_capture_start = 0;
+}
+
+static void metal_graph_dspark_verify_capture_abort(ds4_gpu_graph *g) {
+    if (!g) return;
+    ds4_dspark_capture_state_invalidate(&g->dspark_verify_capture_state);
+    g->dspark_verify_capture_active = false;
+    g->dspark_verify_capture_rows = 0;
+    g->dspark_verify_capture_start = 0;
+}
+
+static bool metal_graph_dspark_capture_begin(
+        ds4_gpu_graph *g,
+        uint64_t       start,
+        uint32_t       rows) {
+    if (!g) return false;
+    if (!g->dspark_capture_state.enabled) return true;
+    if (rows == 0 || start > UINT64_MAX - rows ||
+        !ds4_dspark_history_state_begin(
+            &g->dspark_history_state, start, rows) ||
+        !ds4_dspark_capture_state_begin(
+            &g->dspark_capture_state, start + rows)) {
+        fprintf(stderr,
+                "ds4: DSpark capture/history generation is active, discontiguous, or invalid\n");
+        metal_graph_dspark_capture_invalidate(g);
+        return false;
+    }
+    return true;
+}
+
+/* Reduce only the retained suffix of a normal target forward, append it to
+ * each 128-row history ring, and publish its last row as the current tap.
+ * Decode writes the mean directly into the current tap and copies it once to
+ * the ring.  Multi-row prefill reuses batch_attn_cur after the layer FFN; that
+ * scratch is dead until the next layer and is large enough for the at-most-128
+ * reduced rows, so no additional prefill-sized allocation is needed. */
+static bool metal_graph_dspark_capture_after_layer(
+        ds4_gpu_graph  *g,
+        uint32_t        layer,
+        ds4_gpu_tensor *post_layer_hc,
+        uint32_t        active_tokens,
+        uint32_t        token_index) {
+    if (!g) return false;
+    if (!g->dspark_capture_state.enabled) return true;
+
+    bool capture_current = false;
+    bool capture_history = false;
+    uint32_t current_slot = UINT32_MAX;
+    uint32_t history_slot = UINT32_MAX;
+    if (!ds4_dspark_capture_state_reserve_after_layer(
+            &g->dspark_capture_state, layer,
+            &capture_current, &current_slot) ||
+        !ds4_dspark_history_state_reserve_after_layer(
+            &g->dspark_history_state, layer,
+            &capture_history, &history_slot) ||
+        capture_current != capture_history || current_slot != history_slot) {
+        fprintf(stderr,
+                "ds4: DSpark current/history order rejected target layer %u\n",
+                layer);
+        return false;
+    }
+    if (!capture_current) return true;
+
+    ds4_dspark_history_append_plan plan;
+    if (active_tokens == 0 || token_index != active_tokens - 1u ||
+        active_tokens != g->dspark_history_state.pending_rows ||
+        !ds4_dspark_history_append_plan_make(
+            g->dspark_history_state.pending_start,
+            active_tokens, &plan) ||
+        plan.retained_rows == 0 ||
+        current_slot >= DS4_DSPARK_CAPTURE_STAGE_COUNT) {
+        fprintf(stderr,
+                "ds4: invalid DSpark history capture row geometry at layer %u\n",
+                layer);
+        return false;
+    }
+
+    bool ok = ds4_gpu_dspark_capture_history_tensor(
+        g->dspark_capture[current_slot],
+        g->dspark_history[current_slot],
+        g->batch_attn_cur,
+        post_layer_hc,
+        active_tokens,
+        plan.input_skip,
+        plan.retained_rows,
+        plan.first_physical_row,
+        plan.first_rows,
+        plan.second_rows) != 0;
+    /* Device bytes may have been partially overwritten if the helper failed.
+     * Commit metadata only after full device success; every caller then closes
+     * the enclosing forward with capture_finish(false), which invalidates both
+     * current and history readiness. */
+    if (ok) {
+        ok = ds4_dspark_capture_state_commit_slot(
+                 &g->dspark_capture_state, current_slot) &&
+             ds4_dspark_history_state_commit_slot(
+                 &g->dspark_history_state, history_slot);
+    }
+    if (!ok) {
+        fprintf(stderr,
+                "ds4: failed to encode DSpark current/history after target layer %u\n",
+                layer);
+    }
+    return ok;
+}
+
+static bool metal_graph_dspark_capture_finish(
+        ds4_gpu_graph *g,
+        bool           forward_succeeded) {
+    if (!g) return false;
+    if (!g->dspark_capture_state.enabled) return forward_succeeded;
+    const bool current_ready = ds4_dspark_capture_state_finish(
+        &g->dspark_capture_state, forward_succeeded);
+    const bool history_ready = ds4_dspark_history_state_finish(
+        &g->dspark_history_state, forward_succeeded);
+    const uint64_t frontier = g->dspark_history_state.frontier;
+    const bool coherent = current_ready && history_ready &&
+        ds4_dspark_capture_state_ready_at(
+            &g->dspark_capture_state, frontier) &&
+        ds4_dspark_history_state_current_ready_at(
+            &g->dspark_history_state, frontier);
+    if (!coherent) {
+        if (forward_succeeded) {
+            fprintf(stderr,
+                    "ds4: target forward completed without coherent DSpark current/history state\n");
+        }
+        metal_graph_dspark_capture_invalidate(g);
+    }
+    return forward_succeeded && coherent;
+}
+
+/* A speculative target verifier computes several possible continuation rows
+ * before the CPU knows how much of the suffix is accepted.  Keep those rows
+ * separate from published state: all accepted rows are appended to history,
+ * while only the final accepted row becomes the current DSpark tap. */
+static bool metal_graph_dspark_verify_capture_begin(
+        ds4_gpu_graph *g,
+        uint64_t       start,
+        uint32_t       n_rows) {
+    if (!g) return false;
+    if (!g->dspark_verify_capture_state.enabled) return true;
+
+    const uint64_t row_bytes =
+        (uint64_t)DS4_DSPARK_CAPTURE_WIDTH * sizeof(float);
+    const uint64_t scratch_bytes =
+        (uint64_t)DS4_DSPARK_VERIFY_CAPTURE_MAX_ROWS * row_bytes;
+    if (g->dspark_verify_capture_active ||
+        g->dspark_verify_capture_state.in_progress ||
+        g->dspark_capture_state.in_progress ||
+        g->dspark_history_state.in_progress || n_rows == 0 ||
+        n_rows > DS4_DSPARK_VERIFY_CAPTURE_MAX_ROWS ||
+        start > UINT64_MAX - n_rows) {
+        fprintf(stderr,
+                "ds4: invalid DSpark speculative capture transaction\n");
+        return false;
+    }
+    for (uint32_t stage = 0;
+         stage < DS4_DSPARK_CAPTURE_STAGE_COUNT; stage++) {
+        if (!g->dspark_capture[stage] ||
+            ds4_gpu_tensor_bytes(g->dspark_capture[stage]) != row_bytes ||
+            !g->dspark_verify_capture[stage] ||
+            ds4_gpu_tensor_bytes(g->dspark_verify_capture[stage]) !=
+                scratch_bytes) {
+            fprintf(stderr,
+                    "ds4: invalid DSpark speculative capture row storage\n");
+            return false;
+        }
+    }
+
+    const uint64_t end = start + n_rows;
+    if (end == 0 ||
+        !ds4_dspark_capture_state_begin(
+            &g->dspark_verify_capture_state, end)) {
+        fprintf(stderr,
+                "ds4: failed to begin DSpark speculative capture generation\n");
+        return false;
+    }
+    g->dspark_verify_capture_active = true;
+    g->dspark_verify_capture_rows = n_rows;
+    g->dspark_verify_capture_start = start;
+    return true;
+}
+
+static bool metal_graph_dspark_verify_capture_after_layer_batch(
+        ds4_gpu_graph  *g,
+        uint32_t        layer,
+        ds4_gpu_tensor *post_layer_hc,
+        uint32_t        n_rows) {
+    if (!g) return false;
+    if (!g->dspark_verify_capture_state.enabled) return true;
+    const uint64_t row_bytes =
+        (uint64_t)DS4_DSPARK_CAPTURE_WIDTH * sizeof(float);
+    const uint64_t hc_row_bytes =
+        (uint64_t)DS4_N_HC * DS4_DSPARK_CAPTURE_WIDTH * sizeof(float);
+    if (!g->dspark_verify_capture_active || n_rows == 0 ||
+        n_rows != g->dspark_verify_capture_rows ||
+        n_rows > DS4_DSPARK_VERIFY_CAPTURE_MAX_ROWS || !post_layer_hc ||
+        ds4_gpu_tensor_bytes(post_layer_hc) < (uint64_t)n_rows * hc_row_bytes) {
+        fprintf(stderr,
+                "ds4: invalid DSpark speculative batch capture row geometry\n");
+        return false;
+    }
+
+    bool capture = false;
+    uint32_t slot = UINT32_MAX;
+    if (!ds4_dspark_capture_state_reserve_after_layer(
+            &g->dspark_verify_capture_state, layer, &capture, &slot)) {
+        fprintf(stderr,
+                "ds4: DSpark speculative batch capture rejected layer %u\n",
+                layer);
+        return false;
+    }
+    if (!capture) return true;
+    if (slot >= DS4_DSPARK_CAPTURE_STAGE_COUNT ||
+        !g->dspark_verify_capture[slot]) {
+        return false;
+    }
+
+    ds4_gpu_tensor *rows = ds4_gpu_tensor_view(
+        g->dspark_verify_capture[slot], 0, (uint64_t)n_rows * row_bytes);
+    const bool ok = rows && ds4_gpu_tensor_bytes(rows) ==
+                              (uint64_t)n_rows * row_bytes &&
+                    ds4_gpu_hc_mean_tensor(rows,
+                                           post_layer_hc,
+                                           DS4_DSPARK_CAPTURE_WIDTH,
+                                           DS4_N_HC) != 0 &&
+                    ds4_dspark_capture_state_commit_slot(
+                        &g->dspark_verify_capture_state, slot);
+    ds4_gpu_tensor_free(rows);
+    if (!ok) {
+        fprintf(stderr,
+                "ds4: failed DSpark speculative batch capture after layer %u\n",
+                layer);
+    }
+    return ok;
+}
+
+static bool metal_graph_dspark_verify_capture_publish(
+        ds4_gpu_graph *g,
+        uint32_t       committed_rows,
+        uint64_t       frontier) {
+    if (!g) return false;
+    if (!g->dspark_verify_capture_state.enabled) return true;
+
+    const uint8_t complete =
+        (uint8_t)((1u << DS4_DSPARK_CAPTURE_STAGE_COUNT) - 1u);
+    if (!g->dspark_verify_capture_active || committed_rows == 0 ||
+        committed_rows > g->dspark_verify_capture_rows ||
+        g->dspark_verify_capture_rows > DS4_DSPARK_VERIFY_CAPTURE_MAX_ROWS ||
+        g->dspark_verify_capture_start > UINT64_MAX - committed_rows ||
+        frontier != g->dspark_verify_capture_start + committed_rows ||
+        frontier == 0 || !g->dspark_verify_capture_state.in_progress ||
+        g->dspark_verify_capture_state.completed_mask != complete ||
+        g->dspark_verify_capture_state.pending_frontier !=
+            g->dspark_verify_capture_start +
+                g->dspark_verify_capture_rows) {
+        fprintf(stderr,
+                "ds4: rejected inconsistent DSpark speculative capture commit\n");
+        metal_graph_dspark_capture_invalidate(g);
+        return false;
+    }
+
+    ds4_dspark_history_append_plan plan;
+    if (!ds4_dspark_history_append_plan_make(
+            g->dspark_verify_capture_start, committed_rows, &plan) ||
+        plan.input_skip != 0 || plan.retained_rows != committed_rows ||
+        !ds4_dspark_history_state_begin(
+            &g->dspark_history_state,
+            g->dspark_verify_capture_start, committed_rows) ||
+        !ds4_dspark_capture_state_begin(
+            &g->dspark_capture_state, frontier)) {
+        fprintf(stderr,
+                "ds4: failed to begin committed DSpark history publication\n");
+        metal_graph_dspark_capture_invalidate(g);
+        return false;
+    }
+
+    bool ok = ds4_gpu_begin_commands() != 0;
+    for (uint32_t stage = 0;
+         ok && stage < DS4_DSPARK_CAPTURE_STAGE_COUNT; stage++) {
+        bool capture_current = false;
+        bool capture_history = false;
+        uint32_t current_slot = UINT32_MAX;
+        uint32_t history_slot = UINT32_MAX;
+        ok = ds4_dspark_capture_state_reserve_after_layer(
+                 &g->dspark_capture_state,
+                 DS4_DSPARK_CAPTURE_CONTRACT.target_layer[stage],
+                 &capture_current, &current_slot) &&
+             ds4_dspark_history_state_reserve_after_layer(
+                 &g->dspark_history_state,
+                 DS4_DSPARK_CAPTURE_CONTRACT.target_layer[stage],
+                 &capture_history, &history_slot) &&
+             capture_current && capture_history &&
+             current_slot == stage && history_slot == stage &&
+             g->dspark_capture[stage] &&
+             g->dspark_history[stage] &&
+             g->dspark_verify_capture[stage];
+        if (ok) {
+            ok = ds4_gpu_dspark_publish_history_tensor(
+                     g->dspark_capture[stage],
+                     g->dspark_history[stage],
+                     g->dspark_verify_capture[stage],
+                     committed_rows,
+                     plan.first_physical_row,
+                     plan.first_rows,
+                     plan.second_rows) != 0 &&
+                 /* As above, stage ownership follows device success. */
+                 ds4_dspark_capture_state_commit_slot(
+                     &g->dspark_capture_state, current_slot) &&
+                 ds4_dspark_history_state_commit_slot(
+                     &g->dspark_history_state, history_slot);
+        }
+    }
+    if (ok) ok = ds4_gpu_end_commands() != 0;
+    else (void)ds4_gpu_synchronize();
+    if (!ok) {
+        fprintf(stderr,
+                "ds4: failed to publish committed DSpark speculative capture row\n");
+        metal_graph_dspark_capture_invalidate(g);
+        return false;
+    }
+
+    const bool current_ready = ds4_dspark_capture_state_finish(
+        &g->dspark_capture_state, true);
+    const bool history_ready = ds4_dspark_history_state_finish(
+        &g->dspark_history_state, true);
+    metal_graph_dspark_verify_capture_abort(g);
+    if (!current_ready || !history_ready ||
+        !ds4_dspark_capture_state_ready_at(
+            &g->dspark_capture_state, frontier) ||
+        !ds4_dspark_history_state_current_ready_at(
+            &g->dspark_history_state, frontier)) {
+        fprintf(stderr,
+                "ds4: committed DSpark speculative current/history did not become ready\n");
+        metal_graph_dspark_capture_invalidate(g);
+        return false;
+    }
+    return true;
+}
+
 /* Release every Metal tensor owned by the whole-model graph runtime. */
 static void metal_graph_free(ds4_gpu_graph *g) {
+    for (uint32_t stage = 0;
+         stage < DS4_DSPARK_CAPTURE_STAGE_COUNT; stage++) {
+        ds4_gpu_tensor_free(g->dspark_verify_capture[stage]);
+        ds4_gpu_tensor_free(g->dspark_history[stage]);
+        ds4_gpu_tensor_free(g->dspark_capture[stage]);
+    }
     ds4_gpu_tensor_free(g->directional_steering_dirs);
     ds4_gpu_tensor_free(g->batch_ffn_out);
     ds4_gpu_tensor_free(g->batch_routed_out);
@@ -19946,9 +20320,14 @@ static bool metal_graph_alloc_raw_cap(
         uint32_t                raw_cap,
         uint32_t                ctx_size,
         uint32_t                prefill_cap,
-        bool                    enable_mtp) {
+        bool                    enable_mtp,
+        bool                    enable_dspark) {
     memset(g, 0, sizeof(*g));
     g->mtp_enabled = enable_mtp;
+    ds4_dspark_capture_state_init(&g->dspark_capture_state, enable_dspark);
+    ds4_dspark_capture_state_init(
+        &g->dspark_verify_capture_state, enable_dspark);
+    ds4_dspark_history_state_init(&g->dspark_history_state, enable_dspark);
     if (raw_cap == 0) raw_cap = 1;
     if (ctx_size == 0) ctx_size = raw_cap;
     if (prefill_cap == 0) prefill_cap = 1;
@@ -20127,6 +20506,19 @@ static bool metal_graph_alloc_raw_cap(
     g->output_embd = ds4_gpu_tensor_alloc((uint64_t)DS4_N_EMBD * sizeof(float));
     g->output_norm = ds4_gpu_tensor_alloc((uint64_t)DS4_N_EMBD * sizeof(float));
     g->logits = ds4_gpu_tensor_alloc(vocab_dim * sizeof(float));
+    if (enable_dspark) {
+        for (uint32_t stage = 0;
+             stage < DS4_DSPARK_CAPTURE_STAGE_COUNT; stage++) {
+            g->dspark_capture[stage] = ds4_gpu_tensor_alloc(
+                (uint64_t)DS4_DSPARK_CAPTURE_WIDTH * sizeof(float));
+            g->dspark_history[stage] = ds4_gpu_tensor_alloc(
+                (uint64_t)DS4_DSPARK_HISTORY_ROWS *
+                DS4_DSPARK_CAPTURE_WIDTH * sizeof(float));
+            g->dspark_verify_capture[stage] = ds4_gpu_tensor_alloc(
+                (uint64_t)DS4_DSPARK_VERIFY_CAPTURE_MAX_ROWS *
+                DS4_DSPARK_CAPTURE_WIDTH * sizeof(float));
+        }
+    }
     /*
      * MTP is deliberately outside the normal graph footprint.  A session that
      * does not opt in with --mtp must allocate and execute exactly the same
@@ -20240,6 +20632,15 @@ static bool metal_graph_alloc_raw_cap(
                     g->after_ffn_hc &&
                     g->output_pre && g->output_weights && g->output_embd &&
                     g->output_norm && g->logits &&
+                    (!enable_dspark ||
+                     (g->dspark_capture[0] && g->dspark_capture[1] &&
+                      g->dspark_capture[2] &&
+                      g->dspark_history[0] &&
+                      g->dspark_history[1] &&
+                      g->dspark_history[2] &&
+                      g->dspark_verify_capture[0] &&
+                      g->dspark_verify_capture[1] &&
+                      g->dspark_verify_capture[2])) &&
                     (!enable_mtp ||
                      (g->mtp_embed && g->mtp_enorm && g->mtp_eproj &&
                       g->mtp_eproj_hc && g->mtp_hnorm_hc && g->mtp_hproj_hc &&
@@ -20272,7 +20673,8 @@ static bool metal_graph_alloc(
         ds4_gpu_graph *g,
         const ds4_weights     *weights,
         const ds4_layer_weights *layer) {
-    return metal_graph_alloc_raw_cap(g, weights, layer, DS4_N_SWA, DS4_N_SWA, 1, false);
+    return metal_graph_alloc_raw_cap(
+        g, weights, layer, DS4_N_SWA, DS4_N_SWA, 1, false, false);
 }
 
 static bool metal_graph_install_model_spans(
@@ -25401,6 +25803,10 @@ static bool metal_graph_encode_token_raw_swa(
         ds4_gpu_tensor *tmp = g->cur_hc;
         g->cur_hc = g->after_ffn_hc;
         g->after_ffn_hc = tmp;
+        if (ok) {
+            ok = metal_graph_dspark_capture_after_layer(
+                g, il, g->cur_hc, 1u, 0u);
+        }
         if (ok && allow_split_flush && split_after_layers != 0 && il + 1u == split_after_layers) {
             ok = ds4_gpu_flush_commands() != 0;
         }
@@ -27921,10 +28327,13 @@ static bool metal_graph_eval_token_raw_swa_streaming(
         int                    token,
         uint32_t               pos,
         float                 *logits) {
+    if (!g) return false;
     if (g->raw_cap == 0) {
         fprintf(stderr, "ds4: Metal graph raw KV cache is not allocated\n");
+        metal_graph_dspark_capture_invalidate(g);
         return false;
     }
+    if (!metal_graph_dspark_capture_begin(g, pos, 1u)) return false;
 
     const bool profile = getenv("DS4_METAL_GRAPH_TOKEN_PROFILE") != NULL;
     const bool throttle = graph_power_throttle_enabled(g);
@@ -27978,6 +28387,10 @@ static bool metal_graph_eval_token_raw_swa_streaming(
                 g->cur_hc = g->after_ffn_hc;
                 g->after_ffn_hc = tmp;
             }
+            if (ok) {
+                ok = metal_graph_dspark_capture_after_layer(
+                    g, il, g->cur_hc, 1u, 0u);
+            }
         }
         if (ok && logits) {
             ok = metal_graph_encode_output_head(g, model, weights, weights->output->dim[1]);
@@ -28007,7 +28420,7 @@ static bool metal_graph_eval_token_raw_swa_streaming(
                 fprintf(stderr, "ds4: Metal synchronize after batched SSD streaming graph eval failure also failed\n");
             }
         }
-        return ok;
+        return metal_graph_dspark_capture_finish(g, ok);
     }
     if (ok) ok = ds4_gpu_end_commands() != 0;
 
@@ -28043,6 +28456,10 @@ static bool metal_graph_eval_token_raw_swa_streaming(
             ds4_gpu_tensor *tmp = g->cur_hc;
             g->cur_hc = g->after_ffn_hc;
             g->after_ffn_hc = tmp;
+        }
+        if (ok) {
+            ok = metal_graph_dspark_capture_after_layer(
+                g, il, g->cur_hc, 1u, 0u);
         }
         const double tl_encoded = profile ? now_sec() : 0.0;
         if (ok) ok = ds4_gpu_end_commands() != 0;
@@ -28085,7 +28502,7 @@ static bool metal_graph_eval_token_raw_swa_streaming(
             fprintf(stderr, "ds4: Metal synchronize after SSD streaming graph eval failure also failed\n");
         }
     }
-    return ok;
+    return metal_graph_dspark_capture_finish(g, ok);
 }
 
 /* Execute one Metal decode token and read back logits. */
@@ -28099,6 +28516,8 @@ static bool metal_graph_eval_token_raw_swa(
     if (g && g->ssd_streaming) {
         return metal_graph_eval_token_raw_swa_streaming(g, model, weights, token, pos, logits);
     }
+
+    if (!metal_graph_dspark_capture_begin(g, pos, 1u)) return false;
 
     const bool profile = getenv("DS4_METAL_GRAPH_TOKEN_PROFILE") != NULL;
     const bool throttle = graph_power_throttle_enabled(g);
@@ -28130,7 +28549,7 @@ static bool metal_graph_eval_token_raw_swa(
             fprintf(stderr, "ds4: Metal synchronize after graph eval failure also failed\n");
         }
     }
-    return ok;
+    return metal_graph_dspark_capture_finish(g, ok);
 }
 
 static bool metal_graph_streaming_decode_prefill_wide_default(
@@ -28214,9 +28633,13 @@ static bool metal_graph_prefill_decode_streaming_range(
         ds4_session_cancel_fn  cancel,
         void                  *cancel_ud,
         bool                  *cancelled) {
+    if (g && start == 0) metal_graph_dspark_capture_invalidate(g);
     if (!metal_graph_use_streaming_decode_prefill(g, weights, n_tokens)) return false;
     if (!prompt || start > (uint32_t)prompt->len ||
-        n_tokens > (uint32_t)prompt->len - start) return false;
+        n_tokens > (uint32_t)prompt->len - start) {
+        metal_graph_dspark_capture_invalidate(g);
+        return false;
+    }
     if (start == 0) {
         ds4_gpu_stream_expert_cache_reset_route_hotness();
     }
@@ -28235,25 +28658,31 @@ static bool metal_graph_prefill_decode_streaming_range(
         display_progress(display_progress_ud, "prefill_display", (int)start, prompt->len);
     }
 
+    uint32_t completed_tokens = 0;
     for (uint32_t i = 0; i < n_tokens; i++) {
         if (cancel && cancel(cancel_ud)) {
             if (cancelled) *cancelled = true;
+            if (completed_tokens != 0) {
+                metal_graph_dspark_capture_invalidate(g);
+            }
             return true;
         }
         const uint32_t pos = start + i;
         const bool last = i + 1u == n_tokens;
         float *token_logits = (last && logits) ? logits : NULL;
-        if (!metal_graph_eval_token_raw_swa(g,
-                                            model,
-                                            weights,
-                                            prompt->v[pos],
-                                            pos,
-                                            token_logits)) {
+        const bool token_ok = metal_graph_eval_token_raw_swa(g,
+                                                             model,
+                                                             weights,
+                                                             prompt->v[pos],
+                                                             pos,
+                                                             token_logits);
+        if (!token_ok) {
             if (ds4_gpu_synchronize() == 0) {
                 fprintf(stderr, "ds4: Metal synchronize after decode-style streaming prefill failure also failed\n");
             }
             return false;
         }
+        completed_tokens++;
 
         if (last && progress && logits) {
             progress(progress_ud, "prefill_chunk", (int)(pos + 1u), prompt->len);
@@ -28263,6 +28692,7 @@ static bool metal_graph_prefill_decode_streaming_range(
         }
         if (cancel && cancel(cancel_ud)) {
             if (cancelled) *cancelled = true;
+            metal_graph_dspark_capture_invalidate(g);
             return true;
         }
         if (show_progress) {
@@ -28554,6 +28984,7 @@ static bool metal_graph_eval_token_raw_swa_top(
         int                   *top_id,
         float                 *logits) {
     if (!top_id) return false;
+    if (!metal_graph_dspark_capture_begin(g, pos, 1u)) return false;
 
     bool ok = ds4_gpu_begin_commands() != 0;
     if (ok) ok = metal_graph_encode_token_raw_swa(g, model, weights,
@@ -28573,7 +29004,7 @@ static bool metal_graph_eval_token_raw_swa_top(
             fprintf(stderr, "ds4: Metal synchronize after top-only graph eval failure also failed\n");
         }
     }
-    return ok;
+    return metal_graph_dspark_capture_finish(g, ok);
 }
 
 static bool metal_graph_eval_mtp_draft_from_hc(
@@ -28930,6 +29361,7 @@ static bool imatrix_collector_save(
 }
 
 static bool metal_graph_reset_prefill_state(ds4_gpu_graph *g) {
+    metal_graph_dspark_capture_invalidate(g);
     memset(g->layer_n_comp, 0, sizeof(g->layer_n_comp));
     memset(g->layer_n_index_comp, 0, sizeof(g->layer_n_index_comp));
     g->mtp_n_raw = 0;
@@ -28980,18 +29412,30 @@ static bool metal_graph_prefill_layer_major(
         ds4_imatrix_collector *imatrix,
         ds4_session_progress_fn display_progress,
         void                  *display_progress_ud) {
-    if (n_tokens == 0 || n_tokens > g->prefill_cap) return false;
-    if (start > (uint32_t)prompt->len) return false;
-    if (n_tokens > (uint32_t)prompt->len - start) return false;
+    if (!g) return false;
+    if (start == 0) metal_graph_dspark_capture_invalidate(g);
+    if (!prompt || n_tokens == 0 || n_tokens > g->prefill_cap ||
+        start > (uint32_t)prompt->len ||
+        n_tokens > (uint32_t)prompt->len - start) {
+        metal_graph_dspark_capture_invalidate(g);
+        return false;
+    }
 
     if (display_progress)
         display_progress(display_progress_ud, "prefill_display", (int)start, prompt->len);
 
     bool ok = metal_graph_upload_prompt_tokens(g->prefill_tokens, prompt, start, n_tokens);
-    if (!ok) return false;
+    if (!ok) {
+        metal_graph_dspark_capture_invalidate(g);
+        return false;
+    }
 
 
-    if (!metal_graph_warmup_prefill_kernels(g, model, weights, n_tokens)) return false;
+    if (!metal_graph_warmup_prefill_kernels(g, model, weights, n_tokens)) {
+        metal_graph_dspark_capture_invalidate(g);
+        return false;
+    }
+    if (!metal_graph_dspark_capture_begin(g, start, n_tokens)) return false;
 
     const bool split_profile = getenv("DS4_METAL_GRAPH_PREFILL_SPLIT_PROFILE") != NULL;
     /*
@@ -29027,6 +29471,10 @@ static bool metal_graph_prefill_layer_major(
                                                 il,
                                                 start,
                                                 n_tokens);
+            if (ok) {
+                ok = metal_graph_dspark_capture_after_layer(
+                    g, il, g->batch_cur_hc, n_tokens, n_tokens - 1u);
+            }
             if (!ok) {
                 fprintf(stderr, "ds4: gpu whole-prefill layer %u encode failed\n", il);
             }
@@ -29071,6 +29519,7 @@ static bool metal_graph_prefill_layer_major(
             if (ds4_gpu_synchronize() == 0) {
                 fprintf(stderr, "ds4: Metal synchronize after whole-prefill graph failure also failed\n");
             }
+            (void)metal_graph_dspark_capture_finish(g, false);
             return false;
         }
 
@@ -29088,12 +29537,15 @@ static bool metal_graph_prefill_layer_major(
                     (t_read - t_before_read) * 1000.0,
                     (t_read - t0) * 1000.0);
         }
-        return ok;
+        return metal_graph_dspark_capture_finish(g, ok);
     }
 
     if (g->ssd_streaming) {
         g->streaming_static_decode_map_current = false;
-        if (!metal_graph_stream_map_token(model, weights)) return false;
+        if (!metal_graph_stream_map_token(model, weights)) {
+            (void)metal_graph_dspark_capture_finish(g, false);
+            return false;
+        }
     }
     metal_graph_stream_prefill_selected_profile_reset(g);
     metal_graph_stream_prepare_slot layer_prepare_slots[DS4_STREAM_PREFILL_MAX_PREPARE_AHEAD];
@@ -29131,6 +29583,7 @@ static bool metal_graph_prefill_layer_major(
                                                             batch_selected_addr,
                                                             layer_prepare_slots,
                                                             layer_prepare_ahead)) {
+                (void)metal_graph_dspark_capture_finish(g, false);
                 return false;
             }
         } else {
@@ -29170,6 +29623,7 @@ static bool metal_graph_prefill_layer_major(
         if (ds4_gpu_synchronize() == 0) {
             fprintf(stderr, "ds4: Metal synchronize after layer-major prefill embed failure also failed\n");
         }
+        (void)metal_graph_dspark_capture_finish(g, false);
         return false;
     }
 
@@ -29268,6 +29722,10 @@ static bool metal_graph_prefill_layer_major(
                 g->batch_cur_hc = g->batch_next_hc;
                 g->batch_next_hc = tmp;
             }
+            if (ok) {
+                ok = metal_graph_dspark_capture_after_layer(
+                    g, il, g->batch_cur_hc, n_tokens, n_tokens - 1u);
+            }
             if (ok) ok = metal_graph_capture_prefill_seed_router_selected(g,
                                                                           il,
                                                                           n_tokens);
@@ -29302,6 +29760,10 @@ static bool metal_graph_prefill_layer_major(
                                                         il,
                                                         start,
                                                         n_tokens);
+            if (ok) {
+                ok = metal_graph_dspark_capture_after_layer(
+                    g, il, g->batch_cur_hc, n_tokens, n_tokens - 1u);
+            }
             if (!ok) {
                 fprintf(stderr, "ds4: gpu layer-major prefill layer %u encode failed\n", il);
             }
@@ -29360,6 +29822,7 @@ static bool metal_graph_prefill_layer_major(
             if (ds4_gpu_synchronize() == 0) {
                 fprintf(stderr, "ds4: Metal synchronize after layer-major prefill failure also failed\n");
             }
+            (void)metal_graph_dspark_capture_finish(g, false);
             return false;
         }
         graph_power_note_prefill_layer(g, il, layer_elapsed);
@@ -29382,14 +29845,17 @@ static bool metal_graph_prefill_layer_major(
         if (ds4_gpu_synchronize() == 0) {
             fprintf(stderr, "ds4: Metal synchronize after layer-major prefill failure also failed\n");
         }
+        (void)metal_graph_dspark_capture_finish(g, false);
         return false;
     }
     if (show_progress) fputc('\n', stderr);
     metal_graph_stream_prefill_selected_profile_summary(g);
     if (!metal_graph_seed_streaming_expert_cache_from_hotlist(g, model, weights)) {
+        (void)metal_graph_dspark_capture_finish(g, false);
         return false;
     }
     if (!metal_graph_seed_streaming_expert_cache_from_prefill(g, model, weights)) {
+        (void)metal_graph_dspark_capture_finish(g, false);
         return false;
     }
 
@@ -29437,7 +29903,10 @@ static bool metal_graph_prefill_layer_major(
     const double t_head_done = profile ? now_sec() : 0.0;
     g->cur_hc = saved_cur;
     if (last_hc) ds4_gpu_tensor_free(last_hc);
-    if (!ok) return false;
+    if (!ok) {
+        (void)metal_graph_dspark_capture_finish(g, false);
+        return false;
+    }
 
     const double t_before_read = profile ? now_sec() : 0.0;
     if (logits) {
@@ -29461,7 +29930,7 @@ static bool metal_graph_prefill_layer_major(
                 (t_read - t_before_read) * 1000.0,
                 (t_read - t0) * 1000.0);
     }
-    return ok;
+    return metal_graph_dspark_capture_finish(g, ok);
 }
 
 static bool metal_graph_prefill_raw_swa(
@@ -29477,8 +29946,11 @@ static bool metal_graph_prefill_raw_swa(
         ds4_session_cancel_fn  cancel,
         void                  *cancel_ud,
         bool                  *cancelled) {
-    if (n_tokens <= 0 || n_tokens > prompt->len) return false;
-    if ((uint32_t)n_tokens > g->prefill_cap) return false;
+    if (g) metal_graph_dspark_capture_invalidate(g);
+    if (!g || !prompt || n_tokens <= 0 || n_tokens > prompt->len ||
+        (uint32_t)n_tokens > g->prefill_cap) {
+        return false;
+    }
     if (metal_graph_use_streaming_decode_prefill_range(g, weights, 0,
                                                        (uint32_t)n_tokens)) {
         return metal_graph_prefill_decode_streaming_range(g,
@@ -29543,9 +30015,14 @@ static bool metal_graph_prefill_chunked_range(
         ds4_session_cancel_fn  cancel,
         void                  *cancel_ud,
         bool                  *cancelled) {
-    if (n_tokens == 0 || g->prefill_cap == 0) return false;
-    if (start > (uint32_t)prompt->len) return false;
-    if (n_tokens > (uint32_t)prompt->len - start) return false;
+    if (!g) return false;
+    if (start == 0) metal_graph_dspark_capture_invalidate(g);
+    if (!prompt || n_tokens == 0 || g->prefill_cap == 0 ||
+        start > (uint32_t)prompt->len ||
+        n_tokens > (uint32_t)prompt->len - start) {
+        metal_graph_dspark_capture_invalidate(g);
+        return false;
+    }
     if (g->ssd_streaming && start == 0) {
         ds4_gpu_stream_expert_cache_reset_route_hotness();
     }
@@ -29571,7 +30048,10 @@ static bool metal_graph_prefill_chunked_range(
 
     uint32_t chunk_cap = g->prefill_cap;
     if (start != 0 && chunk_cap > g->raw_cap) chunk_cap = g->raw_cap;
-    if (chunk_cap == 0) return false;
+    if (chunk_cap == 0) {
+        metal_graph_dspark_capture_invalidate(g);
+        return false;
+    }
 
     const bool profile = getenv("DS4_METAL_GRAPH_PREFILL_PROFILE") != NULL;
     const double t0 = profile ? now_sec() : 0.0;
@@ -29660,7 +30140,10 @@ static bool metal_graph_prefill_chunked(
         ds4_session_cancel_fn  cancel,
         void                  *cancel_ud,
         bool                  *cancelled) {
-    if (n_tokens <= 0) return false;
+    if (n_tokens <= 0) {
+        metal_graph_dspark_capture_invalidate(g);
+        return false;
+    }
     return metal_graph_prefill_chunked_range(g,
                                              model,
                                              weights,
@@ -29699,10 +30182,23 @@ static bool metal_graph_verify_suffix_tops(
         bool                   capture_prefix1,
         int                   *row_tops,
         float                 *row_logits) {
-    if (n_tokens == 0 || n_tokens > g->prefill_cap || !g->spec_logits) return false;
-    if (start > (uint32_t)prompt->len || n_tokens > (uint32_t)prompt->len - start) return false;
+    if (!g) return false;
+    if (!model || !weights || !weights->output || n_tokens == 0 ||
+        n_tokens > g->prefill_cap ||
+        n_tokens > DS4_DSPARK_VERIFY_CAPTURE_MAX_ROWS || !g->spec_logits) {
+        metal_graph_dspark_capture_invalidate(g);
+        return false;
+    }
+    if (!prompt || start > (uint32_t)prompt->len ||
+        n_tokens > (uint32_t)prompt->len - start) {
+        metal_graph_dspark_capture_invalidate(g);
+        return false;
+    }
     const uint32_t top_rows = n_tokens > 1 ? n_tokens - 1 : 0;
-    if (top_rows && !row_tops) return false;
+    if (top_rows && !row_tops) {
+        metal_graph_dspark_capture_invalidate(g);
+        return false;
+    }
 
     bool ok = metal_graph_upload_prompt_tokens(g->prefill_tokens, prompt, start, n_tokens);
     if (ok) ok = metal_graph_upload_prompt_embeddings_hc(g->batch_cur_hc,
@@ -29712,7 +30208,14 @@ static bool metal_graph_verify_suffix_tops(
                                                          prompt,
                                                          start,
                                                          n_tokens);
-    if (!ok) return false;
+    if (!ok) {
+        metal_graph_dspark_capture_invalidate(g);
+        return false;
+    }
+    if (!metal_graph_dspark_verify_capture_begin(g, start, n_tokens)) {
+        metal_graph_dspark_capture_invalidate(g);
+        return false;
+    }
 
     const bool saved_capture = g->spec_capture_prefix1;
     g->spec_capture_prefix1 = capture_prefix1 && n_tokens == 2;
@@ -29725,11 +30228,18 @@ static bool metal_graph_verify_suffix_tops(
                                             il,
                                             start,
                                             n_tokens);
+        if (ok) {
+            ok = metal_graph_dspark_verify_capture_after_layer_batch(
+                g, il, g->batch_cur_hc, n_tokens);
+        }
     }
     if (ok) ok = ds4_gpu_end_commands() != 0;
     else (void)ds4_gpu_synchronize();
     g->spec_capture_prefix1 = saved_capture;
-    if (!ok) return false;
+    if (!ok) {
+        metal_graph_dspark_capture_invalidate(g);
+        return false;
+    }
 
     ok = ds4_gpu_begin_commands() != 0;
     if (ok) ok = metal_graph_encode_output_head_batch(g,
@@ -29770,6 +30280,7 @@ static bool metal_graph_verify_suffix_tops(
                                    row_logits,
                                    (uint64_t)n_tokens * DS4_N_VOCAB * sizeof(row_logits[0])) != 0;
     }
+    if (!ok) metal_graph_dspark_capture_invalidate(g);
     return ok;
 }
 
@@ -29800,13 +30311,20 @@ static bool metal_graph_verify_decode2_exact(
         int                   *top0,
         float                 *logits0,
         float                 *logits1) {
-    if (!g || !top0 || !logits1 || g->raw_cap == 0) return false;
+    if (!g) return false;
+    if (!model || !weights || !weights->output || !top0 || !logits1 ||
+        g->raw_cap == 0) {
+        metal_graph_dspark_capture_invalidate(g);
+        return false;
+    }
 
     const uint64_t hc_dim = (uint64_t)DS4_N_HC * DS4_N_EMBD;
     ds4_gpu_tensor *cur0 = metal_graph_tensor_row_view(g->batch_cur_hc, 0, hc_dim);
     ds4_gpu_tensor *cur1 = metal_graph_tensor_row_view(g->batch_cur_hc, 1, hc_dim);
     ds4_gpu_tensor *next0 = metal_graph_tensor_row_view(g->batch_next_hc, 0, hc_dim);
     ds4_gpu_tensor *next1 = metal_graph_tensor_row_view(g->batch_next_hc, 1, hc_dim);
+    ds4_gpu_tensor *next_pair_hc = g->batch_next_hc;
+    ds4_gpu_tensor *cur_pair_hc = g->batch_cur_hc;
     bool ok = cur0 && cur1 && next0 && next1;
 
     if (ok) ok = ds4_gpu_embed_token_hc_tensor(cur0,
@@ -29825,6 +30343,7 @@ static bool metal_graph_verify_decode2_exact(
                                                   (uint32_t)token1,
                                                   DS4_N_EMBD,
                                                   DS4_N_HC) != 0;
+    if (ok) ok = metal_graph_dspark_verify_capture_begin(g, start, 2u);
 
     ds4_gpu_tensor *saved_cur = g->cur_hc;
     ds4_gpu_tensor *saved_after = g->after_ffn_hc;
@@ -29865,9 +30384,13 @@ static bool metal_graph_verify_decode2_exact(
                                              metal_graph_raw_span_for_batch(g, pos1, 1),
                                              token1);
         if (!ok) break;
+        ok = metal_graph_dspark_verify_capture_after_layer_batch(
+            g, il, next_pair_hc, 2u);
+        if (!ok) break;
 
         ds4_gpu_tensor *tmp = cur0; cur0 = next0; next0 = tmp;
         tmp = cur1; cur1 = next1; next1 = tmp;
+        tmp = cur_pair_hc; cur_pair_hc = next_pair_hc; next_pair_hc = tmp;
     }
     if (ok) ok = ds4_gpu_end_commands() != 0;
     else (void)ds4_gpu_synchronize();
@@ -29911,6 +30434,7 @@ static bool metal_graph_verify_decode2_exact(
     g->cur_hc = saved_cur;
     g->after_ffn_hc = saved_after;
     g->spec_capture_prefix1 = saved_capture;
+    if (!ok) metal_graph_dspark_capture_invalidate(g);
 
     ds4_gpu_tensor_free(next1);
     ds4_gpu_tensor_free(next0);
@@ -30321,7 +30845,8 @@ static int metal_graph_prompt_logits_test(
 
     ds4_gpu_graph g;
     bool ok = metal_graph_alloc_raw_cap(&g, weights, &weights->layer[0],
-                                        raw_cap, (uint32_t)ctx_size, (uint32_t)n_test, false);
+                                        raw_cap, (uint32_t)ctx_size,
+                                        (uint32_t)n_test, false, false);
     if (!ok) {
         metal_graph_free(&g);
         fprintf(stderr, "ds4: failed to initialize Metal graph prompt test runtime\n");
@@ -34307,7 +34832,9 @@ static int generate_metal_graph_raw_swa(
     }
     ds4_gpu_graph g;
     bool ok = metal_graph_alloc_raw_cap(&g, weights, &weights->layer[0],
-                                        raw_cap, (uint32_t)ctx_size, prefill_cap, false);
+                                        raw_cap, (uint32_t)ctx_size,
+                                        prefill_cap, false,
+                                        model->native_dspark_store_v2);
     if (!ok) {
         fprintf(stderr, "ds4: failed to allocate GPU graph runtime\n");
         return 1;
@@ -36081,6 +36608,11 @@ int ds4_session_load_payload(ds4_session *s, FILE *fp, uint64_t payload_bytes, c
     return 1;
 #else
     ds4_gpu_graph *g = &s->graph;
+    /* DSpark history is intentionally not part of the current checkpoint
+     * payload.  Any load attempt drops its device-only lineage before parsing
+     * or mutating target KV state; later decode can rebuild a complete suffix
+     * after 128 contiguous rows. */
+    metal_graph_dspark_capture_invalidate(g);
     const uint32_t saved_ctx = h[2];
     const uint32_t saved_prefill_cap = h[3];
     const uint32_t saved_raw_cap = h[4];
@@ -36472,7 +37004,8 @@ int ds4_engine_collect_imatrix(ds4_engine *e,
 
     ds4_gpu_graph g;
     bool ok = metal_graph_alloc_raw_cap(&g, weights, &weights->layer[0],
-                                        raw_cap, (uint32_t)ctx_size, prefill_cap, false);
+                                        raw_cap, (uint32_t)ctx_size,
+                                        prefill_cap, false, false);
     if (!ok) {
         fprintf(stderr, "ds4: failed to allocate imatrix Metal graph runtime\n");
         free(dataset);
@@ -41757,7 +42290,9 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
         return 1;
     }
     if (!metal_graph_alloc_raw_cap(&s->graph, &e->weights, shape_layer,
-                                   raw_cap, (uint32_t)ctx_size, s->prefill_cap, e->mtp_ready))
+                                   raw_cap, (uint32_t)ctx_size,
+                                   s->prefill_cap, e->mtp_ready,
+                                   e->model.native_dspark_store_v2))
     {
         free(s);
         return 1;
@@ -44753,7 +45288,12 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
                                                   row_logits);
         }
         const double verify_done = mtp_timing ? now_sec() : 0.0;
-        if (ok && row0_top == drafts[1]) {
+        const bool full_accept = ok && row0_top == drafts[1];
+        if (full_accept) {
+            ok = metal_graph_dspark_verify_capture_publish(
+                &s->graph, 2u, (uint64_t)start + 2u);
+        }
+        if (ok && full_accept) {
             memcpy(s->logits, row_logits, (size_t)DS4_N_VOCAB * sizeof(s->logits[0]));
             token_vec_push(&s->checkpoint, drafts[0]);
             token_vec_push(&s->checkpoint, drafts[1]);
@@ -44780,6 +45320,10 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
             s->checkpoint.len = start;
             ok = spec_frontier_commit_prefix1(s);
         }
+        if (ok) {
+            ok = metal_graph_dspark_verify_capture_publish(
+                &s->graph, 1u, (uint64_t)start + 1u);
+        }
         if (ok) memcpy(s->logits, row0_logits, (size_t)DS4_N_VOCAB * sizeof(s->logits[0]));
         if (ok) {
             token_vec_push(&s->checkpoint, drafts[0]);
@@ -44804,7 +45348,10 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
         }
         if (have_frontier) {
             s->checkpoint.len = start;
+            metal_graph_dspark_capture_invalidate(&s->graph);
             (void)spec_frontier_restore(&frontier, s);
+        } else {
+            metal_graph_dspark_capture_invalidate(&s->graph);
         }
         spec_frontier_free(&frontier);
         free(row0_logits);
@@ -44878,6 +45425,7 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
             }
             if (exact_replay_debug && have_frontier) {
                 s->checkpoint.len = start;
+                metal_graph_dspark_verify_capture_abort(&s->graph);
                 ok = spec_frontier_restore(&frontier, s);
                 if (ok) {
                     int replayed = 0;
@@ -44912,6 +45460,12 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
                                                       (uint32_t)(draft_n - 1),
                                                       row_logits);
                 if (ok) {
+                    ok = metal_graph_dspark_verify_capture_publish(
+                        &s->graph,
+                        (uint32_t)draft_n,
+                        (uint64_t)start + (uint32_t)draft_n);
+                }
+                if (ok) {
                     memcpy(s->logits, row_logits, (size_t)DS4_N_VOCAB * sizeof(s->logits[0]));
                     for (int i = 0; i < draft_n && n_accept < accepted_cap; i++) {
                         accepted[n_accept++] = drafts[i];
@@ -44944,6 +45498,10 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
                 const double prefix_done = mtp_timing ? now_sec() : 0.0;
                 if (ok) ok = metal_graph_read_spec_logits_row(&s->graph, 0, row_logits);
                 if (ok) {
+                    ok = metal_graph_dspark_verify_capture_publish(
+                        &s->graph, 1u, (uint64_t)start + 1u);
+                }
+                if (ok) {
                     memcpy(s->logits, row_logits, (size_t)DS4_N_VOCAB * sizeof(s->logits[0]));
                     accepted[n_accept++] = drafts[0];
                     s->checkpoint_valid = true;
@@ -44968,6 +45526,7 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
                 }
             } else {
                 s->checkpoint.len = start;
+                metal_graph_dspark_verify_capture_abort(&s->graph);
                 ok = have_frontier && spec_frontier_restore(&frontier, s);
             }
             if (ok && draft_n == 2 && commit_drafts == 1) {
@@ -45017,6 +45576,12 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
                                                               (uint32_t)(commit_drafts - 1),
                                                               row_logits);
                 if (ok) {
+                    ok = metal_graph_dspark_verify_capture_publish(
+                        &s->graph,
+                        (uint32_t)commit_drafts,
+                        (uint64_t)start + (uint32_t)commit_drafts);
+                }
+                if (ok) {
                     memcpy(s->logits, row_logits, (size_t)DS4_N_VOCAB * sizeof(s->logits[0]));
                     for (int i = 0; i < commit_drafts && n_accept < accepted_cap; i++) {
                         accepted[n_accept++] = drafts[i];
@@ -45045,6 +45610,7 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
             }
         }
         s->checkpoint.len = start;
+        metal_graph_dspark_capture_invalidate(&s->graph);
         if (have_frontier) {
             (void)spec_frontier_restore(&frontier, s);
         } else if (!verifier_may_have_mutated) {
@@ -45160,6 +45726,10 @@ void ds4_session_invalidate(ds4_session *s) {
     s->checkpoint.len = 0;
     s->mtp_draft_valid = false;
 #ifndef DS4_NO_GPU
+    if (s->engine && s->engine->backend == DS4_BACKEND_METAL &&
+        s->engine->model.family == DS4_MODEL_FAMILY_DEEPSEEK4) {
+        metal_graph_dspark_capture_invalidate(&s->graph);
+    }
     ds4_session_glm_reset_dense_cache(s);
 #endif
 }
@@ -45178,9 +45748,17 @@ void ds4_session_rewind(ds4_session *s, int pos) {
         }
         return;
     }
+#ifndef DS4_NO_GPU
+    const bool rewound = pos < s->checkpoint.len;
+#endif
     s->checkpoint.len = pos;
     s->mtp_draft_valid = false;
 #ifndef DS4_NO_GPU
+    if (s->engine && s->engine->backend == DS4_BACKEND_METAL &&
+        s->engine->model.family == DS4_MODEL_FAMILY_DEEPSEEK4 &&
+        rewound) {
+        metal_graph_dspark_capture_invalidate(&s->graph);
+    }
     ds4_session_glm_cap_dense_cache(s);
 #endif
 }

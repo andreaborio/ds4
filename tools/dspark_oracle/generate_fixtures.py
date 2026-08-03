@@ -34,6 +34,10 @@ DEFAULT_OUTPUT = ROOT / "tests" / "dspark" / "fixtures-v1.json"
 #   independently evaluated from the pinned official equations.  They are not
 #   recomputed here, so changing a weight, lane order, normalization, or axis
 #   makes the fixture fail instead of silently regenerating a matching answer.
+# * Target capture values use layer*65536 + token*8192 + lane*512 plus a
+#   periodic dimension term.  Averaging lanes 0/1/2/3 contributes exactly 768;
+#   the prefill case has 130 rows so its frontier is distinct from the retained
+#   last-128 history starting at local row two.
 EMBEDDING = [[1.0, 0.0], [0.0, 1.0], [1.0, 1.0], [-1.0, 0.5]]
 MARKOV_PROJECTION = [
     [0.2, -0.1],
@@ -97,6 +101,110 @@ HC_CAPTURE_FIXTURE = {
     ],
 }
 
+TARGET_CAPTURE_FIXTURE = {
+    "layerIds": [40, 41, 42],
+    "shapePerLayer": [4, 4096],
+    "generator": {
+        "layerScale": 65536.0,
+        "tokenScale": 8192.0,
+        "hcScale": 512.0,
+        "dimensionPeriod": 257,
+        "dimensionOffset": -128,
+        "dimensionScale": 0.125,
+    },
+    "decodeTokenCount": 1,
+    "decodeStartPosition": 141,
+    "prefillTokenCount": 130,
+    "prefillStartPosition": 11,
+    "expected": {
+        "decodeTokenIndex": 0,
+        "decodeAbsoluteTokenPosition": 141,
+        "decodeSamples": [
+            {"layer": 0, "dimension": 0, "value": 752.0},
+            {"layer": 0, "dimension": 128, "value": 768.0},
+            {"layer": 1, "dimension": 257, "value": 66288.0},
+            {"layer": 2, "dimension": 4095, "value": 131854.0},
+        ],
+        "prefillTokenIndex": 129,
+        "prefillAbsoluteTokenPosition": 140,
+        "historyTokenStart": 13,
+        "historyLength": 128,
+        "prefillSamples": [
+            {"layer": 0, "dimension": 0, "value": 1057520.0},
+            {"layer": 1, "dimension": 128, "value": 1123072.0},
+            {"layer": 2, "dimension": 4095, "value": 1188622.0},
+        ],
+        "historySamples": [
+            {"logical": 0, "layer": 0, "dimension": 0,
+             "value": 17136.0},
+            {"logical": 0, "layer": 1, "dimension": 128,
+             "value": 82688.0},
+            {"logical": 127, "layer": 2, "dimension": 4095,
+             "value": 1188622.0},
+        ],
+    },
+}
+
+
+PROPOSAL_TOKEN_LAYOUT_FIXTURE = {
+    "lastTargetPosition": 128,
+    "pendingTokenId": 17,
+    "noiseTokenId": 128799,
+    "blockSize": 5,
+    "expected": {
+        "inputTokenIds": [17, 128799, 128799, 128799, 128799],
+        "inputPositions": [129, 130, 131, 132, 133],
+        "proposedOutputPositions": [130, 131, 132, 133, 134],
+    },
+}
+
+
+DIRECT_CONTEXT_KV_FIXTURE = {
+    "mainX": [[1.0, 2.0, 3.0, 4.0], [2.0, -1.0, 0.5, -3.0]],
+    "projectionGenerator": {
+        "shape": [512, 4],
+        "kind": "repeatingIdentityRows",
+    },
+    "normWeight": {"shape": [512], "fill": 1.0},
+    "absolutePositions": [0, 129],
+    "normEps": 1.0e-6,
+    "ropeTheta": 10000.0,
+    "expected": {
+        "normalizedSamples": [
+            {"token": 0, "dimension": 0, "value": 0.365234375},
+            {"token": 0, "dimension": 3, "value": 1.4609375},
+            {"token": 1, "dimension": 0, "value": 1.0625},
+            {"token": 1, "dimension": 3, "value": -1.5859375},
+        ],
+        "ropedSamples": [
+            {"token": 0, "dimension": 448, "value": 0.365234375},
+            {"token": 0, "dimension": 511, "value": 1.4609375},
+            {"token": 1, "dimension": 448, "value": -1.1484375},
+            {"token": 1, "dimension": 449, "value": 0.31640625},
+            {"token": 1, "dimension": 510, "value": 0.29296875},
+            {"token": 1, "dimension": 511, "value": -1.578125},
+        ],
+        "storedSamples": [
+            {"token": 0, "dimension": 0, "value": 0.375},
+            {"token": 0, "dimension": 1, "value": 0.75},
+            {"token": 0, "dimension": 2, "value": 1.125},
+            {"token": 0, "dimension": 3, "value": 1.5},
+            {"token": 1, "dimension": 0, "value": 1.0},
+            {"token": 1, "dimension": 1, "value": -0.5},
+            {"token": 1, "dimension": 2, "value": 0.25},
+            {"token": 1, "dimension": 3, "value": -1.625},
+            {"token": 1, "dimension": 448, "value": -1.1484375},
+            {"token": 1, "dimension": 511, "value": -1.578125},
+        ],
+        "nonropeScales": [
+            [0.00390625, 0.00390625, 0.00390625, 0.00390625,
+             0.00390625, 0.00390625, 0.00390625],
+            [0.00390625, 0.00390625, 0.00390625, 0.00390625,
+             0.00390625, 0.00390625, 0.00390625],
+        ],
+    },
+}
+
 
 def _dense_weight(
     rows: int,
@@ -144,20 +252,22 @@ HC_HEAD_FUNCTION = _dense_weight(
 
 
 def _stage_setup_fixture() -> dict[str, Any]:
-    denominator = math.sqrt(18.5 + 1.0e-6)
+    denominator = math.sqrt(4153.0 + 1.0e-6)
     return {
         "targetHidden": [[1.0, 2.0], [3.0, 4.0], [5.0, 6.0]],
         "mainProjection": [
-            [1.0, 0.0, 0.0, 0.0, 0.0, 0.0],
-            [0.0, 0.0, 0.0, 0.0, 0.0, 1.0],
+            [1.0, 2.0, 3.0, 4.0, 5.0, 6.0],
+            [-2.0, 1.0, -1.0, 3.0, 2.0, -4.0],
         ],
-        "mainNormWeight": [2.0, 0.5],
-        "acceptedEmbedding": [0.1, 0.2],
+        "mainNormWeight": [1.5, 0.75],
+        "pendingEmbedding": [0.1, 0.2],
         "noiseEmbedding": [-0.3, 0.4],
         "blockSize": 5,
         "hcLanes": 4,
         "expected": {
-            "mainHidden": [2.0 / denominator, 3.0 / denominator],
+            "concatenated": [1.0, 2.0, 3.0, 4.0, 5.0, 6.0],
+            "preNorm": [91.0, -5.0],
+            "mainHidden": [136.5 / denominator, -3.75 / denominator],
             "draftRows": [
                 [0.1, 0.2],
                 [-0.3, 0.4],
@@ -264,21 +374,21 @@ def _raw_cache_fixture() -> dict[str, Any]:
                  "value": 227007.0},
                 {"stage": 2, "view": 127, "dimension": 511,
                  "value": 328511.0},
-                {"stage": 2, "view": 128, "dimension": 511,
-                 "value": 329511.0},
-                {"stage": 0, "view": 129, "dimension": 0,
+                {"stage": 0, "view": 128, "dimension": 0,
                  "value": 500000.0},
-                {"stage": 2, "view": 133, "dimension": 511,
+                {"stage": 2, "view": 132, "dimension": 511,
                  "value": 704511.0},
             ],
-            "afterCommitTokenStart": 2,
+            "verifierTokenCount": 4,
+            "acceptedRows": 3,
+            "afterCommitTokenStart": 4,
             "afterCommitSamples": [
                 {"stage": 0, "logical": 0, "dimension": 0,
-                 "value": 2000.0},
+                 "value": 4000.0},
                 {"stage": 2, "logical": 127, "dimension": 511,
-                 "value": 329511.0},
-                {"stage": 2, "physical": 1, "dimension": 511,
-                 "value": 329511.0},
+                 "value": 331511.0},
+                {"stage": 2, "physical": 3, "dimension": 511,
+                 "value": 331511.0},
             ],
         },
     }
@@ -442,7 +552,10 @@ def build_fixture() -> dict[str, Any]:
         "numericType": "float64",
         "cases": {
             "postLayerHCMean": HC_CAPTURE_FIXTURE,
+            "targetCaptureRows": TARGET_CAPTURE_FIXTURE,
+            "proposalTokenLayout": PROPOSAL_TOKEN_LAYOUT_FIXTURE,
             "stageSetup": _stage_setup_fixture(),
+            "directContextKV": DIRECT_CONTEXT_KV_FIXTURE,
             "hyperConnection": _hc_fixture(),
             "stageChain": _stage_chain_fixture(),
             "rawCache": _raw_cache_fixture(),

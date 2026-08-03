@@ -7,6 +7,7 @@ import ast
 import inspect
 import json
 import os
+import re
 import struct
 import subprocess
 import sys
@@ -24,9 +25,14 @@ from tools.dspark_oracle import (  # noqa: E402
     DSPARK_RAW_CACHE_WIDTH,
     DSPARK_RAW_CACHE_WINDOW,
     DSPARK_STAGE_COUNT,
+    DSPARK_TARGET_LAYER_IDS,
     MetadataError,
     append_raw_cache,
+    capture_target_hidden_rows,
+    commit_raw_cache_transaction,
+    concatenate_target_captures,
     conditional_confidence,
+    direct_stage_context_kv,
     empty_raw_cache,
     finalize_draft_head,
     hc_head,
@@ -39,6 +45,7 @@ from tools.dspark_oracle import (  # noqa: E402
     post_layer_hc_mean,
     prefill_raw_cache,
     prepare_stage_zero,
+    proposal_token_layout,
     proposal_raw_cache_view,
     rms_norm,
     run_synthetic_stage_chain,
@@ -61,6 +68,115 @@ from tools.dspark_oracle.support_schema import (  # noqa: E402
 FIXTURE_PATH = Path(__file__).with_name("fixtures-v1.json")
 PROVENANCE_PATH = ROOT / "tools" / "dspark_oracle" / "provenance.json"
 GENERATOR_PATH = ROOT / "tools" / "dspark_oracle" / "generate_fixtures.py"
+DS4_SOURCE_PATH = ROOT / "ds4.c"
+DS4_METAL_SOURCE_PATH = ROOT / "ds4_metal.m"
+DSPARK_GRAPH_PATH = ROOT / "runtime" / "ds4_dspark_graph.inc"
+
+
+_C_NONCODE_RE = re.compile(
+    r'"(?:\\.|[^"\\])*"|\'(?:\\.|[^\'\\])*\'|//[^\r\n]*|/\*.*?\*/',
+    re.DOTALL,
+)
+_C_TOKEN_RE = re.compile(
+    r"[A-Za-z_]\w*|(?:0[xX][0-9A-Fa-f]+|\d+)(?:[uUlL]+)?|"
+    r"->|==|!=|<=|>=|&&|\|\||\+\+|--|<<|>>|"
+    r"[{}()\[\],;.=+\-!*/&|?:<>]"
+)
+
+
+def _strip_c_noncode(source: str) -> str:
+    """Remove comments and literals without moving structural delimiters."""
+
+    def replace(match: re.Match[str]) -> str:
+        return "".join("\n" if char == "\n" else " " for char in match.group())
+
+    return _C_NONCODE_RE.sub(replace, source)
+
+
+def _matching_character(source: str, start: int, opener: str, closer: str) -> int:
+    depth = 0
+    for index in range(start, len(source)):
+        if source[index] == opener:
+            depth += 1
+        elif source[index] == closer:
+            depth -= 1
+            if depth == 0:
+                return index
+    raise AssertionError(f"unbalanced {opener}{closer} starting at byte {start}")
+
+
+def _c_function_body(source: str, name: str) -> str:
+    stripped = _strip_c_noncode(source)
+    signature = re.compile(rf"\b{re.escape(name)}\s*\(")
+    for match in signature.finditer(stripped):
+        open_paren = stripped.find("(", match.start(), match.end())
+        close_paren = _matching_character(stripped, open_paren, "(", ")")
+        body_start = close_paren + 1
+        while body_start < len(stripped) and stripped[body_start].isspace():
+            body_start += 1
+        if body_start >= len(stripped) or stripped[body_start] != "{":
+            continue
+        body_end = _matching_character(stripped, body_start, "{", "}")
+        return stripped[body_start + 1:body_end]
+    raise AssertionError(f"C function definition not found: {name}")
+
+
+def _c_tokens(source: str) -> list[str]:
+    return _C_TOKEN_RE.findall(source)
+
+
+def _matching_token(
+        tokens: list[str], start: int, opener: str, closer: str) -> int:
+    depth = 0
+    for index in range(start, len(tokens)):
+        if tokens[index] == opener:
+            depth += 1
+        elif tokens[index] == closer:
+            depth -= 1
+            if depth == 0:
+                return index
+    raise AssertionError(f"unbalanced token pair {opener}{closer} at {start}")
+
+
+def _c_calls(
+        tokens: list[str], name: str,
+) -> list[tuple[int, int, list[list[str]]]]:
+    calls: list[tuple[int, int, list[list[str]]]] = []
+    for start in range(len(tokens) - 1):
+        if tokens[start] != name or tokens[start + 1] != "(":
+            continue
+        end = _matching_token(tokens, start + 1, "(", ")")
+        arguments: list[list[str]] = []
+        argument: list[str] = []
+        nesting: list[str] = []
+        matching = {")": "(", "]": "[", "}": "{"}
+        for token in tokens[start + 2:end]:
+            if token in ("(", "[", "{"):
+                nesting.append(token)
+            elif token in matching:
+                if not nesting or nesting.pop() != matching[token]:
+                    raise AssertionError(f"unbalanced call arguments for {name}")
+            if token == "," and not nesting:
+                arguments.append(argument)
+                argument = []
+            else:
+                argument.append(token)
+        if argument or arguments:
+            arguments.append(argument)
+        calls.append((start, end, arguments))
+    return calls
+
+
+def _token_sequence_index(
+        tokens: list[str], sequence: list[str], *, start: int = 0,
+        end: int | None = None) -> int:
+    if end is None:
+        end = len(tokens)
+    limit = end - len(sequence) + 1
+    for index in range(start, max(start, limit)):
+        if tokens[index:index + len(sequence)] == sequence:
+            return index
+    return -1
 
 
 def _gguf_string(value: str) -> bytes:
@@ -191,6 +307,155 @@ class OracleFixtureTests(unittest.TestCase):
             post_layer_hc_mean(valid[:, :, :-1])
 
     @staticmethod
+    def _target_capture_input(
+        case: dict[str, object], token_count: int
+    ) -> np.ndarray:
+        hc_lanes, hidden_width = (
+            int(value) for value in case["shapePerLayer"]
+        )
+        generator = case["generator"]
+        layer = np.arange(3, dtype=np.float64)[:, None, None, None]
+        token = np.arange(token_count, dtype=np.float64)[None, :, None, None]
+        hc = np.arange(hc_lanes, dtype=np.float64)[None, None, :, None]
+        dimension = np.arange(hidden_width, dtype=np.int64)[None, None, None, :]
+        dimension_term = (
+            (dimension % int(generator["dimensionPeriod"]))
+            + int(generator["dimensionOffset"])
+        ) * float(generator["dimensionScale"])
+        return (
+            layer * float(generator["layerScale"])
+            + token * float(generator["tokenScale"])
+            + hc * float(generator["hcScale"])
+            + dimension_term
+        )
+
+    @staticmethod
+    def _assert_capture_samples(
+        rows: np.ndarray, samples: list[dict[str, object]]
+    ) -> None:
+        for sample in samples:
+            actual = rows[int(sample["layer"]), int(sample["dimension"])]
+            assert actual == float(sample["value"]), sample
+
+    def test_target_capture_decode_rows_are_ordered_and_non_degenerate(self) -> None:
+        case = self.fixture["cases"]["targetCaptureRows"]
+        hidden = self._target_capture_input(case, case["decodeTokenCount"])
+        result = capture_target_hidden_rows(
+            tuple(hidden), case["layerIds"], phase="decode",
+            start_position=case["decodeStartPosition"],
+        )
+        self.assertEqual(result.layer_ids, DSPARK_TARGET_LAYER_IDS)
+        self.assertEqual(result.phase, "decode")
+        self.assertEqual(
+            result.token_index, case["expected"]["decodeTokenIndex"]
+        )
+        self.assertEqual(
+            result.absolute_token_position,
+            case["expected"]["decodeAbsoluteTokenPosition"],
+        )
+        self.assertEqual(result.rows.shape, (3, 4096))
+        self.assertEqual(result.history_rows.shape, (1, 3, 4096))
+        np.testing.assert_array_equal(result.history_rows[0], result.rows)
+        self._assert_capture_samples(
+            result.rows, case["expected"]["decodeSamples"]
+        )
+        self.assertFalse(np.shares_memory(result.rows, hidden))
+        self.assertFalse(np.array_equal(result.rows[0], result.rows[1]))
+        self.assertFalse(np.array_equal(result.rows[1], result.rows[2]))
+
+        # The lanes are intentionally distinct: selecting one lane instead of
+        # the post-HC mean cannot accidentally satisfy the closed samples.
+        self.assertFalse(np.array_equal(result.rows, hidden[:, 0, 0, :]))
+
+    def test_target_capture_prefill_keeps_last_128_and_distinct_frontier(self) -> None:
+        case = self.fixture["cases"]["targetCaptureRows"]
+        hidden = self._target_capture_input(case, case["prefillTokenCount"])
+        result = capture_target_hidden_rows(
+            tuple(hidden), case["layerIds"], phase="prefill",
+            start_position=case["prefillStartPosition"],
+        )
+        self.assertEqual(result.phase, "prefill")
+        self.assertEqual(
+            result.token_index, case["expected"]["prefillTokenIndex"]
+        )
+        self.assertEqual(
+            result.absolute_token_position,
+            case["expected"]["prefillAbsoluteTokenPosition"],
+        )
+        self.assertEqual(
+            result.history_token_start, case["expected"]["historyTokenStart"]
+        )
+        self.assertEqual(
+            result.history_rows.shape,
+            (case["expected"]["historyLength"], 3, 4096),
+        )
+        self._assert_capture_samples(
+            result.rows, case["expected"]["prefillSamples"]
+        )
+        for sample in case["expected"]["historySamples"]:
+            actual = result.history_rows[
+                int(sample["logical"]),
+                int(sample["layer"]),
+                int(sample["dimension"]),
+            ]
+            self.assertEqual(actual, sample["value"])
+        np.testing.assert_array_equal(result.history_rows[-1], result.rows)
+        self.assertFalse(np.array_equal(result.history_rows[0], result.rows))
+
+    def test_official_pending_token_and_candidate_position_shift(self) -> None:
+        case = self.fixture["cases"]["proposalTokenLayout"]
+        result = proposal_token_layout(
+            case["lastTargetPosition"],
+            case["pendingTokenId"],
+            case["noiseTokenId"],
+            block_size=case["blockSize"],
+        )
+        self.assertEqual(result.pending_token_id, case["pendingTokenId"])
+        self.assertEqual(
+            result.input_token_ids.tolist(), case["expected"]["inputTokenIds"]
+        )
+        self.assertEqual(
+            result.input_positions.tolist(), case["expected"]["inputPositions"]
+        )
+        self.assertEqual(
+            result.proposed_output_positions.tolist(),
+            case["expected"]["proposedOutputPositions"],
+        )
+        self.assertNotIn(
+            case["lastTargetPosition"], result.input_positions.tolist()
+        )
+        self.assertEqual(
+            result.proposed_output_positions[0], result.input_positions[0] + 1
+        )
+
+    def test_target_capture_rejects_layer_and_phase_mutations(self) -> None:
+        case = self.fixture["cases"]["targetCaptureRows"]
+        decode = self._target_capture_input(case, case["decodeTokenCount"])
+        prefill = self._target_capture_input(case, case["prefillTokenCount"])
+        with self.assertRaisesRegex(ValueError, "ordered 40, 41, 42"):
+            capture_target_hidden_rows(
+                tuple(decode[[1, 0, 2]]), [41, 40, 42], phase="decode"
+            )
+        with self.assertRaisesRegex(ValueError, "ordered 40, 41, 42"):
+            capture_target_hidden_rows(
+                tuple(decode), [40, 40, 42], phase="decode"
+            )
+        with self.assertRaisesRegex(ValueError, "exactly one token row"):
+            capture_target_hidden_rows(
+                tuple(prefill), case["layerIds"], phase="decode"
+            )
+        with self.assertRaisesRegex(ValueError, "same token count"):
+            capture_target_hidden_rows(
+                (decode[0], prefill[1], decode[2]),
+                case["layerIds"],
+                phase="prefill",
+            )
+        with self.assertRaisesRegex(ValueError, "'decode' or 'prefill'"):
+            capture_target_hidden_rows(
+                tuple(decode), case["layerIds"], phase="verify"
+            )
+
+    @staticmethod
     def _fixture_matrix(description: object) -> np.ndarray:
         if isinstance(description, dict):
             return np.full(
@@ -203,6 +468,15 @@ class OracleFixtureTests(unittest.TestCase):
     def test_stage_zero_main_projection_norm_and_noise_layout(self) -> None:
         case = self.fixture["cases"]["stageSetup"]
         target = np.asarray(case["targetHidden"], dtype=np.float64)
+        concatenated = concatenate_target_captures(target)
+        np.testing.assert_array_equal(
+            concatenated, case["expected"]["concatenated"]
+        )
+        self.assertFalse(np.shares_memory(concatenated, target))
+        np.testing.assert_array_equal(
+            concatenated @ np.asarray(case["mainProjection"]).T,
+            case["expected"]["preNorm"],
+        )
         projected = main_project_and_norm(
             target,
             np.asarray(case["mainProjection"], dtype=np.float64),
@@ -210,7 +484,7 @@ class OracleFixtureTests(unittest.TestCase):
         )
         setup = prepare_stage_zero(
             target,
-            case["acceptedEmbedding"],
+            case["pendingEmbedding"],
             case["noiseEmbedding"],
             np.asarray(case["mainProjection"], dtype=np.float64),
             case["mainNormWeight"],
@@ -228,10 +502,103 @@ class OracleFixtureTests(unittest.TestCase):
                 np.asarray(case["expected"]["draftRows"]),
             )
 
+        # Every target tap participates with a stage-distinct coefficient.
+        # Swapping any pair changes both the concatenation and the projected
+        # stage-zero main row.
+        for first, second in ((0, 1), (1, 2), (0, 2)):
+            mutated = np.array(target, copy=True)
+            mutated[[first, second]] = mutated[[second, first]]
+            self.assertFalse(np.array_equal(
+                concatenate_target_captures(mutated), concatenated
+            ))
+            self.assertFalse(np.allclose(
+                main_project_and_norm(
+                    mutated,
+                    np.asarray(case["mainProjection"], dtype=np.float64),
+                    case["mainNormWeight"],
+                ),
+                projected,
+            ))
+
     def test_main_projection_requires_three_captures(self) -> None:
         with self.assertRaisesRegex(ValueError, "exactly three"):
             main_project_and_norm(
                 np.zeros((2, 2)), np.zeros((2, 4)), np.ones(2)
+            )
+
+    def test_official_context_kv_is_direct_with_rope_and_nope_fp8(self) -> None:
+        case = self.fixture["cases"]["directContextKV"]
+        projection_shape = tuple(case["projectionGenerator"]["shape"])
+        projection = np.zeros(projection_shape, dtype=np.float64)
+        projection[
+            np.arange(projection_shape[0]),
+            np.arange(projection_shape[0]) % projection_shape[1],
+        ] = 1.0
+        result = direct_stage_context_kv(
+            np.asarray(case["mainX"], dtype=np.float64),
+            projection,
+            self._fixture_matrix(case["normWeight"]),
+            case["absolutePositions"],
+            eps=case["normEps"],
+            rope_theta=case["ropeTheta"],
+        )
+        expected = case["expected"]
+        self.assertEqual(result.normalized.shape, (2, 512))
+        self.assertEqual(result.stored.shape, (2, 512))
+        self.assertEqual(result.nonrope_scales.shape, (2, 7))
+        self.assertEqual(
+            result.absolute_positions.tolist(), case["absolutePositions"]
+        )
+        for field, samples in (
+            ("normalized", expected["normalizedSamples"]),
+            ("roped", expected["ropedSamples"]),
+            ("stored", expected["storedSamples"]),
+        ):
+            array = getattr(result, field)
+            for sample in samples:
+                self.assertEqual(
+                    array[int(sample["token"]), int(sample["dimension"])],
+                    sample["value"],
+                )
+        np.testing.assert_array_equal(
+            result.nonrope_scales, expected["nonropeScales"]
+        )
+        # Position zero is identity RoPE.  Position 129 must rotate only the
+        # tail; the in-place FP8 Q/DQ must alter only the 448 non-RoPE values.
+        np.testing.assert_array_equal(result.normalized[0, -64:],
+                                      result.roped[0, -64:])
+        self.assertFalse(np.array_equal(result.normalized[1, -64:],
+                                        result.roped[1, -64:]))
+        np.testing.assert_array_equal(result.roped[:, -64:],
+                                      result.stored[:, -64:])
+        self.assertFalse(np.array_equal(result.roped[:, :-64],
+                                        result.stored[:, :-64]))
+
+        zero_result = direct_stage_context_kv(
+            np.zeros((1, 4), dtype=np.float64),
+            projection,
+            self._fixture_matrix(case["normWeight"]),
+            [0],
+            eps=case["normEps"],
+            rope_theta=case["ropeTheta"],
+        )
+        np.testing.assert_array_equal(
+            zero_result.nonrope_scales,
+            np.full((1, 7), 2.0 ** -22, dtype=np.float64),
+        )
+        np.testing.assert_array_equal(zero_result.stored,
+                                      np.zeros((1, 512)))
+
+    def test_context_kv_rejects_candidate_or_position_aliases(self) -> None:
+        main = np.ones((2, 4), dtype=np.float64)
+        projection = np.ones((512, 4), dtype=np.float64)
+        with self.assertRaisesRegex(ValueError, "match main_x"):
+            direct_stage_context_kv(
+                main, projection, np.ones(512), [9]
+            )
+        with self.assertRaisesRegex(ValueError, "non-negative"):
+            direct_stage_context_kv(
+                main, projection, np.ones(512), [9, -1]
             )
 
     def test_hyper_connection_split_pre_post_and_head(self) -> None:
@@ -438,24 +805,36 @@ class OracleFixtureTests(unittest.TestCase):
         self._assert_raw_samples(logical128, logical_samples, "logical")
         self._assert_raw_samples(state128.rows, physical_samples, "physical")
 
-        current = self._raw_cache_rows(
-            np.asarray([case["proposalPosition"]]), case
-        )[0]
         draft = self._raw_cache_drafts(case)
         before = np.array(state128.rows, copy=True)
         view = proposal_raw_cache_view(
-            state128, case["proposalPosition"], current, draft
+            state128, case["proposalPosition"], draft
         )
         self.assertEqual(
             view.shape,
-            (DSPARK_STAGE_COUNT, DSPARK_RAW_CACHE_WINDOW + 1 + 5,
+            (DSPARK_STAGE_COUNT, DSPARK_RAW_CACHE_WINDOW + 5,
              DSPARK_RAW_CACHE_WIDTH),
         )
         self._assert_raw_samples(view, expected["proposalSamples"], "view")
         np.testing.assert_array_equal(state128.rows, before)
 
-        committed = append_raw_cache(
-            state128, case["proposalPosition"], current
+        verifier_positions = np.arange(
+            case["proposalPosition"],
+            case["proposalPosition"] + expected["verifierTokenCount"],
+            dtype=np.int64,
+        )
+        verifier_rows = self._raw_cache_rows(verifier_positions, case)
+        rolled_back = commit_raw_cache_transaction(
+            state128, case["proposalPosition"], verifier_rows, 0
+        )
+        self.assertIs(rolled_back, state128)
+        np.testing.assert_array_equal(rolled_back.rows, before)
+
+        committed = commit_raw_cache_transaction(
+            state128,
+            case["proposalPosition"],
+            verifier_rows,
+            expected["acceptedRows"],
         )
         self.assertEqual(
             committed.token_start, expected["afterCommitTokenStart"]
@@ -474,6 +853,25 @@ class OracleFixtureTests(unittest.TestCase):
             committed.rows, physical_samples, "physical"
         )
         self.assertFalse(np.shares_memory(committed.rows, state128.rows))
+        np.testing.assert_array_equal(state128.rows, before)
+
+        # Validation is transactional: a discontinuity or invalid prefix
+        # cannot partially overwrite even the wrap slots.
+        with self.assertRaisesRegex(ValueError, "does not follow"):
+            commit_raw_cache_transaction(
+                state128,
+                case["proposalPosition"] + 1,
+                verifier_rows,
+                expected["acceptedRows"],
+            )
+        with self.assertRaisesRegex(ValueError, "valid target-row prefix"):
+            commit_raw_cache_transaction(
+                state128,
+                case["proposalPosition"],
+                verifier_rows,
+                expected["verifierTokenCount"] + 1,
+            )
+        np.testing.assert_array_equal(state128.rows, before)
 
     def test_raw_cache_rejects_non_0731_geometry(self) -> None:
         with self.assertRaisesRegex(ValueError, "capacity must be 128"):
@@ -872,6 +1270,10 @@ class OracleFixtureTests(unittest.TestCase):
             provenance["implementation"]["supportSchemaDerivation"]["status"],
             "pending",
         )
+        self.assertEqual(
+            provenance["implementation"]["runtimeCaptureParity"]["status"],
+            "pending",
+        )
         target = next(
             source
             for source in provenance["sources"]
@@ -1075,6 +1477,41 @@ class OracleFixtureTests(unittest.TestCase):
             numpy_capture,
             mlx_optional.MLX_F32_HC_MEAN_MAX_ABS_DRIFT,
         )
+        with self.assertRaisesRegex(ValueError, r"\[token, 4, 4096\]"):
+            mlx_optional.post_layer_hc_mean(hidden[:, :3, :])
+
+        target_capture = self.fixture["cases"]["targetCaptureRows"]
+        for phase, token_count_key in (
+            ("decode", "decodeTokenCount"),
+            ("prefill", "prefillTokenCount"),
+        ):
+            target_hidden = self._target_capture_input(
+                target_capture, target_capture[token_count_key]
+            )
+            numpy_rows = capture_target_hidden_rows(
+                tuple(target_hidden),
+                target_capture["layerIds"],
+                phase=phase,
+            )
+            mlx_rows, mlx_token_index, mlx_history = \
+                mlx_optional.capture_target_hidden_rows(
+                    tuple(target_hidden),
+                    target_capture["layerIds"],
+                    phase=phase,
+                )
+            self.assertEqual(mlx_token_index, numpy_rows.token_index)
+            self.assert_max_abs_drift(
+                f"MLX float32 {phase} target capture rows",
+                mlx_rows,
+                numpy_rows.rows,
+                mlx_optional.MLX_F32_HC_MEAN_MAX_ABS_DRIFT,
+            )
+            self.assert_max_abs_drift(
+                f"MLX float32 {phase} retained target history",
+                mlx_history,
+                numpy_rows.history_rows,
+                mlx_optional.MLX_F32_HC_MEAN_MAX_ABS_DRIFT,
+            )
 
         setup = self.fixture["cases"]["stageSetup"]
         numpy_main = main_project_and_norm(
@@ -1160,6 +1597,612 @@ class OracleFixtureTests(unittest.TestCase):
             mlx_head,
             numpy_head,
             mlx_optional.MLX_F32_HC_OUTPUT_MAX_ABS_DRIFT,
+        )
+
+    def test_runtime_capture_call_sites_match_oracle_contract(self) -> None:
+        source = DS4_SOURCE_PATH.read_text(encoding="utf-8")
+        metal_source = DS4_METAL_SOURCE_PATH.read_text(encoding="utf-8")
+
+        def function_tokens(name: str) -> list[str]:
+            return _c_tokens(_c_function_body(source, name))
+
+        def metal_function_tokens(name: str) -> list[str]:
+            return _c_tokens(_c_function_body(metal_source, name))
+
+        def require_sequence(
+                tokens: list[str], sequence: list[str], message: str,
+                *, start: int = 0, end: int | None = None) -> int:
+            index = _token_sequence_index(
+                tokens, sequence, start=start, end=end)
+            self.assertNotEqual(index, -1, message)
+            return index
+
+        def capture_calls(
+                tokens: list[str], expected_count: int,
+        ) -> list[tuple[int, int, list[list[str]]]]:
+            calls = _c_calls(tokens, "metal_graph_dspark_capture_after_layer")
+            self.assertEqual(len(calls), expected_count)
+            return calls
+
+        def assert_capture_arguments(
+                calls: list[tuple[int, int, list[list[str]]]],
+                expected: list[list[str]]) -> None:
+            for _, _, arguments in calls:
+                self.assertEqual(arguments, expected)
+
+        def assert_swap_between(
+                tokens: list[str], producer_end: int, consumer_start: int,
+                current: str, next_buffer: str) -> None:
+            swap = [
+                "g", "->", current, "=", "g", "->", next_buffer, ";",
+                "g", "->", next_buffer, "=", "tmp", ";",
+            ]
+            require_sequence(
+                tokens,
+                swap,
+                f"{current}/{next_buffer} must swap after the layer producer "
+                "and before DSpark capture",
+                start=producer_end + 1,
+                end=consumer_start,
+            )
+
+        # The array order is the layer-to-slot mapping consumed by the oracle;
+        # accepting a permutation would silently concatenate the wrong rows.
+        graph_source = DSPARK_GRAPH_PATH.read_text(encoding="utf-8")
+        contract_tokens = _c_tokens(_strip_c_noncode(graph_source))
+        require_sequence(
+            contract_tokens,
+            [".", "target_layer", "=", "{", "40", ",", "41", ",", "42", "}"],
+            "runtime target layers must retain oracle slot order 40/41/42",
+        )
+        slot_tokens = _c_tokens(_c_function_body(
+            graph_source, "ds4_dspark_capture_slot_after_layer"))
+        require_sequence(
+            slot_tokens,
+            [
+                "DS4_DSPARK_CAPTURE_CONTRACT", ".", "target_layer", "[",
+                "index", "]", "==", "layer",
+            ],
+            "slot lookup must compare the indexed target-layer contract",
+        )
+        require_sequence(
+            slot_tokens,
+            ["if", "(", "slot", ")", "*", "slot", "=", "index", ";"],
+            "the matched contract index must remain the capture slot",
+        )
+
+        decode_arguments = [
+            ["g"], ["il"], ["g", "->", "cur_hc"], ["1u"], ["0u"],
+        ]
+        resident = function_tokens("metal_graph_encode_token_raw_swa")
+        resident_captures = capture_calls(resident, 1)
+        assert_capture_arguments(resident_captures, decode_arguments)
+        resident_producers = _c_calls(
+            resident, "metal_graph_encode_decode_layer")
+        self.assertEqual(len(resident_producers), 1)
+        assert_swap_between(
+            resident,
+            resident_producers[0][1],
+            resident_captures[0][0],
+            "cur_hc",
+            "after_ffn_hc",
+        )
+
+        streaming = function_tokens("metal_graph_eval_token_raw_swa_streaming")
+        streaming_captures = capture_calls(streaming, 2)
+        assert_capture_arguments(streaming_captures, decode_arguments)
+        streaming_producers = _c_calls(
+            streaming, "metal_graph_encode_decode_layer")
+        self.assertEqual(len(streaming_producers), 2)
+        for capture, producer in zip(streaming_captures, streaming_producers):
+            self.assertLess(producer[1], capture[0])
+            assert_swap_between(
+                streaming,
+                producer[1],
+                capture[0],
+                "cur_hc",
+                "after_ffn_hc",
+            )
+
+        batch_helper = function_tokens("metal_graph_encode_layer_batch")
+        batch_attention = _c_calls(
+            batch_helper, "metal_graph_encode_layer_attention_batch")
+        batch_ffn = _c_calls(batch_helper, "metal_graph_encode_layer_ffn_batch")
+        self.assertEqual(len(batch_attention), 1)
+        self.assertEqual(len(batch_ffn), 1)
+        self.assertLess(batch_attention[0][1], batch_ffn[0][0])
+        require_sequence(
+            batch_helper,
+            [
+                "g", "->", "batch_cur_hc", "=", "g", "->",
+                "batch_next_hc", ";", "g", "->", "batch_next_hc", "=",
+                "tmp", ";",
+            ],
+            "complete prefill helper must publish post-FFN HC before returning",
+            start=batch_ffn[0][1] + 1,
+        )
+
+        prefill = function_tokens("metal_graph_prefill_layer_major")
+        prefill_captures = capture_calls(prefill, 3)
+        prefill_arguments = [
+            ["g"],
+            ["il"],
+            ["g", "->", "batch_cur_hc"],
+            ["n_tokens"],
+            ["n_tokens", "-", "1u"],
+        ]
+        assert_capture_arguments(prefill_captures, prefill_arguments)
+        producers: list[tuple[int, int, str]] = []
+        for producer_name in (
+                "metal_graph_encode_layer_batch",
+                "metal_graph_encode_layer_ffn_batch"):
+            producers.extend(
+                (start, end, producer_name)
+                for start, end, _ in _c_calls(prefill, producer_name)
+            )
+        nearest_producers: list[tuple[int, int, str]] = []
+        for capture_start, _, _ in prefill_captures:
+            preceding = [
+                producer for producer in producers
+                if producer[1] < capture_start
+            ]
+            self.assertTrue(preceding, "capture must follow a layer producer")
+            nearest_producers.append(max(preceding, key=lambda item: item[0]))
+        self.assertEqual(
+            [producer[2] for producer in nearest_producers],
+            [
+                "metal_graph_encode_layer_batch",
+                "metal_graph_encode_layer_ffn_batch",
+                "metal_graph_encode_layer_batch",
+            ],
+        )
+        # The profiled split branch calls the FFN half directly, so its swap
+        # cannot rely on the complete-layer helper checked above.
+        assert_swap_between(
+            prefill,
+            nearest_producers[1][1],
+            prefill_captures[1][0],
+            "batch_cur_hc",
+            "batch_next_hc",
+        )
+
+        suffix_verifier = function_tokens("metal_graph_verify_suffix_tops")
+        exact_verifier = function_tokens("metal_graph_verify_decode2_exact")
+        for verifier_name, verifier in (
+                ("metal_graph_verify_suffix_tops", suffix_verifier),
+                ("metal_graph_verify_decode2_exact", exact_verifier)):
+            self.assertEqual(
+                _c_calls(verifier, "metal_graph_dspark_capture_after_layer"),
+                [],
+                f"{verifier_name} must not publish through the current capture tap",
+            )
+
+        suffix_begin = _c_calls(
+            suffix_verifier, "metal_graph_dspark_verify_capture_begin")
+        suffix_scratch = _c_calls(
+            suffix_verifier,
+            "metal_graph_dspark_verify_capture_after_layer_batch")
+        suffix_layers = _c_calls(
+            suffix_verifier, "metal_graph_encode_layer_batch")
+        self.assertEqual(len(suffix_begin), 1)
+        self.assertEqual(
+            suffix_begin[0][2], [["g"], ["start"], ["n_tokens"]])
+        self.assertEqual(len(suffix_layers), 1)
+        self.assertEqual(len(suffix_scratch), 1)
+        self.assertEqual(
+            suffix_scratch[0][2],
+            [
+                ["g"], ["il"], ["g", "->", "batch_cur_hc"],
+                ["n_tokens"],
+            ],
+        )
+        self.assertLess(suffix_begin[0][1], suffix_layers[0][0])
+        self.assertLess(suffix_layers[0][1], suffix_scratch[0][0])
+        suffix_invalidations = _c_calls(
+            suffix_verifier, "metal_graph_dspark_capture_invalidate")
+        self.assertGreaterEqual(
+            len(suffix_invalidations), 2,
+            "suffix-verifier validation and execution failures must discard "
+            "scratch capture",
+        )
+        require_sequence(
+            suffix_verifier,
+            [
+                "if", "(", "!", "metal_graph_dspark_verify_capture_begin",
+                "(", "g", ",", "start", ",", "n_tokens", ")", ")",
+                "{", "metal_graph_dspark_capture_invalidate", "(", "g",
+                ")", ";", "return", "false", ";", "}",
+            ],
+            "a failed suffix capture begin must invalidate before returning",
+        )
+        require_sequence(
+            suffix_verifier,
+            [
+                "if", "(", "!", "ok", ")",
+                "metal_graph_dspark_capture_invalidate", "(", "g", ")",
+                ";", "return", "ok", ";",
+            ],
+            "suffix completion failure must invalidate before returning",
+        )
+
+        exact_begin = _c_calls(
+            exact_verifier, "metal_graph_dspark_verify_capture_begin")
+        exact_scratch = _c_calls(
+            exact_verifier,
+            "metal_graph_dspark_verify_capture_after_layer_batch")
+        exact_layers = _c_calls(
+            exact_verifier, "metal_graph_encode_decode_layer")
+        self.assertEqual(len(exact_begin), 1)
+        self.assertEqual(exact_begin[0][2], [["g"], ["start"], ["2u"]])
+        self.assertEqual(len(exact_layers), 2)
+        self.assertEqual(len(exact_scratch), 1)
+        self.assertEqual(
+            exact_scratch[0][2],
+            [["g"], ["il"], ["next_pair_hc"], ["2u"]],
+        )
+        self.assertLess(exact_begin[0][1], exact_layers[0][0])
+        self.assertLess(exact_layers[0][1], exact_layers[1][0])
+        self.assertLess(exact_layers[1][1], exact_scratch[0][0])
+        exact_invalidations = _c_calls(
+            exact_verifier, "metal_graph_dspark_capture_invalidate")
+        self.assertGreaterEqual(
+            len(exact_invalidations), 1,
+            "exact-verifier failure must discard scratch capture",
+        )
+        require_sequence(
+            exact_verifier,
+            [
+                "if", "(", "!", "ok", ")",
+                "metal_graph_dspark_capture_invalidate", "(", "g", ")",
+                ";",
+            ],
+            "exact-verifier completion failure must invalidate capture",
+        )
+
+        verify_begin = function_tokens("metal_graph_dspark_verify_capture_begin")
+        require_sequence(
+            verify_begin,
+            [
+                "const", "uint64_t", "end", "=", "start", "+", "n_rows",
+                ";",
+            ],
+            "verifier capture generation must target the full speculative end",
+        )
+        begin_state = _c_calls(
+            verify_begin, "ds4_dspark_capture_state_begin")
+        self.assertEqual(len(begin_state), 1)
+        self.assertEqual(
+            begin_state[0][2],
+            [["&", "g", "->", "dspark_verify_capture_state"], ["end"]],
+        )
+        for assignment in (
+                ["g", "->", "dspark_verify_capture_active", "=", "true", ";"],
+                ["g", "->", "dspark_verify_capture_rows", "=", "n_rows", ";"],
+                ["g", "->", "dspark_verify_capture_start", "=", "start", ";"]):
+            require_sequence(
+                verify_begin, assignment,
+                "verifier begin must retain its isolated scratch transaction")
+
+        for scratch_helper in (
+                "metal_graph_dspark_verify_capture_after_layer_batch",):
+            scratch_tokens = function_tokens(scratch_helper)
+            require_sequence(
+                scratch_tokens,
+                ["g", "->", "dspark_verify_capture", "[", "slot", "]"],
+                f"{scratch_helper} must write verifier scratch storage",
+            )
+            self.assertEqual(
+                _token_sequence_index(
+                    scratch_tokens,
+                    ["g", "->", "dspark_capture", "[", "slot", "]"]),
+                -1,
+                f"{scratch_helper} must not overwrite consumable capture rows",
+            )
+
+        publish = function_tokens("metal_graph_dspark_verify_capture_publish")
+        device_publish = metal_function_tokens(
+            "ds4_gpu_dspark_publish_history_tensor")
+        publish_copies = _c_calls(device_publish, "ds4_gpu_tensor_copy")
+        self.assertEqual(
+            len(publish_copies), 3,
+            "shared publication helper needs first history span, optional wrap span, and "
+            "one current-frontier copy",
+        )
+        self.assertEqual(
+            publish_copies[2][2],
+            [
+                ["current"],
+                ["0"],
+                ["candidate"],
+                [
+                    "(", "uint64_t", ")", "(", "committed_rows", "-",
+                    "1u", ")", "*", "row_bytes",
+                ],
+                ["row_bytes"],
+            ],
+        )
+        host_publish_calls = _c_calls(
+            publish, "ds4_gpu_dspark_publish_history_tensor")
+        self.assertEqual(len(host_publish_calls), 1)
+        self.assertEqual(
+            host_publish_calls[0][2],
+            [
+                ["g", "->", "dspark_capture", "[", "stage", "]"],
+                ["g", "->", "dspark_history", "[", "stage", "]"],
+                ["g", "->", "dspark_verify_capture", "[", "stage", "]"],
+                ["committed_rows"],
+                ["plan", ".", "first_physical_row"],
+                ["plan", ".", "first_rows"],
+                ["plan", ".", "second_rows"],
+            ],
+            "host publication must delegate exact geometry to the shared device helper",
+        )
+        self.assertEqual(
+            len(_c_calls(publish, "ds4_gpu_tensor_copy")), 0,
+            "host publication must not retain a mirrored device implementation",
+        )
+        require_sequence(
+            publish,
+            [
+                "ds4_dspark_history_state_begin", "(", "&", "g", "->",
+                "dspark_history_state", ",", "g", "->",
+                "dspark_verify_capture_start", ",", "committed_rows", ")",
+            ],
+            "publication must begin one transaction for all committed rows",
+        )
+        ready_checks = _c_calls(
+            publish, "ds4_dspark_capture_state_ready_at")
+        self.assertEqual(len(ready_checks), 1)
+        self.assertEqual(
+            ready_checks[0][2],
+            [["&", "g", "->", "dspark_capture_state"], ["frontier"]],
+        )
+        history_ready_checks = _c_calls(
+            publish, "ds4_dspark_history_state_current_ready_at")
+        self.assertEqual(len(history_ready_checks), 1)
+        self.assertEqual(
+            history_ready_checks[0][2],
+            [["&", "g", "->", "dspark_history_state"], ["frontier"]],
+        )
+        publish_aborts = _c_calls(
+            publish, "metal_graph_dspark_verify_capture_abort")
+        self.assertEqual(len(publish_aborts), 1)
+        current_finish = _c_calls(
+            publish, "ds4_dspark_capture_state_finish")
+        history_finish = _c_calls(
+            publish, "ds4_dspark_history_state_finish")
+        self.assertEqual(len(current_finish), 1)
+        self.assertEqual(len(history_finish), 1)
+        self.assertLess(current_finish[0][1], publish_aborts[0][0])
+        self.assertLess(history_finish[0][1], publish_aborts[0][0])
+        self.assertGreaterEqual(
+            len(_c_calls(publish, "metal_graph_dspark_capture_invalidate")),
+            3,
+            "validation, publication, and readiness failures must invalidate "
+            "current and history state",
+        )
+
+        speculative = function_tokens("ds4_session_eval_speculative_argmax")
+        publish_calls = _c_calls(
+            speculative, "metal_graph_dspark_verify_capture_publish")
+        self.assertEqual(
+            [call[2] for call in publish_calls],
+            [
+                [
+                    ["&", "s", "->", "graph"], ["2u"],
+                    ["(", "uint64_t", ")", "start", "+", "2u"],
+                ],
+                [
+                    ["&", "s", "->", "graph"], ["1u"],
+                    ["(", "uint64_t", ")", "start", "+", "1u"],
+                ],
+                [
+                    ["&", "s", "->", "graph"],
+                    ["(", "uint32_t", ")", "draft_n"],
+                    [
+                        "(", "uint64_t", ")", "start", "+", "(",
+                        "uint32_t", ")", "draft_n",
+                    ],
+                ],
+                [
+                    ["&", "s", "->", "graph"], ["1u"],
+                    ["(", "uint64_t", ")", "start", "+", "1u"],
+                ],
+                [
+                    ["&", "s", "->", "graph"],
+                    ["(", "uint32_t", ")", "commit_drafts"],
+                    [
+                        "(", "uint64_t", ")", "start", "+", "(",
+                        "uint32_t", ")", "commit_drafts",
+                    ],
+                ],
+            ],
+            "each acceptance path must publish its committed row count/frontier",
+        )
+        invalidations = _c_calls(
+            speculative, "metal_graph_dspark_capture_invalidate")
+        verifier_aborts = _c_calls(
+            speculative, "metal_graph_dspark_verify_capture_abort")
+        restores = _c_calls(speculative, "spec_frontier_restore")
+        self.assertGreaterEqual(len(invalidations), 1)
+        self.assertGreaterEqual(len(verifier_aborts), 1)
+        self.assertGreaterEqual(len(restores), 1)
+        cleanups = sorted(
+            invalidations + verifier_aborts, key=lambda call: call[0]
+        )
+        previous_restore_end = -1
+        for restore_start, restore_end, _ in restores:
+            cleanups_before_restore = [
+                cleanup for cleanup in cleanups
+                if previous_restore_end < cleanup[1] < restore_start
+            ]
+            self.assertTrue(
+                cleanups_before_restore,
+                "every speculative frontier restore must first abort verifier "
+                "scratch or invalidate all capture/history state",
+            )
+            previous_restore_end = restore_end
+        replay_evaluations = [
+            evaluation for evaluation in _c_calls(
+                speculative, "metal_graph_eval_token_raw_swa")
+            if any(restore[1] < evaluation[0] for restore in restores)
+        ]
+        self.assertEqual(
+            len(replay_evaluations),
+            2,
+            "both exact replay lanes must remain classified by this test",
+        )
+        for replay in replay_evaluations:
+            preceding_restore = max(
+                (restore for restore in restores if restore[1] < replay[0]),
+                key=lambda call: call[0],
+            )
+            self.assertTrue(any(
+                invalidation[1] < preceding_restore[0]
+                for invalidation in invalidations
+            ))
+
+        decode_prefill = function_tokens(
+            "metal_graph_prefill_decode_streaming_range")
+        invalidations = _c_calls(
+            decode_prefill, "metal_graph_dspark_capture_invalidate")
+        evaluations = _c_calls(
+            decode_prefill, "metal_graph_eval_token_raw_swa")
+        self.assertGreaterEqual(
+            len(invalidations), 1,
+            "decode-style prefill cancellation/failure must invalidate history",
+        )
+        self.assertEqual(len(evaluations), 1)
+        loop = require_sequence(
+            decode_prefill, ["for", "("],
+            "decode-style prefill must retain its token loop")
+        last = require_sequence(
+            decode_prefill,
+            [
+                "const", "bool", "last", "=", "i", "+", "1u", "==",
+                "n_tokens", ";",
+            ],
+            "the final decode-style prefill token still owns logits output",
+            start=loop,
+        )
+        completed = require_sequence(
+            decode_prefill,
+            [
+                "completed_tokens", "++", ";",
+            ],
+            "each successful decode-style prefill row must become committed",
+            start=evaluations[0][1] + 1,
+        )
+        self.assertEqual(
+            _token_sequence_index(
+                decode_prefill, ["dspark_capture_suspended"]),
+            -1,
+            "official prompt history must capture every decode-style row, not "
+            "suspend all but the frontier",
+        )
+        self.assertLess(loop, last)
+        self.assertLess(last, evaluations[0][0])
+        self.assertLess(evaluations[0][1], completed)
+
+        allocator = function_tokens("metal_graph_alloc_raw_cap")
+        state_initializers = _c_calls(
+            allocator, "ds4_dspark_capture_state_init")
+        self.assertEqual(
+            [call[2] for call in state_initializers],
+            [
+                [["&", "g", "->", "dspark_capture_state"],
+                 ["enable_dspark"]],
+                [["&", "g", "->", "dspark_verify_capture_state"],
+                 ["enable_dspark"]],
+            ],
+        )
+        history_initializers = _c_calls(
+            allocator, "ds4_dspark_history_state_init")
+        self.assertEqual(len(history_initializers), 1)
+        self.assertEqual(
+            history_initializers[0][2],
+            [["&", "g", "->", "dspark_history_state"], ["enable_dspark"]],
+        )
+        enabled_block = require_sequence(
+            allocator,
+            ["if", "(", "enable_dspark", ")", "{"],
+            "capture tensors must have an explicit enable_dspark allocation gate",
+        )
+        block_open = enabled_block + 4
+        block_close = _matching_token(allocator, block_open, "{", "}")
+        for capture_field in (
+                "dspark_capture", "dspark_history", "dspark_verify_capture"):
+            capture_allocation = [
+                "g", "->", capture_field, "[", "stage", "]", "=",
+                "ds4_gpu_tensor_alloc", "(",
+            ]
+            allocation_index = require_sequence(
+                allocator,
+                capture_allocation,
+                f"enabled DSpark graphs must allocate {capture_field} rows",
+                start=block_open + 1,
+                end=block_close,
+            )
+            self.assertEqual(
+                _token_sequence_index(
+                    allocator, capture_allocation, start=allocation_index + 1),
+                -1,
+                f"{capture_field} storage must not be allocated outside its gate",
+            )
+        require_sequence(
+            allocator,
+            [
+                "(", "!", "enable_dspark", "||", "(", "g", "->",
+                "dspark_capture", "[", "0", "]", "&&", "g", "->",
+                "dspark_capture", "[", "1", "]", "&&", "g", "->",
+                "dspark_capture", "[", "2", "]", "&&", "g", "->",
+                "dspark_history", "[", "0", "]", "&&", "g", "->",
+                "dspark_history", "[", "1", "]", "&&", "g", "->",
+                "dspark_history", "[", "2", "]", "&&", "g", "->",
+                "dspark_verify_capture", "[", "0", "]", "&&", "g", "->",
+                "dspark_verify_capture", "[", "1", "]", "&&", "g", "->",
+                "dspark_verify_capture", "[", "2", "]", ")", ")",
+            ],
+            "allocator success must require all rows only when DSpark is enabled",
+        )
+
+        allocation_callers = {
+            "metal_graph_alloc": ["false"],
+            "metal_graph_prompt_logits_test": ["false"],
+            "generate_metal_graph_raw_swa": [
+                "model", "->", "native_dspark_store_v2"],
+            "ds4_engine_collect_imatrix": ["false"],
+            "ds4_session_create": [
+                "e", "->", "model", ".", "native_dspark_store_v2"],
+        }
+        for caller, expected_enable_argument in allocation_callers.items():
+            calls = _c_calls(
+                function_tokens(caller), "metal_graph_alloc_raw_cap")
+            self.assertEqual(len(calls), 1, caller)
+            self.assertEqual(len(calls[0][2]), 8, caller)
+            self.assertEqual(calls[0][2][-1], expected_enable_argument, caller)
+
+        full_source_tokens = _c_tokens(_strip_c_noncode(source))
+        runtime_capture_calls = [
+            call for call in _c_calls(
+                full_source_tokens, "metal_graph_dspark_capture_after_layer")
+            if call[1] + 1 >= len(full_source_tokens)
+            or full_source_tokens[call[1] + 1] != "{"
+        ]
+        self.assertEqual(
+            len(runtime_capture_calls),
+            6,
+            "every production capture tap must be classified by this test",
+        )
+        raw_allocator_calls = [
+            call for call in _c_calls(full_source_tokens, "metal_graph_alloc_raw_cap")
+            if call[1] + 1 >= len(full_source_tokens)
+            or full_source_tokens[call[1] + 1] != "{"
+        ]
+        self.assertEqual(
+            len(raw_allocator_calls),
+            len(allocation_callers),
+            "every raw graph allocation must declare its DSpark enable policy",
         )
 
     def test_generated_fixture_is_current(self) -> None:

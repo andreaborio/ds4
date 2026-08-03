@@ -70,8 +70,12 @@
       ],
       "observations": {
         "stageChain": "exactly three DSparkBlock stages; stage zero alone owns main_proj/main_norm and stage two alone owns the final HC, norm, Markov, and confidence heads",
-        "mainInput": "captures after target layers 40/41/42 are HC-mean reduced, concatenated, projected 12288->4096, and RMS-normalized once; the same main_x feeds every stage attention KV path",
-        "rawCache": "each stage owns an independent 512-wide attention KV ring derived from main_x; current-target and five draft rows form a noncausal proposal view, while committed cache ownership advances only with target positions",
+        "mainInput": "captures after target layers 40/41/42 are HC-mean reduced and concatenated 40->41->42 at every target position; stage-zero main_proj/main_norm processes the complete prompt sequence, retaining its last 128 rows for each stage context, while the separate last row is only the frontier tap for starting the next draft",
+        "contextKV": "each stage derives target history directly as kv_norm(Wkv(main_x(t))), applies base-theta RoPE only to the 64-wide tail at absolute target position t, and in-place E4M3FN Q/DQ only to seven 64-wide non-RoPE groups; target history does not pass through candidate HC-pre or attention norm",
+        "tokenShift": "after target evaluates p, target logits provide pending y[p+1]; DSpark embeds [y[p+1], noise x4] at input positions p+1..p+5 and its five head rows propose p+2..p+6",
+        "nonropeStorage": "the pinned config selects dtype=fp8 and scale_fmt=ue8m0 while ModelArgs supplies the absent scale_dtype key's fp8 default; the pinned act_quant kernel applies 64-wide in-place E4M3FN Q/DQ with amax floor 1e-4, power-of-two ceil(amax/448) scale, clamp to +/-448, FP32 dequant multiply, and BF16 store",
+        "rawCache": "each stage owns an independent 512-wide ring already committed through p before a proposal view is formed; the view is that committed history plus five transient candidate rows, with no duplicate current-main row; every accepted target-verifier row appends in order and a rejected suffix rolls back",
+        "officialVsAntirez": "the official direct target-history KV path, token shift, and no-duplicate-frontier ownership are semantic authority; antirez mechanics that transform/reinsert only a frontier main row are explicitly not copied",
         "hyperConnection": "four HC lanes; pre=sigmoid+eps, post=2*sigmoid, combination uses 20 alternating row/column Sinkhorn normalizations, and the final HC head is a sigmoid-weighted lane reduction"
       }
     },
@@ -148,10 +152,16 @@
       "currentEvidence": "reviewed declaration cross-checked against the authenticated final GGUF and converter manifest",
       "missingEvidence": "an independent generator derived directly from the three pinned source-safetensors headers",
       "policy": "do not simulate independence by generating one schema declaration from another"
+    },
+    "runtimeCaptureParity": {
+      "status": "pending",
+      "currentEvidence": "independent synthetic NumPy vectors and optional MLX 0.32.0 Metal parity distinguish the frontier tap from the complete last-128 prompt history; NumPy additionally pins direct context KV, absolute RoPE, non-RoPE E4M3FN Q/DQ, token shift, and transactional accepted-prefix ownership",
+      "missingEvidence": "real-weight combined-GGUF captures for target layers 40/41/42, every retained prompt main_x/context-KV row, candidate KV, and accepted verifier rows in decode and prompt prefill",
+      "policy": "synthetic fixture parity cannot be promoted as real model or runtime graph parity"
     }
   },
   "validation": {
-    "capturedAt": "2026-08-03T03:59:31+02:00",
+    "capturedAt": "2026-08-03T05:33:14+02:00",
     "hardware": "Apple M5 Pro, 64 GB unified memory",
     "os": "macOS 26.5.2 (25F84)",
     "python": "3.13.13",
@@ -163,7 +173,10 @@
       "markovFloat32": 0.00009765625,
       "confidenceFloat32": 0.00000004427712207988321,
       "postLayerHCMeanFloat32": 0.0,
-      "mainProjectionNormFloat32": 0.00000001597020593546716,
+      "decodeTargetCaptureRowsFloat32": 0.0,
+      "prefillTargetCaptureRowsFloat32": 0.0,
+      "prefillTargetCaptureHistoryFloat32": 0.0,
+      "mainProjectionNormFloat32": 0.000000047017249649172754,
       "hcPreWeightsFloat32": 0.00000002382725033944766,
       "hcPostWeightsFloat32": 0.00000004074554504907013,
       "hcSinkhornFloat32": 0.00000006646726902204136,
@@ -172,19 +185,22 @@
       "hcFinalHeadFloat32": 0.00000009989789218067813
     },
     "semanticAudit": {
-      "capturedAt": "2026-08-03T03:59:31+02:00",
+      "capturedAt": "2026-08-03T05:33:14+02:00",
       "deepSpecRevision": "005e03b81cec38b7da6399833d609ee89a2587f2",
-      "systemPython": "35 passed, 1 explicit optional-MLX skip with final support file enabled",
-      "mlxMetal": "36 passed with mlx==0.32.0, mlx-metal==0.32.0, Device(gpu, 0)",
+      "systemPython": "41 passed, 2 explicit optional MLX/support-file skips",
+      "mlxMetal": "42 passed, 1 explicit optional-support-file skip with mlx==0.32.0, mlx-metal==0.32.0, Device(gpu, 0)",
       "findings": [
         "confidence scheduling uses the first per-position sigmoid below threshold, not cumulative survival",
         "greedy and caller-uniform sampled Markov drafts feed each selected token into the next proposal step",
         "sampling acceptance is prefix-cumulative only after independent p/q draws; rejection uses the guarded p-q residual",
         "post-layer capture averages the four HC lanes at production width 4096 without aliasing the source",
+        "layer, token, HC, and hidden axes remain distinct: ordered taps 40/41/42 expose both the frontier row and every row in the retained last-128 prompt history",
         "non-degenerate HC and final-head vectors distinguish lane order, flattening, omitted normalization/output projection, and confidence input",
-        "stage zero concatenates exactly three target captures before main_proj/main_norm and repeats accepted/noise embeddings across four HC lanes",
+        "stage zero concatenates exactly three target captures at every retained position before main_proj/main_norm and repeats pending y[p+1]/noise embeddings across four HC lanes at p+1..p+5",
         "the synthetic topology requires three ordered stage-distinct transforms while preserving one immutable shared main_x",
-        "three stage-specific 128-by-512 raw-cache rings retain only committed target-derived rows; closed samples cover positions 0/127/128/129 and the current target plus five noncausal draft rows are a transactional proposal view",
+        "three stage-specific 128-by-512 rings use direct kv_norm(Wkv(main_x)), absolute-position RoPE on the 64-wide tail, and UE8M0-scaled E4M3FN Q/DQ on the 448-wide non-RoPE prefix",
+        "the proposal ring is already committed through p and adds only five transient candidate rows; accepted multi-row target-verifier prefixes commit atomically while rejection and zero-row rollback preserve prior storage",
+        "the pending target token is y[p+1], candidate inputs occupy p+1..p+5, and five DSpark head outputs propose p+2..p+6 rather than re-predicting y[p+1]",
         "the final support GGUF v3 header contains exactly 81 descriptors split 26/24/31 across stages; real-file offsets and structural size are checked without reading payload bytes"
       ]
     }
