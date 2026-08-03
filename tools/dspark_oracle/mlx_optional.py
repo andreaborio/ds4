@@ -41,6 +41,12 @@ MLX_F32_CONTEXT_SCALE_MAX_ABS_DRIFT = 0.0
 # fixture MLX differs from the NumPy online-softmax oracle in six lanes, each
 # by at most one 2^-12 step after the final BF16 publication.
 MLX_BF16_ATTENTION_OUTPUT_MAX_ABS_DRIFT = 2.44140625e-4
+# The compact stage-zero chain uses deterministic synthetic projections and
+# conditions V away from zero cancellation.  All publications before
+# attention, and those after inverse RoPE, are exact between NumPy and MLX.
+# C=2 is exact; the wrapped C=128 attention result differs in two lanes (ten at
+# inverse RoPE), each by at most one 2^-12 BF16 step.
+MLX_BF16_STAGE_ZERO_ATTENTION_MAX_ABS_DRIFT = 2.44140625e-4
 EXPECTED_MLX_VERSION = "0.32.0"
 EXPECTED_MLX_METAL_VERSION = "0.32.0"
 DSPARK_TARGET_LAYER_IDS = (40, 41, 42)
@@ -49,6 +55,8 @@ DSPARK_RAW_CACHE_WINDOW = 128
 DSPARK_ATTENTION_HEADS = 64
 DSPARK_ATTENTION_BLOCK = 64
 DSPARK_PROPOSAL_ROWS = 5
+DSPARK_ROPE_WIDTH = 64
+DSPARK_OUTPUT_GROUPS = 8
 
 
 @dataclass(frozen=True)
@@ -61,6 +69,31 @@ class MLXStageContextKV:
     roped: np.ndarray
     stored: np.ndarray
     nonrope_scales: np.ndarray
+
+
+@dataclass(frozen=True)
+class MLXStageZeroAttentionHalf:
+    """Host-visible MLX boundaries for the compact stage-zero oracle."""
+
+    absolute_positions: np.ndarray
+    hidden_input: np.ndarray
+    hc_pre_output: np.ndarray
+    attention_normalized: np.ndarray
+    q_a: np.ndarray
+    q_a_normalized: np.ndarray
+    q_b: np.ndarray
+    q_head_normalized: np.ndarray
+    q_roped: np.ndarray
+    kv_projected: np.ndarray
+    kv_normalized: np.ndarray
+    kv_roped: np.ndarray
+    kv_stored: np.ndarray
+    kv_nonrope_scales: np.ndarray
+    attention_output: np.ndarray
+    attention_inverse_roped: np.ndarray
+    output_a: np.ndarray
+    output_b: np.ndarray
+    hc_post_output: np.ndarray
 
 
 def _e4m3fn_positive_values() -> np.ndarray:
@@ -245,6 +278,81 @@ def _mlx_bfloat16_boundary(mx: object, value: object) -> object:
     """Publish a BF16 boundary and reopen it as float32 for the next op."""
 
     return value.astype(mx.bfloat16).astype(mx.float32)
+
+
+def _mlx_rms_norm_bfloat16(
+    mx: object,
+    value: object,
+    weight: object,
+    *,
+    eps: float,
+) -> object:
+    variance = mx.mean(mx.square(value), axis=-1, keepdims=True)
+    return _mlx_bfloat16_boundary(
+        mx, value * mx.rsqrt(variance + float(eps)) * weight
+    )
+
+
+def _mlx_q_head_norm_bfloat16(
+    mx: object,
+    value: object,
+    *,
+    eps: float,
+) -> object:
+    """Keep the pinned per-head Q expression at every BF16 boundary."""
+
+    squared = _mlx_bfloat16_boundary(mx, mx.square(value))
+    mean = _mlx_bfloat16_boundary(
+        mx, mx.mean(squared, axis=-1, keepdims=True)
+    )
+    added = _mlx_bfloat16_boundary(mx, mean + float(eps))
+    inverse_rms = _mlx_bfloat16_boundary(
+        mx, mx.rsqrt(added)
+    )
+    return _mlx_bfloat16_boundary(mx, value * inverse_rms)
+
+
+def _mlx_rope_tail_bfloat16(
+    mx: object,
+    value: object,
+    positions: object,
+    *,
+    inverse: bool,
+    rope_theta: float,
+) -> object:
+    """Rotate the final 64 lanes on MLX and reopen the BF16 tail."""
+
+    tail = mx.reshape(
+        value[..., -DSPARK_ROPE_WIDTH:],
+        (*value.shape[:-1], DSPARK_ROPE_WIDTH // 2, 2),
+    )
+    frequency = 1.0 / mx.power(
+        mx.array(float(rope_theta), dtype=mx.float32),
+        mx.arange(0, DSPARK_ROPE_WIDTH, 2, dtype=mx.float32)
+        / float(DSPARK_ROPE_WIDTH),
+    )
+    angle_shape = (
+        (positions.shape[0],)
+        + (1,) * (value.ndim - 2)
+        + (DSPARK_ROPE_WIDTH // 2,)
+    )
+    angles = mx.reshape(positions[:, None] * frequency[None, :], angle_shape)
+    cosine = mx.cos(angles)
+    sine = mx.sin(angles)
+    if inverse:
+        sine = -sine
+    first = tail[..., 0] * cosine - tail[..., 1] * sine
+    second = tail[..., 0] * sine + tail[..., 1] * cosine
+    rotated = _mlx_bfloat16_boundary(
+        mx,
+        mx.reshape(
+            mx.stack((first, second), axis=-1),
+            (*value.shape[:-1], DSPARK_ROPE_WIDTH),
+        ),
+    )
+    return mx.concatenate(
+        (value[..., :-DSPARK_ROPE_WIDTH], rotated), axis=-1
+    )
 
 
 def _mlx_round_e4m3fn(mx: object, value: object) -> object:
@@ -461,6 +569,270 @@ def dspark_attention_official(
     )
     mx.eval(output)
     return np.asarray(output, dtype=np.float64)
+
+
+def stage_zero_attention_half(
+    hidden_input: np.ndarray,
+    hc_function_weight: np.ndarray,
+    hc_scale: Sequence[float] | np.ndarray,
+    hc_base: Sequence[float] | np.ndarray,
+    attention_norm_weight: Sequence[float] | np.ndarray,
+    q_a_weight: np.ndarray,
+    q_a_norm_weight: Sequence[float] | np.ndarray,
+    q_b_weight: np.ndarray,
+    kv_weight: np.ndarray,
+    kv_norm_weight: Sequence[float] | np.ndarray,
+    absolute_positions: Sequence[int] | np.ndarray,
+    physical_ring_rows: np.ndarray,
+    committed_count: int,
+    committed_token_start: int,
+    other_stage_draft_rows: np.ndarray,
+    attention_sinks: Sequence[float] | np.ndarray,
+    output_a_weight: np.ndarray,
+    output_b_weight: np.ndarray,
+    *,
+    norm_eps: float = 1.0e-6,
+    hc_eps: float = 1.0e-6,
+    hc_iterations: int = 20,
+    rope_theta: float = 10000.0,
+) -> MLXStageZeroAttentionHalf:
+    """Re-express the compact final-geometry stage-zero seam on MLX Metal."""
+
+    hidden_source = np.asarray(hidden_input, dtype=np.float32)
+    positions_source = np.asarray(absolute_positions)
+    hc_function_source = np.asarray(hc_function_weight, dtype=np.float32)
+    hc_scale_source = np.asarray(hc_scale, dtype=np.float32)
+    hc_base_source = np.asarray(hc_base, dtype=np.float32)
+    attention_norm_source = np.asarray(
+        attention_norm_weight, dtype=np.float32
+    )
+    q_a_source = np.asarray(q_a_weight, dtype=np.float32)
+    q_a_norm_source = np.asarray(q_a_norm_weight, dtype=np.float32)
+    q_b_source = np.asarray(q_b_weight, dtype=np.float32)
+    kv_source = np.asarray(kv_weight, dtype=np.float32)
+    kv_norm_source = np.asarray(kv_norm_weight, dtype=np.float32)
+    output_a_source = np.asarray(output_a_weight, dtype=np.float32)
+    output_b_source = np.asarray(output_b_weight, dtype=np.float32)
+    ring_source = np.asarray(physical_ring_rows, dtype=np.float32)
+    transient_source = np.asarray(other_stage_draft_rows, dtype=np.float32)
+    sinks_source = np.asarray(attention_sinks, dtype=np.float32)
+    if hidden_source.ndim != 3 or hidden_source.shape[:2] != (5, 4):
+        raise ValueError("stage-zero hidden must have shape [5, 4, hidden]")
+    if hidden_source.shape[2] == 0 or not np.all(np.isfinite(hidden_source)):
+        raise ValueError("stage-zero hidden must be finite and non-empty")
+    if (positions_source.shape != (5,) or
+            not np.issubdtype(positions_source.dtype, np.integer) or
+            np.any(positions_source < 0) or np.any(np.diff(positions_source) != 1)):
+        raise ValueError("absolute_positions must be five consecutive integers")
+    if (isinstance(committed_token_start, bool) or
+            not isinstance(committed_token_start, (int, np.integer)) or
+            int(committed_token_start) < 0):
+        raise ValueError("committed_token_start must be non-negative")
+    if (isinstance(committed_count, bool) or
+            not isinstance(committed_count, (int, np.integer)) or
+            int(committed_count) < 2 or int(committed_count) > 128):
+        raise ValueError("committed_count must be inside [2, 128]")
+    if int(committed_count) < 128 and int(committed_token_start) != 0:
+        raise ValueError("partial official raw cache must start at position zero")
+    if positions_source[0] != int(committed_token_start) + committed_count:
+        raise ValueError("absolute_positions must start at committed cache end")
+    if ring_source.shape != (DSPARK_RAW_CACHE_WINDOW, DSPARK_RAW_CACHE_WIDTH):
+        raise ValueError("physical_ring_rows must have shape [128, 512]")
+    if transient_source.shape != (3, 5, DSPARK_RAW_CACHE_WIDTH):
+        raise ValueError("other_stage_draft_rows must have shape [3, 5, 512]")
+    hidden_width = hidden_source.shape[2]
+    q_rank = q_a_source.shape[0] if q_a_source.ndim == 2 else 0
+    output_rank = output_a_source.shape[1] if output_a_source.ndim == 3 else 0
+    if hc_function_source.shape != (24, 4 * hidden_width):
+        raise ValueError("HC function weight must have shape [24, 4 * hidden]")
+    if hc_scale_source.shape != (3,) or hc_base_source.shape != (24,):
+        raise ValueError("HC scale/base geometry mismatch")
+    if attention_norm_source.shape != (hidden_width,):
+        raise ValueError("attention norm weight must match hidden width")
+    if q_a_source.shape != (q_rank, hidden_width) or q_rank == 0:
+        raise ValueError("q_a weight must have shape [q_rank, hidden]")
+    if q_a_norm_source.shape != (q_rank,):
+        raise ValueError("q_a norm weight must match q_rank")
+    if q_b_source.shape != (
+        DSPARK_ATTENTION_HEADS * DSPARK_RAW_CACHE_WIDTH, q_rank
+    ):
+        raise ValueError("q_b weight must have shape [64 * 512, q_rank]")
+    if kv_source.shape != (DSPARK_RAW_CACHE_WIDTH, hidden_width):
+        raise ValueError("KV weight must have shape [512, hidden]")
+    if kv_norm_source.shape != (DSPARK_RAW_CACHE_WIDTH,):
+        raise ValueError("KV norm weight must have shape [512]")
+    if sinks_source.shape != (DSPARK_ATTENTION_HEADS,):
+        raise ValueError("attention_sinks must have shape [64]")
+    if output_a_source.shape != (
+        DSPARK_OUTPUT_GROUPS,
+        output_rank,
+        (DSPARK_ATTENTION_HEADS // DSPARK_OUTPUT_GROUPS)
+        * DSPARK_RAW_CACHE_WIDTH,
+    ) or output_rank < 2:
+        raise ValueError(
+            "output_a weight must have shape [8, output_rank>=2, 8 * 512]"
+        )
+    if output_b_source.shape != (
+        hidden_width, DSPARK_OUTPUT_GROUPS * output_rank
+    ):
+        raise ValueError("output_b weight must have shape [hidden, 8 * output_rank]")
+    if not np.isfinite(float(norm_eps)) or norm_eps <= 0.0:
+        raise ValueError("norm_eps must be finite and positive")
+    if not np.isfinite(float(hc_eps)) or hc_eps <= 0.0:
+        raise ValueError("hc_eps must be finite and positive")
+    if (isinstance(hc_iterations, bool) or
+            not isinstance(hc_iterations, (int, np.integer)) or
+            int(hc_iterations) < 1):
+        raise ValueError("hc_iterations must be a positive integer")
+    if not np.isfinite(float(rope_theta)) or rope_theta <= 0.0:
+        raise ValueError("rope_theta must be finite and positive")
+    if not all(np.all(np.isfinite(item)) for item in (
+        hc_function_source, hc_scale_source, hc_base_source,
+        attention_norm_source, q_a_source, q_a_norm_source, q_b_source,
+        kv_source, kv_norm_source, ring_source, transient_source,
+        sinks_source, output_a_source, output_b_source,
+    )):
+        raise ValueError("stage-zero attention weights and inputs must be finite")
+
+    mx = _mlx()
+    hidden_boundary = _mlx_bfloat16_boundary(
+        mx, mx.array(hidden_source)
+    )
+    mx.eval(hidden_boundary)
+    hidden_boundary_host = np.asarray(hidden_boundary, dtype=np.float32)
+    reduced, _pre, post, combination = hc_pre(
+        hidden_boundary_host,
+        hc_function_source,
+        hc_scale_source,
+        hc_base_source,
+        norm_eps=norm_eps,
+        hc_eps=hc_eps,
+        iterations=hc_iterations,
+    )
+    positions = mx.array(positions_source.astype(np.float32, copy=False))
+    hc_pre_output = _mlx_bfloat16_boundary(
+        mx, mx.array(np.asarray(reduced, dtype=np.float32))
+    )
+    attention_normalized = _mlx_rms_norm_bfloat16(
+        mx,
+        hc_pre_output,
+        mx.array(attention_norm_source),
+        eps=norm_eps,
+    )
+    q_a = _mlx_bfloat16_boundary(
+        mx, attention_normalized @ mx.transpose(mx.array(q_a_source))
+    )
+    q_a_normalized = _mlx_rms_norm_bfloat16(
+        mx,
+        q_a,
+        mx.array(q_a_norm_source),
+        eps=norm_eps,
+    )
+    q_b = _mlx_bfloat16_boundary(
+        mx, q_a_normalized @ mx.transpose(mx.array(q_b_source))
+    )
+    q_b = mx.reshape(
+        q_b,
+        (DSPARK_PROPOSAL_ROWS, DSPARK_ATTENTION_HEADS,
+         DSPARK_RAW_CACHE_WIDTH),
+    )
+    q_head_normalized = _mlx_q_head_norm_bfloat16(
+        mx, q_b, eps=norm_eps
+    )
+    q_roped = _mlx_rope_tail_bfloat16(
+        mx,
+        q_head_normalized,
+        positions,
+        inverse=False,
+        rope_theta=rope_theta,
+    )
+    mx.eval(
+        hc_pre_output, attention_normalized, q_a, q_a_normalized,
+        q_b, q_head_normalized, q_roped,
+    )
+
+    context = direct_stage_context_kv(
+        np.asarray(attention_normalized, dtype=np.float32),
+        kv_source,
+        kv_norm_source,
+        positions_source,
+        eps=norm_eps,
+        rope_theta=rope_theta,
+    )
+    draft_rows = np.array(transient_source, copy=True)
+    draft_rows[0] = context.stored.astype(np.float32)
+    attention_host = dspark_attention_official(
+        np.asarray(q_roped, dtype=np.float32),
+        ring_source,
+        committed_count,
+        draft_rows[0],
+        sinks_source,
+    )
+    attention_output = mx.array(attention_host.astype(np.float32))
+    inverse_roped = _mlx_rope_tail_bfloat16(
+        mx,
+        attention_output,
+        positions,
+        inverse=True,
+        rope_theta=rope_theta,
+    )
+    grouped = mx.reshape(
+        inverse_roped,
+        (DSPARK_PROPOSAL_ROWS,
+         DSPARK_OUTPUT_GROUPS,
+         (DSPARK_ATTENTION_HEADS // DSPARK_OUTPUT_GROUPS)
+         * DSPARK_RAW_CACHE_WIDTH),
+    )
+    output_a_weights = mx.array(output_a_source)
+    output_a_parts = []
+    for group in range(DSPARK_OUTPUT_GROUPS):
+        output_a_parts.append(
+            grouped[:, group] @ mx.transpose(output_a_weights[group])
+        )
+    output_a = _mlx_bfloat16_boundary(
+        mx, mx.stack(output_a_parts, axis=1)
+    )
+    output_b = _mlx_bfloat16_boundary(
+        mx,
+        mx.reshape(output_a, (DSPARK_PROPOSAL_ROWS, -1))
+        @ mx.transpose(mx.array(output_b_source)),
+    )
+    mx.eval(inverse_roped, output_a, output_b)
+    post_host = hc_post(
+        np.asarray(output_b, dtype=np.float32),
+        hidden_boundary_host,
+        post,
+        combination,
+    )
+    hc_post_output = _mlx_bfloat16_boundary(
+        mx, mx.array(post_host.astype(np.float32))
+    )
+    mx.eval(hc_post_output)
+
+    def host(value: object) -> np.ndarray:
+        return np.asarray(value, dtype=np.float64)
+
+    return MLXStageZeroAttentionHalf(
+        np.array(positions_source, dtype=np.int64, copy=True),
+        host(hidden_boundary),
+        host(hc_pre_output),
+        host(attention_normalized),
+        host(q_a),
+        host(q_a_normalized),
+        host(q_b),
+        host(q_head_normalized),
+        host(q_roped),
+        context.projected,
+        context.normalized,
+        context.roped,
+        context.stored,
+        context.nonrope_scales,
+        np.asarray(attention_host, dtype=np.float64),
+        host(inverse_roped),
+        host(output_a),
+        host(output_b),
+        host(hc_post_output),
+    )
 
 
 def hc_split_sinkhorn(

@@ -22,6 +22,7 @@ from .reference import (
     StageContextKV,
     StageChain,
     StageSetup,
+    StageZeroAttentionHalf,
     TargetCaptureRows,
     append_raw_cache,
     capture_target_hidden_rows,
@@ -49,6 +50,7 @@ from .reference import (
     rms_norm,
     run_synthetic_stage_chain,
     speculative_sample_exact,
+    stage_zero_attention_half,
 )
 
 __all__ = [
@@ -69,6 +71,7 @@ __all__ = [
     "StageContextKV",
     "StageChain",
     "StageSetup",
+    "StageZeroAttentionHalf",
     "TargetCaptureRows",
     "append_raw_cache",
     "capture_target_hidden_rows",
@@ -96,5 +99,6 @@ __all__ = [
     "rms_norm",
     "run_synthetic_stage_chain",
     "speculative_sample_exact",
+    "stage_zero_attention_half",
     "validate_0731_metadata",
 ]

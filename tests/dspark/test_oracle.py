@@ -14,6 +14,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 from pathlib import Path
 
 import numpy as np
@@ -52,9 +53,11 @@ from tools.dspark_oracle import (  # noqa: E402
     rms_norm,
     run_synthetic_stage_chain,
     speculative_sample_exact,
+    stage_zero_attention_half,
     validate_0731_metadata,
 )
 from tools.dspark_oracle import mlx_optional  # noqa: E402
+from tools.dspark_oracle import reference as dspark_reference  # noqa: E402
 from tools.dspark_oracle.support_schema import (  # noqa: E402
     SupportHeader,
     SupportSchemaError,
@@ -952,6 +955,151 @@ class OracleFixtureTests(unittest.TestCase):
         return state, queries, drafts, sinks
 
     @staticmethod
+    def _stage_zero_attention_half_inputs(
+        committed_count: int,
+    ) -> dict[str, object]:
+        """Compact weights around a final 5x64x512 attention seam."""
+
+        if committed_count not in (2, 128):
+            raise ValueError("fixture admits only C=2 or C=128")
+        generator = np.random.default_rng(0x0731A770)
+        hidden_width = 8
+        q_rank = 8
+        output_rank = 2
+        hidden = generator.standard_normal(
+            (5, 4, hidden_width), dtype=np.float32
+        ) * np.float32(0.35)
+        # HC weights are zero here so both oracles enter the first named BF16
+        # boundary identically.  Non-degenerate HC mixes are covered by the
+        # independent HC fixture; random dense weights here would compound a
+        # one-ULP HC difference through every later boundary.
+        hc_function = np.zeros((24, 4 * hidden_width), dtype=np.float32)
+        attention_norm = generator.uniform(
+            0.65, 1.35, size=hidden_width
+        ).astype(np.float32)
+        q_a = np.zeros((q_rank, hidden_width), dtype=np.float32)
+        q_a[np.arange(q_rank), np.arange(hidden_width)] = np.asarray(
+            [0.5, -0.75, 1.0, -0.25] * 2, dtype=np.float32
+        )
+        q_a_norm = np.arange(q_rank, dtype=np.float32) / 16.0 + 0.75
+        q_b = np.zeros((64 * 512, q_rank), dtype=np.float32)
+        q_b_view = q_b.reshape(64, 512, q_rank)
+        dimensions = np.arange(512)
+        for column in range(q_rank):
+            q_b_view[:, :, column] = np.where(
+                ((dimensions >> column) & 1) == 0, 0.0625, -0.0625
+            )
+        # One exact sign flip per head makes the compact Q-B fixture
+        # head-distinguishing without perturbing the otherwise shared pattern.
+        for head in range(64):
+            q_b_view[head, head, head % q_rank] *= -1.0
+        kv = np.zeros((512, hidden_width), dtype=np.float32)
+        kv_rows = np.arange(kv.shape[0])
+        # All five compact hidden rows have a positive lane 1.  Selecting it
+        # keeps the synthetic V values away from cancellation around zero;
+        # four exact positive scales preserve dimension diversity.
+        kv[:, 1] = ((kv_rows % 4).astype(np.float32) + 1.0) / 4.0
+        kv_norm = (
+            (np.arange(512) % 11).astype(np.float32) + 8.0
+        ) / 512.0
+        ring_source = generator.standard_normal(
+            (130, 3, 512), dtype=np.float32
+        ) * np.float32(0.28)
+        ring_source = (
+            np.abs(ring_source) / np.float32(32.0)
+            + np.float32(1.0 / 32.0)
+        )
+        state = prefill_raw_cache(
+            ring_source[:2] if committed_count == 2 else ring_source,
+            start_position=0,
+        )
+        other_drafts = generator.standard_normal(
+            (3, 5, 512), dtype=np.float32
+        ) * np.float32(0.24)
+        sinks = np.linspace(-1.5, 1.125, 64, dtype=np.float32)
+        output_a = np.zeros(
+            (8, output_rank, 8 * 512), dtype=np.float32
+        )
+        output_a_values = np.asarray(
+            [0.125, -0.0625, 0.25, -0.125,
+             0.03125, -0.25, 0.0625, 0.125],
+            dtype=np.float32,
+        )
+        for group in range(8):
+            for rank in range(output_rank):
+                rank_scale = 1.0 if rank == 0 else -0.5
+                for index, value in enumerate(output_a_values):
+                    dimension = (
+                        group * 131 + rank * 277 + index * 503
+                    ) % 4096
+                    output_a[group, rank, dimension] = value * rank_scale
+        output_b = np.fromfunction(
+            lambda row, column: ((row * 5 + column * 3) % 9 - 4) / 8,
+            (hidden_width, 8 * output_rank),
+            dtype=int,
+        ).astype(np.float32)
+        positions = np.arange(
+            state.token_start + state.length,
+            state.token_start + state.length + 5,
+            dtype=np.int64,
+        )
+        return {
+            "hidden_input": hidden,
+            "hc_function_weight": hc_function,
+            "hc_scale": np.zeros(3, dtype=np.float32),
+            "hc_base": np.zeros(24, dtype=np.float32),
+            "attention_norm_weight": attention_norm,
+            "q_a_weight": q_a,
+            "q_a_norm_weight": q_a_norm,
+            "q_b_weight": q_b,
+            "kv_weight": kv,
+            "kv_norm_weight": kv_norm,
+            "absolute_positions": positions,
+            "raw_cache": state,
+            "other_stage_draft_rows": other_drafts,
+            "attention_sinks": sinks,
+            "output_a_weight": output_a,
+            "output_b_weight": output_b,
+        }
+
+    @staticmethod
+    def _round_fixture_bfloat16(value: np.ndarray) -> np.ndarray:
+        source = np.asarray(value, dtype=np.float32)
+        bits = np.array(source, copy=True).view(np.uint32)
+        rounding = np.uint32(0x7FFF) + (
+            (bits >> np.uint32(16)) & np.uint32(1)
+        )
+        return ((bits + rounding) & np.uint32(0xFFFF0000)).view(np.float32)
+
+    @staticmethod
+    def _mlx_stage_zero_attention_half(
+        inputs: dict[str, object],
+        **kwargs: object,
+    ) -> object:
+        state = inputs["raw_cache"]
+        return mlx_optional.stage_zero_attention_half(
+            inputs["hidden_input"],
+            inputs["hc_function_weight"],
+            inputs["hc_scale"],
+            inputs["hc_base"],
+            inputs["attention_norm_weight"],
+            inputs["q_a_weight"],
+            inputs["q_a_norm_weight"],
+            inputs["q_b_weight"],
+            inputs["kv_weight"],
+            inputs["kv_norm_weight"],
+            inputs["absolute_positions"],
+            state.rows[0],
+            state.length,
+            state.token_start,
+            inputs["other_stage_draft_rows"],
+            inputs["attention_sinks"],
+            inputs["output_a_weight"],
+            inputs["output_b_weight"],
+            **kwargs,
+        )
+
+    @staticmethod
     def _assert_raw_samples(
         array: np.ndarray,
         samples: list[dict[str, object]],
@@ -1111,6 +1259,507 @@ class OracleFixtureTests(unittest.TestCase):
             mlx_optional.dspark_attention_official(
                 queries, state.rows[1], 1, drafts[1], sinks
             )
+
+    def test_stage_zero_attention_half_freezes_final_0731_boundaries(
+        self,
+    ) -> None:
+        expected = {
+            2: {
+                "positions": [2, 3, 4, 5, 6],
+                "q_roped":
+                    "c4af08ae39bb3541f37de67e55353eba4892a7fdc8ca7ebe22af466c2411bcc7",
+                "kv_roped":
+                    "92e588e8d190862bba215a26a6c3311ecc281f7d2e7d05b2115c5abee6d6cc9f",
+                "kv_stored":
+                    "2bf3bb6e70ceffb31053ff6d4d8080c3cbd7487f2e48db919e27ca4c47ece0af",
+                "attention_output":
+                    "a72d3d257b520857919b0f7c7f74a0d3d96de6219b7a9571a7a54689d8ca2db4",
+                "attention_inverse_roped":
+                    "f3cc9dbfec4c941f8e2af195c8061b18980d952c4d1e042c8b0e5a0da667e654",
+                "output_a":
+                    "c6995846d183f18795767f2b2135eef1be5f662ab2f5c6e650ed999b012c6829",
+                "output_b":
+                    "a85a891f87a400b428279e69eaf12e9947bccda060b1ba17e665f97e51e5e930",
+                "hc_post_output":
+                    "908b623444a23182afa2e77345fcad5ff6621a54a4d0759e31b81d3d51ea9670",
+            },
+            128: {
+                "positions": [130, 131, 132, 133, 134],
+                "q_roped":
+                    "4c66d4e2459b826612dcdd5d6e40cb5ee6eb1a95191c5f7229a1c19feb0d76d6",
+                "kv_roped":
+                    "779baae533c21b3ef9f2c9fe6c936ea1365a3b71d391d6ab203ad96d393b0f14",
+                "kv_stored":
+                    "ec4457c2b6b07dfa71bb4d4a34340b1f4c9396ab73c7158dd9872d5f5f5ea47a",
+                "attention_output":
+                    "2657472630bb63bcc52d53833f4326cd5b4ee56cfa1c3382a96f8b192ec3be23",
+                "attention_inverse_roped":
+                    "185399963ec57e0ce27a006e7f44c7865de3b5b16c6039e9a5eb45d6f626c4f9",
+                "output_a":
+                    "999c69eaff63752dc81822a734ef20574acc1bee0c4a22085c554807ddabd6e0",
+                "output_b":
+                    "cb595fc41764a08e5259630e88b5ac6e8af1a599ef003c4aa06f51801d5ec6eb",
+                "hc_post_output":
+                    "ac303a4a96c2fd9d03042c55cefc6f2f62e229ad794535f177f98d681e99e8bd",
+            },
+        }
+        common_digests = {
+            "hidden_input":
+                "04795e84f99fd90ce64f6848fd7b6bd4f9e0cc91c320acb131931a688ce0e121",
+            "hc_pre_output":
+                "bee72ec3bd81cfae3bd13980ca6cdd9201fe9e350d406540e4c69d56475a2a9b",
+            "attention_normalized":
+                "89d1ce6729a9a49b72df6d724044365c1c4337f218a280d2f0cb9869964fc010",
+            "q_a":
+                "676f6cdb2d3a5af51fd7e4c9f643328d5646e99af88a0e9e8858fc4cafd662ad",
+            "q_a_normalized":
+                "e2edae32ec96e877d425d2e3045ba8f4518f1cfba3aee860179a0f3dfe3351fd",
+            "q_b":
+                "b3e26819e09ad64681813691990d0c4915d7c33010490e1516c9746eafee0202",
+            "q_head_normalized":
+                "9eef1d0a375260173e947940fc3294ba03c67d58eb95f8cedeb4e80af4aca22a",
+            "kv_projected":
+                "1555036a1c4e3167b86d1a74eb0e4b0da8abfe63e1578809127ff8db111a5059",
+            "kv_normalized":
+                "14a362457d1b631903d9a56be9f5d9c1fe15de8284d14faa87a72889225a79b9",
+            "kv_nonrope_scales":
+                "57c0e9e040e2ecb200d5b6695df6c53edb9c166cc4552aa32614fbeaeadb6b46",
+        }
+        boundary_shapes = {
+            "hidden_input": (5, 4, 8),
+            "hc_pre_output": (5, 8),
+            "attention_normalized": (5, 8),
+            "q_a": (5, 8),
+            "q_a_normalized": (5, 8),
+            "q_b": (5, 64, 512),
+            "q_head_normalized": (5, 64, 512),
+            "q_roped": (5, 64, 512),
+            "kv_projected": (5, 512),
+            "kv_normalized": (5, 512),
+            "kv_roped": (5, 512),
+            "kv_stored": (5, 512),
+            "attention_output": (5, 64, 512),
+            "attention_inverse_roped": (5, 64, 512),
+            "output_a": (5, 8, 2),
+            "output_b": (5, 8),
+            "hc_post_output": (5, 4, 8),
+        }
+
+        full_inputs: dict[str, object] | None = None
+        full_result: object | None = None
+        for count in (2, 128):
+            inputs = self._stage_zero_attention_half_inputs(count)
+            q_b_blocks = np.asarray(
+                inputs["q_b_weight"], dtype=np.float32
+            ).reshape(64, 512, 8)
+            self.assertEqual(
+                len({
+                    hashlib.sha256(block.tobytes()).digest()
+                    for block in q_b_blocks
+                }),
+                64,
+            )
+            state = inputs["raw_cache"]
+            before = np.array(state.rows, copy=True)
+            result = stage_zero_attention_half(**inputs)
+            self.assertTrue(np.all(np.any(
+                result.q_a_normalized != 0.0, axis=0
+            )))
+            for field in ("q_b", "q_roped"):
+                head_blocks = getattr(result, field).transpose(1, 0, 2)
+                self.assertEqual(
+                    len({block.tobytes() for block in head_blocks}), 64,
+                    f"{field} must retain 64 live head signatures",
+                )
+            self.assertTrue(np.all(np.any(
+                result.output_a != 0.0, axis=0
+            )))
+            self.assertEqual(
+                int(np.count_nonzero(result.output_a)), result.output_a.size
+            )
+            self.assertEqual(
+                result.absolute_positions.tolist(), expected[count]["positions"]
+            )
+            self.assertEqual(state.length, count)
+            self.assertEqual(state.token_start, 0 if count == 2 else 2)
+            np.testing.assert_array_equal(state.rows, before)
+            self.assertEqual(result.kv_nonrope_scales.shape, (5, 7))
+            for field, shape in boundary_shapes.items():
+                boundary = getattr(result, field)
+                self.assertEqual(boundary.shape, shape, field)
+                self._assert_bfloat16_boundary(boundary)
+            for field, digest in common_digests.items():
+                self.assertEqual(
+                    self._array_digest(getattr(result, field), "<f4"),
+                    digest,
+                    field,
+                )
+            idempotent_inputs = dict(inputs)
+            idempotent_inputs["hidden_input"] = result.hidden_input
+            idempotent = stage_zero_attention_half(**idempotent_inputs)
+            for field in result.__dataclass_fields__:
+                np.testing.assert_array_equal(
+                    getattr(idempotent, field), getattr(result, field),
+                    err_msg=f"already-BF16 input changed {field}",
+                )
+            for field, digest in expected[count].items():
+                if field == "positions":
+                    continue
+                self.assertEqual(
+                    self._array_digest(getattr(result, field), "<f4"),
+                    digest,
+                    f"C={count} {field}",
+                )
+            if count == 128:
+                for field, unique_count in (
+                    ("kv_projected", 20),
+                    ("kv_normalized", 61),
+                    ("kv_roped", 264),
+                    ("kv_stored", 236),
+                ):
+                    boundary = getattr(result, field)
+                    self.assertEqual(
+                        int(np.count_nonzero(boundary)), boundary.size, field
+                    )
+                    self.assertEqual(
+                        int(np.unique(boundary).size), unique_count, field
+                    )
+                fp8_changed = (
+                    result.kv_roped[:, :-64] != result.kv_stored[:, :-64]
+                ).reshape(5, 7, 64)
+                self.assertEqual(int(np.count_nonzero(fp8_changed)), 2178)
+                np.testing.assert_array_equal(
+                    np.count_nonzero(fp8_changed, axis=(0, 2)),
+                    np.asarray([310, 312, 310, 313, 311, 311, 311]),
+                )
+                full_inputs, full_result = inputs, result
+
+        assert full_inputs is not None and full_result is not None
+        full_state = full_inputs["raw_cache"]
+        chronological_state = type(full_state)(
+            full_state.capacity,
+            full_state.token_start,
+            full_state.length,
+            logical_raw_cache(full_state),
+        )
+        chronological_inputs = dict(full_inputs)
+        chronological_inputs["raw_cache"] = chronological_state
+        chronological = stage_zero_attention_half(**chronological_inputs)
+        self.assertEqual(
+            int(np.count_nonzero(
+                full_result.attention_output != chronological.attention_output
+            )),
+            83,
+        )
+        self.assertEqual(
+            float(np.max(np.abs(
+                full_result.attention_output
+                - chronological.attention_output
+            ))),
+            0.000244140625,
+        )
+
+    def test_stage_zero_attention_half_rejects_skipped_bf16_boundaries(
+        self,
+    ) -> None:
+        inputs = self._stage_zero_attention_half_inputs(128)
+        result = stage_zero_attention_half(**inputs)
+
+        # Negative control 1: the stage input itself is published BF16 before
+        # HC-pre and is also the only legal HC-post residual.
+        raw_hidden = np.asarray(inputs["hidden_input"], dtype=np.float32)
+        self.assertEqual(
+            int(np.count_nonzero(raw_hidden != result.hidden_input)), 160
+        )
+        skipped_input_hc, skipped_input_split = hc_pre(
+            raw_hidden,
+            inputs["hc_function_weight"],
+            inputs["hc_scale"],
+            inputs["hc_base"],
+        )
+        skipped_input_hc = self._round_fixture_bfloat16(skipped_input_hc)
+        self.assertEqual(
+            int(np.count_nonzero(
+                skipped_input_hc != result.hc_pre_output
+            )),
+            14,
+        )
+        skipped_input_residual = self._round_fixture_bfloat16(hc_post(
+            result.output_b, raw_hidden, skipped_input_split
+        ))
+        self.assertEqual(
+            int(np.count_nonzero(
+                skipped_input_residual != result.hc_post_output
+            )),
+            88,
+        )
+        original_round = dspark_reference._round_bfloat16
+        round_calls = 0
+
+        def skip_first_input_round(value: np.ndarray) -> np.ndarray:
+            nonlocal round_calls
+            round_calls += 1
+            if round_calls == 1:
+                return np.asarray(value, dtype=np.float32)
+            return original_round(value)
+
+        with mock.patch.object(
+            dspark_reference,
+            "_round_bfloat16",
+            side_effect=skip_first_input_round,
+        ):
+            skipped_input_end_to_end = stage_zero_attention_half(**inputs)
+        self.assertEqual(round_calls, 26)
+        self.assertEqual(
+            int(np.count_nonzero(
+                skipped_input_end_to_end.attention_output
+                != result.attention_output
+            )),
+            640,
+        )
+        self.assertEqual(
+            int(np.count_nonzero(
+                skipped_input_end_to_end.hc_post_output
+                != result.hc_post_output
+            )),
+            92,
+        )
+
+        # Negative control 2: HC-pre is specified to return to the model dtype
+        # before attn_norm.  Keeping its float32 reduction live changes 15
+        # frozen BF16 lanes at the next publication.
+        unrounded_hc, _ = hc_pre(
+            result.hidden_input,
+            inputs["hc_function_weight"],
+            inputs["hc_scale"],
+            inputs["hc_base"],
+        )
+        unrounded_hc = np.asarray(unrounded_hc, dtype=np.float32)
+        variance = np.mean(
+            np.square(unrounded_hc), axis=-1, keepdims=True,
+            dtype=np.float32,
+        )
+        skipped_pre_attn_norm = self._round_fixture_bfloat16(
+            unrounded_hc
+            * (np.float32(1.0) / np.sqrt(variance + np.float32(1.0e-6)))
+            * np.asarray(inputs["attention_norm_weight"], dtype=np.float32)
+        )
+        self.assertEqual(
+            int(np.count_nonzero(
+                skipped_pre_attn_norm != result.attention_normalized
+            )),
+            15,
+        )
+        self.assertNotEqual(
+            self._array_digest(skipped_pre_attn_norm, "<f4"),
+            self._array_digest(result.attention_normalized, "<f4"),
+        )
+
+        # Negative control 3: per-head Q norm is not float32 RMSNorm.  The
+        # pinned BF16 expression publishes square, mean, rsqrt and multiply.
+        q_b = result.q_b.astype(np.float32)
+        wrong_q_variance = np.mean(
+            np.square(q_b), axis=-1, keepdims=True, dtype=np.float32
+        )
+        wrong_q_norm = self._round_fixture_bfloat16(
+            q_b * (
+                np.float32(1.0)
+                / np.sqrt(wrong_q_variance + np.float32(1.0e-6))
+            )
+        )
+        self.assertEqual(
+            int(np.count_nonzero(
+                wrong_q_norm != result.q_head_normalized
+            )),
+            52096,
+        )
+
+        # Negative control 4: wo_a publishes BF16 before wo_b.  Feeding the
+        # unrounded grouped projection directly into wo_b changes 19
+        # final BF16 lanes for the wrapped fixture.
+        grouped = result.attention_inverse_roped.astype(np.float32).reshape(
+            5, 8, 8 * 512
+        )
+        unrounded_output_a = np.einsum(
+            "qgd,grd->qgr",
+            grouped,
+            np.asarray(inputs["output_a_weight"], dtype=np.float32),
+            dtype=np.float32,
+            optimize=False,
+        )
+        skipped_output_a_store = self._round_fixture_bfloat16(
+            unrounded_output_a.reshape(5, -1)
+            @ np.asarray(inputs["output_b_weight"], dtype=np.float32).T
+        )
+        self.assertEqual(
+            int(np.count_nonzero(
+                skipped_output_a_store != result.output_b
+            )),
+            19,
+        )
+        self.assertNotEqual(
+            self._array_digest(skipped_output_a_store, "<f4"),
+            self._array_digest(result.output_b, "<f4"),
+        )
+
+        # Negative control 5: official flattening is group-major then rank.
+        # With rank >= 2, a plausible rank-major transpose is observable.
+        wrong_output_layout = self._round_fixture_bfloat16(
+            np.transpose(result.output_a, (0, 2, 1)).reshape(5, -1)
+            @ np.asarray(inputs["output_b_weight"], dtype=np.float32).T
+        )
+        self.assertEqual(
+            int(np.count_nonzero(wrong_output_layout != result.output_b)),
+            40,
+        )
+
+        # Negative control 6: Q-B rows are head-specific.  Rotating the 64
+        # head blocks must not preserve sparse attention or its digest.
+        permuted_inputs = dict(inputs)
+        q_b_weight = np.asarray(inputs["q_b_weight"], dtype=np.float32)
+        permuted_inputs["q_b_weight"] = np.roll(
+            q_b_weight.reshape(64, 512, 8), shift=1, axis=0
+        ).reshape(64 * 512, 8)
+        permuted = stage_zero_attention_half(**permuted_inputs)
+        for field in ("q_b", "q_roped", "attention_output"):
+            changed_heads = (
+                getattr(permuted, field) != getattr(result, field)
+            ).reshape(5, 64, -1).any(axis=(0, 2))
+            self.assertTrue(
+                np.all(changed_heads),
+                f"Q-B head rotation left a fixed point in {field}",
+            )
+        self.assertEqual(
+            int(np.count_nonzero(
+                permuted.attention_output != result.attention_output
+            )),
+            1429,
+        )
+
+    def test_stage_zero_attention_half_binds_rope_to_cache_frontier(
+        self,
+    ) -> None:
+        for count in (2, 128):
+            inputs = self._stage_zero_attention_half_inputs(count)
+            for offset in (1, 997):
+                bad = dict(inputs)
+                bad["absolute_positions"] = (
+                    np.asarray(inputs["absolute_positions"], dtype=np.int64)
+                    + offset
+                )
+                with self.assertRaisesRegex(
+                    ValueError, "start at committed cache end"
+                ):
+                    stage_zero_attention_half(**bad)
+                with self.assertRaisesRegex(
+                    ValueError, "start at committed cache end"
+                ):
+                    self._mlx_stage_zero_attention_half(bad)
+
+    def test_stage_zero_attention_half_rejects_invalid_inputs_pre_device(
+        self,
+    ) -> None:
+        """Both implementations fail closed before optional MLX is loaded."""
+
+        def nan_copy(value: object) -> np.ndarray:
+            result = np.array(value, dtype=np.float32, copy=True)
+            result.flat[0] = np.nan
+            return result
+
+        def nan_cache(inputs: dict[str, object]) -> object:
+            state = inputs["raw_cache"]
+            rows = np.array(state.rows, copy=True)
+            rows[0, 0, 0] = np.nan
+            return type(state)(
+                state.capacity, state.token_start, state.length, rows
+            )
+
+        def nan_transient(
+            inputs: dict[str, object], stage: int
+        ) -> np.ndarray:
+            result = np.array(
+                inputs["other_stage_draft_rows"],
+                dtype=np.float32,
+                copy=True,
+            )
+            result[stage, 0, 0] = np.nan
+            return result
+
+        cases = (
+            ("empty hidden", "hidden_input",
+             lambda _i: np.empty((5, 4, 0), dtype=np.float32), {},
+             "finite and non-empty"),
+            ("nonfinite hidden", "hidden_input",
+             lambda i: nan_copy(i["hidden_input"]), {}, "finite"),
+            ("HC shape", "hc_function_weight",
+             lambda _i: np.zeros((23, 32), dtype=np.float32), {},
+             "HC function weight"),
+            ("HC scale shape", "hc_scale",
+             lambda _i: np.zeros(2, dtype=np.float32), {},
+             "HC scale/base"),
+            ("HC base shape", "hc_base",
+             lambda _i: np.zeros(23, dtype=np.float32), {},
+             "HC scale/base"),
+            ("attention norm shape", "attention_norm_weight",
+             lambda _i: np.zeros(7, dtype=np.float32), {},
+             "attention norm"),
+            ("Q norm shape", "q_a_norm_weight",
+             lambda _i: np.zeros(7, dtype=np.float32), {}, "q_a norm"),
+            ("KV shape", "kv_weight",
+             lambda _i: np.zeros((511, 8), dtype=np.float32), {},
+             "KV weight"),
+            ("KV norm shape", "kv_norm_weight",
+             lambda _i: np.zeros(511, dtype=np.float32), {}, "KV norm"),
+            ("sink shape", "attention_sinks",
+             lambda _i: np.zeros(63, dtype=np.float32), {},
+             "attention_sinks"),
+            ("nonfinite HC", "hc_function_weight",
+             lambda i: nan_copy(i["hc_function_weight"]), {}, "finite"),
+            ("nonfinite Q", "q_b_weight",
+             lambda i: nan_copy(i["q_b_weight"]), {}, "finite"),
+            ("nonfinite ring", "raw_cache", nan_cache, {},
+             "invalid|finite"),
+            ("nonfinite transient stage 1", "other_stage_draft_rows",
+             lambda i: nan_transient(i, 1), {}, "finite"),
+            ("nonfinite transient stage 2", "other_stage_draft_rows",
+             lambda i: nan_transient(i, 2), {}, "finite"),
+            ("nonfinite sink", "attention_sinks",
+             lambda i: nan_copy(i["attention_sinks"]), {}, "finite"),
+            ("nonfinite output A", "output_a_weight",
+             lambda i: nan_copy(i["output_a_weight"]), {}, "finite"),
+            ("nonfinite output B", "output_b_weight",
+             lambda i: nan_copy(i["output_b_weight"]), {}, "finite"),
+            ("norm epsilon", None, None, {"norm_eps": 0.0}, "norm_eps"),
+            ("HC epsilon", None, None, {"hc_eps": np.nan}, "hc_eps"),
+            ("HC iterations zero", None, None, {"hc_iterations": 0},
+             "hc_iterations"),
+            ("HC iterations bool", None, None, {"hc_iterations": True},
+             "hc_iterations"),
+            ("RoPE theta", None, None, {"rope_theta": 0.0}, "rope_theta"),
+        )
+
+        for label, key, replacement, kwargs, error in cases:
+            inputs = self._stage_zero_attention_half_inputs(2)
+            if key is not None:
+                inputs[key] = replacement(inputs)
+            with self.subTest(case=label, implementation="NumPy"):
+                with mock.patch.object(
+                    mlx_optional,
+                    "_mlx",
+                    side_effect=AssertionError("device reached"),
+                ) as device:
+                    with self.assertRaisesRegex(ValueError, error):
+                        stage_zero_attention_half(**inputs, **kwargs)
+                    device.assert_not_called()
+            with self.subTest(case=label, implementation="MLX"):
+                with mock.patch.object(
+                    mlx_optional,
+                    "_mlx",
+                    side_effect=AssertionError("device reached"),
+                ) as device:
+                    with self.assertRaisesRegex(ValueError, error):
+                        self._mlx_stage_zero_attention_half(inputs, **kwargs)
+                    device.assert_not_called()
 
     def test_raw_cache_rejects_non_0731_geometry(self) -> None:
         with self.assertRaisesRegex(ValueError, "capacity must be 128"):
@@ -1680,6 +2329,10 @@ class OracleFixtureTests(unittest.TestCase):
             mlx_optional.MLX_BF16_ATTENTION_OUTPUT_MAX_ABS_DRIFT,
             2.44140625e-4,
         )
+        self.assertEqual(
+            mlx_optional.MLX_BF16_STAGE_ZERO_ATTENTION_MAX_ABS_DRIFT,
+            2.44140625e-4,
+        )
         self.assertGreater(
             mlx_optional.MLX_F32_MARKOV_MATMUL_MAX_ABS_DRIFT,
             mlx_optional.MLX_F32_CONFIDENCE_MAX_ABS_DRIFT,
@@ -2029,6 +2682,70 @@ class OracleFixtureTests(unittest.TestCase):
             numpy_attention,
             mlx_optional.MLX_BF16_ATTENTION_OUTPUT_MAX_ABS_DRIFT,
         )
+
+        # The compact stage-zero fixture keeps the exact final attention
+        # geometry while reducing only hidden/Q-LoRA/output-LoRA fixture
+        # widths.  Deterministic compact projections and the conditioned V
+        # path keep upstream drift from becoming a whole-chain cascade.
+        for committed_count in (2, 128):
+            stage_inputs = self._stage_zero_attention_half_inputs(
+                committed_count
+            )
+            numpy_stage = stage_zero_attention_half(**stage_inputs)
+            mlx_stage = self._mlx_stage_zero_attention_half(stage_inputs)
+            np.testing.assert_array_equal(
+                mlx_stage.absolute_positions,
+                numpy_stage.absolute_positions,
+            )
+            for field in numpy_stage.__dataclass_fields__:
+                if field in (
+                    "absolute_positions",
+                    "attention_output",
+                    "attention_inverse_roped",
+                ):
+                    continue
+                self.assert_max_abs_drift(
+                    f"MLX stage-zero C={committed_count} {field}",
+                    getattr(mlx_stage, field),
+                    getattr(numpy_stage, field),
+                    0.0,
+                )
+            for field in (
+                "attention_output", "attention_inverse_roped"
+            ):
+                actual_boundary = getattr(mlx_stage, field)
+                expected_boundary = getattr(numpy_stage, field)
+                self.assert_max_abs_drift(
+                    f"MLX stage-zero C={committed_count} {field}",
+                    actual_boundary,
+                    expected_boundary,
+                    mlx_optional.MLX_BF16_STAGE_ZERO_ATTENTION_MAX_ABS_DRIFT,
+                )
+                difference = actual_boundary != expected_boundary
+                expected_differences = (
+                    0 if committed_count == 2 else
+                    2 if field == "attention_output" else 10
+                )
+                self.assertEqual(
+                    int(np.count_nonzero(difference)),
+                    expected_differences,
+                    f"MLX stage-zero C={committed_count} {field} lane count",
+                )
+                if expected_differences:
+                    actual_codes = np.asarray(
+                        actual_boundary, dtype=np.float32
+                    ).view(np.uint32) >> np.uint32(16)
+                    expected_codes = np.asarray(
+                        expected_boundary, dtype=np.float32
+                    ).view(np.uint32) >> np.uint32(16)
+                    code_distance = np.abs(
+                        actual_codes.astype(np.int32)
+                        - expected_codes.astype(np.int32)
+                    )
+                    np.testing.assert_array_equal(
+                        code_distance[difference],
+                        np.ones(expected_differences, dtype=np.int32),
+                    )
 
     def test_runtime_capture_call_sites_match_oracle_contract(self) -> None:
         source = DS4_SOURCE_PATH.read_text(encoding="utf-8")

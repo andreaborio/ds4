@@ -130,6 +130,38 @@ class DSparkAttentionResult:
     physical_kv: np.ndarray
 
 
+@dataclass(frozen=True)
+class StageZeroAttentionHalf:
+    """Named BF16 publications through the final-0731 stage-zero attention half.
+
+    The synthetic hidden, Q-LoRA and output-LoRA widths may be smaller than the
+    checkpoint so model-free fixtures stay compact.  The semantically relevant
+    attention seam is not reduced: every query, transient KV row and attention
+    output is still ``[5, 64, 512]`` and the committed context is the physical
+    final-0731 ``[128, 512]`` ring.
+    """
+
+    absolute_positions: np.ndarray
+    hidden_input: np.ndarray
+    hc_pre_output: np.ndarray
+    attention_normalized: np.ndarray
+    q_a: np.ndarray
+    q_a_normalized: np.ndarray
+    q_b: np.ndarray
+    q_head_normalized: np.ndarray
+    q_roped: np.ndarray
+    kv_projected: np.ndarray
+    kv_normalized: np.ndarray
+    kv_roped: np.ndarray
+    kv_stored: np.ndarray
+    kv_nonrope_scales: np.ndarray
+    attention_output: np.ndarray
+    attention_inverse_roped: np.ndarray
+    output_a: np.ndarray
+    output_b: np.ndarray
+    hc_post_output: np.ndarray
+
+
 # These are the numerical guards in DeepSpec's pinned evaluator.  They are
 # deliberately named here: callers must not mistake them for a different
 # proposal distribution or an adjustable product policy.
@@ -142,6 +174,8 @@ DSPARK_TARGET_LAYER_IDS = (40, 41, 42)
 DSPARK_ATTENTION_HEADS = 64
 DSPARK_ATTENTION_BLOCK = 64
 DSPARK_PROPOSAL_ROWS = 5
+DSPARK_ROPE_WIDTH = 64
+DSPARK_OUTPUT_GROUPS = 8
 
 
 def post_layer_hc_mean(hidden_states: np.ndarray) -> np.ndarray:
@@ -333,6 +367,99 @@ def _round_bfloat16(value: np.ndarray) -> np.ndarray:
     rounding = np.uint32(0x7FFF) + ((bits >> np.uint32(16)) & np.uint32(1))
     rounded = (bits + rounding) & np.uint32(0xFFFF0000)
     return rounded.view(np.float32)
+
+
+def _linear_bfloat16(value: np.ndarray, weight: np.ndarray) -> np.ndarray:
+    """Apply one compact fixture linear and publish its BF16 result."""
+
+    source = np.asarray(value, dtype=np.float32)
+    matrix = np.asarray(weight, dtype=np.float32)
+    return _round_bfloat16(source @ matrix.T)
+
+
+def _rms_norm_bfloat16(
+    value: np.ndarray,
+    weight: np.ndarray,
+    *,
+    eps: float,
+) -> np.ndarray:
+    """Apply official float32 RMS accumulation and publish BF16."""
+
+    source = np.asarray(value, dtype=np.float32)
+    weights = np.asarray(weight, dtype=np.float32)
+    variance = np.mean(
+        np.square(source), axis=-1, keepdims=True, dtype=np.float32
+    )
+    normalized = (
+        source
+        * (np.float32(1.0) / np.sqrt(variance + np.float32(eps)))
+        * weights
+    )
+    return _round_bfloat16(normalized)
+
+
+def _q_head_norm_bfloat16(value: np.ndarray, *, eps: float) -> np.ndarray:
+    """Reproduce the pinned BF16 expression used for per-head Q norm.
+
+    Unlike :class:`RMSNorm`, the official source does not promote ``q`` with
+    ``.float()``.  Square, the published reduction result, reciprocal square
+    root, and final multiply therefore each return to BF16.
+    """
+
+    source = np.asarray(value, dtype=np.float32)
+    squared = _round_bfloat16(np.square(source))
+    mean = _round_bfloat16(np.mean(
+        squared, axis=-1, keepdims=True, dtype=np.float32
+    ))
+    added = _round_bfloat16(mean + np.float32(eps))
+    inverse_rms = _round_bfloat16(
+        np.float32(1.0) / np.sqrt(added)
+    )
+    return _round_bfloat16(source * inverse_rms)
+
+
+def _rope_tail_bfloat16(
+    value: np.ndarray,
+    absolute_positions: np.ndarray,
+    *,
+    inverse: bool,
+    rope_theta: float,
+) -> np.ndarray:
+    """Rotate the final 64 values and publish only that changed BF16 tail."""
+
+    source = np.asarray(value, dtype=np.float32)
+    positions = np.asarray(absolute_positions, dtype=np.float32)
+    if source.ndim < 2 or source.shape[0] != positions.shape[0]:
+        raise ValueError("RoPE positions must match the first tensor dimension")
+    if source.shape[-1] < DSPARK_ROPE_WIDTH:
+        raise ValueError("RoPE input must expose the final 64 dimensions")
+    result = np.array(source, copy=True)
+    paired = result[..., -DSPARK_ROPE_WIDTH:].reshape(
+        *result.shape[:-1], DSPARK_ROPE_WIDTH // 2, 2
+    )
+    frequency = np.float32(1.0) / np.power(
+        np.float32(rope_theta),
+        np.arange(0, DSPARK_ROPE_WIDTH, 2, dtype=np.float32)
+        / np.float32(DSPARK_ROPE_WIDTH),
+        dtype=np.float32,
+    )
+    angle_shape = (
+        (positions.shape[0],)
+        + (1,) * (source.ndim - 2)
+        + (DSPARK_ROPE_WIDTH // 2,)
+    )
+    angles = (positions[:, None] * frequency[None, :]).reshape(angle_shape)
+    cosine = np.cos(angles).astype(np.float32)
+    sine = np.sin(angles).astype(np.float32)
+    if inverse:
+        sine = -sine
+    first = paired[..., 0] * cosine - paired[..., 1] * sine
+    second = paired[..., 0] * sine + paired[..., 1] * cosine
+    rotated = np.stack((first, second), axis=-1).reshape(
+        *result.shape[:-1], DSPARK_ROPE_WIDTH
+    )
+    result[..., -DSPARK_ROPE_WIDTH:] = _round_bfloat16(rotated)
+    return result
 
 
 def _e4m3fn_positive_values() -> tuple[np.ndarray, np.ndarray]:
@@ -1271,6 +1398,243 @@ def dspark_attention_official(
     return DSparkAttentionResult(
         output,
         physical.astype(np.float64),
+    )
+
+
+def stage_zero_attention_half(
+    hidden_input: np.ndarray,
+    hc_function_weight: np.ndarray,
+    hc_scale: Sequence[float] | np.ndarray,
+    hc_base: Sequence[float] | np.ndarray,
+    attention_norm_weight: Sequence[float] | np.ndarray,
+    q_a_weight: np.ndarray,
+    q_a_norm_weight: Sequence[float] | np.ndarray,
+    q_b_weight: np.ndarray,
+    kv_weight: np.ndarray,
+    kv_norm_weight: Sequence[float] | np.ndarray,
+    absolute_positions: Sequence[int] | np.ndarray,
+    raw_cache: RawCacheState,
+    other_stage_draft_rows: np.ndarray,
+    attention_sinks: Sequence[float] | np.ndarray,
+    output_a_weight: np.ndarray,
+    output_b_weight: np.ndarray,
+    *,
+    norm_eps: float = 1.0e-6,
+    hc_eps: float = 1.0e-6,
+    hc_iterations: int = 20,
+    rope_theta: float = 10000.0,
+) -> StageZeroAttentionHalf:
+    """Run the ordered final-0731 stage-zero attention half model-free.
+
+    This freezes operation order and storage precision, not checkpoint weight
+    numerics.  Compact fixtures may reduce hidden width, Q-LoRA rank and
+    output-LoRA rank.  They may not reduce the five query rows, 64 heads,
+    512-wide head/KV state, 64-wide RoPE tail, eight output groups, or the
+    physical 128-row context ring used by :func:`dspark_attention_official`.
+
+    ``hidden_input`` is itself the first named BF16 publication.  HC-pre and
+    HC-post consume only that reopened value, so an already-BF16 caller is
+    idempotent and an unrounded float32 residual cannot bypass the boundary.
+    Every later named activation is likewise reopened in float32 after an
+    official BF16 publication; the seven non-RoPE scales remain float32.  The
+    target-derived committed ring is read without mutation; this call replaces
+    only stage zero of the supplied transient draft template with the KV rows
+    derived from the HC-pre attention input.
+
+    """
+
+    hidden_source = np.asarray(hidden_input, dtype=np.float32)
+    if (hidden_source.ndim != 3 or
+            hidden_source.shape[:2] != (DSPARK_PROPOSAL_ROWS, 4)):
+        raise ValueError("stage-zero hidden must have shape [5, 4, hidden]")
+    hidden_width = hidden_source.shape[2]
+    if hidden_width == 0 or not np.all(np.isfinite(hidden_source)):
+        raise ValueError("stage-zero hidden must be finite and non-empty")
+    hidden = _round_bfloat16(hidden_source)
+    positions_raw = np.asarray(absolute_positions)
+    if (positions_raw.shape != (DSPARK_PROPOSAL_ROWS,) or
+            not np.issubdtype(positions_raw.dtype, np.integer)):
+        raise ValueError("absolute_positions must contain five integers")
+    positions = positions_raw.astype(np.int64, copy=False)
+    if (np.any(positions < 0) or
+            np.any(np.diff(positions) != np.int64(1))):
+        raise ValueError("absolute_positions must be five consecutive positions")
+    _validate_raw_cache_state(raw_cache)
+    if positions[0] != raw_cache.token_start + raw_cache.length:
+        raise ValueError("absolute_positions must start at committed cache end")
+    if not np.isfinite(float(norm_eps)) or norm_eps <= 0.0:
+        raise ValueError("norm_eps must be finite and positive")
+    if not np.isfinite(float(hc_eps)) or hc_eps <= 0.0:
+        raise ValueError("hc_eps must be finite and positive")
+    if (isinstance(hc_iterations, bool) or
+            not isinstance(hc_iterations, (int, np.integer)) or
+            int(hc_iterations) < 1):
+        raise ValueError("hc_iterations must be a positive integer")
+    if not np.isfinite(float(rope_theta)) or rope_theta <= 0.0:
+        raise ValueError("rope_theta must be finite and positive")
+
+    hc_function = np.asarray(hc_function_weight, dtype=np.float32)
+    hc_scales = np.asarray(hc_scale, dtype=np.float32)
+    hc_bases = np.asarray(hc_base, dtype=np.float32)
+    attention_norm = np.asarray(attention_norm_weight, dtype=np.float32)
+    q_a_matrix = np.asarray(q_a_weight, dtype=np.float32)
+    q_a_norm = np.asarray(q_a_norm_weight, dtype=np.float32)
+    q_b_matrix = np.asarray(q_b_weight, dtype=np.float32)
+    kv_matrix = np.asarray(kv_weight, dtype=np.float32)
+    kv_norm = np.asarray(kv_norm_weight, dtype=np.float32)
+    transient = np.asarray(other_stage_draft_rows, dtype=np.float32)
+    sinks = np.asarray(attention_sinks, dtype=np.float32)
+    output_a_matrix = np.asarray(output_a_weight, dtype=np.float32)
+    output_b_matrix = np.asarray(output_b_weight, dtype=np.float32)
+    q_rank = q_a_matrix.shape[0] if q_a_matrix.ndim == 2 else 0
+    output_rank = (
+        output_a_matrix.shape[1] if output_a_matrix.ndim == 3 else 0
+    )
+    expected_q_b = (
+        DSPARK_ATTENTION_HEADS * DSPARK_RAW_CACHE_WIDTH,
+        q_rank,
+    )
+    expected_output_a = (
+        DSPARK_OUTPUT_GROUPS,
+        output_rank,
+        (DSPARK_ATTENTION_HEADS // DSPARK_OUTPUT_GROUPS)
+        * DSPARK_RAW_CACHE_WIDTH,
+    )
+    if hc_function.shape != (24, 4 * hidden_width):
+        raise ValueError("HC function weight must have shape [24, 4 * hidden]")
+    if hc_scales.shape != (3,) or hc_bases.shape != (24,):
+        raise ValueError("HC scale/base geometry mismatch")
+    if attention_norm.shape != (hidden_width,):
+        raise ValueError("attention norm weight must match hidden width")
+    if q_rank == 0 or q_a_matrix.shape[1:] != (hidden_width,):
+        raise ValueError("q_a weight must have shape [q_rank, hidden]")
+    if q_a_norm.shape != (q_rank,):
+        raise ValueError("q_a norm weight must match q_rank")
+    if q_b_matrix.shape != expected_q_b:
+        raise ValueError("q_b weight must have shape [64 * 512, q_rank]")
+    if kv_matrix.shape != (DSPARK_RAW_CACHE_WIDTH, hidden_width):
+        raise ValueError("KV weight must have shape [512, hidden]")
+    if kv_norm.shape != (DSPARK_RAW_CACHE_WIDTH,):
+        raise ValueError("KV norm weight must have shape [512]")
+    if transient.shape != (
+        DSPARK_STAGE_COUNT, DSPARK_PROPOSAL_ROWS, DSPARK_RAW_CACHE_WIDTH
+    ):
+        raise ValueError("other_stage_draft_rows must have shape [3, 5, 512]")
+    if sinks.shape != (DSPARK_ATTENTION_HEADS,):
+        raise ValueError("attention_sinks must have shape [64]")
+    if (output_rank < 2 or output_a_matrix.shape != expected_output_a):
+        raise ValueError(
+            "output_a weight must have shape [8, output_rank>=2, 8 * 512]"
+        )
+    if output_b_matrix.shape != (
+        hidden_width, DSPARK_OUTPUT_GROUPS * output_rank
+    ):
+        raise ValueError("output_b weight must have shape [hidden, 8 * output_rank]")
+    if not all(np.all(np.isfinite(item)) for item in (
+        hc_function, hc_scales, hc_bases, attention_norm,
+        q_a_matrix, q_a_norm, q_b_matrix,
+        kv_matrix, kv_norm, transient, sinks, output_a_matrix,
+        output_b_matrix,
+    )):
+        raise ValueError("stage-zero attention weights and inputs must be finite")
+
+    reduced, split = hc_pre(
+        hidden,
+        hc_function,
+        hc_scales,
+        hc_bases,
+        norm_eps=norm_eps,
+        hc_eps=hc_eps,
+        iterations=hc_iterations,
+    )
+    hc_pre_output = _round_bfloat16(reduced)
+    attention_normalized = _rms_norm_bfloat16(
+        hc_pre_output, attention_norm, eps=norm_eps
+    )
+
+    q_a = _linear_bfloat16(attention_normalized, q_a_matrix)
+    q_a_normalized = _rms_norm_bfloat16(q_a, q_a_norm, eps=norm_eps)
+    q_b = _linear_bfloat16(q_a_normalized, q_b_matrix).reshape(
+        DSPARK_PROPOSAL_ROWS,
+        DSPARK_ATTENTION_HEADS,
+        DSPARK_RAW_CACHE_WIDTH,
+    )
+    q_head_normalized = _q_head_norm_bfloat16(q_b, eps=norm_eps)
+    q_roped = _rope_tail_bfloat16(
+        q_head_normalized,
+        positions,
+        inverse=False,
+        rope_theta=rope_theta,
+    )
+
+    kv_projected = _linear_bfloat16(attention_normalized, kv_matrix)
+    kv_normalized = _rms_norm_bfloat16(
+        kv_projected, kv_norm, eps=norm_eps
+    )
+    kv_roped = _rope_tail_bfloat16(
+        kv_normalized,
+        positions,
+        inverse=False,
+        rope_theta=rope_theta,
+    )
+    kv_stored = np.array(kv_roped, copy=True)
+    kv_stored[:, :-DSPARK_ROPE_WIDTH], kv_scales = (
+        _simulate_official_nope_fp8(kv_stored[:, :-DSPARK_ROPE_WIDTH])
+    )
+
+    draft_rows = np.array(transient, copy=True)
+    draft_rows[0] = kv_stored
+    attention = dspark_attention_official(
+        q_roped,
+        raw_cache,
+        draft_rows,
+        sinks,
+        stage=0,
+    ).output.astype(np.float32)
+    inverse_roped = _rope_tail_bfloat16(
+        attention,
+        positions,
+        inverse=True,
+        rope_theta=rope_theta,
+    )
+    grouped = inverse_roped.reshape(
+        DSPARK_PROPOSAL_ROWS,
+        DSPARK_OUTPUT_GROUPS,
+        (DSPARK_ATTENTION_HEADS // DSPARK_OUTPUT_GROUPS)
+        * DSPARK_RAW_CACHE_WIDTH,
+    )
+    output_a = _round_bfloat16(np.einsum(
+        "qgd,grd->qgr",
+        grouped,
+        output_a_matrix,
+        dtype=np.float32,
+        optimize=False,
+    ))
+    output_b = _linear_bfloat16(
+        output_a.reshape(DSPARK_PROPOSAL_ROWS, -1), output_b_matrix
+    )
+    hc_post_output = _round_bfloat16(hc_post(output_b, hidden, split))
+
+    return StageZeroAttentionHalf(
+        np.array(positions, copy=True),
+        hidden,
+        hc_pre_output,
+        attention_normalized,
+        q_a,
+        q_a_normalized,
+        q_b,
+        q_head_normalized,
+        q_roped,
+        kv_projected,
+        kv_normalized,
+        kv_roped,
+        kv_stored,
+        kv_scales.astype(np.float32),
+        attention,
+        inverse_roped,
+        output_a,
+        output_b,
+        hc_post_output,
     )
 
 

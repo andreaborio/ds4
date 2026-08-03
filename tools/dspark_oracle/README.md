@@ -76,6 +76,49 @@ final BF16 output. The deterministic full-ring fixture changes 10,073 output
 lanes (maximum `0.00048828125`) if a plausible chronological staging shortcut
 is substituted, so the rejected order cannot pass under a loose float bound.
 
+The stage-zero attention-half fixture freezes the official ordered seam as
+`HC-pre -> attention norm -> Q-A -> Q-A norm -> Q-B -> per-head norm -> RoPE`
+in parallel with `KV -> KV norm -> RoPE -> non-RoPE FP8 Q/DQ`, followed by the
+physical two-source attention, inverse RoPE, grouped output-A, output-B, and
+HC-post. The stage input is first published to BF16; that reopened value is
+used by both HC-pre and the HC-post residual. Every other named return to model
+storage is also explicit BF16. Per-head Q normalization separately publishes
+BF16 after square, mean, epsilon addition, reciprocal square root, and final
+multiply. Absolute proposal positions must begin at the committed raw-cache
+frontier, so RoPE cannot silently detach from cache history. The fixture covers
+both a partial `C=2` ring and a physical wrapped `C=128` ring.
+
+The compact Q-B projection retains all eight reduced Q ranks and gives every
+one of the 64 heads a distinct exact signature. Rotating its head blocks
+changes all 64 heads through Q, RoPE, and attention, including 1,429 wrapped
+attention lanes. Output-A uses rank two, makes both ranks live in every group,
+and exposes the required group-major/rank-minor flattening: a rank-major
+mutation changes all 40 output-B lanes. Other negative controls are likewise
+observable. Rebuilding the full ring chronologically changes 83 attention
+lanes (maximum `0.000244140625`); skipping the input publication changes 14
+HC-pre lanes, 640 attention lanes, and 92 HC-post lanes; substituting the raw
+input only as the residual changes 88 HC-post lanes. Omitting BF16 before
+attention norm changes 15 lanes, using a float32-until-final Q norm changes
+52,096 lanes, and omitting the output-A publication changes 19 lanes.
+
+That fixture does not claim synthetic reduced weights reproduce checkpoint
+weights. Hidden width and Q-LoRA/output-LoRA ranks are reduced to keep the
+fixture small; the semantic attention seam remains the final geometry
+`[5, 64, 512]`, with eight output groups and the physical `[128, 512]` ring.
+Its dense synthetic GEMMs do not simulate the activation or weight
+quantization of Q-A, Q-B, KV, output-A, or output-B, and they do not exercise
+the production Q8 Metal decoder. Those require real-weight runtime captures.
+Deterministic compact projections only keep this boundary oracle numerically
+well-conditioned. In particular, the fixture gives the synthetic V path a
+small positive floor to avoid cancellation around zero. That conditioning is
+not evidence about checkpoint value distributions; the separate raw-context
+oracle covers general signed storage inputs and varying FP8 group scales. On
+MLX 0.32 Metal every named boundary before attention, and every boundary after
+inverse RoPE, is exact against NumPy. `C=2` attention and inverse RoPE are also
+exact; at wrapped `C=128`, attention differs in two lanes and inverse RoPE in
+ten. Every difference is one adjacent BF16 code with maximum absolute drift
+`0.000244140625`.
+
 `schema.json` maps the pinned official Hugging Face config to the canonical
 combined-GGUF `dspark.*` records and to the standalone support header, including
 its six authenticated source-provenance fields. The target keeps
@@ -182,6 +225,8 @@ What is validated now:
   current-frontier row;
 - five-row/64-head two-source attention with the pinned 64-row online-softmax,
   per-block BF16 numerator weights, denominator-only sinks, and BF16 output;
+- ordered stage-zero attention-half boundaries from HC-pre through HC-post,
+  including C=2 and C=128 wrapped physical-ring cases and boundary mutations;
 - pending `y[p+1]`, candidate inputs `p+1..p+5`, and proposed outputs
   `p+2..p+6`;
 - final-head wiring into greedy/sampled sequential Markov and per-position
