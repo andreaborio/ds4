@@ -3323,6 +3323,130 @@ class OracleFixtureTests(unittest.TestCase):
             np.tile(np.arange(6, dtype=np.int32), (4, 1)),
         )
 
+    def test_native_support_routed_checkpoint_matches_frozen_oracle(self) -> None:
+        source = DS4_METAL_SOURCE_PATH.read_text(encoding="utf-8")
+
+        def initializer(name: str) -> str:
+            match = re.search(
+                rf"{re.escape(name)}[^=]*=\s*\{{(.*?)\n\s*\}};",
+                source,
+                re.DOTALL,
+            )
+            self.assertIsNotNone(match, name)
+            assert match is not None
+            return match.group(1)
+
+        def uint32_values(name: str) -> np.ndarray:
+            return np.asarray([
+                int(value, 16)
+                for value in re.findall(
+                    r"UINT32_C\(0x([0-9a-fA-F]+)\)",
+                    initializer(name),
+                )
+            ], dtype=np.uint32)
+
+        selected = np.asarray([
+            int(value)
+            for value in re.findall(
+                r"(?<![xA-Fa-f0-9])(-?\d+)(?=\s*,)",
+                initializer("g_dspark_routed_test_selected"),
+            )
+        ], dtype=np.int32).reshape(5, 6)
+        np.testing.assert_array_equal(selected, FFN_SELECTED_EXPERTS)
+
+        fixture = build_physical_ffn_fixture()
+        result = dspark_reference.stage_ffn_moe_payload_first(
+            **fixture.inputs
+        )
+        weight_bits = uint32_values(
+            "g_dspark_routed_test_weight_bits"
+        )
+        np.testing.assert_array_equal(
+            weight_bits,
+            result.expert_weights.astype("<f4").view("<u4").reshape(-1),
+        )
+
+        def in_expert_id_order(field: str) -> np.ndarray:
+            values = getattr(result, field)
+            return np.stack([
+                values[row, slot]
+                for row in range(5)
+                for slot in np.argsort(
+                    result.selected_experts[row], kind="stable"
+                )
+            ]).astype("<f4")
+
+        sorted_down = in_expert_id_order("routed_down").view("<u4")
+        down_pattern = uint32_values(
+            "g_dspark_routed_test_down_pattern"
+        ).reshape(30, 4)
+        np.testing.assert_array_equal(down_pattern, sorted_down[:, :4])
+        np.testing.assert_array_equal(
+            sorted_down, np.tile(down_pattern, (1, 1024))
+        )
+
+        routed_sum = result.routed_sum.astype("<f4").view("<u4")
+        sum_pattern = uint32_values(
+            "g_dspark_routed_test_sum_pattern"
+        ).reshape(5, 4)
+        np.testing.assert_array_equal(sum_pattern, routed_sum[:, :4])
+        np.testing.assert_array_equal(
+            routed_sum, np.tile(sum_pattern, (1, 1024))
+        )
+
+        expected_hashes = {
+            "input": self._array_digest(result.ffn_normalized, "<f4"),
+            "gate": self._array_digest(
+                in_expert_id_order("routed_gate"), "<f4"
+            ),
+            "up": self._array_digest(
+                in_expert_id_order("routed_up"), "<f4"
+            ),
+            "mid": self._array_digest(
+                in_expert_id_order("routed_mid"), "<f4"
+            ),
+            "down": self._array_digest(
+                in_expert_id_order("routed_down"), "<f4"
+            ),
+            "sum": self._array_digest(result.routed_sum, "<f4"),
+        }
+        self.assertEqual(expected_hashes, {
+            "input":
+                "c6a60e7d9980460fd4e0c7c0bf86e3714529c97985a85d7bcaafede9d28660f3",
+            "gate":
+                "5fab35c8aada22905d435ee298f2cb8b2ee50e46db0bbfc43aee6d16e5dd9f9c",
+            "up":
+                "b9599f7561f30bd39563f2869c3b29d2d8a24ec04da4cbbc29ac27055ba6d5cd",
+            "mid":
+                "121738d8b17fd4709825df9eda1817067f880fe2692158d527b616bcf401c6b2",
+            "down":
+                "c851ef3f25fb561eda6dd6c8d3cf228cf07ac9ca121df1237e99ed18a5eca30a",
+            "sum":
+                "a0fffc630dffb5e5453e4a592b3259cb518a1de0179c7565ec3639674af1ad85",
+        })
+        for digest in expected_hashes.values():
+            self.assertIn(digest, source)
+        self.assertEqual(
+            ffn_payload_manifest(fixture)["routed_payload_sha256"],
+            "49bf413cc3e98472a7aceb53b1b4a16b83ab2182354dfe766815c3a064f274bb",
+        )
+        self.assertIn(
+            "49bf413cc3e98472a7aceb53b1b4a16b83ab2182354dfe766815c3a064f274bb",
+            source,
+        )
+
+        self.assertEqual(
+            uint32_values("g_dspark_routed_test_sum_control").tolist(),
+            [
+                0x36950000,
+                0x2A330000,
+                0x44490000,
+                0x475F0000,
+                0xC1120000,
+                0x4E2E0000,
+            ],
+        )
+
     def assert_max_abs_drift(
         self,
         label: str,
