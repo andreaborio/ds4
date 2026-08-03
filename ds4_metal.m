@@ -354,6 +354,15 @@ enum {
     DS4_DSPARK_SUPPORT_TOP_K = 6,
     DS4_DSPARK_SUPPORT_BATCH_MAX =
         DS4_DSPARK_SUPPORT_CANDIDATE_ROWS * DS4_DSPARK_SUPPORT_TOP_K,
+    DS4_DSPARK_SUPPORT_COMPONENT_ADDRESS_BYTES =
+        3 * DS4_DSPARK_SUPPORT_EXPERT_COUNT * sizeof(uint64_t),
+    DS4_DSPARK_SUPPORT_ROUTE_ID_BYTES =
+        DS4_DSPARK_SUPPORT_BATCH_MAX * sizeof(int32_t),
+    DS4_DSPARK_SUPPORT_ADDRESS_VIEW_BYTES =
+        DS4_DSPARK_SUPPORT_COMPONENT_ADDRESS_BYTES +
+        DS4_DSPARK_SUPPORT_ROUTE_ID_BYTES,
+    /* One transient shared Metal allocation backs all three tables. */
+    DS4_DSPARK_SUPPORT_ADDRESS_TABLE_PAGE_BYTES = 16 * 1024,
     DS4_DSPARK_TARGET_LAYER_COUNT = 43,
     /* Stages execute serially. One stage can need five disjoint top-6 sets;
      * keep those records pinned through its GPU work, plus one in-flight I/O
@@ -630,8 +639,9 @@ static int ds4_gpu_dspark_support_cache_activate_combined(void);
 static void ds4_gpu_stream_expert_cache_clear_all(int reset_stats);
 static void ds4_gpu_dspark_support_cache_clear(int reset_stats);
 #ifdef DS4_TEST_HOOKS
-/* Private DSpark SUPPORT loader scaffold. The graph stays fail-closed until a
- * Metal encoder consumes the records and records its command-buffer sequence. */
+/* White-box DSpark SUPPORT transaction seam.  Keep it out of release builds
+ * until a real graph caller owns the address view and its admission charge;
+ * no session, CLI or public graph entry point can acquire this lease. */
 static int ds4_gpu_dspark_support_cache_acquire_stage_lease(
         uint32_t stage,
         uint64_t *lease_id);
@@ -10335,9 +10345,9 @@ void ds4_gpu_expert_store_v2_clear_for_store(
         ds4_gpu_qwen35_expert_pack_clear();
         return;
     }
-    /* SUPPORT loads are test-only and synchronous until the DSpark graph
-     * exists. Still fence any shared Metal buffer before descriptor teardown,
-     * so this ownership rule remains safe when graph execution is added. */
+    /* The white-box SUPPORT transaction is synchronous and fenced, while
+     * product DSpark execution remains disconnected and fail-closed.  Fence
+     * any retained shared test record again before descriptor teardown. */
     if (g_initialized && g_dspark_support_cache_entry_count != 0 &&
         !ds4_gpu_synchronize()) {
         fprintf(stderr,
@@ -14199,10 +14209,9 @@ static int ds4_gpu_dspark_support_lease_pins(
 }
 
 #ifdef DS4_TEST_HOOKS
-/* The future DSpark encoder must call this after encoding its final SUPPORT
- * consumer and before the completion signal. Keeping it production-private
- * makes the lifetime contract explicit without exposing an unusable API while
- * the graph remains fail-closed. */
+/* A DSpark SUPPORT transaction calls this after its final Metal consumer and
+ * before authenticated release.  The recorded sequence is the lifetime edge:
+ * pinned records may not become evictable until that exact batch completes. */
 static int ds4_gpu_dspark_support_lease_note_current_batch_use(void) {
     if (!g_stream_expert_cache_lease.active ||
         g_stream_expert_cache_lease.domain !=
@@ -16836,6 +16845,182 @@ static int ds4_gpu_dspark_support_cache_release_stage_lease(
             &g_dspark_support_cache_lease_failures, 1);
     }
     return drain_ok;
+}
+
+typedef struct {
+    __strong id<MTLBuffer> address_buffer;
+    NSUInteger component_offset[3];
+    NSUInteger ids_offset;
+    __strong id<MTLBuffer> resources[DS4_DSPARK_SUPPORT_BATCH_MAX];
+    uint32_t resource_count;
+    uint32_t route_count;
+} ds4_gpu_dspark_support_selected_addr_view;
+
+typedef int (*ds4_gpu_dspark_support_selected_addr_encoder)(
+        id<MTLCommandBuffer>                            cb,
+        const ds4_gpu_dspark_support_selected_addr_view *view,
+        void                                            *opaque);
+
+/* Execute one isolated SUPPORT stage transaction.  The three component
+ * address tables use the existing selected-address ABI and are keyed by model
+ * expert id (0..255); expert_ids preserves the five-by-six route order.  Both
+ * remain private so the later DSpark graph need not expose cache entries or
+ * Metal resources through a public API.
+ *
+ * The transaction owns the entire lifetime edge.  Acquisition and a batch
+ * load either publish every requested record or none; after a Metal batch is
+ * created, even a partially failing encoder is recorded as the lease's last
+ * use and fenced before authenticated release removes the pins. */
+static int ds4_gpu_dspark_support_selected_addr_transaction(
+        uint32_t                                         stage,
+        const int32_t                                   *expert_ids,
+        uint32_t                                         candidate_rows,
+        ds4_gpu_dspark_support_selected_addr_encoder     encode,
+        void                                            *opaque) {
+    if (!expert_ids || !encode || candidate_rows == 0 ||
+        candidate_rows > DS4_DSPARK_SUPPORT_CANDIDATE_ROWS ||
+        g_batch_cb || [g_pending_cbs count] != 0 ||
+        g_stream_expert_cache_owned_seq != 0) {
+        return 0;
+    }
+
+    const uint32_t route_count =
+        candidate_rows * DS4_DSPARK_SUPPORT_TOP_K;
+    uint64_t lease_id = 0;
+    uint32_t unique_experts = 0;
+    int ok = ds4_gpu_dspark_support_cache_acquire_stage_lease(
+        stage, &lease_id);
+    if (!ok) return 0;
+
+    ds4_gpu_dspark_support_selected_addr_view view = {0};
+    __strong id<MTLCommandBuffer> cb = nil;
+    int owned = 0;
+    ok = ds4_gpu_dspark_support_cache_load_stage_lease(
+        lease_id, expert_ids, route_count, &unique_experts);
+    if (!ok || unique_experts == 0 ||
+        !ds4_gpu_dspark_support_lease_store_matches()) {
+        ok = 0;
+        goto release;
+    }
+
+    uint32_t layer_index = 0;
+    if (!ds4_gpu_expert_store_layer_index(
+            g_dspark_expert_pack, stage, &layer_index)) {
+        ok = 0;
+        goto release;
+    }
+    const ds4_gpu_qwen35_expert_pack_layer *layer =
+        &g_dspark_expert_pack->layers[layer_index];
+    const NSUInteger one_table_bytes =
+        (NSUInteger)DS4_DSPARK_SUPPORT_EXPERT_COUNT * sizeof(uint64_t);
+    if (!layer->valid || layer->record_bytes == 0 ||
+        one_table_bytes > NSUIntegerMax / 3u) {
+        ok = 0;
+        goto release;
+    }
+    for (uint32_t component = 0; component < 3; component++) {
+        if (layer->component_offset[component] > NSUIntegerMax ||
+            layer->component_bytes[component] == 0 ||
+            layer->component_offset[component] > layer->record_bytes ||
+            layer->component_bytes[component] >
+                layer->record_bytes - layer->component_offset[component]) {
+            ok = 0;
+            goto release;
+        }
+        view.component_offset[component] =
+            (NSUInteger)component * one_table_bytes;
+    }
+
+    view.address_buffer = [g_device
+        newBufferWithLength:DS4_DSPARK_SUPPORT_ADDRESS_VIEW_BYTES
+                    options:MTLResourceStorageModeShared];
+    if (!view.address_buffer || ![view.address_buffer contents]) {
+        ok = 0;
+        goto release;
+    }
+    view.address_buffer.label =
+        @"ds4_dspark_support_selected_address_view";
+    view.route_count = route_count;
+    uint8_t *table_bytes = (uint8_t *)[view.address_buffer contents];
+    memset(table_bytes, 0, DS4_DSPARK_SUPPORT_ADDRESS_VIEW_BYTES);
+    view.ids_offset = DS4_DSPARK_SUPPORT_COMPONENT_ADDRESS_BYTES;
+
+    for (uint32_t route = 0; route < route_count; route++) {
+        const uint32_t expert = (uint32_t)expert_ids[route];
+        ds4_gpu_dspark_support_cache_entry *entry =
+            &g_dspark_support_cache[stage][expert];
+        if (!entry->valid || !entry->buffer ||
+            !ds4_gpu_dspark_support_lease_pins(stage, expert) ||
+            entry->record_bytes != layer->record_bytes) {
+            ok = 0;
+            goto release;
+        }
+        for (uint32_t component = 0; component < 3; component++) {
+            uint64_t *addresses = (uint64_t *)(
+                table_bytes + view.component_offset[component]);
+            const uint64_t address = ds4_gpu_buffer_address(
+                entry->buffer,
+                (NSUInteger)layer->component_offset[component]);
+            if (address == 0 ||
+                (addresses[expert] != 0 && addresses[expert] != address)) {
+                ok = 0;
+                goto release;
+            }
+            addresses[expert] = address;
+        }
+        uint32_t resource = 0;
+        while (resource < view.resource_count &&
+               view.resources[resource] != entry->buffer) {
+            resource++;
+        }
+        if (resource == view.resource_count) {
+            if (view.resource_count >=
+                DS4_DSPARK_SUPPORT_BATCH_MAX) {
+                ok = 0;
+                goto release;
+            }
+            view.resources[view.resource_count++] = entry->buffer;
+        }
+    }
+    memcpy(table_bytes + view.ids_offset,
+           expert_ids,
+           (size_t)route_count * sizeof(expert_ids[0]));
+    [view.address_buffer didModifyRange:
+        NSMakeRange(0, DS4_DSPARK_SUPPORT_ADDRESS_VIEW_BYTES)];
+
+    if (!ds4_gpu_begin_commands()) {
+        ok = 0;
+        goto release;
+    }
+    cb = ds4_gpu_command_buffer(&owned);
+    const uint64_t batch_seq = g_stream_expert_cache_batch_seq;
+    /* Protect the batch before handing control to an encoder: it may append a
+     * SUPPORT read and then fail.  Post-encode identity checks forbid a future
+     * callback from hiding that read behind a commit/split/replacement. */
+    const int pre_note_ok = cb && owned == 0 && batch_seq != 0 &&
+        ds4_gpu_dspark_support_lease_note_current_batch_use();
+    const int encode_ok = pre_note_ok && encode(cb, &view, opaque);
+    const int batch_identity_ok =
+        g_batch_cb == cb &&
+        g_stream_expert_cache_batch_seq == batch_seq;
+    const int post_note_ok = batch_identity_ok &&
+        ds4_gpu_dspark_support_lease_note_current_batch_use() &&
+        ds4_gpu_dspark_support_lease_store_matches();
+    ok = ok && encode_ok && post_note_ok;
+    if ((!pre_note_ok || !batch_identity_ok) &&
+        (g_batch_cb || [g_pending_cbs count] != 0 ||
+         g_stream_expert_cache_owned_seq != 0)) {
+        /* The callback violated the isolated-transaction contract.  Drain all
+         * visible command ownership while the lease is still authenticated;
+         * last_use_seq alone may describe the batch that it replaced. */
+        if (!ds4_gpu_synchronize()) ok = 0;
+    }
+
+release: {
+        const int release_ok =
+            ds4_gpu_dspark_support_cache_release_stage_lease(lease_id);
+        return ok && release_ok;
+    }
 }
 #endif
 
@@ -39679,14 +39864,24 @@ int ds4_gpu_internal_dspark_dual_store_test(void) {
     return ok;
 }
 
+enum {
+    DS4_DSPARK_SUPPORT_TEST_TARGET_BASE = 64 * 1024,
+    DS4_DSPARK_SUPPORT_TEST_SUPPORT_BASE = 3 * 1024 * 1024,
+    DS4_DSPARK_SUPPORT_TEST_LAYER_STRIDE = 64 * 1024,
+    DS4_DSPARK_SUPPORT_TEST_COMPONENT_STRIDE = 20 * 1024,
+};
+
 static int ds4_gpu_internal_dspark_support_bind_target_for_test(
         uint32_t n_layer,
         uint64_t model_size) {
     for (uint32_t layer = 0; layer < n_layer; layer++) {
-        const uint64_t base = 64u * 1024u + (uint64_t)layer * 1024u;
+        const uint64_t base = DS4_DSPARK_SUPPORT_TEST_TARGET_BASE +
+            (uint64_t)layer * DS4_DSPARK_SUPPORT_TEST_LAYER_STRIDE;
         if (!ds4_gpu_expert_store_v2_bind_layer_for_store(
                 DS4_GPU_EXPERT_STORE_TARGET, layer, model_size,
-                base, base + 256u, base + 512u)) {
+                base,
+                base + DS4_DSPARK_SUPPORT_TEST_COMPONENT_STRIDE,
+                base + 2u * DS4_DSPARK_SUPPORT_TEST_COMPONENT_STRIDE)) {
             return 0;
         }
     }
@@ -39698,11 +39893,13 @@ static int ds4_gpu_internal_dspark_support_bind_support_for_test(
     for (uint32_t stage = 0;
          stage < DS4_DSPARK_SUPPORT_LAYER_COUNT;
          stage++) {
-        const uint64_t base = 256u * 1024u +
-            (uint64_t)stage * 8192u;
+        const uint64_t base = DS4_DSPARK_SUPPORT_TEST_SUPPORT_BASE +
+            (uint64_t)stage * DS4_DSPARK_SUPPORT_TEST_LAYER_STRIDE;
         if (!ds4_gpu_expert_store_v2_bind_layer_for_store(
                 DS4_GPU_EXPERT_STORE_SUPPORT, stage, model_size,
-                base, base + 1024u, base + 4096u)) {
+                base,
+                base + DS4_DSPARK_SUPPORT_TEST_COMPONENT_STRIDE,
+                base + 2u * DS4_DSPARK_SUPPORT_TEST_COMPONENT_STRIDE)) {
             return 0;
         }
     }
@@ -39737,6 +39934,343 @@ static int ds4_gpu_internal_dspark_support_populate_target_for_test(
         }
     }
     return g_stream_expert_cache_entry_count == count;
+}
+
+typedef struct {
+    __strong id<MTLBuffer> input;
+    __strong id<MTLBuffer> output;
+    const int32_t *route_ids;
+    uint32_t stage;
+    uint32_t candidate_rows;
+    int fail_after_consumer;
+    int host_address_order_ok;
+} ds4_gpu_dspark_support_selected_addr_test_context;
+
+static float ds4_gpu_dspark_support_selected_addr_test_half(
+        uint16_t bits) {
+    const uint32_t exponent = (bits >> 10u) & 0x1fu;
+    const uint32_t mantissa = bits & 0x03ffu;
+    if (exponent == 0) {
+        return ldexpf((float)mantissa, -24);
+    }
+    return ldexpf(1.0f + (float)mantissa / 1024.0f,
+                  (int)exponent - 15);
+}
+
+static float ds4_gpu_dspark_support_selected_addr_test_expected(
+        uint32_t stage,
+        uint32_t expert,
+        uint32_t component) {
+    static const uint16_t component_base[3] = {
+        0x3800u, 0x3c00u, 0x4000u,
+    };
+    const uint16_t scale_bits = component_base[component] +
+        (uint16_t)(stage * 257u + expert);
+    /* qs=0 chooses grid[0] (eight +8 values) and sign[0] (all positive).
+     * With a 256-wide all-one input, the admitted IQ2 kernel returns 256*d. */
+    return 256.0f *
+        ds4_gpu_dspark_support_selected_addr_test_half(scale_bits);
+}
+
+/* Lifetime/addressability probe only.  It deliberately reuses the qualified
+ * production IQ2 selected-address matvec; it does not claim DSpark MoE numeric
+ * parity.  The host check proves that sparse expert-keyed tables preserve the
+ * separate route list, while the Metal dispatch dereferences the same records. */
+static int ds4_gpu_dspark_support_selected_addr_test_encode(
+        id<MTLCommandBuffer>                             cb,
+        const ds4_gpu_dspark_support_selected_addr_view *view,
+        void                                             *opaque) {
+    ds4_gpu_dspark_support_selected_addr_test_context *context =
+        (ds4_gpu_dspark_support_selected_addr_test_context *)opaque;
+    if (!cb || !view || !context || !context->input || !context->output ||
+        !context->route_ids ||
+        context->candidate_rows == 0 ||
+        context->candidate_rows > DS4_DSPARK_SUPPORT_CANDIDATE_ROWS ||
+        view->route_count !=
+            context->candidate_rows * DS4_DSPARK_SUPPORT_TOP_K ||
+        [view->address_buffer length] !=
+            DS4_DSPARK_SUPPORT_ADDRESS_VIEW_BYTES ||
+        DS4_DSPARK_SUPPORT_ADDRESS_VIEW_BYTES >
+            DS4_DSPARK_SUPPORT_ADDRESS_TABLE_PAGE_BYTES ||
+        view->component_offset[0] != 0 ||
+        view->component_offset[1] !=
+            DS4_DSPARK_SUPPORT_EXPERT_COUNT * sizeof(uint64_t) ||
+        view->component_offset[2] !=
+            2u * DS4_DSPARK_SUPPORT_EXPERT_COUNT * sizeof(uint64_t) ||
+        view->ids_offset != DS4_DSPARK_SUPPORT_COMPONENT_ADDRESS_BYTES ||
+        memcmp((const uint8_t *)[view->address_buffer contents] +
+                   view->ids_offset,
+               context->route_ids,
+               (size_t)view->route_count * sizeof(context->route_ids[0])) != 0) {
+        return 0;
+    }
+
+    uint64_t selected_words[DS4_DSPARK_SUPPORT_EXPERT_COUNT / 64u] = {0};
+    const uint8_t *table_bytes =
+        (const uint8_t *)[view->address_buffer contents];
+    const ds4_gpu_qwen35_expert_pack_layer *layer =
+        &g_dspark_expert_pack->layers[context->stage];
+    context->host_address_order_ok = 1;
+    for (uint32_t route = 0; route < view->route_count; route++) {
+        const uint32_t expert = (uint32_t)context->route_ids[route];
+        selected_words[expert / 64u] |= 1ull << (expert % 64u);
+        const ds4_gpu_dspark_support_cache_entry *entry =
+            &g_dspark_support_cache[context->stage][expert];
+        const uint8_t *record = (const uint8_t *)[entry->buffer contents];
+        static const uint16_t component_base[3] = {
+            0x3800u, 0x3c00u, 0x4000u,
+        };
+        if (!record) {
+            context->host_address_order_ok = 0;
+        } else {
+            for (uint32_t component = 0; component < 3; component++) {
+                uint16_t sentinel = 0;
+                memcpy(&sentinel, record + component * 66u,
+                       sizeof(sentinel));
+                const uint16_t expected =
+                    component_base[component] +
+                    (uint16_t)(context->stage * 257u + expert);
+                if (sentinel != expected) {
+                    context->host_address_order_ok = 0;
+                }
+            }
+        }
+        for (uint32_t component = 0; component < 3; component++) {
+            const uint64_t *addresses = (const uint64_t *)(
+                table_bytes + view->component_offset[component]);
+            const uint64_t expected = ds4_gpu_buffer_address(
+                entry->buffer,
+                (NSUInteger)layer->component_offset[component]);
+            if (addresses[expert] != expected || expected == 0) {
+                context->host_address_order_ok = 0;
+            }
+        }
+    }
+    for (uint32_t expert = 0;
+         expert < DS4_DSPARK_SUPPORT_EXPERT_COUNT;
+         expert++) {
+        const int selected =
+            (selected_words[expert / 64u] &
+                (1ull << (expert % 64u))) != 0;
+        for (uint32_t component = 0; component < 3; component++) {
+            const uint64_t *addresses = (const uint64_t *)(
+                table_bytes + view->component_offset[component]);
+            if (!selected && addresses[expert] != 0) {
+                context->host_address_order_ok = 0;
+            }
+        }
+    }
+    if (!context->host_address_order_ok ||
+        !g_moe_mul_mv_addr_iq2_xxs_pipeline) {
+        return 0;
+    }
+
+    const ds4_gpu_mul_mv_id_args args =
+        ds4_gpu_make_mul_mv_id_args(
+            256, 1, DS4_DSPARK_SUPPORT_EXPERT_COUNT,
+            66, 66, 1, DS4_DSPARK_SUPPORT_TOP_K,
+            context->candidate_rows, 4);
+    for (uint32_t component = 0; component < 3; component++) {
+        id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
+        if (!enc) return 0;
+        [enc setComputePipelineState:g_moe_mul_mv_addr_iq2_xxs_pipeline];
+        [enc setBytes:&args length:sizeof(args) atIndex:0];
+        [enc setBuffer:view->address_buffer
+                offset:view->component_offset[component]
+               atIndex:1];
+        [enc setBuffer:context->input offset:0 atIndex:2];
+        [enc setBuffer:context->output
+                offset:(NSUInteger)component * view->route_count *
+                    sizeof(float)
+               atIndex:3];
+        [enc setBuffer:view->address_buffer
+                offset:view->ids_offset
+               atIndex:4];
+        [enc useResource:view->address_buffer usage:MTLResourceUsageRead];
+        for (uint32_t resource = 0;
+             resource < view->resource_count;
+             resource++) {
+            [enc useResource:view->resources[resource]
+                       usage:MTLResourceUsageRead];
+        }
+        [enc setThreadgroupMemoryLength:
+            ds4_gpu_routed_mv_smem(DS4_METAL_TENSOR_IQ2_XXS)
+                                atIndex:0];
+        [enc dispatchThreadgroups:
+                 MTLSizeMake(1, 1, view->route_count)
+             threadsPerThreadgroup:MTLSizeMake(32, 2, 1)];
+        ds4_gpu_end_compute_encoder(cb, enc);
+        if (component == 0 && context->fail_after_consumer) return 0;
+    }
+    return 1;
+}
+
+static int ds4_gpu_internal_dspark_support_selected_addr_test(void) {
+    const float untouched = -1234567.0f;
+    const uint32_t target_entries_before =
+        g_stream_expert_cache_entry_count;
+    const uint64_t target_hits_before = g_stream_expert_cache_hits;
+    const uint64_t target_misses_before = g_stream_expert_cache_misses;
+    const uint64_t target_evictions_before = g_stream_expert_cache_evictions;
+    const uint64_t target_pread_bytes_before =
+        g_stream_expert_cache_pread_bytes;
+    int32_t distinct[DS4_DSPARK_SUPPORT_BATCH_MAX];
+    for (uint32_t route = 0; route < 27; route++) {
+        distinct[route] = (int32_t)route;
+    }
+    distinct[27] = 29;
+    distinct[28] = 30;
+    distinct[29] = 255;
+    const int32_t duplicates[DS4_DSPARK_SUPPORT_BATCH_MAX] = {
+        255, 0, 29, 30, 255, 0,
+        29, 30, 0, 255, 29, 30,
+        0, 29, 255, 30, 0, 29,
+        30, 255, 29, 0, 30, 255,
+        255, 30, 29, 0, 255, 30,
+    };
+    const int32_t invalid[DS4_DSPARK_SUPPORT_TOP_K] = {
+        0, 29, 30, 255, 256, 0,
+    };
+    const NSUInteger input_bytes =
+        DS4_DSPARK_SUPPORT_CANDIDATE_ROWS * 256u * sizeof(float);
+    const NSUInteger output_bytes =
+        3u * DS4_DSPARK_SUPPORT_BATCH_MAX * sizeof(float);
+    id<MTLBuffer> input = [g_device newBufferWithLength:input_bytes
+                                                options:MTLResourceStorageModeShared];
+    id<MTLBuffer> output = [g_device newBufferWithLength:output_bytes
+                                                 options:MTLResourceStorageModeShared];
+    if (!input || !output) {
+        fprintf(stderr, "ds4: DSpark SUPPORT selected-address test allocation failed\n");
+        return 0;
+    }
+    for (uint32_t value = 0;
+         value < input_bytes / sizeof(float);
+         value++) {
+        ((float *)[input contents])[value] = 1.0f;
+    }
+    [input didModifyRange:NSMakeRange(0, input_bytes)];
+    ds4_gpu_dspark_support_cache_clear(0);
+
+    ds4_gpu_dspark_support_selected_addr_test_context context = {
+        .input = input,
+        .output = output,
+        .route_ids = invalid,
+        .stage = 1,
+        .candidate_rows = 1,
+    };
+    if (ds4_gpu_dspark_support_selected_addr_transaction(
+            context.stage, invalid, context.candidate_rows,
+            ds4_gpu_dspark_support_selected_addr_test_encode, &context) ||
+        g_stream_expert_cache_lease.active || g_batch_cb ||
+        g_dspark_support_cache_entry_count != 0) {
+        fprintf(stderr, "ds4: DSpark SUPPORT selected-address invalid-route unwind failed\n");
+        return 0;
+    }
+
+    for (uint32_t value = 0;
+         value < output_bytes / sizeof(float);
+         value++) {
+        ((float *)[output contents])[value] = untouched;
+    }
+    [output didModifyRange:NSMakeRange(0, output_bytes)];
+    context.route_ids = duplicates;
+    context.candidate_rows = DS4_DSPARK_SUPPORT_CANDIDATE_ROWS;
+    context.fail_after_consumer = 1;
+    context.host_address_order_ok = 0;
+    const uint64_t failed_fences_before =
+        g_dspark_support_cache_release_sync_fences;
+    if (ds4_gpu_dspark_support_selected_addr_transaction(
+            context.stage, duplicates, context.candidate_rows,
+            ds4_gpu_dspark_support_selected_addr_test_encode, &context) ||
+        !context.host_address_order_ok ||
+        g_stream_expert_cache_lease.active || g_batch_cb ||
+        g_dspark_support_cache_release_sync_fences !=
+            failed_fences_before + 1u) {
+        fprintf(stderr, "ds4: DSpark SUPPORT selected-address partial-consumer unwind failed\n");
+        return 0;
+    }
+    for (uint32_t route = 0;
+         route < DS4_DSPARK_SUPPORT_BATCH_MAX;
+         route++) {
+        const float gate_value = ((const float *)[output contents])[route];
+        const float expected =
+            ds4_gpu_dspark_support_selected_addr_test_expected(
+                context.stage, (uint32_t)duplicates[route], 0);
+        if (gate_value != expected ||
+            ((const float *)[output contents])[
+                DS4_DSPARK_SUPPORT_BATCH_MAX + route] != untouched ||
+            ((const float *)[output contents])[
+                2u * DS4_DSPARK_SUPPORT_BATCH_MAX + route] != untouched) {
+            fprintf(stderr,
+                    "ds4: DSpark SUPPORT selected-address partial output failed route=%u got=%g expected=%g\n",
+                    route, gate_value, expected);
+            return 0;
+        }
+    }
+
+    for (uint32_t value = 0;
+         value < output_bytes / sizeof(float);
+         value++) {
+        ((float *)[output contents])[value] = untouched;
+    }
+    [output didModifyRange:NSMakeRange(0, output_bytes)];
+    context.route_ids = distinct;
+    context.fail_after_consumer = 0;
+    context.host_address_order_ok = 0;
+    const uint64_t success_fences_before =
+        g_dspark_support_cache_release_sync_fences;
+    if (!ds4_gpu_dspark_support_selected_addr_transaction(
+            context.stage, distinct, context.candidate_rows,
+            ds4_gpu_dspark_support_selected_addr_test_encode, &context) ||
+        !context.host_address_order_ok ||
+        g_stream_expert_cache_lease.active || g_batch_cb ||
+        g_dspark_support_cache_release_sync_fences !=
+            success_fences_before + 1u ||
+        ds4_gpu_dspark_support_lease_pinned_count() != 0) {
+        fprintf(stderr, "ds4: DSpark SUPPORT selected-address success transaction failed\n");
+        return 0;
+    }
+    for (uint32_t route = 0;
+         route < DS4_DSPARK_SUPPORT_BATCH_MAX;
+         route++) {
+        const float gate_value = ((const float *)[output contents])[route];
+        const float up_value = ((const float *)[output contents])[
+            DS4_DSPARK_SUPPORT_BATCH_MAX + route];
+        const float down_value = ((const float *)[output contents])[
+            2u * DS4_DSPARK_SUPPORT_BATCH_MAX + route];
+        const uint32_t expert = (uint32_t)distinct[route];
+        if (gate_value !=
+                ds4_gpu_dspark_support_selected_addr_test_expected(
+                    context.stage, expert, 0) ||
+            up_value !=
+                ds4_gpu_dspark_support_selected_addr_test_expected(
+                    context.stage, expert, 1) ||
+            down_value !=
+                ds4_gpu_dspark_support_selected_addr_test_expected(
+                    context.stage, expert, 2)) {
+            fprintf(stderr,
+                    "ds4: DSpark SUPPORT selected-address output failed route=%u expert=%u got=(%g,%g,%g) expected=(%g,%g,%g)\n",
+                    route, expert, gate_value, up_value, down_value,
+                    ds4_gpu_dspark_support_selected_addr_test_expected(
+                        context.stage, expert, 0),
+                    ds4_gpu_dspark_support_selected_addr_test_expected(
+                        context.stage, expert, 1),
+                    ds4_gpu_dspark_support_selected_addr_test_expected(
+                        context.stage, expert, 2));
+            return 0;
+        }
+    }
+    const int telemetry_ok = g_dspark_support_cache_entry_count ==
+               DS4_DSPARK_SUPPORT_CACHE_FLOOR - 1u &&
+           g_stream_expert_cache_entry_count == target_entries_before &&
+           g_stream_expert_cache_hits == target_hits_before &&
+           g_stream_expert_cache_misses == target_misses_before &&
+           g_stream_expert_cache_evictions == target_evictions_before &&
+           g_stream_expert_cache_pread_bytes == target_pread_bytes_before;
+    if (!telemetry_ok) {
+        fprintf(stderr, "ds4: DSpark SUPPORT selected-address TARGET telemetry isolation failed\n");
+    }
+    return telemetry_ok;
 }
 
 typedef struct {
@@ -39835,7 +40369,11 @@ static int ds4_gpu_internal_dspark_support_lease_behavior_test(
             DS4_EXPERT_STORE_STORAGE_GGML, 0, support_layers) &&
         !ds4_gpu_expert_store_v2_bind_layer_for_store(
             DS4_GPU_EXPERT_STORE_SUPPORT, 0, model_size,
-            256u * 1024u, 257u * 1024u, 260u * 1024u));
+            DS4_DSPARK_SUPPORT_TEST_SUPPORT_BASE,
+            DS4_DSPARK_SUPPORT_TEST_SUPPORT_BASE +
+                DS4_DSPARK_SUPPORT_TEST_COMPONENT_STRIDE,
+            DS4_DSPARK_SUPPORT_TEST_SUPPORT_BASE +
+                2u * DS4_DSPARK_SUPPORT_TEST_COMPONENT_STRIDE));
 
     const int32_t duplicates[] = {3, 3, 4, 4};
     const uint32_t target_entries_before =
@@ -39915,8 +40453,11 @@ static int ds4_gpu_internal_dspark_support_lease_behavior_test(
         g_stream_expert_cache_budget_override == 320 &&
         ds4_gpu_expert_store_v2_bind_layer_for_store(
             DS4_GPU_EXPERT_STORE_TARGET, 0, model_size,
-            64u * 1024u, 64u * 1024u + 256u,
-            64u * 1024u + 512u));
+            DS4_DSPARK_SUPPORT_TEST_TARGET_BASE,
+            DS4_DSPARK_SUPPORT_TEST_TARGET_BASE +
+                DS4_DSPARK_SUPPORT_TEST_COMPONENT_STRIDE,
+            DS4_DSPARK_SUPPORT_TEST_TARGET_BASE +
+                2u * DS4_DSPARK_SUPPORT_TEST_COMPONENT_STRIDE));
     ds4_gpu_set_streaming_expert_cache_expert_bytes(saved_expert_bytes);
     DS4_DSPARK_SUPPORT_TEST_REQUIRE(
         g_stream_expert_cache_expert_bytes == saved_expert_bytes &&
@@ -40012,7 +40553,7 @@ static int ds4_gpu_internal_dspark_support_lease_behavior_test(
         ds4_gpu_dspark_support_cache_release_stage_lease(lease) &&
         g_dspark_support_cache_release_already_completed_fences ==
             already_completed_fences_before + 1u &&
-        ((const uint8_t *)[event_result contents])[0] == 146u);
+        ((const uint8_t *)[event_result contents])[0] == 2u);
     lease = 0;
     DS4_DSPARK_SUPPORT_TEST_REQUIRE(ds4_gpu_synchronize());
 
@@ -40048,7 +40589,7 @@ static int ds4_gpu_internal_dspark_support_lease_behavior_test(
         g_dspark_support_cache_release_sync_fences ==
             sync_fences_before + 1u &&
         ((const uint8_t *)[sync_result contents])[0] ==
-            (uint8_t)(73u + 7u * 11u));
+            8u);
     lease = 0;
 
     DS4_DSPARK_SUPPORT_TEST_REQUIRE(
@@ -40085,7 +40626,8 @@ static int ds4_gpu_internal_dspark_support_lease_behavior_test(
             DS4_EXPERT_STORE_STORAGE_GGML, 0, support_layers) &&
         g_dspark_support_pack_generation != generation_after_clear &&
         ds4_gpu_internal_dspark_support_bind_support_for_test(model_size) &&
-        ds4_gpu_dspark_support_cache_combined_available());
+        ds4_gpu_dspark_support_cache_combined_available() &&
+        ds4_gpu_internal_dspark_support_selected_addr_test());
 
 #undef DS4_DSPARK_SUPPORT_TEST_REQUIRE
     return 1;
@@ -40116,11 +40658,12 @@ failed:
 
 int ds4_gpu_internal_dspark_support_cache_test(void) {
     enum {
-        FILE_SIZE = 128 * 1024,
-        MODEL_SIZE = 1024 * 1024,
-        RECORD_BYTES = 3,
+        FILE_SIZE = 4 * 1024 * 1024,
+        MODEL_SIZE = 4 * 1024 * 1024,
+        IQ2_BLOCK_BYTES = 66,
+        RECORD_BYTES = 3 * IQ2_BLOCK_BYTES,
         TARGET_LAYER_COUNT = DS4_DSPARK_TARGET_LAYER_COUNT,
-        TARGET_RECORD_BYTES = 3,
+        TARGET_RECORD_BYTES = RECORD_BYTES,
         TARGET_LAYER_BYTES =
             DS4_DSPARK_SUPPORT_EXPERT_COUNT * TARGET_RECORD_BYTES,
         SUPPORT_LAYER_BYTES =
@@ -40156,16 +40699,16 @@ int ds4_gpu_internal_dspark_support_cache_test(void) {
     memset(target_layers, 0, sizeof(target_layers));
     for (uint32_t layer = 0; layer < TARGET_LAYER_COUNT; layer++) {
         target_layers[layer].layer = layer;
-        target_layers[layer].data_offset = 32u * 1024u +
+        target_layers[layer].data_offset = 256u * 1024u +
             (uint64_t)layer * TARGET_LAYER_BYTES;
         target_layers[layer].data_size = TARGET_LAYER_BYTES;
         target_layers[layer].record_bytes = TARGET_RECORD_BYTES;
         target_layers[layer].component_offset[0] = 0;
-        target_layers[layer].component_offset[1] = 1;
-        target_layers[layer].component_offset[2] = 2;
-        target_layers[layer].component_bytes[0] = 1;
-        target_layers[layer].component_bytes[1] = 1;
-        target_layers[layer].component_bytes[2] = 1;
+        target_layers[layer].component_offset[1] = IQ2_BLOCK_BYTES;
+        target_layers[layer].component_offset[2] = 2u * IQ2_BLOCK_BYTES;
+        target_layers[layer].component_bytes[0] = IQ2_BLOCK_BYTES;
+        target_layers[layer].component_bytes[1] = IQ2_BLOCK_BYTES;
+        target_layers[layer].component_bytes[2] = IQ2_BLOCK_BYTES;
     }
     ds4_gpu_expert_store_layer_v2 support_layers[
         DS4_DSPARK_SUPPORT_LAYER_COUNT];
@@ -40179,11 +40722,11 @@ int ds4_gpu_internal_dspark_support_cache_test(void) {
         support_layers[stage].data_size = SUPPORT_LAYER_BYTES;
         support_layers[stage].record_bytes = RECORD_BYTES;
         support_layers[stage].component_offset[0] = 0;
-        support_layers[stage].component_offset[1] = 1;
-        support_layers[stage].component_offset[2] = 2;
-        support_layers[stage].component_bytes[0] = 1;
-        support_layers[stage].component_bytes[1] = 1;
-        support_layers[stage].component_bytes[2] = 1;
+        support_layers[stage].component_offset[1] = IQ2_BLOCK_BYTES;
+        support_layers[stage].component_offset[2] = 2u * IQ2_BLOCK_BYTES;
+        support_layers[stage].component_bytes[0] = IQ2_BLOCK_BYTES;
+        support_layers[stage].component_bytes[1] = IQ2_BLOCK_BYTES;
+        support_layers[stage].component_bytes[2] = IQ2_BLOCK_BYTES;
     }
 
     support_bytes = malloc(
@@ -40197,9 +40740,18 @@ int ds4_gpu_internal_dspark_support_cache_test(void) {
         for (uint32_t expert = 0;
              expert < DS4_DSPARK_SUPPORT_EXPERT_COUNT;
              expert++) {
-            for (uint32_t byte = 0; byte < RECORD_BYTES; byte++) {
-                stage_bytes[expert * RECORD_BYTES + byte] =
-                    (uint8_t)(stage * 73u + expert * 11u + byte);
+            uint8_t *record = stage_bytes + expert * RECORD_BYTES;
+            memset(record, 0, RECORD_BYTES);
+            static const uint16_t component_base[3] = {
+                0x3800u, 0x3c00u, 0x4000u,
+            };
+            for (uint32_t component = 0; component < 3; component++) {
+                const uint16_t sentinel =
+                    component_base[component] +
+                    (uint16_t)(stage * 257u + expert);
+                memcpy(record + component * IQ2_BLOCK_BYTES,
+                       &sentinel,
+                       sizeof(sentinel));
             }
         }
         ok = ds4_gpu_internal_qwen35_expert_pack_pwrite_all(
@@ -40711,8 +41263,8 @@ int ds4_gpu_internal_dspark_support_cache_test(void) {
         ok = stage0 && stage0_hit == stage0 && stage1 &&
              stage0_buffer != stage1->buffer &&
              stage0_contents && stage1_contents &&
-             stage0_contents[0] == (uint8_t)(7u * 11u) &&
-             stage1_contents[0] == (uint8_t)(73u + 7u * 11u) &&
+             stage0_contents[0] == 7u &&
+             stage1_contents[0] == 8u &&
              g_dspark_support_cache_hits == 1 &&
              g_dspark_support_cache_misses == 2 &&
              g_dspark_support_cache_expert_loads == 2 &&
