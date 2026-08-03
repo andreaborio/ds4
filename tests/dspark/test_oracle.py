@@ -103,6 +103,7 @@ PROPOSAL_GENERATOR_PATH = (
 DS4_SOURCE_PATH = ROOT / "ds4.c"
 DS4_METAL_SOURCE_PATH = ROOT / "ds4_metal.m"
 DSPARK_GRAPH_PATH = ROOT / "runtime" / "ds4_dspark_graph.inc"
+TRANSACTION_RNG_TEST_PATH = Path(__file__).with_name("test_transaction_rng.py")
 
 
 _C_NONCODE_RE = re.compile(
@@ -248,6 +249,26 @@ def _synthetic_support_gguf(
             struct.pack("<IQ", spec.ggml_type, 0),
         ))
     return b"".join(parts)
+
+
+class TransactionRngGateTests(unittest.TestCase):
+    def test_standalone_transaction_rng_suite_passes(self) -> None:
+        completed = subprocess.run(
+            [sys.executable, str(TRANSACTION_RNG_TEST_PATH)],
+            cwd=ROOT,
+            text=True,
+            capture_output=True,
+            timeout=60,
+            check=False,
+        )
+        self.assertEqual(
+            completed.returncode,
+            0,
+            "standalone transactional RNG suite failed\n"
+            f"stdout:\n{completed.stdout}\n"
+            f"stderr:\n{completed.stderr}",
+        )
+        self.assertIn("OK", completed.stderr)
 
 
 class OracleFixtureTests(unittest.TestCase):

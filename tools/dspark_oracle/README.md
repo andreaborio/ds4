@@ -40,6 +40,31 @@ previous draft position. Sampled verification uses
 `1e-8`, exactly as in the pinned evaluator. Full acceptance samples the bonus
 target row.
 
+`transaction_rng.py` is a separate, independent ownership oracle for a future
+two-phase caller; it is not wired to the runtime and does not change the exact
+sampling equations above. It reproduces the runtime's xorshift64* transition
+and high-24-bit uniform exactly, including greedy and sampled fallback paths
+that consume no draw. A ledger records `rng_after[C]` for every inspected token
+prefix. `commit(adopted_count, observed_count)` normally receives equal counts,
+but a sampled EOS or think-stop uses `observed_count = adopted_count + 1`: its
+draw is published even though the terminal token is not evaluated by the target
+or adopted into the generated block. Any synthetic terminal framing appended
+after the generation loop remains frontend ownership. Proposal and acceptance
+subdraws are deterministic, position-indexed, domain-separated functions that
+cannot advance public RNG state.
+
+That separation is necessary rather than cosmetic. In a conventional eager
+single stream, all proposal draws precede acceptance draws; a partial caller
+prefix can therefore require an acceptance draw that occurs only after a
+discarded proposal-suffix draw. No state checkpoint of the same linear stream
+can both include the acceptance and exclude that suffix. The oracle keeps
+depth zero byte/RNG-identical to the current sampler, but it makes no seeded
+parity claim for speculative depth greater than zero. Its explicit 64-bit
+mixer provides reproducible pseudorandom substreams, not a proof of statistical
+independence or an official DeepSpec RNG schedule. The existing exact sampler
+continues to accept caller-supplied uniforms, so distribution equations and
+RNG ownership remain separately testable.
+
 The raw-cache oracle pins the final 0731 semantic geometry to three independent
 `[128, 512]` rings, not a backend allocation. Prompt prefill retains and
 projects every one of the last 128 target capture rows, not just the frontier
@@ -340,8 +365,13 @@ Regenerate or check the small synthetic fixture with:
 python3 tools/dspark_oracle/generate_fixtures.py
 python3 tools/dspark_oracle/generate_fixtures.py --check
 python3 tools/dspark_oracle/proposal_fixture.py --check
+python3 tests/dspark/test_transaction_rng.py
 python3 tests/dspark/test_oracle.py
 ```
+
+The canonical `test_oracle.py` gate also runs the standalone transactional RNG
+suite as a subprocess, so the repository's existing model-free test command
+cannot silently omit it.
 
 To validate the authenticated final support file without reading payloads:
 
