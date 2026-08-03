@@ -816,6 +816,166 @@ static void test_qwen35_ssd_static_contract(void) {
     free(fixture);
 }
 
+static sample_outcome test_sample_outcome(
+        const float *logits,
+        uint32_t     n_vocab,
+        float        temperature,
+        int          top_k,
+        float        top_p,
+        float        min_p,
+        uint64_t    *rng) {
+    sample_outcome out = {
+        .token = -1,
+        .drew = false,
+        .rng_after = 0,
+    };
+    const int token = sample_top_p_min_p(
+        logits, n_vocab, temperature, top_k, top_p, min_p, rng, &out);
+    CHECK(token == out.token);
+    return out;
+}
+
+static void test_sampler_outcomes(void) {
+    const uint64_t seed = UINT64_C(0x0123456789abcdef);
+
+    /* Greedy and no-finite fallbacks must not require an RNG pointer. */
+    const float greedy_logits[] = {1.0f, 3.0f, 3.0f, 2.0f};
+    sample_outcome out = test_sample_outcome(
+        greedy_logits, 4, 0.0f, 0, 1.0f, 0.0f, NULL);
+    CHECK(out.token == 1 && out.rng_after == 0 && !out.drew);
+    CHECK(ds4_sample_logits(greedy_logits, 4, 0.0f, 0, 1.0f, 0.0f,
+                            NULL) == 1);
+
+    const float nonfinite_logits[] = {NAN, INFINITY, -INFINITY};
+    out = test_sample_outcome(
+        nonfinite_logits, 3, 1.0f, 0, 1.0f, 0.0f, NULL);
+    CHECK(out.token == 1 && out.rng_after == 0 && !out.drew);
+    out = test_sample_outcome(
+        nonfinite_logits, 3, 1.0f, 3, 1.0f, 0.0f, NULL);
+    CHECK(out.token == 1 && out.rng_after == 0 && !out.drew);
+
+    /* A non-finite probability sum returns the best token without drawing. */
+    const float two_logits[] = {2.0f, 0.0f};
+    uint64_t rng = seed;
+    out = test_sample_outcome(two_logits, 2, NAN, 0, 1.0f, 0.0f, &rng);
+    CHECK(out.token == 0 && out.rng_after == seed && !out.drew);
+    CHECK(rng == seed);
+    rng = seed;
+    out = test_sample_outcome(two_logits, 2, NAN, 2, 1.0f, 0.0f, &rng);
+    CHECK(out.token == 0 && out.rng_after == seed && !out.drew);
+    CHECK(rng == seed);
+
+    /* min_p > 1 filters even the maximum candidate in the full-vocab path.
+     * This is the reachable n == 0 fallback.  Once n is nonzero, each filter
+     * loop necessarily retains its first candidate, so filtered == 0 is only
+     * a defensive guard. */
+    rng = seed;
+    out = test_sample_outcome(two_logits, 2, 1.0f, 0, 1.0f, 2.0f, &rng);
+    CHECK(out.token == 0 && out.rng_after == seed && !out.drew);
+    CHECK(rng == seed);
+
+    /* Exercise the fast helper's <= 0 sum guard with deliberately inconsistent
+     * white-box bookkeeping; no public call can produce finite > 0 while all
+     * logits are non-finite. */
+    sample_outcome guarded = {
+        .token = -17,
+        .rng_after = UINT64_C(0xdeadbeef),
+        .drew = true,
+    };
+    rng = seed;
+    int guarded_token = -17;
+    CHECK(sample_fast_top_p(nonfinite_logits, 3, 1, 0.0f, 2,
+                            1.0f, 0.5f, 0.0f, &rng,
+                            &guarded_token, &guarded));
+    CHECK(guarded_token == guarded.token);
+    CHECK(guarded.token == 2 && guarded.rng_after == seed && !guarded.drew);
+    CHECK(rng == seed);
+    guarded = (sample_outcome){
+        .token = -19,
+        .rng_after = UINT64_C(0xcafef00d),
+        .drew = true,
+    };
+    guarded_token = -19;
+    CHECK(!sample_fast_top_p(nonfinite_logits, 3, 0, 0.0f, 2,
+                             1.0f, 0.5f, 0.0f, NULL,
+                             &guarded_token, &guarded));
+    CHECK(guarded_token == -19);
+    CHECK(guarded.token == -19 && guarded.rng_after == UINT64_C(0xcafef00d) &&
+          guarded.drew);
+
+    /* One retained token still performs a categorical draw.  This deliberately
+     * returns the same token as the fallbacks above while distinguishing drew
+     * and the exact zero-seed xorshift state. */
+    rng = 0;
+    out = test_sample_outcome(two_logits, 2, 1.0f, 0, 0.5f, 0.0f, &rng);
+    CHECK(out.token == 0 && out.drew);
+    CHECK(out.rng_after == UINT64_C(0x03f721dffe39b342));
+    CHECK(rng == out.rng_after);
+
+    /* Force fast-top-p to decline its 512-entry heap.  The full fallback owns
+     * the one and only draw; the declined helper owns none. */
+    float broad_logits[600];
+    for (uint32_t i = 0; i < 600; i++) {
+        broad_logits[i] = -(float)i / 1000.0f;
+    }
+    guarded = (sample_outcome){
+        .token = -23,
+        .rng_after = UINT64_C(0x1234),
+        .drew = true,
+    };
+    rng = 1;
+    guarded_token = -23;
+    CHECK(!sample_fast_top_p(broad_logits, 600, 600, 0.0f, 0,
+                             1.0f, 0.9f, 0.0f, &rng,
+                             &guarded_token, &guarded));
+    CHECK(guarded_token == -23);
+    CHECK(rng == 1 && guarded.token == -23 &&
+          guarded.rng_after == UINT64_C(0x1234) && guarded.drew);
+    rng = 1;
+    out = test_sample_outcome(
+        broad_logits, 600, 1.0f, 0, 0.9f, 0.0f, &rng);
+    CHECK(out.drew && out.rng_after == UINT64_C(0x0000000002000001));
+    CHECK(rng == out.rng_after);
+    uint64_t wrapper_rng = 1;
+    CHECK(ds4_sample_logits(broad_logits, 600, 1.0f, 0, 0.9f, 0.0f,
+                            &wrapper_rng) == out.token);
+    CHECK(wrapper_rng == out.rng_after);
+
+    /* top_k keeps its existing earlier-id tie order and reports the draw made
+     * after filtering. */
+    const float tied_logits[] = {2.0f, 2.0f, 0.0f};
+    rng = UINT64_C(0x5830920757d41153);
+    out = test_sample_outcome(tied_logits, 3, 1.0f, 2, 1.0f, 0.0f, &rng);
+    CHECK(out.token == 1 && out.drew);
+    CHECK(out.rng_after == UINT64_C(0x44da53dec8eb16d8));
+    CHECK(rng == out.rng_after);
+
+    /* Canonicalized controls must be exactly equivalent, including RNG. */
+    uint64_t canonical_rng = 1;
+    sample_outcome canonical = test_sample_outcome(
+        tied_logits, 3, 1.0f, 0, 1.0f, 0.0f, &canonical_rng);
+    rng = 1;
+    out = test_sample_outcome(
+        tied_logits, 3, 1.0f, -7, 0.0f, -0.5f, &rng);
+    CHECK(out.token == canonical.token && out.rng_after == canonical.rng_after &&
+          out.drew == canonical.drew && rng == canonical_rng);
+
+    canonical_rng = 1;
+    canonical = test_sample_outcome(
+        tied_logits, 3, 1.0f, 3, 1.0f, 0.0f, &canonical_rng);
+    rng = 1;
+    out = test_sample_outcome(
+        tied_logits, 3, 1.0f, 4096, 2.0f, 0.0f, &rng);
+    CHECK(out.token == canonical.token && out.rng_after == canonical.rng_after &&
+          out.drew == canonical.drew && rng == canonical_rng);
+
+    /* Public invalid-input behavior must not acquire RNG ownership. */
+    rng = seed;
+    CHECK(ds4_sample_logits(NULL, 2, 1.0f, 0, 1.0f, 0.0f, &rng) == 0);
+    CHECK(ds4_sample_logits(two_logits, 0, 1.0f, 0, 1.0f, 0.0f, &rng) == 0);
+    CHECK(rng == seed);
+}
+
 static void test_dynamic_logits(ds4_session *session) {
     const uint32_t n_vocab = QWEN35_N_VOCAB;
     CHECK(ds4_engine_vocab_size(session->engine) == QWEN35_N_VOCAB);
@@ -852,6 +1012,16 @@ static void test_dynamic_logits(ds4_session *session) {
     uint64_t rng = UINT64_C(0x123456789abcdef0);
     CHECK(ds4_session_sample(session, 0.0f, 0, 1.0f, 0.0f, &rng) ==
           (int)QWEN35_N_VALID_TOKEN - 1);
+
+    uint64_t direct_rng = 0;
+    sample_outcome direct = test_sample_outcome(
+        session->logits, ds4_session_selectable_vocab_size(session),
+        1.0f, 2, 1.0f, 0.0f, &direct_rng);
+    uint64_t session_rng = 0;
+    CHECK(ds4_session_sample(session, 1.0f, 2, 1.0f, 0.0f, &session_rng) ==
+          direct.token);
+    CHECK(direct.drew && session_rng == direct.rng_after &&
+          direct_rng == direct.rng_after);
 
     ds4_token_score top[2];
     CHECK(ds4_session_top_logprobs(session, top, 2) == 2);
@@ -1085,6 +1255,7 @@ static void test_fail_closed_surfaces(ds4_session *session) {
 int main(void) {
     CHECK(ds4_dspark_runtime_contract_self_check());
     CHECK(ds4_test_dspark_memory_accounting());
+    test_sampler_outcomes();
 #ifndef DS4_NO_GPU
     CHECK(ds4_internal_dspark_raw_finalizer_test());
 #endif

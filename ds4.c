@@ -35999,6 +35999,41 @@ typedef struct {
     float prob;
 } sample_candidate;
 
+typedef struct {
+    int token;
+    bool drew;
+    uint64_t rng_after;
+} sample_outcome;
+DS4_STATIC_ASSERT(ds4_sample_outcome_size, sizeof(sample_outcome) == 16);
+
+static inline int sample_publish_no_draw(
+        sample_outcome *out,
+        int             token,
+        const uint64_t *rng) {
+    if (out) {
+        *out = (sample_outcome){
+            .token = token,
+            .drew = false,
+            .rng_after = rng ? *rng : 0,
+        };
+    }
+    return token;
+}
+
+static inline int sample_publish_after_draw(
+        sample_outcome *out,
+        int             token,
+        const uint64_t *rng) {
+    if (out) {
+        *out = (sample_outcome){
+            .token = token,
+            .drew = true,
+            .rng_after = *rng,
+        };
+    }
+    return token;
+}
+
 static int sample_candidate_cmp_desc(const void *a, const void *b) {
     const sample_candidate *ca = a;
     const sample_candidate *cb = b;
@@ -36050,7 +36085,8 @@ static bool sample_fast_top_p(
         float        top_p,
         float        min_p,
         uint64_t    *rng,
-        int         *token_out) {
+        int         *token_out,
+        sample_outcome *outcome_out) {
     enum { SAMPLE_FAST_TOP_P_CAP = 512 };
     if (!logits || !rng || !token_out || finite == 0) return false;
     if (finite > SAMPLE_FAST_TOP_P_CAP && top_p >= 0.999f) return false;
@@ -36081,7 +36117,7 @@ static bool sample_fast_top_p(
         }
     }
     if (sum <= 0.0f || !isfinite(sum)) {
-        *token_out = best;
+        *token_out = sample_publish_no_draw(outcome_out, best, rng);
         return true;
     }
 
@@ -36112,7 +36148,7 @@ static bool sample_fast_top_p(
         return false;
     }
     if (filtered == 0) {
-        *token_out = best;
+        *token_out = sample_publish_no_draw(outcome_out, best, rng);
         return true;
     }
 
@@ -36120,11 +36156,13 @@ static bool sample_fast_top_p(
     for (uint32_t i = 0; i < filtered; i++) {
         r -= heap[i].prob;
         if (r <= 0.0f) {
-            *token_out = heap[i].id;
+            *token_out = sample_publish_after_draw(
+                outcome_out, heap[i].id, rng);
             return true;
         }
     }
-    *token_out = heap[filtered - 1u].id;
+    *token_out = sample_publish_after_draw(
+        outcome_out, heap[filtered - 1u].id, rng);
     return true;
 }
 
@@ -36134,7 +36172,8 @@ static int sample_full_vocab(
         float        temperature,
         float        top_p,
         float        min_p,
-        uint64_t    *rng) {
+        uint64_t    *rng,
+        sample_outcome *out) {
     float max_logit = DS4_NEG_INF;
     int best = 0;
     uint32_t finite = 0;
@@ -36147,7 +36186,10 @@ static int sample_full_vocab(
             best = (int)i;
         }
     }
-    if (finite == 0) return sample_argmax(logits, n_vocab);
+    if (finite == 0) {
+        return sample_publish_no_draw(
+            out, sample_argmax(logits, n_vocab), rng);
+    }
 
     int fast_token = best;
     if (top_p < 1.0f &&
@@ -36160,7 +36202,8 @@ static int sample_full_vocab(
                           top_p,
                           min_p,
                           rng,
-                          &fast_token)) {
+                          &fast_token,
+                          out)) {
         return fast_token;
     }
 
@@ -36200,7 +36243,7 @@ static int sample_full_vocab(
         }
         if (sum <= 0.0f || !isfinite(sum) || n == 0) {
             if (cand != local) free(cand);
-            return best;
+            return sample_publish_no_draw(out, best, rng);
         }
         float r = sample_rng_f32(rng) * sum;
         for (uint32_t i = 0; i < n; i++) {
@@ -36208,11 +36251,11 @@ static int sample_full_vocab(
             if (r <= 0.0f) {
                 const int id = cand[i].id;
                 if (cand != local) free(cand);
-                return id;
+                return sample_publish_after_draw(out, id, rng);
             }
         }
         if (cand != local) free(cand);
-        return best;
+        return sample_publish_after_draw(out, best, rng);
     }
 
     sample_candidate *cand = xmalloc((size_t)finite * sizeof(cand[0]));
@@ -36227,7 +36270,7 @@ static int sample_full_vocab(
     }
     if (sum <= 0.0f || !isfinite(sum)) {
         free(cand);
-        return best;
+        return sample_publish_no_draw(out, best, rng);
     }
 
     qsort(cand, n, sizeof(cand[0]), sample_candidate_cmp_desc);
@@ -36243,7 +36286,7 @@ static int sample_full_vocab(
     }
     if (filtered == 0) {
         free(cand);
-        return best;
+        return sample_publish_no_draw(out, best, rng);
     }
 
     float r = sample_rng_f32(rng) * filtered_sum;
@@ -36252,12 +36295,12 @@ static int sample_full_vocab(
         if (r <= 0.0f) {
             const int id = cand[i].id;
             free(cand);
-            return id;
+            return sample_publish_after_draw(out, id, rng);
         }
     }
     const int id = cand[filtered - 1].id;
     free(cand);
-    return id;
+    return sample_publish_after_draw(out, id, rng);
 }
 
 static int sample_top_p_min_p(
@@ -36267,11 +36310,18 @@ static int sample_top_p_min_p(
         int          top_k,
         float        top_p,
         float        min_p,
-        uint64_t    *rng) {
-    if (temperature <= 0.0f) return sample_argmax(logits, n_vocab);
+        uint64_t    *rng,
+        sample_outcome *out) {
+    if (temperature <= 0.0f) {
+        return sample_publish_no_draw(
+            out, sample_argmax(logits, n_vocab), rng);
+    }
     if (top_p <= 0.0f || top_p > 1.0f) top_p = 1.0f;
     if (min_p < 0.0f) min_p = 0.0f;
-    if (top_k <= 0) return sample_full_vocab(logits, n_vocab, temperature, top_p, min_p, rng);
+    if (top_k <= 0) {
+        return sample_full_vocab(
+            logits, n_vocab, temperature, top_p, min_p, rng, out);
+    }
     if (top_k > 1024) top_k = 1024;
     if ((uint32_t)top_k > n_vocab) top_k = (int)n_vocab;
 
@@ -36291,7 +36341,10 @@ static int sample_top_p_min_p(
         vals[j] = v;
         ids[j] = (int)i;
     }
-    if (n == 0) return sample_argmax(logits, n_vocab);
+    if (n == 0) {
+        return sample_publish_no_draw(
+            out, sample_argmax(logits, n_vocab), rng);
+    }
 
     float probs[1024];
     const float max_logit = vals[0];
@@ -36300,7 +36353,9 @@ static int sample_top_p_min_p(
         probs[i] = expf((vals[i] - max_logit) / temperature);
         sum += probs[i];
     }
-    if (sum <= 0.0f || !isfinite(sum)) return ids[0];
+    if (sum <= 0.0f || !isfinite(sum)) {
+        return sample_publish_no_draw(out, ids[0], rng);
+    }
 
     const float min_prob = (probs[0] / sum) * min_p;
     float filtered_sum = 0.0f;
@@ -36312,14 +36367,14 @@ static int sample_top_p_min_p(
         filtered++;
         if (filtered_sum / sum >= top_p) break;
     }
-    if (filtered <= 0) return ids[0];
+    if (filtered <= 0) return sample_publish_no_draw(out, ids[0], rng);
 
     float r = sample_rng_f32(rng) * filtered_sum;
     for (int i = 0; i < filtered; i++) {
         r -= probs[i];
-        if (r <= 0.0f) return ids[i];
+        if (r <= 0.0f) return sample_publish_after_draw(out, ids[i], rng);
     }
-    return ids[filtered - 1];
+    return sample_publish_after_draw(out, ids[filtered - 1], rng);
 }
 
 static void print_top_logits(
@@ -46854,14 +46909,15 @@ int ds4_session_argmax_excluding(ds4_session *s, int excluded_id) {
 int ds4_sample_logits(const float *logits, int n_vocab, float temperature,
                       int top_k, float top_p, float min_p, uint64_t *rng) {
     if (!logits || n_vocab <= 0) return 0;
-    return sample_top_p_min_p(logits, (uint32_t)n_vocab, temperature, top_k, top_p, min_p, rng);
+    return sample_top_p_min_p(logits, (uint32_t)n_vocab,
+                              temperature, top_k, top_p, min_p, rng, NULL);
 }
 
 int ds4_session_sample(ds4_session *s, float temperature, int top_k, float top_p, float min_p, uint64_t *rng) {
     if (!s || !s->logits) return -1;
-    return sample_top_p_min_p(s->logits,
-                              ds4_session_selectable_vocab_size(s),
-                              temperature, top_k, top_p, min_p, rng);
+    return sample_top_p_min_p(
+        s->logits, ds4_session_selectable_vocab_size(s),
+        temperature, top_k, top_p, min_p, rng, NULL);
 }
 
 int ds4_session_top_logprobs(ds4_session *s, ds4_token_score *out, int k) {
