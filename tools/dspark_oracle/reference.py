@@ -33,11 +33,68 @@ class SpeculativeSample:
     residual_probabilities: np.ndarray | None
 
 
+@dataclass(frozen=True)
+class HCSplit:
+    """Hyper-Connection weights for one attention or FFN sublayer."""
+
+    pre: np.ndarray
+    post: np.ndarray
+    combination: np.ndarray
+
+
+@dataclass(frozen=True)
+class StageSetup:
+    """Shared main projection and repeated noisy block entering stage zero."""
+
+    main_hidden: np.ndarray
+    draft_hidden: np.ndarray
+
+
+@dataclass(frozen=True)
+class StageChain:
+    """Outputs of three ordered synthetic stages sharing one main input."""
+
+    stage_outputs: tuple[np.ndarray, np.ndarray, np.ndarray]
+
+
+@dataclass(frozen=True)
+class MarkovDraft:
+    """Sequential Markov proposal with explicit sampling probabilities."""
+
+    tokens: np.ndarray
+    corrected_logits: np.ndarray
+    probabilities: np.ndarray
+
+
+@dataclass(frozen=True)
+class DraftHead:
+    """Final HC head, sequential Markov logits, and confidence schedule."""
+
+    hidden: np.ndarray
+    base_logits: np.ndarray
+    tokens: np.ndarray
+    corrected_logits: np.ndarray
+    confidence: ConfidenceSchedule
+
+
+@dataclass(frozen=True)
+class RawCacheState:
+    """Three independent physical rings and their shared logical window."""
+
+    capacity: int
+    token_start: int
+    length: int
+    rows: np.ndarray
+
+
 # These are the numerical guards in DeepSpec's pinned evaluator.  They are
 # deliberately named here: callers must not mistake them for a different
 # proposal distribution or an adjustable product policy.
 DRAFT_PROBABILITY_FLOOR = 1.0e-8
 RESIDUAL_MASS_FLOOR = 1.0e-8
+DSPARK_STAGE_COUNT = 3
+DSPARK_RAW_CACHE_WINDOW = 128
+DSPARK_RAW_CACHE_WIDTH = 512
 
 
 def post_layer_hc_mean(hidden_states: np.ndarray) -> np.ndarray:
@@ -57,6 +114,302 @@ def post_layer_hc_mean(hidden_states: np.ndarray) -> np.ndarray:
     if not np.all(np.isfinite(hidden)):
         raise ValueError("hidden_states must contain only finite values")
     return np.mean(hidden, axis=1)
+
+
+def rms_norm(
+    hidden_states: np.ndarray,
+    weight: Sequence[float] | np.ndarray,
+    *,
+    eps: float = 1.0e-6,
+) -> np.ndarray:
+    """Reference RMSNorm with float64 accumulation and no additive bias."""
+
+    hidden = np.asarray(hidden_states, dtype=np.float64)
+    weights = np.asarray(weight, dtype=np.float64)
+    if hidden.ndim == 0 or hidden.shape[-1:] != weights.shape:
+        raise ValueError("RMSNorm weight must match the final hidden dimension")
+    if not np.all(np.isfinite(hidden)) or not np.all(np.isfinite(weights)):
+        raise ValueError("RMSNorm inputs must be finite")
+    if not np.isfinite(float(eps)) or eps <= 0.0:
+        raise ValueError("RMSNorm epsilon must be finite and positive")
+    variance = np.mean(np.square(hidden), axis=-1, keepdims=True)
+    return hidden * (1.0 / np.sqrt(variance + float(eps))) * weights
+
+
+def main_project_and_norm(
+    target_hidden: np.ndarray,
+    projection: np.ndarray,
+    norm_weight: Sequence[float] | np.ndarray,
+    *,
+    eps: float = 1.0e-6,
+) -> np.ndarray:
+    """Concatenate captures 40/41/42, apply ``main_proj``, then RMSNorm.
+
+    ``target_hidden`` uses ``[..., stage=3, hidden]``.  Projection uses the
+    conventional linear layout ``[hidden, 3 * hidden]``; GGUF stores its
+    dimensions in the reverse logical order ``[3 * hidden, hidden]``.
+    """
+
+    target = np.asarray(target_hidden, dtype=np.float64)
+    project = _float_matrix(projection, "main projection")
+    weights = np.asarray(norm_weight, dtype=np.float64)
+    if target.ndim < 2 or target.shape[-2] != 3:
+        raise ValueError("target_hidden must have exactly three capture stages")
+    hidden = target.shape[-1]
+    if project.shape != (hidden, 3 * hidden):
+        raise ValueError("main projection must have shape [hidden, 3 * hidden]")
+    if weights.shape != (hidden,):
+        raise ValueError("main norm weight must have shape [hidden]")
+    if not np.all(np.isfinite(target)):
+        raise ValueError("target_hidden must be finite")
+    flattened = target.reshape(*target.shape[:-2], 3 * hidden)
+    return rms_norm(flattened @ project.T, weights, eps=eps)
+
+
+def prepare_stage_zero(
+    target_hidden: np.ndarray,
+    accepted_embedding: Sequence[float] | np.ndarray,
+    noise_embedding: Sequence[float] | np.ndarray,
+    main_projection: np.ndarray,
+    main_norm_weight: Sequence[float] | np.ndarray,
+    *,
+    block_size: int = 5,
+    hc_lanes: int = 4,
+    eps: float = 1.0e-6,
+) -> StageSetup:
+    """Build the exact DSpark stage-zero inputs for one proposal block."""
+
+    if block_size != 5 or hc_lanes != 4:
+        raise ValueError("final 0731 requires block_size=5 and hc_lanes=4")
+    main_hidden = main_project_and_norm(
+        target_hidden, main_projection, main_norm_weight, eps=eps
+    )
+    if main_hidden.ndim != 1:
+        raise ValueError("stage-zero setup expects one target position")
+    accepted = np.asarray(accepted_embedding, dtype=np.float64)
+    noise = np.asarray(noise_embedding, dtype=np.float64)
+    if accepted.shape != main_hidden.shape or noise.shape != main_hidden.shape:
+        raise ValueError("accepted/noise embeddings must match hidden width")
+    if not np.all(np.isfinite(accepted)) or not np.all(np.isfinite(noise)):
+        raise ValueError("accepted/noise embeddings must be finite")
+    draft = np.repeat(noise[None, :], block_size, axis=0)
+    draft[0] = accepted
+    draft_hidden = np.repeat(draft[:, None, :], hc_lanes, axis=1)
+    return StageSetup(main_hidden, draft_hidden)
+
+
+def run_synthetic_stage_chain(
+    draft_hidden: np.ndarray,
+    main_hidden: np.ndarray,
+    stage_weights: np.ndarray,
+    main_weights: np.ndarray,
+    stage_biases: np.ndarray,
+) -> StageChain:
+    """Exercise only the ordered three-stage DSpark topology.
+
+    This is deliberately not an approximation of attention or the MoE.  Each
+    stage applies a distinct affine transform to the previous stage output and
+    to the same immutable ``main_hidden``.  Closed fixtures can therefore catch
+    stage reordering, skipping, reuse, or accidentally feeding a stage-local
+    main value into the next stage without needing model weights.
+    """
+
+    hidden = np.asarray(draft_hidden, dtype=np.float64)
+    main = np.asarray(main_hidden, dtype=np.float64)
+    stages = np.asarray(stage_weights, dtype=np.float64)
+    mains = np.asarray(main_weights, dtype=np.float64)
+    biases = np.asarray(stage_biases, dtype=np.float64)
+    if hidden.ndim < 2 or hidden.shape[-1] == 0:
+        raise ValueError("draft_hidden must have rows and a hidden dimension")
+    width = hidden.shape[-1]
+    if main.shape != (width,):
+        raise ValueError("main_hidden must have shape [hidden]")
+    expected_matrices = (DSPARK_STAGE_COUNT, width, width)
+    if stages.shape != expected_matrices or mains.shape != expected_matrices:
+        raise ValueError("stage/main weights must have shape [3, hidden, hidden]")
+    if biases.shape != (DSPARK_STAGE_COUNT, width):
+        raise ValueError("stage_biases must have shape [3, hidden]")
+    if not all(np.all(np.isfinite(item))
+               for item in (hidden, main, stages, mains, biases)):
+        raise ValueError("synthetic stage-chain inputs must be finite")
+
+    outputs: list[np.ndarray] = []
+    current = hidden
+    for stage in range(DSPARK_STAGE_COUNT):
+        current = (
+            current @ stages[stage].T
+            + main @ mains[stage].T
+            + biases[stage]
+        )
+        outputs.append(np.array(current, copy=True))
+    return StageChain(tuple(outputs))
+
+
+def _stable_sigmoid(value: np.ndarray) -> np.ndarray:
+    result = np.empty_like(value, dtype=np.float64)
+    positive = value >= 0.0
+    result[positive] = 1.0 / (1.0 + np.exp(-value[positive]))
+    negative_exp = np.exp(value[~positive])
+    result[~positive] = negative_exp / (1.0 + negative_exp)
+    return result
+
+
+def hc_split_sinkhorn(
+    mixes: np.ndarray,
+    scale: Sequence[float] | np.ndarray,
+    base: Sequence[float] | np.ndarray,
+    *,
+    hc_lanes: int = 4,
+    iterations: int = 20,
+    eps: float = 1.0e-6,
+) -> HCSplit:
+    """Split HC logits into pre/post weights and a Sinkhorn matrix."""
+
+    values = np.asarray(mixes, dtype=np.float64)
+    scales = np.asarray(scale, dtype=np.float64)
+    bases = np.asarray(base, dtype=np.float64)
+    mix_width = (2 + hc_lanes) * hc_lanes
+    if values.ndim == 0 or values.shape[-1] != mix_width:
+        raise ValueError("HC mixes have the wrong final dimension")
+    if scales.shape != (3,) or bases.shape != (mix_width,):
+        raise ValueError("HC scale/base geometry mismatch")
+    if iterations < 1:
+        raise ValueError("HC Sinkhorn iterations must be positive")
+    if not np.isfinite(float(eps)) or eps <= 0.0:
+        raise ValueError("HC epsilon must be finite and positive")
+    if not all(np.all(np.isfinite(item)) for item in (values, scales, bases)):
+        raise ValueError("HC inputs must be finite")
+
+    pre_logits = values[..., :hc_lanes]
+    post_logits = values[..., hc_lanes:2 * hc_lanes]
+    combination_logits = values[..., 2 * hc_lanes:].reshape(
+        *values.shape[:-1], hc_lanes, hc_lanes
+    )
+    pre = _stable_sigmoid(
+        pre_logits * scales[0] + bases[:hc_lanes]
+    ) + eps
+    post = 2.0 * _stable_sigmoid(
+        post_logits * scales[1] + bases[hc_lanes:2 * hc_lanes]
+    )
+    combination = (
+        combination_logits * scales[2]
+        + bases[2 * hc_lanes:].reshape(hc_lanes, hc_lanes)
+    )
+    combination -= np.max(combination, axis=-1, keepdims=True)
+    combination = np.exp(combination)
+    combination = (
+        combination / np.sum(combination, axis=-1, keepdims=True) + eps
+    )
+    combination = combination / (
+        np.sum(combination, axis=-2, keepdims=True) + eps
+    )
+    for _ in range(iterations - 1):
+        combination = combination / (
+            np.sum(combination, axis=-1, keepdims=True) + eps
+        )
+        combination = combination / (
+            np.sum(combination, axis=-2, keepdims=True) + eps
+        )
+    return HCSplit(pre, post, combination)
+
+
+def hc_pre(
+    hidden_states: np.ndarray,
+    function_weight: np.ndarray,
+    scale: Sequence[float] | np.ndarray,
+    base: Sequence[float] | np.ndarray,
+    *,
+    norm_eps: float = 1.0e-6,
+    hc_eps: float = 1.0e-6,
+    iterations: int = 20,
+) -> tuple[np.ndarray, HCSplit]:
+    """Reduce four HC lanes and retain weights required by ``hc_post``."""
+
+    hidden = np.asarray(hidden_states, dtype=np.float64)
+    function = _float_matrix(function_weight, "HC function weight")
+    if hidden.ndim < 2 or hidden.shape[-2] != 4:
+        raise ValueError("HC hidden state must have exactly four lanes")
+    flat_width = hidden.shape[-2] * hidden.shape[-1]
+    if function.shape != (24, flat_width):
+        raise ValueError("HC function weight must have shape [24, 4 * hidden]")
+    if not np.all(np.isfinite(hidden)):
+        raise ValueError("HC hidden state must be finite")
+    if not np.isfinite(float(norm_eps)) or norm_eps <= 0.0:
+        raise ValueError("HC norm epsilon must be finite and positive")
+    flattened = hidden.reshape(*hidden.shape[:-2], flat_width)
+    inverse_rms = 1.0 / np.sqrt(
+        np.mean(np.square(flattened), axis=-1, keepdims=True)
+        + float(norm_eps)
+    )
+    split = hc_split_sinkhorn(
+        (flattened @ function.T) * inverse_rms,
+        scale,
+        base,
+        hc_lanes=4,
+        iterations=iterations,
+        eps=hc_eps,
+    )
+    reduced = np.sum(split.pre[..., :, None] * hidden, axis=-2)
+    return reduced, split
+
+
+def hc_post(
+    branch_output: np.ndarray,
+    residual: np.ndarray,
+    split: HCSplit,
+) -> np.ndarray:
+    """Expand one branch result back into four HC lanes."""
+
+    branch = np.asarray(branch_output, dtype=np.float64)
+    saved = np.asarray(residual, dtype=np.float64)
+    if saved.ndim < 2 or saved.shape[-2] != 4:
+        raise ValueError("HC residual must have exactly four lanes")
+    if branch.shape != saved.shape[:-2] + (saved.shape[-1],):
+        raise ValueError("HC branch output must match residual hidden width")
+    if split.post.shape != saved.shape[:-2] + (4,):
+        raise ValueError("HC post weights do not match residual rows")
+    if split.combination.shape != saved.shape[:-2] + (4, 4):
+        raise ValueError("HC combination matrix does not match residual rows")
+    combined = np.einsum("...ji,...id->...jd", split.combination, saved)
+    return split.post[..., :, None] * branch[..., None, :] + combined
+
+
+def hc_head(
+    hidden_states: np.ndarray,
+    function_weight: np.ndarray,
+    scale: Sequence[float] | np.ndarray,
+    base: Sequence[float] | np.ndarray,
+    *,
+    norm_eps: float = 1.0e-6,
+    hc_eps: float = 1.0e-6,
+) -> np.ndarray:
+    """Collapse the final four HC lanes before norm/logits/confidence."""
+
+    hidden = np.asarray(hidden_states, dtype=np.float64)
+    function = _float_matrix(function_weight, "HC head function weight")
+    scales = np.asarray(scale, dtype=np.float64).reshape(-1)
+    bases = np.asarray(base, dtype=np.float64)
+    if hidden.ndim < 2 or hidden.shape[-2] != 4:
+        raise ValueError("HC head input must have exactly four lanes")
+    flat_width = 4 * hidden.shape[-1]
+    if function.shape != (4, flat_width):
+        raise ValueError("HC head function must have shape [4, 4 * hidden]")
+    if scales.shape != (1,) or bases.shape != (4,):
+        raise ValueError("HC head scale/base geometry mismatch")
+    if not all(np.all(np.isfinite(item))
+               for item in (hidden, function, scales, bases)):
+        raise ValueError("HC head inputs must be finite")
+    if (not np.isfinite(float(norm_eps)) or norm_eps <= 0.0 or
+            not np.isfinite(float(hc_eps)) or hc_eps <= 0.0):
+        raise ValueError("HC head epsilons must be finite and positive")
+    flattened = hidden.reshape(*hidden.shape[:-2], flat_width)
+    inverse_rms = 1.0 / np.sqrt(
+        np.mean(np.square(flattened), axis=-1, keepdims=True)
+        + float(norm_eps)
+    )
+    mixes = (flattened @ function.T) * inverse_rms
+    pre = _stable_sigmoid(mixes * scales[0] + bases) + float(hc_eps)
+    return np.sum(pre[..., :, None] * hidden, axis=-2)
 
 
 def _float_matrix(value: object, name: str) -> np.ndarray:
@@ -142,6 +495,65 @@ def markov_greedy_draft(
     return drafted, step_logits
 
 
+def markov_sampled_draft(
+    base_logits: np.ndarray,
+    first_previous_token: int,
+    embedding: np.ndarray,
+    projection: np.ndarray,
+    sampling_uniforms: Sequence[float] | np.ndarray,
+    *,
+    temperature: float,
+) -> MarkovDraft:
+    """Sample a Markov-corrected block sequentially from supplied uniforms.
+
+    The previous token is updated after every categorical draw, matching the
+    official per-position loop.  Caller-provided uniforms make the stochastic
+    path reproducible and keep RNG implementation details outside the oracle.
+    """
+
+    base = _float_matrix(base_logits, "base_logits")
+    embed = _float_matrix(embedding, "embedding")
+    project = _float_matrix(projection, "projection")
+    if embed.shape != project.shape or base.shape[1] != embed.shape[0]:
+        raise ValueError(
+            "base logits must use the vocabulary shared by Markov weights"
+        )
+    if isinstance(first_previous_token, bool) or not isinstance(
+        first_previous_token, (int, np.integer)
+    ):
+        raise ValueError("first_previous_token must be an integer token id")
+    previous = int(first_previous_token)
+    _validate_token_range(
+        np.asarray([previous], dtype=np.int64),
+        embed.shape[0],
+        "first_previous_token",
+    )
+    if not np.isfinite(float(temperature)) or temperature <= 0.0:
+        raise ValueError("sampled Markov temperature must be finite and positive")
+    uniforms = _uniform_vector(
+        sampling_uniforms, base.shape[0], "sampling_uniforms"
+    )
+
+    drafted = np.empty(base.shape[0], dtype=np.int64)
+    corrected = np.empty_like(base)
+    probabilities = np.empty_like(base)
+    for position in range(base.shape[0]):
+        bias = markov_step_bias(
+            np.asarray([previous], dtype=np.int64), embed, project
+        )[0]
+        corrected[position] = base[position] + bias
+        scaled = corrected[position] / float(temperature)
+        scaled -= np.max(scaled)
+        row = np.exp(scaled)
+        row /= np.sum(row, dtype=np.float64)
+        probabilities[position] = row
+        drafted[position] = categorical_from_uniform(
+            row, float(uniforms[position])
+        )
+        previous = int(drafted[position])
+    return MarkovDraft(drafted, corrected, probabilities)
+
+
 def conditional_confidence(
     block_hidden: np.ndarray,
     previous_tokens: Sequence[int] | np.ndarray,
@@ -195,6 +607,241 @@ def conditional_confidence(
         below = np.flatnonzero(probabilities < float(threshold))
         keep = int(below[0]) if below.size else probabilities.shape[0]
     return ConfidenceSchedule(logits, probabilities, keep)
+
+
+def finalize_draft_head(
+    final_hc: np.ndarray,
+    first_previous_token: int,
+    output_projection: np.ndarray,
+    norm_weight: Sequence[float] | np.ndarray,
+    hc_function: np.ndarray,
+    hc_scale: Sequence[float] | np.ndarray,
+    hc_base: Sequence[float] | np.ndarray,
+    markov_embedding: np.ndarray,
+    markov_projection: np.ndarray,
+    confidence_projection: Sequence[float] | np.ndarray,
+    *,
+    confidence_threshold: float,
+    norm_eps: float = 1.0e-6,
+    hc_eps: float = 1.0e-6,
+) -> DraftHead:
+    """Evaluate the final DSpark head with sequential Markov feedback.
+
+    Confidence consumes the HC-collapsed hidden rows before the final RMSNorm,
+    paired with W1 embeddings of ``[accepted, draft[0], ...]``.  Base logits
+    consume the same rows after RMSNorm and the shared target output matrix.
+    """
+
+    collapsed = hc_head(
+        final_hc,
+        hc_function,
+        hc_scale,
+        hc_base,
+        norm_eps=norm_eps,
+        hc_eps=hc_eps,
+    )
+    if collapsed.ndim != 2 or collapsed.shape[0] != 5:
+        raise ValueError("final 0731 draft head requires exactly five rows")
+    output = _float_matrix(output_projection, "output projection")
+    if output.shape[1] != collapsed.shape[-1]:
+        raise ValueError("output projection hidden width mismatch")
+    base_logits = rms_norm(collapsed, norm_weight, eps=norm_eps) @ output.T
+    tokens, corrected = markov_greedy_draft(
+        base_logits,
+        first_previous_token,
+        markov_embedding,
+        markov_projection,
+    )
+    previous = np.concatenate((
+        np.asarray([first_previous_token], dtype=np.int64),
+        tokens[:-1],
+    ))
+    confidence = conditional_confidence(
+        collapsed,
+        previous,
+        markov_embedding,
+        confidence_projection,
+        threshold=confidence_threshold,
+    )
+    return DraftHead(
+        collapsed, base_logits, tokens, corrected, confidence
+    )
+
+
+def empty_raw_cache(
+    capacity: int = DSPARK_RAW_CACHE_WINDOW,
+    width: int = DSPARK_RAW_CACHE_WIDTH,
+) -> RawCacheState:
+    """Allocate the three exact final-0731 DSpark raw-KV rings."""
+
+    if (isinstance(capacity, bool) or
+            not isinstance(capacity, (int, np.integer)) or
+            int(capacity) != DSPARK_RAW_CACHE_WINDOW):
+        raise ValueError("final 0731 raw-cache capacity must be 128")
+    if (isinstance(width, bool) or
+            not isinstance(width, (int, np.integer)) or
+            int(width) != DSPARK_RAW_CACHE_WIDTH):
+        raise ValueError("final 0731 raw-cache width must be 512")
+    return RawCacheState(
+        capacity=DSPARK_RAW_CACHE_WINDOW,
+        token_start=0,
+        length=0,
+        rows=np.zeros(
+            (DSPARK_STAGE_COUNT,
+             DSPARK_RAW_CACHE_WINDOW,
+             DSPARK_RAW_CACHE_WIDTH),
+            dtype=np.float64,
+        ),
+    )
+
+
+def _validate_raw_cache_state(state: RawCacheState) -> None:
+    if (
+        state.capacity != DSPARK_RAW_CACHE_WINDOW
+        or state.token_start < 0
+        or state.length < 0
+        or state.length > state.capacity
+        or state.rows.ndim != 3
+        or state.rows.shape[0] != DSPARK_STAGE_COUNT
+        or state.rows.shape[1] != state.capacity
+        or state.rows.shape[2] != DSPARK_RAW_CACHE_WIDTH
+        or not np.all(np.isfinite(state.rows))
+    ):
+        raise ValueError("invalid three-stage raw-cache state")
+
+
+def append_raw_cache(
+    state: RawCacheState,
+    token_position: int,
+    stage_rows: np.ndarray,
+) -> RawCacheState:
+    """Commit one target-derived KV row to every stage-specific ring."""
+
+    _validate_raw_cache_state(state)
+    rows = np.asarray(stage_rows, dtype=np.float64)
+    if rows.shape != (DSPARK_STAGE_COUNT, DSPARK_RAW_CACHE_WIDTH):
+        raise ValueError("stage_rows must have shape [3, 512]")
+    if not np.all(np.isfinite(rows)):
+        raise ValueError("raw-cache rows must be finite")
+    if (isinstance(token_position, bool) or
+            not isinstance(token_position, (int, np.integer)) or
+            token_position < 0):
+        raise ValueError("token_position must be a non-negative integer")
+    expected = state.token_start + state.length
+    if state.length and token_position != expected:
+        raise ValueError(
+            f"raw-cache append position {token_position} does not follow {expected}"
+        )
+    if not state.length and token_position < state.token_start:
+        raise ValueError("raw-cache append precedes its logical start")
+
+    physical = token_position % state.capacity
+    storage = np.array(state.rows, copy=True)
+    storage[:, physical, :] = rows
+    length = min(state.length + 1, state.capacity)
+    token_start = token_position - length + 1
+    return RawCacheState(
+        state.capacity, token_start, length, storage
+    )
+
+
+def prefill_raw_cache(
+    stage_rows: np.ndarray,
+    *,
+    start_position: int = 0,
+) -> RawCacheState:
+    """Populate all three stage rings from target-derived prefill KV rows.
+
+    Input layout is exactly ``[token, stage=3, raw_width=512]``.  Once the
+    final-0731 capacity of 128 is exceeded, physical slots wrap by absolute
+    token position while the logical view retains only the newest window.
+    """
+
+    rows = np.asarray(stage_rows, dtype=np.float64)
+    if (
+        rows.ndim != 3
+        or rows.shape[1:] != (DSPARK_STAGE_COUNT, DSPARK_RAW_CACHE_WIDTH)
+        or rows.shape[0] == 0
+    ):
+        raise ValueError("prefill rows must have shape [token, 3, 512]")
+    if not np.all(np.isfinite(rows)):
+        raise ValueError("prefill raw-cache rows must be finite")
+    if (isinstance(start_position, bool) or
+            not isinstance(start_position, (int, np.integer)) or
+            start_position < 0):
+        raise ValueError("start_position must be a non-negative integer")
+    storage = np.zeros(
+        (DSPARK_STAGE_COUNT,
+         DSPARK_RAW_CACHE_WINDOW,
+         DSPARK_RAW_CACHE_WIDTH),
+        dtype=np.float64,
+    )
+    positions = start_position + np.arange(rows.shape[0], dtype=np.int64)
+    # A local mutable construction avoids copying the entire production-sized
+    # ring for every prefill token.  The returned state owns this storage.
+    for offset, position in enumerate(positions):
+        storage[:, int(position) % DSPARK_RAW_CACHE_WINDOW, :] = rows[offset]
+    length = min(rows.shape[0], DSPARK_RAW_CACHE_WINDOW)
+    token_start = int(positions[-1]) - length + 1
+    return RawCacheState(
+        DSPARK_RAW_CACHE_WINDOW, token_start, length, storage
+    )
+
+
+def logical_raw_cache(state: RawCacheState) -> np.ndarray:
+    """Return committed rows as ``[stage=3, logical_token, raw_width=512]``."""
+
+    _validate_raw_cache_state(state)
+    if state.length == 0:
+        return np.empty(
+            (DSPARK_STAGE_COUNT, 0, DSPARK_RAW_CACHE_WIDTH),
+            dtype=np.float64,
+        )
+    positions = (
+        np.arange(state.token_start, state.token_start + state.length)
+        % state.capacity
+    )
+    return np.array(state.rows[:, positions, :], copy=True)
+
+
+def proposal_raw_cache_view(
+    state: RawCacheState,
+    token_position: int,
+    current_main_rows: np.ndarray,
+    draft_rows: np.ndarray,
+) -> np.ndarray:
+    """Expose context + current target row + noncausal draft rows per stage.
+
+    The returned proposal view is temporary and does not mutate the committed
+    rings.  This models the production invariant that rejection/abandonment of
+    a proposal cannot advance support-cache ownership.
+    """
+
+    _validate_raw_cache_state(state)
+    if (isinstance(token_position, bool) or
+            not isinstance(token_position, (int, np.integer))):
+        raise ValueError("token_position must be an integer")
+    current = np.asarray(current_main_rows, dtype=np.float64)
+    draft = np.asarray(draft_rows, dtype=np.float64)
+    width = state.rows.shape[2]
+    if current.shape != (DSPARK_STAGE_COUNT, width):
+        raise ValueError("current_main_rows must have shape [3, 512]")
+    if (
+        draft.ndim != 3
+        or draft.shape[0] != DSPARK_STAGE_COUNT
+        or draft.shape[2] != width
+    ):
+        raise ValueError("draft_rows must have shape [3, block, 512]")
+    if draft.shape[1] != 5:
+        raise ValueError("final 0731 proposal raw cache requires five draft rows")
+    if token_position != state.token_start + state.length:
+        raise ValueError("proposal position must equal committed cache end")
+    if not np.all(np.isfinite(current)) or not np.all(np.isfinite(draft)):
+        raise ValueError("proposal raw-cache rows must be finite")
+    committed = logical_raw_cache(state)
+    return np.concatenate(
+        (committed, current[:, None, :], draft), axis=1
+    )
 
 
 def _probability_matrix(value: object, name: str) -> np.ndarray:

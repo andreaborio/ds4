@@ -30,6 +30,13 @@ FINAL_DSPARK_PROVENANCE = {
     "dspark.source.shard48_sha256":
         "cc43742bd24ae6bcdea343a91442f6f66aed2cfebcc6b235470204851ce2f8a9",
 }
+FINAL_DSPARK_SUPPORT_BYTES = 5_989_114_912
+FINAL_DSPARK_SUPPORT_SHA256 = bytes.fromhex(
+    "aa2bd4b5b916e1aa0a01392d69cbdd9798a3f3050c29c22973c8ee4233af0413"
+)
+FINAL_DSPARK_PAYLOAD_SHA256 = bytes.fromhex(
+    "66398593c23efe9ac1be1c9bcc0f95087257e0b3e98087e892b6887ad3d80c95"
+)
 
 
 def load_tool():
@@ -409,9 +416,21 @@ def write_sparse_dspark_store_container(path: Path, plan) -> None:
             fd, plan.descriptor_bytes,
             data_offset + tool.STORE_HEADER_BYTES,
         )
-        provisional = tool.make_header(plan, bytes(32), bytes(32))
+        pinned_plan = tool.dataclasses.replace(
+            plan,
+            source=tool.dataclasses.replace(
+                plan.source, size=FINAL_DSPARK_SUPPORT_BYTES
+            ),
+        )
+        provisional = tool.make_header(
+            pinned_plan,
+            FINAL_DSPARK_SUPPORT_SHA256,
+            FINAL_DSPARK_PAYLOAD_SHA256,
+        )
         store_header = tool.make_header(
-            plan, bytes(32), bytes(32),
+            pinned_plan,
+            FINAL_DSPARK_SUPPORT_SHA256,
+            FINAL_DSPARK_PAYLOAD_SHA256,
             tool.manifest_digest(provisional, plan.descriptor_bytes),
         )
         tool.pwrite_all(fd, store_header, data_offset)
@@ -490,6 +509,10 @@ def run(*args: str, ok: bool = True) -> subprocess.CompletedProcess[str]:
 def main() -> int:
     tool = load_tool()
     assert tool.DSPARK_0731_PROVENANCE == FINAL_DSPARK_PROVENANCE
+    assert tool.DSPARK_0731_FINAL_SUPPORT_SHA256 == \
+        FINAL_DSPARK_SUPPORT_SHA256
+    assert tool.DSPARK_0731_FINAL_SUPPORT_PAYLOAD_SHA256 == \
+        FINAL_DSPARK_PAYLOAD_SHA256
     probe = os.environ.get("DS4_EXPERT_STORE_PROBE")
     with tempfile.TemporaryDirectory(prefix="ds4-expert-major-test-") as tmp:
         tmp_path = Path(tmp)
@@ -998,6 +1021,15 @@ def main() -> int:
         )
         assert aux_manifest["source_tensors"] == 81
         assert [layer.index for layer in aux_layers] == [0, 1, 2]
+        verified_manifest, verified_layers, verified_source_digest = \
+            tool.verify_store_identity(
+                support_gguf, support_plan, sparse_aux_gguf,
+                sparse_aux_store, tool.DSPARK_STORE_TENSOR, "DSpark",
+                source_digest=FINAL_DSPARK_SUPPORT_SHA256,
+            )
+        assert verified_manifest == aux_manifest
+        assert verified_layers == aux_layers
+        assert verified_source_digest == FINAL_DSPARK_SUPPORT_SHA256
         for field in ("data_offset", "data_size", "store_size"):
             mismatched_plan = tool.dataclasses.replace(
                 support_plan,

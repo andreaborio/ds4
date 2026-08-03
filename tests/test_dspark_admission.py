@@ -37,6 +37,27 @@ STORE_COMPONENT_BYTES = 56
 STORE_COMPONENT_OFFSET = 32
 STORE_ALIGNMENT = 4096
 STORE_MANIFEST_DIGEST_OFFSET = 168
+DSPARK_SUPPORT_SOURCE_BYTES = 5_989_114_912
+DSPARK_SUPPORT_SOURCE_SHA256 = bytes.fromhex(
+    "aa2bd4b5b916e1aa0a01392d69cbdd9798a3f3050c29c22973c8ee4233af0413"
+)
+DSPARK_SUPPORT_PAYLOAD_SHA256 = bytes.fromhex(
+    "66398593c23efe9ac1be1c9bcc0f95087257e0b3e98087e892b6887ad3d80c95"
+)
+DSPARK_PROVENANCE = OrderedDict([
+    ("dspark.source.revision",
+     "7872f01b1d1fe23eabc4c98b48bffcef5a386062"),
+    ("dspark.source.config_sha256",
+     "6c8f3d2d3b48707541b88f32f22ef3f0f8a6b57d8523281e2b8d3cdb0ae9a023"),
+    ("dspark.source.index_sha256",
+     "98efab455cf08dfbbbaaba6f570e1bf10bf927d2b4c3c453a59c2f6f0e3be92b"),
+    ("dspark.source.shard46_sha256",
+     "5db924ca907e0d93acd975bd5079c3662717f9ac709f23d079bd8f816d29d9dd"),
+    ("dspark.source.shard47_sha256",
+     "62816173f9f6e136b20b48e3b6f16613ac9ea02b5603f636928b253244a548bd"),
+    ("dspark.source.shard48_sha256",
+     "cc43742bd24ae6bcdea343a91442f6f66aed2cfebcc6b235470204851ce2f8a9"),
+])
 
 
 @dataclass(frozen=True)
@@ -96,7 +117,14 @@ def tensor_bytes(tensor: Tensor) -> int:
 
 
 def deepseek_metadata(*, include_dspark: bool, alias: bool = False,
-                      case_alias: bool = False
+                      case_alias: bool = False,
+                      stage_count: int = 3,
+                      target_layers: list[int] | None = None,
+                      target_layers_type: int = UINT32,
+                      provenance_omit: str | None = None,
+                      provenance_altered: str | None = None,
+                      provenance_bad_type: str | None = None,
+                      provenance_case_alias: bool = False,
                       ) -> OrderedDict[str, tuple[int, object]]:
     ratios = [0 if layer < 2 else 4 if layer % 2 == 0 else 128
               for layer in range(43)]
@@ -147,14 +175,31 @@ def deepseek_metadata(*, include_dspark: bool, alias: bool = False,
             ("dspark.block_size", (UINT32, 5)),
             ("dspark.markov_rank", (UINT32, 256)),
             ("dspark.noise_token_id", (UINT32, 128799)),
-            ("dspark.target_layer_ids", (ARRAY, (UINT32, [40, 41, 42]))),
-            ("dspark.stage_count", (UINT32, 3)),
-            ("dspark.n_layers", (UINT32, 3)),
+            ("dspark.target_layer_ids", (
+                ARRAY,
+                (target_layers_type,
+                 [40, 41, 42] if target_layers is None else target_layers),
+            )),
+            ("dspark.stage_count", (UINT32, stage_count)),
+            ("dspark.n_layers", (UINT32, stage_count)),
         ])
+        for key, value in DSPARK_PROVENANCE.items():
+            if key == provenance_omit:
+                continue
+            if key == provenance_altered:
+                value = "unreviewed"
+            metadata[key] = (
+                (UINT32, 7) if key == provenance_bad_type
+                else (STRING, value)
+            )
         if alias:
             metadata["deepseek4.dspark.block_size"] = (UINT32, 5)
         if case_alias:
             metadata["DeepSeek4.DSPark.block_size"] = (UINT32, 5)
+        if provenance_case_alias:
+            metadata["DSpark.Source.Revision"] = (
+                STRING, DSPARK_PROVENANCE["dspark.source.revision"]
+            )
     return metadata
 
 
@@ -248,7 +293,14 @@ def dspark_static_tensors() -> list[Tensor]:
 
 
 def make_store(name: str, layers: int, source_tensors: int, *,
-               expert_used: int = 6) -> tuple[Tensor, bytes]:
+               expert_used: int = 6,
+               source_size: int = 1,
+               source_sha256: bytes = bytes(32),
+               payload_sha256: bytes = bytes(32),
+               bad_component_type: bool = False,
+               bad_component_dim: bool = False) -> tuple[Tensor, bytes]:
+    if len(source_sha256) != 32 or len(payload_sha256) != 32:
+        raise ValueError("expert-store SHA-256 fields must contain 32 bytes")
     expert_count = 256
     data_offset = align_up(
         STORE_HEADER_BYTES + layers * STORE_LAYER_BYTES, STORE_ALIGNMENT
@@ -277,11 +329,16 @@ def make_store(name: str, layers: int, source_tensors: int, *,
         for role, (dims, value_type, expert_bytes) in enumerate(zip(
             component_dims, component_types, expert_sizes
         )):
+            encoded_type = F16 if bad_component_type and role == 0 \
+                else value_type
+            encoded_dims = ((dims[0] - 1, dims[1], dims[2])
+                            if bad_component_dim and role == 0 else dims)
             struct.pack_into(
                 "<IIIIQQQQQ", entry,
                 STORE_COMPONENT_OFFSET + role * STORE_COMPONENT_BYTES,
-                role, value_type, 3, 256,
-                dims[0], dims[1], dims[2], expert_bytes, record_offset,
+                role, encoded_type, 3, 256,
+                encoded_dims[0], encoded_dims[1], encoded_dims[2],
+                expert_bytes, record_offset,
             )
             record_offset += expert_bytes
         assert record_bytes == 7_077_888
@@ -296,7 +353,9 @@ def make_store(name: str, layers: int, source_tensors: int, *,
         source_tensors, layers, len(descriptors), STORE_HEADER_BYTES,
         data_offset, store_size - data_offset, store_size,
     )
-    struct.pack_into("<Q", header, 88, 1)
+    struct.pack_into("<Q", header, 88, source_size)
+    header[96:128] = source_sha256
+    header[128:160] = payload_sha256
     struct.pack_into("<II", header, 160, 0, 0)
     digest_header = bytearray(header)
     digest_header[
@@ -311,10 +370,25 @@ def make_store(name: str, layers: int, source_tensors: int, *,
 def write_fixture(path: Path, *, combined: bool,
                   metadata_alias: bool = False,
                   metadata_case_alias: bool = False,
+                  metadata_stage_count: int = 3,
+                  metadata_target_layers: list[int] | None = None,
+                  metadata_target_layers_type: int = UINT32,
+                  duplicate_metadata_key: str | None = None,
+                  provenance_omit: str | None = None,
+                  provenance_altered: str | None = None,
+                  provenance_bad_type: str | None = None,
+                  provenance_case_alias: bool = False,
                   support_expert_used: int = 6,
                   support_source_tensors: int = 81,
+                  support_source_size: int = DSPARK_SUPPORT_SOURCE_BYTES,
+                  support_bad_source_digest: bool = False,
+                  support_bad_payload_digest: bool = False,
                   omit_static: str | None = None,
+                  bad_static_name: bool = False,
                   bad_static_shape: bool = False,
+                  bad_static_type: bool = False,
+                  support_bad_component_type: bool = False,
+                  support_bad_component_dim: bool = False,
                   overlap_stores: bool = False,
                   overlap_static_store: bool = False,
                   misaligned_static: bool = False,
@@ -339,6 +413,19 @@ def write_fixture(path: Path, *, combined: bool,
                 if item.name == "mtp.1.attn_q_a.weight" else item
                 for item in support_static
             ]
+        if bad_static_name:
+            support_static = [
+                Tensor("mtp.1.attention_norm.weight", item.dims,
+                       item.value_type)
+                if item.name == "mtp.1.attn_norm.weight" else item
+                for item in support_static
+            ]
+        if bad_static_type:
+            support_static = [
+                Tensor(item.name, item.dims, F16)
+                if item.name == "mtp.1.attn_norm.weight" else item
+                for item in support_static
+            ]
         if duplicate_static_name:
             support_static = [
                 Tensor("mtp.0.hc_attn_base.weight", item.dims,
@@ -350,6 +437,13 @@ def write_fixture(path: Path, *, combined: bool,
         support_store, support_manifest = make_store(
             DSPARK_STORE, 3, support_source_tensors,
             expert_used=support_expert_used,
+            source_size=support_source_size,
+            source_sha256=(bytes(32) if support_bad_source_digest
+                           else DSPARK_SUPPORT_SOURCE_SHA256),
+            payload_sha256=(bytes(32) if support_bad_payload_digest
+                            else DSPARK_SUPPORT_PAYLOAD_SHA256),
+            bad_component_type=support_bad_component_type,
+            bad_component_dim=support_bad_component_dim,
         )
         payloads.append((support_store, support_manifest))
     tensors.append(target_store)
@@ -361,11 +455,23 @@ def write_fixture(path: Path, *, combined: bool,
     metadata = deepseek_metadata(
         include_dspark=combined, alias=metadata_alias,
         case_alias=metadata_case_alias,
+        stage_count=metadata_stage_count,
+        target_layers=metadata_target_layers,
+        target_layers_type=metadata_target_layers_type,
+        provenance_omit=provenance_omit,
+        provenance_altered=provenance_altered,
+        provenance_bad_type=provenance_bad_type,
+        provenance_case_alias=provenance_case_alias,
     )
+    metadata_entries = list(metadata.items())
+    if duplicate_metadata_key is not None:
+        metadata_entries.append(
+            (duplicate_metadata_key, metadata[duplicate_metadata_key])
+        )
     header = bytearray(struct.pack(
-        "<IIQQ", 0x46554747, 3, len(tensors), len(metadata)
+        "<IIQQ", 0x46554747, 3, len(tensors), len(metadata_entries)
     ))
-    for key, (value_type, value) in metadata.items():
+    for key, (value_type, value) in metadata_entries:
         header += pack_string(key)
         header += struct.pack("<I", value_type)
         header += pack_value(value_type, value)
@@ -425,9 +531,10 @@ def write_fixture(path: Path, *, combined: bool,
     return target_source_count, target_source_count + 81
 
 
-def run(binary: Path, model: Path, lock: Path, *, inspect: bool
+def run(binary: Path, model: Path, lock: Path, *, inspect: bool,
+        backend: str = "cpu"
         ) -> subprocess.CompletedProcess[str]:
-    command = [str(binary), "-m", str(model), "--cpu"]
+    command = [str(binary), "-m", str(model), f"--{backend}"]
     command += ["--inspect"] if inspect else ["-p", "admission gate"]
     environment = os.environ.copy()
     environment["DS4_LOCK_FILE"] = str(lock)
@@ -468,6 +575,9 @@ def main() -> int:
                 "dspark cache-plan:" not in target_output,
                 "target-only inspect acquired DSpark runtime state",
                 target_result)
+        require("SUPPORT descriptor installed" not in target_output,
+                "inspect unexpectedly installed a Metal descriptor",
+                target_result)
         target.unlink()
 
         combined = root / "combined.gguf"
@@ -498,6 +608,9 @@ def main() -> int:
         )
         require(f", {combined_count} tensors" in output,
                 "nine DSpark routed identities were not expanded", inspect_result)
+        require("SUPPORT descriptor installed" not in output,
+                "combined inspect unexpectedly installed a Metal descriptor",
+                inspect_result)
 
         inference_result = run(
             binary, combined, root / "combined-open.lock", inspect=False
@@ -512,6 +625,25 @@ def main() -> int:
             "combined artifact did not fail at the explicit engine gate",
             inference_result,
         )
+        metal_inference_result = run(
+            binary, combined, root / "combined-metal-open.lock",
+            inspect=False, backend="metal",
+        )
+        metal_inference_output = (
+            metal_inference_result.stdout + metal_inference_result.stderr
+        )
+        require(metal_inference_result.returncode != 0,
+                "combined artifact reached Metal inference",
+                metal_inference_result)
+        if "metal backend requested but it is unavailable" not in \
+                metal_inference_output:
+            require(
+                "embedded DSpark support is inspection-only until its Metal graph "
+                "and independently budgeted SSD cache are qualified" in
+                metal_inference_output,
+                "combined artifact bypassed the gate with --metal",
+                metal_inference_result,
+            )
         combined.unlink()
 
         negative_cases = (
@@ -519,15 +651,57 @@ def main() -> int:
              "non-canonical alias"),
             ("metadata-case-alias", {"metadata_case_alias": True},
              "non-canonical alias"),
+            ("provenance-missing", {
+                "provenance_omit": "dspark.source.index_sha256"
+             }, "source provenance inventory is incomplete"),
+            ("provenance-altered", {
+                "provenance_altered": "dspark.source.shard47_sha256"
+             }, "source provenance does not match the pinned final 0731"),
+            ("provenance-type", {
+                "provenance_bad_type": "dspark.source.config_sha256"
+             }, "source provenance does not match the pinned final 0731"),
+            ("provenance-case-alias", {"provenance_case_alias": True},
+             "non-canonical alias"),
+            ("wrong-stage-count", {"metadata_stage_count": 2},
+             "does not match the final 0731 contract"),
+            ("wrong-target-layer-type", {
+                "metadata_target_layers_type": UINT64
+             }, "target-layer metadata is invalid"),
+            ("wrong-target-layer-count", {
+                "metadata_target_layers": [40, 41]
+             }, "target-layer metadata is invalid"),
+            ("wrong-target-layer-value", {
+                "metadata_target_layers": [40, 41, 43]
+             }, "does not match the final 0731 contract"),
+            ("duplicate-contract-metadata", {
+                "duplicate_metadata_key": "dspark.block_size"
+             }, "inventory is incomplete or duplicated"),
+            ("duplicate-provenance-metadata", {
+                "duplicate_metadata_key": "dspark.source.revision"
+             }, "source provenance inventory is incomplete or duplicated"),
             ("wrong-top-k", {"support_expert_used": 5},
              "manifest identity is invalid"),
             ("wrong-source-count", {"support_source_tensors": 82},
+             "manifest identity is invalid"),
+            ("wrong-source-size", {"support_source_size": 1},
+             "manifest identity is invalid"),
+            ("wrong-source-digest", {"support_bad_source_digest": True},
+             "manifest identity is invalid"),
+            ("wrong-payload-digest", {"support_bad_payload_digest": True},
              "manifest identity is invalid"),
             ("missing-static", {
                 "omit_static": "mtp.1.attn_norm.weight"
              }, "store does not match GGUF metadata or tensor inventory"),
             ("wrong-static-shape", {"bad_static_shape": True},
              "static tensor contract mismatch"),
+            ("wrong-static-type", {"bad_static_type": True},
+             "static tensor contract mismatch"),
+            ("wrong-static-name", {"bad_static_name": True},
+             "static tensor contract mismatch"),
+            ("wrong-routed-type", {"support_bad_component_type": True},
+             "component geometry is invalid at layer 0 role 0"),
+            ("wrong-routed-shape", {"support_bad_component_dim": True},
+             "component geometry is invalid at layer 0 role 0"),
             ("overlapping-stores", {"overlap_stores": True},
              "target and DSpark expert stores overlap"),
             ("overlapping-static-store", {"overlap_static_store": True},

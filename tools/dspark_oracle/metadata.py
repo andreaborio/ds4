@@ -19,9 +19,13 @@ class MetadataError(ValueError):
 @dataclass(frozen=True)
 class DSparkMetadata:
     block_size: int
+    hc_lanes: int
     markov_rank: int
     noise_token_id: int
     stage_count: int
+    sinkhorn_iterations: int
+    raw_cache_window: int
+    raw_cache_width: int
     target_layer_ids: tuple[int, ...]
     target_layer_count: int
     vocab_size: int
@@ -35,8 +39,8 @@ def load_schema() -> dict[str, Any]:
         document = json.loads(SCHEMA_PATH.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as exc:
         raise MetadataError(f"cannot load DSpark oracle schema: {exc}") from exc
-    if not isinstance(document, dict) or document.get("schemaVersion") != 1:
-        raise MetadataError("DSpark oracle schemaVersion must be 1")
+    if not isinstance(document, dict) or document.get("schemaVersion") != 2:
+        raise MetadataError("DSpark oracle schemaVersion must be 2")
     if document.get("profile") != "deepseek-v4-flash-0731-dspark":
         raise MetadataError("DSpark oracle schema has the wrong profile")
     return document
@@ -76,22 +80,11 @@ def validate_0731_metadata(
 
     errors: list[str] = []
     expected = expected_by_flavor[flavor]
-    if flavor == "hf":
-        unknown_dspark = sorted(
-            key
-            for key in metadata
-            if key.startswith("dspark_") and key not in expected
-        )
-    else:
-        unknown_dspark = sorted(
-            key
-            for key in metadata
-            if (
-                key.startswith("dspark.")
-                or key.startswith("deepseek4.dspark")
-            )
-            and key not in expected
-        )
+    unknown_dspark = sorted(
+        key
+        for key in metadata
+        if "dspark" in key.lower() and key not in expected
+    )
     if unknown_dspark:
         errors.append("unknown DSpark keys: " + ", ".join(unknown_dspark))
     for key, wanted in expected.items():
@@ -111,9 +104,13 @@ def validate_0731_metadata(
 
     result = DSparkMetadata(
         block_size=int(value("blockSize")),
+        hc_lanes=int(value("hcLanes")),
         markov_rank=int(value("markovRank")),
         noise_token_id=int(value("noiseTokenId")),
         stage_count=int(value("stageCount")),
+        sinkhorn_iterations=int(value("sinkhornIterations")),
+        raw_cache_window=int(value("rawCacheWindow")),
+        raw_cache_width=int(value("rawCacheWidth")),
         target_layer_ids=tuple(int(item) for item in value("targetLayerIds")),
         target_layer_count=int(value("targetLayerCount")),
         vocab_size=int(value("vocabSize")),
@@ -122,7 +119,8 @@ def validate_0731_metadata(
     )
     if len(result.target_layer_ids) != result.stage_count:
         raise MetadataError("target_layer_ids count must equal stage_count")
-    if flavor == "gguf" and metadata["dspark.n_layers"] != result.stage_count:
+    if flavor in ("gguf", "support") and \
+            metadata["dspark.n_layers"] != result.stage_count:
         raise MetadataError("dspark.n_layers must equal dspark.stage_count")
     if tuple(sorted(set(result.target_layer_ids))) != result.target_layer_ids:
         raise MetadataError("target_layer_ids must be unique and strictly increasing")

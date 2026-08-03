@@ -1761,6 +1761,7 @@ typedef struct {
     bool native_expert_store_v2;
     uint64_t native_expert_store_offset;
     uint64_t native_expert_store_bytes;
+    uint64_t native_expert_store_source_tensor_count;
     bool native_dspark_store_v2;
     uint64_t native_dspark_store_offset;
     uint64_t native_dspark_store_bytes;
@@ -2341,6 +2342,8 @@ static void model_expand_qwen35_expert_store_v2(ds4_model *m) {
     m->native_expert_store_v2 = true;
     m->native_expert_store_offset = physical_offset;
     m->native_expert_store_bytes = physical_bytes;
+    m->native_expert_store_source_tensor_count =
+        manifest->source_tensor_count;
     m->max_tensor_bytes = 0;
     for (uint64_t i = 0; i < m->n_tensors; i++) {
         if (m->tensors[i].bytes > m->max_tensor_bytes) {
@@ -2537,6 +2540,8 @@ static void model_expand_glm_native_expert_store(ds4_model *m) {
     m->native_expert_store_v2 = true;
     m->native_expert_store_offset = physical_offset;
     m->native_expert_store_bytes = physical_bytes;
+    m->native_expert_store_source_tensor_count =
+        manifest->source_tensor_count;
     m->max_tensor_bytes = 0;
     for (uint64_t i = 0; i < m->n_tensors; i++) {
         if (m->tensors[i].bytes > m->max_tensor_bytes) {
@@ -2730,6 +2735,8 @@ static void model_expand_deepseek4_native_expert_store(ds4_model *m) {
     m->native_expert_store_v2 = true;
     m->native_expert_store_offset = physical_offset;
     m->native_expert_store_bytes = physical_bytes;
+    m->native_expert_store_source_tensor_count =
+        manifest->source_tensor_count;
     m->max_tensor_bytes = 0;
     for (uint64_t i = 0; i < m->n_tensors; i++) {
         if (m->tensors[i].bytes > m->max_tensor_bytes) {
@@ -2837,7 +2844,7 @@ static void model_validate_dspark_physical_layout(
 }
 
 static void model_validate_dspark_0731_metadata(ds4_model *m) {
-    static const char *const key[6] = {
+    static const char *const contract_key[6] = {
         "dspark.block_size",
         "dspark.markov_rank",
         "dspark.noise_token_id",
@@ -2845,15 +2852,55 @@ static void model_validate_dspark_0731_metadata(ds4_model *m) {
         "dspark.stage_count",
         "dspark.n_layers",
     };
-    uint32_t seen[6] = {0};
+    static const struct {
+        const char *key;
+        const char *value;
+    } provenance[] = {
+        {
+            "dspark.source.revision",
+            "7872f01b1d1fe23eabc4c98b48bffcef5a386062",
+        },
+        {
+            "dspark.source.config_sha256",
+            "6c8f3d2d3b48707541b88f32f22ef3f0f8a6b57d8523281e2b8d3cdb0ae9a023",
+        },
+        {
+            "dspark.source.index_sha256",
+            "98efab455cf08dfbbbaaba6f570e1bf10bf927d2b4c3c453a59c2f6f0e3be92b",
+        },
+        {
+            "dspark.source.shard46_sha256",
+            "5db924ca907e0d93acd975bd5079c3662717f9ac709f23d079bd8f816d29d9dd",
+        },
+        {
+            "dspark.source.shard47_sha256",
+            "62816173f9f6e136b20b48e3b6f16613ac9ea02b5603f636928b253244a548bd",
+        },
+        {
+            "dspark.source.shard48_sha256",
+            "cc43742bd24ae6bcdea343a91442f6f66aed2cfebcc6b235470204851ce2f8a9",
+        },
+    };
+    uint32_t contract_seen[6] = {0};
+    uint32_t provenance_seen[
+        sizeof(provenance) / sizeof(provenance[0])] = {0};
     for (uint64_t i = 0; i < m->n_kv; i++) {
         const ds4_str candidate = m->kv[i].key;
         bool canonical = false;
         for (uint32_t index = 0; index < 6; index++) {
-            if (ds4_streq(candidate, key[index])) {
-                seen[index]++;
+            if (ds4_streq(candidate, contract_key[index])) {
+                contract_seen[index]++;
                 canonical = true;
                 break;
+            }
+        }
+        for (uint32_t index = 0;
+             !canonical &&
+             index < sizeof(provenance) / sizeof(provenance[0]);
+             index++) {
+            if (ds4_streq(candidate, provenance[index].key)) {
+                provenance_seen[index]++;
+                canonical = true;
             }
         }
         if (!canonical && ds4_str_contains_ascii_ci(candidate, "dspark")) {
@@ -2861,21 +2908,43 @@ static void model_validate_dspark_0731_metadata(ds4_model *m) {
         }
     }
     for (uint32_t index = 0; index < 6; index++) {
-        if (seen[index] != 1u) {
+        if (contract_seen[index] != 1u) {
             ds4_die("DSpark support metadata inventory is incomplete or duplicated");
         }
     }
+    for (uint32_t index = 0;
+         index < sizeof(provenance) / sizeof(provenance[0]); index++) {
+        if (provenance_seen[index] != 1u) {
+            ds4_die("DSpark source provenance inventory is incomplete or duplicated");
+        }
+        ds4_str value = {0};
+        if (!model_get_string(m, provenance[index].key, &value) ||
+            !ds4_streq(value, provenance[index].value)) {
+            fprintf(stderr,
+                    "ds4: DSpark source provenance does not match the pinned "
+                    "final 0731 source: %s\n",
+                    provenance[index].key);
+            exit(1);
+        }
+    }
+    if (m->native_expert_store_source_tensor_count == 0u ||
+        m->native_expert_store_source_tensor_count >
+            UINT64_MAX - DS4_DSPARK_0731_PHYSICAL_TENSOR_COUNT ||
+        m->n_tensors != m->native_expert_store_source_tensor_count +
+                            DS4_DSPARK_0731_PHYSICAL_TENSOR_COUNT) {
+        ds4_die("DSpark combined physical inventory does not preserve the target source identity");
+    }
 
     uint32_t n_layers = 0;
-    if (!model_get_u32(m, key[0], &m->dspark_block_size) ||
-        !model_get_u32(m, key[1], &m->dspark_markov_rank) ||
-        !model_get_u32(m, key[2], &m->dspark_noise_token_id) ||
-        !model_get_u32(m, key[4], &m->dspark_stage_count) ||
-        !model_get_u32(m, key[5], &n_layers)) {
+    if (!model_get_u32(m, contract_key[0], &m->dspark_block_size) ||
+        !model_get_u32(m, contract_key[1], &m->dspark_markov_rank) ||
+        !model_get_u32(m, contract_key[2], &m->dspark_noise_token_id) ||
+        !model_get_u32(m, contract_key[4], &m->dspark_stage_count) ||
+        !model_get_u32(m, contract_key[5], &n_layers)) {
         ds4_die("DSpark support scalar metadata types are invalid");
     }
     ds4_array_ref target_layers = {0};
-    if (!model_get_array(m, key[3], &target_layers) ||
+    if (!model_get_array(m, contract_key[3], &target_layers) ||
         target_layers.type != GGUF_VALUE_UINT32 ||
         target_layers.len != DS4_DSPARK_0731_STAGE_COUNT) {
         ds4_die("DSpark support target-layer metadata is invalid");
@@ -3178,6 +3247,15 @@ static void model_expand_deepseek4_dspark_store_v2(ds4_model *m) {
         free(names);
         ds4_expert_store_close(store);
         ds4_die("DSpark logical tensor inventory is incomplete");
+    }
+    if (m->native_expert_store_source_tensor_count >
+            UINT64_MAX - DS4_DSPARK_0731_SOURCE_TENSOR_COUNT ||
+        logical_count != m->native_expert_store_source_tensor_count +
+                             DS4_DSPARK_0731_SOURCE_TENSOR_COUNT) {
+        free(logical);
+        free(names);
+        ds4_expert_store_close(store);
+        ds4_die("DSpark combined logical inventory does not preserve the target source identity");
     }
 
     const uint64_t physical_offset = store_tensor->abs_offset;
@@ -4489,6 +4567,50 @@ typedef struct {
     ds4_layer_weights block;
 } ds4_mtp_weights;
 
+/* DSpark is part of the combined target model.  Keep its final-0731 layout
+ * separate from the legacy external MTP API: the three support stages have
+ * their own attention/MoE weights, while stage 0 and stage 2 own additional
+ * projection and prediction heads. */
+typedef struct {
+    ds4_tensor *hc_attn_base;
+    ds4_tensor *hc_attn_fn;
+    ds4_tensor *hc_attn_scale;
+    ds4_tensor *attn_sinks;
+    ds4_tensor *attn_q_a;
+    ds4_tensor *attn_q_a_norm;
+    ds4_tensor *attn_q_b;
+    ds4_tensor *attn_kv;
+    ds4_tensor *attn_kv_a_norm;
+    ds4_tensor *attn_output_a;
+    ds4_tensor *attn_output_b;
+    ds4_tensor *attn_norm;
+    ds4_tensor *hc_ffn_base;
+    ds4_tensor *hc_ffn_fn;
+    ds4_tensor *hc_ffn_scale;
+    ds4_tensor *ffn_gate_inp;
+    ds4_tensor *ffn_exp_probs_b;
+    ds4_tensor *ffn_norm;
+    ds4_tensor *ffn_gate_shexp;
+    ds4_tensor *ffn_up_shexp;
+    ds4_tensor *ffn_down_shexp;
+    ds4_tensor *ffn_gate_exps;
+    ds4_tensor *ffn_up_exps;
+    ds4_tensor *ffn_down_exps;
+} ds4_dspark_stage_weights;
+
+typedef struct {
+    ds4_dspark_stage_weights stage[DS4_DSPARK_0731_STAGE_COUNT];
+    ds4_tensor *main_proj;
+    ds4_tensor *main_norm;
+    ds4_tensor *norm;
+    ds4_tensor *hc_head_base;
+    ds4_tensor *hc_head_fn;
+    ds4_tensor *hc_head_scale;
+    ds4_tensor *markov_w1;
+    ds4_tensor *markov_w2;
+    ds4_tensor *confidence_proj;
+} ds4_dspark_weights;
+
 /* =========================================================================
  * Fixed Weight Binding and Model Validation.
  * =========================================================================
@@ -5625,6 +5747,153 @@ static void mtp_weights_validate_layout(const ds4_mtp_weights *w) {
     tensor_expect_layout(l->ffn_gate_shexp, DS4_TENSOR_Q8_0, 2, DS4_N_EMBD, DS4_N_FF_EXP, 0);
     tensor_expect_layout(l->ffn_up_shexp,   DS4_TENSOR_Q8_0, 2, DS4_N_EMBD, DS4_N_FF_EXP, 0);
     tensor_expect_layout(l->ffn_down_shexp, DS4_TENSOR_Q8_0, 2, DS4_N_FF_EXP, DS4_N_EMBD, 0);
+}
+
+static void dspark_weights_validate_layout(
+        const ds4_model          *m,
+        const ds4_dspark_weights *w) {
+    if (!m || !w || !m->native_dspark_store_v2) {
+        ds4_die("internal error: missing combined DSpark weights");
+    }
+    if (m->native_dspark_source_tensor_count !=
+            DS4_DSPARK_0731_SOURCE_TENSOR_COUNT ||
+        m->dspark_stage_count != DS4_DSPARK_0731_STAGE_COUNT ||
+        m->dspark_target_layers[0] != 40u ||
+        m->dspark_target_layers[1] != 41u ||
+        m->dspark_target_layers[2] != 42u) {
+        ds4_die("DSpark bound weights do not match the final 0731 stage contract");
+    }
+
+    uint32_t bound = 0;
+    for (uint32_t stage_index = 0;
+         stage_index < DS4_DSPARK_0731_STAGE_COUNT; stage_index++) {
+        const ds4_dspark_stage_weights *stage = &w->stage[stage_index];
+        const ds4_tensor *const stage_tensor[] = {
+            stage->hc_attn_base,
+            stage->hc_attn_fn,
+            stage->hc_attn_scale,
+            stage->attn_sinks,
+            stage->attn_q_a,
+            stage->attn_q_a_norm,
+            stage->attn_q_b,
+            stage->attn_kv,
+            stage->attn_kv_a_norm,
+            stage->attn_output_a,
+            stage->attn_output_b,
+            stage->attn_norm,
+            stage->hc_ffn_base,
+            stage->hc_ffn_fn,
+            stage->hc_ffn_scale,
+            stage->ffn_gate_inp,
+            stage->ffn_exp_probs_b,
+            stage->ffn_norm,
+            stage->ffn_gate_shexp,
+            stage->ffn_up_shexp,
+            stage->ffn_down_shexp,
+            stage->ffn_gate_exps,
+            stage->ffn_up_exps,
+            stage->ffn_down_exps,
+        };
+        for (uint32_t tensor_index = 0;
+             tensor_index < sizeof(stage_tensor) / sizeof(stage_tensor[0]);
+             tensor_index++) {
+            if (!stage_tensor[tensor_index]) {
+                ds4_die("DSpark stage binding is incomplete");
+            }
+            bound++;
+        }
+
+        tensor_expect_layout(stage->hc_attn_base,
+                             DS4_TENSOR_F32, 1, 24, 0, 0);
+        tensor_expect_layout(stage->hc_attn_fn,
+                             DS4_TENSOR_F16, 2, 16384, 24, 0);
+        tensor_expect_layout(stage->hc_attn_scale,
+                             DS4_TENSOR_F32, 1, 3, 0, 0);
+        tensor_expect_layout(stage->attn_sinks,
+                             DS4_TENSOR_F32, 1, 64, 0, 0);
+        tensor_expect_layout(stage->attn_q_a,
+                             DS4_TENSOR_Q8_0, 2, 4096, 1024, 0);
+        tensor_expect_layout(stage->attn_q_a_norm,
+                             DS4_TENSOR_F32, 1, 1024, 0, 0);
+        tensor_expect_layout(stage->attn_q_b,
+                             DS4_TENSOR_Q8_0, 2, 1024, 32768, 0);
+        tensor_expect_layout(stage->attn_kv,
+                             DS4_TENSOR_Q8_0, 2, 4096, 512, 0);
+        tensor_expect_layout(stage->attn_kv_a_norm,
+                             DS4_TENSOR_F32, 1, 512, 0, 0);
+        tensor_expect_layout(stage->attn_output_a,
+                             DS4_TENSOR_Q8_0, 2, 4096, 8192, 0);
+        tensor_expect_layout(stage->attn_output_b,
+                             DS4_TENSOR_Q8_0, 2, 8192, 4096, 0);
+        tensor_expect_layout(stage->attn_norm,
+                             DS4_TENSOR_F32, 1, 4096, 0, 0);
+        tensor_expect_layout(stage->hc_ffn_base,
+                             DS4_TENSOR_F32, 1, 24, 0, 0);
+        tensor_expect_layout(stage->hc_ffn_fn,
+                             DS4_TENSOR_F16, 2, 16384, 24, 0);
+        tensor_expect_layout(stage->hc_ffn_scale,
+                             DS4_TENSOR_F32, 1, 3, 0, 0);
+        tensor_expect_layout(stage->ffn_gate_inp,
+                             DS4_TENSOR_Q8_0, 2, 4096, 256, 0);
+        tensor_expect_layout(stage->ffn_exp_probs_b,
+                             DS4_TENSOR_F32, 1, 256, 0, 0);
+        tensor_expect_layout(stage->ffn_norm,
+                             DS4_TENSOR_F32, 1, 4096, 0, 0);
+        tensor_expect_layout(stage->ffn_gate_shexp,
+                             DS4_TENSOR_Q8_0, 2, 4096, 2048, 0);
+        tensor_expect_layout(stage->ffn_up_shexp,
+                             DS4_TENSOR_Q8_0, 2, 4096, 2048, 0);
+        tensor_expect_layout(stage->ffn_down_shexp,
+                             DS4_TENSOR_Q8_0, 2, 2048, 4096, 0);
+        tensor_expect_layout(stage->ffn_gate_exps,
+                             DS4_TENSOR_IQ2_XXS, 3, 4096, 2048, 256);
+        tensor_expect_layout(stage->ffn_up_exps,
+                             DS4_TENSOR_IQ2_XXS, 3, 4096, 2048, 256);
+        tensor_expect_layout(stage->ffn_down_exps,
+                             DS4_TENSOR_Q2_K, 3, 2048, 4096, 256);
+    }
+
+    const ds4_tensor *const special_tensor[] = {
+        w->main_proj,
+        w->main_norm,
+        w->norm,
+        w->hc_head_base,
+        w->hc_head_fn,
+        w->hc_head_scale,
+        w->markov_w1,
+        w->markov_w2,
+        w->confidence_proj,
+    };
+    for (uint32_t tensor_index = 0;
+         tensor_index < sizeof(special_tensor) / sizeof(special_tensor[0]);
+         tensor_index++) {
+        if (!special_tensor[tensor_index]) {
+            ds4_die("DSpark special-head binding is incomplete");
+        }
+        bound++;
+    }
+    if (bound != DS4_DSPARK_0731_SOURCE_TENSOR_COUNT) {
+        ds4_die("internal error: DSpark binder did not cover exactly 81 tensors");
+    }
+
+    tensor_expect_layout(w->main_proj,
+                         DS4_TENSOR_Q8_0, 2, 12288, 4096, 0);
+    tensor_expect_layout(w->main_norm,
+                         DS4_TENSOR_F32, 1, 4096, 0, 0);
+    tensor_expect_layout(w->norm,
+                         DS4_TENSOR_F32, 1, 4096, 0, 0);
+    tensor_expect_layout(w->hc_head_base,
+                         DS4_TENSOR_F32, 1, 4, 0, 0);
+    tensor_expect_layout(w->hc_head_fn,
+                         DS4_TENSOR_F16, 2, 16384, 4, 0);
+    tensor_expect_layout(w->hc_head_scale,
+                         DS4_TENSOR_F32, 1, 1, 0, 0);
+    tensor_expect_layout(w->markov_w1,
+                         DS4_TENSOR_Q8_0, 2, 256, 129280, 0);
+    tensor_expect_layout(w->markov_w2,
+                         DS4_TENSOR_Q8_0, 2, 256, 129280, 0);
+    tensor_expect_layout(w->confidence_proj,
+                         DS4_TENSOR_Q8_0, 2, 4352, 1, 0);
 }
 
 static bool ds4_shape_matches_metadata(
@@ -7726,6 +7995,83 @@ static void mtp_weights_bind(ds4_mtp_weights *w, const ds4_model *m) {
     l->ffn_down_shexp  = required_tensor(m, "mtp.0.ffn_down_shexp.weight");
 
     mtp_weights_validate_layout(w);
+}
+
+static void dspark_weights_bind(
+        ds4_dspark_weights *w,
+        const ds4_model    *m) {
+    if (!w || !m || !m->native_dspark_store_v2) {
+        ds4_die("internal error: cannot bind absent DSpark support");
+    }
+    memset(w, 0, sizeof(*w));
+
+    for (uint32_t stage_index = 0;
+         stage_index < DS4_DSPARK_0731_STAGE_COUNT; stage_index++) {
+        ds4_dspark_stage_weights *stage = &w->stage[stage_index];
+        stage->hc_attn_base = required_tensorf(
+            m, "mtp.%u.hc_attn_base.weight", stage_index);
+        stage->hc_attn_fn = required_tensorf(
+            m, "mtp.%u.hc_attn_fn.weight", stage_index);
+        stage->hc_attn_scale = required_tensorf(
+            m, "mtp.%u.hc_attn_scale.weight", stage_index);
+        stage->attn_sinks = required_tensorf(
+            m, "mtp.%u.attn_sinks.weight", stage_index);
+        stage->attn_q_a = required_tensorf(
+            m, "mtp.%u.attn_q_a.weight", stage_index);
+        stage->attn_q_a_norm = required_tensorf(
+            m, "mtp.%u.attn_q_a_norm.weight", stage_index);
+        stage->attn_q_b = required_tensorf(
+            m, "mtp.%u.attn_q_b.weight", stage_index);
+        stage->attn_kv = required_tensorf(
+            m, "mtp.%u.attn_kv.weight", stage_index);
+        stage->attn_kv_a_norm = required_tensorf(
+            m, "mtp.%u.attn_kv_a_norm.weight", stage_index);
+        stage->attn_output_a = required_tensorf(
+            m, "mtp.%u.attn_output_a.weight", stage_index);
+        stage->attn_output_b = required_tensorf(
+            m, "mtp.%u.attn_output_b.weight", stage_index);
+        stage->attn_norm = required_tensorf(
+            m, "mtp.%u.attn_norm.weight", stage_index);
+        stage->hc_ffn_base = required_tensorf(
+            m, "mtp.%u.hc_ffn_base.weight", stage_index);
+        stage->hc_ffn_fn = required_tensorf(
+            m, "mtp.%u.hc_ffn_fn.weight", stage_index);
+        stage->hc_ffn_scale = required_tensorf(
+            m, "mtp.%u.hc_ffn_scale.weight", stage_index);
+        stage->ffn_gate_inp = required_tensorf(
+            m, "mtp.%u.ffn_gate_inp.weight", stage_index);
+        stage->ffn_exp_probs_b = required_tensorf(
+            m, "mtp.%u.exp_probs_b.bias", stage_index);
+        stage->ffn_norm = required_tensorf(
+            m, "mtp.%u.ffn_norm.weight", stage_index);
+        stage->ffn_gate_shexp = required_tensorf(
+            m, "mtp.%u.ffn_gate_shexp.weight", stage_index);
+        stage->ffn_up_shexp = required_tensorf(
+            m, "mtp.%u.ffn_up_shexp.weight", stage_index);
+        stage->ffn_down_shexp = required_tensorf(
+            m, "mtp.%u.ffn_down_shexp.weight", stage_index);
+        stage->ffn_gate_exps = required_tensorf(
+            m, "mtp.%u.ffn_gate_exps.weight", stage_index);
+        stage->ffn_up_exps = required_tensorf(
+            m, "mtp.%u.ffn_up_exps.weight", stage_index);
+        stage->ffn_down_exps = required_tensorf(
+            m, "mtp.%u.ffn_down_exps.weight", stage_index);
+    }
+
+    w->main_proj = required_tensor(m, "mtp.0.main_proj.weight");
+    w->main_norm = required_tensor(m, "mtp.0.main_norm.weight");
+    w->norm = required_tensor(m, "mtp.2.norm.weight");
+    w->hc_head_base = required_tensor(m, "mtp.2.hc_head_base.weight");
+    w->hc_head_fn = required_tensor(m, "mtp.2.hc_head_fn.weight");
+    w->hc_head_scale = required_tensor(m, "mtp.2.hc_head_scale.weight");
+    w->markov_w1 = required_tensor(
+        m, "mtp.2.markov_head.markov_w1.weight");
+    w->markov_w2 = required_tensor(
+        m, "mtp.2.markov_head.markov_w2.weight");
+    w->confidence_proj = required_tensor(
+        m, "mtp.2.confidence_head.proj.weight");
+
+    dspark_weights_validate_layout(m, w);
 }
 
 static void weights_free(ds4_weights *w) {
@@ -30323,6 +30669,7 @@ struct ds4_engine {
     ds4_vocab vocab;
     ds4_weights weights;
     ds4_qwen35_weights qwen35_weights;
+    ds4_dspark_weights dspark_weights;
     ds4_mtp_weights mtp_weights;
     ds4_backend backend;
     int mtp_draft_tokens;
@@ -30369,6 +30716,8 @@ struct ds4_engine {
      * GPU teardown have both completed. */
     ds4_expert_store *expert_store_v2;
     bool expert_store_v2_ready;
+    ds4_expert_store *dspark_store_v2;
+    bool dspark_store_v2_ready;
 #endif
     bool metal_ready;
     bool mtp_ready;
@@ -39591,6 +39940,141 @@ bool hebrus_internal_qwen35_guarded_phase_planner_test(void) {
                geometry.minimum_cache_experts;
 }
 
+static bool ds4_engine_install_dspark_store_v2(ds4_engine *e) {
+    if (!e || !e->model.native_dspark_store_v2 ||
+        e->model.family != DS4_MODEL_FAMILY_DEEPSEEK4) {
+        return false;
+    }
+    if (e->dspark_store_v2_ready) return true;
+
+    char error[256] = {0};
+    ds4_expert_store *store = NULL;
+    if (!ds4_expert_store_open_embedded(
+            &store, e->model.fd,
+            e->model.native_dspark_store_offset,
+            e->model.native_dspark_store_bytes,
+            DS4_EXPERT_STORE_FAMILY_DEEPSEEK4,
+            error, sizeof(error)) ||
+        !ds4_expert_store_validate_dspark_0731(
+            store, error, sizeof(error))) {
+        fprintf(stderr,
+                "ds4: native DSpark support store could not be reopened: %s\n",
+                error[0] ? error : "final-0731 validation failed");
+        ds4_expert_store_close(store);
+        return false;
+    }
+
+    const ds4_expert_store_manifest *manifest =
+        ds4_expert_store_manifest_get(store);
+    if (!manifest ||
+        manifest->layer_count != DS4_DSPARK_0731_STAGE_COUNT ||
+        manifest->expert_count != DS4_DSPARK_0731_EXPERT_COUNT ||
+        manifest->expert_used_count !=
+            DS4_DSPARK_0731_EXPERT_USED_COUNT ||
+        manifest->source_tensor_count !=
+            DS4_DSPARK_0731_SOURCE_TENSOR_COUNT ||
+        manifest->storage_format != DS4_EXPERT_STORE_STORAGE_GGML ||
+        manifest->group_size != 0u) {
+        fprintf(stderr,
+                "ds4: native DSpark support store does not match the final "
+                "0731 descriptor contract\n");
+        ds4_expert_store_close(store);
+        return false;
+    }
+
+    ds4_gpu_expert_store_layer_v2
+        gpu_layers[DS4_DSPARK_0731_STAGE_COUNT];
+    uint64_t logical_offsets[DS4_DSPARK_0731_STAGE_COUNT][3];
+    memset(gpu_layers, 0, sizeof(gpu_layers));
+    memset(logical_offsets, 0, sizeof(logical_offsets));
+    for (uint32_t stage_index = 0;
+         stage_index < DS4_DSPARK_0731_STAGE_COUNT; stage_index++) {
+        const ds4_expert_store_layer *entry =
+            ds4_expert_store_layer_at(store, stage_index);
+        const ds4_dspark_stage_weights *stage =
+            &e->dspark_weights.stage[stage_index];
+        const ds4_tensor *const tensor[3] = {
+            stage->ffn_gate_exps,
+            stage->ffn_up_exps,
+            stage->ffn_down_exps,
+        };
+        if (!entry || entry->layer != stage_index ||
+            entry->record_bytes != e->model.native_dspark_record_bytes) {
+            fprintf(stderr,
+                    "ds4: native DSpark support store is missing stage %u\n",
+                    stage_index);
+            ds4_expert_store_close(store);
+            return false;
+        }
+        gpu_layers[stage_index].layer = stage_index;
+        gpu_layers[stage_index].data_offset =
+            ds4_expert_store_file_offset(store) + entry->data_offset;
+        gpu_layers[stage_index].data_size = entry->data_size;
+        gpu_layers[stage_index].record_bytes = entry->record_bytes;
+        for (uint32_t role = 0; role < 3u; role++) {
+            const ds4_expert_store_component *component =
+                &entry->component[role];
+            if (!tensor[role] ||
+                tensor[role]->type != component->ggml_type ||
+                tensor[role]->ndim != 3u ||
+                tensor[role]->dim[0] != component->dim[0] ||
+                tensor[role]->dim[1] != component->dim[1] ||
+                tensor[role]->dim[2] != component->dim[2] ||
+                tensor[role]->bytes !=
+                    component->expert_bytes * manifest->expert_count) {
+                fprintf(stderr,
+                        "ds4: native DSpark stage %u role %u differs from "
+                        "its bound logical tensor\n",
+                        stage_index, role);
+                ds4_expert_store_close(store);
+                return false;
+            }
+            gpu_layers[stage_index].component_offset[role] =
+                component->record_offset;
+            gpu_layers[stage_index].component_bytes[role] =
+                component->expert_bytes;
+            logical_offsets[stage_index][role] = tensor[role]->abs_offset;
+        }
+    }
+
+    if (!ds4_gpu_expert_store_v2_install_for_store(
+            DS4_GPU_EXPERT_STORE_SUPPORT,
+            ds4_expert_store_fd(store), e->model.size,
+            manifest->layer_count, manifest->expert_count,
+            manifest->storage_format, manifest->group_size,
+            gpu_layers)) {
+        fprintf(stderr,
+                "ds4: Metal rejected the native DSpark SUPPORT descriptor\n");
+        ds4_expert_store_close(store);
+        return false;
+    }
+    for (uint32_t stage_index = 0;
+         stage_index < DS4_DSPARK_0731_STAGE_COUNT; stage_index++) {
+        if (!ds4_gpu_expert_store_v2_bind_layer_for_store(
+                DS4_GPU_EXPERT_STORE_SUPPORT,
+                stage_index, e->model.size,
+                logical_offsets[stage_index][0],
+                logical_offsets[stage_index][1],
+                logical_offsets[stage_index][2])) {
+            fprintf(stderr,
+                    "ds4: Metal rejected native DSpark SUPPORT binding for "
+                    "stage %u\n",
+                    stage_index);
+            ds4_gpu_expert_store_v2_clear_for_store(
+                DS4_GPU_EXPERT_STORE_SUPPORT);
+            ds4_expert_store_close(store);
+            return false;
+        }
+    }
+
+    e->dspark_store_v2 = store;
+    e->dspark_store_v2_ready = true;
+    fprintf(stderr,
+            "ds4: DSpark SUPPORT descriptor installed: 3 stages x 256 "
+            "experts; execution remains fail-closed\n");
+    return true;
+}
+
 static bool ds4_engine_install_expert_store_v2(ds4_engine *e) {
     if (!e || !e->model.native_expert_store_v2) {
         return false;
@@ -39634,7 +40118,9 @@ static bool ds4_engine_install_expert_store_v2(ds4_engine *e) {
         manifest->layer_count != expected_layers ||
         manifest->expert_count != expected_experts ||
         manifest->expert_used_count != expected_experts_used ||
-        manifest->source_tensor_count != e->model.n_tensors) {
+        e->model.native_expert_store_source_tensor_count == 0u ||
+        manifest->source_tensor_count !=
+            e->model.native_expert_store_source_tensor_count) {
         fprintf(stderr,
                 "ds4: native %s expert store does not match the active shape profile\n",
                 family_name);
@@ -39761,6 +40247,15 @@ static bool ds4_engine_install_expert_store_v2(ds4_engine *e) {
             ds4_expert_store_close(store);
             return false;
         }
+    }
+    if (e->model.native_dspark_store_v2 &&
+        !ds4_engine_install_dspark_store_v2(e)) {
+        fprintf(stderr,
+                "ds4: Metal could not install the combined DSpark SUPPORT "
+                "descriptor\n");
+        ds4_gpu_expert_store_v2_clear();
+        ds4_expert_store_close(store);
+        return false;
     }
     if (!e->ssd_streaming &&
         !ds4_gpu_expert_store_v2_enable_resident()) {
@@ -40428,6 +40923,9 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
 #endif
     }
     weights_bind(&e->weights, &e->model);
+    if (e->model.native_dspark_store_v2) {
+        dspark_weights_bind(&e->dspark_weights, &e->model);
+    }
     if (!ds4_engine_resolve_residency(e, opt)) {
         ds4_engine_close(e);
         return 1;
@@ -41064,6 +41562,10 @@ void ds4_engine_close(ds4_engine *e) {
                 "ds4: accelerator synchronization failed during engine shutdown\n");
     }
 #if defined(__APPLE__)
+    if (e->dspark_store_v2) {
+        ds4_gpu_expert_store_v2_clear_for_store(
+            DS4_GPU_EXPERT_STORE_SUPPORT);
+    }
     if (e->expert_store_v2) {
         ds4_gpu_expert_store_v2_clear();
     }
@@ -41075,6 +41577,9 @@ void ds4_engine_close(ds4_engine *e) {
     ds4_expert_store_close(e->expert_store_v2);
     e->expert_store_v2 = NULL;
     e->expert_store_v2_ready = false;
+    ds4_expert_store_close(e->dspark_store_v2);
+    e->dspark_store_v2 = NULL;
+    e->dspark_store_v2_ready = false;
 #endif
 #endif
     if (e->mtp_ready) model_close(&e->mtp_model);

@@ -45,6 +45,13 @@ DSPARK_PREVIEW_REFERENCE_SHA256 = bytes.fromhex(
 DSPARK_0731_FINAL_SUPPORT_SHA256: bytes | None = bytes.fromhex(
     "aa2bd4b5b916e1aa0a01392d69cbdd9798a3f3050c29c22973c8ee4233af0413"
 )
+# SHA-256 of the deterministic ExpertMajor payload written from that exact
+# support artifact (canonical padding plus three interleaved stage payloads).
+# This is intentionally distinct from both the support whole-file digest above
+# and the independent 81-tensor comparison manifest.
+DSPARK_0731_FINAL_SUPPORT_PAYLOAD_SHA256 = bytes.fromhex(
+    "66398593c23efe9ac1be1c9bcc0f95087257e0b3e98087e892b6887ad3d80c95"
+)
 DSPARK_0731_PROVENANCE = {
     "dspark.source.revision":
         "7872f01b1d1fe23eabc4c98b48bffcef5a386062",
@@ -1408,6 +1415,15 @@ def require_final_dspark_support_pin() -> bytes:
     return pin
 
 
+def require_final_dspark_payload_digest(actual: bytes) -> None:
+    expected = DSPARK_0731_FINAL_SUPPORT_PAYLOAD_SHA256
+    if len(actual) != 32 or actual != expected:
+        raise FormatError(
+            "DSpark ExpertMajor payload SHA-256 does not match final 0731; "
+            f"expected {expected.hex()}, got {actual.hex()}"
+        )
+
+
 def parse_bytes(text: str) -> int:
     match = re.fullmatch(r"(\d+)(KiB|MiB|GiB)?", text)
     if not match:
@@ -1643,6 +1659,7 @@ def build_combined(source_path: Path, support_path: Path, destination: Path,
             native_data_offset + support_store.new_rel_offset,
             support_digest, "DSpark expert-major",
         )
+        require_final_dspark_payload_digest(support_payload_digest)
         os.fsync(output_fd)
         if verify_after:
             native = load_gguf_fd(temp, output_fd)
@@ -2113,6 +2130,9 @@ def verify_combined_open(
     verify_store_payload(
         support_plan, support_store, support_manifest, support_layers,
         support_fd, native_fd, "DSpark expert-major",
+    )
+    require_final_dspark_payload_digest(
+        bytes(support_manifest["payload_sha256"])
     )
     if authenticated_target_digest is not None:
         final_target_digest = hash_fd(

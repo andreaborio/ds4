@@ -1750,6 +1750,8 @@ int ds4_gpu_internal_expert_store_v2_kernel_test(void);
 #ifdef DS4_TEST_HOOKS
 /* TARGET/SUPPORT descriptor namespace and offset-isolation regression. */
 int ds4_gpu_internal_dspark_dual_store_test(void);
+/* Separate SUPPORT SSD cache quota, namespace, I/O and teardown regression. */
+int ds4_gpu_internal_dspark_support_cache_test(void);
 /* Device-only post-layer HC mean regression for the DSpark tap. */
 int ds4_gpu_internal_dspark_hc_mean_test(void);
 #endif

@@ -323,6 +323,8 @@ typedef struct {
 
 typedef struct {
     int fd;
+    dev_t file_device;
+    ino_t file_inode;
     uint64_t file_size;
     uint64_t model_size;
     uint32_t n_layer;
@@ -347,11 +349,25 @@ static ds4_gpu_qwen35_expert_pack_state g_qwen35_expert_pack;
 enum {
     DS4_DSPARK_SUPPORT_LAYER_COUNT = 3,
     DS4_DSPARK_SUPPORT_EXPERT_COUNT = 256,
+    DS4_DSPARK_TARGET_LAYER_COUNT = 43,
+    /* Three top-6 stages plus one in-flight record.  This reservation is
+     * charged against the same parent count as TARGET; it is never borrowed
+     * from TARGET implicitly. */
+    DS4_DSPARK_SUPPORT_CACHE_FLOOR = 19,
+    DS4_DSPARK_TARGET_CACHE_FLOOR = 259,
+    DS4_DSPARK_COMBINED_CACHE_FLOOR =
+        DS4_DSPARK_TARGET_CACHE_FLOOR + DS4_DSPARK_SUPPORT_CACHE_FLOOR,
 };
 static ds4_gpu_qwen35_expert_pack_state *g_dspark_expert_pack;
+/* A SUPPORT descriptor is paired with one exact TARGET installation, not
+ * merely with a reusable fd number.  TARGET clear/reinstall advances this
+ * identity so a descriptor retained by another engine cannot become live. */
+static uint64_t g_target_expert_pack_generation;
+static uint64_t g_dspark_support_target_generation;
 static id<MTLBuffer> g_qwen35_expert_pack_resident_buffers[
     DS4_EXPERT_STORE_MAX_LAYER];
 static void ds4_gpu_qwen35_expert_pack_state_reset(void);
+static void ds4_gpu_target_expert_pack_advance_generation(void);
 
 static ds4_gpu_qwen35_expert_pack_state *ds4_gpu_expert_pack_for_store(
         ds4_gpu_expert_store_id store_id) {
@@ -446,6 +462,22 @@ static uint64_t g_stream_expert_cache_buffer_allocs;
 static uint64_t g_stream_expert_cache_buffer_reuses;
 static uint64_t g_stream_expert_cache_decode_tokens;
 static uint64_t g_stream_expert_cache_hotness_decay_token;
+/* DSpark SUPPORT has its own cache identity and telemetry.  Only the parent
+ * expert-count envelope is shared with TARGET; entries, clocks, eviction and
+ * I/O counters are deliberately independent. */
+static uint64_t g_dspark_support_cache_bytes;
+static uint32_t g_dspark_support_cache_entry_count;
+static uint64_t g_dspark_support_cache_hits;
+static uint64_t g_dspark_support_cache_misses;
+static uint64_t g_dspark_support_cache_evictions;
+static uint64_t g_dspark_support_cache_expert_loads;
+static uint64_t g_dspark_support_cache_pread_syscalls;
+static uint64_t g_dspark_support_cache_pread_bytes;
+static double g_dspark_support_cache_pread_ms;
+static uint64_t g_dspark_support_cache_clock;
+#ifdef DS4_TEST_HOOKS
+static uint64_t g_dspark_reconcile_synchronize_calls;
+#endif
 static uint64_t g_stream_expert_timing_selected_calls;
 static double g_stream_expert_timing_selected_read_ms;
 static double g_stream_expert_timing_selected_sync_ms;
@@ -566,7 +598,18 @@ static int ds4_gpu_stream_expert_cache_note_expert_size(
         uint64_t gate_expert_bytes,
         uint64_t down_expert_bytes);
 static uint32_t ds4_gpu_stream_expert_cache_configured_budget(void);
+static uint32_t ds4_gpu_stream_expert_cache_apply_target_caps(
+        uint32_t target_budget,
+        int locked);
+static uint32_t ds4_gpu_stream_expert_cache_parent_budget(int locked);
+static int ds4_gpu_dspark_support_cache_combined_available(void);
+static uint32_t ds4_gpu_dspark_support_cache_budget_for_parent(
+        uint32_t parent_budget);
+static uint32_t ds4_gpu_dspark_support_cache_configured_budget(void);
+static void ds4_gpu_dspark_support_cache_target_cap_changed(void);
+static int ds4_gpu_dspark_support_cache_reconcile_transition(int fence);
 static void ds4_gpu_stream_expert_cache_clear_all(int reset_stats);
+static void ds4_gpu_dspark_support_cache_clear(int reset_stats);
 static void ds4_gpu_stream_expert_pending_load_clear(void);
 static void ds4_gpu_qwen35_stream_batch_pending_clear(void);
 static void ds4_gpu_stream_expert_pread_pool_shutdown(void);
@@ -780,6 +823,18 @@ typedef struct {
     uint8_t slab_backed;
 } ds4_gpu_stream_expert_cache_entry;
 
+static int ds4_gpu_stream_expert_pending_load_finish(
+        ds4_gpu_stream_expert_cache_entry **entries);
+
+typedef struct {
+    __strong id<MTLBuffer> buffer;
+    uint64_t source_offset;
+    uint64_t record_bytes;
+    uint64_t last_used;
+    int source_fd;
+    uint8_t valid;
+} ds4_gpu_dspark_support_cache_entry;
+
 /* Prevalidated cache bindings for one half of Qwen's top-8 route. This stays
  * private so the generic one-tensor API cannot bypass its normal selected-ID
  * accounting or cache validation. */
@@ -800,6 +855,12 @@ typedef struct {
 
 static ds4_gpu_stream_expert_cache_entry
     g_stream_expert_cache[DS4_METAL_STREAM_EXPERT_CACHE_MAX_LAYER][DS4_METAL_STREAM_EXPERT_CACHE_MAX_EXPERT];
+/* SUPPORT stage ids are a separate namespace.  Keeping a literal [3][256]
+ * table prevents identical TARGET/SUPPORT numeric coordinates from aliasing
+ * and leaves the qualified TARGET hot table and its scan geometry untouched. */
+static ds4_gpu_dspark_support_cache_entry
+    g_dspark_support_cache[DS4_DSPARK_SUPPORT_LAYER_COUNT]
+                           [DS4_DSPARK_SUPPORT_EXPERT_COUNT];
 static ds4_gpu_stream_expert_cache_entry
     g_stream_full_expert_addr_entry[DS4_METAL_STREAM_EXPERT_CACHE_MAX_LAYER];
 static uint32_t g_stream_expert_cache_layer_count[DS4_METAL_STREAM_EXPERT_CACHE_MAX_LAYER];
@@ -3686,11 +3747,17 @@ void ds4_gpu_print_memory_report(const char *label) {
     const uint64_t tensor_peak_snap = g_tensor_alloc_peak_bytes;
     pthread_mutex_unlock(&g_tensor_mu);
 
+    uint64_t streaming_live = g_stream_expert_cache_bytes;
+    if (streaming_live > UINT64_MAX - g_dspark_support_cache_bytes) {
+        streaming_live = UINT64_MAX;
+    } else {
+        streaming_live += g_dspark_support_cache_bytes;
+    }
     uint64_t tracked_live = tensor_live_snap;
-    if (tracked_live > UINT64_MAX - g_stream_expert_cache_bytes) {
+    if (tracked_live > UINT64_MAX - streaming_live) {
         tracked_live = UINT64_MAX;
     } else {
-        tracked_live += g_stream_expert_cache_bytes;
+        tracked_live += streaming_live;
     }
 
     const bool color = ds4_log_is_tty(stderr);
@@ -3703,7 +3770,7 @@ void ds4_gpu_print_memory_report(const char *label) {
             label && label[0] ? " " : "",
             label && label[0] ? label : "",
             ds4_gpu_gib(tensor_live_snap),
-            ds4_gpu_gib(g_stream_expert_cache_bytes),
+            ds4_gpu_gib(streaming_live),
             bright_green,
             ds4_gpu_gib(tracked_live),
             reset);
@@ -3909,6 +3976,33 @@ void ds4_gpu_print_memory_report(const char *label) {
             }
         }
     }
+    if (g_dspark_support_cache_hits != 0 ||
+        g_dspark_support_cache_misses != 0 ||
+        g_dspark_support_cache_bytes != 0) {
+        const uint64_t lookups = g_dspark_support_cache_hits +
+                                 g_dspark_support_cache_misses;
+        const double hit_rate = lookups != 0 ?
+            (double)g_dspark_support_cache_hits / (double)lookups : 0.0;
+        fprintf(stderr,
+                "ds4:   DSpark SUPPORT expert cache parent_budget=%u "
+                "target_budget=%u support_budget=%u entries=%u "
+                "live=%.2f GiB hits=%llu misses=%llu hit_rate=%.3f "
+                "evictions=%llu expert_loads=%llu pread_syscalls=%llu "
+                "pread=%.2f GiB pread_ms=%.3f\n",
+                ds4_gpu_stream_expert_cache_parent_budget(0),
+                ds4_gpu_stream_expert_cache_configured_budget(),
+                ds4_gpu_dspark_support_cache_configured_budget(),
+                g_dspark_support_cache_entry_count,
+                ds4_gpu_gib(g_dspark_support_cache_bytes),
+                (unsigned long long)g_dspark_support_cache_hits,
+                (unsigned long long)g_dspark_support_cache_misses,
+                hit_rate,
+                (unsigned long long)g_dspark_support_cache_evictions,
+                (unsigned long long)g_dspark_support_cache_expert_loads,
+                (unsigned long long)g_dspark_support_cache_pread_syscalls,
+                ds4_gpu_gib(g_dspark_support_cache_pread_bytes),
+                g_dspark_support_cache_pread_ms);
+    }
     fprintf(stderr,
             "ds4:   model residency requests %llu%s\n",
             (unsigned long long)g_model_residency_count,
@@ -3984,7 +4078,23 @@ void ds4_gpu_internal_force_qwen35_exact_router_for_test(bool enabled) {
 }
 
 void ds4_gpu_set_glm_model(bool enabled) {
+    const int previous_mode = g_glm_model_mode;
+    const int combined_before =
+        ds4_gpu_dspark_support_cache_combined_available();
     g_glm_model_mode = enabled ? 1 : 0;
+    const int combined_after =
+        ds4_gpu_dspark_support_cache_combined_available();
+    if (combined_before != combined_after &&
+        !ds4_gpu_dspark_support_cache_reconcile_transition(1)) {
+        /* Preserve the last fully reconciled state. A void model-mode setter
+         * cannot publish a half-transition whose cache still belongs to the
+         * previous identity/budget. Normal target-only calls never enter this
+         * path because availability remains false on both sides. */
+        g_glm_model_mode = previous_mode;
+        fprintf(stderr,
+                "ds4: Metal model-mode transition could not reconcile "
+                "the combined TARGET/SUPPORT cache\n");
+    }
 }
 
 void ds4_gpu_set_ssd_streaming(bool enabled) {
@@ -4008,6 +4118,7 @@ void ds4_gpu_set_ssd_streaming(bool enabled) {
         g_stream_expert_cache_slab_target_bytes_override = 0;
     }
     ds4_gpu_stream_expert_cache_clear_all(1);
+    ds4_gpu_dspark_support_cache_clear(1);
     if (g_ssd_streaming_mode) {
         fprintf(stderr,
                 "ds4: Metal SSD streaming mode enabled; full model residency and warmup are skipped\n");
@@ -4033,6 +4144,7 @@ void ds4_gpu_set_streaming_expert_cache_budget(uint32_t experts) {
     }
     g_stream_expert_cache_budget_override = experts;
     ds4_gpu_stream_expert_cache_clear_all(1);
+    ds4_gpu_dspark_support_cache_clear(1);
 }
 
 int ds4_gpu_grow_streaming_expert_cache_budget(uint32_t experts) {
@@ -4041,7 +4153,19 @@ int ds4_gpu_grow_streaming_expert_cache_budget(uint32_t experts) {
         experts = DS4_METAL_STREAM_EXPERT_CACHE_MAX_ENTRIES;
     }
     const uint32_t current = g_stream_expert_cache_budget_override;
-    if (experts < current || experts < g_stream_expert_cache_entry_count) {
+    const uint32_t support =
+        ds4_gpu_dspark_support_cache_budget_for_parent(experts);
+    const uint32_t target =
+        ds4_gpu_stream_expert_cache_apply_target_caps(
+            experts >= support ? experts - support : 0, 0);
+    const uint32_t effective_parent =
+        target > UINT32_MAX - support ? UINT32_MAX : target + support;
+    if (target < g_stream_expert_cache_required_floor ||
+        experts < current || target < g_stream_expert_cache_entry_count ||
+        g_stream_expert_cache_entry_count > UINT32_MAX -
+            g_dspark_support_cache_entry_count ||
+        effective_parent < g_stream_expert_cache_entry_count +
+                               g_dspark_support_cache_entry_count) {
         return 0;
     }
     g_stream_expert_cache_budget_override = experts;
@@ -4052,6 +4176,7 @@ void ds4_gpu_set_streaming_expert_cache_required_floor(uint32_t experts) {
     /* Budget changes preserve this model contract; SSD-mode reset/cleanup
      * clears it before another model can reuse the process-global backend. */
     g_stream_expert_cache_required_floor = experts;
+    ds4_gpu_dspark_support_cache_target_cap_changed();
 }
 
 void ds4_gpu_set_streaming_expert_cache_expert_bytes(uint64_t bytes) {
@@ -9049,12 +9174,17 @@ void ds4_gpu_cleanup(void) {
          * pool; reversing this order would leave completed staging memory
          * without a valid generation to account or release it. */
         ds4_gpu_stream_expert_cache_clear_all(1);
+        ds4_gpu_dspark_support_cache_clear(1);
         /* cache_clear_all() has now waited for every expert-store pread and
          * dropped every buffer populated from it. Reset only our borrowed
          * descriptor; the engine remains responsible for close(). */
+        if (g_qwen35_expert_pack.active) {
+            ds4_gpu_target_expert_pack_advance_generation();
+        }
         ds4_gpu_qwen35_expert_pack_state_reset();
         free(g_dspark_expert_pack);
         g_dspark_expert_pack = NULL;
+        g_dspark_support_target_generation = 0;
         ds4_gpu_stream_expert_pread_pool_shutdown();
         for (uint32_t layer = 0; layer < DS4_METAL_STREAM_EXPERT_CACHE_MAX_LAYER; layer++) {
             g_stream_expert_cache_gate_addr_buffers[layer] = nil;
@@ -10022,6 +10152,15 @@ static void ds4_gpu_qwen35_expert_pack_state_reset(void) {
     g_qwen35_expert_pack.fd = -1;
 }
 
+static void ds4_gpu_target_expert_pack_advance_generation(void) {
+    g_target_expert_pack_generation =
+        g_target_expert_pack_generation == UINT64_MAX ?
+            1 : g_target_expert_pack_generation + 1;
+    if (g_target_expert_pack_generation == 0) {
+        g_target_expert_pack_generation = 1;
+    }
+}
+
 static void ds4_gpu_qwen35_expert_pack_clear(void) {
     if (!g_qwen35_expert_pack.active) {
         ds4_gpu_qwen35_expert_pack_state_reset();
@@ -10038,10 +10177,12 @@ static void ds4_gpu_qwen35_expert_pack_clear(void) {
                     "ds4: Metal Qwen expert-pack clear could not synchronize GPU work\n");
         }
         ds4_gpu_stream_expert_cache_clear_all(0);
+        ds4_gpu_dspark_support_cache_clear(1);
         /* A resident pack is part of the model residency set. End that set
          * before releasing its no-copy buffers and unmapping their storage. */
         ds4_gpu_model_residency_clear();
     }
+    ds4_gpu_target_expert_pack_advance_generation();
     ds4_gpu_qwen35_expert_pack_state_reset();
 }
 
@@ -10058,11 +10199,18 @@ void ds4_gpu_expert_store_v2_clear_for_store(
         ds4_gpu_qwen35_expert_pack_clear();
         return;
     }
-    /* Support execution is still fail-closed, so it cannot own an in-flight
-     * resident buffer or SSD load yet. Keep descriptor teardown independent
-     * of the live target store. */
+    /* SUPPORT loads are test-only and synchronous until the DSpark graph
+     * exists. Still fence any shared Metal buffer before descriptor teardown,
+     * so this ownership rule remains safe when graph execution is added. */
+    if (g_initialized && g_dspark_support_cache_entry_count != 0 &&
+        !ds4_gpu_synchronize()) {
+        fprintf(stderr,
+                "ds4: Metal DSpark SUPPORT clear could not synchronize GPU work\n");
+    }
+    ds4_gpu_dspark_support_cache_clear(1);
     free(pack);
     g_dspark_expert_pack = NULL;
+    g_dspark_support_target_generation = 0;
 }
 
 int ds4_gpu_expert_store_v2_layer_span_for_store(
@@ -10182,6 +10330,8 @@ int ds4_gpu_expert_store_v2_install_for_store(
     }
     memset(pack, 0, sizeof(*pack));
     pack->fd = fd;
+    pack->file_device = st.st_dev;
+    pack->file_inode = st.st_ino;
     pack->file_size = file_size;
     pack->n_layer = n_layer;
     pack->n_expert = n_expert;
@@ -10203,6 +10353,11 @@ int ds4_gpu_expert_store_v2_install_for_store(
     pack->active = 1;
     if (support_store) {
         g_dspark_expert_pack = support_pack;
+        g_dspark_support_target_generation =
+            g_qwen35_expert_pack.active ?
+                g_target_expert_pack_generation : 0;
+    } else {
+        ds4_gpu_target_expert_pack_advance_generation();
     }
     return 1;
 }
@@ -10311,8 +10466,23 @@ int ds4_gpu_expert_store_v2_bind_layer_for_store(
         uint64_t down_offset) {
     ds4_gpu_qwen35_expert_pack_state *pack =
         ds4_gpu_expert_pack_for_store(store_id);
-    return pack && ds4_gpu_expert_store_bind_layer_internal(
-        pack, layer, model_size, gate_offset, up_offset, down_offset);
+    const int combined_before =
+        ds4_gpu_dspark_support_cache_combined_available();
+    if (!pack || !ds4_gpu_expert_store_bind_layer_internal(
+            pack, layer, model_size,
+            gate_offset, up_offset, down_offset)) {
+        return 0;
+    }
+    if (!combined_before &&
+        ds4_gpu_dspark_support_cache_combined_available() &&
+        !ds4_gpu_dspark_support_cache_reconcile_transition(1)) {
+        if (g_dspark_expert_pack) {
+            ds4_gpu_expert_store_v2_clear_for_store(
+                DS4_GPU_EXPERT_STORE_SUPPORT);
+        }
+        return 0;
+    }
+    return 1;
 }
 
 static int ds4_gpu_qwen35_expert_pack_enable_resident(void) {
@@ -11022,36 +11192,132 @@ static uint32_t ds4_gpu_stream_expert_cache_requested_budget(void) {
     return 0;
 }
 
-static uint32_t ds4_gpu_stream_expert_cache_configured_budget(void) {
-    uint32_t budget = ds4_gpu_stream_expert_cache_requested_budget();
-    if (budget != 0 &&
+static int ds4_gpu_dspark_support_cache_combined_available(void) {
+    if (!g_ssd_streaming_mode ||
+        !g_qwen35_expert_pack.active ||
+        !g_qwen35_expert_pack.embedded_v2 ||
+        g_glm_model_mode ||
+        g_qwen35_expert_pack.storage_format !=
+            DS4_EXPERT_STORE_STORAGE_GGML ||
+        g_qwen35_expert_pack.group_size != 0 ||
+        g_qwen35_expert_pack.n_layer !=
+            DS4_DSPARK_TARGET_LAYER_COUNT ||
+        g_qwen35_expert_pack.n_expert != DS4_DSPARK_SUPPORT_EXPERT_COUNT ||
+        (g_qwen35_expert_pack.n_layer == QWEN35_N_LAYER &&
+         g_qwen35_expert_pack.n_expert == QWEN35_N_EXPERT) ||
+        g_qwen35_expert_pack.bound_layers !=
+            g_qwen35_expert_pack.n_layer ||
+        !g_dspark_expert_pack ||
+        !g_dspark_expert_pack->active ||
+        !g_dspark_expert_pack->embedded_v2 ||
+        g_dspark_expert_pack->storage_format != DS4_EXPERT_STORE_STORAGE_GGML ||
+        g_dspark_expert_pack->group_size != 0 ||
+        g_dspark_expert_pack->n_layer != DS4_DSPARK_SUPPORT_LAYER_COUNT ||
+        g_dspark_expert_pack->n_expert != DS4_DSPARK_SUPPORT_EXPERT_COUNT ||
+        g_dspark_expert_pack->bound_layers !=
+            g_dspark_expert_pack->n_layer ||
+        g_target_expert_pack_generation == 0 ||
+        g_dspark_support_target_generation !=
+            g_target_expert_pack_generation ||
+        g_qwen35_expert_pack.file_device !=
+            g_dspark_expert_pack->file_device ||
+        g_qwen35_expert_pack.file_inode !=
+            g_dspark_expert_pack->file_inode ||
+        g_qwen35_expert_pack.file_size !=
+            g_dspark_expert_pack->file_size ||
+        g_qwen35_expert_pack.model_size == 0 ||
+        g_qwen35_expert_pack.model_size !=
+            g_dspark_expert_pack->model_size) {
+        return 0;
+    }
+    for (uint32_t layer = 0;
+         layer < g_qwen35_expert_pack.n_layer;
+         layer++) {
+        if (!g_qwen35_expert_pack.layers[layer].valid) return 0;
+    }
+    uint64_t support_record_bytes = 0;
+    for (uint32_t stage = 0; stage < DS4_DSPARK_SUPPORT_LAYER_COUNT; stage++) {
+        const ds4_gpu_qwen35_expert_pack_layer *entry =
+            &g_dspark_expert_pack->layers[stage];
+        if (!entry->valid || entry->layer != stage) return 0;
+        if (stage == 0) support_record_bytes = entry->record_bytes;
+        else if (entry->record_bytes != support_record_bytes) return 0;
+    }
+    return 1;
+}
+
+static uint32_t ds4_gpu_stream_expert_cache_apply_target_caps(
+        uint32_t target_budget,
+        int      locked) {
+    if (target_budget != 0 &&
         g_stream_expert_cache_growth_budget_cap_active &&
-        budget > g_stream_expert_cache_growth_budget_cap) {
-        budget = g_stream_expert_cache_growth_budget_cap;
+        target_budget > g_stream_expert_cache_growth_budget_cap) {
+        target_budget = g_stream_expert_cache_growth_budget_cap;
     }
-    if (budget != 0 &&
+    if (target_budget != 0 &&
         g_stream_expert_cache_mlock_budget_cap_active &&
-        (g_stream_expert_cache_mlock_budget_cap != 0 ||
+        (locked || g_stream_expert_cache_mlock_budget_cap != 0 ||
          g_stream_expert_cache_required_floor != 0) &&
-        budget > g_stream_expert_cache_mlock_budget_cap) {
-        budget = g_stream_expert_cache_mlock_budget_cap;
+        target_budget > g_stream_expert_cache_mlock_budget_cap) {
+        target_budget = g_stream_expert_cache_mlock_budget_cap;
     }
-    return budget;
+    return target_budget;
+}
+
+static uint32_t ds4_gpu_dspark_support_cache_budget_for_parent_mode(
+        uint32_t parent_budget,
+        int      locked) {
+    if (!ds4_gpu_dspark_support_cache_combined_available() ||
+        parent_budget < DS4_DSPARK_COMBINED_CACHE_FLOOR) {
+        return 0;
+    }
+    const uint32_t target_candidate = parent_budget -
+        DS4_DSPARK_SUPPORT_CACHE_FLOOR;
+    return ds4_gpu_stream_expert_cache_apply_target_caps(
+               target_candidate, locked) >= DS4_DSPARK_TARGET_CACHE_FLOOR ?
+        DS4_DSPARK_SUPPORT_CACHE_FLOOR : 0;
+}
+
+static uint32_t ds4_gpu_dspark_support_cache_budget_for_parent(
+        uint32_t parent_budget) {
+    return ds4_gpu_dspark_support_cache_budget_for_parent_mode(
+        parent_budget, 0);
+}
+
+static uint32_t ds4_gpu_dspark_support_cache_configured_budget(void) {
+    const uint32_t parent = ds4_gpu_stream_expert_cache_requested_budget();
+    return ds4_gpu_dspark_support_cache_budget_for_parent(parent);
+}
+
+static void ds4_gpu_dspark_support_cache_target_cap_changed(void) {
+    if (ds4_gpu_dspark_support_cache_configured_budget() == 0) {
+        ds4_gpu_dspark_support_cache_clear(0);
+    }
+}
+
+static uint32_t ds4_gpu_stream_expert_cache_configured_budget(void) {
+    const uint32_t parent = ds4_gpu_stream_expert_cache_requested_budget();
+    const uint32_t support =
+        ds4_gpu_dspark_support_cache_budget_for_parent(parent);
+    const uint32_t target = parent >= support ? parent - support : 0;
+    return ds4_gpu_stream_expert_cache_apply_target_caps(target, 0);
 }
 
 static uint32_t ds4_gpu_stream_expert_cache_locked_budget(void) {
-    uint32_t budget = ds4_gpu_stream_expert_cache_requested_budget();
-    if (budget != 0 &&
-        g_stream_expert_cache_growth_budget_cap_active &&
-        budget > g_stream_expert_cache_growth_budget_cap) {
-        budget = g_stream_expert_cache_growth_budget_cap;
-    }
-    if (budget != 0 &&
-        g_stream_expert_cache_mlock_budget_cap_active &&
-        budget > g_stream_expert_cache_mlock_budget_cap) {
-        budget = g_stream_expert_cache_mlock_budget_cap;
-    }
-    return budget;
+    const uint32_t parent = ds4_gpu_stream_expert_cache_requested_budget();
+    const uint32_t support =
+        ds4_gpu_dspark_support_cache_budget_for_parent_mode(parent, 1);
+    const uint32_t target = parent >= support ? parent - support : 0;
+    return ds4_gpu_stream_expert_cache_apply_target_caps(target, 1);
+}
+
+static uint32_t ds4_gpu_stream_expert_cache_parent_budget(int locked) {
+    const uint32_t parent = ds4_gpu_stream_expert_cache_requested_budget();
+    const uint32_t support =
+        ds4_gpu_dspark_support_cache_budget_for_parent_mode(parent, locked);
+    const uint32_t target = ds4_gpu_stream_expert_cache_apply_target_caps(
+        parent >= support ? parent - support : 0, locked);
+    return target > UINT32_MAX - support ? UINT32_MAX : target + support;
 }
 
 static int ds4_gpu_stream_expert_cache_required_floor_satisfied(void) {
@@ -12157,6 +12423,7 @@ static void ds4_gpu_stream_expert_cache_cap_budget_to_locked(void) {
         g_stream_expert_cache_mlock_budget_cap = cap;
     }
     g_stream_expert_cache_mlock_budget_cap_active = 1;
+    ds4_gpu_dspark_support_cache_target_cap_changed();
 }
 
 static int ds4_gpu_stream_expert_cache_mlock(void *ptr, size_t len) {
@@ -12476,6 +12743,7 @@ static void ds4_gpu_stream_expert_cache_freeze_growth(
     }
     g_stream_expert_cache_growth_budget_cap = cap;
     g_stream_expert_cache_growth_budget_cap_active = 1;
+    ds4_gpu_dspark_support_cache_target_cap_changed();
 
     if (g_stream_expert_cache_growth_guard_warned) return;
     g_stream_expert_cache_growth_guard_warned = 1;
@@ -13978,6 +14246,60 @@ static void ds4_gpu_stream_expert_cache_clear_all(int reset_stats) {
     }
 }
 
+static void ds4_gpu_dspark_support_cache_clear_entry(
+        uint32_t stage,
+        uint32_t expert,
+        int count_eviction) {
+    if (stage >= DS4_DSPARK_SUPPORT_LAYER_COUNT ||
+        expert >= DS4_DSPARK_SUPPORT_EXPERT_COUNT) {
+        return;
+    }
+    ds4_gpu_dspark_support_cache_entry *entry =
+        &g_dspark_support_cache[stage][expert];
+    if (!entry->valid) return;
+    const uint64_t bytes = entry->record_bytes;
+    entry->buffer = nil;
+    entry->source_offset = 0;
+    entry->record_bytes = 0;
+    entry->last_used = 0;
+    entry->source_fd = -1;
+    entry->valid = 0;
+    if (g_dspark_support_cache_entry_count != 0) {
+        g_dspark_support_cache_entry_count--;
+    }
+    if (g_dspark_support_cache_bytes >= bytes) {
+        g_dspark_support_cache_bytes -= bytes;
+    } else {
+        g_dspark_support_cache_bytes = 0;
+    }
+    if (count_eviction) {
+        ds4_gpu_stream_expert_counter_add(
+            &g_dspark_support_cache_evictions, 1);
+    }
+}
+
+static void ds4_gpu_dspark_support_cache_clear(int reset_stats) {
+    for (uint32_t stage = 0; stage < DS4_DSPARK_SUPPORT_LAYER_COUNT; stage++) {
+        for (uint32_t expert = 0;
+             expert < DS4_DSPARK_SUPPORT_EXPERT_COUNT;
+             expert++) {
+            ds4_gpu_dspark_support_cache_clear_entry(stage, expert, 0);
+        }
+    }
+    g_dspark_support_cache_entry_count = 0;
+    g_dspark_support_cache_bytes = 0;
+    if (reset_stats) {
+        g_dspark_support_cache_hits = 0;
+        g_dspark_support_cache_misses = 0;
+        g_dspark_support_cache_evictions = 0;
+        g_dspark_support_cache_expert_loads = 0;
+        g_dspark_support_cache_pread_syscalls = 0;
+        g_dspark_support_cache_pread_bytes = 0;
+        g_dspark_support_cache_pread_ms = 0.0;
+        g_dspark_support_cache_clock = 0;
+    }
+}
+
 static int ds4_gpu_stream_expert_cache_is_protected(
         uint32_t expert,
         const int32_t *protect_ids,
@@ -14604,6 +14926,7 @@ static uint32_t ds4_gpu_stream_expert_cache_release_mlock_margin(
         g_stream_expert_cache_mlock_budget_cap = cap;
     }
     g_stream_expert_cache_mlock_budget_cap_active = 1;
+    ds4_gpu_dspark_support_cache_target_cap_changed();
 
     const uint64_t released_bytes =
         (uint64_t)released * g_stream_expert_cache_slab_slot_bytes;
@@ -15109,6 +15432,75 @@ static void ds4_gpu_stream_expert_cache_prune_global(
     }
 }
 
+/* Reconcile a descriptor/budget transition before SUPPORT can become visible.
+ * TARGET cache slots may still be referenced by queued Metal work, so a late
+ * SUPPORT activation fences and drains the existing owner before pruning the
+ * newly reserved 19-slot share. */
+static int ds4_gpu_dspark_reconcile_synchronize(void) {
+#ifdef DS4_TEST_HOOKS
+    g_dspark_reconcile_synchronize_calls++;
+#endif
+    return ds4_gpu_synchronize();
+}
+
+static int ds4_gpu_dspark_support_cache_reconcile_transition(int fence) {
+    const uint32_t target_budget =
+        ds4_gpu_stream_expert_cache_configured_budget();
+    const uint32_t support_budget =
+        ds4_gpu_dspark_support_cache_configured_budget();
+    const uint32_t parent_budget =
+        ds4_gpu_stream_expert_cache_parent_budget(0);
+    const int target_over =
+        g_stream_expert_cache_entry_count > target_budget;
+    const int support_over =
+        g_dspark_support_cache_entry_count > support_budget;
+    const int total_over =
+        g_stream_expert_cache_entry_count > UINT32_MAX -
+            g_dspark_support_cache_entry_count ||
+        g_stream_expert_cache_entry_count +
+            g_dspark_support_cache_entry_count > parent_budget;
+    if (fence) {
+        if (g_stream_expert_cache_lease_active ||
+            g_stream_expert_pending_load.active ||
+            g_qwen35_stream_pending.state != DS4_QWEN35_STREAM_IO_EMPTY ||
+            !ds4_gpu_dspark_reconcile_synchronize() ||
+            !ds4_gpu_stream_expert_pending_load_finish(NULL) ||
+            !ds4_gpu_dspark_reconcile_synchronize()) {
+            return 0;
+        }
+    } else if (g_stream_expert_cache_lease_active ||
+               g_stream_expert_pending_load.active ||
+               g_qwen35_stream_pending.state !=
+                   DS4_QWEN35_STREAM_IO_EMPTY) {
+        return 0;
+    }
+    if (!target_over && !support_over && !total_over) return 1;
+    if (g_stream_expert_cache_entry_count > target_budget) {
+        if (target_budget == 0) {
+            ds4_gpu_stream_expert_cache_clear_all(0);
+        } else {
+            ds4_gpu_stream_expert_cache_prune_global(
+                UINT32_MAX, NULL, 0);
+        }
+    }
+    if (g_stream_expert_cache_entry_count > target_budget) return 0;
+    if (g_dspark_support_cache_entry_count > support_budget) {
+        ds4_gpu_dspark_support_cache_clear(0);
+    }
+    if (g_stream_expert_cache_entry_count > UINT32_MAX -
+            g_dspark_support_cache_entry_count ||
+        g_stream_expert_cache_entry_count +
+            g_dspark_support_cache_entry_count > parent_budget) {
+        ds4_gpu_dspark_support_cache_clear(0);
+    }
+    return g_stream_expert_cache_entry_count <= target_budget &&
+           g_dspark_support_cache_entry_count <= support_budget &&
+           g_stream_expert_cache_entry_count <= UINT32_MAX -
+               g_dspark_support_cache_entry_count &&
+           g_stream_expert_cache_entry_count +
+               g_dspark_support_cache_entry_count <= parent_budget;
+}
+
 static int ds4_gpu_stream_expert_cache_entry_matches(
         const ds4_gpu_stream_expert_cache_entry *e,
         const void *model_map,
@@ -15491,6 +15883,162 @@ static ds4_gpu_stream_expert_cache_entry *ds4_gpu_stream_expert_cache_get(
                                                      0);
 }
 
+#ifdef DS4_TEST_HOOKS
+/* This probe exercises SUPPORT cache ownership and SSD I/O without exposing a
+ * DSpark execution path.  The production graph may reuse the mechanism only
+ * after it has an explicit command-buffer lifetime and parity coverage. */
+static ds4_gpu_dspark_support_cache_entry *
+ds4_gpu_dspark_support_cache_get_for_test(
+        uint32_t stage,
+        uint32_t expert) {
+    const uint32_t support_budget =
+        ds4_gpu_dspark_support_cache_configured_budget();
+    if (support_budget == 0 || !g_device ||
+        !ds4_gpu_dspark_support_cache_combined_available() ||
+        stage >= DS4_DSPARK_SUPPORT_LAYER_COUNT ||
+        expert >= DS4_DSPARK_SUPPORT_EXPERT_COUNT) {
+        return NULL;
+    }
+
+    uint32_t layer_index = 0;
+    if (!ds4_gpu_expert_store_layer_index(
+            g_dspark_expert_pack, stage, &layer_index)) {
+        return NULL;
+    }
+    const ds4_gpu_qwen35_expert_pack_layer *layer =
+        &g_dspark_expert_pack->layers[layer_index];
+    uint64_t expert_delta = 0;
+    uint64_t source_offset = 0;
+    if (!ds4_gpu_qwen35_expert_pack_mul_u64(
+            expert, layer->record_bytes, &expert_delta) ||
+        !ds4_gpu_qwen35_expert_pack_add_u64(
+            layer->data_offset, expert_delta, &source_offset) ||
+        !ds4_gpu_qwen35_expert_pack_range_valid(
+            source_offset, layer->record_bytes,
+            g_dspark_expert_pack->file_size) ||
+        layer->record_bytes > NSUIntegerMax ||
+        layer->record_bytes > (uint64_t)[g_device maxBufferLength]) {
+        return NULL;
+    }
+
+    ds4_gpu_dspark_support_cache_entry *entry =
+        &g_dspark_support_cache[stage][expert];
+    if (entry->valid && entry->buffer &&
+        entry->source_fd == g_dspark_expert_pack->fd &&
+        entry->source_offset == source_offset &&
+        entry->record_bytes == layer->record_bytes) {
+        ds4_gpu_stream_expert_counter_add(
+            &g_dspark_support_cache_clock, 1);
+        entry->last_used = g_dspark_support_cache_clock;
+        ds4_gpu_stream_expert_counter_add(
+            &g_dspark_support_cache_hits, 1);
+        return entry;
+    }
+    if (entry->valid) {
+        ds4_gpu_dspark_support_cache_clear_entry(stage, expert, 0);
+    }
+
+    /* The TARGET reservation is authoritative.  A SUPPORT miss first brings
+     * TARGET down to its configured share, then checks the shared parent
+     * envelope before it acquires a slot of its own. */
+    ds4_gpu_stream_expert_cache_prune_global(UINT32_MAX, NULL, 0);
+    const uint32_t target_budget =
+        ds4_gpu_stream_expert_cache_configured_budget();
+    const uint32_t parent_budget =
+        ds4_gpu_stream_expert_cache_parent_budget(0);
+    if (g_stream_expert_cache_entry_count > target_budget) return NULL;
+
+    if (g_dspark_support_cache_entry_count >= support_budget) {
+        uint32_t victim_stage = UINT32_MAX;
+        uint32_t victim_expert = UINT32_MAX;
+        uint64_t oldest = UINT64_MAX;
+        for (uint32_t candidate_stage = 0;
+             candidate_stage < DS4_DSPARK_SUPPORT_LAYER_COUNT;
+             candidate_stage++) {
+            for (uint32_t candidate_expert = 0;
+                 candidate_expert < DS4_DSPARK_SUPPORT_EXPERT_COUNT;
+                 candidate_expert++) {
+                const ds4_gpu_dspark_support_cache_entry *candidate =
+                    &g_dspark_support_cache[candidate_stage][candidate_expert];
+                if (!candidate->valid) continue;
+                if (victim_stage == UINT32_MAX ||
+                    candidate->last_used < oldest) {
+                    victim_stage = candidate_stage;
+                    victim_expert = candidate_expert;
+                    oldest = candidate->last_used;
+                }
+            }
+        }
+        if (victim_stage == UINT32_MAX) return NULL;
+        ds4_gpu_dspark_support_cache_clear_entry(
+            victim_stage, victim_expert, 1);
+    }
+    if (g_dspark_support_cache_entry_count >= support_budget ||
+        g_stream_expert_cache_entry_count > UINT32_MAX -
+            g_dspark_support_cache_entry_count ||
+        g_stream_expert_cache_entry_count +
+            g_dspark_support_cache_entry_count >= parent_budget) {
+        return NULL;
+    }
+
+    id<MTLBuffer> buffer =
+        [g_device newBufferWithLength:(NSUInteger)layer->record_bytes
+                              options:MTLResourceStorageModeShared];
+    uint8_t *destination = buffer ? (uint8_t *)[buffer contents] : NULL;
+    if (!buffer || !destination) return NULL;
+    buffer.label = @"ds4_dspark_support_cache_record";
+
+    const double read_t0 = ds4_gpu_now_ms();
+    uint64_t read_bytes = 0;
+    uint64_t pread_syscalls = 0;
+    int read_ok = 1;
+    while (read_bytes < layer->record_bytes) {
+        const uint64_t remaining = layer->record_bytes - read_bytes;
+        const size_t request = remaining > (uint64_t)SSIZE_MAX ?
+            (size_t)SSIZE_MAX : (size_t)remaining;
+        ssize_t got;
+        do {
+            got = pread(g_dspark_expert_pack->fd,
+                        destination + read_bytes,
+                        request,
+                        (off_t)(source_offset + read_bytes));
+        } while (got < 0 && errno == EINTR);
+        if (got <= 0) {
+            read_ok = 0;
+            break;
+        }
+        ds4_gpu_stream_expert_counter_add(&pread_syscalls, 1);
+        read_bytes += (uint64_t)got;
+    }
+    const double read_ms = ds4_gpu_now_ms() - read_t0;
+    ds4_gpu_stream_expert_counter_add(
+        &g_dspark_support_cache_pread_syscalls, pread_syscalls);
+    ds4_gpu_stream_expert_counter_add(
+        &g_dspark_support_cache_pread_bytes, read_bytes);
+    g_dspark_support_cache_pread_ms += read_ms;
+    if (!read_ok || read_bytes != layer->record_bytes) return NULL;
+
+    [buffer didModifyRange:NSMakeRange(0, (NSUInteger)layer->record_bytes)];
+    ds4_gpu_stream_expert_counter_add(&g_dspark_support_cache_clock, 1);
+    entry->buffer = buffer;
+    entry->source_offset = source_offset;
+    entry->record_bytes = layer->record_bytes;
+    entry->last_used = g_dspark_support_cache_clock;
+    entry->source_fd = g_dspark_expert_pack->fd;
+    entry->valid = 1;
+    if (g_dspark_support_cache_entry_count < UINT32_MAX) {
+        g_dspark_support_cache_entry_count++;
+    }
+    ds4_gpu_stream_expert_counter_add(
+        &g_dspark_support_cache_bytes, layer->record_bytes);
+    ds4_gpu_stream_expert_counter_add(
+        &g_dspark_support_cache_misses, 1);
+    ds4_gpu_stream_expert_counter_add(
+        &g_dspark_support_cache_expert_loads, 1);
+    return entry;
+}
+#endif
+
 static int ds4_gpu_stream_expert_pending_load_profile_enabled(void) {
     return getenv("DS4_METAL_STREAMING_EXPERT_EARLY_LOAD_PROFILE") != NULL;
 }
@@ -15703,7 +16251,14 @@ int ds4_gpu_reconfigure_streaming_expert_cache_budget(uint32_t experts) {
     if (experts > DS4_METAL_STREAM_EXPERT_CACHE_MAX_ENTRIES) {
         experts = DS4_METAL_STREAM_EXPERT_CACHE_MAX_ENTRIES;
     }
-    if (experts < g_stream_expert_cache_required_floor) return 0;
+    const uint32_t next_support =
+        ds4_gpu_dspark_support_cache_budget_for_parent(experts);
+    const uint32_t next_target =
+        ds4_gpu_stream_expert_cache_apply_target_caps(
+            experts >= next_support ? experts - next_support : 0, 0);
+    if (next_target < g_stream_expert_cache_required_floor) {
+        return 0;
+    }
     if (g_stream_expert_cache_required_floor != 0 &&
         g_stream_expert_cache_mlock_budget_cap_active &&
         g_stream_expert_cache_mlock_budget_cap <
@@ -15712,10 +16267,22 @@ int ds4_gpu_reconfigure_streaming_expert_cache_budget(uint32_t experts) {
     }
 
     const uint32_t previous = g_stream_expert_cache_budget_override;
-    if (experts == previous) {
+    const uint32_t previous_support =
+        ds4_gpu_dspark_support_cache_budget_for_parent(previous);
+    const uint32_t previous_target =
+        ds4_gpu_stream_expert_cache_apply_target_caps(
+            previous >= previous_support ? previous - previous_support : 0,
+            0);
+    const int target_over_budget =
+        g_stream_expert_cache_entry_count > next_target;
+    const int support_over_budget =
+        g_dspark_support_cache_entry_count > next_support;
+    if (experts == previous &&
+        !target_over_budget && !support_over_budget) {
         return ds4_gpu_stream_expert_cache_required_floor_satisfied();
     }
     if (g_stream_expert_cache_lease_active ||
+        g_stream_expert_pending_load.active ||
         g_qwen35_stream_pending.state != DS4_QWEN35_STREAM_IO_EMPTY) {
         return 0;
     }
@@ -15730,7 +16297,7 @@ int ds4_gpu_reconfigure_streaming_expert_cache_budget(uint32_t experts) {
     }
 
     g_stream_expert_cache_budget_override = experts;
-    if (experts < previous) {
+    if (next_target < previous_target || target_over_budget) {
         /* Slabs cannot be partially deallocated. A shrink therefore drops the
          * resident set and recreates smaller slabs lazily, which is the only
          * way to return physical memory now instead of merely lowering an LRU
@@ -15738,7 +16305,11 @@ int ds4_gpu_reconfigure_streaming_expert_cache_budget(uint32_t experts) {
          * the model-lifetime floor. */
         ds4_gpu_stream_expert_cache_clear_all(0);
     }
-    return ds4_gpu_stream_expert_cache_required_floor_satisfied();
+    if (next_support < previous_support || support_over_budget) {
+        ds4_gpu_dspark_support_cache_clear(0);
+    }
+    return ds4_gpu_dspark_support_cache_reconcile_transition(0) &&
+           ds4_gpu_stream_expert_cache_required_floor_satisfied();
 }
 
 static int ds4_gpu_stream_expert_pending_load_matches(
@@ -37582,6 +38153,516 @@ int ds4_gpu_internal_dspark_dual_store_test(void) {
             DS4_GPU_EXPERT_STORE_SUPPORT);
     }
     ds4_gpu_expert_store_v2_clear_for_store(DS4_GPU_EXPERT_STORE_TARGET);
+    close(fd);
+    return ok;
+}
+
+static int ds4_gpu_internal_dspark_support_bind_target_for_test(
+        uint32_t n_layer,
+        uint64_t model_size) {
+    for (uint32_t layer = 0; layer < n_layer; layer++) {
+        const uint64_t base = 64u * 1024u + (uint64_t)layer * 1024u;
+        if (!ds4_gpu_expert_store_v2_bind_layer_for_store(
+                DS4_GPU_EXPERT_STORE_TARGET, layer, model_size,
+                base, base + 256u, base + 512u)) {
+            return 0;
+        }
+    }
+    return 1;
+}
+
+static int ds4_gpu_internal_dspark_support_bind_support_for_test(
+        uint64_t model_size) {
+    for (uint32_t stage = 0;
+         stage < DS4_DSPARK_SUPPORT_LAYER_COUNT;
+         stage++) {
+        const uint64_t base = 256u * 1024u +
+            (uint64_t)stage * 8192u;
+        if (!ds4_gpu_expert_store_v2_bind_layer_for_store(
+                DS4_GPU_EXPERT_STORE_SUPPORT, stage, model_size,
+                base, base + 1024u, base + 4096u)) {
+            return 0;
+        }
+    }
+    return 1;
+}
+
+static int ds4_gpu_internal_dspark_support_populate_target_for_test(
+        uint32_t count,
+        const void *model_identity,
+        uint64_t model_size,
+        id<MTLBuffer> buffer) {
+    if (!model_identity || !buffer || count > 512u ||
+        g_stream_expert_cache_entry_count > count) {
+        return 0;
+    }
+    for (uint32_t index = g_stream_expert_cache_entry_count;
+         index < count;
+         index++) {
+        const uint32_t layer = index / DS4_DSPARK_SUPPORT_EXPERT_COUNT;
+        const uint32_t expert = index % DS4_DSPARK_SUPPORT_EXPERT_COUNT;
+        const ds4_gpu_qwen35_expert_pack_layer *binding =
+            &g_qwen35_expert_pack.layers[layer];
+        if (!binding->valid ||
+            !ds4_gpu_stream_expert_cache_install_loaded(
+                model_identity, model_size, layer, expert,
+                DS4_DSPARK_SUPPORT_EXPERT_COUNT,
+                binding->gate_offset + expert,
+                binding->up_offset + expert,
+                binding->down_offset + expert,
+                1, 1, buffer, buffer, buffer, 0, 1, 2)) {
+            return 0;
+        }
+    }
+    return g_stream_expert_cache_entry_count == count;
+}
+
+int ds4_gpu_internal_dspark_support_cache_test(void) {
+    enum {
+        FILE_SIZE = 128 * 1024,
+        MODEL_SIZE = 1024 * 1024,
+        RECORD_BYTES = 15,
+        TARGET_LAYER_COUNT = DS4_DSPARK_TARGET_LAYER_COUNT,
+        TARGET_RECORD_BYTES = 3,
+        TARGET_LAYER_BYTES =
+            DS4_DSPARK_SUPPORT_EXPERT_COUNT * TARGET_RECORD_BYTES,
+        SUPPORT_LAYER_BYTES =
+            DS4_DSPARK_SUPPORT_EXPERT_COUNT * RECORD_BYTES,
+    };
+    char path[] = "/tmp/ds4-dspark-support-cache.XXXXXX";
+    char other_path[] = "/tmp/ds4-dspark-support-other.XXXXXX";
+    int fd = -1;
+    int target_fd = -1;
+    int support_fd = -1;
+    int other_fd = -1;
+    uint8_t *support_bytes = NULL;
+    int ok = (!g_initialized && !ds4_gpu_init()) || g_initialized;
+    if (!ok || g_qwen35_expert_pack.active || g_dspark_expert_pack) {
+        return 0;
+    }
+
+    fd = mkstemp(path);
+    if (fd < 0) return 0;
+    (void)unlink(path);
+    ok = ftruncate(fd, FILE_SIZE) == 0;
+    if (ok) {
+        target_fd = fcntl(fd, F_DUPFD_CLOEXEC, 0);
+        support_fd = fcntl(fd, F_DUPFD_CLOEXEC, 0);
+        other_fd = mkstemp(other_path);
+        if (other_fd >= 0) (void)unlink(other_path);
+        ok = target_fd >= 0 && support_fd >= 0 &&
+             target_fd != support_fd && other_fd >= 0 &&
+             ftruncate(other_fd, FILE_SIZE) == 0;
+    }
+
+    ds4_gpu_expert_store_layer_v2 target_layers[TARGET_LAYER_COUNT];
+    memset(target_layers, 0, sizeof(target_layers));
+    for (uint32_t layer = 0; layer < TARGET_LAYER_COUNT; layer++) {
+        target_layers[layer].layer = layer;
+        target_layers[layer].data_offset = 32u * 1024u +
+            (uint64_t)layer * TARGET_LAYER_BYTES;
+        target_layers[layer].data_size = TARGET_LAYER_BYTES;
+        target_layers[layer].record_bytes = TARGET_RECORD_BYTES;
+        target_layers[layer].component_offset[0] = 0;
+        target_layers[layer].component_offset[1] = 1;
+        target_layers[layer].component_offset[2] = 2;
+        target_layers[layer].component_bytes[0] = 1;
+        target_layers[layer].component_bytes[1] = 1;
+        target_layers[layer].component_bytes[2] = 1;
+    }
+    ds4_gpu_expert_store_layer_v2 support_layers[
+        DS4_DSPARK_SUPPORT_LAYER_COUNT];
+    memset(support_layers, 0, sizeof(support_layers));
+    for (uint32_t stage = 0;
+         stage < DS4_DSPARK_SUPPORT_LAYER_COUNT;
+         stage++) {
+        support_layers[stage].layer = stage;
+        support_layers[stage].data_offset = 4096u +
+            (uint64_t)stage * SUPPORT_LAYER_BYTES;
+        support_layers[stage].data_size = SUPPORT_LAYER_BYTES;
+        support_layers[stage].record_bytes = RECORD_BYTES;
+        support_layers[stage].component_offset[0] = 0;
+        support_layers[stage].component_offset[1] = 3;
+        support_layers[stage].component_offset[2] = 8;
+        support_layers[stage].component_bytes[0] = 3;
+        support_layers[stage].component_bytes[1] = 5;
+        support_layers[stage].component_bytes[2] = 7;
+    }
+
+    support_bytes = malloc(
+        (size_t)SUPPORT_LAYER_BYTES * DS4_DSPARK_SUPPORT_LAYER_COUNT);
+    if (!support_bytes) ok = 0;
+    for (uint32_t stage = 0;
+         ok && stage < DS4_DSPARK_SUPPORT_LAYER_COUNT;
+         stage++) {
+        uint8_t *stage_bytes = support_bytes +
+            (size_t)stage * SUPPORT_LAYER_BYTES;
+        for (uint32_t expert = 0;
+             expert < DS4_DSPARK_SUPPORT_EXPERT_COUNT;
+             expert++) {
+            for (uint32_t byte = 0; byte < RECORD_BYTES; byte++) {
+                stage_bytes[expert * RECORD_BYTES + byte] =
+                    (uint8_t)(stage * 73u + expert * 11u + byte);
+            }
+        }
+        ok = ds4_gpu_internal_qwen35_expert_pack_pwrite_all(
+            fd, stage_bytes, SUPPORT_LAYER_BYTES,
+            support_layers[stage].data_offset);
+    }
+
+    ds4_gpu_set_ssd_streaming(true);
+    ds4_gpu_set_streaming_expert_cache_required_floor(
+        DS4_DSPARK_TARGET_CACHE_FLOOR);
+    ds4_gpu_set_streaming_expert_cache_budget(0);
+    if (ok) {
+        ok = ds4_gpu_stream_expert_cache_parent_budget(0) == 0 &&
+             ds4_gpu_stream_expert_cache_configured_budget() == 0 &&
+             ds4_gpu_dspark_support_cache_get_for_test(0, 0) == NULL &&
+             ds4_gpu_dspark_support_cache_configured_budget() == 0;
+    }
+    if (ok) {
+        ok = ds4_gpu_expert_store_v2_install_for_store(
+                 DS4_GPU_EXPERT_STORE_TARGET, target_fd, FILE_SIZE,
+                 TARGET_LAYER_COUNT,
+                 DS4_DSPARK_SUPPORT_EXPERT_COUNT,
+                 DS4_EXPERT_STORE_STORAGE_GGML, 0, target_layers) &&
+             ds4_gpu_internal_dspark_support_bind_target_for_test(
+                 TARGET_LAYER_COUNT, MODEL_SIZE) &&
+             ds4_gpu_dspark_support_cache_get_for_test(0, 0) == NULL &&
+             ds4_gpu_dspark_support_cache_configured_budget() == 0;
+    }
+    if (ok) {
+        ok = ds4_gpu_expert_store_v2_install_for_store(
+                 DS4_GPU_EXPERT_STORE_SUPPORT, other_fd, FILE_SIZE,
+                 DS4_DSPARK_SUPPORT_LAYER_COUNT,
+                 DS4_DSPARK_SUPPORT_EXPERT_COUNT,
+                 DS4_EXPERT_STORE_STORAGE_GGML, 0, support_layers) &&
+             ds4_gpu_internal_dspark_support_bind_support_for_test(
+                 MODEL_SIZE) &&
+             !ds4_gpu_dspark_support_cache_combined_available() &&
+             ds4_gpu_dspark_support_cache_configured_budget() == 0 &&
+             ds4_gpu_dspark_support_cache_get_for_test(0, 0) == NULL;
+    }
+    if (g_dspark_expert_pack) {
+        ds4_gpu_expert_store_v2_clear_for_store(
+            DS4_GPU_EXPERT_STORE_SUPPORT);
+    }
+    if (ok) {
+        ok = ds4_gpu_expert_store_v2_install_for_store(
+                 DS4_GPU_EXPERT_STORE_SUPPORT, support_fd, FILE_SIZE,
+                 DS4_DSPARK_SUPPORT_LAYER_COUNT,
+                 DS4_DSPARK_SUPPORT_EXPERT_COUNT,
+                 DS4_EXPERT_STORE_STORAGE_GGML, 0, support_layers) &&
+             ds4_gpu_internal_dspark_support_bind_support_for_test(
+                 MODEL_SIZE + 1) &&
+             !ds4_gpu_dspark_support_cache_combined_available() &&
+             ds4_gpu_dspark_support_cache_configured_budget() == 0;
+    }
+    if (g_dspark_expert_pack) {
+        ds4_gpu_expert_store_v2_clear_for_store(
+            DS4_GPU_EXPERT_STORE_SUPPORT);
+    }
+    if (ok) {
+        ok = ds4_gpu_expert_store_v2_install_for_store(
+                 DS4_GPU_EXPERT_STORE_SUPPORT, support_fd, FILE_SIZE,
+                 DS4_DSPARK_SUPPORT_LAYER_COUNT,
+            DS4_DSPARK_SUPPORT_EXPERT_COUNT,
+            DS4_EXPERT_STORE_STORAGE_GGML, 0, support_layers) &&
+             ds4_gpu_internal_dspark_support_bind_support_for_test(
+                 MODEL_SIZE) &&
+             ds4_gpu_dspark_support_cache_combined_available();
+    }
+    if (ok) {
+        g_qwen35_expert_pack.n_layer = TARGET_LAYER_COUNT + 1;
+        g_qwen35_expert_pack.bound_layers = TARGET_LAYER_COUNT + 1;
+        ok = !ds4_gpu_dspark_support_cache_combined_available();
+        g_qwen35_expert_pack.n_layer = TARGET_LAYER_COUNT;
+        g_qwen35_expert_pack.bound_layers = TARGET_LAYER_COUNT;
+    }
+
+    id<MTLBuffer> target_buffer =
+        [g_device newBufferWithLength:3 options:MTLResourceStorageModeShared];
+    if (target_buffer) {
+        memset([target_buffer contents], 0, 3);
+        [target_buffer didModifyRange:NSMakeRange(0, 3)];
+    }
+
+    /* Model-mode changes can toggle combined availability without changing
+     * either descriptor. Activation must fence/prune immediately; disabling
+     * the pairing must drop every SUPPORT entry while preserving TARGET. */
+    const uint64_t reconcile_sync_before_mode =
+        g_dspark_reconcile_synchronize_calls;
+    ds4_gpu_set_glm_model(true);
+    ds4_gpu_set_streaming_expert_cache_budget(278);
+    if (ok) {
+        ok = target_buffer &&
+             !ds4_gpu_dspark_support_cache_combined_available() &&
+             g_dspark_reconcile_synchronize_calls ==
+                 reconcile_sync_before_mode + 2 &&
+             ds4_gpu_internal_dspark_support_populate_target_for_test(
+                 260, support_bytes, MODEL_SIZE, target_buffer);
+    }
+    ds4_gpu_set_glm_model(false);
+    if (ok) {
+        ok = ds4_gpu_dspark_support_cache_combined_available() &&
+             g_dspark_reconcile_synchronize_calls ==
+                 reconcile_sync_before_mode + 4 &&
+             g_stream_expert_cache_entry_count == 259 &&
+             ds4_gpu_stream_expert_cache_configured_budget() == 259 &&
+             ds4_gpu_dspark_support_cache_configured_budget() == 19 &&
+             ds4_gpu_dspark_support_cache_get_for_test(0, 53) != NULL;
+    }
+    ds4_gpu_set_glm_model(true);
+    if (ok) {
+        ok = !ds4_gpu_dspark_support_cache_combined_available() &&
+             g_dspark_reconcile_synchronize_calls ==
+                 reconcile_sync_before_mode + 6 &&
+             g_stream_expert_cache_entry_count == 259 &&
+             g_dspark_support_cache_entry_count == 0 &&
+             ds4_gpu_stream_expert_cache_configured_budget() == 278 &&
+             ds4_gpu_dspark_support_cache_configured_budget() == 0;
+    }
+    ds4_gpu_set_glm_model(false);
+    if (ok) {
+        ok = ds4_gpu_dspark_support_cache_combined_available() &&
+             g_dspark_reconcile_synchronize_calls ==
+                 reconcile_sync_before_mode + 8 &&
+             g_stream_expert_cache_entry_count == 259 &&
+             ds4_gpu_stream_expert_cache_configured_budget() == 259 &&
+             ds4_gpu_dspark_support_cache_configured_budget() == 19;
+    }
+
+    const uint32_t below_support_floor[] = {18, 19, 277};
+    for (uint32_t i = 0;
+         ok && i < sizeof(below_support_floor) /
+                     sizeof(below_support_floor[0]);
+         i++) {
+        const uint32_t parent = below_support_floor[i];
+        ds4_gpu_set_streaming_expert_cache_budget(parent);
+        ok = ds4_gpu_stream_expert_cache_parent_budget(0) == parent &&
+             ds4_gpu_stream_expert_cache_configured_budget() == parent &&
+             ds4_gpu_dspark_support_cache_configured_budget() == 0 &&
+             ds4_gpu_dspark_support_cache_get_for_test(0, 7) == NULL &&
+             g_dspark_support_cache_entry_count == 0;
+    }
+
+    if (ok) {
+        ds4_gpu_set_streaming_expert_cache_budget(277);
+        ok = target_buffer &&
+             ds4_gpu_internal_dspark_support_populate_target_for_test(
+                 260, support_bytes, MODEL_SIZE, target_buffer) &&
+             !ds4_gpu_grow_streaming_expert_cache_budget(278) &&
+             g_stream_expert_cache_budget_override == 277 &&
+             g_stream_expert_cache_entry_count == 260 &&
+             ds4_gpu_reconfigure_streaming_expert_cache_budget(278) &&
+             g_stream_expert_cache_entry_count == 0 &&
+             ds4_gpu_stream_expert_cache_parent_budget(0) == 278 &&
+             ds4_gpu_stream_expert_cache_configured_budget() == 259 &&
+             ds4_gpu_dspark_support_cache_configured_budget() == 19;
+    }
+    if (ok) {
+        ok = ds4_gpu_internal_dspark_support_populate_target_for_test(
+                 259, support_bytes, MODEL_SIZE, target_buffer) &&
+             ds4_gpu_dspark_support_cache_get_for_test(0, 31) != NULL &&
+             ds4_gpu_reconfigure_streaming_expert_cache_budget(277) &&
+             g_stream_expert_cache_entry_count == 259 &&
+             g_dspark_support_cache_entry_count == 0 &&
+             ds4_gpu_dspark_support_cache_configured_budget() == 0 &&
+             ds4_gpu_reconfigure_streaming_expert_cache_budget(278) &&
+             g_stream_expert_cache_entry_count == 0 &&
+             ds4_gpu_internal_dspark_support_populate_target_for_test(
+                 259, support_bytes, MODEL_SIZE, target_buffer) &&
+             ds4_gpu_grow_streaming_expert_cache_budget(320) &&
+             g_stream_expert_cache_budget_override == 320 &&
+             ds4_gpu_stream_expert_cache_parent_budget(0) == 320 &&
+             ds4_gpu_stream_expert_cache_configured_budget() == 301 &&
+             ds4_gpu_dspark_support_cache_configured_budget() == 19 &&
+             ds4_gpu_stream_expert_cache_configured_budget() +
+                 ds4_gpu_dspark_support_cache_configured_budget() == 320;
+    }
+    ds4_gpu_dspark_support_cache_clear(1);
+
+    const uint32_t target_entries_before =
+        g_stream_expert_cache_entry_count;
+    const uint64_t target_hits_before = g_stream_expert_cache_hits;
+    const uint64_t target_misses_before = g_stream_expert_cache_misses;
+    const uint32_t target_hotness_before =
+        g_stream_expert_cache_route_hotness[0][7];
+    const uint8_t target_valid_before = g_stream_expert_cache[0][7].valid;
+    ds4_gpu_dspark_support_cache_entry *stage0 = ok ?
+        ds4_gpu_dspark_support_cache_get_for_test(0, 7) : NULL;
+    id<MTLBuffer> stage0_buffer = stage0 ? stage0->buffer : nil;
+    ds4_gpu_dspark_support_cache_entry *stage0_hit = stage0 ?
+        ds4_gpu_dspark_support_cache_get_for_test(0, 7) : NULL;
+    ds4_gpu_dspark_support_cache_entry *stage1 = stage0_hit ?
+        ds4_gpu_dspark_support_cache_get_for_test(1, 7) : NULL;
+    if (ok) {
+        const uint8_t *stage0_contents = stage0_buffer ?
+            (const uint8_t *)[stage0_buffer contents] : NULL;
+        const uint8_t *stage1_contents = stage1 && stage1->buffer ?
+            (const uint8_t *)[stage1->buffer contents] : NULL;
+        ok = stage0 && stage0_hit == stage0 && stage1 &&
+             stage0_buffer != stage1->buffer &&
+             stage0_contents && stage1_contents &&
+             stage0_contents[0] == (uint8_t)(7u * 11u) &&
+             stage1_contents[0] == (uint8_t)(73u + 7u * 11u) &&
+             g_dspark_support_cache_hits == 1 &&
+             g_dspark_support_cache_misses == 2 &&
+             g_dspark_support_cache_expert_loads == 2 &&
+             g_dspark_support_cache_pread_syscalls == 2 &&
+             g_dspark_support_cache_pread_bytes == 2u * RECORD_BYTES &&
+             g_stream_expert_cache_entry_count == target_entries_before &&
+             g_stream_expert_cache_hits == target_hits_before &&
+             g_stream_expert_cache_misses == target_misses_before &&
+             g_stream_expert_cache_route_hotness[0][7] ==
+                 target_hotness_before &&
+             g_stream_expert_cache[0][7].valid == target_valid_before;
+    }
+
+    for (uint32_t expert = 0; ok && expert < 18; expert++) {
+        ok = ds4_gpu_dspark_support_cache_get_for_test(2, expert) != NULL;
+    }
+    if (ok) {
+        ok = g_dspark_support_cache_entry_count == 19 &&
+             g_dspark_support_cache_evictions == 1 &&
+             g_dspark_support_cache_misses == 20 &&
+             g_dspark_support_cache_expert_loads == 20 &&
+             g_stream_expert_cache_entry_count +
+                 g_dspark_support_cache_entry_count <=
+                     ds4_gpu_stream_expert_cache_parent_budget(0) &&
+             !g_dspark_support_cache[0][7].valid &&
+             g_dspark_support_cache[1][7].valid;
+    }
+
+    if (g_dspark_expert_pack) {
+        ds4_gpu_expert_store_v2_clear_for_store(
+            DS4_GPU_EXPERT_STORE_SUPPORT);
+    }
+    if (ok) {
+        ok = !g_dspark_expert_pack &&
+             g_dspark_support_cache_entry_count == 0 &&
+             g_dspark_support_cache_bytes == 0 &&
+             !g_dspark_support_cache[1][7].valid &&
+             g_dspark_support_cache[1][7].buffer == nil &&
+             g_dspark_support_cache_hits == 0 &&
+             g_dspark_support_cache_misses == 0 &&
+             g_qwen35_expert_pack.active &&
+             ds4_gpu_stream_expert_cache_configured_budget() == 320 &&
+             ds4_gpu_dspark_support_cache_configured_budget() == 0;
+    }
+
+    /* Late SUPPORT activation must fence and prune TARGET immediately; it
+     * may not wait for the first SUPPORT lookup to enforce the 259+19 split. */
+    ds4_gpu_set_streaming_expert_cache_budget(278);
+    if (ok) {
+        ok = ds4_gpu_internal_dspark_support_populate_target_for_test(
+                 260, support_bytes, MODEL_SIZE, target_buffer) &&
+             ds4_gpu_expert_store_v2_install_for_store(
+                 DS4_GPU_EXPERT_STORE_SUPPORT, support_fd, FILE_SIZE,
+                 DS4_DSPARK_SUPPORT_LAYER_COUNT,
+                 DS4_DSPARK_SUPPORT_EXPERT_COUNT,
+                 DS4_EXPERT_STORE_STORAGE_GGML, 0, support_layers) &&
+             ds4_gpu_internal_dspark_support_bind_support_for_test(
+                 MODEL_SIZE) &&
+             g_stream_expert_cache_entry_count == 259 &&
+             ds4_gpu_stream_expert_cache_configured_budget() == 259 &&
+             ds4_gpu_dspark_support_cache_configured_budget() == 19;
+    }
+
+    /* mlock is a TARGET cap. At 259 it must not consume SUPPORT a second
+     * time; at 258 SUPPORT fails closed and no SUPPORT entry survives. */
+    ds4_gpu_stream_expert_cache_clear_all(0);
+    if (ok) {
+        ok = ds4_gpu_dspark_support_cache_get_for_test(0, 23) != NULL;
+    }
+    g_stream_expert_cache_mlock_budget_cap = 259;
+    g_stream_expert_cache_mlock_budget_cap_active = 1;
+    if (ok) {
+        ok = ds4_gpu_stream_expert_cache_configured_budget() == 259 &&
+             ds4_gpu_dspark_support_cache_configured_budget() == 19 &&
+             ds4_gpu_stream_expert_cache_parent_budget(0) == 278 &&
+             g_dspark_support_cache_entry_count == 1;
+    }
+    g_stream_expert_cache_mlock_budget_cap = 258;
+    ds4_gpu_dspark_support_cache_target_cap_changed();
+    if (ok) {
+        ok = ds4_gpu_stream_expert_cache_configured_budget() == 258 &&
+             ds4_gpu_dspark_support_cache_configured_budget() == 0 &&
+             ds4_gpu_stream_expert_cache_parent_budget(0) == 258 &&
+             g_dspark_support_cache_entry_count == 0 &&
+             g_stream_expert_cache_entry_count == 0 &&
+             !ds4_gpu_reconfigure_streaming_expert_cache_budget(278);
+    }
+    g_stream_expert_cache_mlock_budget_cap = 259;
+    if (ok) {
+        ok = ds4_gpu_reconfigure_streaming_expert_cache_budget(277) &&
+             g_stream_expert_cache_budget_override == 277;
+    }
+    g_stream_expert_cache_mlock_budget_cap = 258;
+    ds4_gpu_dspark_support_cache_target_cap_changed();
+    if (ok) {
+        ok = !ds4_gpu_grow_streaming_expert_cache_budget(278) &&
+             g_stream_expert_cache_budget_override == 277;
+    }
+    g_stream_expert_cache_mlock_budget_cap = 259;
+    if (ok) {
+        ok = ds4_gpu_grow_streaming_expert_cache_budget(278) &&
+             ds4_gpu_stream_expert_cache_configured_budget() == 259 &&
+             ds4_gpu_dspark_support_cache_configured_budget() == 19;
+    }
+
+    /* TARGET clear invalidates the pairing generation and clears SUPPORT.
+     * Reinstalling an identical-looking TARGET cannot revive the old SUPPORT
+     * descriptor; SUPPORT must be installed and bound again. */
+    if (ok) {
+        ok = ds4_gpu_dspark_support_cache_get_for_test(1, 41) != NULL;
+    }
+    const uint64_t target_generation_before_clear =
+        g_target_expert_pack_generation;
+    ds4_gpu_expert_store_v2_clear_for_store(DS4_GPU_EXPERT_STORE_TARGET);
+    if (ok) {
+        ok = g_dspark_expert_pack &&
+             g_dspark_support_cache_entry_count == 0 &&
+             ds4_gpu_dspark_support_cache_configured_budget() == 0 &&
+             g_target_expert_pack_generation !=
+                 target_generation_before_clear;
+    }
+    if (ok) {
+        ok = ds4_gpu_expert_store_v2_install_for_store(
+                 DS4_GPU_EXPERT_STORE_TARGET, target_fd, FILE_SIZE,
+                 TARGET_LAYER_COUNT,
+                 DS4_DSPARK_SUPPORT_EXPERT_COUNT,
+                 DS4_EXPERT_STORE_STORAGE_GGML, 0, target_layers) &&
+             ds4_gpu_internal_dspark_support_bind_target_for_test(
+                 TARGET_LAYER_COUNT, MODEL_SIZE) &&
+             ds4_gpu_dspark_support_cache_configured_budget() == 0 &&
+             ds4_gpu_dspark_support_cache_get_for_test(1, 41) == NULL;
+    }
+    if (ok) {
+        ok = ds4_gpu_expert_store_v2_install_for_store(
+                 DS4_GPU_EXPERT_STORE_SUPPORT, support_fd, FILE_SIZE,
+                 DS4_DSPARK_SUPPORT_LAYER_COUNT,
+                 DS4_DSPARK_SUPPORT_EXPERT_COUNT,
+                 DS4_EXPERT_STORE_STORAGE_GGML, 0, support_layers) &&
+             ds4_gpu_internal_dspark_support_bind_support_for_test(
+                 MODEL_SIZE) &&
+             ds4_gpu_dspark_support_cache_get_for_test(1, 41) != NULL;
+    }
+
+    if (g_dspark_expert_pack) {
+        ds4_gpu_expert_store_v2_clear_for_store(
+            DS4_GPU_EXPERT_STORE_SUPPORT);
+    }
+    if (g_qwen35_expert_pack.active) {
+        ds4_gpu_expert_store_v2_clear_for_store(
+            DS4_GPU_EXPERT_STORE_TARGET);
+    }
+    ds4_gpu_set_streaming_expert_cache_budget(0);
+    ds4_gpu_set_ssd_streaming(false);
+    free(support_bytes);
+    if (other_fd >= 0) close(other_fd);
+    if (support_fd >= 0) close(support_fd);
+    if (target_fd >= 0) close(target_fd);
     close(fd);
     return ok;
 }

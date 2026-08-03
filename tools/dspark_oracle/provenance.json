@@ -1,5 +1,5 @@
 {
-  "schemaVersion": 2,
+  "schemaVersion": 3,
   "capturedAt": "2026-08-03",
   "profile": "deepseek-v4-flash-0731-dspark",
   "sources": [
@@ -50,6 +50,48 @@
       "url": "https://huggingface.co/deepseek-ai/DeepSeek-V4-Flash-DSpark/blob/62af8fffb2f7030cac4de2f0169f5b8d1101b646/config.json"
     },
     {
+      "role": "official-dspark-inference-equations",
+      "repository": "deepseek-ai/DeepSeek-V4-Flash-DSpark",
+      "revision": "62af8fffb2f7030cac4de2f0169f5b8d1101b646",
+      "url": "https://huggingface.co/deepseek-ai/DeepSeek-V4-Flash-DSpark/tree/62af8fffb2f7030cac4de2f0169f5b8d1101b646/inference",
+      "files": [
+        {
+          "path": "inference/config.json",
+          "sha256": "c90861f3d10a9e4ef5954f8f1a34c529d480da1c5799f84660028f4e38e14e71"
+        },
+        {
+          "path": "inference/model.py",
+          "sha256": "c0c19e6c9fa439bac7fbb1c5bc1868232dfd5aa2f439a548d0e33dcc2a9edd3f"
+        },
+        {
+          "path": "inference/kernel.py",
+          "sha256": "59b325083d7103975cba025bd0d60ea343bb82d8fff53088afb7c04bd380c0c2"
+        }
+      ],
+      "observations": {
+        "stageChain": "exactly three DSparkBlock stages; stage zero alone owns main_proj/main_norm and stage two alone owns the final HC, norm, Markov, and confidence heads",
+        "mainInput": "captures after target layers 40/41/42 are HC-mean reduced, concatenated, projected 12288->4096, and RMS-normalized once; the same main_x feeds every stage attention KV path",
+        "rawCache": "each stage owns an independent 512-wide attention KV ring derived from main_x; current-target and five draft rows form a noncausal proposal view, while committed cache ownership advances only with target positions",
+        "hyperConnection": "four HC lanes; pre=sigmoid+eps, post=2*sigmoid, combination uses 20 alternating row/column Sinkhorn normalizations, and the final HC head is a sigmoid-weighted lane reduction"
+      }
+    },
+    {
+      "role": "authenticated-final-support-gguf",
+      "path": "DeepSeek-V4-Flash-0731-DSpark-support.gguf",
+      "size": 5989114912,
+      "sha256": "aa2bd4b5b916e1aa0a01392d69cbdd9798a3f3050c29c22973c8ee4233af0413",
+      "sourceAccepted": true,
+      "publicationAccepted": false,
+      "observations": {
+        "ggufVersion": 3,
+        "tensorCount": 81,
+        "stageTensorCounts": [26, 24, 31],
+        "headerValidation": "GGUF v3 metadata, tensor directory, aligned/non-overlapping/in-bounds offsets, and structural file size only; oracle fixtures contain no payload bytes and complete SHA-256/payload identity remain with gguf-tools/ds4-expert-major.py verify --dspark-support",
+        "sourceRevision": "7872f01b1d1fe23eabc4c98b48bffcef5a386062"
+      },
+      "note": "Locally authenticated final-0731 standalone support output. It is valid development evidence but is not a committed fixture and remains outside publication until the runtime correctness and performance gates pass."
+    },
+    {
       "role": "reference-quantized-support-gguf",
       "repository": "sakamakismile/DeepSeek-V4-Flash-DSpark-support-ds4-GGUF",
       "revision": "2286cd2429a0f2400ac84b07e9a2274114db9dd2",
@@ -97,13 +139,19 @@
     }
   ],
   "implementation": {
-    "method": "independent NumPy equations and synthetic data",
+    "method": "independent NumPy equations, reviewed header-only GGUF schema, frozen closed expected vectors, and synthetic data",
     "productionDependency": false,
     "mlx": "optional primitive cross-check only; mlx-lm is not used",
-    "externalRuntimeCodeCopied": false
+    "externalRuntimeCodeCopied": false,
+    "supportSchemaDerivation": {
+      "status": "pending",
+      "currentEvidence": "reviewed declaration cross-checked against the authenticated final GGUF and converter manifest",
+      "missingEvidence": "an independent generator derived directly from the three pinned source-safetensors headers",
+      "policy": "do not simulate independence by generating one schema declaration from another"
+    }
   },
   "validation": {
-    "capturedAt": "2026-08-03T01:19:59+02:00",
+    "capturedAt": "2026-08-03T03:59:31+02:00",
     "hardware": "Apple M5 Pro, 64 GB unified memory",
     "os": "macOS 26.5.2 (25F84)",
     "python": "3.13.13",
@@ -113,19 +161,31 @@
     "device": "Metal",
     "maximumObservedAbsoluteDrift": {
       "markovFloat32": 0.00009765625,
-      "confidenceFloat32": 0.0000000343827,
-      "postLayerHCMeanFloat32": 0.0
+      "confidenceFloat32": 0.00000004427712207988321,
+      "postLayerHCMeanFloat32": 0.0,
+      "mainProjectionNormFloat32": 0.00000001597020593546716,
+      "hcPreWeightsFloat32": 0.00000002382725033944766,
+      "hcPostWeightsFloat32": 0.00000004074554504907013,
+      "hcSinkhornFloat32": 0.00000006646726902204136,
+      "hcPreReductionFloat32": 0.00000003326538255965517,
+      "hcPostExpansionFloat32": 0.00000025449105267583156,
+      "hcFinalHeadFloat32": 0.00000009989789218067813
     },
     "semanticAudit": {
-      "capturedAt": "2026-08-03T00:36:30+02:00",
+      "capturedAt": "2026-08-03T03:59:31+02:00",
       "deepSpecRevision": "005e03b81cec38b7da6399833d609ee89a2587f2",
-      "systemPython": "23 passed, 1 optional-MLX skip",
-      "mlxMetal": "24 passed",
+      "systemPython": "35 passed, 1 explicit optional-MLX skip with final support file enabled",
+      "mlxMetal": "36 passed with mlx==0.32.0, mlx-metal==0.32.0, Device(gpu, 0)",
       "findings": [
         "confidence scheduling uses the first per-position sigmoid below threshold, not cumulative survival",
-        "the vanilla Markov head feeds each sampled token into the next proposal step",
+        "greedy and caller-uniform sampled Markov drafts feed each selected token into the next proposal step",
         "sampling acceptance is prefix-cumulative only after independent p/q draws; rejection uses the guarded p-q residual",
-        "post-layer capture averages the four HC lanes at production width 4096 without aliasing the source"
+        "post-layer capture averages the four HC lanes at production width 4096 without aliasing the source",
+        "non-degenerate HC and final-head vectors distinguish lane order, flattening, omitted normalization/output projection, and confidence input",
+        "stage zero concatenates exactly three target captures before main_proj/main_norm and repeats accepted/noise embeddings across four HC lanes",
+        "the synthetic topology requires three ordered stage-distinct transforms while preserving one immutable shared main_x",
+        "three stage-specific 128-by-512 raw-cache rings retain only committed target-derived rows; closed samples cover positions 0/127/128/129 and the current target plus five noncausal draft rows are a transactional proposal view",
+        "the final support GGUF v3 header contains exactly 81 descriptors split 26/24/31 across stages; real-file offsets and structural size are checked without reading payload bytes"
       ]
     }
   }

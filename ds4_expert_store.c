@@ -533,6 +533,23 @@ bool ds4_expert_store_validate_dspark_0731(
         return false;
     }
     const ds4_expert_store_manifest *manifest = &store->manifest;
+    /* These are the whole-source and routed-payload identities emitted by the
+     * authenticated final-0731 support conversion. Comparing both fields
+     * rejects preview and accidentally mismatched standard-converter stores.
+     * They are manifest claims, not a substitute for publication's offline
+     * recomputation of the multi-GiB payload and whole-artifact digests. */
+    static const uint8_t source_sha256[DS4_EXPERT_STORE_V2_SHA256_BYTES] = {
+        0xaa, 0x2b, 0xd4, 0xb5, 0xb9, 0x16, 0xe1, 0xaa,
+        0x0a, 0x01, 0x39, 0x2d, 0x69, 0xcb, 0xdd, 0x97,
+        0x98, 0xa3, 0xf3, 0x05, 0x0c, 0x29, 0xc2, 0x29,
+        0x73, 0xc8, 0xee, 0x42, 0x33, 0xaf, 0x04, 0x13,
+    };
+    static const uint8_t payload_sha256[DS4_EXPERT_STORE_V2_SHA256_BYTES] = {
+        0x66, 0x39, 0x85, 0x93, 0xc2, 0x3e, 0xfe, 0x9a,
+        0xc1, 0xbe, 0x1c, 0x9b, 0xcc, 0x0f, 0x95, 0x08,
+        0x72, 0x57, 0xe0, 0xb3, 0xe9, 0x80, 0x87, 0xe8,
+        0x92, 0xb6, 0x88, 0x7a, 0xd3, 0xd8, 0x0c, 0x95,
+    };
     if (manifest->version != DS4_EXPERT_STORE_V2_VERSION ||
         manifest->family != DS4_EXPERT_STORE_FAMILY_DEEPSEEK4 ||
         manifest->storage_format != DS4_EXPERT_STORE_STORAGE_GGML ||
@@ -542,9 +559,14 @@ bool ds4_expert_store_validate_dspark_0731(
         manifest->expert_used_count != DS4_DSPARK_0731_EXPERT_USED_COUNT ||
         manifest->source_tensor_count !=
             DS4_DSPARK_0731_SOURCE_TENSOR_COUNT ||
+        manifest->source_size != DS4_DSPARK_0731_SOURCE_BYTES ||
         manifest->data_offset != DS4_DSPARK_0731_DATA_OFFSET ||
         manifest->data_size != DS4_DSPARK_0731_DATA_BYTES ||
-        manifest->store_size != DS4_DSPARK_0731_STORE_BYTES) {
+        manifest->store_size != DS4_DSPARK_0731_STORE_BYTES ||
+        memcmp(manifest->source_sha256, source_sha256,
+               sizeof(source_sha256)) != 0 ||
+        memcmp(manifest->payload_sha256, payload_sha256,
+               sizeof(payload_sha256)) != 0) {
         set_error(error, error_size,
                   "DSpark 0731 manifest identity is invalid");
         return false;
