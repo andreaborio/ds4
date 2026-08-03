@@ -102,6 +102,8 @@ PROPOSAL_GENERATOR_PATH = (
 )
 DS4_SOURCE_PATH = ROOT / "ds4.c"
 DS4_METAL_SOURCE_PATH = ROOT / "ds4_metal.m"
+DS4_CLI_SOURCE_PATH = ROOT / "ds4_cli.c"
+CLI_TRANSACTION_TEST_PATH = ROOT / "tests" / "test_cli_transactional_consumer.py"
 DSPARK_GRAPH_PATH = ROOT / "runtime" / "ds4_dspark_graph.inc"
 TRANSACTION_RNG_TEST_PATH = Path(__file__).with_name("test_transaction_rng.py")
 
@@ -212,6 +214,154 @@ def _token_sequence_index(
     return -1
 
 
+def _c_function_definitions(source: str) -> dict[str, list[str]]:
+    """Return tokenized C function bodies without guessing from line layout."""
+
+    tokens = _c_tokens(_strip_c_noncode(source))
+    definitions: dict[str, list[str]] = {}
+    control_words = {"for", "if", "switch", "while"}
+    for index in range(len(tokens) - 2):
+        name = tokens[index]
+        if (not re.fullmatch(r"[A-Za-z_]\w*", name) or
+                name in control_words or tokens[index + 1] != "("):
+            continue
+        close_paren = _matching_token(tokens, index + 1, "(", ")")
+        if close_paren + 1 >= len(tokens) or tokens[close_paren + 1] != "{":
+            continue
+        close_body = _matching_token(tokens, close_paren + 1, "{", "}")
+        if name in definitions:
+            raise AssertionError(f"duplicate C function definition: {name}")
+        definitions[name] = tokens[close_paren + 2:close_body]
+    return definitions
+
+
+def _c_reachable_functions(
+        definitions: dict[str, list[str]], entry: str) -> set[str]:
+    if entry not in definitions:
+        raise AssertionError(f"C function definition not found: {entry}")
+    reachable: set[str] = set()
+    pending = [entry]
+    while pending:
+        name = pending.pop()
+        if name in reachable:
+            continue
+        reachable.add(name)
+        body = definitions[name]
+        for index in range(len(body) - 1):
+            callee = body[index]
+            if body[index + 1] == "(" and callee in definitions:
+                pending.append(callee)
+    return reachable
+
+
+def _c_for_loops(
+        tokens: list[str],
+) -> list[tuple[int, int, list[list[str]], int, int]]:
+    """Return for-loop token ranges and their three header clauses."""
+
+    loops: list[tuple[int, int, list[list[str]], int, int]] = []
+    for start in range(len(tokens) - 1):
+        if tokens[start] != "for" or tokens[start + 1] != "(":
+            continue
+        close_paren = _matching_token(tokens, start + 1, "(", ")")
+        clauses: list[list[str]] = [[]]
+        nesting: list[str] = []
+        matching = {")": "(", "]": "[", "}": "{"}
+        for token in tokens[start + 2:close_paren]:
+            if token in ("(", "[", "{"):
+                nesting.append(token)
+            elif token in matching:
+                if not nesting or nesting.pop() != matching[token]:
+                    raise AssertionError("unbalanced for-loop header")
+            if token == ";" and not nesting:
+                clauses.append([])
+            else:
+                clauses[-1].append(token)
+        if len(clauses) != 3:
+            raise AssertionError("for-loop header must contain three clauses")
+        body_start = close_paren + 1
+        if body_start >= len(tokens):
+            raise AssertionError("for-loop has no body")
+        if tokens[body_start] == "{":
+            body_end = _matching_token(tokens, body_start, "{", "}")
+            content_start = body_start + 1
+            content_end = body_end
+        else:
+            try:
+                body_end = tokens.index(";", body_start)
+            except ValueError as exc:
+                raise AssertionError("unterminated for-loop body") from exc
+            content_start = body_start
+            content_end = body_end + 1
+        loops.append((start, body_end, clauses, content_start, content_end))
+    return loops
+
+
+def _c_if_blocks(tokens: list[str]) -> list[tuple[list[str], int, int]]:
+    """Return braced if bodies and their tokenized conditions."""
+
+    blocks: list[tuple[list[str], int, int]] = []
+    for start in range(len(tokens) - 1):
+        if tokens[start] != "if" or tokens[start + 1] != "(":
+            continue
+        close_paren = _matching_token(tokens, start + 1, "(", ")")
+        body_start = close_paren + 1
+        if body_start >= len(tokens) or tokens[body_start] != "{":
+            continue
+        body_end = _matching_token(tokens, body_start, "{", "}")
+        blocks.append((tokens[start + 2:close_paren], body_start, body_end))
+    return blocks
+
+
+def _c_designated_initializer(
+        tokens: list[str], type_name: str,
+) -> tuple[str, dict[str, list[str]]]:
+    matches = []
+    for start in range(len(tokens) - 3):
+        if (tokens[start] != type_name or
+                not re.fullmatch(r"[A-Za-z_]\w*", tokens[start + 1]) or
+                tokens[start + 2:start + 4] != ["=", "{"]):
+            continue
+        close = _matching_token(tokens, start + 3, "{", "}")
+        fields: dict[str, list[str]] = {}
+        cursor = start + 4
+        while cursor < close:
+            if tokens[cursor] == ",":
+                cursor += 1
+                continue
+            if (cursor + 2 >= close or tokens[cursor] != "." or
+                    tokens[cursor + 2] != "="):
+                raise AssertionError(
+                    f"malformed {type_name} designated initializer")
+            field = tokens[cursor + 1]
+            cursor += 3
+            value: list[str] = []
+            nesting: list[str] = []
+            matching = {")": "(", "]": "[", "}": "{"}
+            while cursor < close:
+                token = tokens[cursor]
+                if token in ("(", "[", "{"):
+                    nesting.append(token)
+                elif token in matching:
+                    if not nesting or nesting.pop() != matching[token]:
+                        raise AssertionError(
+                            f"unbalanced {type_name} initializer field")
+                if token == "," and not nesting:
+                    break
+                value.append(token)
+                cursor += 1
+            if field in fields:
+                raise AssertionError(
+                    f"duplicate {type_name} initializer field: {field}")
+            fields[field] = value
+        matches.append((tokens[start + 1], fields))
+    if len(matches) != 1:
+        raise AssertionError(
+            f"expected one {type_name} designated initializer, got "
+            f"{len(matches)}")
+    return matches[0]
+
+
 def _gguf_string(value: str) -> bytes:
     encoded = value.encode("utf-8")
     return struct.pack("<Q", len(encoded)) + encoded
@@ -269,6 +419,437 @@ class TransactionRngGateTests(unittest.TestCase):
             f"stderr:\n{completed.stderr}",
         )
         self.assertIn("OK", completed.stderr)
+
+
+class CliGenerationStructureGateTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        source = DS4_CLI_SOURCE_PATH.read_text(encoding="utf-8")
+        cls.source = source
+        cls.definitions = _c_function_definitions(source)
+
+    def _transaction_owners(self) -> set[str]:
+        return {
+            name for name, body in self.definitions.items()
+            if _c_calls(body, "ds4_session_generation_block_begin") and
+            _c_calls(body, "ds4_session_generation_block_commit")
+        }
+
+    def _shared_transaction_owner(self) -> str:
+        generation_reachable = _c_reachable_functions(
+            self.definitions, "run_generation")
+        repl_reachable = _c_reachable_functions(
+            self.definitions, "run_chat_turn")
+        shared = (
+            generation_reachable & repl_reachable & self._transaction_owners()
+        )
+        self.assertEqual(
+            len(shared),
+            1,
+            "one-shot and REPL must converge on one shared owner of begin/commit",
+        )
+        return next(iter(shared))
+
+    def _normal_one_shot_entry(self) -> str:
+        generation_reachable = _c_reachable_functions(
+            self.definitions, "run_generation")
+        repl_reachable = _c_reachable_functions(
+            self.definitions, "run_chat_turn")
+        owner = self._shared_transaction_owner()
+        candidates = {
+            name for name in generation_reachable - repl_reachable
+            if _c_calls(self.definitions[name], owner)
+        }
+        self.assertEqual(
+            len(candidates),
+            1,
+            "normal one-shot generation must have one singular transactional "
+            "consumer entry",
+        )
+        return next(iter(candidates))
+
+    def test_one_shot_and_repl_share_the_transactional_block_consumer(
+            self) -> None:
+        one_shot = self._normal_one_shot_entry()
+        one_shot_reachable = _c_reachable_functions(
+            self.definitions, one_shot)
+        repl_reachable = _c_reachable_functions(
+            self.definitions, "run_chat_turn")
+        worker_name = self._shared_transaction_owner()
+        self.assertIn(worker_name, one_shot_reachable)
+        self.assertIn(worker_name, repl_reachable)
+        worker = self.definitions[worker_name]
+
+        begin_calls = _c_calls(
+            worker, "ds4_session_generation_block_begin")
+        commit_calls = _c_calls(
+            worker, "ds4_session_generation_block_commit")
+        self.assertEqual(
+            len(begin_calls), 1,
+            "the shared consumer must open one lexical block transaction",
+        )
+        self.assertEqual(
+            len(commit_calls), 1,
+            "the shared consumer must close through one lexical commit site",
+        )
+        self.assertGreaterEqual(len(begin_calls[0][2]), 3)
+        block_argument = begin_calls[0][2][2]
+        block_identifiers = [
+            token for token in block_argument
+            if re.fullmatch(r"[A-Za-z_]\w*", token)
+        ]
+        self.assertTrue(
+            block_identifiers,
+            "generation-block output argument must name its owned block",
+        )
+        block_name = block_identifiers[-1]
+
+        block_loops = []
+        for loop in _c_for_loops(worker):
+            condition = loop[2][1]
+            count_member = any(
+                _token_sequence_index(
+                    condition, [block_name, separator, "count"]
+                ) >= 0
+                for separator in (".", "->")
+            )
+            if count_member and any(
+                    operator in condition for operator in ("<", "!=", ">")):
+                block_loops.append(loop)
+        self.assertEqual(
+            len(block_loops),
+            1,
+            "the shared consumer must iterate the returned block.count once",
+        )
+        loop_start, loop_end, _, content_start, content_end = block_loops[0]
+        token_accesses = []
+        for separator in (".", "->"):
+            sequence = [block_name, separator, "tokens", "["]
+            cursor = 0
+            while True:
+                access = _token_sequence_index(worker, sequence, start=cursor)
+                if access < 0:
+                    break
+                token_accesses.append(access)
+                cursor = access + 1
+        self.assertTrue(
+            token_accesses,
+            "the block.count loop must consume returned block.tokens",
+        )
+        self.assertTrue(
+            all(content_start <= access < content_end
+                for access in token_accesses),
+            "returned block tokens must be inspected only inside the count loop",
+        )
+        self.assertLess(begin_calls[0][1], loop_start)
+        self.assertLess(loop_end, commit_calls[0][0])
+
+        commit_name, commit_fields = _c_designated_initializer(
+            worker, "ds4_generation_block_commit")
+        self.assertEqual(
+            set(commit_fields),
+            {"cookie", "adopted_count", "observed_count", "mode"},
+        )
+        self.assertIn(
+            commit_fields["cookie"],
+            ([block_name, ".", "cookie"], [block_name, "->", "cookie"]),
+            "commit must close the cookie returned by this begin",
+        )
+        adopted_value = commit_fields["adopted_count"]
+        observed_value = commit_fields["observed_count"]
+        self.assertEqual(len(adopted_value), 1)
+        self.assertEqual(len(observed_value), 1)
+        adopted_name = adopted_value[0]
+        observed_name = observed_value[0]
+        self.assertNotEqual(adopted_name, observed_name)
+        self.assertGreaterEqual(
+            _token_sequence_index(
+                worker[content_start:content_end], [adopted_name, "++"]),
+            0,
+            "adopted_count must come from the count advanced by delivery",
+        )
+        self.assertGreaterEqual(
+            _token_sequence_index(
+                worker[content_start:content_end], [observed_name, "++"]),
+            0,
+            "observed_count must come from the count advanced by inspection",
+        )
+        mode = commit_fields["mode"]
+        self.assertEqual(len(mode), 5)
+        self.assertEqual(mode[1], "?")
+        self.assertEqual(mode[2], "DS4_GENERATION_COMMIT_INVALIDATE")
+        self.assertEqual(mode[3], ":")
+        self.assertEqual(mode[4], "DS4_GENERATION_COMMIT_RETAIN")
+        self.assertEqual(
+            commit_calls[0][2][1],
+            ["&", commit_name],
+            "session commit must consume the audited designated initializer",
+        )
+
+        begin_end = begin_calls[0][1]
+        commit_start = commit_calls[0][0]
+        if_blocks = _c_if_blocks(worker)
+        invalidations = _c_calls(worker, "ds4_session_invalidate")
+        for exit_index in range(begin_end + 1, commit_start):
+            exit_token = worker[exit_index]
+            if exit_token in ("goto",):
+                self.fail(
+                    "the active generation-cookie region must not use goto")
+            if exit_token == "return":
+                enclosing = [
+                    (body_start, body_end)
+                    for _, body_start, body_end in if_blocks
+                    if body_start < exit_index < body_end
+                ]
+                self.assertTrue(
+                    enclosing,
+                    "an active-region return must be in an explicit failure block",
+                )
+                body_start, _ = min(
+                    enclosing, key=lambda bounds: bounds[1] - bounds[0])
+                dominating_invalidations = []
+                for call_start, call_end, _ in invalidations:
+                    if not body_start < call_start < call_end < exit_index:
+                        continue
+                    depth = 0
+                    for token in worker[body_start + 1:call_start]:
+                        if token == "{":
+                            depth += 1
+                        elif token == "}":
+                            depth -= 1
+                    statement_boundary = (
+                        call_start == body_start + 1 or
+                        worker[call_start - 1] in (";", "}")
+                    )
+                    if depth == 0 and statement_boundary:
+                        dominating_invalidations.append(call_start)
+                self.assertTrue(
+                    dominating_invalidations,
+                    "every return after begin and before commit must first "
+                    "unconditionally abort the active cookie in its failure block",
+                )
+            if exit_token not in ("break", "continue"):
+                continue
+            if content_start <= exit_index < content_end:
+                continue
+            exact_zero_conditions = {
+                tuple([block_name, separator, "count", "==", "0"])
+                for separator in (".", "->")
+            }
+            zero_count_exit = any(
+                body_start < exit_index < body_end and
+                tuple(condition) in exact_zero_conditions
+                for condition, body_start, body_end in if_blocks
+            )
+            self.assertTrue(
+                zero_count_exit,
+                "break/continue outside the block.count consumer would leave "
+                "a nonempty generation cookie unsettled",
+            )
+
+        forbidden = (
+            "ds4_session_sample",
+            "ds4_session_eval",
+            "ds4_session_eval_speculative_argmax",
+        )
+        for entry, reachable in (
+                (one_shot, one_shot_reachable),
+                ("run_chat_turn", repl_reachable)):
+            offenders = {
+                f"{name}:{api}"
+                for name in reachable
+                for api in forbidden
+                if _c_calls(self.definitions[name], api)
+            }
+            self.assertFalse(
+                offenders,
+                f"{entry} mixes legacy sample/eval with the transactional "
+                f"consumer: {sorted(offenders)}",
+            )
+
+        repl = self.definitions["run_repl"]
+        self.assertTrue(
+            _c_calls(repl, "run_chat_turn"),
+            "the interactive REPL must reach the audited transactional turn",
+        )
+
+    def test_normal_dispatch_is_transactional_and_argmax_is_evidence_only(
+            self) -> None:
+        one_shot = self._normal_one_shot_entry()
+        plain_argmax = []
+        evidence_argmax = []
+        for name, body in self.definitions.items():
+            plain_argmax.extend(
+                (name, call) for call in
+                _c_calls(body, "ds4_engine_generate_argmax"))
+            evidence_argmax.extend(
+                (name, call) for call in
+                _c_calls(body, "ds4_engine_generate_argmax_with_evidence"))
+        self.assertFalse(
+            plain_argmax,
+            "ordinary CLI generation must not retain the engine-owned argmax loop",
+        )
+        self.assertEqual(
+            len(evidence_argmax),
+            1,
+            "only the explicit generation-evidence path may retain engine argmax",
+        )
+        evidence_owner, evidence_call = evidence_argmax[0]
+        dispatch = self.definitions[evidence_owner]
+        one_shot_calls = _c_calls(dispatch, one_shot)
+        self.assertEqual(
+            len(one_shot_calls),
+            1,
+            "the evidence-owning dispatcher must have one normal transaction route",
+        )
+
+        evidence_field = [
+            "cfg", "->", "gen", ".", "dump_generation_evidence_path"]
+        evidence_blocks = [
+            (body_start, body_end)
+            for condition, body_start, body_end in _c_if_blocks(dispatch)
+            if _token_sequence_index(condition, evidence_field) >= 0
+        ]
+        self.assertTrue(
+            evidence_blocks,
+            "generation evidence must retain an explicit if/else-if diagnostic guard",
+        )
+        self.assertTrue(
+            any(start < evidence_call[0] < end
+                for start, end in evidence_blocks),
+            "engine argmax evidence must be enclosed by its diagnostic guard",
+        )
+        evidence_block = next(
+            (start, end) for start, end in evidence_blocks
+            if start < evidence_call[0] < end
+        )
+        final_else_start = evidence_block[1] + 2
+        self.assertEqual(
+            dispatch[evidence_block[1] + 1:final_else_start + 1],
+            ["else", "{"],
+            "the evidence branch must fall through to one explicit final else",
+        )
+        final_else_end = _matching_token(
+            dispatch, final_else_start, "{", "}")
+        self.assertTrue(
+            final_else_start < one_shot_calls[0][0] < final_else_end,
+            "the ordinary/default generation branch must call the transaction",
+        )
+
+        temperature_field = ["cfg", "->", "gen", ".", "temperature"]
+        temperature_dispatches = [
+            condition for condition, _, _ in _c_if_blocks(dispatch)
+            if _token_sequence_index(condition, temperature_field) >= 0
+        ]
+        self.assertFalse(
+            temperature_dispatches,
+            "normal dispatch must not route greedy and sampled requests to "
+            "different generation engines",
+        )
+
+        forbidden = (
+            "ds4_session_sample",
+            "ds4_session_eval",
+            "ds4_session_eval_speculative_argmax",
+        )
+        allowed_diagnostic_conditions = {
+            tuple(["cfg", "->", "gen", ".", "dump_logprobs_path"]),
+            tuple([
+                "cfg", "->", "gen", ".", "decode_consistency_tokens",
+                ">", "0",
+            ]),
+        }
+        actual_forbidden_owners = {
+            name
+            for name, body in self.definitions.items()
+            if any(_c_calls(body, api) for api in forbidden)
+        }
+        allowed_forbidden_owners = {
+            "run_logprob_dump", "run_decode_consistency",
+            "run_perplexity_file",
+        }
+        self.assertTrue(
+            actual_forbidden_owners <= allowed_forbidden_owners,
+            "legacy session sample/eval APIs must not gain a new owner, "
+            "including one reached through a function pointer: "
+            f"{sorted(actual_forbidden_owners - allowed_forbidden_owners)}",
+        )
+        forbidden_references = {
+            f"{name}:{api}"
+            for name, body in self.definitions.items()
+            for api in forbidden
+            for index, token in enumerate(body)
+            if token == api and (
+                name not in allowed_forbidden_owners or
+                index + 1 >= len(body) or body[index + 1] != "("
+            )
+        }
+        self.assertFalse(
+            forbidden_references,
+            "legacy APIs may appear only as direct calls in their named "
+            "diagnostic owners; pointer assignment/aliasing is forbidden: "
+            f"{sorted(forbidden_references)}",
+        )
+        for index in range(len(dispatch) - 1):
+            callee = dispatch[index]
+            if dispatch[index + 1] != "(" or callee not in self.definitions:
+                continue
+            reachable = _c_reachable_functions(self.definitions, callee)
+            offenders = {
+                f"{name}:{api}"
+                for name in reachable
+                for api in forbidden
+                if _c_calls(self.definitions[name], api)
+            }
+            if not offenders:
+                continue
+            guards = {
+                tuple(condition)
+                for condition, body_start, body_end in _c_if_blocks(dispatch)
+                if body_start < index < body_end
+            }
+            self.assertTrue(
+                guards & allowed_diagnostic_conditions,
+                "legacy session sample/eval is allowed only in an explicitly "
+                "classified diagnostic branch; normal dispatch reached "
+                f"{sorted(offenders)} through {callee}",
+            )
+
+    def test_thinking_formatter_is_allocation_free(self) -> None:
+        formatter_reachable = _c_reachable_functions(
+            self.definitions, "token_printer_process")
+        dynamic_calls = {
+            f"{function}:{allocator}"
+            for function in formatter_reachable
+            for allocator in (
+                "malloc", "calloc", "realloc", "free", "strdup",
+                "strndup", "asprintf", "vasprintf",
+            )
+            if _c_calls(self.definitions[function], allocator)
+        }
+        self.assertFalse(
+            dynamic_calls,
+            "the token formatter's inline pending buffer must not depend on "
+            f"fallible per-token allocation: {sorted(dynamic_calls)}",
+        )
+
+    def test_transactional_consumer_behavioral_harness(self) -> None:
+        completed = subprocess.run(
+            [sys.executable, str(CLI_TRANSACTION_TEST_PATH)],
+            cwd=ROOT,
+            text=True,
+            capture_output=True,
+            timeout=60,
+            check=False,
+        )
+        self.assertEqual(
+            completed.returncode,
+            0,
+            "transactional CLI consumer harness failed\n"
+            f"stdout:\n{completed.stdout}\n"
+            f"stderr:\n{completed.stderr}",
+        )
+        self.assertIn("17/17 PASS", completed.stderr)
 
 
 class OracleFixtureTests(unittest.TestCase):
@@ -5589,6 +6170,38 @@ class OracleFixtureTests(unittest.TestCase):
         )
         self.assertEqual(proposal.returncode, 0, proposal.stderr)
         self.assertIn("proposal fixture is current", proposal.stdout)
+
+    def test_benchmark_cohort_validator_is_fail_closed(self) -> None:
+        command = [
+            sys.executable,
+            str(ROOT / "tests" / "dspark" / "test_benchmark_cohort.py"),
+        ]
+        completed = subprocess.run(
+            command,
+            cwd=ROOT,
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertIn("Ran 16 tests", completed.stderr)
+        self.assertIn("OK", completed.stderr)
+
+    def test_benchmark_transactional_decode_contract(self) -> None:
+        command = [
+            sys.executable,
+            str(ROOT / "tests" / "dspark" / "test_bench_transactional.py"),
+        ]
+        completed = subprocess.run(
+            command,
+            cwd=ROOT,
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertIn("Ran 2 tests", completed.stderr)
+        self.assertIn("OK", completed.stderr)
 
     def test_proposal_generator_does_not_load_numerical_oracle(self) -> None:
         tree = ast.parse(PROPOSAL_GENERATOR_PATH.read_text(encoding="utf-8"))

@@ -145,6 +145,38 @@ def validate_pair(
             ):
                 fail(f"{canonical.name}/{legacy.name}: --help all is not full help")
 
+    full_help = run(canonical, ("--help", "all"))
+    mtp_options = (b"--mtp FILE", b"--mtp-draft N", b"--mtp-margin F")
+    if role == "cli":
+        for option in mtp_options:
+            if option in full_help.stdout:
+                fail(f"{canonical.name}: help advertises retired CLI option {option.decode()}")
+
+        retired_cases = (
+            ("--mtp", "--mtp"),
+            ("--mtp=probe", "--mtp"),
+            ("--mtp-draft", "--mtp-draft"),
+            ("--mtp-draft=2", "--mtp-draft"),
+            ("--mtp-margin", "--mtp-margin"),
+            ("--mtp-margin=3", "--mtp-margin"),
+        )
+        for binary in (canonical, legacy):
+            for argument, option in retired_cases:
+                result = run(binary, (argument,))
+                expected = (
+                    f"{binary.name}: MTP option {option} was retired; "
+                    "MTP generation is not supported by the CLI\n"
+                ).encode()
+                if result.returncode != 2 or result.stdout or result.stderr != expected:
+                    fail(f"{binary.name}: {argument} did not fail with the CLI MTP tombstone")
+            near_miss = run(binary, ("--mtpx=probe",))
+            if near_miss.returncode != 2 or b"MTP option" in near_miss.stderr:
+                fail(f"{binary.name}: near-miss MTP option used the retirement tombstone")
+    elif role in ("server", "agent"):
+        for option in mtp_options:
+            if option not in full_help.stdout:
+                fail(f"{canonical.name}: existing MTP help disappeared for {option.decode()}")
+
 
 def main() -> int:
     parser = argparse.ArgumentParser()

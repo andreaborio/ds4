@@ -1790,6 +1790,8 @@ int ds4_gpu_internal_dspark_dual_store_test(void);
 int ds4_gpu_internal_dspark_support_cache_test(void);
 /* Boundary-correct compact-mid routed MoE through one SUPPORT transaction. */
 int ds4_gpu_internal_dspark_support_routed_moe_test(void);
+/* Production-record first/last-block SUPPORT ownership probe. */
+int ds4_gpu_internal_dspark_support_full_width_test(void);
 /* Device-only post-layer HC mean regression for the DSpark tap. */
 int ds4_gpu_internal_dspark_hc_mean_test(void);
 /* Device ring append/publication regression for DSpark capture history. */

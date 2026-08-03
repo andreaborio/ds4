@@ -3987,6 +3987,7 @@ static void test_metal_kernel_group(void) {
     TEST_ASSERT(ds4_gpu_internal_dspark_q_head_norm_bf16_test() != 0);
     TEST_ASSERT(ds4_gpu_internal_dspark_router_f32_test() != 0);
     TEST_ASSERT(ds4_gpu_internal_dspark_support_routed_moe_test() != 0);
+    TEST_ASSERT(ds4_gpu_internal_dspark_support_full_width_test() != 0);
     TEST_ASSERT(ds4_gpu_internal_dspark_three_stage_proposal_test() != 0);
     /* Prove fixture teardown: the second call must regenerate, authenticate,
      * remap, execute, drain every no-copy wrapper, and unmap again. */

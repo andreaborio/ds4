@@ -21,6 +21,14 @@ enum {
     DS4_DSPARK_VERIFY_CAPTURE_MAX_ROWS = 16,
     DS4_DSPARK_RAW_WIDTH = 512,
     DS4_DSPARK_METAL_PAGE_BYTES = 16384,
+    /* Three 256-entry uint64 address tables followed by the five-by-six
+     * int32 route list occupy 6,264 bytes.  The reusable graph owner reserves
+     * one complete Metal allocation page so the future stage executor need
+     * not allocate this view on the decode hot path. */
+    DS4_DSPARK_SELECTED_ADDRESS_VIEW_BYTES =
+        3 * 256 * (int)sizeof(uint64_t) +
+        DS4_DSPARK_SUPPORT_CANDIDATE_ROWS *
+            DS4_DSPARK_SUPPORT_TOP_K * (int)sizeof(int32_t),
     /* One token can retain top-k records from every target layer, plus the
      * record currently being filled by asynchronous I/O. */
     DS4_DSPARK_TARGET_CACHE_FLOOR =
@@ -169,7 +177,8 @@ static uint32_t ds4_dspark_prefill_cap_floor(uint32_t normal_cap) {
 }
 
 /* Conservative sampled-production-path allocation inventory. core_bytes is
- * the 9,764,864-byte drafter core; the default temperature-1 product path
+ * the 9,781,248-byte drafter core, including its reusable selected-address
+ * page; the default temperature-1 product path
  * additionally owns greedy-head intermediates, all five q distributions, a
  * right-sized six-row target-verifier logits buffer (pending + five drafts),
  * and one frontier snapshot for exact restore-and-replay verification. This
@@ -189,6 +198,7 @@ typedef struct {
     uint64_t raw_normalized_bytes;
     uint64_t raw_ring_bytes;
     uint64_t two_source_attention_staging_bytes;
+    uint64_t selected_address_page_bytes;
     uint64_t proposal_scratch_page_bytes;
     uint64_t core_bytes;
     uint64_t greedy_head_scratch_page_bytes;
@@ -290,6 +300,8 @@ static bool ds4_dspark_runtime_memory_make(
             (DS4_DSPARK_HISTORY_ROWS +
              DS4_DSPARK_SUPPORT_CANDIDATE_ROWS) *
             DS4_DSPARK_RAW_WIDTH * sizeof(float),
+        .selected_address_page_bytes =
+            DS4_DSPARK_METAL_PAGE_BYTES,
         .proposal_scratch_page_bytes = proposal_scratch,
         .greedy_head_scratch_page_bytes = greedy_head_scratch,
         .sampled_q_distribution_page_bytes = sampled_q_distribution,
@@ -314,6 +326,7 @@ static bool ds4_dspark_runtime_memory_make(
                         memory.raw_ring_bytes +
                         ds4_dspark_metal_page_charge(
                             memory.two_source_attention_staging_bytes) +
+                        memory.selected_address_page_bytes +
                         proposal_scratch;
     result.verifier_frontier_snapshot_page_bytes =
         verifier_ratio4_snapshot + verifier_ratio128_snapshot;
@@ -333,8 +346,9 @@ static bool ds4_dspark_runtime_memory_make(
         result.raw_normalized_bytes != UINT64_C(12288) ||
         result.raw_ring_bytes != UINT64_C(786432) ||
         result.two_source_attention_staging_bytes != UINT64_C(272384) ||
+        result.selected_address_page_bytes != UINT64_C(16384) ||
         result.proposal_scratch_page_bytes != UINT64_C(1146880) ||
-        result.core_bytes != UINT64_C(9764864) ||
+        result.core_bytes != UINT64_C(9781248) ||
         result.greedy_head_scratch_page_bytes != UINT64_C(557056) ||
         result.sampled_q_distribution_page_bytes != UINT64_C(2588672) ||
         result.target_verifier_logits_page_bytes != UINT64_C(3112960) ||
@@ -344,12 +358,617 @@ static bool ds4_dspark_runtime_memory_make(
         result.sampled_host_vocab_rows_page_bytes != UINT64_C(1048576) ||
         result.sampled_host_confidence_feature_page_bytes != UINT64_C(32768) ||
         result.sampled_host_delta_page_bytes != UINT64_C(1081344) ||
-        result.total_bytes != UINT64_C(29655040)) {
+        result.total_bytes != UINT64_C(29671424)) {
         return false;
     }
     *out = result;
     return true;
 }
+
+#if !defined(DS4_NO_GPU) || defined(DS4_TEST_HOOKS)
+typedef struct {
+    bool frontier_enabled;
+    bool prefix1_enabled;
+} ds4_dspark_verifier_snapshot_plan;
+
+static ds4_dspark_verifier_snapshot_plan
+ds4_dspark_verifier_snapshot_plan_make(
+        bool enable_mtp,
+        bool enable_dspark) {
+    return (ds4_dspark_verifier_snapshot_plan){
+        .frontier_enabled = enable_mtp || enable_dspark,
+        .prefix1_enabled = enable_mtp,
+    };
+}
+
+typedef enum {
+    DS4_DSPARK_FRONTIER_ATTN_KV = 0,
+    DS4_DSPARK_FRONTIER_ATTN_SCORE,
+    DS4_DSPARK_FRONTIER_INDEX_KV,
+    DS4_DSPARK_FRONTIER_INDEX_SCORE,
+    DS4_DSPARK_FRONTIER_PREFIX1_ATTN_KV,
+    DS4_DSPARK_FRONTIER_PREFIX1_ATTN_SCORE,
+    DS4_DSPARK_FRONTIER_PREFIX1_INDEX_KV,
+    DS4_DSPARK_FRONTIER_PREFIX1_INDEX_SCORE,
+    DS4_DSPARK_FRONTIER_KIND_COUNT,
+} ds4_dspark_verifier_frontier_kind;
+
+typedef uint32_t (*ds4_dspark_verifier_frontier_ratio_fn)(
+    uint32_t layer, void *opaque);
+typedef void *(*ds4_dspark_verifier_frontier_get_fn)(
+    uint32_t layer, ds4_dspark_verifier_frontier_kind kind, void *opaque);
+typedef bool (*ds4_dspark_verifier_frontier_set_fn)(
+    uint32_t layer, ds4_dspark_verifier_frontier_kind kind,
+    void *allocation, void *opaque);
+typedef void *(*ds4_dspark_verifier_frontier_allocate_fn)(
+    uint64_t bytes, void *opaque);
+typedef uint64_t (*ds4_dspark_verifier_frontier_bytes_fn)(
+    const void *allocation, void *opaque);
+typedef void (*ds4_dspark_verifier_frontier_release_fn)(
+    void *allocation, void *opaque);
+
+/* Model-free ownership core for the verifier rollback tensors.  Production
+ * supplies a thin Metal adapter; the contract self-check supplies an opaque
+ * fake owner and can therefore force allocation failures without a model or
+ * device.  Geometry lives here so allocation and validation cannot silently
+ * diverge. */
+typedef struct {
+    ds4_dspark_verifier_snapshot_plan plan;
+    uint32_t layer_count;
+    uint32_t attn_head_dim;
+    uint32_t index_head_dim;
+    ds4_dspark_verifier_frontier_ratio_fn ratio;
+    ds4_dspark_verifier_frontier_get_fn get;
+    ds4_dspark_verifier_frontier_set_fn set;
+    ds4_dspark_verifier_frontier_allocate_fn allocate;
+    ds4_dspark_verifier_frontier_bytes_fn bytes;
+    ds4_dspark_verifier_frontier_release_fn release;
+    void *opaque;
+} ds4_dspark_verifier_frontier_ops;
+
+static bool ds4_dspark_verifier_frontier_mul(
+        uint64_t left,
+        uint64_t right,
+        uint64_t *out) {
+    if (!out || (right != 0u && left > UINT64_MAX / right)) return false;
+    *out = left * right;
+    return true;
+}
+
+static bool ds4_dspark_verifier_frontier_ops_valid(
+        const ds4_dspark_verifier_frontier_ops *ops,
+        bool                                    allocating) {
+    return ops && ops->layer_count != 0u &&
+           ops->attn_head_dim != 0u && ops->index_head_dim != 0u &&
+           ops->ratio && ops->get && ops->set && ops->bytes &&
+           ops->release && (!allocating || ops->allocate) &&
+           (!ops->plan.prefix1_enabled || ops->plan.frontier_enabled);
+}
+
+static bool ds4_dspark_verifier_frontier_expected(
+        const ds4_dspark_verifier_frontier_ops *ops,
+        uint32_t                                layer,
+        ds4_dspark_verifier_frontier_kind       kind,
+        bool                                   *wanted,
+        uint64_t                               *bytes) {
+    if (!ops || !wanted || !bytes || layer >= ops->layer_count ||
+        kind >= DS4_DSPARK_FRONTIER_KIND_COUNT) {
+        return false;
+    }
+    *wanted = false;
+    *bytes = 0u;
+    const uint32_t ratio = ops->ratio(layer, ops->opaque);
+    if (ratio != 0u && ratio != 4u && ratio != 128u) return false;
+    if (!ops->plan.frontier_enabled || ratio == 0u) return true;
+
+    const bool prefix1 =
+        kind >= DS4_DSPARK_FRONTIER_PREFIX1_ATTN_KV;
+    if (prefix1 && !ops->plan.prefix1_enabled) return true;
+    const ds4_dspark_verifier_frontier_kind base = prefix1 ?
+        (ds4_dspark_verifier_frontier_kind)(
+            kind - DS4_DSPARK_FRONTIER_PREFIX1_ATTN_KV) : kind;
+    const bool index = base == DS4_DSPARK_FRONTIER_INDEX_KV ||
+                       base == DS4_DSPARK_FRONTIER_INDEX_SCORE;
+    if (index && ratio != 4u) return true;
+
+    const uint32_t coff = ratio == 4u ? 2u : 1u;
+    uint64_t result = coff;
+    if (!ds4_dspark_verifier_frontier_mul(
+            result, index ? ops->index_head_dim : ops->attn_head_dim,
+            &result) ||
+        !ds4_dspark_verifier_frontier_mul(result, coff, &result) ||
+        !ds4_dspark_verifier_frontier_mul(result, ratio, &result) ||
+        !ds4_dspark_verifier_frontier_mul(
+            result, sizeof(float), &result)) {
+        return false;
+    }
+    *wanted = true;
+    *bytes = result;
+    return true;
+}
+
+static bool ds4_dspark_verifier_frontier_free(
+        const ds4_dspark_verifier_frontier_ops *ops) {
+    if (!ds4_dspark_verifier_frontier_ops_valid(ops, false)) return false;
+    bool ok = true;
+    for (uint32_t layer = 0; layer < ops->layer_count; layer++) {
+        for (uint32_t raw_kind = 0;
+             raw_kind < DS4_DSPARK_FRONTIER_KIND_COUNT; raw_kind++) {
+            const ds4_dspark_verifier_frontier_kind kind =
+                (ds4_dspark_verifier_frontier_kind)raw_kind;
+            void *allocation = ops->get(layer, kind, ops->opaque);
+            const bool cleared =
+                ops->set(layer, kind, NULL, ops->opaque);
+            if (cleared && allocation) {
+                ops->release(allocation, ops->opaque);
+            }
+            ok = cleared && ok;
+        }
+    }
+    return ok;
+}
+
+static bool ds4_dspark_verifier_frontier_valid(
+        const ds4_dspark_verifier_frontier_ops *ops,
+        uint64_t                               *page_bytes_out) {
+    if (!ds4_dspark_verifier_frontier_ops_valid(ops, false)) return false;
+    uint64_t page_bytes = 0u;
+    for (uint32_t layer = 0; layer < ops->layer_count; layer++) {
+        for (uint32_t raw_kind = 0;
+             raw_kind < DS4_DSPARK_FRONTIER_KIND_COUNT; raw_kind++) {
+            const ds4_dspark_verifier_frontier_kind kind =
+                (ds4_dspark_verifier_frontier_kind)raw_kind;
+            bool wanted = false;
+            uint64_t expected_bytes = 0u;
+            if (!ds4_dspark_verifier_frontier_expected(
+                    ops, layer, kind, &wanted, &expected_bytes)) {
+                return false;
+            }
+            const void *allocation = ops->get(layer, kind, ops->opaque);
+            if ((!wanted && allocation) ||
+                (wanted && (!allocation ||
+                            ops->bytes(allocation, ops->opaque) !=
+                                expected_bytes))) {
+                return false;
+            }
+            if (wanted) {
+                const uint64_t charge =
+                    ds4_dspark_metal_page_charge(expected_bytes);
+                if (charge == UINT64_MAX ||
+                    page_bytes > UINT64_MAX - charge) {
+                    return false;
+                }
+                page_bytes += charge;
+            }
+        }
+    }
+    if (page_bytes_out) *page_bytes_out = page_bytes;
+    return true;
+}
+
+static bool ds4_dspark_verifier_frontier_allocate(
+        const ds4_dspark_verifier_frontier_ops *ops) {
+    if (!ds4_dspark_verifier_frontier_ops_valid(
+            ops, ops && ops->plan.frontier_enabled)) {
+        return false;
+    }
+    if (!ds4_dspark_verifier_frontier_free(ops)) return false;
+    if (!ops->plan.frontier_enabled) {
+        return ds4_dspark_verifier_frontier_valid(ops, NULL);
+    }
+    for (uint32_t layer = 0; layer < ops->layer_count; layer++) {
+        for (uint32_t raw_kind = 0;
+             raw_kind < DS4_DSPARK_FRONTIER_KIND_COUNT; raw_kind++) {
+            const ds4_dspark_verifier_frontier_kind kind =
+                (ds4_dspark_verifier_frontier_kind)raw_kind;
+            bool wanted = false;
+            uint64_t bytes = 0u;
+            if (!ds4_dspark_verifier_frontier_expected(
+                    ops, layer, kind, &wanted, &bytes)) {
+                goto fail;
+            }
+            if (!wanted) continue;
+            void *allocation = ops->allocate(bytes, ops->opaque);
+            if (!allocation) goto fail;
+            if (!ops->set(layer, kind, allocation, ops->opaque)) {
+                ops->release(allocation, ops->opaque);
+                goto fail;
+            }
+        }
+    }
+    if (!ds4_dspark_verifier_frontier_valid(ops, NULL)) goto fail;
+    return true;
+
+fail:
+    ds4_dspark_verifier_frontier_free(ops);
+    return false;
+}
+#endif
+
+/* Opaque, private owner for the one reusable selected-address Metal page.
+ * Keeping the ownership protocol independent from Metal lets the model-free
+ * contract force allocator failure and verify exact unwind. */
+typedef struct {
+    void *selected_address_page;
+    uint64_t selected_address_page_bytes;
+} ds4_dspark_workspace_owner;
+
+typedef void *(*ds4_dspark_workspace_allocate_fn)(
+    uint64_t bytes, void *opaque);
+typedef void (*ds4_dspark_workspace_release_fn)(
+    void *allocation, void *opaque);
+
+#if !defined(DS4_NO_GPU) || defined(DS4_TEST_HOOKS)
+static bool ds4_dspark_workspace_owner_valid(
+        const ds4_dspark_workspace_owner *owner,
+        bool                              enabled) {
+    if (!owner) return false;
+    if (!enabled) {
+        return owner->selected_address_page == NULL &&
+               owner->selected_address_page_bytes == 0u;
+    }
+    return owner->selected_address_page != NULL &&
+           owner->selected_address_page_bytes ==
+               DS4_DSPARK_METAL_PAGE_BYTES;
+}
+
+static void ds4_dspark_workspace_owner_release(
+        ds4_dspark_workspace_owner    *owner,
+        ds4_dspark_workspace_release_fn release,
+        void                          *opaque) {
+    if (!owner) return;
+    if (owner->selected_address_page && release) {
+        release(owner->selected_address_page, opaque);
+    }
+    memset(owner, 0, sizeof(*owner));
+}
+
+static bool ds4_dspark_workspace_owner_allocate(
+        ds4_dspark_workspace_owner     *owner,
+        bool                            enabled,
+        ds4_dspark_workspace_allocate_fn allocate,
+        void                           *opaque) {
+    if (!owner || !ds4_dspark_workspace_owner_valid(owner, false)) {
+        return false;
+    }
+    if (!enabled) return true;
+    if (!allocate) return false;
+    void *page = allocate(DS4_DSPARK_METAL_PAGE_BYTES, opaque);
+    if (!page) return false;
+    owner->selected_address_page = page;
+    owner->selected_address_page_bytes = DS4_DSPARK_METAL_PAGE_BYTES;
+    return true;
+}
+#endif
+
+#ifdef DS4_TEST_HOOKS
+enum {
+    /* Keep one wider target-only control so the DSpark 43-layer fixture can
+     * never narrow the generic DeepSeek graph owner by accident. */
+    DS4_DSPARK_VERIFIER_SELF_CHECK_LAYER_CAPACITY = 79,
+};
+
+typedef struct {
+    uint32_t alloc_calls;
+    uint32_t release_calls;
+    bool fail;
+    uint8_t page_sentinel;
+} ds4_dspark_workspace_self_check_state;
+
+static void *ds4_dspark_workspace_self_check_allocate(
+        uint64_t bytes,
+        void    *opaque) {
+    ds4_dspark_workspace_self_check_state *state =
+        (ds4_dspark_workspace_self_check_state *)opaque;
+    if (!state || bytes != DS4_DSPARK_METAL_PAGE_BYTES) return NULL;
+    state->alloc_calls++;
+    return state->fail ? NULL : &state->page_sentinel;
+}
+
+static void ds4_dspark_workspace_self_check_release(
+        void *allocation,
+        void *opaque) {
+    ds4_dspark_workspace_self_check_state *state =
+        (ds4_dspark_workspace_self_check_state *)opaque;
+    if (state && allocation == &state->page_sentinel) {
+        state->release_calls++;
+    }
+}
+
+static bool ds4_dspark_workspace_owner_self_check(void) {
+    const ds4_dspark_verifier_snapshot_plan target =
+        ds4_dspark_verifier_snapshot_plan_make(false, false);
+    const ds4_dspark_verifier_snapshot_plan dspark =
+        ds4_dspark_verifier_snapshot_plan_make(false, true);
+    const ds4_dspark_verifier_snapshot_plan mtp =
+        ds4_dspark_verifier_snapshot_plan_make(true, false);
+    ds4_dspark_workspace_owner owner = {0};
+    ds4_dspark_workspace_self_check_state state = {0};
+    if (target.frontier_enabled || target.prefix1_enabled ||
+        !dspark.frontier_enabled || dspark.prefix1_enabled ||
+        !mtp.frontier_enabled || !mtp.prefix1_enabled ||
+        !ds4_dspark_workspace_owner_allocate(
+            &owner, false, ds4_dspark_workspace_self_check_allocate,
+            &state) ||
+        state.alloc_calls != 0u ||
+        !ds4_dspark_workspace_owner_valid(&owner, false)) {
+        return false;
+    }
+    state.fail = true;
+    if (ds4_dspark_workspace_owner_allocate(
+            &owner, true, ds4_dspark_workspace_self_check_allocate,
+            &state) ||
+        state.alloc_calls != 1u || state.release_calls != 0u ||
+        !ds4_dspark_workspace_owner_valid(&owner, false)) {
+        return false;
+    }
+    state.fail = false;
+    if (!ds4_dspark_workspace_owner_allocate(
+            &owner, true, ds4_dspark_workspace_self_check_allocate,
+            &state) ||
+        state.alloc_calls != 2u ||
+        !ds4_dspark_workspace_owner_valid(&owner, true) ||
+        ds4_dspark_workspace_owner_allocate(
+            &owner, true, ds4_dspark_workspace_self_check_allocate,
+            &state)) {
+        return false;
+    }
+    ds4_dspark_workspace_owner_release(
+        &owner, ds4_dspark_workspace_self_check_release, &state);
+    return state.alloc_calls == 2u && state.release_calls == 1u &&
+           ds4_dspark_workspace_owner_valid(&owner, false);
+}
+
+typedef struct {
+    uint64_t bytes;
+    bool live;
+} ds4_dspark_verifier_frontier_self_check_allocation;
+
+typedef struct {
+    void *slot[DS4_DSPARK_VERIFIER_SELF_CHECK_LAYER_CAPACITY]
+              [DS4_DSPARK_FRONTIER_KIND_COUNT];
+    ds4_dspark_verifier_frontier_self_check_allocation allocation[
+        DS4_DSPARK_VERIFIER_SELF_CHECK_LAYER_CAPACITY *
+        DS4_DSPARK_FRONTIER_KIND_COUNT];
+    uint32_t layer_count;
+    uint32_t alloc_calls;
+    uint32_t release_calls;
+    uint32_t live_count;
+    int32_t fail_after;
+    bool invalid_release;
+} ds4_dspark_verifier_frontier_self_check_state;
+
+static void ds4_dspark_verifier_frontier_self_check_reset(
+        ds4_dspark_verifier_frontier_self_check_state *state,
+        int32_t                                         fail_after) {
+    memset(state, 0, sizeof(*state));
+    state->layer_count = DS4_DSPARK_TARGET_LAYER_COUNT;
+    state->fail_after = fail_after;
+}
+
+static uint32_t ds4_dspark_verifier_frontier_self_check_ratio(
+        uint32_t layer,
+        void    *opaque) {
+    (void)opaque;
+    if (layer < 2u) return 0u;
+    return (layer & 1u) == 0u ? 4u : 128u;
+}
+
+static void *ds4_dspark_verifier_frontier_self_check_get(
+        uint32_t                                layer,
+        ds4_dspark_verifier_frontier_kind       kind,
+        void                                   *opaque) {
+    ds4_dspark_verifier_frontier_self_check_state *state = opaque;
+    if (!state || layer >= state->layer_count ||
+        kind >= DS4_DSPARK_FRONTIER_KIND_COUNT) {
+        return NULL;
+    }
+    return state->slot[layer][kind];
+}
+
+static bool ds4_dspark_verifier_frontier_self_check_set(
+        uint32_t                                layer,
+        ds4_dspark_verifier_frontier_kind       kind,
+        void                                   *allocation,
+        void                                   *opaque) {
+    ds4_dspark_verifier_frontier_self_check_state *state = opaque;
+    if (!state || layer >= state->layer_count ||
+        kind >= DS4_DSPARK_FRONTIER_KIND_COUNT ||
+        (allocation && state->slot[layer][kind])) {
+        return false;
+    }
+    state->slot[layer][kind] = allocation;
+    return true;
+}
+
+static void *ds4_dspark_verifier_frontier_self_check_allocate(
+        uint64_t bytes,
+        void    *opaque) {
+    ds4_dspark_verifier_frontier_self_check_state *state = opaque;
+    if (!state) return NULL;
+    const uint32_t call = state->alloc_calls++;
+    if ((int32_t)call == state->fail_after ||
+        call >= sizeof(state->allocation) / sizeof(state->allocation[0])) {
+        return NULL;
+    }
+    state->allocation[call].bytes = bytes;
+    state->allocation[call].live = true;
+    state->live_count++;
+    return &state->allocation[call];
+}
+
+static uint64_t ds4_dspark_verifier_frontier_self_check_bytes(
+        const void *allocation,
+        void       *opaque) {
+    ds4_dspark_verifier_frontier_self_check_state *state = opaque;
+    if (!state || !allocation) return 0u;
+    for (uint32_t index = 0;
+         index < sizeof(state->allocation) / sizeof(state->allocation[0]);
+         index++) {
+        if (allocation == &state->allocation[index] &&
+            state->allocation[index].live) {
+            return state->allocation[index].bytes;
+        }
+    }
+    return 0u;
+}
+
+static void ds4_dspark_verifier_frontier_self_check_release(
+        void *allocation,
+        void *opaque) {
+    ds4_dspark_verifier_frontier_self_check_state *state = opaque;
+    if (!state || !allocation) return;
+    for (uint32_t index = 0;
+         index < sizeof(state->allocation) / sizeof(state->allocation[0]);
+         index++) {
+        if (allocation != &state->allocation[index]) continue;
+        if (!state->allocation[index].live || state->live_count == 0u) {
+            state->invalid_release = true;
+            return;
+        }
+        state->allocation[index].live = false;
+        state->release_calls++;
+        state->live_count--;
+        return;
+    }
+    state->invalid_release = true;
+}
+
+static ds4_dspark_verifier_frontier_ops
+ds4_dspark_verifier_frontier_self_check_ops(
+        ds4_dspark_verifier_frontier_self_check_state *state,
+        ds4_dspark_verifier_snapshot_plan              plan) {
+    return (ds4_dspark_verifier_frontier_ops){
+        .plan = plan,
+        .layer_count = state ? state->layer_count : 0u,
+        .attn_head_dim = 512u,
+        .index_head_dim = 128u,
+        .ratio = ds4_dspark_verifier_frontier_self_check_ratio,
+        .get = ds4_dspark_verifier_frontier_self_check_get,
+        .set = ds4_dspark_verifier_frontier_self_check_set,
+        .allocate = ds4_dspark_verifier_frontier_self_check_allocate,
+        .bytes = ds4_dspark_verifier_frontier_self_check_bytes,
+        .release = ds4_dspark_verifier_frontier_self_check_release,
+        .opaque = state,
+    };
+}
+
+static bool ds4_dspark_verifier_frontier_self_check_clear(
+        const ds4_dspark_verifier_frontier_self_check_state *state) {
+    if (!state || state->live_count != 0u || state->invalid_release) {
+        return false;
+    }
+    for (uint32_t layer = 0; layer < state->layer_count; layer++) {
+        for (uint32_t kind = 0;
+             kind < DS4_DSPARK_FRONTIER_KIND_COUNT; kind++) {
+            if (state->slot[layer][kind]) return false;
+        }
+    }
+    return true;
+}
+
+static bool ds4_dspark_verifier_frontier_self_check(void) {
+    const ds4_dspark_verifier_snapshot_plan target =
+        ds4_dspark_verifier_snapshot_plan_make(false, false);
+    const ds4_dspark_verifier_snapshot_plan dspark =
+        ds4_dspark_verifier_snapshot_plan_make(false, true);
+    const ds4_dspark_verifier_snapshot_plan mtp =
+        ds4_dspark_verifier_snapshot_plan_make(true, false);
+    ds4_dspark_verifier_frontier_self_check_state state;
+    uint64_t page_bytes = UINT64_MAX;
+
+    ds4_dspark_verifier_frontier_self_check_reset(&state, 0);
+    ds4_dspark_verifier_frontier_ops ops =
+        ds4_dspark_verifier_frontier_self_check_ops(&state, target);
+    if (!ds4_dspark_verifier_frontier_allocate(&ops) ||
+        state.alloc_calls != 0u ||
+        !ds4_dspark_verifier_frontier_valid(&ops, &page_bytes) ||
+        page_bytes != 0u ||
+        !ds4_dspark_verifier_frontier_self_check_clear(&state)) {
+        return false;
+    }
+
+    ds4_dspark_verifier_frontier_self_check_reset(&state, 0);
+    state.layer_count = DS4_DSPARK_VERIFIER_SELF_CHECK_LAYER_CAPACITY;
+    ops = ds4_dspark_verifier_frontier_self_check_ops(&state, target);
+    if (!ds4_dspark_verifier_frontier_allocate(&ops) ||
+        state.alloc_calls != 0u ||
+        !ds4_dspark_verifier_frontier_valid(&ops, &page_bytes) ||
+        page_bytes != 0u ||
+        !ds4_dspark_verifier_frontier_self_check_clear(&state)) {
+        return false;
+    }
+
+    ds4_dspark_verifier_frontier_self_check_reset(&state, -1);
+    state.layer_count = DS4_DSPARK_VERIFIER_SELF_CHECK_LAYER_CAPACITY;
+    ops = ds4_dspark_verifier_frontier_self_check_ops(&state, mtp);
+    if (!ds4_dspark_verifier_frontier_allocate(&ops) ||
+        state.alloc_calls != 464u || state.live_count != 464u ||
+        !ds4_dspark_verifier_frontier_valid(&ops, &page_bytes) ||
+        page_bytes != UINT64_C(47513600) ||
+        !state.slot[78][DS4_DSPARK_FRONTIER_ATTN_KV] ||
+        !state.slot[78][DS4_DSPARK_FRONTIER_INDEX_KV] ||
+        !state.slot[78][DS4_DSPARK_FRONTIER_PREFIX1_ATTN_KV] ||
+        !state.slot[78][DS4_DSPARK_FRONTIER_PREFIX1_INDEX_KV] ||
+        !state.slot[77][DS4_DSPARK_FRONTIER_ATTN_KV] ||
+        state.slot[77][DS4_DSPARK_FRONTIER_INDEX_KV] ||
+        !state.slot[77][DS4_DSPARK_FRONTIER_PREFIX1_ATTN_KV] ||
+        state.slot[77][DS4_DSPARK_FRONTIER_PREFIX1_INDEX_KV] ||
+        !ds4_dspark_verifier_frontier_free(&ops) ||
+        state.release_calls != 464u ||
+        !ds4_dspark_verifier_frontier_self_check_clear(&state)) {
+        return false;
+    }
+
+    ds4_dspark_verifier_frontier_self_check_reset(&state, -1);
+    ops = ds4_dspark_verifier_frontier_self_check_ops(&state, dspark);
+    if (!ds4_dspark_verifier_frontier_allocate(&ops) ||
+        state.alloc_calls != 124u || state.live_count != 124u ||
+        !ds4_dspark_verifier_frontier_valid(&ops, &page_bytes) ||
+        page_bytes != UINT64_C(12550144) ||
+        !state.slot[2][DS4_DSPARK_FRONTIER_ATTN_KV] ||
+        !state.slot[2][DS4_DSPARK_FRONTIER_INDEX_KV] ||
+        state.slot[2][DS4_DSPARK_FRONTIER_PREFIX1_ATTN_KV] ||
+        !state.slot[3][DS4_DSPARK_FRONTIER_ATTN_KV] ||
+        state.slot[3][DS4_DSPARK_FRONTIER_INDEX_KV] ||
+        !ds4_dspark_verifier_frontier_free(&ops) ||
+        state.release_calls != 124u ||
+        !ds4_dspark_verifier_frontier_self_check_clear(&state)) {
+        return false;
+    }
+
+    ds4_dspark_verifier_frontier_self_check_reset(&state, -1);
+    ops = ds4_dspark_verifier_frontier_self_check_ops(&state, mtp);
+    if (!ds4_dspark_verifier_frontier_allocate(&ops) ||
+        state.alloc_calls != 248u || state.live_count != 248u ||
+        !ds4_dspark_verifier_frontier_valid(&ops, &page_bytes) ||
+        page_bytes != UINT64_C(2) * UINT64_C(12550144) ||
+        !state.slot[2][DS4_DSPARK_FRONTIER_PREFIX1_ATTN_KV] ||
+        !state.slot[2][DS4_DSPARK_FRONTIER_PREFIX1_INDEX_KV] ||
+        !state.slot[3][DS4_DSPARK_FRONTIER_PREFIX1_ATTN_KV] ||
+        state.slot[3][DS4_DSPARK_FRONTIER_PREFIX1_INDEX_KV] ||
+        !ds4_dspark_verifier_frontier_free(&ops) ||
+        state.release_calls != 248u ||
+        !ds4_dspark_verifier_frontier_self_check_clear(&state)) {
+        return false;
+    }
+
+    const int32_t failpoint[] = {0, 62, 123};
+    for (uint32_t index = 0;
+         index < sizeof(failpoint) / sizeof(failpoint[0]); index++) {
+        ds4_dspark_verifier_frontier_self_check_reset(
+            &state, failpoint[index]);
+        ops = ds4_dspark_verifier_frontier_self_check_ops(&state, dspark);
+        if (ds4_dspark_verifier_frontier_allocate(&ops) ||
+            state.alloc_calls != (uint32_t)failpoint[index] + 1u ||
+            state.release_calls != (uint32_t)failpoint[index] ||
+            !ds4_dspark_verifier_frontier_self_check_clear(&state)) {
+            return false;
+        }
+    }
+    return true;
+}
+#endif
 
 /* Host-side ownership for the three device capture rows.  This structure does
  * not contain activations: it only prevents a partially encoded token, a
@@ -2531,14 +3150,25 @@ static bool ds4_dspark_runtime_contract_self_check(void) {
     bool capture = false;
     uint32_t capture_slot = UINT32_MAX;
     bool raw_finalizer_present = true;
+    bool workspace_owner_ok = true;
+    bool verifier_frontier_ok = true;
 #ifndef DS4_NO_GPU
     raw_finalizer_present =
         metal_graph_dspark_raw_finalizer_code_present();
 #endif
+#ifdef DS4_TEST_HOOKS
+    workspace_owner_ok = ds4_dspark_workspace_owner_self_check();
+    verifier_frontier_ok =
+        ds4_dspark_verifier_frontier_self_check();
+#endif
     ds4_dspark_capture_state_init(&capture_state, true);
     return DS4_DSPARK_CAPTURE_CONTRACT.stage_count == 3u &&
+           DS4_DSPARK_SELECTED_ADDRESS_VIEW_BYTES == 6264u &&
+           DS4_DSPARK_SELECTED_ADDRESS_VIEW_BYTES <=
+               DS4_DSPARK_METAL_PAGE_BYTES &&
            DS4_DSPARK_CAPTURE_CONTRACT.hidden_width == 4096u &&
            DS4_DSPARK_CAPTURE_CONTRACT.hc_lanes == 4u &&
+           verifier_frontier_ok &&
            !ds4_dspark_capture_slot_after_layer(39u, &slot) &&
            ds4_dspark_capture_slot_after_layer(40u, &slot) && slot == 0u &&
            ds4_dspark_capture_slot_after_layer(41u, &slot) && slot == 1u &&
@@ -2567,6 +3197,7 @@ static bool ds4_dspark_runtime_contract_self_check(void) {
            ds4_dspark_capture_state_ready_at(&capture_state, 43u) &&
            !ds4_dspark_capture_state_ready_at(&capture_state, 42u) &&
            ds4_dspark_verifier_contract_self_check() &&
+           workspace_owner_ok &&
            ds4_dspark_history_state_self_check() &&
            ds4_dspark_raw_context_state_self_check() &&
            ds4_dspark_failed_blit_state_self_check() &&
@@ -2578,11 +3209,12 @@ static bool ds4_dspark_runtime_contract_self_check(void) {
            memory.raw_projected_bytes == UINT64_C(12288) &&
            memory.raw_normalized_bytes == UINT64_C(12288) &&
            memory.two_source_attention_staging_bytes == UINT64_C(272384) &&
-           memory.core_bytes == UINT64_C(9764864) &&
+           memory.selected_address_page_bytes == UINT64_C(16384) &&
+           memory.core_bytes == UINT64_C(9781248) &&
            memory.verifier_frontier_snapshot_page_bytes ==
                UINT64_C(12550144) &&
            memory.sampled_host_delta_page_bytes == UINT64_C(1081344) &&
-           memory.total_bytes == UINT64_C(29655040) &&
+           memory.total_bytes == UINT64_C(29671424) &&
            ds4_dspark_equal_memory_cache_plan_make(
                4387u, 5000u, 4387u, 83u, &equal_envelope) &&
            equal_envelope.equal_memory_ceiling_records == 4304u &&

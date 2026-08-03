@@ -853,6 +853,81 @@ if (( ! post_model_identity_match )); then
     rc=125
 fi
 
+# Bracket every executable/runtime input identity around the complete child
+# lifetime.  The pre-run values above identify what the arm intended to launch;
+# these post-run values prevent a concurrent rebuild, checkout edit, Metal
+# source edit, or prompt replacement from being accepted under that stale
+# identity.  The GGUF has its separate inode/size/mtime bracket above so this
+# check deliberately does not reread the huge model payload.
+post_bin_sha256=$(shasum -a 256 "$bin" 2>/dev/null | awk '{print $1}' || true)
+post_repo_head=$(git -C "$root" rev-parse HEAD 2>/dev/null || print unknown)
+post_identity_capture_failed=0
+if post_repo_diff_sha256=$(
+    git -C "$root" diff HEAD --binary 2>/dev/null |
+        shasum -a 256 | awk '{print $1}'
+); then
+    :
+else
+    post_repo_diff_sha256=
+    post_identity_capture_failed=1
+fi
+post_repo_untracked_manifest="$prefix.repo-untracked.post.sha256"
+if ! (
+    cd "$root"
+    git ls-files --others --exclude-standard -z |
+        sort -z |
+        while IFS= read -r -d '' untracked_path; do
+            shasum -a 256 -- "$untracked_path"
+        done
+) >"$post_repo_untracked_manifest"; then
+    : >"$post_repo_untracked_manifest"
+    post_identity_capture_failed=1
+fi
+post_repo_untracked_count=$(
+    wc -l <"$post_repo_untracked_manifest" | tr -d ' ' || true
+)
+post_repo_untracked_manifest_sha256=$(
+    shasum -a 256 "$post_repo_untracked_manifest" 2>/dev/null |
+        awk '{print $1}' || true
+)
+post_repo_source_state_sha256=$(
+    {
+        print -r -- "tracked_diff $post_repo_diff_sha256"
+        print -r -- "untracked_manifest $post_repo_untracked_manifest_sha256"
+    } | shasum -a 256 | awk '{print $1}' || true
+)
+post_metal_file_set_manifest_sha256=$(
+    cd "$root" || exit 1
+    relative_metal_files=(metal/**/*.metal(N))
+    (( ${#relative_metal_files} > 0 )) || exit 1
+    printf '%s\0' "${relative_metal_files[@]}" |
+        sort -z | xargs -0 shasum -a 256 |
+        shasum -a 256 | awk '{print $1}'
+) || post_metal_file_set_manifest_sha256=
+post_prompt_source_sha256=$(
+    shasum -a 256 "$prompt_source" 2>/dev/null | awk '{print $1}' || true
+)
+post_prompt_sha256=$(
+    shasum -a 256 "$prompt" 2>/dev/null | awk '{print $1}' || true
+)
+post_prompt_bytes=$(stat -f %z "$prompt" 2>/dev/null || true)
+
+if (( post_identity_capture_failed )) ||
+   [[ $post_bin_sha256 != $bin_sha256 ||
+      $post_repo_head != $repo_head ||
+      $post_repo_diff_sha256 != $repo_diff_sha256 ||
+      $post_repo_untracked_count != $repo_untracked_count ||
+      $post_repo_untracked_manifest_sha256 != $repo_untracked_manifest_sha256 ||
+      $post_repo_source_state_sha256 != $repo_source_state_sha256 ||
+      $post_metal_file_set_manifest_sha256 != $metal_file_set_manifest_sha256 ||
+      $post_prompt_source_sha256 != $prompt_source_sha256 ||
+      $post_prompt_sha256 != $prompt_sha256 ||
+      $post_prompt_bytes != $prompt_bytes ]]; then
+    [[ -n $abort_reason ]] || abort_reason=runtime_input_identity_changed_during_arm
+    rc=125
+    print -u2 -- "benchmark runtime input identity changed during arm"
+fi
+
 logit_files=("$prefix.logits"/**/*.json(N))
 result_error=
 if (( ${#logit_files} == 0 )); then
@@ -928,10 +1003,11 @@ if [[ -n $qwen_telemetry_jsonl ]]; then
     fi
 fi
 
-grep -m 1 '^ds4: metal_library ' "$prefix.stderr" >"$prefix.metal-library" || true
-if [[ ! -s $prefix.metal-library ]]; then
-    [[ -n $result_error ]] || result_error=missing_runtime_metal_identity
-    print -u2 -- "benchmark produced no runtime Metal library identity"
+grep '^ds4: metal_library ' "$prefix.stderr" >"$prefix.metal-library" || true
+metal_library_identity_count=$(wc -l <"$prefix.metal-library" | tr -d '[:space:]')
+if [[ $metal_library_identity_count != 1 ]]; then
+    [[ -n $result_error ]] || result_error=invalid_runtime_metal_identity
+    print -u2 -- "benchmark produced $metal_library_identity_count runtime Metal library identities; expected exactly one"
 fi
 
 grep -E '^ds4: (build |residency requested=|effective profile=|SSD streaming adaptive cache budget|  host physical |  safety cache budget |  cached expert count:|  .*ExpertMajor AUTO selected |  native prefill cache phase:|DeepSeek native cache phase |memory:|memory detail:)' \
@@ -964,14 +1040,22 @@ fi
     print -- "ctx_alloc=$ctx_alloc"
     print -- "bin=$bin"
     print -- "bin_sha256=$bin_sha256"
+    print -- "post_bin_sha256=$post_bin_sha256"
     print -- "repo_head=$repo_head"
+    print -- "post_repo_head=$post_repo_head"
     print -- "repo_diff_sha256=$repo_diff_sha256"
+    print -- "post_repo_diff_sha256=$post_repo_diff_sha256"
     print -- "repo_untracked_count=$repo_untracked_count"
+    print -- "post_repo_untracked_count=$post_repo_untracked_count"
     print -- "repo_untracked_manifest=$repo_untracked_manifest"
     print -- "repo_untracked_manifest_sha256=$repo_untracked_manifest_sha256"
+    print -- "post_repo_untracked_manifest=$post_repo_untracked_manifest"
+    print -- "post_repo_untracked_manifest_sha256=$post_repo_untracked_manifest_sha256"
     print -- "repo_source_state_sha256=$repo_source_state_sha256"
+    print -- "post_repo_source_state_sha256=$post_repo_source_state_sha256"
     print -- "repo_status_file=$prefix.git-status"
     print -- "metal_file_set_manifest_sha256=$metal_file_set_manifest_sha256"
+    print -- "post_metal_file_set_manifest_sha256=$post_metal_file_set_manifest_sha256"
     print -- "metal_library_identity_file=$prefix.metal-library"
     print -- "resolved_plan_file=$prefix.resolved-plan"
     print -- "resolved_plan_sha256=$resolved_plan_sha256"
@@ -987,9 +1071,12 @@ fi
     print -- "model_mtime_epoch=$model_mtime"
     print -- "prompt_source=$prompt_source"
     print -- "prompt_source_sha256=$prompt_source_sha256"
+    print -- "post_prompt_source_sha256=$post_prompt_source_sha256"
     print -- "prompt=$prompt"
     print -- "prompt_sha256=$prompt_sha256"
+    print -- "post_prompt_sha256=$post_prompt_sha256"
     print -- "prompt_bytes=$prompt_bytes"
+    print -- "post_prompt_bytes=$post_prompt_bytes"
     print -- "prompt_expanded=$prompt_expanded"
     print -- "os_build=$os_build"
     print -- "power_source=$power_source"

@@ -8516,7 +8516,7 @@ static bool ds4_test_dspark_memory_accounting(void) {
 
     ds4_dspark_runtime_memory runtime = {0};
     if (!ds4_dspark_runtime_memory_make(&runtime) ||
-        runtime.total_bytes != UINT64_C(29655040) ||
+        runtime.total_bytes != UINT64_C(29671424) ||
         DS4_DSPARK_SUPPORT_STATIC_PAGE_DELTA_16K >
             UINT64_MAX - runtime.total_bytes) {
         return false;
@@ -8526,11 +8526,11 @@ static bool ds4_test_dspark_memory_accounting(void) {
     const uint64_t fixed_records =
         fixed_bytes / DS4_DSPARK_0731_RECORD_BYTES +
         (fixed_bytes % DS4_DSPARK_0731_RECORD_BYTES != 0);
-    if (fixed_bytes != UINT64_C(582942720) || fixed_records != 83u ||
+    if (fixed_bytes != UINT64_C(582959104) || fixed_records != 83u ||
         (uint64_t)DS4_DSPARK_SUPPORT_CACHE_FLOOR *
                 DS4_DSPARK_0731_RECORD_BYTES != UINT64_C(219414528) ||
         fixed_records * DS4_DSPARK_0731_RECORD_BYTES - fixed_bytes !=
-            UINT64_C(4521984)) {
+            UINT64_C(4505600)) {
         return false;
     }
     ds4_dspark_equal_memory_cache_plan envelope_bound = {0};
@@ -20207,6 +20207,7 @@ typedef struct {
     ds4_gpu_tensor *dspark_raw_projected;
     ds4_gpu_tensor *dspark_raw_normalized;
     ds4_gpu_tensor *dspark_raw_ring[DS4_DSPARK_CAPTURE_STAGE_COUNT];
+    ds4_dspark_workspace_owner dspark_workspace;
     ds4_dspark_capture_state dspark_capture_state;
     ds4_dspark_capture_state dspark_verify_capture_state;
     ds4_dspark_history_state dspark_history_state;
@@ -20687,10 +20688,65 @@ static bool metal_graph_dspark_verify_capture_publish(
     return true;
 }
 
+typedef ds4_gpu_tensor *(*metal_graph_tensor_allocator)(uint64_t bytes);
+
+static void *metal_graph_dspark_page_allocate(
+        uint64_t bytes,
+        void    *opaque) {
+    metal_graph_tensor_allocator allocate =
+        *(metal_graph_tensor_allocator *)opaque;
+    return allocate ? allocate(bytes) : NULL;
+}
+
+static void metal_graph_dspark_page_release(
+        void *allocation,
+        void *opaque) {
+    (void)opaque;
+    ds4_gpu_tensor_free((ds4_gpu_tensor *)allocation);
+}
+
+static void metal_graph_dspark_workspace_free(
+        ds4_dspark_workspace_owner *workspace) {
+    ds4_dspark_workspace_owner_release(
+        workspace, metal_graph_dspark_page_release, NULL);
+}
+
+static bool metal_graph_dspark_workspace_valid(
+        const ds4_dspark_workspace_owner *workspace,
+        bool                              enabled) {
+    if (!ds4_dspark_workspace_owner_valid(workspace, enabled)) return false;
+    if (!enabled) return true;
+    return ds4_gpu_tensor_bytes(
+               (const ds4_gpu_tensor *)workspace->selected_address_page) ==
+               workspace->selected_address_page_bytes &&
+           DS4_DSPARK_SELECTED_ADDRESS_VIEW_BYTES <=
+               DS4_DSPARK_METAL_PAGE_BYTES;
+}
+
+/* Adapt the opaque, model-free owner to the graph's Metal tensor allocator.
+ * The owner's contract self-check injects allocation failure independently. */
+static bool metal_graph_dspark_workspace_alloc_with(
+        ds4_dspark_workspace_owner  *workspace,
+        bool                         enabled,
+        metal_graph_tensor_allocator allocate) {
+    if (!ds4_dspark_workspace_owner_allocate(
+            workspace, enabled, metal_graph_dspark_page_allocate,
+            &allocate)) {
+        return false;
+    }
+    if (!metal_graph_dspark_workspace_valid(workspace, enabled)) {
+        metal_graph_dspark_workspace_free(workspace);
+        return false;
+    }
+    return true;
+}
+
 static bool metal_graph_dspark_raw_storage_valid(
         const ds4_gpu_graph *g) {
     ds4_dspark_runtime_memory memory = {0};
     if (!g || !g->dspark_raw_context_state.enabled ||
+        !metal_graph_dspark_workspace_valid(
+            &g->dspark_workspace, true) ||
         !ds4_dspark_runtime_memory_make(&memory) ||
         memory.raw_ring_bytes % DS4_DSPARK_CAPTURE_STAGE_COUNT != 0 ||
         !g->dspark_raw_pack ||
@@ -21019,8 +21075,158 @@ static bool metal_graph_dspark_raw_finalizer_code_present(void) {
     return true;
 }
 
+typedef struct {
+    ds4_gpu_graph *graph;
+    metal_graph_tensor_allocator allocate;
+} metal_graph_verifier_frontier_adapter;
+
+/* This is the single kind-to-field map.  All get/set paths pass through it so
+ * the model-free owner exercises the same geometry and lifecycle as Metal. */
+static ds4_gpu_tensor **metal_graph_verifier_frontier_slot(
+        ds4_gpu_graph                         *g,
+        uint32_t                               layer,
+        ds4_dspark_verifier_frontier_kind      kind) {
+    if (!g || layer >= DS4_N_LAYER) return NULL;
+    switch (kind) {
+    case DS4_DSPARK_FRONTIER_ATTN_KV:
+        return &g->spec_attn_state_kv[layer];
+    case DS4_DSPARK_FRONTIER_ATTN_SCORE:
+        return &g->spec_attn_state_score[layer];
+    case DS4_DSPARK_FRONTIER_INDEX_KV:
+        return &g->spec_index_state_kv[layer];
+    case DS4_DSPARK_FRONTIER_INDEX_SCORE:
+        return &g->spec_index_state_score[layer];
+    case DS4_DSPARK_FRONTIER_PREFIX1_ATTN_KV:
+        return &g->spec_prefix1_attn_state_kv[layer];
+    case DS4_DSPARK_FRONTIER_PREFIX1_ATTN_SCORE:
+        return &g->spec_prefix1_attn_state_score[layer];
+    case DS4_DSPARK_FRONTIER_PREFIX1_INDEX_KV:
+        return &g->spec_prefix1_index_state_kv[layer];
+    case DS4_DSPARK_FRONTIER_PREFIX1_INDEX_SCORE:
+        return &g->spec_prefix1_index_state_score[layer];
+    case DS4_DSPARK_FRONTIER_KIND_COUNT:
+        break;
+    }
+    return NULL;
+}
+
+static uint32_t metal_graph_verifier_frontier_ratio(
+        uint32_t layer,
+        void    *opaque) {
+    (void)opaque;
+    return ds4_layer_compress_ratio(layer);
+}
+
+static void *metal_graph_verifier_frontier_get(
+        uint32_t                               layer,
+        ds4_dspark_verifier_frontier_kind      kind,
+        void                                  *opaque) {
+    metal_graph_verifier_frontier_adapter *adapter = opaque;
+    ds4_gpu_tensor **slot = adapter ?
+        metal_graph_verifier_frontier_slot(adapter->graph, layer, kind) :
+        NULL;
+    return slot ? *slot : NULL;
+}
+
+static bool metal_graph_verifier_frontier_set(
+        uint32_t                               layer,
+        ds4_dspark_verifier_frontier_kind      kind,
+        void                                  *allocation,
+        void                                  *opaque) {
+    metal_graph_verifier_frontier_adapter *adapter = opaque;
+    ds4_gpu_tensor **slot = adapter ?
+        metal_graph_verifier_frontier_slot(adapter->graph, layer, kind) :
+        NULL;
+    if (!slot) return false;
+    *slot = (ds4_gpu_tensor *)allocation;
+    return true;
+}
+
+static void *metal_graph_verifier_frontier_allocate(
+        uint64_t bytes,
+        void    *opaque) {
+    metal_graph_verifier_frontier_adapter *adapter = opaque;
+    return adapter && adapter->allocate ? adapter->allocate(bytes) : NULL;
+}
+
+static uint64_t metal_graph_verifier_frontier_bytes(
+        const void *allocation,
+        void       *opaque) {
+    (void)opaque;
+    return ds4_gpu_tensor_bytes((const ds4_gpu_tensor *)allocation);
+}
+
+static void metal_graph_verifier_frontier_release(
+        void *allocation,
+        void *opaque) {
+    (void)opaque;
+    ds4_gpu_tensor_free((ds4_gpu_tensor *)allocation);
+}
+
+static ds4_dspark_verifier_frontier_ops
+metal_graph_verifier_frontier_ops_make(
+        metal_graph_verifier_frontier_adapter *adapter,
+        bool                                    frontier_enabled,
+        bool                                    prefix1_enabled) {
+    return (ds4_dspark_verifier_frontier_ops){
+        .plan = {
+            .frontier_enabled = frontier_enabled,
+            .prefix1_enabled = prefix1_enabled,
+        },
+        .layer_count = DS4_N_LAYER,
+        .attn_head_dim = DS4_N_HEAD_DIM,
+        .index_head_dim = DS4_N_INDEXER_HEAD_DIM,
+        .ratio = metal_graph_verifier_frontier_ratio,
+        .get = metal_graph_verifier_frontier_get,
+        .set = metal_graph_verifier_frontier_set,
+        .allocate = metal_graph_verifier_frontier_allocate,
+        .bytes = metal_graph_verifier_frontier_bytes,
+        .release = metal_graph_verifier_frontier_release,
+        .opaque = adapter,
+    };
+}
+
+static void metal_graph_verifier_frontier_free(ds4_gpu_graph *g) {
+    if (!g) return;
+    metal_graph_verifier_frontier_adapter adapter = {.graph = g};
+    const ds4_dspark_verifier_frontier_ops ops =
+        metal_graph_verifier_frontier_ops_make(&adapter, false, false);
+    (void)ds4_dspark_verifier_frontier_free(&ops);
+}
+
+static bool metal_graph_verifier_frontier_valid(
+        ds4_gpu_graph *g,
+        bool           frontier_enabled,
+        bool           prefix1_enabled) {
+    if (!g) return false;
+    metal_graph_verifier_frontier_adapter adapter = {.graph = g};
+    const ds4_dspark_verifier_frontier_ops ops =
+        metal_graph_verifier_frontier_ops_make(
+            &adapter, frontier_enabled, prefix1_enabled);
+    return ds4_dspark_verifier_frontier_valid(&ops, NULL);
+}
+
+/* One exact frontier is shared by legacy MTP and future DSpark verification.
+ * Only legacy MTP owns the second prefix-one shortcut. */
+static bool metal_graph_verifier_frontier_alloc_with(
+        ds4_gpu_graph                 *g,
+        bool                           frontier_enabled,
+        bool                           prefix1_enabled,
+        metal_graph_tensor_allocator   allocate) {
+    if (!g) return false;
+    metal_graph_verifier_frontier_adapter adapter = {
+        .graph = g,
+        .allocate = allocate,
+    };
+    const ds4_dspark_verifier_frontier_ops ops =
+        metal_graph_verifier_frontier_ops_make(
+            &adapter, frontier_enabled, prefix1_enabled);
+    return ds4_dspark_verifier_frontier_allocate(&ops);
+}
+
 /* Release every Metal tensor owned by the whole-model graph runtime. */
 static void metal_graph_free(ds4_gpu_graph *g) {
+    metal_graph_dspark_workspace_free(&g->dspark_workspace);
     for (uint32_t stage = 0;
          stage < DS4_DSPARK_CAPTURE_STAGE_COUNT; stage++) {
         ds4_gpu_tensor_free(g->dspark_raw_ring[stage]);
@@ -21140,16 +21346,7 @@ static void metal_graph_free(ds4_gpu_graph *g) {
     for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
         ds4_gpu_tensor_free(g->layer_index_state_score[il]);
     }
-    for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
-        ds4_gpu_tensor_free(g->spec_attn_state_kv[il]);
-        ds4_gpu_tensor_free(g->spec_attn_state_score[il]);
-        ds4_gpu_tensor_free(g->spec_index_state_kv[il]);
-        ds4_gpu_tensor_free(g->spec_index_state_score[il]);
-        ds4_gpu_tensor_free(g->spec_prefix1_attn_state_kv[il]);
-        ds4_gpu_tensor_free(g->spec_prefix1_attn_state_score[il]);
-        ds4_gpu_tensor_free(g->spec_prefix1_index_state_kv[il]);
-        ds4_gpu_tensor_free(g->spec_prefix1_index_state_score[il]);
-    }
+    metal_graph_verifier_frontier_free(g);
     ds4_gpu_tensor_free(g->kv);
     ds4_gpu_tensor_free(g->kv_raw);
     ds4_gpu_tensor_free(g->q);
@@ -21355,6 +21552,10 @@ static bool metal_graph_dspark_test_storage_alloc(ds4_gpu_graph *g) {
     ds4_dspark_capture_state_init(&g->dspark_verify_capture_state, true);
     ds4_dspark_history_state_init(&g->dspark_history_state, true);
     ds4_dspark_raw_context_state_init(&g->dspark_raw_context_state, true);
+    if (!metal_graph_dspark_workspace_alloc_with(
+            &g->dspark_workspace, true, ds4_gpu_tensor_alloc)) {
+        return false;
+    }
     g->dspark_raw_pack = ds4_gpu_tensor_alloc(memory.raw_pack_bytes);
     g->dspark_main_x = ds4_gpu_tensor_alloc(memory.main_x_bytes);
     g->dspark_raw_projected =
@@ -21972,6 +22173,9 @@ static bool metal_graph_alloc_raw_cap(
         bool                    enable_dspark) {
     memset(g, 0, sizeof(*g));
     g->mtp_enabled = enable_mtp;
+    const ds4_dspark_verifier_snapshot_plan verifier_snapshot =
+        ds4_dspark_verifier_snapshot_plan_make(
+            enable_mtp, enable_dspark);
     ds4_dspark_capture_state_init(&g->dspark_capture_state, enable_dspark);
     ds4_dspark_capture_state_init(
         &g->dspark_verify_capture_state, enable_dspark);
@@ -22083,12 +22287,6 @@ static bool metal_graph_alloc_raw_cap(
                     (DS4_GPU_ATTN_COMP_CACHE_F16 ? sizeof(uint16_t) : sizeof(float)));
             g->layer_attn_state_kv[il] = ds4_gpu_tensor_alloc(attn_width * attn_rows * sizeof(float));
             g->layer_attn_state_score[il] = ds4_gpu_tensor_alloc(attn_width * attn_rows * sizeof(float));
-            if (enable_mtp) {
-                g->spec_attn_state_kv[il] = ds4_gpu_tensor_alloc(attn_width * attn_rows * sizeof(float));
-                g->spec_attn_state_score[il] = ds4_gpu_tensor_alloc(attn_width * attn_rows * sizeof(float));
-                g->spec_prefix1_attn_state_kv[il] = ds4_gpu_tensor_alloc(attn_width * attn_rows * sizeof(float));
-                g->spec_prefix1_attn_state_score[il] = ds4_gpu_tensor_alloc(attn_width * attn_rows * sizeof(float));
-            }
             if (g->layer_attn_state_kv[il]) {
                 state_init_ok = state_init_ok &&
                                 metal_tensor_fill_f32(g->layer_attn_state_kv[il], 0.0f, attn_width * attn_rows);
@@ -22106,12 +22304,6 @@ static bool metal_graph_alloc_raw_cap(
                         (uint64_t)g->layer_comp_cap[il] * DS4_N_INDEXER_HEAD_DIM * sizeof(float));
                 g->layer_index_state_kv[il] = ds4_gpu_tensor_alloc(index_width * index_rows * sizeof(float));
                 g->layer_index_state_score[il] = ds4_gpu_tensor_alloc(index_width * index_rows * sizeof(float));
-                if (enable_mtp) {
-                    g->spec_index_state_kv[il] = ds4_gpu_tensor_alloc(index_width * index_rows * sizeof(float));
-                    g->spec_index_state_score[il] = ds4_gpu_tensor_alloc(index_width * index_rows * sizeof(float));
-                    g->spec_prefix1_index_state_kv[il] = ds4_gpu_tensor_alloc(index_width * index_rows * sizeof(float));
-                    g->spec_prefix1_index_state_score[il] = ds4_gpu_tensor_alloc(index_width * index_rows * sizeof(float));
-                }
                 if (g->layer_index_state_kv[il]) {
                     state_init_ok = state_init_ok &&
                                     metal_tensor_fill_f32(g->layer_index_state_kv[il], 0.0f, index_width * index_rows);
@@ -22122,6 +22314,13 @@ static bool metal_graph_alloc_raw_cap(
                 }
             }
         }
+    }
+    if (verifier_snapshot.frontier_enabled &&
+        !metal_graph_verifier_frontier_alloc_with(
+            g, true, verifier_snapshot.prefix1_enabled,
+            ds4_gpu_tensor_alloc)) {
+        metal_graph_free(g);
+        return false;
     }
     g->comp_kv_cur = ds4_gpu_tensor_alloc(comp_width_max * sizeof(float));
     g->comp_sc_cur = ds4_gpu_tensor_alloc(comp_width_max * sizeof(float));
@@ -22161,6 +22360,12 @@ static bool metal_graph_alloc_raw_cap(
     g->output_embd = ds4_gpu_tensor_alloc((uint64_t)DS4_N_EMBD * sizeof(float));
     g->output_norm = ds4_gpu_tensor_alloc((uint64_t)DS4_N_EMBD * sizeof(float));
     g->logits = ds4_gpu_tensor_alloc(vocab_dim * sizeof(float));
+    if (enable_dspark &&
+        !metal_graph_dspark_workspace_alloc_with(
+            &g->dspark_workspace, true, ds4_gpu_tensor_alloc)) {
+        metal_graph_free(g);
+        return false;
+    }
     if (enable_dspark) {
         g->dspark_raw_pack = ds4_gpu_tensor_alloc(
             dspark_runtime_memory.raw_pack_bytes);
@@ -22262,26 +22467,20 @@ static bool metal_graph_alloc_raw_cap(
         if (layer_cache_ok && ratio != 0) {
             layer_cache_ok = g->layer_attn_comp_cache[il] != NULL &&
                              g->layer_attn_state_kv[il] != NULL &&
-                             g->layer_attn_state_score[il] != NULL &&
-                             (!enable_mtp ||
-                              (g->spec_attn_state_kv[il] != NULL &&
-                               g->spec_attn_state_score[il] != NULL &&
-                               g->spec_prefix1_attn_state_kv[il] != NULL &&
-                               g->spec_prefix1_attn_state_score[il] != NULL));
+                             g->layer_attn_state_score[il] != NULL;
         }
         if (layer_cache_ok && ratio == 4) {
             layer_cache_ok = g->layer_index_comp_cache[il] != NULL &&
                              g->layer_index_state_kv[il] != NULL &&
-                             g->layer_index_state_score[il] != NULL &&
-                             (!enable_mtp ||
-                              (g->spec_index_state_kv[il] != NULL &&
-                               g->spec_index_state_score[il] != NULL &&
-                               g->spec_prefix1_index_state_kv[il] != NULL &&
-                               g->spec_prefix1_index_state_score[il] != NULL));
+                             g->layer_index_state_score[il] != NULL;
         }
     }
 
-    const bool ok = state_init_ok && layer_cache_ok &&
+    const bool verifier_frontier_ok =
+        metal_graph_verifier_frontier_valid(
+            g, verifier_snapshot.frontier_enabled,
+            verifier_snapshot.prefix1_enabled);
+    const bool ok = state_init_ok && layer_cache_ok && verifier_frontier_ok &&
                     g->cur_hc && g->flat_hc && g->hc_mix && g->hc_split &&
                     g->hc_pre && g->hc_post && g->hc_comb &&
                     g->attn_cur && g->attn_norm && g->qr && g->qr_norm &&
@@ -22300,6 +22499,8 @@ static bool metal_graph_alloc_raw_cap(
                     g->after_ffn_hc &&
                     g->output_pre && g->output_weights && g->output_embd &&
                     g->output_norm && g->logits &&
+                    metal_graph_dspark_workspace_valid(
+                        &g->dspark_workspace, enable_dspark) &&
                     (!enable_dspark ||
                      (g->dspark_capture[0] && g->dspark_capture[1] &&
                       g->dspark_capture[2] &&
