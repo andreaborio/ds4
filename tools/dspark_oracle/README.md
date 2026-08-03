@@ -215,8 +215,21 @@ seven-way exact tie, clamp removal, slot-order accumulation, payload-code
 mutation, 30-distinct routing, and duplicate routing are separate negative
 controls.
 
-On pinned MLX 0.32.0 / mlx-metal 0.32.0 on M5 Pro, every FFN boundary has its
-own ceiling. Hidden/HC/norm and the complete shared path are exact. Eight router
+FFN fixture version two makes the asymmetric gate clamp a primary-path
+invariant instead of a local-only control. Shared gate `[0,0]` reopens from Q8
+as `-127/256`, and shared-down row 67 is one exact Q8 `d=1`, code-127 amplifier
+of mid lane zero. Replacing the required upper-only gate clamp with a symmetric
+clamp changes one shared-mid lane, 16 shared-down lanes, one final MoE lane and
+four HC-post lanes. The shared payload digests and every affected publication
+hash are frozen independently; this remains synthetic boundary evidence, not
+real-checkpoint parity.
+
+The fixture-v2 system oracle and its MLX 0.32.0 / mlx-metal 0.32.0 cross-check
+both pass on the M5 Pro. The shared path, including the changed asymmetric
+clamp discriminator, remains exact. The operation-specific ceilings below were
+first frozen with fixture v1 and the complete v2 rerun passes those same
+ceilings; they are limits, not a claim that every v1 maximum was re-observed.
+Hidden/HC/norm and the complete shared path are exact. Eight router
 logits differ by at most `0.015625`, their probabilities by
 `0.0013456344604492188`, and the 30 normalized route weights by
 `0.00004869699478149414`. The explicit pre-down BF16 boundary limits the

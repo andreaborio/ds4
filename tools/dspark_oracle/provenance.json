@@ -154,6 +154,24 @@
       "missingEvidence": "an independent generator derived directly from the three pinned source-safetensors headers",
       "policy": "do not simulate independence by generating one schema declaration from another"
     },
+    "ffnFixture": {
+      "version": 2,
+      "role": "synthetic payload-first native boundary checkpoint, not checkpoint-weight parity",
+      "sharedGateQ8Sha256": "7f10192cdc295ae811318df8d95457b4a1d45aed92e12c5cda99cafa82772e6e",
+      "sharedUpQ8Sha256": "24e79016a69fc0472707508c4536b5c4a909bacee2dbcb37401e0a94737b2a1f",
+      "sharedDownQ8Sha256": "71f5a2c1cc0487b8391aac802e2cddbe127d011bff77d20bc59d2e0470117a9d",
+      "clampDiscriminator": "shared gate [0,0] is -127/256 and shared down row 67 amplifies mid lane zero with Q8 d=1/code=127; a symmetric gate clamp changes shared mid, shared down, final MoE and HC-post",
+      "systemValidation": {
+        "capturedAt": "2026-08-03T14:54:57+02:00",
+        "result": "Ran 58 tests; OK with 2 explicit optional MLX/support-file skips"
+      },
+      "mlxValidation": {
+        "status": "passed",
+        "capturedAt": "2026-08-03T14:52:45+02:00",
+        "validatedFixtureVersion": 2,
+        "result": "Ran 58 tests; OK with 1 explicit optional support-file skip using mlx==0.32.0, mlx-metal==0.32.0, Device(gpu, 0)"
+      }
+    },
     "runtimeCaptureParity": {
       "status": "pending",
       "currentEvidence": "independent synthetic NumPy vectors and optional MLX 0.32.0 Metal parity distinguish the frontier tap from the complete last-128 prompt history; NumPy additionally pins direct context KV, absolute RoPE, non-RoPE E4M3FN Q/DQ, token shift, and transactional accepted-prefix ownership",
@@ -162,7 +180,7 @@
     }
   },
   "validation": {
-    "capturedAt": "2026-08-03T13:53:46+02:00",
+    "capturedAt": "2026-08-03T14:54:57+02:00",
     "hardware": "Apple M5 Pro, 64 GB unified memory",
     "os": "macOS 26.5.2 (25F84)",
     "python": "3.13.13",
@@ -195,10 +213,10 @@
       "ffnHcPostBfloat16": 0.0
     },
     "semanticAudit": {
-      "capturedAt": "2026-08-03T13:53:46+02:00",
+      "capturedAt": "2026-08-03T14:54:57+02:00",
       "deepSpecRevision": "005e03b81cec38b7da6399833d609ee89a2587f2",
-      "systemPython": "55 passed, 2 explicit optional MLX/support-file skips",
-      "mlxMetal": "56 passed, 1 explicit optional-support-file skip with mlx==0.32.0, mlx-metal==0.32.0, Device(gpu, 0)",
+      "systemPython": "Ran 58 tests; OK with 2 explicit optional MLX/support-file skips",
+      "mlxMetal": "Ran 58 tests; OK with 1 explicit optional-support-file skip with mlx==0.32.0, mlx-metal==0.32.0, Device(gpu, 0)",
       "findings": [
         "confidence scheduling uses the first per-position sigmoid below threshold, not cumulative survival",
         "greedy and caller-uniform sampled Markov drafts feed each selected token into the next proposal step",

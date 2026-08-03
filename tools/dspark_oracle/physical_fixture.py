@@ -726,6 +726,11 @@ def _ffn_ideal_weights() -> dict[str, np.ndarray]:
     # the official upper-only gate clamp is exercised on every token.
     shared_gate[np.arange(5), :] = 0.0
     shared_gate[np.arange(5), np.arange(5)] = np.float32(127.0 / 256.0)
+    # The stage contract clamps gate only from above.  Keep one primary-path
+    # gate below -10 so a tempting symmetric clamp propagates through shared
+    # down, final MoE publication and HC-post instead of disappearing after
+    # the local SwiGLU seam.
+    shared_gate[0, 0] = np.float32(-127.0 / 256.0)
     shared_up = _single_q8_coefficient(
         FFN_MID_WIDTH,
         FFN_HIDDEN_WIDTH,
@@ -741,6 +746,11 @@ def _ffn_ideal_weights() -> dict[str, np.ndarray]:
         (down_rows * 19 + 7) % FFN_MID_WIDTH,
         np.where((down_rows % 5) < 2, -1, 1),
     )
+    # Row 67 already selects mid lane zero.  Its exact Q8 code 127 with d=1
+    # amplifies the negative-gate discriminator while remaining one sparse,
+    # payload-first Q8_0 block.
+    shared_down[67, :] = 0.0
+    shared_down[67, 0] = np.float32(127.0)
     return {
         "hc_ffn_function_weight": hc_function,
         "hc_ffn_scale": np.asarray([0.25, 0.125, 0.0625], dtype=np.float32),
@@ -830,7 +840,7 @@ def ffn_payload_manifest(fixture: PhysicalFFNFixture) -> dict[str, object]:
             }
         routed_records[str(expert)] = component_record
     return {
-        "fixture_version": 1,
+        "fixture_version": 2,
         "geometry": {
             "proposal_rows": 5,
             "hc_lanes": 4,
