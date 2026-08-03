@@ -199,10 +199,9 @@ kernel void kernel_dspark_attention_two_source_f32(
     out[tid + 256u] = ds4_dspark_bf16_rne(acc1 / denominator);
 }
 
-#ifdef DS4_TEST_HOOKS
-// Disconnected final-0731 DSpark router oracle.  The production graph does not
-// call this kernel yet, so keep its fixed five-row geometry and host wrapper
-// test-only until the stage executor owns the complete SUPPORT transaction.
+// Production-private final-0731 DSpark router.  Its fixed five-row geometry is
+// owned only by the isolated stage executor; no generic target routing path
+// may select it.
 // Bias changes selection only; the published route weights always come from
 // the unbiased sqrt(softplus(logit)) probabilities.
 static inline float ds4_dspark_router_probability(float value) {
@@ -350,7 +349,22 @@ kernel void kernel_dspark_router_f32_5x256_top6(
             denominator * 1.5f;
     }
 }
-#endif
+
+// Stage-private publication guard. The caller initializes flag to one in the
+// unused tail of its reusable 16 KiB address page. Any NaN or infinity clears
+// it before the candidate shadow can be copied. Integer exponent inspection
+// remains fail-closed under fast-math compilation.
+kernel void kernel_dspark_all_finite_f32(
+        device const float *values [[buffer(0)]],
+        device atomic_uint *flag [[buffer(1)]],
+        constant ulong &count [[buffer(2)]],
+        uint gid [[thread_position_in_grid]]) {
+    if ((ulong)gid >= count) return;
+    const uint bits = as_type<uint>(values[gid]);
+    if ((bits & 0x7f800000u) == 0x7f800000u) {
+        atomic_store_explicit(flag, 0u, memory_order_relaxed);
+    }
+}
 
 // Reopens each F32 lane after an exact BF16 round-to-nearest-even step.  Raw
 // integer arithmetic keeps zero signs and NaN payload/sign handling independent

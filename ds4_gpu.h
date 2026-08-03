@@ -1273,6 +1273,104 @@ int ds4_gpu_dspark_attention_two_source_f32_tensor(
         uint32_t                n_head,
         uint32_t                head_dim);
 
+/* Production-private final-0731 stage boundary.  This is intentionally a
+ * fixed-geometry descriptor rather than a general model API: the caller must
+ * bind one authenticated DSpark stage from the combined GGUF and provide all
+ * graph-lifetime scratch up front.  The Metal call owns no session, admission,
+ * sampler, proposal, or allocation policy.
+ *
+ * On success candidate_shadow receives one complete [5,4,4096] HC stage in a
+ * publication batch that runs only after all attention, SUPPORT and FFN work
+ * has completed and the unpublished candidate is finite. A failed Metal blit
+ * may have touched shadow bytes, so callers must publish or consume them only
+ * after this function succeeds; graph candidate state remains unpublished on
+ * every failure. */
+typedef struct {
+    uint64_t hc_attn_base;
+    uint64_t hc_attn_fn;
+    uint64_t hc_attn_scale;
+    uint64_t attn_sinks;
+    uint64_t attn_q_a;
+    uint64_t attn_q_a_norm;
+    uint64_t attn_q_b;
+    uint64_t attn_kv;
+    uint64_t attn_kv_a_norm;
+    uint64_t attn_output_a;
+    uint64_t attn_output_b;
+    uint64_t attn_norm;
+    uint64_t hc_ffn_base;
+    uint64_t hc_ffn_fn;
+    uint64_t hc_ffn_scale;
+    uint64_t ffn_gate_inp;
+    uint64_t ffn_exp_probs_b;
+    uint64_t ffn_norm;
+    uint64_t ffn_gate_shexp;
+    uint64_t ffn_up_shexp;
+    uint64_t ffn_down_shexp;
+} ds4_gpu_dspark_stage_offsets;
+
+typedef struct {
+    ds4_gpu_tensor *hidden_work;       /* [5,4,4096] */
+    ds4_gpu_tensor *hc_plain_norm;     /* [5,4,4096] */
+    ds4_gpu_tensor *hc_mix;            /* [5,24] */
+    ds4_gpu_tensor *hc_split;          /* [5,24] */
+    ds4_gpu_tensor *hc_pre;            /* [5,4096] */
+    ds4_gpu_tensor *normalized;        /* [5,4096] */
+    ds4_gpu_tensor *q;                 /* [5,64,512] */
+    ds4_gpu_tensor *q_rank;            /* [5,1024] */
+    ds4_gpu_tensor *kv;                /* [5,512] */
+    ds4_gpu_tensor *attention_staging; /* [128+5,512] */
+    ds4_gpu_tensor *attention_out;     /* [5,64,512] */
+    ds4_gpu_tensor *attention_low;     /* [5,8192] */
+    ds4_gpu_tensor *attention_row;     /* [5,4096] */
+    ds4_gpu_tensor *attention_hc;      /* [5,4,4096] */
+    ds4_gpu_tensor *router_logits;     /* [5,256] */
+    ds4_gpu_tensor *router_bias;       /* [256] */
+    ds4_gpu_tensor *router_probs;      /* [5,256] */
+    ds4_gpu_tensor *router_ids;        /* [5,6] int32 */
+    ds4_gpu_tensor *router_weights;    /* [5,6] */
+    ds4_gpu_tensor *sorted_ids;        /* [5,6] int32 */
+    ds4_gpu_tensor *sorted_weights;    /* [5,6] */
+    ds4_gpu_tensor *routed_gate;       /* [5,6,2048] */
+    ds4_gpu_tensor *routed_up;         /* [5,6,2048] */
+    ds4_gpu_tensor *routed_mid;        /* [5,6,2048] */
+    ds4_gpu_tensor *routed_down;       /* [5,6,4096] */
+    ds4_gpu_tensor *routed_sum;        /* [5,4096] */
+    ds4_gpu_tensor *shared_gate;       /* [5,2048] */
+    ds4_gpu_tensor *shared_up;         /* [5,2048] */
+    ds4_gpu_tensor *shared_mid;        /* [5,2048] */
+    ds4_gpu_tensor *shared_down;       /* [5,4096] */
+    ds4_gpu_tensor *moe;               /* [5,4096] */
+    ds4_gpu_tensor *candidate;         /* [5,4,4096], unpublished */
+} ds4_gpu_dspark_stage_scratch;
+
+typedef int (*ds4_gpu_dspark_stage_route_plan_fn)(
+        const int32_t ids[30],
+        const float weights[30],
+        int32_t sorted_ids[30],
+        float sorted_weights[30],
+        void *opaque);
+
+typedef struct {
+    uint32_t stage;                    /* tranche-minimum executor: exactly 0 */
+    const void *model_map;
+    uint64_t model_size;
+    ds4_gpu_dspark_stage_offsets weights;
+    uint32_t position0;
+    uint32_t committed_count;          /* 2..128 */
+    uint32_t committed_start;          /* physical-ring cursor */
+    const ds4_gpu_tensor *committed_kv;/* [128,512], current stage */
+    const ds4_gpu_tensor *hidden_input;/* [5,4,4096] */
+    ds4_gpu_tensor *selected_address_page; /* graph-owned exact 16 KiB */
+    ds4_gpu_tensor *candidate_shadow;  /* stable prior publication */
+    ds4_gpu_dspark_stage_route_plan_fn route_plan;
+    void *route_plan_opaque;
+    ds4_gpu_dspark_stage_scratch scratch;
+} ds4_gpu_dspark_stage_descriptor;
+
+int ds4_gpu_dspark_stage_execute_candidate(
+        const ds4_gpu_dspark_stage_descriptor *stage);
+
 int ds4_gpu_attention_decode_mixed_batch_heads_tensor(
         ds4_gpu_tensor       *heads,
         const void             *model_map,
@@ -1774,13 +1872,13 @@ int hebrus_gpu_internal_stream_expert_cache_scan_limit_test(void);
 int ds4_gpu_internal_qwen35_expert_pack_test(void);
 /* Canonical-vs-embedded GLM Q2 regression for direct and grouped execution. */
 int ds4_gpu_internal_expert_store_v2_kernel_test(void);
-#ifdef DS4_TEST_HOOKS
-/* Candidate final-0731 Q-B primitive.  Keep the disconnected wrapper and API
- * hook-private until the stage graph provides its first production caller. */
+/* Production-private final-0731 Q-B primitive.  The fixed stage executor is
+ * its only release caller; tests keep direct coverage of the precision seam. */
 int ds4_gpu_dspark_q_head_norm_bf16_tensor(
         ds4_gpu_tensor *x,
         uint32_t          rows,
         float             eps);
+#ifdef DS4_TEST_HOOKS
 /* Model-free rollback and authenticated lease-error unwind regressions. */
 int ds4_gpu_internal_qwen35_stream_staging_rollback_test(void);
 int ds4_gpu_internal_qwen35_lease_error_unwind_test(void);

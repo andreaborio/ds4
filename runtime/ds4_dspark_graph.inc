@@ -13,6 +13,7 @@ enum {
     DS4_DSPARK_TARGET_LAYER_COUNT = 43,
     DS4_DSPARK_TARGET_TOP_K = 6,
     DS4_DSPARK_SUPPORT_TOP_K = 6,
+    DS4_DSPARK_SUPPORT_EXPERT_COUNT = 256,
     DS4_DSPARK_SUPPORT_CANDIDATE_ROWS = 5,
     /* The target verifier sees pending + five draft rows.  Row five is
      * verifier-only and never expands the five-row DSpark candidate block. */
@@ -1067,6 +1068,582 @@ typedef struct {
     uint64_t committed_token_start;
     uint64_t candidate_start;
 } ds4_dspark_raw_context_view;
+
+#if !defined(DS4_NO_GPU) || defined(DS4_TEST_HOOKS)
+/* Raw ownership can represent a wrapped partial ring, but the official
+ * final-0731 proposal accepts partial startup only at physical slot zero.
+ * Full non-causal attention keeps all 128 physical rows and may carry any
+ * cursor. Keep the narrower executor conversion explicit and testable. */
+static bool ds4_dspark_stage_committed_start_make(
+        uint32_t  length,
+        uint64_t  token_start,
+        uint32_t *out) {
+    if (!out || length < 2u || length > DS4_DSPARK_HISTORY_ROWS) {
+        return false;
+    }
+    const uint32_t physical =
+        (uint32_t)(token_start % DS4_DSPARK_HISTORY_ROWS);
+    if (length < DS4_DSPARK_HISTORY_ROWS && physical != 0u) {
+        return false;
+    }
+    *out = length == DS4_DSPARK_HISTORY_ROWS ? physical : 0u;
+    return true;
+}
+
+/* The router publishes six rank-ordered selections per candidate row, while
+ * the official routed reduction walks those selections in ascending expert-id
+ * order.  Keep the permutation host-side and pair each weight with its expert:
+ * sorting only the ids would silently apply a route probability to the wrong
+ * FFN result.  Rows remain independent because the same expert may legitimately
+ * serve more than one candidate.
+ *
+ * This plan is production-private and owns no device state.  Building through
+ * a local shadow means malformed router output cannot partially overwrite the
+ * caller's previously valid plan. */
+typedef struct {
+    int32_t expert_id[DS4_DSPARK_SUPPORT_CANDIDATE_ROWS]
+                     [DS4_DSPARK_SUPPORT_TOP_K];
+    float weight[DS4_DSPARK_SUPPORT_CANDIDATE_ROWS]
+                [DS4_DSPARK_SUPPORT_TOP_K];
+} ds4_dspark_stage_route_plan;
+
+/* The project compiles this translation unit with -ffast-math, under which a
+ * source-level isfinite() test may be folded away.  Authenticate the IEEE-754
+ * exponent bits instead so NaN/Inf router output still fails closed in the
+ * actual release compile mode. */
+static bool ds4_dspark_stage_route_f32_finite(float value) {
+    uint32_t bits = 0u;
+    memcpy(&bits, &value, sizeof(bits));
+    return (bits & UINT32_C(0x7f800000)) != UINT32_C(0x7f800000);
+}
+
+static bool ds4_dspark_stage_route_row_valid(
+        const int32_t *expert_id,
+        const float   *weight) {
+    if (!expert_id || !weight) return false;
+    float sum = 0.0f;
+    for (uint32_t slot = 0; slot < DS4_DSPARK_SUPPORT_TOP_K; slot++) {
+        if (expert_id[slot] < 0 ||
+            expert_id[slot] >= DS4_DSPARK_SUPPORT_EXPERT_COUNT ||
+            !ds4_dspark_stage_route_f32_finite(weight[slot]) ||
+            weight[slot] < 0.0f) {
+            return false;
+        }
+        for (uint32_t prior = 0; prior < slot; prior++) {
+            if (expert_id[prior] == expert_id[slot]) return false;
+        }
+        sum += weight[slot];
+        if (!ds4_dspark_stage_route_f32_finite(sum)) return false;
+    }
+    /* The router normalizes the six unbiased probabilities and then applies
+     * the exact final-0731 scale 1.5.  Six F32 divides/multiplies and a serial
+     * validation sum need a small rounding envelope, but a merely positive or
+     * arbitrary caller-provided weight vector is not authenticated output. */
+    const float expected = 1.5f;
+    const float tolerance = 32.0f * FLT_EPSILON * expected;
+    return sum > 0.0f && fabsf(sum - expected) <= tolerance;
+}
+
+static bool ds4_dspark_stage_route_plan_coherent(
+        const ds4_dspark_stage_route_plan *plan) {
+    if (!plan) return false;
+    for (uint32_t row = 0;
+         row < DS4_DSPARK_SUPPORT_CANDIDATE_ROWS; row++) {
+        if (!ds4_dspark_stage_route_row_valid(
+                plan->expert_id[row], plan->weight[row])) {
+            return false;
+        }
+        for (uint32_t slot = 1; slot < DS4_DSPARK_SUPPORT_TOP_K; slot++) {
+            if (plan->expert_id[row][slot - 1u] >=
+                plan->expert_id[row][slot]) {
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
+static bool ds4_dspark_stage_route_plan_make(
+        const int32_t                 *expert_id,
+        const float                   *weight,
+        ds4_dspark_stage_route_plan   *out) {
+    if (!expert_id || !weight || !out) return false;
+    ds4_dspark_stage_route_plan shadow;
+    for (uint32_t row = 0;
+         row < DS4_DSPARK_SUPPORT_CANDIDATE_ROWS; row++) {
+        const uint32_t base = row * DS4_DSPARK_SUPPORT_TOP_K;
+        if (!ds4_dspark_stage_route_row_valid(
+                expert_id + base, weight + base)) {
+            return false;
+        }
+        for (uint32_t slot = 0; slot < DS4_DSPARK_SUPPORT_TOP_K; slot++) {
+            const int32_t id = expert_id[base + slot];
+            const float route_weight = weight[base + slot];
+            uint32_t insert = slot;
+            while (insert != 0u &&
+                   shadow.expert_id[row][insert - 1u] > id) {
+                shadow.expert_id[row][insert] =
+                    shadow.expert_id[row][insert - 1u];
+                shadow.weight[row][insert] = shadow.weight[row][insert - 1u];
+                insert--;
+            }
+            shadow.expert_id[row][insert] = id;
+            shadow.weight[row][insert] = route_weight;
+        }
+    }
+    if (!ds4_dspark_stage_route_plan_coherent(&shadow)) return false;
+    *out = shadow;
+    return true;
+}
+
+/* One graph-owned stage publication.  The state is single-owner host state,
+ * not a cross-thread atomic primitive: "publication" means that READY is
+ * written in one final structure assignment only after the caller has drained
+ * and validated its device shadow.  EXECUTING data is never exposed through
+ * ready(), and abort/invalidate erase both route and cookie-bearing shadows. */
+typedef enum {
+    DS4_DSPARK_STAGE_CANDIDATE_EMPTY = 0,
+    DS4_DSPARK_STAGE_CANDIDATE_EXECUTING = 1,
+    DS4_DSPARK_STAGE_CANDIDATE_READY = 2,
+} ds4_dspark_stage_candidate_phase;
+
+typedef struct {
+    uint64_t cookie;
+    uint32_t stage;
+    ds4_dspark_stage_route_plan route;
+} ds4_dspark_stage_candidate_publication;
+
+typedef struct {
+    bool initialized;
+    bool shadow_valid;
+    ds4_dspark_stage_candidate_phase phase;
+    uint64_t last_cookie;
+    uint64_t active_cookie;
+    uint32_t active_stage;
+    ds4_dspark_stage_candidate_publication shadow;
+    ds4_dspark_stage_candidate_publication ready;
+} ds4_dspark_stage_candidate_state;
+
+static bool ds4_dspark_stage_candidate_publication_is_zero(
+        const ds4_dspark_stage_candidate_publication *publication) {
+    if (!publication) return false;
+    if (publication->cookie != 0u || publication->stage != 0u) return false;
+    for (uint32_t row = 0;
+         row < DS4_DSPARK_SUPPORT_CANDIDATE_ROWS; row++) {
+        for (uint32_t slot = 0; slot < DS4_DSPARK_SUPPORT_TOP_K; slot++) {
+            if (publication->route.expert_id[row][slot] != 0 ||
+                publication->route.weight[row][slot] != 0.0f) {
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
+static bool ds4_dspark_stage_candidate_publication_coherent(
+        const ds4_dspark_stage_candidate_publication *publication) {
+    return publication && publication->cookie != 0u &&
+           publication->stage < DS4_DSPARK_CAPTURE_STAGE_COUNT &&
+           ds4_dspark_stage_route_plan_coherent(&publication->route);
+}
+
+static bool ds4_dspark_stage_candidate_state_coherent(
+        const ds4_dspark_stage_candidate_state *state) {
+    if (!state || !state->initialized) return false;
+    switch (state->phase) {
+    case DS4_DSPARK_STAGE_CANDIDATE_EMPTY:
+        return !state->shadow_valid && state->active_cookie == 0u &&
+               state->active_stage == UINT32_MAX &&
+               ds4_dspark_stage_candidate_publication_is_zero(
+                   &state->shadow) &&
+               ds4_dspark_stage_candidate_publication_is_zero(&state->ready);
+    case DS4_DSPARK_STAGE_CANDIDATE_EXECUTING:
+        if (state->active_cookie == 0u ||
+            state->active_cookie != state->last_cookie ||
+            state->active_stage >= DS4_DSPARK_CAPTURE_STAGE_COUNT ||
+            !ds4_dspark_stage_candidate_publication_is_zero(&state->ready)) {
+            return false;
+        }
+        if (!state->shadow_valid) {
+            return ds4_dspark_stage_candidate_publication_is_zero(
+                &state->shadow);
+        }
+        return ds4_dspark_stage_candidate_publication_coherent(
+                   &state->shadow) &&
+               state->shadow.cookie == state->active_cookie &&
+               state->shadow.stage == state->active_stage;
+    case DS4_DSPARK_STAGE_CANDIDATE_READY:
+        return !state->shadow_valid && state->active_cookie == 0u &&
+               state->active_stage == UINT32_MAX &&
+               ds4_dspark_stage_candidate_publication_is_zero(
+                   &state->shadow) &&
+               ds4_dspark_stage_candidate_publication_coherent(
+                   &state->ready) &&
+               state->ready.cookie == state->last_cookie;
+    default:
+        return false;
+    }
+}
+
+static void ds4_dspark_stage_candidate_state_clear_publication(
+        ds4_dspark_stage_candidate_state *state) {
+    if (!state) return;
+    state->shadow_valid = false;
+    state->phase = DS4_DSPARK_STAGE_CANDIDATE_EMPTY;
+    state->active_cookie = 0u;
+    state->active_stage = UINT32_MAX;
+    memset(&state->shadow, 0, sizeof(state->shadow));
+    memset(&state->ready, 0, sizeof(state->ready));
+}
+
+static void ds4_dspark_stage_candidate_state_init(
+        ds4_dspark_stage_candidate_state *state) {
+    if (!state) return;
+    memset(state, 0, sizeof(*state));
+    state->initialized = true;
+    state->active_stage = UINT32_MAX;
+}
+
+static void ds4_dspark_stage_candidate_state_invalidate(
+        ds4_dspark_stage_candidate_state *state) {
+    if (!state) return;
+    if (!state->initialized) {
+        memset(state, 0, sizeof(*state));
+        return;
+    }
+    ds4_dspark_stage_candidate_state_clear_publication(state);
+}
+
+static void ds4_dspark_stage_candidate_state_free(
+        ds4_dspark_stage_candidate_state *state) {
+    if (state) memset(state, 0, sizeof(*state));
+}
+
+static bool ds4_dspark_stage_candidate_state_begin(
+        ds4_dspark_stage_candidate_state *state,
+        uint32_t                          stage,
+        uint64_t                         *cookie_out) {
+    if (!state || !cookie_out ||
+        !ds4_dspark_stage_candidate_state_coherent(state) ||
+        state->phase != DS4_DSPARK_STAGE_CANDIDATE_EMPTY ||
+        state->last_cookie == UINT64_MAX ||
+        stage >= DS4_DSPARK_CAPTURE_STAGE_COUNT) {
+        return false;
+    }
+    ds4_dspark_stage_candidate_state next = *state;
+    const uint64_t cookie = state->last_cookie + 1u;
+    next.phase = DS4_DSPARK_STAGE_CANDIDATE_EXECUTING;
+    next.last_cookie = cookie;
+    next.active_cookie = cookie;
+    next.active_stage = stage;
+    *state = next;
+    *cookie_out = cookie;
+    return true;
+}
+
+static bool ds4_dspark_stage_candidate_state_set_shadow(
+        ds4_dspark_stage_candidate_state *state,
+        uint64_t                          cookie,
+        const ds4_dspark_stage_route_plan *route) {
+    if (!state || !route ||
+        !ds4_dspark_stage_candidate_state_coherent(state) ||
+        state->phase != DS4_DSPARK_STAGE_CANDIDATE_EXECUTING ||
+        state->shadow_valid || cookie == 0u ||
+        cookie != state->active_cookie ||
+        !ds4_dspark_stage_route_plan_coherent(route)) {
+        return false;
+    }
+    const ds4_dspark_stage_candidate_publication shadow = {
+        .cookie = cookie,
+        .stage = state->active_stage,
+        .route = *route,
+    };
+    state->shadow = shadow;
+    state->shadow_valid = true;
+    return true;
+}
+
+static bool ds4_dspark_stage_candidate_state_publish(
+        ds4_dspark_stage_candidate_state *state,
+        uint64_t                          cookie) {
+    if (!state || !ds4_dspark_stage_candidate_state_coherent(state) ||
+        state->phase != DS4_DSPARK_STAGE_CANDIDATE_EXECUTING ||
+        !state->shadow_valid || cookie == 0u ||
+        cookie != state->active_cookie) {
+        return false;
+    }
+    ds4_dspark_stage_candidate_state next = *state;
+    next.ready = next.shadow;
+    memset(&next.shadow, 0, sizeof(next.shadow));
+    next.shadow_valid = false;
+    next.phase = DS4_DSPARK_STAGE_CANDIDATE_READY;
+    next.active_cookie = 0u;
+    next.active_stage = UINT32_MAX;
+    if (!ds4_dspark_stage_candidate_state_coherent(&next)) return false;
+    *state = next;
+    return true;
+}
+
+static bool ds4_dspark_stage_candidate_state_ready(
+        const ds4_dspark_stage_candidate_state       *state,
+        uint64_t                                      cookie,
+        ds4_dspark_stage_candidate_publication       *out) {
+    if (!state || !out ||
+        !ds4_dspark_stage_candidate_state_coherent(state) ||
+        state->phase != DS4_DSPARK_STAGE_CANDIDATE_READY ||
+        cookie == 0u || cookie != state->ready.cookie) {
+        return false;
+    }
+    *out = state->ready;
+    return true;
+}
+
+static bool ds4_dspark_stage_candidate_state_consume(
+        ds4_dspark_stage_candidate_state *state,
+        uint64_t                          cookie) {
+    if (!state || !ds4_dspark_stage_candidate_state_coherent(state) ||
+        state->phase != DS4_DSPARK_STAGE_CANDIDATE_READY ||
+        cookie == 0u || cookie != state->ready.cookie) {
+        return false;
+    }
+    ds4_dspark_stage_candidate_state next = *state;
+    ds4_dspark_stage_candidate_state_clear_publication(&next);
+    if (!ds4_dspark_stage_candidate_state_coherent(&next)) return false;
+    *state = next;
+    return true;
+}
+
+static bool ds4_dspark_stage_candidate_state_abort(
+        ds4_dspark_stage_candidate_state *state,
+        uint64_t                          cookie) {
+    if (!state || !ds4_dspark_stage_candidate_state_coherent(state) ||
+        state->phase != DS4_DSPARK_STAGE_CANDIDATE_EXECUTING ||
+        cookie == 0u || cookie != state->active_cookie) {
+        return false;
+    }
+    ds4_dspark_stage_candidate_state next = *state;
+    ds4_dspark_stage_candidate_state_clear_publication(&next);
+    if (!ds4_dspark_stage_candidate_state_coherent(&next)) return false;
+    *state = next;
+    return true;
+}
+
+#ifdef DS4_TEST_HOOKS
+static float ds4_dspark_stage_candidate_self_check_float(uint32_t bits) {
+    float value = 0.0f;
+    memcpy(&value, &bits, sizeof(value));
+    return value;
+}
+
+static bool ds4_dspark_stage_candidate_state_self_check(void) {
+    uint32_t committed_start = UINT32_MAX;
+    if (ds4_dspark_stage_committed_start_make(
+            1u, 0u, &committed_start) ||
+        ds4_dspark_stage_committed_start_make(
+            6u, 127u, &committed_start) ||
+        !ds4_dspark_stage_committed_start_make(
+            6u, 128u, &committed_start) ||
+        committed_start != 0u ||
+        !ds4_dspark_stage_committed_start_make(
+            DS4_DSPARK_HISTORY_ROWS, 130u, &committed_start) ||
+        committed_start != 2u) {
+        return false;
+    }
+    int32_t expert_id[DS4_DSPARK_SUPPORT_CANDIDATE_ROWS]
+                     [DS4_DSPARK_SUPPORT_TOP_K];
+    float weight[DS4_DSPARK_SUPPORT_CANDIDATE_ROWS]
+                [DS4_DSPARK_SUPPORT_TOP_K];
+    for (uint32_t row = 0;
+         row < DS4_DSPARK_SUPPORT_CANDIDATE_ROWS; row++) {
+        for (uint32_t slot = 0; slot < DS4_DSPARK_SUPPORT_TOP_K; slot++) {
+            expert_id[row][slot] =
+                (int32_t)(row * 32u + (DS4_DSPARK_SUPPORT_TOP_K - slot));
+            weight[row][slot] = (float)slot * 0.1f;
+        }
+    }
+    /* Duplicates across rows are valid; only a duplicate within one six-slot
+     * selection would execute the same expert twice for that candidate. */
+    expert_id[4][5] = expert_id[0][0];
+
+    ds4_dspark_stage_route_plan route;
+    if (!ds4_dspark_stage_route_plan_make(
+            &expert_id[0][0], &weight[0][0], &route) ||
+        !ds4_dspark_stage_route_plan_coherent(&route)) {
+        return false;
+    }
+    for (uint32_t row = 0;
+         row < DS4_DSPARK_SUPPORT_CANDIDATE_ROWS; row++) {
+        for (uint32_t slot = 1; slot < DS4_DSPARK_SUPPORT_TOP_K; slot++) {
+            if (route.expert_id[row][slot - 1u] >=
+                    route.expert_id[row][slot]) {
+                return false;
+            }
+        }
+        for (uint32_t slot = 0; slot < DS4_DSPARK_SUPPORT_TOP_K; slot++) {
+            const uint32_t source_slot =
+                DS4_DSPARK_SUPPORT_TOP_K - slot - 1u;
+            if (route.expert_id[row][slot] != expert_id[row][source_slot] ||
+                route.weight[row][slot] != weight[row][source_slot]) {
+                return false;
+            }
+        }
+    }
+
+    ds4_dspark_stage_route_plan sentinel = route;
+    ds4_dspark_stage_route_plan unchanged;
+    const int32_t original_id = expert_id[2][3];
+    const float original_weight = weight[2][3];
+#define DS4_DSPARK_ROUTE_REJECTS_WITHOUT_PUBLISH(ID_VALUE, WEIGHT_VALUE) do { \
+        memcpy(&unchanged, &sentinel, sizeof(unchanged));                    \
+        expert_id[2][3] = (ID_VALUE);                                       \
+        weight[2][3] = (WEIGHT_VALUE);                                      \
+        if (ds4_dspark_stage_route_plan_make(                               \
+                &expert_id[0][0], &weight[0][0], &unchanged) ||             \
+            memcmp(&unchanged, &sentinel, sizeof(unchanged)) != 0) {         \
+            return false;                                                   \
+        }                                                                   \
+        expert_id[2][3] = original_id;                                      \
+        weight[2][3] = original_weight;                                     \
+    } while (0)
+    DS4_DSPARK_ROUTE_REJECTS_WITHOUT_PUBLISH(-1, original_weight);
+    DS4_DSPARK_ROUTE_REJECTS_WITHOUT_PUBLISH(
+        DS4_DSPARK_SUPPORT_EXPERT_COUNT, original_weight);
+    DS4_DSPARK_ROUTE_REJECTS_WITHOUT_PUBLISH(
+        original_id,
+        ds4_dspark_stage_candidate_self_check_float(UINT32_C(0x7fc12345)));
+    DS4_DSPARK_ROUTE_REJECTS_WITHOUT_PUBLISH(
+        original_id,
+        ds4_dspark_stage_candidate_self_check_float(UINT32_C(0x7f800000)));
+    DS4_DSPARK_ROUTE_REJECTS_WITHOUT_PUBLISH(original_id, -0.25f);
+    DS4_DSPARK_ROUTE_REJECTS_WITHOUT_PUBLISH(original_id, 0.0f);
+#undef DS4_DSPARK_ROUTE_REJECTS_WITHOUT_PUBLISH
+
+    memcpy(&unchanged, &sentinel, sizeof(unchanged));
+    expert_id[2][3] = expert_id[2][2];
+    if (ds4_dspark_stage_route_plan_make(
+            &expert_id[0][0], &weight[0][0], &unchanged) ||
+        memcmp(&unchanged, &sentinel, sizeof(unchanged)) != 0) {
+        return false;
+    }
+    expert_id[2][3] = original_id;
+
+    ds4_dspark_stage_candidate_state state;
+    ds4_dspark_stage_candidate_state snapshot;
+    ds4_dspark_stage_candidate_publication publication;
+    uint64_t cookie = 0u;
+    ds4_dspark_stage_candidate_state_init(&state);
+    memcpy(&snapshot, &state, sizeof(snapshot));
+    if (!ds4_dspark_stage_candidate_state_coherent(&state) ||
+        ds4_dspark_stage_candidate_state_begin(
+            &state, DS4_DSPARK_CAPTURE_STAGE_COUNT, &cookie) ||
+        memcmp(&state, &snapshot, sizeof(state)) != 0 ||
+        !ds4_dspark_stage_candidate_state_begin(&state, 1u, &cookie) ||
+        cookie != 1u ||
+        state.phase != DS4_DSPARK_STAGE_CANDIDATE_EXECUTING ||
+        ds4_dspark_stage_candidate_state_ready(&state, cookie, &publication)) {
+        return false;
+    }
+
+    memcpy(&snapshot, &state, sizeof(snapshot));
+    if (ds4_dspark_stage_candidate_state_publish(&state, cookie) ||
+        memcmp(&state, &snapshot, sizeof(state)) != 0 ||
+        ds4_dspark_stage_candidate_state_set_shadow(
+            &state, cookie + 1u, &route) ||
+        memcmp(&state, &snapshot, sizeof(state)) != 0 ||
+        !ds4_dspark_stage_candidate_state_set_shadow(
+            &state, cookie, &route) ||
+        !state.shadow_valid ||
+        ds4_dspark_stage_candidate_state_ready(
+            &state, cookie, &publication)) {
+        return false;
+    }
+    memcpy(&snapshot, &state, sizeof(snapshot));
+    if (ds4_dspark_stage_candidate_state_set_shadow(
+            &state, cookie, &route) ||
+        memcmp(&state, &snapshot, sizeof(state)) != 0) {
+        return false;
+    }
+
+    memcpy(&snapshot, &state, sizeof(snapshot));
+    if (ds4_dspark_stage_candidate_state_publish(&state, cookie + 1u) ||
+        memcmp(&state, &snapshot, sizeof(state)) != 0 ||
+        !ds4_dspark_stage_candidate_state_publish(&state, cookie) ||
+        state.phase != DS4_DSPARK_STAGE_CANDIDATE_READY ||
+        state.shadow_valid ||
+        !ds4_dspark_stage_candidate_state_ready(
+            &state, cookie, &publication) ||
+        publication.cookie != cookie || publication.stage != 1u ||
+        memcmp(&publication.route, &route, sizeof(route)) != 0) {
+        return false;
+    }
+    memcpy(&snapshot, &state, sizeof(snapshot));
+    if (ds4_dspark_stage_candidate_state_begin(&state, 0u, &cookie) ||
+        memcmp(&state, &snapshot, sizeof(state)) != 0) {
+        return false;
+    }
+
+    memcpy(&snapshot, &state, sizeof(snapshot));
+    if (ds4_dspark_stage_candidate_state_consume(&state, cookie + 1u) ||
+        memcmp(&state, &snapshot, sizeof(state)) != 0 ||
+        !ds4_dspark_stage_candidate_state_consume(&state, cookie) ||
+        !ds4_dspark_stage_candidate_state_coherent(&state) ||
+        state.phase != DS4_DSPARK_STAGE_CANDIDATE_EMPTY ||
+        state.last_cookie != cookie ||
+        !ds4_dspark_stage_candidate_state_begin(&state, 2u, &cookie) ||
+        cookie != 2u ||
+        !ds4_dspark_stage_candidate_state_set_shadow(
+            &state, cookie, &route)) {
+        return false;
+    }
+
+    memcpy(&snapshot, &state, sizeof(snapshot));
+    if (ds4_dspark_stage_candidate_state_abort(&state, cookie - 1u) ||
+        memcmp(&state, &snapshot, sizeof(state)) != 0 ||
+        !ds4_dspark_stage_candidate_state_abort(&state, cookie) ||
+        state.phase != DS4_DSPARK_STAGE_CANDIDATE_EMPTY ||
+        state.last_cookie != cookie ||
+        !ds4_dspark_stage_candidate_state_coherent(&state)) {
+        return false;
+    }
+
+    if (!ds4_dspark_stage_candidate_state_begin(&state, 0u, &cookie) ||
+        cookie != 3u) {
+        return false;
+    }
+    ds4_dspark_stage_candidate_state_invalidate(&state);
+    if (!ds4_dspark_stage_candidate_state_coherent(&state) ||
+        state.phase != DS4_DSPARK_STAGE_CANDIDATE_EMPTY ||
+        state.last_cookie != cookie ||
+        !ds4_dspark_stage_candidate_state_begin(&state, 0u, &cookie) ||
+        cookie != 4u ||
+        !ds4_dspark_stage_candidate_state_set_shadow(
+            &state, cookie, &route) ||
+        !ds4_dspark_stage_candidate_state_publish(&state, cookie)) {
+        return false;
+    }
+    ds4_dspark_stage_candidate_state_invalidate(&state);
+    if (!ds4_dspark_stage_candidate_state_coherent(&state) ||
+        state.phase != DS4_DSPARK_STAGE_CANDIDATE_EMPTY ||
+        state.last_cookie != cookie) {
+        return false;
+    }
+
+    state.last_cookie = UINT64_MAX;
+    memcpy(&snapshot, &state, sizeof(snapshot));
+    if (ds4_dspark_stage_candidate_state_begin(&state, 0u, &cookie) ||
+        memcmp(&state, &snapshot, sizeof(state)) != 0) {
+        return false;
+    }
+    ds4_dspark_stage_candidate_state_invalidate(&state);
+    if (!ds4_dspark_stage_candidate_state_coherent(&state) ||
+        state.last_cookie != UINT64_MAX) {
+        return false;
+    }
+    ds4_dspark_stage_candidate_state_free(&state);
+    return !state.initialized;
+}
+#endif
+#endif
 
 /* Pure scheduler/verifier contract for one DSpark round.  This is deliberately
  * disconnected from ds4_session and Metal execution: it fixes the token and
@@ -3152,6 +3729,7 @@ static bool ds4_dspark_runtime_contract_self_check(void) {
     bool raw_finalizer_present = true;
     bool workspace_owner_ok = true;
     bool verifier_frontier_ok = true;
+    bool stage_candidate_ok = true;
 #ifndef DS4_NO_GPU
     raw_finalizer_present =
         metal_graph_dspark_raw_finalizer_code_present();
@@ -3160,6 +3738,7 @@ static bool ds4_dspark_runtime_contract_self_check(void) {
     workspace_owner_ok = ds4_dspark_workspace_owner_self_check();
     verifier_frontier_ok =
         ds4_dspark_verifier_frontier_self_check();
+    stage_candidate_ok = ds4_dspark_stage_candidate_state_self_check();
 #endif
     ds4_dspark_capture_state_init(&capture_state, true);
     return DS4_DSPARK_CAPTURE_CONTRACT.stage_count == 3u &&
@@ -3169,6 +3748,7 @@ static bool ds4_dspark_runtime_contract_self_check(void) {
            DS4_DSPARK_CAPTURE_CONTRACT.hidden_width == 4096u &&
            DS4_DSPARK_CAPTURE_CONTRACT.hc_lanes == 4u &&
            verifier_frontier_ok &&
+           stage_candidate_ok &&
            !ds4_dspark_capture_slot_after_layer(39u, &slot) &&
            ds4_dspark_capture_slot_after_layer(40u, &slot) && slot == 0u &&
            ds4_dspark_capture_slot_after_layer(41u, &slot) && slot == 1u &&

@@ -301,9 +301,8 @@ kernel void kernel_dsv4_moe_sum6_f32(
     }
 }
 
-#ifdef DS4_TEST_HOOKS
 /* Fast-math may reassociate the production reduction even when its source is
- * written left-to-right.  This disconnected DSpark checkpoint forces every
+ * written left-to-right.  The DSpark stage executor forces every
  * intermediate publication through a volatile thread scalar, matching the
  * official expert-id-ascending F32 fold exactly. */
 kernel void kernel_dspark_moe_sum6_sequential_f32(
@@ -332,8 +331,6 @@ kernel void kernel_dspark_moe_sum6_sequential_f32(
         d[col] = v;
     }
 }
-#endif
-
 /* Qwen3.6 routes every token to eight experts.  Keep the reduction in one
  * dispatch so the resident path does not serialize seven generic add kernels
  * after the down projection.  The accumulation order matches the historical

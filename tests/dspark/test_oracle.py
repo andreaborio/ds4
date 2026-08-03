@@ -4792,9 +4792,12 @@ class OracleFixtureTests(unittest.TestCase):
         )
 
         transaction_start = source.index(
-            "static int ds4_gpu_dspark_support_selected_addr_transaction("
+            "static int "
+            "ds4_gpu_dspark_support_selected_addr_transaction_with_page("
         )
-        transaction_end = source.index("\n#endif", transaction_start)
+        transaction_end = source.index(
+            "\n#ifdef DS4_TEST_HOOKS", transaction_start
+        )
         transaction_source = source[transaction_start:transaction_end]
         self.assertLess(
             transaction_source.index(
@@ -6064,13 +6067,27 @@ class OracleFixtureTests(unittest.TestCase):
             history_initializers[0][2],
             [["&", "g", "->", "dspark_history_state"], ["enable_dspark"]],
         )
+        enabled_gate = ["if", "(", "enable_dspark", ")", "{"]
         enabled_block = require_sequence(
             allocator,
-            ["if", "(", "enable_dspark", ")", "{"],
-            "capture tensors must have an explicit enable_dspark allocation gate",
+            enabled_gate,
+            "DSpark storage must have an explicit enable_dspark allocation gate",
         )
-        block_open = enabled_block + 4
-        block_close = _matching_token(allocator, block_open, "{", "}")
+        while True:
+            block_open = enabled_block + 4
+            block_close = _matching_token(allocator, block_open, "{", "}")
+            if _token_sequence_index(
+                    allocator,
+                    ["g", "->", "dspark_capture", "[", "stage", "]", "="],
+                    start=block_open + 1,
+                    end=block_close) != -1:
+                break
+            enabled_block = require_sequence(
+                allocator,
+                enabled_gate,
+                "capture tensors must remain inside an enable_dspark allocation gate",
+                start=block_close + 1,
+            )
         for capture_field in (
                 "dspark_capture", "dspark_history", "dspark_verify_capture"):
             capture_allocation = [

@@ -20207,7 +20207,21 @@ typedef struct {
     ds4_gpu_tensor *dspark_raw_projected;
     ds4_gpu_tensor *dspark_raw_normalized;
     ds4_gpu_tensor *dspark_raw_ring[DS4_DSPARK_CAPTURE_STAGE_COUNT];
+    ds4_gpu_tensor *dspark_attention_staging;
     ds4_dspark_workspace_owner dspark_workspace;
+    /* Proposal ownership is separate from the ordinary prefill scratch that
+     * the stage executor may borrow while isolated.  These buffers represent
+     * the complete already-admitted 1,146,880-byte proposal inventory: no
+     * stage may allocate an unaccounted replacement on its hot path. */
+    ds4_gpu_tensor *dspark_draft_tokens;
+    ds4_gpu_tensor *dspark_draft_hc;
+    ds4_gpu_tensor *dspark_target_hc;
+    ds4_gpu_tensor *dspark_stage_input_hc;
+    ds4_gpu_tensor *dspark_stage_output_hc;
+    ds4_gpu_tensor *dspark_position_ids;
+    ds4_gpu_tensor *dspark_stage_hidden_input_view;
+    ds4_gpu_dspark_stage_scratch dspark_stage_scratch;
+    ds4_dspark_stage_candidate_state dspark_stage_candidate_state;
     ds4_dspark_capture_state dspark_capture_state;
     ds4_dspark_capture_state dspark_verify_capture_state;
     ds4_dspark_history_state dspark_history_state;
@@ -20342,6 +20356,8 @@ static void graph_power_note_decode_token(ds4_gpu_graph *g, double elapsed_sec) 
 
 static void metal_graph_dspark_capture_invalidate(ds4_gpu_graph *g) {
     if (!g) return;
+    ds4_dspark_stage_candidate_state_invalidate(
+        &g->dspark_stage_candidate_state);
     ds4_dspark_capture_state_invalidate(&g->dspark_capture_state);
     ds4_dspark_capture_state_invalidate(&g->dspark_verify_capture_state);
     ds4_dspark_history_state_invalidate(&g->dspark_history_state);
@@ -20758,7 +20774,10 @@ static bool metal_graph_dspark_raw_storage_valid(
             memory.raw_projected_bytes ||
         !g->dspark_raw_normalized ||
         ds4_gpu_tensor_bytes(g->dspark_raw_normalized) !=
-            memory.raw_normalized_bytes) {
+            memory.raw_normalized_bytes ||
+        !g->dspark_attention_staging ||
+        ds4_gpu_tensor_bytes(g->dspark_attention_staging) !=
+            memory.two_source_attention_staging_bytes) {
         return false;
     }
     const uint64_t ring_bytes =
@@ -20784,6 +20803,169 @@ static bool metal_graph_dspark_raw_storage_valid(
         }
     }
     return true;
+}
+
+static bool metal_graph_dspark_proposal_storage_valid(
+        const ds4_gpu_graph *g) {
+    const uint64_t row_bytes =
+        (uint64_t)DS4_N_EMBD * sizeof(float);
+    const uint64_t hc_row_bytes = DS4_N_HC * row_bytes;
+    return g && g->prefill_cap >= DS4_DSPARK_RAW_FINALIZER_MAX_ROWS &&
+           g->dspark_draft_tokens &&
+           ds4_gpu_tensor_bytes(g->dspark_draft_tokens) ==
+               (uint64_t)DS4_DSPARK_SUPPORT_CANDIDATE_ROWS *
+                   sizeof(int32_t) &&
+           g->dspark_draft_hc &&
+           ds4_gpu_tensor_bytes(g->dspark_draft_hc) ==
+               (uint64_t)DS4_DSPARK_SUPPORT_CANDIDATE_ROWS *
+                   hc_row_bytes &&
+           g->dspark_target_hc &&
+           ds4_gpu_tensor_bytes(g->dspark_target_hc) == hc_row_bytes &&
+           g->dspark_stage_input_hc &&
+           ds4_gpu_tensor_bytes(g->dspark_stage_input_hc) ==
+               (uint64_t)DS4_DSPARK_RAW_FINALIZER_MAX_ROWS *
+                   hc_row_bytes &&
+           g->dspark_stage_output_hc &&
+           ds4_gpu_tensor_bytes(g->dspark_stage_output_hc) ==
+               (uint64_t)DS4_DSPARK_SUPPORT_CANDIDATE_ROWS *
+                   hc_row_bytes &&
+           g->dspark_position_ids &&
+           ds4_gpu_tensor_bytes(g->dspark_position_ids) ==
+               (uint64_t)DS4_DSPARK_RAW_FINALIZER_MAX_ROWS *
+                   sizeof(int32_t);
+}
+
+static void metal_graph_dspark_stage_views_free(ds4_gpu_graph *g) {
+    if (!g) return;
+    ds4_gpu_tensor_free(g->dspark_stage_scratch.moe);
+    ds4_gpu_tensor_free(g->dspark_stage_scratch.shared_down);
+    ds4_gpu_tensor_free(g->dspark_stage_scratch.shared_mid);
+    ds4_gpu_tensor_free(g->dspark_stage_scratch.shared_up);
+    ds4_gpu_tensor_free(g->dspark_stage_scratch.shared_gate);
+    ds4_gpu_tensor_free(g->dspark_stage_scratch.routed_sum);
+    ds4_gpu_tensor_free(g->dspark_stage_scratch.routed_down);
+    ds4_gpu_tensor_free(g->dspark_stage_scratch.routed_mid);
+    ds4_gpu_tensor_free(g->dspark_stage_scratch.routed_up);
+    ds4_gpu_tensor_free(g->dspark_stage_scratch.routed_gate);
+    /* sorted IDs/weights intentionally alias their router publications. */
+    ds4_gpu_tensor_free(g->dspark_stage_scratch.router_weights);
+    ds4_gpu_tensor_free(g->dspark_stage_scratch.router_ids);
+    ds4_gpu_tensor_free(g->dspark_stage_scratch.router_probs);
+    ds4_gpu_tensor_free(g->dspark_stage_scratch.router_bias);
+    ds4_gpu_tensor_free(g->dspark_stage_scratch.router_logits);
+    ds4_gpu_tensor_free(g->dspark_stage_scratch.attention_hc);
+    ds4_gpu_tensor_free(g->dspark_stage_scratch.attention_row);
+    ds4_gpu_tensor_free(g->dspark_stage_scratch.attention_low);
+    ds4_gpu_tensor_free(g->dspark_stage_scratch.attention_out);
+    ds4_gpu_tensor_free(g->dspark_stage_scratch.kv);
+    ds4_gpu_tensor_free(g->dspark_stage_scratch.q_rank);
+    ds4_gpu_tensor_free(g->dspark_stage_scratch.q);
+    ds4_gpu_tensor_free(g->dspark_stage_scratch.normalized);
+    ds4_gpu_tensor_free(g->dspark_stage_scratch.hc_pre);
+    ds4_gpu_tensor_free(g->dspark_stage_scratch.hc_split);
+    ds4_gpu_tensor_free(g->dspark_stage_scratch.hc_mix);
+    ds4_gpu_tensor_free(g->dspark_stage_scratch.hc_plain_norm);
+    ds4_gpu_tensor_free(g->dspark_stage_scratch.hidden_work);
+    ds4_gpu_tensor_free(g->dspark_stage_hidden_input_view);
+    memset(&g->dspark_stage_scratch, 0, sizeof(g->dspark_stage_scratch));
+    g->dspark_stage_hidden_input_view = NULL;
+}
+
+static ds4_gpu_tensor *metal_graph_dspark_stage_view(
+        ds4_gpu_tensor *owner,
+        uint64_t        bytes) {
+    return owner && ds4_gpu_tensor_bytes(owner) >= bytes
+        ? ds4_gpu_tensor_view(owner, 0, bytes) : NULL;
+}
+
+/* Bind exact five-row views once at graph creation.  Several Metal helpers
+ * derive their row count from tensor byte length, so passing an oversized
+ * prefill allocation would silently execute a sixth row. */
+static bool metal_graph_dspark_stage_views_alloc(ds4_gpu_graph *g) {
+    enum {
+        ROWS = DS4_DSPARK_SUPPORT_CANDIDATE_ROWS,
+        HIDDEN = 4096,
+        HC = 4,
+        MIX = 24,
+        Q_RANK = 1024,
+        Q_WIDTH = 64 * 512,
+        KV_WIDTH = 512,
+        LOW_WIDTH = 8192,
+        EXPERTS = 256,
+        TOP_K = 6,
+        MID = 2048,
+    };
+    if (!g || g->dspark_stage_hidden_input_view ||
+        g->dspark_stage_scratch.hidden_work) return false;
+#define DS4_DSPARK_STAGE_VIEW(field, owner, values) do {                    \
+        g->dspark_stage_scratch.field = metal_graph_dspark_stage_view(       \
+            (owner), (uint64_t)(values) * sizeof(float));                    \
+        if (!g->dspark_stage_scratch.field) goto fail;                       \
+    } while (0)
+    g->dspark_stage_hidden_input_view = metal_graph_dspark_stage_view(
+        g->dspark_stage_input_hc,
+        (uint64_t)ROWS * HC * HIDDEN * sizeof(float));
+    if (!g->dspark_stage_hidden_input_view) goto fail;
+    DS4_DSPARK_STAGE_VIEW(hidden_work, g->batch_cur_hc,
+                          ROWS * HC * HIDDEN);
+    DS4_DSPARK_STAGE_VIEW(hc_plain_norm, g->batch_flat_hc,
+                          ROWS * HC * HIDDEN);
+    DS4_DSPARK_STAGE_VIEW(hc_mix, g->batch_hc_mix, ROWS * MIX);
+    DS4_DSPARK_STAGE_VIEW(hc_split, g->batch_hc_split, ROWS * MIX);
+    DS4_DSPARK_STAGE_VIEW(hc_pre, g->batch_attn_cur, ROWS * HIDDEN);
+    DS4_DSPARK_STAGE_VIEW(normalized, g->batch_attn_norm, ROWS * HIDDEN);
+    DS4_DSPARK_STAGE_VIEW(q, g->batch_q, ROWS * Q_WIDTH);
+    DS4_DSPARK_STAGE_VIEW(q_rank, g->batch_qr, ROWS * Q_RANK);
+    DS4_DSPARK_STAGE_VIEW(kv, g->batch_kv, ROWS * KV_WIDTH);
+    g->dspark_stage_scratch.attention_staging =
+        g->dspark_attention_staging;
+    DS4_DSPARK_STAGE_VIEW(attention_out, g->batch_heads, ROWS * Q_WIDTH);
+    DS4_DSPARK_STAGE_VIEW(attention_low, g->batch_attn_low,
+                          ROWS * LOW_WIDTH);
+    DS4_DSPARK_STAGE_VIEW(attention_row, g->batch_attn_out, ROWS * HIDDEN);
+    DS4_DSPARK_STAGE_VIEW(attention_hc, g->batch_after_attn_hc,
+                          ROWS * HC * HIDDEN);
+    DS4_DSPARK_STAGE_VIEW(router_logits, g->batch_router_logits,
+                          ROWS * EXPERTS);
+    g->dspark_stage_scratch.router_bias = ds4_gpu_tensor_view(
+        g->batch_router_probs,
+        (uint64_t)ROWS * EXPERTS * sizeof(float),
+        (uint64_t)EXPERTS * sizeof(float));
+    if (!g->dspark_stage_scratch.router_bias) goto fail;
+    DS4_DSPARK_STAGE_VIEW(router_probs, g->batch_router_probs,
+                          ROWS * EXPERTS);
+    g->dspark_stage_scratch.router_ids = metal_graph_dspark_stage_view(
+        g->batch_router_selected,
+        (uint64_t)ROWS * TOP_K * sizeof(int32_t));
+    if (!g->dspark_stage_scratch.router_ids) goto fail;
+    DS4_DSPARK_STAGE_VIEW(router_weights, g->batch_router_weights,
+                          ROWS * TOP_K);
+    g->dspark_stage_scratch.sorted_ids =
+        g->dspark_stage_scratch.router_ids;
+    g->dspark_stage_scratch.sorted_weights =
+        g->dspark_stage_scratch.router_weights;
+    DS4_DSPARK_STAGE_VIEW(routed_gate, g->batch_routed_gate,
+                          ROWS * TOP_K * MID);
+    DS4_DSPARK_STAGE_VIEW(routed_up, g->batch_routed_up,
+                          ROWS * TOP_K * MID);
+    DS4_DSPARK_STAGE_VIEW(routed_mid, g->batch_routed_mid,
+                          ROWS * TOP_K * MID);
+    DS4_DSPARK_STAGE_VIEW(routed_down, g->batch_routed_down,
+                          ROWS * TOP_K * HIDDEN);
+    DS4_DSPARK_STAGE_VIEW(routed_sum, g->batch_routed_out, ROWS * HIDDEN);
+    DS4_DSPARK_STAGE_VIEW(shared_gate, g->batch_shared_gate, ROWS * MID);
+    DS4_DSPARK_STAGE_VIEW(shared_up, g->batch_shared_up, ROWS * MID);
+    DS4_DSPARK_STAGE_VIEW(shared_mid, g->batch_shared_mid, ROWS * MID);
+    DS4_DSPARK_STAGE_VIEW(shared_down, g->batch_shared_out, ROWS * HIDDEN);
+    DS4_DSPARK_STAGE_VIEW(moe, g->batch_ffn_cur, ROWS * HIDDEN);
+    g->dspark_stage_scratch.candidate = g->dspark_stage_output_hc;
+#undef DS4_DSPARK_STAGE_VIEW
+    return true;
+
+fail:
+#undef DS4_DSPARK_STAGE_VIEW
+    metal_graph_dspark_stage_views_free(g);
+    return false;
 }
 
 static bool metal_graph_dspark_raw_weight_matches(
@@ -21046,11 +21228,202 @@ static bool metal_graph_dspark_raw_context_finalize(
     return ok;
 }
 
+typedef struct {
+    bool called;
+    ds4_dspark_stage_route_plan route;
+} metal_graph_dspark_stage_route_adapter;
+
+static bool metal_graph_verifier_frontier_valid(
+        ds4_gpu_graph *g,
+        bool           frontier_enabled,
+        bool           prefix1_enabled);
+
+static int metal_graph_dspark_stage_route_plan(
+        const int32_t ids[30],
+        const float   weights[30],
+        int32_t       sorted_ids[30],
+        float         sorted_weights[30],
+        void         *opaque) {
+    metal_graph_dspark_stage_route_adapter *adapter =
+        (metal_graph_dspark_stage_route_adapter *)opaque;
+    ds4_dspark_stage_route_plan route;
+    if (!adapter || adapter->called || !sorted_ids || !sorted_weights ||
+        !ds4_dspark_stage_route_plan_make(ids, weights, &route)) {
+        return 0;
+    }
+    memcpy(sorted_ids, route.expert_id, sizeof(route.expert_id));
+    memcpy(sorted_weights, route.weight, sizeof(route.weight));
+    adapter->route = route;
+    adapter->called = true;
+    return 1;
+}
+
+static bool metal_graph_dspark_stage0_static_weights_valid(
+        const ds4_model                *model,
+        const ds4_dspark_stage_weights *stage) {
+    if (!model || !stage || !model->map || model->size == 0 ||
+        !model->native_dspark_store_v2) return false;
+    const ds4_tensor *const tensor[] = {
+        stage->hc_attn_base, stage->hc_attn_fn, stage->hc_attn_scale,
+        stage->attn_sinks, stage->attn_q_a, stage->attn_q_a_norm,
+        stage->attn_q_b, stage->attn_kv, stage->attn_kv_a_norm,
+        stage->attn_output_a, stage->attn_output_b, stage->attn_norm,
+        stage->hc_ffn_base, stage->hc_ffn_fn, stage->hc_ffn_scale,
+        stage->ffn_gate_inp, stage->ffn_exp_probs_b, stage->ffn_norm,
+        stage->ffn_gate_shexp, stage->ffn_up_shexp,
+        stage->ffn_down_shexp,
+    };
+    for (uint32_t i = 0; i < sizeof(tensor) / sizeof(tensor[0]); i++) {
+        if (!tensor[i] || !model_tensor_pointer_member(model, tensor[i]) ||
+            !dspark_physical_tensor_range_valid(model, tensor[i])) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static bool metal_graph_dspark_stage0_descriptor_bind(
+        ds4_gpu_dspark_stage_descriptor  *out,
+        ds4_gpu_graph                    *g,
+        const ds4_model                  *model,
+        const ds4_dspark_weights         *weights,
+        uint32_t                          position0,
+        metal_graph_dspark_stage_route_adapter *route_adapter) {
+    if (!out || !g || !model || !weights || !route_adapter ||
+        g->prefill_cap < DS4_DSPARK_RAW_FINALIZER_MAX_ROWS ||
+        g->dspark_verify_capture_active ||
+        ds4_gpu_commands_active() != 0 ||
+        !metal_graph_dspark_raw_storage_valid(g) ||
+        !metal_graph_dspark_proposal_storage_valid(g) ||
+        !metal_graph_dspark_workspace_valid(&g->dspark_workspace, true) ||
+        !metal_graph_verifier_frontier_valid(g, true, false) ||
+        !ds4_dspark_raw_context_state_ready_at(
+            &g->dspark_raw_context_state, position0) ||
+        g->dspark_raw_context_state.length < 2u ||
+        g->dspark_raw_context_state.length > DS4_DSPARK_HISTORY_ROWS ||
+        !metal_graph_dspark_stage0_static_weights_valid(
+            model, &weights->stage[0]) ||
+        !g->dspark_stage_hidden_input_view ||
+        !g->dspark_stage_scratch.candidate ||
+        !g->dspark_draft_hc) {
+        return false;
+    }
+    const ds4_dspark_stage_weights *stage = &weights->stage[0];
+    const uint32_t committed_count = g->dspark_raw_context_state.length;
+    uint32_t committed_start = 0u;
+    if (!ds4_dspark_stage_committed_start_make(
+            committed_count,
+            g->dspark_raw_context_state.token_start,
+            &committed_start)) {
+        return false;
+    }
+    memset(out, 0, sizeof(*out));
+    out->stage = 0u;
+    out->model_map = model->map;
+    out->model_size = model->size;
+#define DS4_DSPARK_STAGE_OFFSET(name) \
+    out->weights.name = stage->name->abs_offset
+    DS4_DSPARK_STAGE_OFFSET(hc_attn_base);
+    DS4_DSPARK_STAGE_OFFSET(hc_attn_fn);
+    DS4_DSPARK_STAGE_OFFSET(hc_attn_scale);
+    DS4_DSPARK_STAGE_OFFSET(attn_sinks);
+    DS4_DSPARK_STAGE_OFFSET(attn_q_a);
+    DS4_DSPARK_STAGE_OFFSET(attn_q_a_norm);
+    DS4_DSPARK_STAGE_OFFSET(attn_q_b);
+    DS4_DSPARK_STAGE_OFFSET(attn_kv);
+    DS4_DSPARK_STAGE_OFFSET(attn_kv_a_norm);
+    DS4_DSPARK_STAGE_OFFSET(attn_output_a);
+    DS4_DSPARK_STAGE_OFFSET(attn_output_b);
+    DS4_DSPARK_STAGE_OFFSET(attn_norm);
+    DS4_DSPARK_STAGE_OFFSET(hc_ffn_base);
+    DS4_DSPARK_STAGE_OFFSET(hc_ffn_fn);
+    DS4_DSPARK_STAGE_OFFSET(hc_ffn_scale);
+    DS4_DSPARK_STAGE_OFFSET(ffn_gate_inp);
+    DS4_DSPARK_STAGE_OFFSET(ffn_exp_probs_b);
+    DS4_DSPARK_STAGE_OFFSET(ffn_norm);
+    DS4_DSPARK_STAGE_OFFSET(ffn_gate_shexp);
+    DS4_DSPARK_STAGE_OFFSET(ffn_up_shexp);
+    DS4_DSPARK_STAGE_OFFSET(ffn_down_shexp);
+#undef DS4_DSPARK_STAGE_OFFSET
+    out->position0 = position0;
+    out->committed_count = committed_count;
+    out->committed_start = committed_start;
+    out->committed_kv = g->dspark_raw_ring[0];
+    out->hidden_input = g->dspark_stage_hidden_input_view;
+    out->selected_address_page =
+        (ds4_gpu_tensor *)g->dspark_workspace.selected_address_page;
+    out->candidate_shadow = g->dspark_draft_hc;
+    out->route_plan = metal_graph_dspark_stage_route_plan;
+    out->route_plan_opaque = route_adapter;
+    out->scratch = g->dspark_stage_scratch;
+    return true;
+}
+
+/* First production-width ownership seam.  It remains unreachable from
+ * admission/session: callers must already own a fully initialized combined
+ * graph, committed raw context and verifier frontier. */
+static bool metal_graph_dspark_stage0_execute_private(
+        ds4_gpu_graph            *g,
+        const ds4_model          *model,
+        const ds4_dspark_weights *weights,
+        uint32_t                  position0,
+        uint64_t                 *cookie_out) {
+    if (cookie_out) *cookie_out = 0u;
+    if (!g || !model || !weights || !cookie_out) return false;
+    uint64_t cookie = 0u;
+    metal_graph_dspark_stage_route_adapter route_adapter = {0};
+    ds4_gpu_dspark_stage_descriptor descriptor;
+    if (!metal_graph_dspark_stage0_descriptor_bind(
+            &descriptor, g, model, weights, position0, &route_adapter) ||
+        !ds4_dspark_stage_candidate_state_begin(
+            &g->dspark_stage_candidate_state, 0u, &cookie)) {
+        return false;
+    }
+    const bool executed =
+        ds4_gpu_dspark_stage_execute_candidate(&descriptor) != 0;
+    if (!executed || !route_adapter.called ||
+        !ds4_dspark_stage_candidate_state_set_shadow(
+            &g->dspark_stage_candidate_state,
+            cookie, &route_adapter.route) ||
+        !ds4_dspark_stage_candidate_state_publish(
+            &g->dspark_stage_candidate_state, cookie)) {
+        if (!ds4_dspark_stage_candidate_state_abort(
+                &g->dspark_stage_candidate_state, cookie)) {
+            ds4_dspark_stage_candidate_state_invalidate(
+                &g->dspark_stage_candidate_state);
+        }
+        return false;
+    }
+    ds4_dspark_stage_candidate_publication publication;
+    if (!ds4_dspark_stage_candidate_state_ready(
+            &g->dspark_stage_candidate_state, cookie, &publication) ||
+        publication.stage != 0u) {
+        ds4_dspark_stage_candidate_state_invalidate(
+            &g->dspark_stage_candidate_state);
+        return false;
+    }
+    *cookie_out = cookie;
+    return true;
+}
+
+static bool metal_graph_dspark_stage_candidate_discard(
+        ds4_gpu_graph *g,
+        uint64_t       cookie) {
+    return g && ds4_dspark_stage_candidate_state_consume(
+                    &g->dspark_stage_candidate_state, cookie);
+}
+
 static bool metal_graph_dspark_raw_finalizer_code_present(void) {
     uint64_t source = 0;
     uint64_t destination = 0;
     if (metal_graph_dspark_raw_context_finalize(
             NULL, NULL, NULL, 0u, 0u, false)) {
+        return false;
+    }
+    uint64_t cookie = 0u;
+    if (metal_graph_dspark_stage0_execute_private(
+            NULL, NULL, NULL, 0u, &cookie) ||
+        metal_graph_dspark_stage_candidate_discard(NULL, 0u)) {
         return false;
     }
     if (!metal_graph_dspark_raw_pack_offsets(
@@ -21226,6 +21599,15 @@ static bool metal_graph_verifier_frontier_alloc_with(
 
 /* Release every Metal tensor owned by the whole-model graph runtime. */
 static void metal_graph_free(ds4_gpu_graph *g) {
+    ds4_dspark_stage_candidate_state_free(
+        &g->dspark_stage_candidate_state);
+    metal_graph_dspark_stage_views_free(g);
+    ds4_gpu_tensor_free(g->dspark_position_ids);
+    ds4_gpu_tensor_free(g->dspark_stage_output_hc);
+    ds4_gpu_tensor_free(g->dspark_stage_input_hc);
+    ds4_gpu_tensor_free(g->dspark_target_hc);
+    ds4_gpu_tensor_free(g->dspark_draft_hc);
+    ds4_gpu_tensor_free(g->dspark_draft_tokens);
     metal_graph_dspark_workspace_free(&g->dspark_workspace);
     for (uint32_t stage = 0;
          stage < DS4_DSPARK_CAPTURE_STAGE_COUNT; stage++) {
@@ -21234,6 +21616,7 @@ static void metal_graph_free(ds4_gpu_graph *g) {
         ds4_gpu_tensor_free(g->dspark_history[stage]);
         ds4_gpu_tensor_free(g->dspark_capture[stage]);
     }
+    ds4_gpu_tensor_free(g->dspark_attention_staging);
     ds4_gpu_tensor_free(g->dspark_raw_normalized);
     ds4_gpu_tensor_free(g->dspark_raw_projected);
     ds4_gpu_tensor_free(g->dspark_main_x);
@@ -22182,9 +22565,14 @@ static bool metal_graph_alloc_raw_cap(
     ds4_dspark_history_state_init(&g->dspark_history_state, enable_dspark);
     ds4_dspark_raw_context_state_init(
         &g->dspark_raw_context_state, enable_dspark);
+    if (enable_dspark) {
+        ds4_dspark_stage_candidate_state_init(
+            &g->dspark_stage_candidate_state);
+    }
     ds4_dspark_runtime_memory dspark_runtime_memory = {0};
     if (enable_dspark &&
-        !ds4_dspark_runtime_memory_make(&dspark_runtime_memory)) {
+        (!metal_graph_dspark_raw_finalizer_code_present() ||
+         !ds4_dspark_runtime_memory_make(&dspark_runtime_memory))) {
         return false;
     }
     if (raw_cap == 0) raw_cap = 1;
@@ -22367,6 +22755,26 @@ static bool metal_graph_alloc_raw_cap(
         return false;
     }
     if (enable_dspark) {
+        const uint64_t dspark_row_bytes =
+            (uint64_t)DS4_N_EMBD * sizeof(float);
+        const uint64_t dspark_hc_row_bytes =
+            DS4_N_HC * dspark_row_bytes;
+        g->dspark_draft_tokens = ds4_gpu_tensor_alloc(
+            (uint64_t)DS4_DSPARK_SUPPORT_CANDIDATE_ROWS *
+            sizeof(int32_t));
+        g->dspark_draft_hc = ds4_gpu_tensor_alloc(
+            (uint64_t)DS4_DSPARK_SUPPORT_CANDIDATE_ROWS *
+            dspark_hc_row_bytes);
+        g->dspark_target_hc = ds4_gpu_tensor_alloc(dspark_hc_row_bytes);
+        g->dspark_stage_input_hc = ds4_gpu_tensor_alloc(
+            (uint64_t)DS4_DSPARK_RAW_FINALIZER_MAX_ROWS *
+            dspark_hc_row_bytes);
+        g->dspark_stage_output_hc = ds4_gpu_tensor_alloc(
+            (uint64_t)DS4_DSPARK_SUPPORT_CANDIDATE_ROWS *
+            dspark_hc_row_bytes);
+        g->dspark_position_ids = ds4_gpu_tensor_alloc(
+            (uint64_t)DS4_DSPARK_RAW_FINALIZER_MAX_ROWS *
+            sizeof(int32_t));
         g->dspark_raw_pack = ds4_gpu_tensor_alloc(
             dspark_runtime_memory.raw_pack_bytes);
         g->dspark_main_x = ds4_gpu_tensor_alloc(
@@ -22375,6 +22783,8 @@ static bool metal_graph_alloc_raw_cap(
             dspark_runtime_memory.raw_projected_bytes);
         g->dspark_raw_normalized = ds4_gpu_tensor_alloc(
             dspark_runtime_memory.raw_normalized_bytes);
+        g->dspark_attention_staging = ds4_gpu_tensor_alloc(
+            dspark_runtime_memory.two_source_attention_staging_bytes);
         const uint64_t raw_ring_bytes =
             dspark_runtime_memory.raw_ring_bytes /
             DS4_DSPARK_CAPTURE_STAGE_COUNT;
@@ -22460,6 +22870,9 @@ static bool metal_graph_alloc_raw_cap(
     g->batch_routed_down = ds4_gpu_tensor_alloc(pc * DS4_N_EXPERT_USED * DS4_N_EMBD * sizeof(float));
     g->batch_routed_out = ds4_gpu_tensor_alloc(pc * DS4_N_EMBD * sizeof(float));
 
+    const bool dspark_stage_views_ok = !enable_dspark ||
+        metal_graph_dspark_stage_views_alloc(g);
+
     bool layer_cache_ok = true;
     for (uint32_t il = 0; layer_cache_ok && il < DS4_N_LAYER; il++) {
         layer_cache_ok = g->layer_raw_cache[il] != NULL;
@@ -22481,6 +22894,7 @@ static bool metal_graph_alloc_raw_cap(
             g, verifier_snapshot.frontier_enabled,
             verifier_snapshot.prefix1_enabled);
     const bool ok = state_init_ok && layer_cache_ok && verifier_frontier_ok &&
+                    dspark_stage_views_ok &&
                     g->cur_hc && g->flat_hc && g->hc_mix && g->hc_split &&
                     g->hc_pre && g->hc_post && g->hc_comb &&
                     g->attn_cur && g->attn_norm && g->qr && g->qr_norm &&
@@ -22512,6 +22926,8 @@ static bool metal_graph_alloc_raw_cap(
                       g->dspark_verify_capture[2])) &&
                     (!enable_dspark ||
                      metal_graph_dspark_raw_storage_valid(g)) &&
+                    (!enable_dspark ||
+                     metal_graph_dspark_proposal_storage_valid(g)) &&
                     (!enable_mtp ||
                      (g->mtp_embed && g->mtp_enorm && g->mtp_eproj &&
                       g->mtp_eproj_hc && g->mtp_hnorm_hc && g->mtp_hproj_hc &&
