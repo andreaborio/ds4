@@ -45,13 +45,27 @@ two-phase caller; it is not wired to the runtime and does not change the exact
 sampling equations above. It reproduces the runtime's xorshift64* transition
 and high-24-bit uniform exactly, including greedy and sampled fallback paths
 that consume no draw. A ledger records `rng_after[C]` for every inspected token
-prefix. `commit(adopted_count, observed_count)` normally receives equal counts,
-but a sampled EOS or think-stop uses `observed_count = adopted_count + 1`: its
-draw is published even though the terminal token is not evaluated by the target
-or adopted into the generated block. Any synthetic terminal framing appended
-after the generation loop remains frontend ownership. Proposal and acceptance
-subdraws are deterministic, position-indexed, domain-separated functions that
-cannot advance public RNG state.
+prefix. `commit(adopted_count, observed_count, mode)` has two explicit
+dispositions. `adopted_count` is always the block-token prefix adopted into
+caller-visible output before the disposition is chosen. `RETAIN` additionally
+preserves that output prefix as reusable target/session state and therefore
+permits only `observed_count == adopted_count` or one additional sampled
+EOS/think-stop token. `INVALIDATE` handles a byte-level stop string or delivery
+failure that may be detected only after several block tokens have been
+inspected; it permits any
+`0 <= adopted_count <= observed_count <= block_count`. That disposition
+destroys the target/session state; it does not preserve `adopted_count` as a
+reusable session prefix, so the caller must rebuild before further target work,
+but the RNG ownership oracle still publishes exactly
+`rng_after[observed_count]`. It never publishes a later suffix ticket. Any
+synthetic terminal framing appended after the generation loop remains frontend
+ownership. In both modes the absolute public-ticket position advances by
+`observed_count`, including deterministic fallback tickets that consumed no
+xorshift draw. `INVALIDATE` therefore preserves the exact public RNG
+state+position boundary for a rebuilt target/session; it never authorizes
+reuse of the invalidated target state. Proposal and acceptance subdraws are
+deterministic, position-indexed, domain-separated functions that cannot advance
+public RNG state.
 
 That separation is necessary rather than cosmetic. In a conventional eager
 single stream, all proposal draws precede acceptance draws; a partial caller

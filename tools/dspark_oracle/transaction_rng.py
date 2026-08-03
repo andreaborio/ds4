@@ -28,13 +28,19 @@ output position, including a terminal token that may not become visible.
 for that position consumes a categorical uniform.  That
 schedule is attached only after the verifier has produced a block; it cannot
 be an input to eager proposal generation.  The ledger publishes only the first
-``observed_count`` tickets at ``commit(adopted_count, observed_count)``.
-Usually the counts are equal.  A sampled EOS or think-stop is the one allowed
-exception: sampling inspected the terminal token and may have consumed its RNG
-draw, but that token is not evaluated by the target or adopted into the
-generated block, so ``observed_count == adopted_count + 1``.  Any synthetic
-terminal framing added after the loop remains frontend ownership.  Proposal
-and acceptance uniforms are
+``observed_count`` tickets at
+``commit(adopted_count, observed_count, mode)``.  ``adopted_count`` is always
+the block-token prefix the caller adopted into its output before choosing the
+disposition.  ``RETAIN`` also preserves that prefix as reusable target/session
+state and therefore allows only equal counts or one terminal token sampled but
+not adopted.  ``INVALIDATE`` covers byte-level stop strings and delivery
+failures: detection may inspect several block tokens past the caller-adopted
+output prefix, so it permits any
+``adopted_count <= observed_count <= block_count``.  The target/session state
+is unusable after that disposition and must be rebuilt, but the public RNG
+ledger still publishes exactly ``rng_after[observed_count]``; later block
+tickets never leak into it.  Any synthetic terminal framing added after the
+loop remains frontend ownership.  Proposal and acceptance uniforms are
 explicit domain-separated functions of the transaction's stable starting
 state and absolute public-ticket position; calculating them never advances
 public RNG state.
@@ -52,6 +58,7 @@ remain owned by ``reference.speculative_sample_exact``.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from enum import Enum
 import hashlib
 import math
 import struct
@@ -79,6 +86,13 @@ class TransactionRngError(ValueError):
 
 class StaleTransactionError(TransactionRngError):
     """A transaction cookie does not identify the active transaction."""
+
+
+class CommitMode(Enum):
+    """Whether the caller may retain the target/session state after commit."""
+
+    RETAIN = "retain"
+    INVALIDATE = "invalidate"
 
 
 def _require_u64(value: int, name: str) -> int:
@@ -194,8 +208,10 @@ def _draw_schedule(values: Iterable[bool]) -> tuple[bool, ...]:
 class TransactionRngLedger:
     """The publishable RNG states for every inspected block prefix.
 
-    The final inspected position may be a terminal token that is deliberately
-    absent from the adopted target/session prefix.
+    In RETAIN mode the final inspected position may be one terminal token that
+    is absent from the caller-adopted output prefix, which is also preserved as
+    reusable target/session state.  INVALIDATE may inspect a longer prefix,
+    but it destroys the target/session state and requires a rebuild.
     """
 
     transaction_id: int
@@ -473,32 +489,48 @@ class TransactionalRng:
         transaction_id: int,
         adopted_count: int,
         observed_count: int,
+        mode: CommitMode,
     ) -> int:
-        """Publish the RNG state for observations, separate from adoption.
+        """Publish the exact observed RNG prefix under one target disposition.
 
-        ``adopted_count`` is the prefix made visible to the target/session.
-        ``observed_count`` also includes one terminal token sampled but not
-        evaluated by the target or adopted into the generated block.  This
-        RNG-only oracle validates that relationship; the caller remains
-        responsible for committing exactly ``adopted_count`` rows to its
-        target frontier.  Synthetic post-loop terminal framing is outside this
-        oracle.
+        ``adopted_count`` is the block-token prefix adopted into caller-visible
+        output before the disposition is chosen.  In ``RETAIN`` mode that
+        output prefix is also preserved as reusable target/session state, and
+        ``observed_count`` may additionally include only one terminal token
+        sampled but not evaluated or adopted.  In ``INVALIDATE`` mode, a
+        multi-token byte stop or delivery failure may have inspected any longer
+        prefix inside the published block; the disposition destroys the target
+        state rather than retaining ``adopted_count`` as a reusable session
+        prefix.  The caller must rebuild before further target work.  This
+        RNG-only oracle deliberately
+        preserves the public ledger across that invalidation and never
+        publishes tickets after ``observed_count``.  The absolute public-ticket
+        position advances by ``observed_count`` even when deterministic
+        fallback tickets consumed no xorshift draw.  Synthetic post-loop
+        terminal framing is outside this oracle.
         """
 
         self._require_active(transaction_id)
         if self._ledger is None:
             raise TransactionRngError("transaction has no published block")
+        if not isinstance(mode, CommitMode):
+            raise TransactionRngError("mode must be a CommitMode")
         for value, name in (
             (adopted_count, "adopted_count"),
             (observed_count, "observed_count"),
         ):
             if isinstance(value, bool) or not isinstance(value, int):
                 raise TransactionRngError(f"{name} must be an integer")
-        if adopted_count < 0 or observed_count < adopted_count:
-            raise TransactionRngError("observed_count must cover the adopted prefix")
-        if observed_count > adopted_count + 1:
+        if (adopted_count < 0
+                or observed_count < adopted_count
+                or observed_count > self._ledger.block_count):
             raise TransactionRngError(
-                "at most one unadopted terminal observation is allowed"
+                "counts must satisfy 0 <= adopted_count <= observed_count "
+                "<= block_count"
+            )
+        if mode is CommitMode.RETAIN and observed_count > adopted_count + 1:
+            raise TransactionRngError(
+                "RETAIN allows at most one unadopted terminal observation"
             )
         state = self._ledger.state_after_observed(observed_count)
         if self._position > U64_MASK - observed_count:

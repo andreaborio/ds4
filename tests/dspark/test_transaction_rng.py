@@ -13,6 +13,7 @@ ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
 
 from tools.dspark_oracle.transaction_rng import (  # noqa: E402
+    CommitMode,
     MAX_DSPARK_BLOCK_COUNT,
     SamplingPolicy,
     StaleTransactionError,
@@ -102,7 +103,7 @@ class TransactionLedgerTests(unittest.TestCase):
             ),
         )
         self.assertEqual(
-            rng.commit(reservation.transaction_id, 4, 4),
+            rng.commit(reservation.transaction_id, 4, 4, CommitMode.RETAIN),
             ledger.rng_after[4],
         )
         self.assertEqual(rng.state, 0xA9D6C08A3025649E)
@@ -115,7 +116,7 @@ class TransactionLedgerTests(unittest.TestCase):
         old_future_uniform = first.canonical_uniforms([True] * 5)[2]
         rng.publish(first.transaction_id, 5, [True] * 5)
         self.assertEqual(
-            rng.commit(first.transaction_id, 2, 2),
+            rng.commit(first.transaction_id, 2, 2, CommitMode.RETAIN),
             0xEBFF37A39F313BF6,
         )
         self.assertEqual(rng.stream_position, 43)
@@ -132,14 +133,17 @@ class TransactionLedgerTests(unittest.TestCase):
             same_boundary.auxiliary_uniform("proposal", 0),
         )
         rng.publish(resumed.transaction_id, 3, [True, True, True])
-        rng.commit(resumed.transaction_id, 0, 0)
+        rng.commit(resumed.transaction_id, 0, 0, CommitMode.RETAIN)
 
     def test_commit_zero_restores_rng_and_ordinary_fallback_draw(self) -> None:
         rng = TransactionalRng(1, stream_position=9)
         reservation = rng.begin(SAMPLED, 3)
         pending_uniform = reservation.canonical_uniforms([True, True, True])[0]
         rng.publish(reservation.transaction_id, 3, [True, True, True])
-        self.assertEqual(rng.commit(reservation.transaction_id, 0, 0), 1)
+        self.assertEqual(
+            rng.commit(reservation.transaction_id, 0, 0, CommitMode.RETAIN),
+            1,
+        )
         self.assertEqual(rng.state, 1)
         self.assertEqual(rng.stream_position, 9)
 
@@ -158,6 +162,7 @@ class TransactionLedgerTests(unittest.TestCase):
                 reservation.transaction_id,
                 adopted_count=0,
                 observed_count=1,
+                mode=CommitMode.RETAIN,
             ),
             ledger.rng_after[1],
         )
@@ -165,7 +170,7 @@ class TransactionLedgerTests(unittest.TestCase):
         self.assertEqual(rng.stream_position, 42)
         self.assertEqual(target_frontier + 0, target_frontier)
 
-    def test_suffix_stop_publishes_observed_draw_but_not_later_suffix(self) -> None:
+    def test_terminal_stop_publishes_observed_draw_but_not_later_suffix(self) -> None:
         target_frontier = 100
         rng = TransactionalRng(SEED, stream_position=41)
         reservation = rng.begin(SAMPLED, 4)
@@ -176,6 +181,7 @@ class TransactionLedgerTests(unittest.TestCase):
                 reservation.transaction_id,
                 adopted_count=2,
                 observed_count=3,
+                mode=CommitMode.RETAIN,
             ),
             ledger.rng_after[3],
         )
@@ -188,6 +194,77 @@ class TransactionLedgerTests(unittest.TestCase):
         resumed = rng.begin(SAMPLED, 1)
         fourth_uniform = reservation.canonical_uniforms([True] * 4)[3]
         self.assertEqual(resumed.canonical_uniforms([True])[0], fourth_uniform)
+
+    def test_multitoken_stop_c0_o3_invalidates_but_preserves_rng_boundary(self) -> None:
+        rng = TransactionalRng(SEED, stream_position=41)
+        reservation = rng.begin(SAMPLED, 5)
+        schedule = [False, True, False, True, True]
+        ledger = rng.publish(reservation.transaction_id, 5, schedule)
+
+        self.assertEqual(
+            rng.commit(
+                reservation.transaction_id,
+                adopted_count=0,
+                observed_count=3,
+                mode=CommitMode.INVALIDATE,
+            ),
+            ledger.rng_after[3],
+        )
+        self.assertEqual(rng.state, 0xA69CF1E9AA4D68FC)
+        # Public ticket position counts observations even where categorical
+        # fallback consumed no xorshift draw.
+        self.assertEqual(rng.stream_position, 44)
+        self.assertFalse(rng.active)
+
+        # INVALIDATE makes the old target/session unusable.  A caller may
+        # transfer this exact state+position boundary only to rebuilt target
+        # state; the unobserved fourth ticket is still the next public draw.
+        replacement_rng = TransactionalRng(rng.state, rng.stream_position)
+        rebuilt = replacement_rng.begin(SAMPLED, 1)
+        self.assertEqual(
+            rebuilt.canonical_uniforms([True])[0],
+            reservation.canonical_uniforms(schedule)[3],
+        )
+        observed_position_control = TransactionalRng(
+            rng.state, stream_position=44
+        ).begin(SAMPLED, 1)
+        stale_position_control = TransactionalRng(
+            rng.state, stream_position=41
+        ).begin(SAMPLED, 1)
+        self.assertEqual(
+            rebuilt.auxiliary_uniform("proposal", 0),
+            observed_position_control.auxiliary_uniform("proposal", 0),
+        )
+        self.assertNotEqual(
+            rebuilt.auxiliary_uniform("proposal", 0),
+            stale_position_control.auxiliary_uniform("proposal", 0),
+        )
+
+    def test_multitoken_stop_c2_o5_never_publishes_later_suffix(self) -> None:
+        rng = TransactionalRng(SEED, stream_position=41)
+        reservation = rng.begin(SAMPLED, 7)
+        ledger = rng.publish(reservation.transaction_id, 7, [True] * 7)
+
+        self.assertEqual(
+            rng.commit(
+                reservation.transaction_id,
+                adopted_count=2,
+                observed_count=5,
+                mode=CommitMode.INVALIDATE,
+            ),
+            ledger.rng_after[5],
+        )
+        self.assertEqual(rng.state, ledger.rng_after[5])
+        self.assertNotEqual(rng.state, ledger.rng_after[6])
+        self.assertNotEqual(rng.state, ledger.rng_after[7])
+        self.assertEqual(rng.stream_position, 46)
+
+        replacement_rng = TransactionalRng(rng.state, rng.stream_position)
+        rebuilt = replacement_rng.begin(SAMPLED, 1)
+        self.assertEqual(
+            rebuilt.canonical_uniforms([True])[0],
+            reservation.canonical_uniforms([True] * 7)[5],
+        )
 
     def test_mixed_draw_and_no_draw_schedule(self) -> None:
         rng = TransactionalRng(SEED, stream_position=100)
@@ -211,7 +288,7 @@ class TransactionLedgerTests(unittest.TestCase):
         self.assertEqual(uniforms[3], 0.8337453603744507)
 
         self.assertEqual(
-            rng.commit(reservation.transaction_id, 3, 3),
+            rng.commit(reservation.transaction_id, 3, 3, CommitMode.RETAIN),
             0xA69CF1E9AA4D68FC,
         )
         self.assertEqual(rng.stream_position, 103)
@@ -231,13 +308,13 @@ class TransactionLedgerTests(unittest.TestCase):
             greedy.auxiliary_uniform("proposal", 0)
         with self.assertRaises(TransactionRngError):
             greedy.dspark_round_uniforms(1, [False, False, False])
-        greedy_rng.commit(greedy.transaction_id, 3, 3)
+        greedy_rng.commit(greedy.transaction_id, 3, 3, CommitMode.RETAIN)
         self.assertEqual(greedy_rng.state, SEED)
 
         fallback_rng = TransactionalRng(SEED)
         fallback = fallback_rng.begin(SAMPLED, 2)
         fallback_rng.publish(fallback.transaction_id, 2, [False, False])
-        fallback_rng.commit(fallback.transaction_id, 2, 2)
+        fallback_rng.commit(fallback.transaction_id, 2, 2, CommitMode.RETAIN)
         self.assertEqual(fallback_rng.state, SEED)
         self.assertEqual(fallback_rng.stream_position, 2)
 
@@ -262,7 +339,7 @@ class TransactionLedgerTests(unittest.TestCase):
         ledger = rng.publish(reservation.transaction_id, 2, [True, True])
         self.assertEqual(ledger.rng_after, (SEED, first_state, second_state))
         self.assertEqual(
-            rng.commit(reservation.transaction_id, 2, 2),
+            rng.commit(reservation.transaction_id, 2, 2, CommitMode.RETAIN),
             second_state,
         )
 
@@ -321,7 +398,7 @@ class TransactionLedgerTests(unittest.TestCase):
         first = rng.begin(SAMPLED, 3)
         first_fingerprint = first.policy.fingerprint()
         rng.publish(first.transaction_id, 3, [True, False, True])
-        rng.commit(first.transaction_id, 2, 2)
+        rng.commit(first.transaction_id, 2, 2, CommitMode.RETAIN)
 
         changed = SamplingPolicy(temperature=1.0, top_k=32, top_p=0.8, min_p=0.1)
         second = rng.begin(changed, 2)
@@ -346,7 +423,9 @@ class TransactionLifecycleTests(unittest.TestCase):
         with self.assertRaises(StaleTransactionError):
             rng.publish(reservation.transaction_id + 1, 1, [True])
         with self.assertRaises(TransactionRngError):
-            rng.commit(reservation.transaction_id, 0, 0)
+            rng.commit(
+                reservation.transaction_id, 0, 0, CommitMode.RETAIN
+            )
         with self.assertRaises(TransactionRngError):
             rng.publish(True, 1, [True])
         with self.assertRaises(TransactionRngError):
@@ -358,16 +437,20 @@ class TransactionLifecycleTests(unittest.TestCase):
         with self.assertRaises(TransactionRngError):
             rng.publish(reservation.transaction_id, 2, [True, True])
         with self.assertRaises(TransactionRngError):
-            rng.commit(reservation.transaction_id, 3, 3)
-        rng.commit(reservation.transaction_id, 1, 1)
+            rng.commit(
+                reservation.transaction_id, 3, 3, CommitMode.RETAIN
+            )
+        rng.commit(reservation.transaction_id, 1, 1, CommitMode.RETAIN)
         with self.assertRaises(StaleTransactionError):
-            rng.commit(reservation.transaction_id, 0, 0)
+            rng.commit(
+                reservation.transaction_id, 0, 0, CommitMode.RETAIN
+            )
 
         next_reservation = rng.begin(SAMPLED, 1)
         with self.assertRaises(StaleTransactionError):
             rng.publish(reservation.transaction_id, 1, [True])
         rng.publish(next_reservation.transaction_id, 1, [True])
-        rng.commit(next_reservation.transaction_id, 0, 0)
+        rng.commit(next_reservation.transaction_id, 0, 0, CommitMode.RETAIN)
 
     def test_adopted_and_observed_counts_fail_closed(self) -> None:
         invalid_counts = (
@@ -393,8 +476,55 @@ class TransactionLifecycleTests(unittest.TestCase):
                         reservation.transaction_id,
                         adopted_count,  # type: ignore[arg-type]
                         observed_count,  # type: ignore[arg-type]
+                        CommitMode.RETAIN,
                     )
                 self.assertEqual(rng.__dict__, snapshot)
+
+        invalid_invalidate_counts = (
+            (-1, 0),
+            (1, 0),
+            (0, 3),
+            (3, 3),
+            (True, 1),
+            (0, False),
+        )
+        for adopted_count, observed_count in invalid_invalidate_counts:
+            with self.subTest(
+                mode=CommitMode.INVALIDATE,
+                adopted_count=adopted_count,
+                observed_count=observed_count,
+            ):
+                rng = TransactionalRng(SEED)
+                reservation = rng.begin(SAMPLED, 2)
+                rng.publish(reservation.transaction_id, 2, [True, True])
+                snapshot = dict(rng.__dict__)
+                with self.assertRaises(TransactionRngError):
+                    rng.commit(
+                        reservation.transaction_id,
+                        adopted_count,  # type: ignore[arg-type]
+                        observed_count,  # type: ignore[arg-type]
+                        CommitMode.INVALIDATE,
+                    )
+                self.assertEqual(rng.__dict__, snapshot)
+
+    def test_invalid_commit_mode_fails_closed(self) -> None:
+        rng = TransactionalRng(SEED)
+        reservation = rng.begin(SAMPLED, 2)
+        rng.publish(reservation.transaction_id, 2, [True, True])
+
+        for mode in (None, "retain", "invalidate", 0, True):
+            with self.subTest(mode=mode):
+                snapshot = dict(rng.__dict__)
+                with self.assertRaises(TransactionRngError):
+                    rng.commit(
+                        reservation.transaction_id,
+                        0,
+                        0,
+                        mode,  # type: ignore[arg-type]
+                    )
+                self.assertEqual(rng.__dict__, snapshot)
+
+        rng.commit(reservation.transaction_id, 0, 0, CommitMode.RETAIN)
 
     def test_cookie_exhaustion_and_invalid_begin_are_byte_identical(self) -> None:
         rng = TransactionalRng(SEED)
@@ -409,7 +539,7 @@ class TransactionLifecycleTests(unittest.TestCase):
         final = rng.begin(SAMPLED, 1)
         self.assertEqual(final.transaction_id, (1 << 64) - 1)
         rng.publish(final.transaction_id, 1, [False])
-        rng.commit(final.transaction_id, 0, 0)
+        rng.commit(final.transaction_id, 0, 0, CommitMode.RETAIN)
 
         snapshot = dict(rng.__dict__)
         with self.assertRaises(TransactionRngError):
