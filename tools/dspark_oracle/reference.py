@@ -113,6 +113,28 @@ class DraftHead:
 
 
 @dataclass(frozen=True)
+class DisconnectedProposal:
+    """One model-free three-stage proposal through the final DSpark heads.
+
+    The stage bodies are deliberately small affine stand-ins.  Attention and
+    MoE numerics have their own payload-first checkpoints; this object freezes
+    the missing orchestration contract: every stage consumes the previous HC
+    output and the same immutable ``main_x``, then the final HC head feeds the
+    target output matrix, sequential Markov correction, and confidence head.
+    """
+
+    stage_outputs: tuple[np.ndarray, np.ndarray, np.ndarray]
+    head_hidden: np.ndarray
+    head_normalized: np.ndarray
+    base_logits: np.ndarray
+    previous_tokens: np.ndarray
+    markov_embeddings: np.ndarray
+    draft_tokens: np.ndarray
+    corrected_logits: np.ndarray
+    confidence: ConfidenceSchedule
+
+
+@dataclass(frozen=True)
 class RawCacheState:
     """Three independent physical rings and their shared logical window."""
 
@@ -406,7 +428,21 @@ def _round_bfloat16(value: np.ndarray) -> np.ndarray:
     bits = np.array(result, copy=True).view(np.uint32)
     rounding = np.uint32(0x7FFF) + ((bits >> np.uint32(16)) & np.uint32(1))
     rounded = (bits + rounding) & np.uint32(0xFFFF0000)
-    return rounded.view(np.float32)
+    published = rounded.view(np.float32)
+    if not np.all(np.isfinite(published)):
+        raise ValueError("BF16 publication produced a non-finite value")
+    return published
+
+
+def _require_finite_publication(
+    value: np.ndarray, name: str,
+) -> np.ndarray:
+    """Reject a derived proposal value before it can enter the result."""
+
+    result = np.asarray(value)
+    if not np.all(np.isfinite(result)):
+        raise ValueError(f"{name} publication produced a non-finite value")
+    return result
 
 
 def _linear_bfloat16(value: np.ndarray, weight: np.ndarray) -> np.ndarray:
@@ -456,6 +492,45 @@ def _q_head_norm_bfloat16(value: np.ndarray, *, eps: float) -> np.ndarray:
         np.float32(1.0) / np.sqrt(added)
     )
     return _round_bfloat16(source * inverse_rms)
+
+
+def _hc_head_bfloat16(
+    hidden: np.ndarray,
+    function: np.ndarray,
+    scale: np.ndarray,
+    base: np.ndarray,
+    *,
+    norm_eps: float,
+    hc_eps: float,
+) -> np.ndarray:
+    """Evaluate the official final HC head in F32 and publish BF16."""
+
+    source = np.asarray(hidden, dtype=np.float32)
+    rows = source.reshape(source.shape[0], -1)
+    variance = np.mean(
+        np.square(rows), axis=-1, keepdims=True, dtype=np.float32
+    )
+    inverse_rms = (
+        np.float32(1.0)
+        / np.sqrt(variance + np.float32(norm_eps)).astype(np.float32)
+    )
+    mixes = np.einsum(
+        "rf,of->ro", rows, function,
+        dtype=np.float32, optimize=False,
+    ) * inverse_rms
+    logits = mixes * np.float32(scale[0]) + base
+    pre = np.empty_like(logits, dtype=np.float32)
+    positive = logits >= np.float32(0.0)
+    pre[positive] = np.float32(1.0) / (
+        np.float32(1.0) + np.exp(-logits[positive]).astype(np.float32)
+    )
+    negative_exp = np.exp(logits[~positive]).astype(np.float32)
+    pre[~positive] = negative_exp / (np.float32(1.0) + negative_exp)
+    pre += np.float32(hc_eps)
+    collapsed = np.sum(
+        pre[..., None] * source, axis=1, dtype=np.float32
+    )
+    return _round_bfloat16(collapsed)
 
 
 def _rope_tail_bfloat16(
@@ -1434,6 +1509,240 @@ def finalize_draft_head(
     )
     return DraftHead(
         collapsed, base_logits, tokens, corrected, confidence
+    )
+
+
+def disconnected_three_stage_proposal(
+    initial_hc: np.ndarray,
+    main_x: Sequence[float] | np.ndarray,
+    stage_weights: Sequence[object],
+    stage_main_weights: Sequence[object],
+    stage_biases: np.ndarray,
+    head_function_weight: object,
+    head_scale: Sequence[float] | np.ndarray,
+    head_base: Sequence[float] | np.ndarray,
+    head_norm_weight: Sequence[float] | np.ndarray,
+    target_output_weight: object,
+    markov_w1: object,
+    markov_w2: object,
+    confidence_weight: object,
+    pending_token_id: int,
+    *,
+    confidence_threshold: float,
+    norm_eps: float = 1.0e-6,
+    hc_eps: float = 1.0e-6,
+) -> DisconnectedProposal:
+    """Compose the disconnected three-stage proposal and final heads.
+
+    Each synthetic stage publishes BF16 after
+
+    ``current_hc @ stage_weight.T + main_x @ stage_main_weight.T + bias``.
+
+    The affine body is not an attention or MoE approximation.  It is a compact
+    topology discriminator around the separately qualified stage primitives.
+    The same read-only ``main_x`` enters all three bodies, while ``current_hc``
+    is replaced only by the preceding stage's published HC output.
+
+    The final path follows the pinned 0731 equations and dtype boundaries:
+    HC collapse to BF16, RMSNorm to BF16, target output in F32, then a
+    sequential Q8-payload-derived Markov correction.  The confidence features
+    are ``[HC pre-norm hidden, W1(previous)]`` for previous tokens exactly
+    ``[pending, d0, d1, d2, d3]``.  No caller-visible result exists if any
+    input fails validation because all geometry and finiteness checks happen
+    before the first stage is evaluated.
+    """
+
+    hidden = np.asarray(initial_hc, dtype=np.float32)
+    main = np.asarray(main_x, dtype=np.float32)
+    biases = np.asarray(stage_biases, dtype=np.float32)
+    if hidden.ndim != 3 or hidden.shape[:2] != (DSPARK_PROPOSAL_ROWS, 4):
+        raise ValueError("initial_hc must have shape [5, 4, hidden]")
+    width = hidden.shape[2]
+    if width <= 0 or main.shape != (width,):
+        raise ValueError("main_x must have shape [hidden]")
+    if len(stage_weights) != DSPARK_STAGE_COUNT or len(
+        stage_main_weights
+    ) != DSPARK_STAGE_COUNT:
+        raise ValueError("proposal requires exactly three stage weight pairs")
+    opened_stage = tuple(
+        _payload_matrix(value, f"stage {index} weight")
+        for index, value in enumerate(stage_weights)
+    )
+    opened_main = tuple(
+        _payload_matrix(value, f"stage {index} main weight")
+        for index, value in enumerate(stage_main_weights)
+    )
+    if any(value.shape != (width, width) for value in opened_stage):
+        raise ValueError("stage weights must each have shape [hidden, hidden]")
+    if any(value.shape != (width, width) for value in opened_main):
+        raise ValueError(
+            "stage main weights must each have shape [hidden, hidden]"
+        )
+    if biases.shape != (DSPARK_STAGE_COUNT, width):
+        raise ValueError("stage_biases must have shape [3, hidden]")
+
+    head_function = _payload_matrix(
+        head_function_weight, "HC head function weight"
+    )
+    head_scales = np.asarray(head_scale, dtype=np.float32).reshape(-1)
+    head_bases = np.asarray(head_base, dtype=np.float32).reshape(-1)
+    norm = np.asarray(head_norm_weight, dtype=np.float32).reshape(-1)
+    output = _payload_matrix(target_output_weight, "target output weight")
+    w1 = _payload_matrix(markov_w1, "markov W1")
+    w2 = _payload_matrix(markov_w2, "markov W2")
+    confidence_projection = _payload_matrix(
+        confidence_weight, "confidence weight"
+    )
+    if head_function.shape != (4, 4 * width):
+        raise ValueError("HC head function must have shape [4, 4 * hidden]")
+    if head_scales.shape != (1,) or head_bases.shape != (4,):
+        raise ValueError("HC head scale/base geometry mismatch")
+    if norm.shape != (width,):
+        raise ValueError("head norm weight must have shape [hidden]")
+    if output.ndim != 2 or output.shape[1] != width or output.shape[0] < 2:
+        raise ValueError("target output weight must have shape [vocab, hidden]")
+    vocab = output.shape[0]
+    if w1.ndim != 2 or w2.shape != w1.shape or w1.shape[0] != vocab:
+        raise ValueError("Markov W1/W2 must have shape [vocab, rank]")
+    rank = w1.shape[1]
+    if rank <= 0:
+        raise ValueError("Markov rank must be positive")
+    if confidence_projection.shape != (1, width + rank):
+        raise ValueError(
+            "confidence weight must have shape [1, hidden + markov rank]"
+        )
+    if isinstance(pending_token_id, bool) or not isinstance(
+        pending_token_id, (int, np.integer)
+    ):
+        raise ValueError("pending_token_id must be an integer token id")
+    if pending_token_id < 0 or pending_token_id >= vocab:
+        raise ValueError("pending_token_id is outside the target vocabulary")
+    if (not np.isfinite(float(norm_eps)) or norm_eps <= 0.0 or
+            not np.isfinite(float(hc_eps)) or hc_eps <= 0.0):
+        raise ValueError("proposal epsilons must be finite and positive")
+    if (not np.isfinite(float(confidence_threshold)) or
+            confidence_threshold < 0.0 or confidence_threshold > 1.0):
+        raise ValueError("confidence threshold must be finite and inside [0, 1]")
+    finite_values = (
+        hidden, main, biases, head_function, head_scales, head_bases,
+        norm, output, w1, w2, confidence_projection,
+        *opened_stage, *opened_main,
+    )
+    if not all(np.all(np.isfinite(value)) for value in finite_values):
+        raise ValueError("proposal inputs and reopened payloads must be finite")
+
+    # All validation is complete.  From this point every publication is a new
+    # private array; callers' initial HC and main_x buffers remain immutable.
+    current = _round_bfloat16(np.array(hidden, copy=True))
+    frozen_main = np.array(main, copy=True)
+    outputs: list[np.ndarray] = []
+    for stage in range(DSPARK_STAGE_COUNT):
+        with np.errstate(over="ignore", invalid="ignore"):
+            branch = np.einsum(
+                "rlh,dh->rld", current, opened_stage[stage],
+                dtype=np.float32, optimize=False,
+            )
+            main_branch = np.einsum(
+                "h,dh->d", frozen_main, opened_main[stage],
+                dtype=np.float32, optimize=False,
+            )
+            branch = branch + main_branch[None, None, :] + biases[stage]
+        _require_finite_publication(branch, f"stage {stage} F32 output")
+        current = _round_bfloat16(branch)
+        _require_finite_publication(current, f"stage {stage} BF16 output")
+        outputs.append(np.array(current, copy=True))
+
+    with np.errstate(over="ignore", invalid="ignore"):
+        collapsed = _hc_head_bfloat16(
+            current,
+            head_function,
+            head_scales,
+            head_bases,
+            norm_eps=norm_eps,
+            hc_eps=hc_eps,
+        )
+    _require_finite_publication(collapsed, "head hidden BF16")
+    with np.errstate(over="ignore", invalid="ignore"):
+        normalized = _rms_norm_bfloat16(collapsed, norm, eps=norm_eps)
+    _require_finite_publication(normalized, "head norm BF16")
+    with np.errstate(over="ignore", invalid="ignore"):
+        base_logits = np.einsum(
+            "rh,vh->rv", normalized, output,
+            dtype=np.float32, optimize=False,
+        )
+    _require_finite_publication(base_logits, "target base logits F32")
+
+    drafted = np.empty(DSPARK_PROPOSAL_ROWS, dtype=np.int64)
+    previous_tokens = np.empty(DSPARK_PROPOSAL_ROWS, dtype=np.int64)
+    markov_embeddings = np.empty(
+        (DSPARK_PROPOSAL_ROWS, rank), dtype=np.float32
+    )
+    corrected = np.empty_like(base_logits, dtype=np.float32)
+    previous = int(pending_token_id)
+    for position in range(DSPARK_PROPOSAL_ROWS):
+        previous_tokens[position] = previous
+        embed = _round_bfloat16(w1[previous])
+        _require_finite_publication(
+            embed, f"Markov embedding {position} BF16"
+        )
+        markov_embeddings[position] = embed
+        with np.errstate(over="ignore", invalid="ignore"):
+            bias = np.einsum(
+                "r,vr->v", embed, w2, dtype=np.float32, optimize=False
+            )
+        _require_finite_publication(bias, f"Markov bias {position} F32")
+        with np.errstate(over="ignore", invalid="ignore"):
+            corrected_row = base_logits[position] + bias
+        _require_finite_publication(
+            corrected_row, f"Markov corrected logits {position} F32"
+        )
+        corrected[position] = corrected_row
+        drafted[position] = int(np.argmax(corrected[position]))
+        previous = int(drafted[position])
+
+    features = np.concatenate((collapsed, markov_embeddings), axis=1)
+    with np.errstate(over="ignore", invalid="ignore"):
+        confidence_logits = np.einsum(
+            "rf,of->r", features, confidence_projection,
+            dtype=np.float32, optimize=False,
+        )
+    _require_finite_publication(confidence_logits, "confidence logits F32")
+    confidence_probabilities = np.empty_like(
+        confidence_logits, dtype=np.float32
+    )
+    positive = confidence_logits >= np.float32(0.0)
+    with np.errstate(over="ignore", invalid="ignore"):
+        confidence_probabilities[positive] = np.float32(1.0) / (
+            np.float32(1.0)
+            + np.exp(-confidence_logits[positive]).astype(np.float32)
+        )
+        negative_exp = np.exp(confidence_logits[~positive]).astype(np.float32)
+        confidence_probabilities[~positive] = negative_exp / (
+            np.float32(1.0) + negative_exp
+        )
+    _require_finite_publication(
+        confidence_probabilities, "confidence probabilities F32"
+    )
+    if confidence_threshold <= 0.0:
+        keep = DSPARK_PROPOSAL_ROWS
+    else:
+        below = np.flatnonzero(
+            confidence_probabilities < np.float32(confidence_threshold)
+        )
+        keep = int(below[0]) if below.size else DSPARK_PROPOSAL_ROWS
+    schedule = ConfidenceSchedule(
+        confidence_logits, confidence_probabilities, keep
+    )
+    return DisconnectedProposal(
+        tuple(outputs),
+        collapsed,
+        normalized,
+        base_logits,
+        previous_tokens,
+        markov_embeddings,
+        drafted,
+        corrected,
+        schedule,
     )
 
 

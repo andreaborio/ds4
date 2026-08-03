@@ -74,6 +74,14 @@ from tools.dspark_oracle.physical_fixture import (  # noqa: E402
     unpack_iq2_xxs,
     unpack_q2_k,
 )
+from tools.dspark_oracle.proposal_fixture import (  # noqa: E402
+    FROZEN_PROPOSAL_MANIFEST_SHA256,
+    PROPOSAL_CONFIDENCE_THRESHOLD,
+    PROPOSAL_HIDDEN_WIDTH,
+    PROPOSAL_MARKOV_RANK,
+    build_physical_proposal_fixture,
+    proposal_payload_manifest,
+)
 from tools.dspark_oracle.support_schema import (  # noqa: E402
     SupportHeader,
     SupportSchemaError,
@@ -89,6 +97,9 @@ from tools.dspark_oracle.support_schema import (  # noqa: E402
 FIXTURE_PATH = Path(__file__).with_name("fixtures-v1.json")
 PROVENANCE_PATH = ROOT / "tools" / "dspark_oracle" / "provenance.json"
 GENERATOR_PATH = ROOT / "tools" / "dspark_oracle" / "generate_fixtures.py"
+PROPOSAL_GENERATOR_PATH = (
+    ROOT / "tools" / "dspark_oracle" / "proposal_fixture.py"
+)
 DS4_SOURCE_PATH = ROOT / "ds4.c"
 DS4_METAL_SOURCE_PATH = ROOT / "ds4_metal.m"
 DSPARK_GRAPH_PATH = ROOT / "runtime" / "ds4_dspark_graph.inc"
@@ -2480,6 +2491,452 @@ class OracleFixtureTests(unittest.TestCase):
         self.assertFalse(np.allclose(
             wrong_confidence.logits, result.confidence.logits
         ))
+
+    def test_disconnected_three_stage_proposal_payload_manifest(self) -> None:
+        fixture = build_physical_proposal_fixture()
+        manifest = proposal_payload_manifest(fixture)
+        self.assertEqual(manifest["fixture_version"], 1)
+        self.assertEqual(manifest["geometry"], {
+            "proposal_rows": 5,
+            "hc_lanes": 4,
+            "hidden_width": 32,
+            "stage_count": 3,
+            "vocab": 8,
+            "markov_rank": 256,
+        })
+        self.assertEqual(manifest["pending_token"], 0)
+        self.assertEqual(manifest["confidence_threshold"], 0.5)
+        self.assertEqual(manifest["payload_bytes"], 13014)
+        self.assertEqual(
+            manifest["payload_sha256"],
+            "1984119eda4977ac3cb3f06b518dd240819799fb2b2ffdae7f13f34c8cd8fd96",
+        )
+        self.assertEqual(
+            manifest["initial_hc_sha256"],
+            "e4e1aab19ee6f54a48929584e8769d3156ee187e0faf1ca8e30bc3924f8145ff",
+        )
+        self.assertEqual(
+            manifest["main_x_sha256"],
+            "c7c33f4b07e3a2464867e1b9e3987cf3a51d03dbb45e96fdf02b0b046b1a9488",
+        )
+        canonical = json.dumps(
+            manifest, sort_keys=True, separators=(",", ":")
+        ).encode("utf-8")
+        self.assertEqual(
+            hashlib.sha256(canonical).hexdigest(),
+            FROZEN_PROPOSAL_MANIFEST_SHA256,
+        )
+        self.assertEqual(
+            manifest["weights"]["head_function_weight"]["storage"], "F16"
+        )
+        self.assertEqual(
+            manifest["weights"]["stage_biases"]["storage"], "F32"
+        )
+        for name in (
+            "stage_weight_0", "stage_weight_1", "stage_weight_2",
+            "stage_main_weight_0", "stage_main_weight_1",
+            "stage_main_weight_2", "target_output_weight", "markov_w1",
+            "markov_w2", "confidence_weight",
+        ):
+            self.assertEqual(manifest["weights"][name]["storage"], "Q8_0")
+
+    def test_disconnected_three_stage_proposal_is_one_coherent_chain(self) -> None:
+        fixture = build_physical_proposal_fixture()
+        hidden = np.asarray(fixture.inputs["initial_hc"])
+        main = np.asarray(fixture.inputs["main_x"])
+        hidden_before = np.array(hidden, copy=True)
+        main_before = np.array(main, copy=True)
+        result = dspark_reference.disconnected_three_stage_proposal(
+            **fixture.inputs
+        )
+
+        expected_hashes = {
+            "stage0": "89eb728a03459be8050d43910be6dbc90966e473099e8de241e821714acabf9e",
+            "stage1": "929e9af5f8d3667fc2f3b06f5f4d4bc2b10071993db5978e10e18772fe3e45e2",
+            "stage2": "477ec8fe01a66a15cd86acaf543486ad2402ff34279dd2dd08b59767bcfda355",
+            "head": "b3db792510507787f54c699cdb3b18b39ab552b900bc107847b3a687c0413801",
+            "norm": "70eda6a1998e9edfc7b3ebad8f0729b790606581f87e0239500ff43274268355",
+            "base": "0c7f725e79b4610023b2cb0fa4505414431cb9358b28bd63f2211a5cbbb97c0a",
+            "markov_embeddings": "c9d364479227164244fe08f0b9e5c4c101ca3913b243bf19b376ea25c88405d1",
+            "corrected": "afd5943f93f819fd7f6286b79a91485c09b25b2a660f5c0fd61f946266980892",
+            "confidence_logits": "2566d9117791a2ed760e2202e688b1125d8d1dbfa59e3c5b657574bc77162817",
+            "confidence_probabilities": "39d969af1e5e93bd89c1a7c6969e225e84283c53012946416d1315eafeb19737",
+        }
+        for index, stage in enumerate(result.stage_outputs):
+            self.assertEqual(
+                self._array_digest(stage, "<f4"),
+                expected_hashes[f"stage{index}"],
+            )
+        self.assertEqual(
+            self._array_digest(result.head_hidden, "<f4"),
+            expected_hashes["head"],
+        )
+        self.assertEqual(
+            self._array_digest(result.head_normalized, "<f4"),
+            expected_hashes["norm"],
+        )
+        self.assertEqual(
+            self._array_digest(result.base_logits, "<f4"),
+            expected_hashes["base"],
+        )
+        self.assertEqual(
+            self._array_digest(result.markov_embeddings, "<f4"),
+            expected_hashes["markov_embeddings"],
+        )
+        self.assertEqual(
+            self._array_digest(result.corrected_logits, "<f4"),
+            expected_hashes["corrected"],
+        )
+        self.assertEqual(
+            self._array_digest(result.confidence.logits, "<f4"),
+            expected_hashes["confidence_logits"],
+        )
+        self.assertEqual(
+            self._array_digest(result.confidence.probabilities, "<f4"),
+            expected_hashes["confidence_probabilities"],
+        )
+        np.testing.assert_array_equal(hidden, hidden_before)
+        np.testing.assert_array_equal(main, main_before)
+
+        # Stage 1 must consume stage 0, and stage 2 must consume stage 1.  A
+        # mutation at stage 1 leaves stage 0 exact but propagates through the
+        # final HC/head transaction.
+        stage_weights = list(fixture.inputs["stage_weights"])
+        changed_stage1 = np.array(
+            stage_weights[1].dequantized, dtype=np.float32, copy=True
+        )
+        changed_stage1[0, 0] += np.float32(0.5)
+        stage_weights[1] = changed_stage1
+        changed = dspark_reference.disconnected_three_stage_proposal(
+            **{**fixture.inputs, "stage_weights": tuple(stage_weights)}
+        )
+        np.testing.assert_array_equal(
+            changed.stage_outputs[0], result.stage_outputs[0]
+        )
+        self.assertFalse(np.array_equal(
+            changed.stage_outputs[1], result.stage_outputs[1]
+        ))
+        self.assertFalse(np.array_equal(
+            changed.stage_outputs[2], result.stage_outputs[2]
+        ))
+        self.assertFalse(np.array_equal(changed.head_hidden, result.head_hidden))
+
+        # The stage-specific transforms are ordered, while the one main_x is
+        # reused read-only by every stage rather than replaced by stage output.
+        reversed_result = dspark_reference.disconnected_three_stage_proposal(
+            **{
+                **fixture.inputs,
+                "stage_weights": tuple(reversed(fixture.inputs["stage_weights"])),
+                "stage_main_weights": tuple(reversed(
+                    fixture.inputs["stage_main_weights"]
+                )),
+                "stage_biases": np.asarray(
+                    fixture.inputs["stage_biases"]
+                )[::-1],
+            }
+        )
+        self.assertFalse(np.array_equal(
+            reversed_result.stage_outputs[-1], result.stage_outputs[-1]
+        ))
+        for changed_stage_index in range(3):
+            stage_main_weights = list(fixture.inputs["stage_main_weights"])
+            stage_main_weights[changed_stage_index] = np.zeros(
+                (PROPOSAL_HIDDEN_WIDTH, PROPOSAL_HIDDEN_WIDTH),
+                dtype=np.float32,
+            )
+            without_one_main_edge = (
+                dspark_reference.disconnected_three_stage_proposal(
+                    **{
+                        **fixture.inputs,
+                        "stage_main_weights": tuple(stage_main_weights),
+                    }
+                )
+            )
+            for prior in range(changed_stage_index):
+                np.testing.assert_array_equal(
+                    without_one_main_edge.stage_outputs[prior],
+                    result.stage_outputs[prior],
+                )
+            self.assertFalse(np.array_equal(
+                without_one_main_edge.stage_outputs[changed_stage_index],
+                result.stage_outputs[changed_stage_index],
+            ))
+
+        # Every stage boundary is a BF16 HC publication.  Skipping only the
+        # stage-zero publication must propagate into stage one and the final
+        # head instead of being hidden by the synthetic affine body.
+        original_round = dspark_reference._round_bfloat16
+        round_index = 0
+
+        def skip_stage_zero_publication(value: np.ndarray) -> np.ndarray:
+            nonlocal round_index
+            current_index = round_index
+            round_index += 1
+            if current_index == 1:  # ingress is 0, stage-zero output is 1
+                return np.asarray(value, dtype=np.float32)
+            return original_round(value)
+
+        with mock.patch.object(
+            dspark_reference,
+            "_round_bfloat16",
+            side_effect=skip_stage_zero_publication,
+        ):
+            skipped_stage_zero = (
+                dspark_reference.disconnected_three_stage_proposal(
+                    **fixture.inputs
+                )
+            )
+        self.assertFalse(np.array_equal(
+            skipped_stage_zero.stage_outputs[0], result.stage_outputs[0]
+        ))
+        self.assertFalse(np.array_equal(
+            skipped_stage_zero.stage_outputs[1], result.stage_outputs[1]
+        ))
+        self.assertFalse(np.array_equal(
+            skipped_stage_zero.head_hidden, result.head_hidden
+        ))
+
+    def test_disconnected_stage_chain_has_closed_form_propagation(self) -> None:
+        fixture = build_physical_proposal_fixture()
+        raw = (
+            np.arange(5 * 4 * PROPOSAL_HIDDEN_WIDTH, dtype=np.int64)
+            .reshape(5, 4, PROPOSAL_HIDDEN_WIDTH) % 5
+        ) - 2
+        initial = raw.astype(np.float32) / np.float32(128.0)
+        identity = np.eye(PROPOSAL_HIDDEN_WIDTH, dtype=np.float32)
+        zeros = np.zeros_like(identity)
+        result = dspark_reference.disconnected_three_stage_proposal(
+            **{
+                **fixture.inputs,
+                "initial_hc": initial,
+                "main_x": np.zeros(PROPOSAL_HIDDEN_WIDTH, dtype=np.float32),
+                "stage_weights": (
+                    identity * np.float32(2.0),
+                    identity * np.float32(3.0),
+                    identity * np.float32(4.0),
+                ),
+                "stage_main_weights": (zeros, zeros, zeros),
+                "stage_biases": np.zeros((3, 32), dtype=np.float32),
+            }
+        )
+        # Dyadic inputs and diagonal weights make these expected values a
+        # manual closed form, independent of fixture digests/reference output.
+        np.testing.assert_array_equal(result.stage_outputs[0], initial * 2.0)
+        np.testing.assert_array_equal(result.stage_outputs[1], initial * 6.0)
+        np.testing.assert_array_equal(result.stage_outputs[2], initial * 24.0)
+
+        changed_stage_zero = dspark_reference.disconnected_three_stage_proposal(
+            **{
+                **fixture.inputs,
+                "initial_hc": initial,
+                "main_x": np.zeros(PROPOSAL_HIDDEN_WIDTH, dtype=np.float32),
+                "stage_weights": (
+                    identity * np.float32(5.0),
+                    identity * np.float32(3.0),
+                    identity * np.float32(4.0),
+                ),
+                "stage_main_weights": (zeros, zeros, zeros),
+                "stage_biases": np.zeros((3, 32), dtype=np.float32),
+            }
+        )
+        np.testing.assert_array_equal(
+            changed_stage_zero.stage_outputs[0], initial * 5.0
+        )
+        np.testing.assert_array_equal(
+            changed_stage_zero.stage_outputs[1], initial * 15.0
+        )
+        self.assertFalse(np.array_equal(
+            changed_stage_zero.stage_outputs[1], initial * 3.0
+        ))
+
+    def test_disconnected_proposal_head_markov_and_confidence_contract(self) -> None:
+        fixture = build_physical_proposal_fixture()
+        result = dspark_reference.disconnected_three_stage_proposal(
+            **fixture.inputs
+        )
+        np.testing.assert_array_equal(result.previous_tokens, [0, 1, 2, 3, 4])
+        np.testing.assert_array_equal(result.draft_tokens, [1, 2, 3, 4, 5])
+        self.assertEqual(result.markov_embeddings.shape, (5, PROPOSAL_MARKOV_RANK))
+        self.assertEqual(result.head_hidden.shape, (5, PROPOSAL_HIDDEN_WIDTH))
+        self.assertEqual(result.base_logits.shape, (5, 8))
+        self.assertEqual(result.confidence.keep, 3)
+        self.assertTrue(np.all(
+            result.confidence.probabilities[:3]
+            >= np.float32(PROPOSAL_CONFIDENCE_THRESHOLD)
+        ))
+        self.assertLess(
+            float(result.confidence.probabilities[3]),
+            PROPOSAL_CONFIDENCE_THRESHOLD,
+        )
+        self.assertGreater(
+            float(result.confidence.probabilities[4]),
+            PROPOSAL_CONFIDENCE_THRESHOLD,
+        )
+
+        # The target output matrix is applied after the final RMSNorm, before
+        # Markov correction.  Removing it changes every base-logit row.
+        no_target_head = dspark_reference.disconnected_three_stage_proposal(
+            **{
+                **fixture.inputs,
+                "target_output_weight": np.zeros((8, 32), dtype=np.float32),
+            }
+        )
+        self.assertGreater(int(np.count_nonzero(result.base_logits)), 0)
+        self.assertFalse(np.array_equal(
+            no_target_head.base_logits, result.base_logits
+        ))
+
+        # Confidence consumes HC-collapsed pre-norm hidden, not the normalized
+        # target-head input.  Its position-four recovery also proves that the
+        # prefix stops at the first low row instead of selecting the last pass.
+        confidence_weight = fixture.inputs["confidence_weight"].dequantized
+        wrong_features = np.concatenate((
+            result.head_normalized, result.markov_embeddings
+        ), axis=1)
+        wrong_logits = np.einsum(
+            "rf,of->r", wrong_features, confidence_weight,
+            dtype=np.float32, optimize=False,
+        )
+        self.assertFalse(np.array_equal(wrong_logits, result.confidence.logits))
+
+        # Reusing the pending token at every Markov position breaks the exact
+        # previous-token sequence and therefore the drafted block.
+        repeated_embeddings = np.repeat(
+            result.markov_embeddings[:1], 5, axis=0
+        )
+        repeated_bias = np.einsum(
+            "pr,vr->pv", repeated_embeddings,
+            fixture.inputs["markov_w2"].dequantized,
+            dtype=np.float32, optimize=False,
+        )
+        repeated_tokens = np.argmax(
+            result.base_logits + repeated_bias, axis=1
+        )
+        np.testing.assert_array_equal(repeated_tokens, [1, 1, 1, 1, 1])
+        self.assertFalse(np.array_equal(repeated_tokens, result.draft_tokens))
+
+    def test_disconnected_proposal_rejects_malformed_before_evaluation(self) -> None:
+        fixture = build_physical_proposal_fixture()
+        original_hidden = np.array(fixture.inputs["initial_hc"], copy=True)
+        original_main = np.array(fixture.inputs["main_x"], copy=True)
+
+        bad_stage_weights = list(fixture.inputs["stage_weights"])
+        bad_stage_weights[2] = np.zeros((31, 32), dtype=np.float32)
+        with mock.patch.object(
+            np, "einsum", wraps=np.einsum
+        ) as einsum:
+            with self.assertRaisesRegex(ValueError, "stage weights"):
+                dspark_reference.disconnected_three_stage_proposal(
+                    **{
+                        **fixture.inputs,
+                        "stage_weights": tuple(bad_stage_weights),
+                    }
+                )
+            einsum.assert_not_called()
+
+        cases = (
+            ("initial_hc", np.zeros((5, 3, 32), dtype=np.float32),
+             r"\[5, 4, hidden\]"),
+            ("main_x", np.zeros(31, dtype=np.float32), r"\[hidden\]"),
+            ("head_function_weight", np.zeros((4, 127), dtype=np.float32),
+             r"\[4, 4 \* hidden\]"),
+            ("head_norm_weight", np.zeros(31, dtype=np.float32),
+             "head norm"),
+            ("target_output_weight", np.zeros((8, 31), dtype=np.float32),
+             "target output"),
+            ("markov_w1", np.zeros((8, 255), dtype=np.float32),
+             "Markov W1/W2"),
+            ("confidence_weight", np.zeros((1, 287), dtype=np.float32),
+             "confidence weight"),
+            ("pending_token_id", 8, "outside"),
+            ("pending_token_id", True, "integer"),
+            ("confidence_threshold", np.nan, "threshold"),
+        )
+        for key, value, error in cases:
+            with self.subTest(key=key):
+                with self.assertRaisesRegex(ValueError, error):
+                    dspark_reference.disconnected_three_stage_proposal(
+                        **{**fixture.inputs, key: value}
+                    )
+
+        nonfinite_confidence = np.array(
+            fixture.inputs["confidence_weight"].dequantized, copy=True
+        )
+        nonfinite_confidence[0, 0] = np.nan
+        with self.assertRaisesRegex(ValueError, "finite"):
+            dspark_reference.disconnected_three_stage_proposal(
+                **{
+                    **fixture.inputs,
+                    "confidence_weight": nonfinite_confidence,
+                }
+            )
+        np.testing.assert_array_equal(
+            fixture.inputs["initial_hc"], original_hidden
+        )
+        np.testing.assert_array_equal(fixture.inputs["main_x"], original_main)
+
+    def test_disconnected_proposal_rejects_finite_input_overflow(self) -> None:
+        fixture = build_physical_proposal_fixture()
+        maximum = np.finfo(np.float32).max
+
+        overflow_stage = list(fixture.inputs["stage_weights"])
+        overflow_stage[0] = np.full(
+            (PROPOSAL_HIDDEN_WIDTH, PROPOSAL_HIDDEN_WIDTH),
+            maximum,
+            dtype=np.float32,
+        )
+        cases: tuple[tuple[str, dict[str, object], str], ...] = (
+            (
+                "stage output",
+                {"stage_weights": tuple(overflow_stage)},
+                "stage 0 F32 output",
+            ),
+            (
+                "target output",
+                {"target_output_weight": np.full(
+                    (8, PROPOSAL_HIDDEN_WIDTH), maximum, dtype=np.float32
+                )},
+                "target base logits",
+            ),
+            (
+                "Markov W1 publication",
+                {"markov_w1": np.full(
+                    (8, PROPOSAL_MARKOV_RANK), maximum, dtype=np.float32
+                )},
+                "BF16 publication",
+            ),
+            (
+                "confidence projection",
+                {"confidence_weight": np.full(
+                    (1, PROPOSAL_HIDDEN_WIDTH + PROPOSAL_MARKOV_RANK),
+                    maximum,
+                    dtype=np.float32,
+                )},
+                "confidence logits",
+            ),
+        )
+        for label, replacement, error in cases:
+            with self.subTest(case=label):
+                with self.assertRaisesRegex(ValueError, error):
+                    dspark_reference.disconnected_three_stage_proposal(
+                        **{**fixture.inputs, **replacement}
+                    )
+
+        # Keep W1 finite and BF16-representable but make two live rank lanes
+        # accumulate FLT_MAX from W2 at the first Markov row.
+        overflow_w1 = np.zeros((8, PROPOSAL_MARKOV_RANK), dtype=np.float32)
+        overflow_w1[0, :2] = np.float32(1.0)
+        overflow_w2 = np.full(
+            (8, PROPOSAL_MARKOV_RANK), maximum, dtype=np.float32
+        )
+        with self.assertRaisesRegex(ValueError, "Markov bias 0"):
+            dspark_reference.disconnected_three_stage_proposal(
+                **{
+                    **fixture.inputs,
+                    "markov_w1": overflow_w1,
+                    "markov_w2": overflow_w2,
+                }
+            )
 
     def test_markov_sequential_closed_form_vector(self) -> None:
         # Hand-derived: token 0 selects bias [0, 3] and therefore token 1;
@@ -5006,6 +5463,51 @@ class OracleFixtureTests(unittest.TestCase):
         completed = subprocess.run(command, text=True, capture_output=True)
         self.assertEqual(completed.returncode, 0, completed.stderr)
         self.assertIn("fixture check: OK", completed.stdout)
+
+        proposal_command = [
+            sys.executable,
+            str(PROPOSAL_GENERATOR_PATH),
+            "--check",
+        ]
+        proposal = subprocess.run(
+            proposal_command,
+            cwd=ROOT,
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        self.assertEqual(proposal.returncode, 0, proposal.stderr)
+        self.assertIn("proposal fixture is current", proposal.stdout)
+
+    def test_proposal_generator_does_not_load_numerical_oracle(self) -> None:
+        tree = ast.parse(PROPOSAL_GENERATOR_PATH.read_text(encoding="utf-8"))
+        imports: list[str] = []
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                imports.extend(alias.name for alias in node.names)
+            elif isinstance(node, ast.ImportFrom):
+                module = node.module or ""
+                imports.extend(f"{module}.{alias.name}" for alias in node.names)
+        coupled = [
+            name for name in imports
+            if "dspark_oracle.reference" in name
+            or "dspark_oracle.physical_fixture" in name
+            or name.startswith("reference")
+            or name.startswith("physical_fixture")
+        ]
+        self.assertEqual(coupled, [])
+
+        # The standalone script also checks sys.modules before building the
+        # payloads. Running it by path avoids package __init__ side effects.
+        completed = subprocess.run(
+            [sys.executable, str(PROPOSAL_GENERATOR_PATH), "--check"],
+            cwd=ROOT,
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertNotIn("coupled oracle module", completed.stdout)
 
     def test_fixture_generator_does_not_import_oracle_implementation(self) -> None:
         tree = ast.parse(GENERATOR_PATH.read_text(encoding="utf-8"))

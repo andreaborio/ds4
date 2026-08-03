@@ -191,6 +191,66 @@
         }
       }
     },
+    "proposalFixture": {
+      "version": 1,
+      "role": "synthetic payload-first transaction checkpoint joining three stage-local HC states to the final head; not an attention, MoE, checkpoint-weight, or performance oracle",
+      "sourceEquation": {
+        "repository": "deepseek-ai/DeepSeek-V4-Flash-DSpark",
+        "revision": "62af8fffb2f7030cac4de2f0169f5b8d1101b646",
+        "path": "inference/model.py",
+        "sha256": "c0c19e6c9fa439bac7fbb1c5bc1868232dfd5aa2f439a548d0e33dcc2a9edd3f",
+        "observedSeam": "three ordered DSparkBlock calls share the stage-zero main_x; stage two applies HC head, RMSNorm, target output, sequential Markov W1/W2, then confidence over HC pre-norm hidden concatenated with each previous-token W1 embedding"
+      },
+      "geometry": {
+        "proposalRows": 5,
+        "hcLanes": 4,
+        "stageCount": 3,
+        "hiddenWidth": 32,
+        "vocab": 8,
+        "markovRank": 256
+      },
+      "reductionBoundary": "hidden width and vocabulary are topology-only reductions; the affine stage body does not approximate HC, attention, routing, or MoE, whose separate checkpoints retain their applicable production axes",
+      "fixtureGeneratorImportsNumericalOracle": false,
+      "fixtureGeneratorImportsPhysicalFixture": false,
+      "fixtureProducerCodecs": "standalone narrow Q8_0/F16/F32 serialization and byte reopen; check mode rejects numerical-oracle module presence and tests audit the import AST",
+      "derivedFinitenessPolicy": "every stage F32/BF16 output, final HC hidden, final norm, target base-logit matrix, per-position Markov embedding/bias/corrected row, and confidence logits/probabilities must be finite before return; finite FLT_MAX inputs that overflow fail closed",
+      "independentControls": "dyadic diagonal stage weights yield hand-derived 2x, 6x and 24x publications; changing stage zero yields hand-derived 5x then 15x, and removing one stage-local main_x edge leaves all earlier stages byte-identical while changing that stage",
+      "payloadBytes": 13014,
+      "payloadSha256": "1984119eda4977ac3cb3f06b518dd240819799fb2b2ffdae7f13f34c8cd8fd96",
+      "manifestSha256": "fb303e80eed40ec3756af0b3632766007c11ab90823410db770af6d64fe504d5",
+      "initialHcSha256": "e4e1aab19ee6f54a48929584e8769d3156ee187e0faf1ca8e30bc3924f8145ff",
+      "mainXSha256": "c7c33f4b07e3a2464867e1b9e3987cf3a51d03dbb45e96fdf02b0b046b1a9488",
+      "frozenPublications": {
+        "stage0Bfloat16Sha256": "89eb728a03459be8050d43910be6dbc90966e473099e8de241e821714acabf9e",
+        "stage1Bfloat16Sha256": "929e9af5f8d3667fc2f3b06f5f4d4bc2b10071993db5978e10e18772fe3e45e2",
+        "stage2Bfloat16Sha256": "477ec8fe01a66a15cd86acaf543486ad2402ff34279dd2dd08b59767bcfda355",
+        "headHiddenBfloat16Sha256": "b3db792510507787f54c699cdb3b18b39ab552b900bc107847b3a687c0413801",
+        "headNormBfloat16Sha256": "70eda6a1998e9edfc7b3ebad8f0729b790606581f87e0239500ff43274268355",
+        "targetBaseLogitsF32Sha256": "0c7f725e79b4610023b2cb0fa4505414431cb9358b28bd63f2211a5cbbb97c0a",
+        "markovEmbeddingsBfloat16Sha256": "c9d364479227164244fe08f0b9e5c4c101ca3913b243bf19b376ea25c88405d1",
+        "correctedLogitsF32Sha256": "afd5943f93f819fd7f6286b79a91485c09b25b2a660f5c0fd61f946266980892",
+        "confidenceLogitsF32Sha256": "2566d9117791a2ed760e2202e688b1125d8d1dbfa59e3c5b657574bc77162817",
+        "confidenceProbabilitiesF32Sha256": "39d969af1e5e93bd89c1a7c6969e225e84283c53012946416d1315eafeb19737"
+      },
+      "closedSchedule": {
+        "previousTokens": [0, 1, 2, 3, 4],
+        "draftTokens": [1, 2, 3, 4, 5],
+        "confidenceThreshold": 0.5,
+        "firstBelowDepth": 3,
+        "positionFourRecoversAboveThreshold": true
+      },
+      "systemValidation": {
+        "capturedAt": "2026-08-03T16:21:54+02:00",
+        "result": "standalone proposal check mode and import audit, Python compile, provenance JSON, full 66-test system oracle, and diff check passed with two explicit optional MLX/support-file skips"
+      },
+      "mlxValidation": {
+        "status": "not-run-for-this-checkpoint",
+        "reason": "this tranche is an orchestration-level model-free NumPy checkpoint; existing MLX lanes continue to cover the stage primitives, and no independent MLX implementation of the synthetic affine transaction was added"
+      },
+      "nativeMetalValidation": {
+        "status": "pending"
+      }
+    },
     "runtimeCaptureParity": {
       "status": "pending",
       "currentEvidence": "independent synthetic NumPy vectors and optional MLX 0.32.0 Metal parity distinguish the frontier tap from the complete last-128 prompt history; NumPy additionally pins direct context KV, absolute RoPE, non-RoPE E4M3FN Q/DQ, token shift, and transactional accepted-prefix ownership",
@@ -232,9 +292,9 @@
       "ffnHcPostBfloat16": 0.0
     },
     "semanticAudit": {
-      "capturedAt": "2026-08-03T15:52:12+02:00",
+      "capturedAt": "2026-08-03T16:21:54+02:00",
       "deepSpecRevision": "005e03b81cec38b7da6399833d609ee89a2587f2",
-      "systemPython": "Ran 59 tests; OK with 2 explicit optional MLX/support-file skips",
+      "systemPython": "Ran 66 tests; OK with 2 explicit optional MLX/support-file skips; standalone proposal check mode and import audit current",
       "mlxMetal": "Ran 59 tests; OK with 1 explicit optional-support-file skip with mlx==0.32.0, mlx-metal==0.32.0, Device(gpu, 0)",
       "findings": [
         "confidence scheduling uses the first per-position sigmoid below threshold, not cumulative survival",
@@ -245,12 +305,13 @@
         "non-degenerate HC and final-head vectors distinguish lane order, flattening, omitted normalization/output projection, and confidence input",
         "stage zero concatenates exactly three target captures at every retained position before main_proj/main_norm and repeats pending y[p+1]/noise embeddings across four HC lanes at p+1..p+5",
         "the synthetic topology requires three ordered stage-distinct transforms while preserving one immutable shared main_x",
+        "the payload-first transaction checkpoint chains all three BF16 HC states, then collapses the final HC, normalizes, applies the target output matrix, and feeds exact previous tokens [pending,d0,d1,d2,d3] into Markov W1/W2 before first-below confidence scheduling",
         "three stage-specific 128-by-512 rings use direct kv_norm(Wkv(main_x)), absolute-position RoPE on the 64-wide tail, and UE8M0-scaled E4M3FN Q/DQ on the 448-wide non-RoPE prefix",
         "the proposal ring is already committed through p and adds only five transient candidate rows; the full-ring attention view preserves pinned physical slot order 0..127 rather than chronological wrap order; accepted multi-row target-verifier prefixes commit atomically while rejection and zero-row rollback preserve prior storage",
         "five noncausal query rows attend through online 64-row blocks with FP32 max, denominator and accumulator, per-block BF16 exponential weights, denominator-only sinks and a final BF16 output boundary; the full-ring fixture changes 10,073 lanes under the rejected chronological ordering",
         "the pending target token is y[p+1], candidate inputs occupy p+1..p+5, and five DSpark head outputs propose p+2..p+6 rather than re-predicting y[p+1]",
         "the final support GGUF v3 header contains exactly 81 descriptors split 26/24/31 across stages; real-file offsets and structural size are checked without reading payload bytes",
-        "the production-width FFN fixture preserves five rows, four HC lanes, hidden width 4096, 256 experts and top six while reducing only the intermediate width to one valid 256-value IQ2_XXS/Q2_K block; 30 distinct payload-only routed records include expert ids 0, 29, 30 and 255",
+        "the production-width FFN fixture preserves five rows, four HC lanes, hidden width 4096, 256 experts and top six while reducing only the intermediate width to one valid 256-value IQ2_XXS/Q2_K block; its 30-record router union includes expert ids 0, 2, 22 and 251, while the separate selected-address fixture retains boundary ids 0, 29, 30 and 255",
         "sqrt-softplus routing is F32, selection bias never enters expert weights, Hebrus resolves exact ties by lower expert id, the six unbiased values normalize to 1.5, duplicate candidate rows reuse six routed records, and invalid or zero-denominator rows fail closed without a SUPPORT expert id",
         "shared Q8 and routed IQ2_XXS/Q2_K execution publishes BF16 at the official HC/norm, pre-down, per-down, MoE and HC-post seams; clamp-10 and ascending-expert-id F32 accumulation are independently observable"
       ]

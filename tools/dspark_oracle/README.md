@@ -261,6 +261,46 @@ and the F32 routed sum; final MoE BF16 and HC-post BF16 are exact. These are
 operation-specific synthetic-fixture limits, not checkpoint accuracy claims or
 a tolerance for the future native graph.
 
+`proposal_fixture.py` adds the missing transaction-level checkpoint above
+those stage-local primitives. It keeps the production proposal geometry of
+five rows, four HC lanes, three ordered stages, and Markov rank 256, while
+reducing hidden width to 32 and vocabulary to eight. The reduction is
+intentional: six 4096-by-4096 matrices would turn a topology test into a large
+memory/compute test without exercising another production kernel. Its affine
+stage body is only an orchestration discriminator. It does not approximate HC,
+attention, routing, or MoE; those equations remain covered by their separate
+full-axis checkpoints.
+
+The transaction begins from one `[5,4,32]` HC state. Every stage consumes the
+previous stage's BF16 publication plus the same immutable `main_x`; stage
+weights are distinct, so reordering them or restarting from the initial HC
+cannot satisfy the frozen hashes. Stage two then performs the official final
+HC collapse, BF16 RMSNorm, and target output projection. Markov W1/W2 retain
+rank 256 and generate the closed previous-token sequence
+`[pending,d0,d1,d2,d3] = [0,1,2,3,4]`, drafting `[1,2,3,4,5]`. Confidence
+uses `[HC pre-norm hidden,W1(previous)]`: rows zero through two pass threshold
+0.5, row three fails, and row four passes again. The accepted depth is
+therefore three under first-below scheduling; cumulative confidence or a
+last-passing policy is observably wrong.
+
+All 13,014 weight bytes are Q8_0, F16, or F32 payloads reopened before use.
+The standalone fixture generator owns only narrow producer codecs for those
+three formats; it imports neither `physical_fixture.py` nor the numerical
+proposal oracle, directly or transitively. Its check mode rejects either
+oracle appearing in `sys.modules`, and the test suite audits its import AST.
+Its
+canonical manifest SHA-256 is
+`fb303e80eed40ec3756af0b3632766007c11ab90823410db770af6d64fe504d5`;
+the aggregate name/length/payload stream is
+`1984119eda4977ac3cb3f06b518dd240819799fb2b2ffdae7f13f34c8cd8fd96`.
+Tests keep numerical publications as frozen literal digests rather than
+regenerating expected vectors from `reference.py`. Independent dyadic diagonal
+controls additionally derive stage outputs by hand (`2x`, `6x`, `24x`) and
+isolate the direct `main_x` edge into each stage. Complete shape/finiteness
+validation precedes the first stage evaluation; malformed inputs and finite
+FLT_MAX values that overflow any stage/head/Markov/confidence publication fail
+without a proposal result or mutation of the source HC/`main_x`.
+
 `schema.json` maps the pinned official Hugging Face config to the canonical
 combined-GGUF `dspark.*` records and to the standalone support header, including
 its six authenticated source-provenance fields. The target keeps
@@ -299,6 +339,7 @@ Regenerate or check the small synthetic fixture with:
 ```sh
 python3 tools/dspark_oracle/generate_fixtures.py
 python3 tools/dspark_oracle/generate_fixtures.py --check
+python3 tools/dspark_oracle/proposal_fixture.py --check
 python3 tests/dspark/test_oracle.py
 ```
 
@@ -362,6 +403,9 @@ What is validated now:
   and model-free official non-RoPE FP8 storage simulation;
 - non-degenerate HC split, 20-step Sinkhorn, pre/post, and final-head equations;
 - ordered three-stage topology with one shared immutable `main_x`;
+- one payload-first three-stage-to-final-head transaction with chained HC
+  publications, BF16 head seams, exact sequential previous-token Markov input,
+  first-below confidence depth, and pre-evaluation malformed-input rejection;
 - transactional three-ring `[128, 512]` ownership, accepted multi-row commit,
   rollback, wraparound, physical attention order, and no duplicate
   current-frontier row;
@@ -383,6 +427,8 @@ Still requiring real runtime captures:
 - physical raw-cache slots and FP8 bytes across prefill, wrap, skip,
   acceptance, and rollback;
 - final base/corrected logits and confidence against the real quantized weights;
+- native Metal parity for the compact transaction-level three-stage/head
+  checkpoint; its current result is model-free NumPy evidence only;
 - exact greedy/sampled target output, SSD bytes, TPOT, and scheduler economics;
 - independent derivation of the 81-name support inventory directly from the
   pinned source-safetensors headers.
