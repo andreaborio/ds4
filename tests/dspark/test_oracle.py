@@ -5016,10 +5016,12 @@ class OracleFixtureTests(unittest.TestCase):
         )
 
         suffix_verifier = function_tokens("metal_graph_verify_suffix_tops")
-        exact_verifier = function_tokens("metal_graph_verify_decode2_exact")
+        exact_verifier = function_tokens("metal_graph_verify_decode_exact")
+        exact_wrapper = function_tokens("metal_graph_verify_decode2_exact")
         for verifier_name, verifier in (
                 ("metal_graph_verify_suffix_tops", suffix_verifier),
-                ("metal_graph_verify_decode2_exact", exact_verifier)):
+                ("metal_graph_verify_decode_exact", exact_verifier),
+                ("metal_graph_verify_decode2_exact", exact_wrapper)):
             self.assertEqual(
                 _c_calls(verifier, "metal_graph_dspark_capture_after_layer"),
                 [],
@@ -5082,30 +5084,118 @@ class OracleFixtureTests(unittest.TestCase):
         exact_layers = _c_calls(
             exact_verifier, "metal_graph_encode_decode_layer")
         self.assertEqual(len(exact_begin), 1)
-        self.assertEqual(exact_begin[0][2], [["g"], ["start"], ["2u"]])
-        self.assertEqual(len(exact_layers), 2)
+        self.assertEqual(
+            exact_begin[0][2], [["g"], ["start"], ["n_tokens"]])
+        self.assertEqual(len(exact_layers), 1)
         self.assertEqual(len(exact_scratch), 1)
         self.assertEqual(
             exact_scratch[0][2],
-            [["g"], ["il"], ["next_pair_hc"], ["2u"]],
+            [["g"], ["il"], ["next_batch_hc"], ["n_tokens"]],
         )
-        self.assertLess(exact_begin[0][1], exact_layers[0][0])
-        self.assertLess(exact_layers[0][1], exact_layers[1][0])
-        self.assertLess(exact_layers[1][1], exact_scratch[0][0])
-        exact_invalidations = _c_calls(
-            exact_verifier, "metal_graph_dspark_capture_invalidate")
+        layer_loop = [
+            "for", "(", "uint32_t", "il", "=", "0", ";", "ok",
+            "&&", "il", "<", "DS4_N_LAYER", ";", "il", "++", ")",
+            "{",
+        ]
+        layer_loop_start = require_sequence(
+            exact_verifier,
+            layer_loop,
+            "exact verifier must traverse target layers outermost",
+            start=exact_begin[0][1] + 1,
+        )
+        layer_loop_open = layer_loop_start + len(layer_loop) - 1
+        layer_loop_close = _matching_token(
+            exact_verifier, layer_loop_open, "{", "}")
+        row_loop = [
+            "for", "(", "uint32_t", "row", "=", "0", ";", "ok",
+            "&&", "row", "<", "n_tokens", ";", "row", "++", ")",
+            "{",
+        ]
+        row_loop_start = require_sequence(
+            exact_verifier,
+            row_loop,
+            "each layer must advance every verifier row autoregressively",
+            start=layer_loop_open + 1,
+            end=layer_loop_close,
+        )
+        row_loop_open = row_loop_start + len(row_loop) - 1
+        row_loop_close = _matching_token(
+            exact_verifier, row_loop_open, "{", "}")
+        self.assertGreater(exact_layers[0][0], row_loop_open)
+        self.assertLess(exact_layers[0][1], row_loop_close)
+        for prefix_helper in (
+                "metal_graph_capture_prefix1_attn_state",
+                "metal_graph_capture_prefix1_index_state"):
+            prefix_calls = _c_calls(exact_verifier, prefix_helper)
+            self.assertEqual(len(prefix_calls), 1)
+            self.assertGreater(prefix_calls[0][0], exact_layers[0][1])
+            self.assertLess(prefix_calls[0][1], row_loop_close)
+        self.assertGreater(exact_scratch[0][0], row_loop_close)
+        self.assertLess(exact_scratch[0][1], layer_loop_close)
+        require_sequence(
+            exact_verifier,
+            [
+                "for", "(", "uint32_t", "row", "=", "0", ";",
+                "row", "<", "n_tokens", ";", "row", "++", ")", "{",
+                "ds4_gpu_tensor", "*", "tmp", "=", "cur", "[", "row",
+                "]", ";", "cur", "[", "row", "]", "=", "next", "[",
+                "row", "]", ";", "next", "[", "row", "]", "=", "tmp",
+                ";", "}", "ds4_gpu_tensor", "*", "tmp", "=",
+                "cur_batch_hc", ";", "cur_batch_hc", "=",
+                "next_batch_hc", ";", "next_batch_hc", "=", "tmp", ";",
+            ],
+            "capture must precede both per-row view swap and batch ownership swap",
+            start=exact_scratch[0][1] + 1,
+            end=layer_loop_close,
+        )
+        exact_aborts = _c_calls(
+            exact_verifier, "metal_graph_dspark_verify_capture_abort")
         self.assertGreaterEqual(
-            len(exact_invalidations), 1,
+            len(exact_aborts), 2,
             "exact-verifier failure must discard scratch capture",
         )
         require_sequence(
             exact_verifier,
             [
                 "if", "(", "!", "ok", ")",
-                "metal_graph_dspark_capture_invalidate", "(", "g", ")",
+                "metal_graph_dspark_verify_capture_abort", "(", "g", ")",
                 ";",
             ],
-            "exact-verifier completion failure must invalidate capture",
+            "exact-verifier completion failure must abort scratch capture",
+        )
+        require_sequence(
+            exact_verifier,
+            [
+                "g", "->", "spec_capture_prefix1", "=",
+                "capture_prefix1", ";",
+            ],
+            "the generalized verifier must receive prefix1 policy explicitly",
+        )
+        require_sequence(
+            exact_verifier,
+            [
+                "if", "(", "ok", "&&", "capture_prefix1", "&&",
+                "row", "==", "0u", ")",
+            ],
+            "prefix1 capture must be controlled by explicit legacy policy",
+        )
+        require_sequence(
+            exact_verifier,
+            [
+                "capture_prefix1", "&&", "n_tokens", "!=", "2u",
+            ],
+            "prefix1 policy must fail closed outside the legacy N=2 shape",
+        )
+        wrapper_calls = _c_calls(
+            exact_wrapper, "metal_graph_verify_decode_exact")
+        self.assertEqual(len(wrapper_calls), 1)
+        self.assertEqual(
+            wrapper_calls[0][2],
+            [
+                ["g"], ["model"], ["weights"], ["tokens"], ["2u"],
+                ["start"], ["true"], ["top0"], ["row_logits"],
+            ],
+            "only the qualified legacy N=2 wrapper enables prefix1 capture",
         )
 
         verify_begin = function_tokens("metal_graph_dspark_verify_capture_begin")

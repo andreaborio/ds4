@@ -31970,7 +31970,9 @@ static bool metal_graph_read_spec_logits_row(ds4_gpu_graph *g, uint32_t row, flo
  * kernels, in autoregressive row order inside every target layer.  The output
  * head is likewise evaluated row-by-row.  N>2 is an additive implementation
  * seam only until it has real-model numeric qualification; the production MTP
- * scheduler below remains on the legacy N=2 wrapper. */
+ * scheduler below remains on the legacy N=2 wrapper.  capture_prefix1 is
+ * legacy MTP policy rather than an N=2 property: a future DSpark caller must
+ * pass false and use its sole full-frontier snapshot for partial replay. */
 static bool metal_graph_verify_decode_exact(
         ds4_gpu_graph *g,
         const ds4_model       *model,
@@ -31978,11 +31980,13 @@ static bool metal_graph_verify_decode_exact(
         const int             *tokens,
         uint32_t               n_tokens,
         uint32_t               start,
+        bool                   capture_prefix1,
         int                   *row_tops,
         float *const          *row_logits) {
     if (!g) return false;
     if (!model || !weights || !weights->token_embd || !weights->output ||
-        !tokens || !ds4_verify_decode_exact_shape_valid(
+        !tokens || (capture_prefix1 && n_tokens != 2u) ||
+        !ds4_verify_decode_exact_shape_valid(
             g->raw_cap, g->raw_window, start, n_tokens, g->prefill_cap) ||
         (n_tokens > 1u && !row_tops) || !row_logits ||
         !row_logits[n_tokens - 1u] || !g->batch_cur_hc ||
@@ -32047,7 +32051,7 @@ static bool metal_graph_verify_decode_exact(
     ds4_gpu_tensor *saved_cur = g->cur_hc;
     ds4_gpu_tensor *saved_after = g->after_ffn_hc;
     const bool saved_capture = g->spec_capture_prefix1;
-    g->spec_capture_prefix1 = n_tokens == 2u;
+    g->spec_capture_prefix1 = capture_prefix1;
     if (ok) ok = ds4_gpu_begin_commands() != 0;
     for (uint32_t il = 0; ok && il < DS4_N_LAYER; il++) {
         for (uint32_t row = 0; ok && row < n_tokens; row++) {
@@ -32064,7 +32068,7 @@ static bool metal_graph_verify_decode_exact(
                                                  pos % g->raw_cap,
                                                  metal_graph_raw_span_for_batch(g, pos, 1),
                                                  tokens[row]);
-            if (ok && row == 0u && n_tokens == 2u) {
+            if (ok && capture_prefix1 && row == 0u) {
                 ok = metal_graph_capture_prefix1_attn_state(g, il) &&
                      metal_graph_capture_prefix1_index_state(g, il);
             }
@@ -32139,7 +32143,7 @@ static bool metal_graph_verify_decode2_exact(
     const int tokens[2] = {token0, token1};
     float *row_logits[2] = {logits0, logits1};
     return metal_graph_verify_decode_exact(
-        g, model, weights, tokens, 2u, start, top0, row_logits);
+        g, model, weights, tokens, 2u, start, true, top0, row_logits);
 }
 
 /* Pick a raw SWA cache size for Metal.  During batched prefill it must cover
