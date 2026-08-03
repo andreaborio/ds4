@@ -1775,6 +1775,12 @@ int ds4_gpu_internal_qwen35_expert_pack_test(void);
 /* Canonical-vs-embedded GLM Q2 regression for direct and grouped execution. */
 int ds4_gpu_internal_expert_store_v2_kernel_test(void);
 #ifdef DS4_TEST_HOOKS
+/* Candidate final-0731 Q-B primitive.  Keep the disconnected wrapper and API
+ * hook-private until the stage graph provides its first production caller. */
+int ds4_gpu_dspark_q_head_norm_bf16_tensor(
+        ds4_gpu_tensor *x,
+        uint32_t          rows,
+        float             eps);
 /* Model-free rollback and authenticated lease-error unwind regressions. */
 int ds4_gpu_internal_qwen35_stream_staging_rollback_test(void);
 int ds4_gpu_internal_qwen35_lease_error_unwind_test(void);
@@ -1788,8 +1794,12 @@ int ds4_gpu_internal_dspark_hc_mean_test(void);
 int ds4_gpu_internal_dspark_history_test(void);
 /* Physical Metal BF16 round/reopen bit-semantics and range regression. */
 int ds4_gpu_internal_bf16_round_f32_test(void);
+/* Final-0731 per-head Q normalization BF16-publication regression. */
+int ds4_gpu_internal_dspark_q_head_norm_bf16_test(void);
 /* Final-0731 DSpark two-source non-causal F32 attention regression. */
 int ds4_gpu_internal_dspark_two_source_attention_test(void);
+/* Payload-first final-0731 stage-zero 32/32/4 physical Metal white box. */
+int ds4_gpu_internal_dspark_stage_zero_physical_test(void);
 #endif
 
 /* =========================================================================

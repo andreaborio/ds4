@@ -59,6 +59,54 @@ static inline float ds4_dspark_bf16_rne(float value) {
         (bits + 0x00007fffu + retained_lsb) & 0xffff0000u);
 }
 
+struct ds4_metal_args_dspark_q_head_norm_bf16 {
+    float eps;
+};
+
+// Final-0731 DSpark Q-head normalization.  Q-B is published as BF16 before
+// this kernel.  The official expression then returns to BF16 after square,
+// mean, epsilon addition, reciprocal square root, and final multiply.  The
+// tensor remains F32 storage so subsequent Metal primitives can consume it
+// without a format conversion.
+kernel void kernel_dspark_q_head_norm_bf16_f32(
+        constant ds4_metal_args_dspark_q_head_norm_bf16 &args [[buffer(0)]],
+        device float *x [[buffer(1)]],
+        uint tid [[thread_index_in_threadgroup]],
+        uint2 tgpig [[threadgroup_position_in_grid]]) {
+    constexpr uint n_head = 64;
+    constexpr uint head_dim = 512;
+    constexpr uint threads = 256;
+    threadgroup float reduction[threads];
+
+    const ulong base = ((ulong)tgpig.y * n_head + tgpig.x) * head_dim;
+    const float source0 = x[base + tid];
+    const float source1 = x[base + tid + threads];
+    const float square0 = ds4_dspark_bf16_rne(source0 * source0);
+    const float square1 = ds4_dspark_bf16_rne(source1 * source1);
+    reduction[tid] = square0 + square1;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint stride = threads / 2u; stride != 0u; stride >>= 1u) {
+        if (tid < stride) {
+            reduction[tid] += reduction[tid + stride];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    if (tid == 0u) {
+        const float mean = ds4_dspark_bf16_rne(
+            reduction[0] * (1.0f / (float)head_dim));
+        const float added = ds4_dspark_bf16_rne(mean + args.eps);
+        reduction[0] = ds4_dspark_bf16_rne(rsqrt(added));
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    const float inverse_rms = reduction[0];
+    x[base + tid] = ds4_dspark_bf16_rne(source0 * inverse_rms);
+    x[base + tid + threads] =
+        ds4_dspark_bf16_rne(source1 * inverse_rms);
+}
+
 // Final-0731 DSpark sparse attention.  One 256-thread group owns one
 // (query,head) pair.  Q/KV enter as BF16-rounded values reopened in F32.
 // The online softmax follows the pinned 64-row TileLang schedule: the
@@ -988,11 +1036,7 @@ kernel void kernel_glm_store_indexer_k(
             if (i < rot_dim) {
                 if ((i & 1u) != 0u) continue;
                 const uint rel_i0 = i;
-#ifdef DS4_METAL_ROPE_EXP2_LOG2
-                const float theta = theta_base * exp2(inv_ndims * (float)rel_i0 * log2(args.freq_base));
-#else
                 const float theta = theta_base * pow(args.freq_base, inv_ndims * (float)rel_i0);
-#endif
                 float cos_theta;
                 float sin_theta;
                 glm_rope_yarn(theta,
@@ -1021,11 +1065,7 @@ kernel void kernel_glm_store_indexer_k(
             if (i < rot_dim) {
                 if ((i & 1u) != 0u) continue;
                 const uint rel_i0 = i;
-#ifdef DS4_METAL_ROPE_EXP2_LOG2
-                const float theta = theta_base * exp2(inv_ndims * (float)rel_i0 * log2(args.freq_base));
-#else
                 const float theta = theta_base * pow(args.freq_base, inv_ndims * (float)rel_i0);
-#endif
                 float cos_theta;
                 float sin_theta;
                 glm_rope_yarn(theta,
@@ -1129,11 +1169,7 @@ kernel void kernel_glm_build_kv_cache(
     const float theta_base = (float)pos;
     const float inv_ndims = -1.0f / (float)args.qk_rope;
     for (uint r = tid * 2u; r < args.qk_rope; r += nth * 2u) {
-#ifdef DS4_METAL_ROPE_EXP2_LOG2
-        const float theta = theta_base * exp2(inv_ndims * (float)r * log2(args.freq_base));
-#else
         const float theta = theta_base * pow(args.freq_base, inv_ndims * (float)r);
-#endif
         float cos_theta;
         float sin_theta;
         glm_rope_yarn(theta,
@@ -1214,11 +1250,7 @@ kernel void kernel_glm_build_kv_cache_decode_group4(
     const float theta_base = (float)pos;
     const float inv_ndims = -1.0f / (float)args.qk_rope;
     for (uint r = tid * 2u; r < args.qk_rope; r += 512u) {
-#ifdef DS4_METAL_ROPE_EXP2_LOG2
-        const float theta = theta_base * exp2(inv_ndims * (float)r * log2(args.freq_base));
-#else
         const float theta = theta_base * pow(args.freq_base, inv_ndims * (float)r);
-#endif
         float cos_theta;
         float sin_theta;
         glm_rope_yarn(theta,
@@ -1297,11 +1329,7 @@ kernel void kernel_glm_build_kv_cache_flash(
     const float theta_base = (float)pos;
     const float inv_ndims = -1.0f / (float)args.qk_rope;
     for (uint r = tid * 2u; r < args.qk_rope; r += nth * 2u) {
-#ifdef DS4_METAL_ROPE_EXP2_LOG2
-        const float theta = theta_base * exp2(inv_ndims * (float)r * log2(args.freq_base));
-#else
         const float theta = theta_base * pow(args.freq_base, inv_ndims * (float)r);
-#endif
         float cos_theta;
         float sin_theta;
         glm_rope_yarn(theta,
@@ -1548,11 +1576,7 @@ kernel void kernel_glm_indexer_rope_tail_f32(
     const float inv_ndims = -1.0f / (float)args.rot_dim;
     for (uint i = tid * 2u; i < args.rot_dim; i += nth * 2u) {
         const uint rel_i0 = i;
-#ifdef DS4_METAL_ROPE_EXP2_LOG2
-        const float theta = theta_base * exp2(inv_ndims * (float)rel_i0 * log2(args.freq_base));
-#else
         const float theta = theta_base * pow(args.freq_base, inv_ndims * (float)rel_i0);
-#endif
         float cos_theta;
         float sin_theta;
         glm_rope_yarn(theta,
@@ -1602,11 +1626,7 @@ static inline float2 glm_cache_load_rotated_rope_pair(
         float              corr1) {
     const float theta_base = (float)row;
     const float inv_ndims = -1.0f / (float)qk_rope;
-#ifdef DS4_METAL_ROPE_EXP2_LOG2
-    const float theta = theta_base * exp2(inv_ndims * (float)r * log2(freq_base));
-#else
     const float theta = theta_base * pow(freq_base, inv_ndims * (float)r);
-#endif
     float corr_dims[2] = {corr0, corr1};
     float cos_theta;
     float sin_theta;
@@ -1638,11 +1658,7 @@ static inline float2 glm_cache_load_rotated_rope_pair_f16_only(
         float              corr1) {
     const float theta_base = (float)row;
     const float inv_ndims = -1.0f / (float)qk_rope;
-#ifdef DS4_METAL_ROPE_EXP2_LOG2
-    const float theta = theta_base * exp2(inv_ndims * (float)r * log2(freq_base));
-#else
     const float theta = theta_base * pow(freq_base, inv_ndims * (float)r);
-#endif
     float corr_dims[2] = {corr0, corr1};
     float cos_theta;
     float sin_theta;
