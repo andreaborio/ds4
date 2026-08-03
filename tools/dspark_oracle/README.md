@@ -189,8 +189,12 @@ both IQ2_XXS gate/up and Q2_K down storage. The Q8_0 router and shared
 gate/up/down matrices, F16 HC function, and F32 norm/HC/router-bias tensors are
 serialized and reopened before use. Routed records are constructed directly
 as valid IQ2_XXS/Q2_K payloads and decoded lazily; there is no ideal routed
-float matrix. Thirty distinct selected records occupy 26,542,080 bytes and
-include expert ids 0, 29, 30, and 255. A separate duplicate-row mutation
+float matrix. Fixture v3 generates five live router coefficients for every one
+of the 256 experts without consulting the frozen expected selection, packs and
+reopens the full Q8_0 matrix, and derives the routed inventory only from that
+output. Thirty distinct selected records occupy 26,542,080 bytes and include
+expert ids 0, 2, 22, and 251. The separate selected-address checkpoint retains
+the boundary ids 0, 29, 30, and 255. A duplicate-row mutation
 reduces the five-row route union to 24 experts, so both the 30-record SUPPORT
 floor and duplicate reuse are observable.
 
@@ -215,7 +219,17 @@ seven-way exact tie, clamp removal, slot-order accumulation, payload-code
 mutation, 30-distinct routing, and duplicate routing are separate negative
 controls.
 
-FFN fixture version two makes the asymmetric gate clamp a primary-path
+FFN fixture version three retains the version-two asymmetric gate clamp and
+also makes routing a primary-path producer rather than an encoded expectation.
+The router formula covers all 256 experts; its F32 bias uses the independent
+modular sequence divided by 8192, so bias removal changes 15 selected
+positions. The derived top-six union remains 30 experts. Its minimum
+sixth/seventh augmented-probability margin is `0.004264354705810547`, greater
+than twice the frozen MLX router-probability ceiling
+`0.0013456344604492188`. This protects the identity of the selected SUPPORT
+records without comparing unlike logits and probabilities.
+
+Fixture version two made the asymmetric gate clamp a primary-path
 invariant instead of a local-only control. Shared gate `[0,0]` reopens from Q8
 as `-127/256`, and shared-down row 67 is one exact Q8 `d=1`, code-127 amplifier
 of mid lane zero. Replacing the required upper-only gate clamp with a symmetric
@@ -224,11 +238,20 @@ four HC-post lanes. The shared payload digests and every affected publication
 hash are frozen independently; this remains synthetic boundary evidence, not
 real-checkpoint parity.
 
-The fixture-v2 system oracle and its MLX 0.32.0 / mlx-metal 0.32.0 cross-check
-both pass on the M5 Pro. The shared path, including the changed asymmetric
-clamp discriminator, remains exact. The operation-specific ceilings below were
-first frozen with fixture v1 and the complete v2 rerun passes those same
-ceilings; they are limits, not a claim that every v1 maximum was re-observed.
+The fixture-v3 system oracle and its MLX 0.32.0 / mlx-metal 0.32.0 cross-check
+both pass on the M5 Pro. The shared path, including the asymmetric clamp
+discriminator, remains exact. The operation-specific ceilings below were first
+frozen with fixture v1 and the complete v3 rerun passes those same ceilings;
+they are limits, not a claim that every v1 maximum was re-observed.
+The native composed checkpoint also passes in two independent Metal processes.
+It retains the NumPy/MLX HC-split golden while bounding the standalone F32
+kernel separately: pre has at most 19/20 differing lanes and one ULP, post at
+most 6/20 and one ULP, and the combination matrix at most 59/80 and four ULP
+after 20 F32 exp/normalization cycles. `hc_mix[7]` is exactly positive zero,
+which isolates its one-ULP post-sigmoid difference from upstream matmul drift.
+Host negative controls reject each segment's ULP and differing-lane ceiling
+plus one. HC-pre, combined MoE, HC-post, routed down, and the sequential routed
+sum remain exact at their published boundaries.
 Hidden/HC/norm and the complete shared path are exact. Eight router
 logits differ by at most `0.015625`, their probabilities by
 `0.0013456344604492188`, and the 30 normalized route weights by

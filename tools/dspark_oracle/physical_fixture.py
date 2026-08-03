@@ -16,6 +16,7 @@ from typing import Mapping
 
 import numpy as np
 
+from . import reference as dspark_reference
 from .reference import RawCacheState, prefill_raw_cache
 
 
@@ -99,11 +100,11 @@ IQ2_XXS_BLOCK_BYTES = 66
 Q2_K_BLOCK = 256
 Q2_K_BLOCK_BYTES = 84
 FFN_SELECTED_EXPERTS = np.asarray([
-    [5, 0, 4, 1, 3, 2],
-    [11, 6, 10, 7, 9, 8],
-    [17, 12, 16, 13, 15, 14],
-    [23, 18, 22, 19, 20, 21],
-    [255, 24, 30, 27, 29, 28],
+    [22, 44, 66, 88, 110, 132],
+    [49, 200, 245, 33, 94, 139],
+    [143, 201, 172, 2, 230, 60],
+    [217, 57, 154, 251, 91, 188],
+    [231, 179, 0, 127, 205, 153],
 ], dtype=np.int32)
 
 
@@ -698,22 +699,22 @@ def _ffn_ideal_weights() -> dict[str, np.ndarray]:
             ((row % 7) - 3) / 32.0
         )
 
+    # Fixture v3 makes the router a real producer rather than encoding its
+    # expected top-k output.  Every expert has five live source coefficients;
+    # Q8_0 packing/reopening happens before routing and the 30-record routed
+    # inventory is derived from that result below.
+    experts = np.arange(FFN_EXPERT_COUNT, dtype=np.int64)[:, None]
+    tokens = np.arange(5, dtype=np.int64)[None, :]
     router = np.zeros(
         (FFN_EXPERT_COUNT, FFN_HIDDEN_WIDTH), dtype=np.float32
     )
-    bias = np.zeros(FFN_EXPERT_COUNT, dtype=np.float32)
-    for token, experts in enumerate(FFN_SELECTED_EXPERTS):
-        for slot, expert_value in enumerate(experts):
-            expert = int(expert_value)
-            router[expert, token] = np.float32(
-                127 * (14 + (expert % 7)) / 4096.0
-            )
-            for dust_lane in range(5, 32):
-                router[expert, dust_lane] = np.float32(
-                    (1.0 if ((expert + dust_lane) & 1) == 0 else -1.0)
-                    / 1024.0
-                )
-            bias[expert] = np.float32((5 - 2 * slot) * 0.4)
+    router[:, :5] = (
+        ((experts * 35 + tokens * 64 + experts * tokens * 142) % 257)
+        - 128
+    ).astype(np.float32) / np.float32(2048.0)
+    bias = (
+        ((np.arange(FFN_EXPERT_COUNT, dtype=np.int64) * 93) % 257) - 128
+    ).astype(np.float32) / np.float32(8192.0)
 
     shared_rows = np.arange(FFN_MID_WIDTH, dtype=np.int64)
     shared_gate = _single_q8_coefficient(
@@ -783,8 +784,27 @@ def build_physical_ffn_fixture() -> PhysicalFFNFixture:
         "shared_up_weight": pack_q8_0(ideal["shared_up_weight"]),
         "shared_down_weight": pack_q8_0(ideal["shared_down_weight"]),
     }
+    hidden = dspark_reference._round_bfloat16(_ffn_hidden_input())
+    reduced, _ = dspark_reference.hc_pre(
+        hidden,
+        packed["hc_ffn_function_weight"].dequantized,
+        packed["hc_ffn_scale"].dequantized,
+        packed["hc_ffn_base"].dequantized,
+    )
+    hc_pre_output = dspark_reference._round_bfloat16(reduced)
+    ffn_normalized = dspark_reference._rms_norm_bfloat16(
+        hc_pre_output, packed["ffn_norm_weight"].dequantized, eps=1.0e-6
+    )
+    selected = dspark_reference.dspark_router_q8(
+        ffn_normalized,
+        packed["router_weight"],
+        packed["selection_bias"].dequantized,
+    ).selected_experts
+    if not np.array_equal(selected, FFN_SELECTED_EXPERTS):
+        raise AssertionError("fixture-v3 derived router output drifted")
+
     routed: dict[int, Mapping[str, LazyPackedMatrix]] = {}
-    for expert_value in FFN_SELECTED_EXPERTS.reshape(-1):
+    for expert_value in selected.reshape(-1):
         expert = int(expert_value)
         record = {
             "gate": pack_synthetic_iq2_xxs(
@@ -815,7 +835,7 @@ def build_physical_ffn_fixture() -> PhysicalFFNFixture:
         MappingProxyType(inputs),
         MappingProxyType(packed),
         MappingProxyType(routed),
-        _readonly(np.array(FFN_SELECTED_EXPERTS, copy=True)),
+        _readonly(np.array(selected, copy=True)),
     )
 
 
@@ -840,7 +860,7 @@ def ffn_payload_manifest(fixture: PhysicalFFNFixture) -> dict[str, object]:
             }
         routed_records[str(expert)] = component_record
     return {
-        "fixture_version": 2,
+        "fixture_version": 3,
         "geometry": {
             "proposal_rows": 5,
             "hc_lanes": 4,

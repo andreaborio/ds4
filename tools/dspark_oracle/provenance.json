@@ -155,21 +155,40 @@
       "policy": "do not simulate independence by generating one schema declaration from another"
     },
     "ffnFixture": {
-      "version": 2,
+      "version": 3,
       "role": "synthetic payload-first native boundary checkpoint, not checkpoint-weight parity",
+      "routerConstruction": "all 256 experts are generated independently from the frozen selected ids with five live source coefficients each, then Q8_0-packed and reopened before top-six selection; routed records are materialized only for the 30-expert output union",
+      "routerQ8Sha256": "7f225d8e24ac28bd16e83691d34a437550ba71432975303e94328e74e31e29b3",
+      "selectionBiasF32Sha256": "b814f6ff7e9c6c5aa72ac9bba86fa78836932c96cb1c3543f38cea0f02c56668",
+      "routedPayloadSha256": "04e33c37ef7788e4f881589d6df758e5a97c8b995463116dc6bf765c6a782e84",
+      "selectedUnionCount": 30,
+      "minimumSixthSeventhSelectionMargin": 0.004264354705810547,
+      "selectionMarginPolicy": "the minimum sixth/seventh augmented-probability margin must exceed twice the frozen MLX router-probability absolute-drift ceiling of 0.0013456344604492188",
       "sharedGateQ8Sha256": "7f10192cdc295ae811318df8d95457b4a1d45aed92e12c5cda99cafa82772e6e",
       "sharedUpQ8Sha256": "24e79016a69fc0472707508c4536b5c4a909bacee2dbcb37401e0a94737b2a1f",
       "sharedDownQ8Sha256": "71f5a2c1cc0487b8391aac802e2cddbe127d011bff77d20bc59d2e0470117a9d",
       "clampDiscriminator": "shared gate [0,0] is -127/256 and shared down row 67 amplifies mid lane zero with Q8 d=1/code=127; a symmetric gate clamp changes shared mid, shared down, final MoE and HC-post",
       "systemValidation": {
-        "capturedAt": "2026-08-03T14:54:57+02:00",
-        "result": "Ran 58 tests; OK with 2 explicit optional MLX/support-file skips"
+        "capturedAt": "2026-08-03T15:51:54+02:00",
+        "result": "Ran 59 tests; OK with 2 explicit optional MLX/support-file skips"
       },
       "mlxValidation": {
         "status": "passed",
-        "capturedAt": "2026-08-03T14:52:45+02:00",
-        "validatedFixtureVersion": 2,
-        "result": "Ran 58 tests; OK with 1 explicit optional support-file skip using mlx==0.32.0, mlx-metal==0.32.0, Device(gpu, 0)"
+        "capturedAt": "2026-08-03T15:52:12+02:00",
+        "validatedFixtureVersion": 3,
+        "result": "Ran 59 tests; OK with 1 explicit optional support-file skip using mlx==0.32.0, mlx-metal==0.32.0, Device(gpu, 0)"
+      },
+      "nativeMetalValidation": {
+        "status": "passed",
+        "capturedAt": "2026-08-03T15:50:44+02:00",
+        "hardware": "Apple M5 Pro, 64 GB unified memory",
+        "result": "build/metal-arm64/bin/ds4_test --metal-kernels passed in a second independent process; SUPPORT routed down and sequential sum, HC-pre, FFN input, shared path, combined MoE, and HC-post publications matched their frozen boundaries",
+        "hcSplitEnvelope": {
+          "policy": "retain the independent NumPy/MLX golden; require finite non-negative F32 results, exact hc_mix[7]=+0, segment-specific mismatch-count and ULP ceilings, and exact downstream BF16 hashes",
+          "pre": "19/20 differing, max 1 ULP",
+          "post": "6/20 differing, max 1 ULP",
+          "combination": "59/80 differing after 20 F32 exp/normalization cycles, max 4 ULP"
+        }
       }
     },
     "runtimeCaptureParity": {
@@ -180,7 +199,7 @@
     }
   },
   "validation": {
-    "capturedAt": "2026-08-03T14:54:57+02:00",
+    "capturedAt": "2026-08-03T15:52:12+02:00",
     "hardware": "Apple M5 Pro, 64 GB unified memory",
     "os": "macOS 26.5.2 (25F84)",
     "python": "3.13.13",
@@ -213,10 +232,10 @@
       "ffnHcPostBfloat16": 0.0
     },
     "semanticAudit": {
-      "capturedAt": "2026-08-03T14:54:57+02:00",
+      "capturedAt": "2026-08-03T15:52:12+02:00",
       "deepSpecRevision": "005e03b81cec38b7da6399833d609ee89a2587f2",
-      "systemPython": "Ran 58 tests; OK with 2 explicit optional MLX/support-file skips",
-      "mlxMetal": "Ran 58 tests; OK with 1 explicit optional-support-file skip with mlx==0.32.0, mlx-metal==0.32.0, Device(gpu, 0)",
+      "systemPython": "Ran 59 tests; OK with 2 explicit optional MLX/support-file skips",
+      "mlxMetal": "Ran 59 tests; OK with 1 explicit optional-support-file skip with mlx==0.32.0, mlx-metal==0.32.0, Device(gpu, 0)",
       "findings": [
         "confidence scheduling uses the first per-position sigmoid below threshold, not cumulative survival",
         "greedy and caller-uniform sampled Markov drafts feed each selected token into the next proposal step",

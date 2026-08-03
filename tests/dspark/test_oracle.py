@@ -2822,7 +2822,24 @@ class OracleFixtureTests(unittest.TestCase):
             "pending",
         )
         ffn_fixture = provenance["implementation"]["ffnFixture"]
-        self.assertEqual(ffn_fixture["version"], 2)
+        self.assertEqual(ffn_fixture["version"], 3)
+        self.assertEqual(
+            ffn_fixture["routerQ8Sha256"],
+            "7f225d8e24ac28bd16e83691d34a437550ba71432975303e94328e74e31e29b3",
+        )
+        self.assertEqual(
+            ffn_fixture["selectionBiasF32Sha256"],
+            "b814f6ff7e9c6c5aa72ac9bba86fa78836932c96cb1c3543f38cea0f02c56668",
+        )
+        self.assertEqual(
+            ffn_fixture["routedPayloadSha256"],
+            "04e33c37ef7788e4f881589d6df758e5a97c8b995463116dc6bf765c6a782e84",
+        )
+        self.assertEqual(ffn_fixture["selectedUnionCount"], 30)
+        self.assertEqual(
+            ffn_fixture["minimumSixthSeventhSelectionMargin"],
+            0.004264354705810547,
+        )
         self.assertEqual(
             ffn_fixture["sharedGateQ8Sha256"],
             "7f10192cdc295ae811318df8d95457b4a1d45aed92e12c5cda99cafa82772e6e",
@@ -2837,11 +2854,25 @@ class OracleFixtureTests(unittest.TestCase):
         )
         self.assertEqual(
             ffn_fixture["systemValidation"]["result"],
-            "Ran 58 tests; OK with 2 explicit optional MLX/support-file skips",
+            "Ran 59 tests; OK with 2 explicit optional MLX/support-file skips",
         )
         self.assertEqual(ffn_fixture["mlxValidation"]["status"], "passed")
         self.assertEqual(
-            ffn_fixture["mlxValidation"]["validatedFixtureVersion"], 2
+            ffn_fixture["mlxValidation"]["validatedFixtureVersion"], 3
+        )
+        native_validation = ffn_fixture["nativeMetalValidation"]
+        self.assertEqual(native_validation["status"], "passed")
+        self.assertEqual(
+            native_validation["hcSplitEnvelope"]["pre"],
+            "19/20 differing, max 1 ULP",
+        )
+        self.assertEqual(
+            native_validation["hcSplitEnvelope"]["post"],
+            "6/20 differing, max 1 ULP",
+        )
+        self.assertEqual(
+            native_validation["hcSplitEnvelope"]["combination"],
+            "59/80 differing after 20 F32 exp/normalization cycles, max 4 ULP",
         )
         target = next(
             source
@@ -3037,7 +3068,7 @@ class OracleFixtureTests(unittest.TestCase):
     def test_physical_ffn_payload_geometry_and_codecs(self) -> None:
         fixture = build_physical_ffn_fixture()
         manifest = ffn_payload_manifest(fixture)
-        self.assertEqual(manifest["fixture_version"], 2)
+        self.assertEqual(manifest["fixture_version"], 3)
         self.assertEqual(manifest["geometry"], {
             "proposal_rows": 5,
             "hc_lanes": 4,
@@ -3050,18 +3081,45 @@ class OracleFixtureTests(unittest.TestCase):
         self.assertEqual(manifest["routed_payload_bytes"], 26_542_080)
         self.assertEqual(
             manifest["routed_payload_sha256"],
-            "49bf413cc3e98472a7aceb53b1b4a16b83ab2182354dfe766815c3a064f274bb",
+            "04e33c37ef7788e4f881589d6df758e5a97c8b995463116dc6bf765c6a782e84",
         )
         self.assertEqual(len(fixture.routed_expert_weights), 30)
         self.assertEqual(
             set(fixture.routed_expert_weights),
             set(int(item) for item in FFN_SELECTED_EXPERTS.reshape(-1)),
         )
-        self.assertTrue({0, 29, 30, 255}.issubset(
+        self.assertTrue({0, 2, 22, 251}.issubset(
             fixture.routed_expert_weights
         ))
 
-        for expert in (0, 29, 30, 255):
+        experts = np.arange(256, dtype=np.int64)[:, None]
+        tokens = np.arange(5, dtype=np.int64)[None, :]
+        router_source = np.zeros((256, 4096), dtype=np.float32)
+        router_source[:, :5] = (
+            ((experts * 35 + tokens * 64 + experts * tokens * 142) % 257)
+            - 128
+        ).astype(np.float32) / np.float32(2048.0)
+        expected_router = pack_q8_0(router_source)
+        self.assertEqual(
+            fixture.packed_weights["router_weight"].payload,
+            expected_router.payload,
+        )
+        self.assertEqual(
+            manifest["non_routed"]["router_weight"]["sha256"],
+            "7f225d8e24ac28bd16e83691d34a437550ba71432975303e94328e74e31e29b3",
+        )
+        expected_bias = (
+            ((np.arange(256, dtype=np.int64) * 93) % 257) - 128
+        ).astype(np.float32) / np.float32(8192.0)
+        np.testing.assert_array_equal(
+            fixture.inputs["selection_bias"], expected_bias
+        )
+        self.assertEqual(
+            manifest["non_routed"]["selection_bias"]["sha256"],
+            "b814f6ff7e9c6c5aa72ac9bba86fa78836932c96cb1c3543f38cea0f02c56668",
+        )
+
+        for expert in (0, 2, 22, 251):
             record = fixture.routed_expert_weights[expert]
             self.assertEqual(
                 [record[role].storage for role in ("gate", "up", "down")],
@@ -3082,7 +3140,7 @@ class OracleFixtureTests(unittest.TestCase):
 
         self.assertNotEqual(
             fixture.routed_expert_weights[0]["gate"].payload,
-            fixture.routed_expert_weights[29]["gate"].payload,
+            fixture.routed_expert_weights[22]["gate"].payload,
         )
         self.assertEqual(
             manifest["non_routed"]["shared_gate_weight"]["sha256"],
@@ -3147,17 +3205,12 @@ class OracleFixtureTests(unittest.TestCase):
         for row in selection_scores:
             order = np.lexsort((expert_ids, -row))
             cutoff_margins.append(float(row[order[5]] - row[order[6]]))
-        self.assertEqual(min(cutoff_margins), 0.04725050926208496)
+        self.assertEqual(min(cutoff_margins), 0.004264354705810547)
         self.assertGreater(
             min(cutoff_margins),
-            2.0 * max(
-                mlx_optional.MLX_FFN_OPERATION_MAX_ABS_DRIFT[
-                    "router_logits"
-                ],
-                mlx_optional.MLX_FFN_OPERATION_MAX_ABS_DRIFT[
-                    "router_probabilities"
-                ],
-            ),
+            2.0 * mlx_optional.MLX_FFN_OPERATION_MAX_ABS_DRIFT[
+                "router_probabilities"
+            ],
         )
         np.testing.assert_allclose(
             np.sum(result.expert_weights, axis=1, dtype=np.float32),
@@ -3206,16 +3259,16 @@ class OracleFixtureTests(unittest.TestCase):
         expected_digests = {
             "ffn_normalized": "c6a60e7d9980460fd4e0c7c0bf86e3714529c97985a85d7bcaafede9d28660f3",
             "router_probabilities":
-                "c0348ed01aff47a3c2848dd67b5e5acddb2ffd4323e1443d5f9d4f018568b63a",
-            "expert_weights": "895dc2d1c4a85c9287b8b54650f2cd6594eca9c9bba28c6bac3c6e5ccc657838",
+                "ba60f30cf8aba114c88886fc3935bd4413eae16341d00f2a3e4d28b23abbe54b",
+            "expert_weights": "cef82038872a6a85f5a1d7f4d1d93bc760c7eaa5a441df6db850b801134188a9",
             "shared_gate": "da153e59f47374f0c7f8e5f4b85ad48449a12ae62e228422399e6de125471be5",
             "shared_up": "ee06aa93ae38f5e1ef7fd566738a0065f0f5ecc90799d354d7d7cdaf7a6144c2",
             "shared_mid": "8308c7c0efd0eedb71a89a7fb34484ae54547ec4e12700924b47fc251deded49",
             "shared_down": "415e3899f0732575d7f3f6e1947411db19a4009f67c74f5ef45324042bbd9ffa",
-            "routed_mid": "0d97fe47189317749e687e17b936557b63e0876d3882723644d2fe115957c107",
-            "routed_sum": "a0fffc630dffb5e5453e4a592b3259cb518a1de0179c7565ec3639674af1ad85",
-            "moe_output": "09e15e7ce1d65c2a7d31d1a9a77791498845eca6da17189869bb556cba088dd6",
-            "hc_post_output": "9e66222140513bf2a12f5f4ee256bf82ae425b0114e073e7c0fd073cdcd1489d",
+            "routed_mid": "34b567efc1a2592fd40812ca6b8275c2fbdea2bc9785b48350a95aaae2e62a0b",
+            "routed_sum": "27961fe0a417ea622f29513f457f778cdd8bfc27d40a36cbc3234d0d4c81b9d6",
+            "moe_output": "3ab416a9dec8128b8a919ae11f23014afc993a2caba664e09c09fd0888823d54",
+            "hc_post_output": "fdd19689c272e919aa765312ab0f63270e1160104730daf05018fbfb83d6e146",
         }
         for field, digest in expected_digests.items():
             self.assertEqual(
@@ -3223,6 +3276,46 @@ class OracleFixtureTests(unittest.TestCase):
                 digest,
                 field,
             )
+
+    def test_physical_ffn_hc_split_pins_metal_f32_sigmoid_seam(self) -> None:
+        fixture = build_physical_ffn_fixture()
+        result = dspark_reference.stage_ffn_moe_payload_first(
+            **fixture.inputs
+        )
+        function = fixture.packed_weights[
+            "hc_ffn_function_weight"
+        ].dequantized
+        mix7 = np.sum(
+            result.hidden_input[0].reshape(-1).astype(np.float32)
+            * function[7].astype(np.float32),
+            dtype=np.float32,
+        )
+        self.assertEqual(mix7.view(np.uint32).item(), 0)
+        post_z = np.float32(
+            mix7 * np.float32(fixture.inputs["hc_scale"][1])
+            + np.float32(fixture.inputs["hc_base"][7])
+        )
+        self.assertEqual(post_z, np.float32(0.09375))
+
+        exponent = np.exp(-np.abs(post_z), dtype=np.float32)
+        metal_f32_order = np.float32(2.0) * (
+            np.float32(1.0) / (np.float32(1.0) + exponent)
+        )
+        self.assertEqual(metal_f32_order.view(np.uint32).item(), 0x3F85FEE1)
+
+        _, golden_split = hc_pre(
+            result.hidden_input,
+            function,
+            fixture.inputs["hc_scale"],
+            fixture.inputs["hc_base"],
+        )
+        official_golden = np.float32(golden_split.post[0, 3])
+        self.assertEqual(official_golden.view(np.uint32).item(), 0x3F85FEE0)
+        self.assertEqual(
+            metal_f32_order.view(np.uint32).item()
+            - official_golden.view(np.uint32).item(),
+            1,
+        )
 
     def test_physical_ffn_mutations_pin_bias_ties_clamp_and_sum_order(self) -> None:
         fixture = build_physical_ffn_fixture()
@@ -3232,26 +3325,12 @@ class OracleFixtureTests(unittest.TestCase):
         unbiased = dspark_reference.dspark_router_q8(
             result.ffn_normalized, fixture.inputs["router_weight"], zero_bias
         )
-        self.assertFalse(np.array_equal(
-            unbiased.selected_experts, result.selected_experts
-        ))
-        for row in range(5):
-            self.assertEqual(
-                set(unbiased.selected_experts[row]),
-                set(result.selected_experts[row]),
-            )
-            base_by_id = {
-                int(expert): float(result.expert_weights[row, slot])
-                for slot, expert in enumerate(result.selected_experts[row])
-            }
-            unbiased_by_id = {
-                int(expert): float(unbiased.expert_weights[row, slot])
-                for slot, expert in enumerate(unbiased.selected_experts[row])
-            }
-            for expert in base_by_id:
-                self.assertAlmostEqual(
-                    base_by_id[expert], unbiased_by_id[expert], places=6
-                )
+        self.assertEqual(
+            int(np.count_nonzero(
+                unbiased.selected_experts != result.selected_experts
+            )),
+            15,
+        )
         np.testing.assert_array_equal(
             unbiased.probabilities, result.router_probabilities
         )
@@ -3259,7 +3338,7 @@ class OracleFixtureTests(unittest.TestCase):
         tied_router = np.array(
             fixture.inputs["router_weight"].dequantized, copy=True
         )
-        tied_router[[0, 1, 2, 3, 4, 5, 25]] = tied_router[0]
+        tied_router[[0, 1, 2, 3, 4, 5, 25]] = tied_router[22]
         tied = dspark_reference.dspark_router_q8(
             result.ffn_normalized, tied_router, zero_bias
         )
@@ -3340,8 +3419,8 @@ class OracleFixtureTests(unittest.TestCase):
         clamp_controls = {
             "shared_mid": (1, 0.004547107499092817),
             "shared_down": (16, 0.5781235694885254),
-            "moe_output": (1, 0.5),
-            "hc_post_output": (4, 0.75),
+            "moe_output": (2_055, 0.57421875),
+            "hc_post_output": (8_219, 0.703125),
         }
         for field, (different, maximum) in clamp_controls.items():
             delta = np.abs(
@@ -3356,7 +3435,7 @@ class OracleFixtureTests(unittest.TestCase):
                 slot_order_sum[row] += result.routed_down[row, slot]
         self.assertEqual(
             int(np.count_nonzero(slot_order_sum != result.routed_sum)),
-            6_144,
+            2_048,
         )
         self.assertEqual(
             float(np.max(np.abs(slot_order_sum - result.routed_sum))),
@@ -3451,14 +3530,6 @@ class OracleFixtureTests(unittest.TestCase):
         result = dspark_reference.stage_ffn_moe_payload_first(
             **fixture.inputs
         )
-        weight_bits = uint32_values(
-            "g_dspark_routed_test_weight_bits"
-        )
-        np.testing.assert_array_equal(
-            weight_bits,
-            result.expert_weights.astype("<f4").view("<u4").reshape(-1),
-        )
-
         def in_expert_id_order(field: str) -> np.ndarray:
             values = getattr(result, field)
             return np.stack([
@@ -3507,24 +3578,24 @@ class OracleFixtureTests(unittest.TestCase):
             "input":
                 "c6a60e7d9980460fd4e0c7c0bf86e3714529c97985a85d7bcaafede9d28660f3",
             "gate":
-                "5fab35c8aada22905d435ee298f2cb8b2ee50e46db0bbfc43aee6d16e5dd9f9c",
+                "756d8b680a45b663aeb1e4aa1a145731c90b7ccb14472c8957eadffec785ebde",
             "up":
-                "b9599f7561f30bd39563f2869c3b29d2d8a24ec04da4cbbc29ac27055ba6d5cd",
+                "00416414a54bfeabc97abcd6556648c0b4d44724a4b1bb0568ac6541e3171b4e",
             "mid":
-                "121738d8b17fd4709825df9eda1817067f880fe2692158d527b616bcf401c6b2",
+                "21fa4b91cb0c82d58d2555fb23760c1f03a6e1a06fdf3815f5d4dc9fef2f2cb4",
             "down":
-                "c851ef3f25fb561eda6dd6c8d3cf228cf07ac9ca121df1237e99ed18a5eca30a",
+                "16c0e8e07474de29a5ec3d2b4aad2b18ef89706a9091742553566271607af00e",
             "sum":
-                "a0fffc630dffb5e5453e4a592b3259cb518a1de0179c7565ec3639674af1ad85",
+                "27961fe0a417ea622f29513f457f778cdd8bfc27d40a36cbc3234d0d4c81b9d6",
         })
         for digest in expected_hashes.values():
             self.assertIn(digest, source)
         self.assertEqual(
             ffn_payload_manifest(fixture)["routed_payload_sha256"],
-            "49bf413cc3e98472a7aceb53b1b4a16b83ab2182354dfe766815c3a064f274bb",
+            "04e33c37ef7788e4f881589d6df758e5a97c8b995463116dc6bf765c6a782e84",
         )
         self.assertIn(
-            "49bf413cc3e98472a7aceb53b1b4a16b83ab2182354dfe766815c3a064f274bb",
+            "04e33c37ef7788e4f881589d6df758e5a97c8b995463116dc6bf765c6a782e84",
             source,
         )
 
@@ -3564,7 +3635,7 @@ class OracleFixtureTests(unittest.TestCase):
             split.combination.reshape(5, 16),
         ), axis=1).astype("<f4")
         native_split = uint32_values(
-            "g_dspark_shared_test_hc_split_bits"
+            "g_dspark_shared_test_expected_hc_split_bits"
         ).reshape(5, 24)
         np.testing.assert_array_equal(native_split, packed_split.view("<u4"))
         self.assertEqual(
@@ -3582,11 +3653,11 @@ class OracleFixtureTests(unittest.TestCase):
             "shared_down":
                 "415e3899f0732575d7f3f6e1947411db19a4009f67c74f5ef45324042bbd9ffa",
             "moe_output":
-                "09e15e7ce1d65c2a7d31d1a9a77791498845eca6da17189869bb556cba088dd6",
+                "3ab416a9dec8128b8a919ae11f23014afc993a2caba664e09c09fd0888823d54",
             "hidden_input":
                 "bf0c4d85aeea6ccf4a50627856bd3fe0d39344176a48833f35539df57bfe89e6",
             "hc_post_output":
-                "9e66222140513bf2a12f5f4ee256bf82ae425b0114e073e7c0fd073cdcd1489d",
+                "fdd19689c272e919aa765312ab0f63270e1160104730daf05018fbfb83d6e146",
         }
         for field, digest in shared_hashes.items():
             self.assertEqual(
@@ -3600,18 +3671,95 @@ class OracleFixtureTests(unittest.TestCase):
             "static int ds4_gpu_dspark_routed_test_encode("
         )
         encode_end = source.index(
-            "static int ds4_gpu_dspark_routed_test_shadow_unchanged(",
+            "/* SUPPORT records and their lease are gone",
             encode_start,
         )
         encode_source = source[encode_start:encode_end]
-        self.assertEqual(encode_source.count("ds4_gpu_matmul_q8_0_tensor("), 3)
+        self.assertEqual(encode_source.count("ds4_gpu_matmul_q8_0_tensor("), 0)
         self.assertEqual(
-            encode_source.count("ds4_gpu_encode_moe_swiglu_weight("), 2
+            encode_source.count("ds4_gpu_encode_moe_swiglu_weight("), 1
         )
-        self.assertIn("ds4_gpu_add_tensor(", encode_source)
-        self.assertIn("ds4_gpu_hc_expand_split_tensor(", encode_source)
+        self.assertNotIn("ds4_gpu_add_tensor(", encode_source)
+        self.assertNotIn("ds4_gpu_hc_expand_split_tensor(", encode_source)
+        self.assertIn(
+            "ds4_gpu_dspark_support_encode_sum6_sequential(",
+            encode_source,
+        )
+
+        post_start = source.index(
+            "static int ds4_gpu_dspark_routed_test_post_route("
+        )
+        post_end = source.index(
+            "static int ds4_gpu_dspark_routed_test_shadow_unchanged(",
+            post_start,
+        )
+        post_source = source[post_start:post_end]
+        self.assertEqual(post_source.count("ds4_gpu_matmul_q8_0_tensor("), 3)
+        self.assertEqual(
+            post_source.count("ds4_gpu_encode_moe_swiglu_weight("), 1
+        )
+        self.assertIn("ds4_gpu_add_tensor(", post_source)
+        self.assertIn("ds4_gpu_hc_expand_split_tensor(", post_source)
         self.assertIn("DS4_DSPARK_ROUTED_TEST_FAIL_AFTER_SHARED_DOWN", source)
         self.assertIn("DS4_DSPARK_ROUTED_TEST_FAIL_AFTER_MOE", source)
+        self.assertIn(
+            "DS4_DSPARK_ROUTED_TEST_FAIL_AFTER_HC_POST_BEFORE_PUBLISH",
+            source,
+        )
+
+        model_start = source.index(
+            "static int ds4_gpu_dspark_shared_test_model("
+        )
+        model_end = source.index(
+            "static int ds4_gpu_dspark_shared_test_release_model_map(",
+            model_start,
+        )
+        model_source = source[model_start:model_end]
+        self.assertNotIn("g_dspark_routed_test_selected", model_source)
+        self.assertIn("expert * 35u", model_source)
+        self.assertIn("token * 64u", model_source)
+        self.assertIn("expert * token * 142u", model_source)
+        self.assertIn("expert * 93u", model_source)
+        self.assertIn("volatile float scale", model_source)
+        self.assertIn("volatile float inverse", model_source)
+        self.assertIn("volatile float scaled", model_source)
+        self.assertIn(
+            "7f225d8e24ac28bd16e83691d34a437550ba71432975303e94328e74e31e29b3",
+            model_source,
+        )
+        self.assertIn(
+            "a8046a58aae8f81ddf17e1e1826909c26f997f5b8c6eeebbaa3c857d66d61910",
+            model_source,
+        )
+
+        transaction_start = source.index(
+            "static int ds4_gpu_dspark_support_selected_addr_transaction("
+        )
+        transaction_end = source.index("\n#endif", transaction_start)
+        transaction_source = source[transaction_start:transaction_end]
+        self.assertLess(
+            transaction_source.index(
+                "ds4_gpu_dspark_support_selected_ids_valid("
+            ),
+            transaction_source.index(
+                "ds4_gpu_dspark_support_cache_acquire_stage_lease("
+            ),
+        )
+
+        pre_start = source.index(
+            "static int ds4_gpu_dspark_routed_test_pre_route("
+        )
+        pre_end = source.index(
+            "static int ds4_gpu_dspark_support_encode_addr_mv(", pre_start
+        )
+        pre_source = source[pre_start:pre_end]
+        self.assertIn(
+            "DS4_DSPARK_ROUTED_TEST_FAIL_INVALID_ROUTER_ROW", pre_source
+        )
+        self.assertLess(
+            pre_source.index("ds4_gpu_dspark_support_selected_ids_valid("),
+            pre_source.index("g_dspark_routed_test_selected"),
+        )
 
         test_start = source.index(
             "int ds4_gpu_internal_dspark_support_routed_moe_test(void)"
@@ -3623,8 +3771,53 @@ class OracleFixtureTests(unittest.TestCase):
         self.assertLess(
             test_source.index("fd = mkstemp(path);"),
             test_source.index(
-                "ds4_gpu_dspark_shared_test_model(&context.shared_model)"
+                "ds4_gpu_dspark_shared_test_model("
             ),
+        )
+        pre_route = test_source.index(
+            "ds4_gpu_dspark_routed_test_pre_route(&context)"
+        )
+        write_payloads = test_source.index(
+            "ds4_gpu_dspark_routed_test_write_payloads("
+        )
+        first_support = test_source.index(
+            "ds4_gpu_dspark_support_selected_addr_transaction("
+        )
+        self.assertLess(pre_route, write_payloads)
+        self.assertLess(write_payloads, first_support)
+        self.assertIn(
+            "DS4_DSPARK_ROUTED_TEST_FAIL_INVALID_ROUTER_ROW", test_source
+        )
+        for counter in (
+            "g_dspark_support_cache_lease_acquires",
+            "g_dspark_support_cache_lease_releases",
+            "g_dspark_support_cache_pread_syscalls",
+            "g_dspark_support_cache_pread_bytes",
+        ):
+            self.assertIn(counter, test_source[:write_payloads])
+        self.assertIn(
+            "context.invalid_router_row_observed", test_source[:write_payloads]
+        )
+        self.assertIn(
+            "ds4_gpu_dspark_routed_test_shadow_unchanged(",
+            test_source[:write_payloads],
+        )
+        self.assertNotIn(
+            "g_dspark_routed_test_selected,",
+            test_source[first_support:],
+        )
+        self.assertIn("context.selected_host", test_source[first_support:])
+        first_post = test_source.index(
+            "ds4_gpu_dspark_routed_test_post_route(&context)"
+        )
+        first_publish = test_source.index(
+            "ds4_gpu_dspark_routed_test_publish("
+        )
+        self.assertLess(first_support, first_post)
+        self.assertLess(first_post, first_publish)
+        self.assertIn(
+            "memcmp(hc_first, hc_second, (size_t)hidden_bytes) == 0",
+            test_source,
         )
         self.assertLess(
             test_source.index("ds4_gpu_tensor_free(context.hc_post);"),
@@ -3647,6 +3840,63 @@ class OracleFixtureTests(unittest.TestCase):
             "g_dspark_shared_test_model_map = NULL",
         ):
             self.assertIn(operation, release_source)
+
+        hc_check_start = source.index(
+            "static int ds4_gpu_dspark_routed_test_check_hc_split("
+        )
+        hc_check_end = source.index(
+            "static int ds4_gpu_dspark_routed_test_check_outputs(",
+            hc_check_start,
+        )
+        hc_check_source = source[hc_check_start:hc_check_end]
+        self.assertIn("context->hc_mix", hc_check_source)
+        self.assertIn("mix_discriminator != 0.0f", hc_check_source)
+        self.assertNotIn("exploratory", hc_check_source)
+        self.assertIn(
+            "ds4_gpu_dspark_routed_test_hc_split_lane_accepts(",
+            hc_check_source,
+        )
+        self.assertIn("composed HC %s=%u/%u", hc_check_source)
+        self.assertIn("max_ulp=%u index=%u", hc_check_source)
+
+        comparator_start = source.index(
+            "static int ds4_gpu_dspark_routed_test_hc_split_lane_accepts("
+        )
+        comparator_end = source.index(
+            "static int "
+            "ds4_gpu_dspark_routed_test_hc_split_comparator_controls(",
+            comparator_start,
+        )
+        comparator_source = source[comparator_start:comparator_end]
+        self.assertIn("segment < 2u ? 1u : 4u", comparator_source)
+        self.assertIn(
+            "different_limits[3] = {19u, 6u, 59u}",
+            comparator_source,
+        )
+        self.assertIn(
+            "ulp_limits[3] = {1u, 1u, 4u}", comparator_source
+        )
+        self.assertIn("!isfinite(actual)", comparator_source)
+        self.assertIn("signbit(actual)", comparator_source)
+
+        controls_start = comparator_end
+        controls_end = source.index(
+            "static int ds4_gpu_dspark_routed_test_check_hc_split(",
+            controls_start,
+        )
+        controls_source = source[controls_start:controls_end]
+        for bits in (
+            "0x3f800001", "0x3f800002", "0x3f800004", "0x3f800005",
+            "0x7fc12345",
+        ):
+            self.assertIn(bits, controls_source)
+        self.assertIn("0u, -1.0f", controls_source)
+        for rejected_metrics in (
+            "0u, 20u, 1u", "0u, 19u, 2u",
+            "1u, 7u, 1u", "1u, 6u, 2u",
+            "2u, 60u, 4u", "2u, 59u, 5u",
+        ):
+            self.assertIn(rejected_metrics, controls_source)
 
         self.assertEqual(
             uint32_values("g_dspark_routed_test_sum_control").tolist(),
