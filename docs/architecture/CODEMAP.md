@@ -70,6 +70,7 @@ helpers remain in the same translation unit while agents can load one family.
 | `ds4_streaming_hotlist.inc` | DeepSeek streaming hotlist data included by `ds4.c` |
 | `ds4_streaming_hotlist_glm52.inc` | GLM 5.2 streaming hotlist data included by `ds4.c` |
 | `runtime/ds4_deepseek_cache_phase.inc` | DeepSeek adaptive ExpertMajor cache transitions around batched prefill; textually included by `ds4.c` |
+| `runtime/ds4_dspark_graph.inc` | DSpark post-layer HC-mean taps and the non-executing TARGET/SUPPORT cache-floor plan; textually included by `ds4.c` |
 | `runtime/ds4_glm_graph.inc` | GLM Metal graph state, allocation, prefill/decode scheduling, routed MoE/SSD orchestration, and GLM generation; textually included by `ds4.c` |
 | `runtime/ds4_metal_glm.inc` | GLM-specific Metal encoders and tensor wrappers; textually included by `ds4_metal.m` |
 
@@ -140,8 +141,12 @@ not validated.
 | `docs/contracts/qwen-release.json` + `tools/qwen_release_contract.py` | Canonical Hebrus-named Stable, opt-in Beta, and historical negative-only Qwen artifact identities plus the model-free gate that parses their documentation, downloader, and test surfaces for drift |
 | `tests/test_qwen_release_contract.py` | Fail-closed fixtures for prose, table, downloader, schema, status, and negative-only Qwen release-contract drift |
 | `tests/qwen/` | Qwen fixtures, provenance, reference collectors, and model-specific gates |
+| `tests/dspark/` | Development-only, model-free fixtures and fail-closed tests for the pinned DeepSeek V4 Flash 0731 DSpark metadata, sequential Markov correction, per-position confidence depth, cumulative binary-acceptance prefixing, and exact speculative sampling |
+| `tests/test_dspark_admission.py` | Sparse, exact-geometry combined-GGUF fixtures for DSpark 0731 loader inspection, physical-range validation, logical routed-tensor expansion, and the explicit pre-inference fail-closed gate |
 | `tests/test-vectors/` | Official and local continuation vectors plus provenance |
 | `gguf-tools/` | Quantization, ExpertMajor conversion, imatrix, and quality-scoring tools |
+| `gguf-tools/ds4-expert-major.py` | Deterministic ExpertMajor v2 converter/verifier; its development-only `--dspark-support` path composes target and 0731 support sources into one atomically installed GGUF with byte-verified target and auxiliary stores |
+| `tools/dspark_oracle/` | NumPy semantic oracle, pinned provenance, reproducible fixture generator, and optional direct-MLX primitive cross-check; never linked into production inference |
 | `speed-bench/` | Benchmark prompt, driver helpers, plots, and historical results |
 | [`docs/benchmarks/`](../benchmarks/README.md) | Indexed dated benchmark decisions and measurements |
 
@@ -157,6 +162,7 @@ not be copied into new tests.
 | `QA_BEFORE_RELEASES.md` | Complete release checklist |
 | `docs/contracts/RUNTIME_SUPPORT.md` | Current supported runtime/model matrix |
 | `docs/contracts/BRAND_COMPATIBILITY.md` | Canonical Hebrus names, compatibility aliases, and permanently stable identifiers |
+| `docs/adr/0008-deepseek-dspark-embedded-support-store.md` | Proposed, not yet accepted: single-GGUF target/support ownership and Apple AUTO/SSD promotion gates for DeepSeek DSpark |
 | `docs/adr/` | Accepted architectural decisions and their consequences |
 | `GOLD_METAL_SSD.md` | Metal/SSD planner details and performance gates; support authority remains `RUNTIME_SUPPORT.md` |
 | `FORK_NOTES.md` | Time-stamped fork/upstream boundary ledger |

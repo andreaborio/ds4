@@ -1,0 +1,64 @@
+{
+  "schemaVersion": 1,
+  "profile": "deepseek-v4-flash-0731-dspark",
+  "semantic": {
+    "blockSize": 5,
+    "markovRank": 256,
+    "noiseTokenId": 128799,
+    "stageCount": 3,
+    "targetLayerIds": [40, 41, 42],
+    "targetLayerCount": 43,
+    "vocabSize": 129280,
+    "expertCount": 256,
+    "expertsPerToken": 6
+  },
+  "metadata": {
+    "hf": {
+      "model_type": "deepseek_v4",
+      "num_hidden_layers": 43,
+      "vocab_size": 129280,
+      "n_routed_experts": 256,
+      "num_experts_per_tok": 6,
+      "dspark_block_size": 5,
+      "dspark_markov_rank": 256,
+      "dspark_noise_token_id": 128799,
+      "dspark_target_layer_ids": [40, 41, 42]
+    },
+    "gguf": {
+      "general.architecture": "deepseek4",
+      "deepseek4.block_count": 43,
+      "deepseek4.vocab_size": 129280,
+      "deepseek4.expert_count": 256,
+      "deepseek4.expert_used_count": 6,
+      "dspark.block_size": 5,
+      "dspark.markov_rank": 256,
+      "dspark.noise_token_id": 128799,
+      "dspark.target_layer_ids": [40, 41, 42],
+      "dspark.stage_count": 3,
+      "dspark.n_layers": 3
+    }
+  },
+  "fieldMap": {
+    "hf": {
+      "blockSize": "dspark_block_size",
+      "markovRank": "dspark_markov_rank",
+      "noiseTokenId": "dspark_noise_token_id",
+      "targetLayerIds": "dspark_target_layer_ids",
+      "targetLayerCount": "num_hidden_layers",
+      "vocabSize": "vocab_size",
+      "expertCount": "n_routed_experts",
+      "expertsPerToken": "num_experts_per_tok"
+    },
+    "gguf": {
+      "blockSize": "dspark.block_size",
+      "markovRank": "dspark.markov_rank",
+      "noiseTokenId": "dspark.noise_token_id",
+      "stageCount": "dspark.stage_count",
+      "targetLayerIds": "dspark.target_layer_ids",
+      "targetLayerCount": "deepseek4.block_count",
+      "vocabSize": "deepseek4.vocab_size",
+      "expertCount": "deepseek4.expert_count",
+      "expertsPerToken": "deepseek4.expert_used_count"
+    }
+  }
+}

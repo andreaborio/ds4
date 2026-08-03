@@ -524,6 +524,83 @@ const ds4_expert_store_layer *ds4_expert_store_layer_at(
     return &store->layers[index];
 }
 
+bool ds4_expert_store_validate_dspark_0731(
+        const ds4_expert_store *store,
+        char                   *error,
+        size_t                  error_size) {
+    if (!store) {
+        set_error(error, error_size, "missing DSpark expert store");
+        return false;
+    }
+    const ds4_expert_store_manifest *manifest = &store->manifest;
+    if (manifest->version != DS4_EXPERT_STORE_V2_VERSION ||
+        manifest->family != DS4_EXPERT_STORE_FAMILY_DEEPSEEK4 ||
+        manifest->storage_format != DS4_EXPERT_STORE_STORAGE_GGML ||
+        manifest->group_size != 0u ||
+        manifest->layer_count != DS4_DSPARK_0731_STAGE_COUNT ||
+        manifest->expert_count != DS4_DSPARK_0731_EXPERT_COUNT ||
+        manifest->expert_used_count != DS4_DSPARK_0731_EXPERT_USED_COUNT ||
+        manifest->source_tensor_count !=
+            DS4_DSPARK_0731_SOURCE_TENSOR_COUNT ||
+        manifest->data_offset != DS4_DSPARK_0731_DATA_OFFSET ||
+        manifest->data_size != DS4_DSPARK_0731_DATA_BYTES ||
+        manifest->store_size != DS4_DSPARK_0731_STORE_BYTES) {
+        set_error(error, error_size,
+                  "DSpark 0731 manifest identity is invalid");
+        return false;
+    }
+
+    static const uint32_t component_type[3] = {16u, 16u, 10u};
+    static const uint64_t component_dim[3][3] = {
+        {4096u, 2048u, DS4_DSPARK_0731_EXPERT_COUNT},
+        {4096u, 2048u, DS4_DSPARK_0731_EXPERT_COUNT},
+        {2048u, 4096u, DS4_DSPARK_0731_EXPERT_COUNT},
+    };
+    static const uint64_t component_bytes[3] = {
+        UINT64_C(2162688), UINT64_C(2162688), UINT64_C(2752512),
+    };
+    static const uint64_t component_offset[3] = {
+        UINT64_C(0), UINT64_C(2162688), UINT64_C(4325376),
+    };
+
+    for (uint32_t stage = 0; stage < DS4_DSPARK_0731_STAGE_COUNT;
+         stage++) {
+        const ds4_expert_store_layer *layer =
+            ds4_expert_store_layer_at(store, stage);
+        const uint64_t expected_data_offset =
+            DS4_DSPARK_0731_DATA_OFFSET +
+            (uint64_t)stage * DS4_DSPARK_0731_STAGE_BYTES;
+        if (!layer || layer->layer != stage ||
+            layer->expert_count != DS4_DSPARK_0731_EXPERT_COUNT ||
+            layer->record_bytes != DS4_DSPARK_0731_RECORD_BYTES ||
+            layer->data_offset != expected_data_offset ||
+            layer->data_size != DS4_DSPARK_0731_STAGE_BYTES) {
+            set_error(error, error_size,
+                      "DSpark 0731 stage %u record geometry is invalid",
+                      stage);
+            return false;
+        }
+        for (uint32_t role = 0; role < 3; role++) {
+            const ds4_expert_store_component *component =
+                &layer->component[role];
+            if (component->role != role ||
+                component->ggml_type != component_type[role] ||
+                component->block_elements != 256u ||
+                component->dim[0] != component_dim[role][0] ||
+                component->dim[1] != component_dim[role][1] ||
+                component->dim[2] != component_dim[role][2] ||
+                component->expert_bytes != component_bytes[role] ||
+                component->record_offset != component_offset[role]) {
+                set_error(error, error_size,
+                          "DSpark 0731 stage %u role %u geometry is invalid",
+                          stage, role);
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
 bool ds4_expert_store_slice_get(
         const ds4_expert_store *store,
         uint32_t                layer,

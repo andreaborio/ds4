@@ -1,0 +1,406 @@
+{
+  "cases": {
+    "confidencePrefix": {
+      "embedding": [
+        [
+          1.0,
+          0.0
+        ],
+        [
+          0.0,
+          1.0
+        ],
+        [
+          1.0,
+          1.0
+        ],
+        [
+          -1.0,
+          0.5
+        ]
+      ],
+      "expected": {
+        "keep": 2,
+        "logits": [
+          0.625,
+          0.5250000000000001,
+          0.17500000000000004
+        ],
+        "probabilities": [
+          0.6513548646660542,
+          0.6283161882953663,
+          0.5436386872370789
+        ]
+      },
+      "hidden": [
+        [
+          0.2,
+          -0.1
+        ],
+        [
+          0.4,
+          0.3
+        ],
+        [
+          -0.2,
+          0.5
+        ]
+      ],
+      "previousTokens": [
+        2,
+        0,
+        0
+      ],
+      "projection": [
+        0.5,
+        -0.25,
+        0.4,
+        0.1
+      ],
+      "threshold": 0.6
+    },
+    "markovGreedy": {
+      "baseLogits": [
+        [
+          1.0,
+          0.5,
+          -1.0,
+          0.0
+        ],
+        [
+          0.2,
+          0.1,
+          0.0,
+          -0.1
+        ],
+        [
+          -0.5,
+          0.2,
+          0.4,
+          0.3
+        ]
+      ],
+      "embedding": [
+        [
+          1.0,
+          0.0
+        ],
+        [
+          0.0,
+          1.0
+        ],
+        [
+          1.0,
+          1.0
+        ],
+        [
+          -1.0,
+          0.5
+        ]
+      ],
+      "expected": {
+        "stepLogits": [
+          [
+            1.1,
+            0.39999999999999997,
+            -0.4,
+            -0.4
+          ],
+          [
+            0.4,
+            -0.30000000000000004,
+            0.1,
+            -0.30000000000000004
+          ],
+          [
+            -0.3,
+            -0.2,
+            0.5,
+            0.09999999999999998
+          ]
+        ],
+        "tokens": [
+          0,
+          0,
+          2
+        ]
+      },
+      "firstPreviousToken": 2,
+      "projection": [
+        [
+          0.2,
+          -0.1
+        ],
+        [
+          -0.4,
+          0.3
+        ],
+        [
+          0.1,
+          0.5
+        ],
+        [
+          -0.2,
+          -0.2
+        ]
+      ]
+    },
+    "metadata0731": {
+      "gguf": {
+        "deepseek4.block_count": 43,
+        "deepseek4.expert_count": 256,
+        "deepseek4.expert_used_count": 6,
+        "deepseek4.vocab_size": 129280,
+        "dspark.block_size": 5,
+        "dspark.markov_rank": 256,
+        "dspark.n_layers": 3,
+        "dspark.noise_token_id": 128799,
+        "dspark.stage_count": 3,
+        "dspark.target_layer_ids": [
+          40,
+          41,
+          42
+        ],
+        "general.architecture": "deepseek4"
+      },
+      "hf": {
+        "dspark_block_size": 5,
+        "dspark_markov_rank": 256,
+        "dspark_noise_token_id": 128799,
+        "dspark_target_layer_ids": [
+          40,
+          41,
+          42
+        ],
+        "model_type": "deepseek_v4",
+        "n_routed_experts": 256,
+        "num_experts_per_tok": 6,
+        "num_hidden_layers": 43,
+        "vocab_size": 129280
+      }
+    },
+    "postLayerHCMean": {
+      "expectedSamples": [
+        {
+          "index": [
+            0,
+            0
+          ],
+          "value": -1.75
+        },
+        {
+          "index": [
+            0,
+            128
+          ],
+          "value": 2.25
+        },
+        {
+          "index": [
+            0,
+            256
+          ],
+          "value": 6.25
+        },
+        {
+          "index": [
+            1,
+            257
+          ],
+          "value": -1.5
+        },
+        {
+          "index": [
+            2,
+            4095
+          ],
+          "value": 6.25
+        }
+      ],
+      "expectedShape": [
+        3,
+        4096
+      ],
+      "generator": {
+        "dimensionOffset": -128,
+        "dimensionPeriod": 257,
+        "dimensionScale": 0.03125,
+        "hcScale": 1.5,
+        "tokenScale": 0.25
+      },
+      "shape": [
+        3,
+        4,
+        4096
+      ]
+    },
+    "samplingAllAccepted": {
+      "acceptanceUniforms": [
+        0.9,
+        0.9,
+        0.9
+      ],
+      "categoricalUniforms": [
+        0.0,
+        0.0,
+        0.0,
+        0.65
+      ],
+      "draftProbabilities": [
+        [
+          0.1,
+          0.4,
+          0.2,
+          0.3
+        ],
+        [
+          0.5,
+          0.1,
+          0.2,
+          0.2
+        ],
+        [
+          0.2,
+          0.2,
+          0.5,
+          0.1
+        ]
+      ],
+      "draftTokens": [
+        1,
+        0,
+        2
+      ],
+      "expected": {
+        "acceptanceThresholds": [
+          1.0,
+          1.0,
+          1.0
+        ],
+        "accepted": 3,
+        "committedTokens": [
+          1,
+          0,
+          2,
+          3
+        ],
+        "replacementToken": 3,
+        "targetRow": 3
+      },
+      "targetProbabilities": [
+        [
+          0.1,
+          0.4,
+          0.2,
+          0.3
+        ],
+        [
+          0.5,
+          0.1,
+          0.2,
+          0.2
+        ],
+        [
+          0.2,
+          0.2,
+          0.5,
+          0.1
+        ],
+        [
+          0.1,
+          0.2,
+          0.3,
+          0.4
+        ]
+      ]
+    },
+    "samplingRejected": {
+      "acceptanceUniforms": [
+        0.1,
+        0.8,
+        0.0
+      ],
+      "categoricalUniforms": [
+        0.0,
+        0.85,
+        0.0,
+        0.0
+      ],
+      "draftProbabilities": [
+        [
+          0.2,
+          0.5,
+          0.1,
+          0.2
+        ],
+        [
+          0.3,
+          0.05,
+          0.4,
+          0.25
+        ],
+        [
+          0.1,
+          0.4,
+          0.4,
+          0.1
+        ]
+      ],
+      "draftTokens": [
+        1,
+        2,
+        2
+      ],
+      "expected": {
+        "acceptanceThresholds": [
+          0.8,
+          0.5,
+          1.0
+        ],
+        "accepted": 1,
+        "committedTokens": [
+          1,
+          1
+        ],
+        "replacementToken": 1,
+        "residualProbabilities": [
+          0.8,
+          0.2,
+          0.0,
+          0.0
+        ],
+        "targetRow": 1
+      },
+      "targetProbabilities": [
+        [
+          0.1,
+          0.4,
+          0.2,
+          0.3
+        ],
+        [
+          0.5,
+          0.1,
+          0.2,
+          0.2
+        ],
+        [
+          0.2,
+          0.2,
+          0.5,
+          0.1
+        ],
+        [
+          0.1,
+          0.2,
+          0.3,
+          0.4
+        ]
+      ]
+    }
+  },
+  "generatedBy": "tools/dspark_oracle/generate_fixtures.py",
+  "numericType": "float64",
+  "profile": "deepseek-v4-flash-0731-dspark",
+  "schemaVersion": 2
+}

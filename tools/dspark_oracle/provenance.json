@@ -1,0 +1,132 @@
+{
+  "schemaVersion": 2,
+  "capturedAt": "2026-08-03",
+  "profile": "deepseek-v4-flash-0731-dspark",
+  "sources": [
+    {
+      "role": "official-target-config",
+      "repository": "deepseek-ai/DeepSeek-V4-Flash-0731",
+      "revision": "7872f01b1d1fe23eabc4c98b48bffcef5a386062",
+      "path": "config.json",
+      "sha256": "6c8f3d2d3b48707541b88f32f22ef3f0f8a6b57d8523281e2b8d3cdb0ae9a023",
+      "url": "https://huggingface.co/deepseek-ai/DeepSeek-V4-Flash-0731/blob/7872f01b1d1fe23eabc4c98b48bffcef5a386062/config.json"
+    },
+    {
+      "role": "official-target-index",
+      "repository": "deepseek-ai/DeepSeek-V4-Flash-0731",
+      "revision": "7872f01b1d1fe23eabc4c98b48bffcef5a386062",
+      "path": "model.safetensors.index.json",
+      "sha256": "98efab455cf08dfbbbaaba6f570e1bf10bf927d2b4c3c453a59c2f6f0e3be92b",
+      "url": "https://huggingface.co/deepseek-ai/DeepSeek-V4-Flash-0731/blob/7872f01b1d1fe23eabc4c98b48bffcef5a386062/model.safetensors.index.json",
+      "observations": {
+        "totalTensorNames": 72317,
+        "mtpTensorNames": 4705,
+        "mtpStageIds": [0, 1, 2],
+        "mtpSourceShards": [
+          {
+            "path": "model-00046-of-00048.safetensors",
+            "size": 3610455184,
+            "sha256": "5db924ca907e0d93acd975bd5079c3662717f9ac709f23d079bd8f816d29d9dd"
+          },
+          {
+            "path": "model-00047-of-00048.safetensors",
+            "size": 3560111960,
+            "sha256": "62816173f9f6e136b20b48e3b6f16613ac9ea02b5603f636928b253244a548bd"
+          },
+          {
+            "path": "model-00048-of-00048.safetensors",
+            "size": 3692775244,
+            "sha256": "cc43742bd24ae6bcdea343a91442f6f66aed2cfebcc6b235470204851ce2f8a9"
+          }
+        ]
+      }
+    },
+    {
+      "role": "official-dspark-config-cross-check",
+      "repository": "deepseek-ai/DeepSeek-V4-Flash-DSpark",
+      "revision": "62af8fffb2f7030cac4de2f0169f5b8d1101b646",
+      "path": "config.json",
+      "sha256": "6c8f3d2d3b48707541b88f32f22ef3f0f8a6b57d8523281e2b8d3cdb0ae9a023",
+      "url": "https://huggingface.co/deepseek-ai/DeepSeek-V4-Flash-DSpark/blob/62af8fffb2f7030cac4de2f0169f5b8d1101b646/config.json"
+    },
+    {
+      "role": "reference-quantized-support-gguf",
+      "repository": "sakamakismile/DeepSeek-V4-Flash-DSpark-support-ds4-GGUF",
+      "revision": "2286cd2429a0f2400ac84b07e9a2274114db9dd2",
+      "path": "DeepSeek-V4-Flash-DSpark-support.gguf",
+      "size": 5989114272,
+      "sha256": "8b3adf5942bec22ae2ea867cd7079cf13530ba83ffcffaf00f5de48664a1a34e",
+      "publicationAccepted": false,
+      "url": "https://huggingface.co/sakamakismile/DeepSeek-V4-Flash-DSpark-support-ds4-GGUF/blob/2286cd2429a0f2400ac84b07e9a2274114db9dd2/DeepSeek-V4-Flash-DSpark-support.gguf",
+      "quantizer": {
+        "repository": "antirez/ds4",
+        "revision": "fc9efd1cc7550d47c497a2c6ba0eeb85baa4df0f",
+        "url": "https://github.com/antirez/ds4/commit/fc9efd1cc7550d47c497a2c6ba0eeb85baa4df0f"
+      },
+      "note": "Reference-only third-party quantization uploaded before the final 0731 release. Its shape, metadata, repository revision, size, and LFS SHA-256 are pinned, but no reproducible source manifest ties its payload to the final 0731 shard hashes. It must not be embedded in a published combined artifact."
+    },
+    {
+      "role": "algorithm-definition",
+      "repository": "deepseek-ai/DeepSpec",
+      "revision": "005e03b81cec38b7da6399833d609ee89a2587f2",
+      "paper": "arXiv:2607.05147",
+      "url": "https://github.com/deepseek-ai/DeepSpec/tree/005e03b81cec38b7da6399833d609ee89a2587f2",
+      "files": [
+        {
+          "path": "deepspec/eval/dspark/draft_ops.py",
+          "sha256": "9d07a301fa643ee3b558a093647ff3db2918a47c96267d3546081eb9df44b799"
+        },
+        {
+          "path": "deepspec/modeling/dspark/markov_head.py",
+          "sha256": "6659bcdc12d923d4fc16cc2280c03078c2110a4792305e1f3f42b5468f75ef46"
+        },
+        {
+          "path": "deepspec/eval/base_evaluator.py",
+          "sha256": "f7630a0da6a4c6ee370ebe66e2cccf3a803c5331ea9ebf6f54b2285cc3b435a9"
+        },
+        {
+          "path": "deepspec/utils/sampling.py",
+          "sha256": "8f8ff58387e70526452672372628d1b2fbacb778a89f1a46abc9e2b7639d215a"
+        }
+      ],
+      "observations": {
+        "confidencePrefix": "first sigmoid(confidence_logit) strictly below threshold; no probability cumprod",
+        "markov": "vanilla head samples sequentially and feeds each sampled token into the next step",
+        "verification": "binary accept decisions use cumprod; selected draft probability and residual mass use 1e-8 numerical guards"
+      }
+    }
+  ],
+  "implementation": {
+    "method": "independent NumPy equations and synthetic data",
+    "productionDependency": false,
+    "mlx": "optional primitive cross-check only; mlx-lm is not used",
+    "externalRuntimeCodeCopied": false
+  },
+  "validation": {
+    "capturedAt": "2026-08-03T01:19:59+02:00",
+    "hardware": "Apple M5 Pro, 64 GB unified memory",
+    "os": "macOS 26.5.2 (25F84)",
+    "python": "3.13.13",
+    "numpy": "2.4.6",
+    "mlx": "0.32.0",
+    "mlxMetal": "0.32.0",
+    "device": "Metal",
+    "maximumObservedAbsoluteDrift": {
+      "markovFloat32": 0.00009765625,
+      "confidenceFloat32": 0.0000000343827,
+      "postLayerHCMeanFloat32": 0.0
+    },
+    "semanticAudit": {
+      "capturedAt": "2026-08-03T00:36:30+02:00",
+      "deepSpecRevision": "005e03b81cec38b7da6399833d609ee89a2587f2",
+      "systemPython": "23 passed, 1 optional-MLX skip",
+      "mlxMetal": "24 passed",
+      "findings": [
+        "confidence scheduling uses the first per-position sigmoid below threshold, not cumulative survival",
+        "the vanilla Markov head feeds each sampled token into the next proposal step",
+        "sampling acceptance is prefix-cumulative only after independent p/q draws; rejection uses the guarded p-q residual",
+        "post-layer capture averages the four HC lanes at production width 4096 without aliasing the source"
+      ]
+    }
+  }
+}

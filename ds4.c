@@ -45,6 +45,8 @@
 #include "ds4_qwen.h"
 #include "ds4_qwen_unicode.h"
 
+#include "runtime/ds4_dspark_graph.inc"
+
 #ifdef DS4_TEST_HOOKS
 #include "tests/internal/ds4_qwen_cpu_test_hooks.h"
 #endif
@@ -1759,11 +1761,24 @@ typedef struct {
     bool native_expert_store_v2;
     uint64_t native_expert_store_offset;
     uint64_t native_expert_store_bytes;
+    bool native_dspark_store_v2;
+    uint64_t native_dspark_store_offset;
+    uint64_t native_dspark_store_bytes;
+    uint64_t native_dspark_record_bytes;
+    uint64_t native_dspark_source_tensor_count;
+    uint32_t dspark_block_size;
+    uint32_t dspark_markov_rank;
+    uint32_t dspark_noise_token_id;
+    uint32_t dspark_stage_count;
+    uint32_t dspark_target_layers[DS4_DSPARK_0731_STAGE_COUNT];
     char *owned_tensor_names;
+    char *owned_dspark_tensor_names;
 
     ds4_kv *kv;
     ds4_tensor *tensors;
 } ds4_model;
+
+static ds4_tensor *model_find_tensor(const ds4_model *m, const char *name);
 
 static uint64_t scalar_value_size(uint32_t type) {
     switch (type) {
@@ -2000,6 +2015,7 @@ static void model_close(ds4_model *m) {
     free(m->kv);
     free(m->tensors);
     free(m->owned_tensor_names);
+    free(m->owned_dspark_tensor_names);
     if (m->map) munmap((void *)m->map, (size_t)m->size);
     if (m->fd >= 0) close(m->fd);
     memset(m, 0, sizeof(*m));
@@ -2541,12 +2557,16 @@ static void model_expand_deepseek4_native_expert_store(ds4_model *m) {
     }
     ds4_tensor *store_tensor = NULL;
     uint32_t store_count = 0;
+    uint32_t dspark_store_count = 0;
     uint32_t canonical_count = 0;
     for (uint64_t i = 0; i < m->n_tensors; i++) {
         ds4_tensor *tensor = &m->tensors[i];
         if (ds4_streq(tensor->name, DS4_EXPERT_STORE_V2_TENSOR)) {
             store_tensor = tensor;
             store_count++;
+        }
+        if (ds4_streq(tensor->name, DS4_DSPARK_EXPERT_STORE_V2_TENSOR)) {
+            dspark_store_count++;
         }
         if (canonical_routed_name(tensor->name, NULL, NULL)) {
             canonical_count++;
@@ -2587,13 +2607,28 @@ static void model_expand_deepseek4_native_expert_store(ds4_model *m) {
         manifest->expert_count != metadata_experts ||
         manifest->expert_used_count != metadata_experts_used ||
         manifest->source_tensor_count < routed_count ||
-        m->n_tensors != expected_physical) {
+        (m->n_tensors != expected_physical &&
+         !(dspark_store_count == 1u &&
+           expected_physical <=
+               UINT64_MAX - DS4_DSPARK_0731_PHYSICAL_TENSOR_COUNT &&
+           m->n_tensors ==
+               expected_physical + DS4_DSPARK_0731_PHYSICAL_TENSOR_COUNT))) {
         ds4_expert_store_close(store);
         ds4_die("DS4-native DeepSeek store does not match GGUF metadata or tensor inventory");
     }
 
+    const uint64_t auxiliary_physical_count =
+        dspark_store_count == 1u ?
+            DS4_DSPARK_0731_PHYSICAL_TENSOR_COUNT : 0u;
+    if (manifest->source_tensor_count >
+        UINT64_MAX - auxiliary_physical_count) {
+        ds4_expert_store_close(store);
+        ds4_die("DS4-native DeepSeek logical tensor count overflows");
+    }
+    const uint64_t logical_capacity =
+        manifest->source_tensor_count + auxiliary_physical_count;
     ds4_tensor *logical = calloc(
-        (size_t)manifest->source_tensor_count, sizeof(logical[0]));
+        (size_t)logical_capacity, sizeof(logical[0]));
     const size_t name_stride = 64;
     char *names = calloc((size_t)routed_count, name_stride);
     if (!logical || !names) {
@@ -2607,7 +2642,7 @@ static void model_expand_deepseek4_native_expert_store(ds4_model *m) {
         if (&m->tensors[i] == store_tensor) continue;
         logical[logical_count++] = m->tensors[i];
     }
-    if (logical_count + routed_count != manifest->source_tensor_count) {
+    if (logical_count + routed_count != logical_capacity) {
         free(logical);
         free(names);
         ds4_expert_store_close(store);
@@ -2677,7 +2712,7 @@ static void model_expand_deepseek4_native_expert_store(ds4_model *m) {
             virtual_offset += matrix_bytes;
         }
     }
-    if (logical_count != manifest->source_tensor_count) {
+    if (logical_count != logical_capacity) {
         free(logical);
         free(names);
         ds4_expert_store_close(store);
@@ -2691,10 +2726,474 @@ static void model_expand_deepseek4_native_expert_store(ds4_model *m) {
     m->tensors = logical;
     m->owned_tensor_names = names;
     m->gguf_n_tensors = physical_count;
-    m->n_tensors = manifest->source_tensor_count;
+    m->n_tensors = logical_capacity;
     m->native_expert_store_v2 = true;
     m->native_expert_store_offset = physical_offset;
     m->native_expert_store_bytes = physical_bytes;
+    m->max_tensor_bytes = 0;
+    for (uint64_t i = 0; i < m->n_tensors; i++) {
+        if (m->tensors[i].bytes > m->max_tensor_bytes) {
+            m->max_tensor_bytes = m->tensors[i].bytes;
+        }
+    }
+    ds4_expert_store_close(store);
+}
+
+static bool ds4_str_has_prefix(ds4_str value, const char *prefix) {
+    const size_t prefix_len = strlen(prefix);
+    return value.ptr && value.len >= prefix_len &&
+           memcmp(value.ptr, prefix, prefix_len) == 0;
+}
+
+static bool ds4_str_equal(ds4_str left, ds4_str right) {
+    return left.ptr && right.ptr && left.len == right.len &&
+           memcmp(left.ptr, right.ptr, (size_t)left.len) == 0;
+}
+
+static bool ds4_str_contains_ascii_ci(ds4_str value, const char *needle) {
+    const size_t needle_len = strlen(needle);
+    if (!value.ptr || needle_len == 0 || value.len < needle_len) return false;
+    for (uint64_t i = 0; i <= value.len - needle_len; i++) {
+        size_t j = 0;
+        while (j < needle_len &&
+               tolower((unsigned char)value.ptr[i + j]) ==
+                   tolower((unsigned char)needle[j])) {
+            j++;
+        }
+        if (j == needle_len) return true;
+    }
+    return false;
+}
+
+static bool dspark_physical_tensor_range_valid(
+        const ds4_model  *m,
+        const ds4_tensor *tensor) {
+    return m && tensor && m->alignment != 0u && tensor->bytes != 0u &&
+           tensor->rel_offset % m->alignment == 0u &&
+           tensor->rel_offset <= UINT64_MAX - m->tensor_data_pos &&
+           tensor->abs_offset == m->tensor_data_pos + tensor->rel_offset &&
+           tensor->abs_offset <= m->size &&
+           tensor->bytes <= m->size - tensor->abs_offset;
+}
+
+static bool dspark_ranges_overlap(
+        uint64_t left_offset,
+        uint64_t left_bytes,
+        uint64_t right_offset,
+        uint64_t right_bytes) {
+    return left_offset < right_offset + right_bytes &&
+           right_offset < left_offset + left_bytes;
+}
+
+/* The target routed matrices have already been expanded into logical identity
+ * ranges inside the target store. Ignore those three-per-layer identities here;
+ * every other tensor is still a physical GGUF range and must be independently
+ * aligned, in-file, uniquely named, and disjoint in a combined artifact. */
+static void model_validate_dspark_physical_layout(
+        const ds4_model  *m,
+        const ds4_tensor *support_store) {
+    if (!m || !support_store || !m->native_expert_store_v2 ||
+        m->alignment == 0u ||
+        m->native_expert_store_offset < m->tensor_data_pos ||
+        (m->native_expert_store_offset - m->tensor_data_pos) %
+            m->alignment != 0u ||
+        m->native_expert_store_offset > m->size ||
+        m->native_expert_store_bytes == 0u ||
+        m->native_expert_store_bytes >
+            m->size - m->native_expert_store_offset) {
+        ds4_die("DSpark combined target expert-store range is invalid");
+    }
+
+    for (uint64_t i = 0; i < m->n_tensors; i++) {
+        const ds4_tensor *left = &m->tensors[i];
+        for (uint64_t j = i + 1u; j < m->n_tensors; j++) {
+            if (ds4_str_equal(left->name, m->tensors[j].name)) {
+                ds4_die("DSpark combined artifact has a duplicate tensor name");
+            }
+        }
+        if (canonical_routed_name(left->name, NULL, NULL)) continue;
+        if (!dspark_physical_tensor_range_valid(m, left)) {
+            ds4_die("DSpark combined physical tensor range is invalid");
+        }
+        if (left != support_store && dspark_ranges_overlap(
+                left->abs_offset, left->bytes,
+                m->native_expert_store_offset,
+                m->native_expert_store_bytes)) {
+            ds4_die("DSpark combined physical tensor overlaps target expert store");
+        }
+        for (uint64_t j = i + 1u; j < m->n_tensors; j++) {
+            const ds4_tensor *right = &m->tensors[j];
+            if (canonical_routed_name(right->name, NULL, NULL)) continue;
+            if (!dspark_physical_tensor_range_valid(m, right)) {
+                ds4_die("DSpark combined physical tensor range is invalid");
+            }
+            if (dspark_ranges_overlap(
+                    left->abs_offset, left->bytes,
+                    right->abs_offset, right->bytes)) {
+                ds4_die("DSpark combined physical tensor ranges overlap");
+            }
+        }
+    }
+}
+
+static void model_validate_dspark_0731_metadata(ds4_model *m) {
+    static const char *const key[6] = {
+        "dspark.block_size",
+        "dspark.markov_rank",
+        "dspark.noise_token_id",
+        "dspark.target_layer_ids",
+        "dspark.stage_count",
+        "dspark.n_layers",
+    };
+    uint32_t seen[6] = {0};
+    for (uint64_t i = 0; i < m->n_kv; i++) {
+        const ds4_str candidate = m->kv[i].key;
+        bool canonical = false;
+        for (uint32_t index = 0; index < 6; index++) {
+            if (ds4_streq(candidate, key[index])) {
+                seen[index]++;
+                canonical = true;
+                break;
+            }
+        }
+        if (!canonical && ds4_str_contains_ascii_ci(candidate, "dspark")) {
+            ds4_die("DSpark support metadata contains a non-canonical alias");
+        }
+    }
+    for (uint32_t index = 0; index < 6; index++) {
+        if (seen[index] != 1u) {
+            ds4_die("DSpark support metadata inventory is incomplete or duplicated");
+        }
+    }
+
+    uint32_t n_layers = 0;
+    if (!model_get_u32(m, key[0], &m->dspark_block_size) ||
+        !model_get_u32(m, key[1], &m->dspark_markov_rank) ||
+        !model_get_u32(m, key[2], &m->dspark_noise_token_id) ||
+        !model_get_u32(m, key[4], &m->dspark_stage_count) ||
+        !model_get_u32(m, key[5], &n_layers)) {
+        ds4_die("DSpark support scalar metadata types are invalid");
+    }
+    ds4_array_ref target_layers = {0};
+    if (!model_get_array(m, key[3], &target_layers) ||
+        target_layers.type != GGUF_VALUE_UINT32 ||
+        target_layers.len != DS4_DSPARK_0731_STAGE_COUNT) {
+        ds4_die("DSpark support target-layer metadata is invalid");
+    }
+    ds4_cursor cursor = cursor_at(m, target_layers.data_pos);
+    for (uint32_t index = 0; index < DS4_DSPARK_0731_STAGE_COUNT;
+         index++) {
+        if (!cursor_u32(&cursor, &m->dspark_target_layers[index])) {
+            ds4_die(cursor.error);
+        }
+    }
+    if (m->dspark_block_size != 5u ||
+        m->dspark_markov_rank != 256u ||
+        m->dspark_noise_token_id != 128799u ||
+        m->dspark_stage_count != DS4_DSPARK_0731_STAGE_COUNT ||
+        n_layers != DS4_DSPARK_0731_STAGE_COUNT ||
+        m->dspark_target_layers[0] !=
+            DS4_DSPARK_CAPTURE_CONTRACT.target_layer[0] ||
+        m->dspark_target_layers[1] !=
+            DS4_DSPARK_CAPTURE_CONTRACT.target_layer[1] ||
+        m->dspark_target_layers[2] !=
+            DS4_DSPARK_CAPTURE_CONTRACT.target_layer[2] ||
+        !ds4_dspark_runtime_contract_self_check()) {
+        ds4_die("DSpark support metadata does not match the final 0731 contract");
+    }
+
+    uint32_t target_blocks = 0;
+    uint32_t target_embedding = 0;
+    uint32_t target_vocab = 0;
+    uint32_t target_experts = 0;
+    uint32_t target_experts_used = 0;
+    uint32_t target_ff = 0;
+    if (!model_get_u32(m, "deepseek4.block_count", &target_blocks) ||
+        !model_get_u32(m, "deepseek4.embedding_length", &target_embedding) ||
+        !model_get_u32(m, "deepseek4.vocab_size", &target_vocab) ||
+        !model_get_u32(m, "deepseek4.expert_count", &target_experts) ||
+        !model_get_u32(m, "deepseek4.expert_used_count",
+                       &target_experts_used) ||
+        !model_get_u32(m, "deepseek4.expert_feed_forward_length",
+                       &target_ff) ||
+        target_blocks != 43u || target_embedding != 4096u ||
+        target_vocab != 129280u || target_experts != 256u ||
+        target_experts_used != 6u || target_ff != 2048u) {
+        ds4_die("DSpark 0731 support does not match the target DeepSeek Flash metadata");
+    }
+}
+
+typedef struct {
+    const char *suffix;
+    uint32_t type;
+    uint32_t ndim;
+    uint64_t dim[2];
+} ds4_dspark_static_spec;
+
+static void model_validate_dspark_static_tensor(
+        const ds4_model              *m,
+        uint32_t                      stage,
+        const ds4_dspark_static_spec *spec) {
+    char name[128];
+    const int length = snprintf(name, sizeof(name), "mtp.%u.%s",
+                                stage, spec->suffix);
+    if (length <= 0 || (size_t)length >= sizeof(name)) {
+        ds4_die("DSpark support tensor name is too long");
+    }
+    const ds4_tensor *tensor = model_find_tensor(m, name);
+    if (!tensor || tensor->type != spec->type ||
+        tensor->ndim != spec->ndim ||
+        tensor->dim[0] != spec->dim[0] ||
+        (spec->ndim == 2u && tensor->dim[1] != spec->dim[1])) {
+        fprintf(stderr,
+                "ds4: DSpark 0731 static tensor contract mismatch: %s\n",
+                name);
+        exit(1);
+    }
+}
+
+static void model_validate_dspark_0731_static_tensors(const ds4_model *m) {
+    static const ds4_dspark_static_spec common[] = {
+        {"hc_attn_base.weight", DS4_TENSOR_F32, 1u, {24u, 0u}},
+        {"hc_attn_fn.weight", DS4_TENSOR_F16, 2u, {16384u, 24u}},
+        {"hc_attn_scale.weight", DS4_TENSOR_F32, 1u, {3u, 0u}},
+        {"attn_sinks.weight", DS4_TENSOR_F32, 1u, {64u, 0u}},
+        {"attn_q_a.weight", DS4_TENSOR_Q8_0, 2u, {4096u, 1024u}},
+        {"attn_q_a_norm.weight", DS4_TENSOR_F32, 1u, {1024u, 0u}},
+        {"attn_q_b.weight", DS4_TENSOR_Q8_0, 2u, {1024u, 32768u}},
+        {"attn_kv.weight", DS4_TENSOR_Q8_0, 2u, {4096u, 512u}},
+        {"attn_kv_a_norm.weight", DS4_TENSOR_F32, 1u, {512u, 0u}},
+        {"attn_output_a.weight", DS4_TENSOR_Q8_0, 2u, {4096u, 8192u}},
+        {"attn_output_b.weight", DS4_TENSOR_Q8_0, 2u, {8192u, 4096u}},
+        {"attn_norm.weight", DS4_TENSOR_F32, 1u, {4096u, 0u}},
+        {"hc_ffn_base.weight", DS4_TENSOR_F32, 1u, {24u, 0u}},
+        {"hc_ffn_fn.weight", DS4_TENSOR_F16, 2u, {16384u, 24u}},
+        {"hc_ffn_scale.weight", DS4_TENSOR_F32, 1u, {3u, 0u}},
+        {"ffn_gate_inp.weight", DS4_TENSOR_Q8_0, 2u, {4096u, 256u}},
+        {"exp_probs_b.bias", DS4_TENSOR_F32, 1u, {256u, 0u}},
+        {"ffn_norm.weight", DS4_TENSOR_F32, 1u, {4096u, 0u}},
+        {"ffn_gate_shexp.weight", DS4_TENSOR_Q8_0, 2u, {4096u, 2048u}},
+        {"ffn_up_shexp.weight", DS4_TENSOR_Q8_0, 2u, {4096u, 2048u}},
+        {"ffn_down_shexp.weight", DS4_TENSOR_Q8_0, 2u, {2048u, 4096u}},
+    };
+    static const ds4_dspark_static_spec stage_zero[] = {
+        {"main_proj.weight", DS4_TENSOR_Q8_0, 2u, {12288u, 4096u}},
+        {"main_norm.weight", DS4_TENSOR_F32, 1u, {4096u, 0u}},
+    };
+    static const ds4_dspark_static_spec final[] = {
+        {"norm.weight", DS4_TENSOR_F32, 1u, {4096u, 0u}},
+        {"hc_head_base.weight", DS4_TENSOR_F32, 1u, {4u, 0u}},
+        {"hc_head_fn.weight", DS4_TENSOR_F16, 2u, {16384u, 4u}},
+        {"hc_head_scale.weight", DS4_TENSOR_F32, 1u, {1u, 0u}},
+        {"markov_head.markov_w1.weight", DS4_TENSOR_Q8_0, 2u,
+         {256u, 129280u}},
+        {"markov_head.markov_w2.weight", DS4_TENSOR_Q8_0, 2u,
+         {256u, 129280u}},
+        {"confidence_head.proj.weight", DS4_TENSOR_Q8_0, 2u, {4352u, 1u}},
+    };
+
+    uint32_t mtp_tensor_count = 0;
+    for (uint64_t i = 0; i < m->n_tensors; i++) {
+        if (ds4_str_has_prefix(m->tensors[i].name, "mtp.")) {
+            mtp_tensor_count++;
+        }
+    }
+    if (mtp_tensor_count != DS4_DSPARK_0731_STATIC_TENSOR_COUNT) {
+        ds4_die("DSpark 0731 support must contain exactly 72 static mtp tensors");
+    }
+    for (uint32_t stage = 0; stage < DS4_DSPARK_0731_STAGE_COUNT;
+         stage++) {
+        for (size_t index = 0; index < sizeof(common) / sizeof(common[0]);
+             index++) {
+            model_validate_dspark_static_tensor(m, stage, &common[index]);
+        }
+    }
+    for (size_t index = 0;
+         index < sizeof(stage_zero) / sizeof(stage_zero[0]); index++) {
+        model_validate_dspark_static_tensor(m, 0u, &stage_zero[index]);
+    }
+    for (size_t index = 0; index < sizeof(final) / sizeof(final[0]);
+         index++) {
+        model_validate_dspark_static_tensor(
+            m, DS4_DSPARK_0731_STAGE_COUNT - 1u, &final[index]);
+    }
+}
+
+/* Recognize and validate the second store, then expose its nine routed
+ * matrices as logical mtp.* identities. Their offsets are never target-store
+ * addresses: the physical auxiliary range is checked independently and is
+ * retained for the future cache/Metal tranche. */
+static void model_expand_deepseek4_dspark_store_v2(ds4_model *m) {
+    if (!m || m->family != DS4_MODEL_FAMILY_DEEPSEEK4 ||
+        !m->tensors || m->n_tensors == 0) {
+        return;
+    }
+
+    ds4_tensor *store_tensor = NULL;
+    uint32_t store_count = 0;
+    bool has_dspark_metadata = false;
+    bool has_mtp_tensor = false;
+    for (uint64_t i = 0; i < m->n_kv; i++) {
+        if (ds4_str_contains_ascii_ci(m->kv[i].key, "dspark")) {
+            has_dspark_metadata = true;
+        }
+    }
+    for (uint64_t i = 0; i < m->n_tensors; i++) {
+        ds4_tensor *tensor = &m->tensors[i];
+        if (ds4_streq(tensor->name, DS4_DSPARK_EXPERT_STORE_V2_TENSOR)) {
+            store_tensor = tensor;
+            store_count++;
+        }
+        if (ds4_str_has_prefix(tensor->name, "mtp.")) has_mtp_tensor = true;
+    }
+    if (store_count == 0u) {
+        if (has_dspark_metadata || has_mtp_tensor) {
+            ds4_die("DSpark metadata or tensors require one embedded support store");
+        }
+        return;
+    }
+    if (store_count != 1u || !store_tensor ||
+        !m->native_expert_store_v2 ||
+        store_tensor->ndim != 1u || store_tensor->type != DS4_TENSOR_I8 ||
+        store_tensor->dim[0] != store_tensor->bytes ||
+        store_tensor->bytes == 0u) {
+        ds4_die("malformed embedded DSpark expert-major v2 tensor inventory");
+    }
+
+    model_validate_dspark_physical_layout(m, store_tensor);
+    model_validate_dspark_0731_metadata(m);
+    model_validate_dspark_0731_static_tensors(m);
+
+    ds4_expert_store *store = NULL;
+    char error[256] = {0};
+    if (!ds4_expert_store_open_embedded(
+            &store, m->fd, store_tensor->abs_offset, store_tensor->bytes,
+            DS4_EXPERT_STORE_FAMILY_DEEPSEEK4, error, sizeof(error)) ||
+        !ds4_expert_store_validate_dspark_0731(
+            store, error, sizeof(error))) {
+        fprintf(stderr, "ds4: embedded DSpark expert store is invalid: %s\n",
+                error[0] ? error : "format or 0731 geometry mismatch");
+        ds4_expert_store_close(store);
+        exit(1);
+    }
+    const ds4_expert_store_manifest *manifest =
+        ds4_expert_store_manifest_get(store);
+
+    const uint64_t target_start = m->native_expert_store_offset;
+    const uint64_t support_start = store_tensor->abs_offset;
+    if (m->native_expert_store_bytes > UINT64_MAX - target_start ||
+        store_tensor->bytes > UINT64_MAX - support_start) {
+        ds4_expert_store_close(store);
+        ds4_die("target or DSpark expert-store range overflows");
+    }
+    const uint64_t target_end = target_start + m->native_expert_store_bytes;
+    const uint64_t support_end = support_start + store_tensor->bytes;
+    if (target_start < support_end && support_start < target_end) {
+        ds4_expert_store_close(store);
+        ds4_die("target and DSpark expert stores overlap");
+    }
+
+    const uint64_t routed_count = DS4_DSPARK_0731_ROUTED_TENSOR_COUNT;
+    if (m->n_tensors == 0u ||
+        m->n_tensors > UINT64_MAX - (routed_count - 1u) ||
+        m->n_tensors - 1u + routed_count > SIZE_MAX / sizeof(ds4_tensor)) {
+        ds4_expert_store_close(store);
+        ds4_die("DSpark logical tensor inventory overflows");
+    }
+    const uint64_t logical_capacity = m->n_tensors - 1u + routed_count;
+    ds4_tensor *logical = calloc((size_t)logical_capacity, sizeof(logical[0]));
+    const size_t name_stride = 64u;
+    char *names = calloc((size_t)routed_count, name_stride);
+    if (!logical || !names) {
+        free(logical);
+        free(names);
+        ds4_expert_store_close(store);
+        ds4_die("out of memory expanding embedded DSpark tensors");
+    }
+    uint64_t logical_count = 0;
+    for (uint64_t i = 0; i < m->n_tensors; i++) {
+        if (&m->tensors[i] == store_tensor) continue;
+        logical[logical_count++] = m->tensors[i];
+    }
+
+    static const char *const role_name[3] = {
+        "ffn_gate_exps", "ffn_up_exps", "ffn_down_exps",
+    };
+    for (uint32_t stage = 0; stage < DS4_DSPARK_0731_STAGE_COUNT;
+         stage++) {
+        const ds4_expert_store_layer *entry =
+            ds4_expert_store_layer_at(store, stage);
+        if (!entry || entry->data_offset > store_tensor->bytes ||
+            support_start > UINT64_MAX - entry->data_offset) {
+            free(logical);
+            free(names);
+            ds4_expert_store_close(store);
+            ds4_die("DSpark physical stage range overflows");
+        }
+        uint64_t virtual_offset = support_start + entry->data_offset;
+        for (uint32_t role = 0; role < 3u; role++) {
+            const ds4_expert_store_component *component =
+                &entry->component[role];
+            const uint64_t synthetic_index = (uint64_t)stage * 3u + role;
+            char *name = names + synthetic_index * name_stride;
+            const int count = snprintf(
+                name, name_stride, "mtp.%u.%s.weight", stage,
+                role_name[role]);
+            const uint64_t matrix_bytes =
+                component->expert_bytes * manifest->expert_count;
+            if (count <= 0 || (size_t)count >= name_stride ||
+                virtual_offset > support_end ||
+                matrix_bytes > support_end - virtual_offset) {
+                free(logical);
+                free(names);
+                ds4_expert_store_close(store);
+                ds4_die("DSpark virtual tensor range exceeds its store");
+            }
+            ds4_tensor *tensor = &logical[logical_count++];
+            *tensor = (ds4_tensor){
+                .name = {.ptr = name, .len = (uint64_t)count},
+                .ndim = 3u,
+                .dim = {
+                    component->dim[0], component->dim[1], component->dim[2],
+                },
+                .type = component->ggml_type,
+                .rel_offset = virtual_offset - m->tensor_data_pos,
+                .abs_offset = virtual_offset,
+                .elements = component->dim[0] * component->dim[1] *
+                            component->dim[2],
+                .bytes = matrix_bytes,
+            };
+            virtual_offset += matrix_bytes;
+        }
+        if (virtual_offset != support_start + entry->data_offset +
+                              entry->data_size) {
+            free(logical);
+            free(names);
+            ds4_expert_store_close(store);
+            ds4_die("DSpark logical stage does not cover its physical record extent");
+        }
+    }
+    if (logical_count != logical_capacity) {
+        free(logical);
+        free(names);
+        ds4_expert_store_close(store);
+        ds4_die("DSpark logical tensor inventory is incomplete");
+    }
+
+    const uint64_t physical_offset = store_tensor->abs_offset;
+    const uint64_t physical_bytes = store_tensor->bytes;
+    const uint64_t source_tensor_count = manifest->source_tensor_count;
+    const uint64_t record_bytes =
+        ds4_expert_store_layer_at(store, 0u)->record_bytes;
+    free(m->tensors);
+    m->tensors = logical;
+    m->owned_dspark_tensor_names = names;
+    m->n_tensors = logical_count;
+    m->native_dspark_store_v2 = true;
+    m->native_dspark_store_offset = physical_offset;
+    m->native_dspark_store_bytes = physical_bytes;
+    m->native_dspark_record_bytes = record_bytes;
+    m->native_dspark_source_tensor_count = source_tensor_count;
     m->max_tensor_bytes = 0;
     for (uint64_t i = 0; i < m->n_tensors; i++) {
         if (m->tensors[i].bytes > m->max_tensor_bytes) {
@@ -2756,6 +3255,7 @@ static void model_open(ds4_model *m, const char *path, bool metal_mapping,
     parse_tensors(m, &c);
     model_expand_glm_native_expert_store(m);
     model_expand_deepseek4_native_expert_store(m);
+    model_expand_deepseek4_dspark_store_v2(m);
     model_expand_qwen35_expert_store_v2(m);
 
     if (!metal_mapping && prefetch_cpu &&
@@ -2852,6 +3352,47 @@ static void model_summary(const ds4_model *m) {
     if (full_attention_interval || ssm_state || ssm_inner) {
         printf("hybrid: full_attention_interval=%u ssm_state=%u ssm_inner=%u\n",
                full_attention_interval, ssm_state, ssm_inner);
+    }
+    if (m->native_dspark_store_v2) {
+        ds4_dspark_cache_plan cache_plan;
+        if (!ds4_dspark_cache_plan_make(
+                DS4_DSPARK_COMBINED_CACHE_FLOOR, true, &cache_plan)) {
+            ds4_die("internal DSpark cache contract is invalid");
+        }
+        printf("dspark support: embedded %s (inspection-only)\n",
+               DS4_DSPARK_EXPERT_STORE_V2_TENSOR);
+        printf("dspark config: stages=%u block_size=%u markov_rank=%u "
+               "noise_token=%u target_layers=%u,%u,%u\n",
+               m->dspark_stage_count,
+               m->dspark_block_size,
+               m->dspark_markov_rank,
+               m->dspark_noise_token_id,
+               m->dspark_target_layers[0],
+               m->dspark_target_layers[1],
+               m->dspark_target_layers[2]);
+        printf("dspark store: experts=%u used=%u source_tensors=%" PRIu64
+               " static_tensors=%u routed_tensors=%u record_bytes=%" PRIu64
+               " store_bytes=%" PRIu64 "\n",
+               DS4_DSPARK_0731_EXPERT_COUNT,
+               DS4_DSPARK_0731_EXPERT_USED_COUNT,
+               m->native_dspark_source_tensor_count,
+               DS4_DSPARK_0731_STATIC_TENSOR_COUNT,
+               DS4_DSPARK_0731_ROUTED_TENSOR_COUNT,
+               m->native_dspark_record_bytes,
+               m->native_dspark_store_bytes);
+        printf("dspark capture: post-layer-hc-mean width=%u hc_lanes=%u "
+               "taps=%u,%u,%u device_only=yes\n",
+               DS4_DSPARK_CAPTURE_CONTRACT.hidden_width,
+               DS4_DSPARK_CAPTURE_CONTRACT.hc_lanes,
+               DS4_DSPARK_CAPTURE_CONTRACT.target_layer[0],
+               DS4_DSPARK_CAPTURE_CONTRACT.target_layer[1],
+               DS4_DSPARK_CAPTURE_CONTRACT.target_layer[2]);
+        printf("dspark cache-plan: target_floor=%u support_floor=%u "
+               "combined_floor=%u ownership=separate "
+               "target_only_extra_records=0 implementation=fail-closed\n",
+               cache_plan.target_floor,
+               cache_plan.support_floor,
+               cache_plan.total_records);
     }
     printf("file size: ");
     print_size(m->size);
@@ -39772,6 +40313,13 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
         e->model.family == DS4_MODEL_FAMILY_DEEPSEEK4;
     const bool glm_family =
         e->model.family == DS4_MODEL_FAMILY_GLM_DSA;
+    if (!opt->inspect_only && e->model.native_dspark_store_v2) {
+        fprintf(stderr,
+                "ds4: embedded DSpark support is inspection-only until its "
+                "Metal graph and independently budgeted SSD cache are qualified\n");
+        ds4_engine_close(e);
+        return 1;
+    }
     if (!opt->inspect_only && qwen_family &&
         !e->model.native_expert_store_v2) {
         fprintf(stderr,

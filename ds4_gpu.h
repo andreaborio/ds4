@@ -75,6 +75,13 @@ typedef struct ds4_gpu_expert_store_layer_v2 {
     uint64_t component_offset[3];
     uint64_t component_bytes[3];
 } ds4_gpu_expert_store_layer_v2;
+/* Expert stores are separate identity domains. TARGET remains zero so every
+ * zero-initialized legacy table keeps the historical target-only behavior. */
+typedef enum ds4_gpu_expert_store_id {
+    DS4_GPU_EXPERT_STORE_TARGET = 0,
+    DS4_GPU_EXPERT_STORE_SUPPORT = 1,
+    DS4_GPU_EXPERT_STORE_COUNT = 2,
+} ds4_gpu_expert_store_id;
 /* Install a validated expert-major store embedded in the model GGUF. layer is
  * the real model-layer id, so inventories may omit a dense prefix. */
 int ds4_gpu_expert_store_v2_install(
@@ -101,6 +108,32 @@ int ds4_gpu_expert_store_v2_layer_span(
         uint64_t *size);
 int ds4_gpu_expert_store_v2_enable_resident(void);
 void ds4_gpu_expert_store_v2_clear(void);
+/* Store-aware variants form the DSpark seam. The legacy entry points above
+ * are exact TARGET wrappers. */
+int ds4_gpu_expert_store_v2_install_for_store(
+        ds4_gpu_expert_store_id                store_id,
+        int                                    fd,
+        uint64_t                               file_size,
+        uint32_t                               n_layer,
+        uint32_t                               n_expert,
+        uint32_t                               storage_format,
+        uint32_t                               group_size,
+        const ds4_gpu_expert_store_layer_v2   *layers);
+int ds4_gpu_expert_store_v2_bind_layer_for_store(
+        ds4_gpu_expert_store_id store_id,
+        uint32_t                layer,
+        uint64_t                model_size,
+        uint64_t                gate_offset,
+        uint64_t                up_offset,
+        uint64_t                down_offset);
+int ds4_gpu_expert_store_v2_layer_span_for_store(
+        ds4_gpu_expert_store_id store_id,
+        uint32_t                layer,
+        uint64_t                model_size,
+        uint64_t               *offset,
+        uint64_t               *size);
+void ds4_gpu_expert_store_v2_clear_for_store(
+        ds4_gpu_expert_store_id store_id);
 int ds4_gpu_set_model_map_range(const void *model_map, uint64_t model_size, uint64_t map_offset, uint64_t map_size, uint64_t max_tensor_bytes);
 int ds4_gpu_set_model_map_spans(const void *model_map, uint64_t model_size, const uint64_t *offsets, const uint64_t *sizes, uint32_t count, uint64_t max_tensor_bytes);
 int ds4_gpu_pro_q4_expert_table_auto_available(void);
@@ -1714,6 +1747,12 @@ int hebrus_gpu_internal_stream_expert_cache_scan_limit_test(void);
 int ds4_gpu_internal_qwen35_expert_pack_test(void);
 /* Canonical-vs-embedded GLM Q2 regression for direct and grouped execution. */
 int ds4_gpu_internal_expert_store_v2_kernel_test(void);
+#ifdef DS4_TEST_HOOKS
+/* TARGET/SUPPORT descriptor namespace and offset-isolation regression. */
+int ds4_gpu_internal_dspark_dual_store_test(void);
+/* Device-only post-layer HC mean regression for the DSpark tap. */
+int ds4_gpu_internal_dspark_hc_mean_test(void);
+#endif
 
 /* =========================================================================
  * Hyper-Connection Kernels.
@@ -1738,6 +1777,14 @@ int ds4_gpu_hc_weighted_sum_tensor(
         ds4_gpu_tensor       *out,
         const ds4_gpu_tensor *residual_hc,
         const ds4_gpu_tensor *weights,
+        uint32_t                n_embd,
+        uint32_t                n_hc);
+
+/* DSpark capture primitive: average the HC lanes after a selected target
+ * decoder layer without host readback or a learned HC-head transform. */
+int ds4_gpu_hc_mean_tensor(
+        ds4_gpu_tensor       *out,
+        const ds4_gpu_tensor *residual_hc,
         uint32_t                n_embd,
         uint32_t                n_hc);
 

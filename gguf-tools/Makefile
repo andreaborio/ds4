@@ -20,7 +20,7 @@ endif
 CFLAGS ?= -O3 -Wall -Wextra -std=c11 $(NATIVE_CPU_FLAG)
 CPPFLAGS ?= -D_GNU_SOURCE
 
-.PHONY: all clean quality-score
+.PHONY: all clean quality-score dspark-support-test
 
 all: deepseek4-quantize
 
@@ -30,6 +30,10 @@ deepseek4-quantize: deepseek4-quantize.c quants.c quants.h
 quality-score:
 	$(MAKE) -C .. $(QUALITY_TARGETS)
 	$(QUALITY_LINK) quality-testing/score_official quality-testing/score_official.c $(QUALITY_OBJS) $(QUALITY_LDLIBS)
+
+dspark-support-test: ../tests/test_dspark_support_quantizer.py \
+		deepseek4-quantize.c quants.c quants.h
+	python3 ../tests/test_dspark_support_quantizer.py
 
 clean:
 	rm -f deepseek4-quantize quality-testing/score_official

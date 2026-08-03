@@ -21,6 +21,17 @@ struct ds4_metal_args_dsv4_hc_weighted_sum {
     uint64_t nb1;
 };
 
+struct ds4_metal_args_dsv4_hc_mean {
+    int64_t  n_embd;
+    int64_t  n_hc;
+    int64_t  n_tokens;
+    uint64_t nb_x0;
+    uint64_t nb_x1;
+    uint64_t nb_x2;
+    uint64_t nb0;
+    uint64_t nb1;
+};
+
 struct ds4_metal_args_dsv4_hc_split_weighted_sum {
     int64_t  n_embd;
     int32_t  n_hc;
@@ -882,4 +893,28 @@ kernel void kernel_dsv4_hc_weighted_sum(
     }
 
     *((device float *) (dst + d*args.nb0 + t*args.nb1)) = acc;
+}
+
+// DSpark captures the arithmetic mean of the post-layer HC lanes.  A dedicated
+// kernel avoids a shared weight buffer whose lifetime could otherwise race an
+// unretained command buffer.
+kernel void kernel_dsv4_hc_mean(
+        constant ds4_metal_args_dsv4_hc_mean & args,
+        device  const char * x,
+        device        char * dst,
+        uint gid [[thread_position_in_grid]]) {
+    const int64_t n_elem = args.n_embd * args.n_tokens;
+    if ((int64_t) gid >= n_elem) {
+        return;
+    }
+
+    const int64_t d = ((int64_t) gid) % args.n_embd;
+    const int64_t t = ((int64_t) gid) / args.n_embd;
+    float acc = 0.0f;
+    for (int64_t h = 0; h < args.n_hc; ++h) {
+        acc += *((device const float *)
+            (x + d*args.nb_x0 + h*args.nb_x1 + t*args.nb_x2));
+    }
+    *((device float *) (dst + d*args.nb0 + t*args.nb1)) =
+        acc / (float) args.n_hc;
 }

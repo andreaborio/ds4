@@ -341,9 +341,30 @@ typedef struct {
 } ds4_gpu_qwen35_expert_pack_state;
 
 static ds4_gpu_qwen35_expert_pack_state g_qwen35_expert_pack;
+/* DSpark support owns a second descriptor namespace. It deliberately does not
+ * alias target layer ids: (TARGET, 0, expert) and (SUPPORT, 0, expert) are
+ * distinct identities even though their numeric coordinates match. */
+enum {
+    DS4_DSPARK_SUPPORT_LAYER_COUNT = 3,
+    DS4_DSPARK_SUPPORT_EXPERT_COUNT = 256,
+};
+static ds4_gpu_qwen35_expert_pack_state *g_dspark_expert_pack;
 static id<MTLBuffer> g_qwen35_expert_pack_resident_buffers[
     DS4_EXPERT_STORE_MAX_LAYER];
 static void ds4_gpu_qwen35_expert_pack_state_reset(void);
+
+static ds4_gpu_qwen35_expert_pack_state *ds4_gpu_expert_pack_for_store(
+        ds4_gpu_expert_store_id store_id) {
+    switch (store_id) {
+    case DS4_GPU_EXPERT_STORE_TARGET:
+        return &g_qwen35_expert_pack;
+    case DS4_GPU_EXPERT_STORE_SUPPORT:
+        return g_dspark_expert_pack;
+    case DS4_GPU_EXPERT_STORE_COUNT:
+        break;
+    }
+    return NULL;
+}
 
 static int ds4_gpu_expert_store_layer_index(
         const ds4_gpu_qwen35_expert_pack_state *pack,
@@ -5440,6 +5461,17 @@ typedef struct {
 
 typedef struct {
     int64_t n_embd;
+    int64_t n_hc;
+    int64_t n_tokens;
+    uint64_t nb_x0;
+    uint64_t nb_x1;
+    uint64_t nb_x2;
+    uint64_t nb0;
+    uint64_t nb1;
+} ds4_gpu_hc_mean_args;
+
+typedef struct {
+    int64_t n_embd;
     int32_t n_hc;
     int32_t sinkhorn_iters;
     int64_t n_rows;
@@ -9021,6 +9053,8 @@ void ds4_gpu_cleanup(void) {
          * dropped every buffer populated from it. Reset only our borrowed
          * descriptor; the engine remains responsible for close(). */
         ds4_gpu_qwen35_expert_pack_state_reset();
+        free(g_dspark_expert_pack);
+        g_dspark_expert_pack = NULL;
         ds4_gpu_stream_expert_pread_pool_shutdown();
         for (uint32_t layer = 0; layer < DS4_METAL_STREAM_EXPERT_CACHE_MAX_LAYER; layer++) {
             g_stream_expert_cache_gate_addr_buffers[layer] = nil;
@@ -10015,14 +10049,32 @@ void ds4_gpu_expert_store_v2_clear(void) {
     ds4_gpu_qwen35_expert_pack_clear();
 }
 
-int ds4_gpu_expert_store_v2_layer_span(
+void ds4_gpu_expert_store_v2_clear_for_store(
+        ds4_gpu_expert_store_id store_id) {
+    ds4_gpu_qwen35_expert_pack_state *pack =
+        ds4_gpu_expert_pack_for_store(store_id);
+    if (!pack) return;
+    if (store_id == DS4_GPU_EXPERT_STORE_TARGET) {
+        ds4_gpu_qwen35_expert_pack_clear();
+        return;
+    }
+    /* Support execution is still fail-closed, so it cannot own an in-flight
+     * resident buffer or SSD load yet. Keep descriptor teardown independent
+     * of the live target store. */
+    free(pack);
+    g_dspark_expert_pack = NULL;
+}
+
+int ds4_gpu_expert_store_v2_layer_span_for_store(
+        ds4_gpu_expert_store_id store_id,
         uint32_t layer,
         uint64_t model_size,
         uint64_t *offset,
         uint64_t *size) {
-    const ds4_gpu_qwen35_expert_pack_state *pack = &g_qwen35_expert_pack;
+    const ds4_gpu_qwen35_expert_pack_state *pack =
+        ds4_gpu_expert_pack_for_store(store_id);
     uint32_t index = 0;
-    if (!pack->active || !pack->embedded_v2 ||
+    if (!pack || !pack->active || !pack->embedded_v2 ||
         !ds4_gpu_expert_store_layer_index(pack, layer, &index) ||
         !pack->layers[index].valid ||
         pack->model_size != model_size || !offset || !size) {
@@ -10038,7 +10090,17 @@ int ds4_gpu_expert_store_v2_layer_span(
     return 1;
 }
 
-int ds4_gpu_expert_store_v2_install(
+int ds4_gpu_expert_store_v2_layer_span(
+        uint32_t layer,
+        uint64_t model_size,
+        uint64_t *offset,
+        uint64_t *size) {
+    return ds4_gpu_expert_store_v2_layer_span_for_store(
+        DS4_GPU_EXPERT_STORE_TARGET, layer, model_size, offset, size);
+}
+
+int ds4_gpu_expert_store_v2_install_for_store(
+        ds4_gpu_expert_store_id              store_id,
         int                                  fd,
         uint64_t                             file_size,
         uint32_t                             n_layer,
@@ -10048,6 +10110,10 @@ int ds4_gpu_expert_store_v2_install(
         const ds4_gpu_expert_store_layer_v2 *layers) {
     struct stat st;
     int flags = -1;
+    ds4_gpu_qwen35_expert_pack_state *pack =
+        ds4_gpu_expert_pack_for_store(store_id);
+    const bool support_store = store_id == DS4_GPU_EXPERT_STORE_SUPPORT;
+    if (store_id != DS4_GPU_EXPERT_STORE_TARGET && !support_store) return 0;
     const bool storage_valid =
         (storage_format == DS4_EXPERT_STORE_STORAGE_GGML &&
          group_size == 0u) ||
@@ -10101,18 +10167,30 @@ int ds4_gpu_expert_store_v2_install(
         }
         previous_layer = entry->layer;
     }
-    if (g_qwen35_expert_pack.active) ds4_gpu_qwen35_expert_pack_clear();
-    ds4_gpu_qwen35_expert_pack_state_reset();
-    g_qwen35_expert_pack.fd = fd;
-    g_qwen35_expert_pack.file_size = file_size;
-    g_qwen35_expert_pack.n_layer = n_layer;
-    g_qwen35_expert_pack.n_expert = n_expert;
-    g_qwen35_expert_pack.storage_format = storage_format;
-    g_qwen35_expert_pack.group_size = group_size;
-    g_qwen35_expert_pack.embedded_v2 = 1;
+    ds4_gpu_qwen35_expert_pack_state *support_pack = NULL;
+    if (support_store) {
+        if (n_layer > DS4_DSPARK_SUPPORT_LAYER_COUNT ||
+            n_expert > DS4_DSPARK_SUPPORT_EXPERT_COUNT) {
+            return 0;
+        }
+        support_pack = calloc(1, sizeof(*support_pack));
+        if (!support_pack) return 0;
+        if (pack) ds4_gpu_expert_store_v2_clear_for_store(store_id);
+        pack = support_pack;
+    } else if (pack->active) {
+        ds4_gpu_expert_store_v2_clear_for_store(store_id);
+    }
+    memset(pack, 0, sizeof(*pack));
+    pack->fd = fd;
+    pack->file_size = file_size;
+    pack->n_layer = n_layer;
+    pack->n_expert = n_expert;
+    pack->storage_format = storage_format;
+    pack->group_size = group_size;
+    pack->embedded_v2 = 1;
     for (uint32_t index = 0; index < n_layer; index++) {
         ds4_gpu_qwen35_expert_pack_layer *destination =
-            &g_qwen35_expert_pack.layers[index];
+            &pack->layers[index];
         destination->layer = layers[index].layer;
         destination->data_offset = layers[index].data_offset;
         destination->data_size = layers[index].data_size;
@@ -10122,17 +10200,33 @@ int ds4_gpu_expert_store_v2_install(
         memcpy(destination->component_bytes, layers[index].component_bytes,
                sizeof(destination->component_bytes));
     }
-    g_qwen35_expert_pack.active = 1;
+    pack->active = 1;
+    if (support_store) {
+        g_dspark_expert_pack = support_pack;
+    }
     return 1;
 }
 
+int ds4_gpu_expert_store_v2_install(
+        int                                  fd,
+        uint64_t                             file_size,
+        uint32_t                             n_layer,
+        uint32_t                             n_expert,
+        uint32_t                             storage_format,
+        uint32_t                             group_size,
+        const ds4_gpu_expert_store_layer_v2 *layers) {
+    return ds4_gpu_expert_store_v2_install_for_store(
+        DS4_GPU_EXPERT_STORE_TARGET, fd, file_size, n_layer, n_expert,
+        storage_format, group_size, layers);
+}
+
 static int ds4_gpu_expert_store_bind_layer_internal(
+        ds4_gpu_qwen35_expert_pack_state *pack,
         uint32_t layer,
         uint64_t model_size,
         uint64_t gate_offset,
         uint64_t up_offset,
         uint64_t down_offset) {
-    ds4_gpu_qwen35_expert_pack_state *pack = &g_qwen35_expert_pack;
     uint32_t index = 0;
     if (!pack->active || model_size == 0 ||
         !ds4_gpu_expert_store_layer_index(pack, layer, &index)) return 0;
@@ -10201,10 +10295,24 @@ int ds4_gpu_expert_store_v2_bind_layer(
         uint32_t layer,
         uint64_t model_size,
         uint64_t gate_offset,
+    uint64_t up_offset,
+    uint64_t down_offset) {
+    return ds4_gpu_expert_store_bind_layer_internal(
+        &g_qwen35_expert_pack, layer, model_size,
+        gate_offset, up_offset, down_offset);
+}
+
+int ds4_gpu_expert_store_v2_bind_layer_for_store(
+        ds4_gpu_expert_store_id store_id,
+        uint32_t layer,
+        uint64_t model_size,
+        uint64_t gate_offset,
         uint64_t up_offset,
         uint64_t down_offset) {
-    return ds4_gpu_expert_store_bind_layer_internal(
-        layer, model_size, gate_offset, up_offset, down_offset);
+    ds4_gpu_qwen35_expert_pack_state *pack =
+        ds4_gpu_expert_pack_for_store(store_id);
+    return pack && ds4_gpu_expert_store_bind_layer_internal(
+        pack, layer, model_size, gate_offset, up_offset, down_offset);
 }
 
 static int ds4_gpu_qwen35_expert_pack_enable_resident(void) {
@@ -10381,13 +10489,15 @@ static int ds4_gpu_qwen35_expert_pack_resolve_layer(
 
 /* Return 0 when no pack is installed, 1 for a translated expert slice, and
  * -1 when a pack is active but the canonical read is not exactly mappable. */
-static int ds4_gpu_qwen35_expert_pack_resolve(
+static int ds4_gpu_qwen35_expert_pack_resolve_for_store(
+        ds4_gpu_expert_store_id store_id,
         uint64_t canonical_offset,
         uint64_t len,
         int     *source_fd,
         uint64_t *source_offset) {
-    const ds4_gpu_qwen35_expert_pack_state *pack = &g_qwen35_expert_pack;
-    if (!pack->active) return 0;
+    const ds4_gpu_qwen35_expert_pack_state *pack =
+        ds4_gpu_expert_pack_for_store(store_id);
+    if (!pack || !pack->active) return 0;
     if (!source_fd || !source_offset || len == 0) return -1;
 
     for (uint32_t layer = 0; layer < pack->n_layer; layer++) {
@@ -10433,6 +10543,16 @@ static int ds4_gpu_qwen35_expert_pack_resolve(
         }
     }
     return -1;
+}
+
+static int ds4_gpu_qwen35_expert_pack_resolve(
+        uint64_t canonical_offset,
+        uint64_t len,
+        int     *source_fd,
+        uint64_t *source_offset) {
+    return ds4_gpu_qwen35_expert_pack_resolve_for_store(
+        DS4_GPU_EXPERT_STORE_TARGET, canonical_offset, len,
+        source_fd, source_offset);
 }
 
 /* Resolve one complete embedded-v2 expert record.  The cache stores gate,
@@ -37354,6 +37474,181 @@ static int ds4_gpu_internal_qwen35_expert_pack_pwrite_all(
     return 1;
 }
 
+#ifdef DS4_TEST_HOOKS
+int ds4_gpu_internal_dspark_dual_store_test(void) {
+    const uint64_t file_size = 16u * 1024u;
+    const uint64_t model_size = 1024u * 1024u;
+    const uint64_t gate_offset = 300u * 1024u;
+    const uint64_t up_offset = 301u * 1024u;
+    const uint64_t down_offset = 302u * 1024u;
+    char path[] = "/tmp/ds4-dspark-dual-store.XXXXXX";
+    int fd = mkstemp(path);
+    if (fd < 0) return 0;
+    (void)unlink(path);
+    int ok = ftruncate(fd, (off_t)file_size) == 0 &&
+             (g_initialized || ds4_gpu_init());
+
+    const ds4_gpu_expert_store_layer_v2 target = {
+        .layer = 0,
+        .data_offset = 4096,
+        .data_size = 45,
+        .record_bytes = 15,
+        .component_offset = {0, 3, 8},
+        .component_bytes = {3, 5, 7},
+    };
+    const ds4_gpu_expert_store_layer_v2 support = {
+        .layer = 0,
+        .data_offset = 8192,
+        .data_size = 45,
+        .record_bytes = 15,
+        .component_offset = {0, 3, 8},
+        .component_bytes = {3, 5, 7},
+    };
+    if (ok) {
+        ok = ds4_gpu_expert_store_v2_install_for_store(
+                 DS4_GPU_EXPERT_STORE_TARGET, fd, file_size, 1, 3,
+                 DS4_EXPERT_STORE_STORAGE_GGML, 0, &target) &&
+             g_dspark_expert_pack == NULL;
+    }
+    if (ok) {
+        ok = ds4_gpu_expert_store_v2_install_for_store(
+                 DS4_GPU_EXPERT_STORE_SUPPORT, fd, file_size, 1, 3,
+                 DS4_EXPERT_STORE_STORAGE_GGML, 0, &support) &&
+             ds4_gpu_expert_store_v2_bind_layer_for_store(
+                 DS4_GPU_EXPERT_STORE_TARGET, 0, model_size,
+                 gate_offset, up_offset, down_offset) &&
+             ds4_gpu_expert_store_v2_bind_layer_for_store(
+                 DS4_GPU_EXPERT_STORE_SUPPORT, 0, model_size,
+                 gate_offset, up_offset, down_offset);
+    }
+
+    uint64_t target_span = 0;
+    uint64_t support_span = 0;
+    uint64_t span_size = 0;
+    int target_fd = -1;
+    int support_fd = -1;
+    uint64_t target_source = 0;
+    uint64_t support_source = 0;
+    if (ok) {
+        ok = ds4_gpu_expert_store_v2_layer_span_for_store(
+                 DS4_GPU_EXPERT_STORE_TARGET, 0, model_size,
+                 &target_span, &span_size) &&
+             span_size == target.data_size &&
+             ds4_gpu_expert_store_v2_layer_span_for_store(
+                 DS4_GPU_EXPERT_STORE_SUPPORT, 0, model_size,
+                 &support_span, &span_size) &&
+             span_size == support.data_size &&
+             target_span == target.data_offset &&
+             support_span == support.data_offset &&
+             target_span != support_span &&
+             ds4_gpu_qwen35_expert_pack_resolve_for_store(
+                 DS4_GPU_EXPERT_STORE_TARGET,
+                 gate_offset + 2u * target.component_bytes[0],
+                 target.component_bytes[0], &target_fd, &target_source) == 1 &&
+             ds4_gpu_qwen35_expert_pack_resolve_for_store(
+                 DS4_GPU_EXPERT_STORE_SUPPORT,
+                 gate_offset + 2u * support.component_bytes[0],
+                 support.component_bytes[0], &support_fd, &support_source) == 1 &&
+             target_fd == fd && support_fd == fd &&
+             target_source == target.data_offset + 2u * target.record_bytes &&
+             support_source == support.data_offset + 2u * support.record_bytes &&
+             target_source != support_source;
+    }
+    if (ok) {
+        uint64_t target_after_clear = 0;
+        uint64_t target_after_clear_size = 0;
+        int target_after_clear_fd = -1;
+        uint64_t target_after_clear_source = 0;
+        ds4_gpu_expert_store_v2_clear_for_store(
+            DS4_GPU_EXPERT_STORE_SUPPORT);
+        ok = g_dspark_expert_pack == NULL &&
+             !ds4_gpu_expert_store_v2_layer_span_for_store(
+                 DS4_GPU_EXPERT_STORE_SUPPORT, 0, model_size,
+                 &support_span, &span_size) &&
+             ds4_gpu_expert_store_v2_layer_span_for_store(
+                 DS4_GPU_EXPERT_STORE_TARGET, 0, model_size,
+                 &target_after_clear, &target_after_clear_size) &&
+             target_after_clear == target.data_offset &&
+             target_after_clear_size == target.data_size &&
+             ds4_gpu_qwen35_expert_pack_resolve_for_store(
+                 DS4_GPU_EXPERT_STORE_TARGET,
+                 gate_offset + 2u * target.component_bytes[0],
+                 target.component_bytes[0], &target_after_clear_fd,
+                 &target_after_clear_source) == 1 &&
+             target_after_clear_fd == fd &&
+             target_after_clear_source == target_source;
+    } else {
+        ds4_gpu_expert_store_v2_clear_for_store(
+            DS4_GPU_EXPERT_STORE_SUPPORT);
+    }
+    ds4_gpu_expert_store_v2_clear_for_store(DS4_GPU_EXPERT_STORE_TARGET);
+    close(fd);
+    return ok;
+}
+
+int ds4_gpu_internal_dspark_hc_mean_test(void) {
+    enum { N_EMBD = 4096, N_HC = 4, N_TOKEN = 3 };
+    NSString *pipeline_key = @"kernel_dsv4_hc_mean";
+    if ([g_pipeline_cache objectForKey:pipeline_key] != nil) return 0;
+
+    const uint64_t input_count = (uint64_t)N_TOKEN * N_HC * N_EMBD;
+    const uint64_t output_count = (uint64_t)N_TOKEN * N_EMBD;
+    float *input = malloc((size_t)input_count * sizeof(*input));
+    float *output = calloc((size_t)output_count, sizeof(*output));
+    if (!input || !output) {
+        free(input);
+        free(output);
+        return 0;
+    }
+    for (uint32_t token = 0; token < N_TOKEN; token++) {
+        for (uint32_t hc = 0; hc < N_HC; hc++) {
+            for (uint32_t dim = 0; dim < N_EMBD; dim++) {
+                input[(token * N_HC + hc) * N_EMBD + dim] =
+                    (float)token * 0.25f + (float)hc * 1.5f +
+                    ((float)((int32_t)(dim % 257u) - 128)) * 0.03125f;
+            }
+        }
+    }
+
+    const uint64_t input_bytes = input_count * sizeof(*input);
+    const uint64_t output_bytes = output_count * sizeof(*output);
+    ds4_gpu_tensor *source = ds4_gpu_tensor_alloc(input_bytes);
+    ds4_gpu_tensor *mean = ds4_gpu_tensor_alloc(output_bytes);
+    ds4_gpu_tensor *alias = source ?
+        ds4_gpu_tensor_view(source, 0, output_bytes) : NULL;
+    ds4_gpu_tensor *undersized = ds4_gpu_tensor_alloc(input_bytes - sizeof(float));
+    ds4_gpu_tensor *bad_shape = ds4_gpu_tensor_alloc(output_bytes - sizeof(float));
+    int ok = source && mean &&
+             alias && undersized && bad_shape &&
+             ds4_gpu_tensor_write(source, 0, input, input_bytes) &&
+             !ds4_gpu_hc_mean_tensor(alias, source, N_EMBD, N_HC) &&
+             !ds4_gpu_hc_mean_tensor(mean, undersized, N_EMBD, N_HC) &&
+             !ds4_gpu_hc_mean_tensor(bad_shape, source, N_EMBD, N_HC) &&
+             ds4_gpu_hc_mean_tensor(mean, source, N_EMBD, N_HC) &&
+             ds4_gpu_tensor_read(mean, 0, output, output_bytes) &&
+             [g_pipeline_cache objectForKey:pipeline_key] != nil;
+    for (uint32_t token = 0; ok && token < N_TOKEN; token++) {
+        for (uint32_t dim = 0; dim < N_EMBD; dim++) {
+            const float expected =
+                (float)token * 0.25f + 2.25f +
+                ((float)((int32_t)(dim % 257u) - 128)) * 0.03125f;
+            if (fabsf(output[token * N_EMBD + dim] - expected) > 1.0e-6f) {
+                ok = 0;
+                break;
+            }
+        }
+    }
+    ds4_gpu_tensor_free(bad_shape);
+    ds4_gpu_tensor_free(undersized);
+    ds4_gpu_tensor_free(alias);
+    ds4_gpu_tensor_free(mean);
+    ds4_gpu_tensor_free(source);
+    free(output);
+    free(input);
+    return ok;
+}
+#endif
+
 int ds4_gpu_internal_qwen35_expert_pack_test(void) {
     const uint64_t file_size = 16u * 1024u;
     const uint64_t model_size = 1024u * 1024u;
@@ -40563,6 +40858,91 @@ int ds4_gpu_hc_weighted_sum_tensor(
                                              n_embd,
                                              n_hc,
                                              "HC weighted sum");
+}
+
+int ds4_gpu_hc_mean_tensor(
+        ds4_gpu_tensor       *out,
+        const ds4_gpu_tensor *residual_hc,
+        uint32_t                n_embd,
+        uint32_t                n_hc) {
+    if (!g_initialized && !ds4_gpu_init()) return 0;
+    if (!out || !residual_hc || n_embd == 0 || n_hc == 0 || n_hc > 16u) {
+        return 0;
+    }
+    @autoreleasepool {
+        id<MTLBuffer> xbuf = ds4_gpu_tensor_buffer(residual_hc);
+        id<MTLBuffer> outbuf = ds4_gpu_tensor_buffer(out);
+        const uint64_t out_row_bytes = (uint64_t)n_embd * sizeof(float);
+        const uint64_t out_bytes = ds4_gpu_tensor_bytes(out);
+        if (out_row_bytes == 0 || out_bytes < out_row_bytes ||
+            out_bytes % out_row_bytes != 0) {
+            fprintf(stderr,
+                    "ds4: Metal DSpark HC mean output size is not a whole token row\n");
+            return 0;
+        }
+        const uint64_t n_tokens = out_bytes / out_row_bytes;
+        const uint64_t row_values = (uint64_t)n_hc * n_embd;
+        if (n_tokens == 0 || n_tokens > INT64_MAX || row_values == 0 ||
+            row_values > UINT64_MAX / sizeof(float) ||
+            n_tokens > UINT64_MAX / (row_values * sizeof(float))) {
+            fprintf(stderr, "ds4: Metal DSpark HC mean shape overflows\n");
+            return 0;
+        }
+        const uint64_t x_bytes = n_tokens * row_values * sizeof(float);
+        if (!xbuf || !outbuf ||
+            ds4_gpu_tensor_bytes(residual_hc) < x_bytes) {
+            fprintf(stderr,
+                    "ds4: Metal DSpark HC mean received an undersized activation\n");
+            return 0;
+        }
+        if (xbuf == outbuf) {
+            const uint64_t x_offset = ds4_gpu_tensor_offset(residual_hc);
+            const uint64_t out_offset = ds4_gpu_tensor_offset(out);
+            if (x_offset < out_offset + out_bytes &&
+                out_offset < x_offset + x_bytes) {
+                fprintf(stderr,
+                        "ds4: Metal DSpark HC mean does not permit overlapping input/output\n");
+                return 0;
+            }
+        }
+
+        id<MTLComputePipelineState> pipeline = nil;
+        @synchronized (g_pipeline_cache) {
+            pipeline = ds4_gpu_get_pipeline("kernel_dsv4_hc_mean");
+        }
+        if (!pipeline) return 0;
+
+        const ds4_gpu_hc_mean_args args = {
+            .n_embd = n_embd,
+            .n_hc = n_hc,
+            .n_tokens = (int64_t)n_tokens,
+            .nb_x0 = sizeof(float),
+            .nb_x1 = (uint64_t)n_embd * sizeof(float),
+            .nb_x2 = (uint64_t)n_hc * n_embd * sizeof(float),
+            .nb0 = sizeof(float),
+            .nb1 = (uint64_t)n_embd * sizeof(float),
+        };
+        const uint64_t n_elem = (uint64_t)n_embd * n_tokens;
+        if (n_elem > NSUIntegerMax) return 0;
+        const NSUInteger nth = MIN((NSUInteger)256,
+                                   MAX((NSUInteger)1, (NSUInteger)n_elem));
+        const NSUInteger n_tg = ((NSUInteger)n_elem + nth - 1u) / nth;
+        int owned = 0;
+        id<MTLCommandBuffer> cb = ds4_gpu_command_buffer(&owned);
+        if (!cb) return 0;
+        id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
+        [enc setComputePipelineState:pipeline];
+        [enc setBytes:&args length:sizeof(args) atIndex:0];
+        [enc setBuffer:xbuf
+                offset:ds4_gpu_tensor_offset(residual_hc)
+               atIndex:1];
+        [enc setBuffer:outbuf offset:ds4_gpu_tensor_offset(out) atIndex:2];
+        [enc dispatchThreadgroups:MTLSizeMake(n_tg, 1, 1)
+             threadsPerThreadgroup:MTLSizeMake(nth, 1, 1)];
+        ds4_gpu_end_compute_encoder(cb, enc);
+        return ds4_gpu_finish_command_buffer(
+            cb, owned, "DSpark post-layer HC mean");
+    }
 }
 
 int ds4_gpu_hc_weighted_sum_split_tensor(
