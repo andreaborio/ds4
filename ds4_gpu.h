@@ -163,10 +163,11 @@ void ds4_gpu_set_streaming_expert_cache_required_floor(uint32_t experts);
 void ds4_gpu_set_streaming_expert_cache_expert_bytes(uint64_t bytes);
 /* Optional model-specific slab-growth target; zero restores the backend
  * default. An explicit DS4_METAL_STREAMING_EXPERT_SLAB_MB wins only outside
- * guarded Qwen tiers, whose measured slab geometry is part of admission. */
+ * guarded model tiers whose measured slab geometry is part of admission. */
 void ds4_gpu_set_streaming_expert_cache_slab_target_bytes(uint64_t bytes);
-/* Guarded Qwen tiers admit every additional slab against a fresh host
- * snapshot. runtime_bytes is the maximum prefill/decode envelope and
+/* Guarded streaming tiers admit every additional TARGET slab against a fresh
+ * host snapshot. runtime_bytes must include the maximum prefill/decode
+ * envelope plus any separately owned cache such as DSpark SUPPORT;
  * static_page_bytes is the complete pageable non-routed coverage. */
 void ds4_gpu_set_streaming_expert_cache_growth_guard(
         bool     enabled,
@@ -174,6 +175,9 @@ void ds4_gpu_set_streaming_expert_cache_growth_guard(
         uint64_t static_page_bytes);
 uint64_t ds4_gpu_recommended_working_set_size(void);
 int ds4_gpu_host_memory_snapshot(ds4_ssd_host_memory *out);
+/* Effective combined cache budget after TARGET caps and an optional DSpark
+ * SUPPORT split. Equal to configured_count() for target-only models. */
+uint32_t ds4_gpu_stream_expert_cache_effective_parent_count(void);
 uint32_t ds4_gpu_stream_expert_cache_configured_count(void);
 uint32_t ds4_gpu_stream_expert_cache_current_count(void);
 /* Complete gate + up + down payload for one logical routed expert.  This is

@@ -14,6 +14,9 @@ enum {
     DS4_DSPARK_TARGET_TOP_K = 6,
     DS4_DSPARK_SUPPORT_TOP_K = 6,
     DS4_DSPARK_SUPPORT_CANDIDATE_ROWS = 5,
+    DS4_DSPARK_VERIFY_CAPTURE_MAX_ROWS = 16,
+    DS4_DSPARK_RAW_WIDTH = 512,
+    DS4_DSPARK_METAL_PAGE_BYTES = 16384,
     /* One token can retain top-k records from every target layer, plus the
      * record currently being filled by asynchronous I/O. */
     DS4_DSPARK_TARGET_CACHE_FLOOR =
@@ -49,6 +52,274 @@ typedef struct {
     uint32_t target_floor;
     uint32_t support_floor;
 } ds4_dspark_cache_plan;
+
+static bool ds4_dspark_cache_plan_make(
+        uint32_t               total_records,
+        bool                   support_enabled,
+        ds4_dspark_cache_plan *out);
+
+typedef struct {
+    uint32_t target_only_policy_records;
+    uint32_t combined_raw_capacity_records;
+    uint32_t combined_policy_records;
+    uint32_t fixed_equivalent_records;
+    uint32_t equal_memory_ceiling_records;
+    uint32_t cycle_aligned_target_records;
+    uint32_t selected_parent_records;
+} ds4_dspark_equal_memory_cache_plan;
+
+/* The combined adaptive plan already sees the added bytes, but a rounded
+ * route-cycle or measured DeepSeek ceiling can hide that reduction. Cap the
+ * result against the target-only policy less one fixed-byte equivalent. Use
+ * the combined plan's raw byte capacity here, not its already cycle-rounded
+ * target-only policy count: SUPPORT-aware rounding happens exactly once below.
+ * Then reserve SUPPORT and round the remaining TARGET share down to a complete
+ * 258-record route cycle; a partial TARGET cycle is not a qualified tier. */
+static bool ds4_dspark_equal_memory_cache_plan_make(
+        uint32_t                            target_only_policy_records,
+        uint32_t                            combined_raw_capacity_records,
+        uint32_t                            combined_policy_records,
+        uint32_t                            fixed_equivalent_records,
+        ds4_dspark_equal_memory_cache_plan *out) {
+    if (!out) return false;
+    memset(out, 0, sizeof(*out));
+    if (target_only_policy_records <= fixed_equivalent_records ||
+        combined_raw_capacity_records == 0 || combined_policy_records == 0 ||
+        fixed_equivalent_records == 0) {
+        return false;
+    }
+    const uint32_t equal_memory_ceiling =
+        target_only_policy_records - fixed_equivalent_records;
+    const uint32_t selected =
+        combined_raw_capacity_records < equal_memory_ceiling ?
+            combined_raw_capacity_records : equal_memory_ceiling;
+    if (selected < DS4_DSPARK_COMBINED_CACHE_FLOOR) return false;
+    const uint32_t target_allowance =
+        selected - DS4_DSPARK_SUPPORT_CACHE_FLOOR;
+    const uint32_t target_working_set =
+        DS4_DSPARK_TARGET_LAYER_COUNT * DS4_DSPARK_TARGET_TOP_K;
+    if (target_allowance < DS4_DSPARK_TARGET_CACHE_FLOOR ||
+        target_working_set == 0) {
+        return false;
+    }
+    const uint32_t cycle_aligned_target =
+        1u + target_working_set *
+                 ((target_allowance - 1u) / target_working_set);
+    if (cycle_aligned_target >
+        UINT32_MAX - DS4_DSPARK_SUPPORT_CACHE_FLOOR) {
+        return false;
+    }
+    const uint32_t cycle_aligned_parent =
+        cycle_aligned_target + DS4_DSPARK_SUPPORT_CACHE_FLOOR;
+    ds4_dspark_cache_plan split = {0};
+    if (!ds4_dspark_cache_plan_make(
+            cycle_aligned_parent, true, &split) ||
+        split.target_records != cycle_aligned_target) {
+        return false;
+    }
+    *out = (ds4_dspark_equal_memory_cache_plan){
+        .target_only_policy_records = target_only_policy_records,
+        .combined_raw_capacity_records = combined_raw_capacity_records,
+        .combined_policy_records = combined_policy_records,
+        .fixed_equivalent_records = fixed_equivalent_records,
+        .equal_memory_ceiling_records = equal_memory_ceiling,
+        .cycle_aligned_target_records = cycle_aligned_target,
+        .selected_parent_records = cycle_aligned_parent,
+    };
+    return true;
+}
+
+/* Long-context policy helpers return a TARGET cycle count. Combined sessions
+ * store parent budgets, so append SUPPORT only after the TARGET result has
+ * been chosen and reject partial/over-decode tiers. Zero remains "disabled". */
+static bool ds4_dspark_phase_parent_for_target(
+        uint32_t  target_records,
+        uint32_t  decode_parent_records,
+        uint32_t *parent_records_out) {
+    if (parent_records_out) *parent_records_out = 0;
+    if (!parent_records_out || decode_parent_records == 0) return false;
+    if (target_records == 0) return true;
+    const uint32_t target_working_set =
+        DS4_DSPARK_TARGET_LAYER_COUNT * DS4_DSPARK_TARGET_TOP_K;
+    if (target_records < DS4_DSPARK_TARGET_CACHE_FLOOR ||
+        (target_records - 1u) % target_working_set != 0 ||
+        target_records > UINT32_MAX - DS4_DSPARK_SUPPORT_CACHE_FLOOR) {
+        return false;
+    }
+    const uint32_t parent =
+        target_records + DS4_DSPARK_SUPPORT_CACHE_FLOOR;
+    ds4_dspark_cache_plan split = {0};
+    if (parent > decode_parent_records ||
+        !ds4_dspark_cache_plan_make(parent, true, &split) ||
+        split.target_records != target_records) {
+        return false;
+    }
+    *parent_records_out = parent;
+    return true;
+}
+
+static uint32_t ds4_dspark_prefill_cap_floor(uint32_t normal_cap) {
+    const uint32_t required =
+        DS4_DSPARK_SUPPORT_CANDIDATE_ROWS + 1u;
+    return normal_cap < required ? required : normal_cap;
+}
+
+/* Conservative sampled-production-path allocation inventory. core_bytes is
+ * the 9,388,032-byte drafter core; the default temperature-1 product path
+ * additionally owns greedy-head intermediates, all five q distributions, a
+ * right-sized six-row target-verifier logits buffer (pending + five drafts),
+ * and one frontier snapshot for exact restore-and-replay verification. This
+ * does not assume the legacy MTP-only 16-row logits buffer or add a second
+ * prefix-one frontier. Metal allocations are page charged individually: tiny
+ * token/id buffers still consume one 16 KiB allocation page. Keeping the
+ * ingredients named makes later graph changes update admission at the same
+ * time instead of growing an invisible reserve. */
+typedef struct {
+    uint64_t capture_current_bytes;
+    uint64_t capture_verifier_bytes;
+    uint64_t capture_history_bytes;
+    uint64_t capture_bytes;
+    uint64_t main_x_bytes;
+    uint64_t raw_ring_bytes;
+    uint64_t proposal_scratch_page_bytes;
+    uint64_t core_bytes;
+    uint64_t greedy_head_scratch_page_bytes;
+    uint64_t sampled_q_distribution_page_bytes;
+    uint64_t target_verifier_logits_page_bytes;
+    uint64_t verifier_ratio4_snapshot_page_bytes;
+    uint64_t verifier_ratio128_snapshot_page_bytes;
+    uint64_t verifier_frontier_snapshot_page_bytes;
+    uint64_t sampled_host_vocab_rows_page_bytes;
+    uint64_t sampled_host_confidence_feature_page_bytes;
+    uint64_t sampled_host_delta_page_bytes;
+    uint64_t total_bytes;
+} ds4_dspark_runtime_memory;
+
+static uint64_t ds4_dspark_metal_page_charge(uint64_t bytes) {
+    const uint64_t page = DS4_DSPARK_METAL_PAGE_BYTES;
+    if (bytes == 0 || bytes > UINT64_MAX - (page - 1u)) return UINT64_MAX;
+    return (bytes + page - 1u) & ~(page - 1u);
+}
+
+static bool ds4_dspark_runtime_memory_make(
+        ds4_dspark_runtime_memory *out) {
+    if (!out) return false;
+    const uint64_t row_bytes =
+        (uint64_t)DS4_DSPARK_CAPTURE_WIDTH * sizeof(float);
+    const uint64_t hc_row_bytes = 4u * row_bytes;
+    const uint64_t block_rows = DS4_DSPARK_SUPPORT_CANDIDATE_ROWS;
+    const uint64_t stage0_rows = block_rows + 1u;
+    const uint64_t stage0_packed =
+        stage0_rows * DS4_DSPARK_CAPTURE_STAGE_COUNT * row_bytes;
+    const uint64_t stage0_proj = row_bytes;
+    const uint64_t draft_tokens = block_rows * sizeof(int32_t);
+    const uint64_t draft_hc = block_rows * hc_row_bytes;
+    const uint64_t target_hc = hc_row_bytes;
+    const uint64_t stage_input_hc = stage0_rows * hc_row_bytes;
+    const uint64_t stage_output_hc = block_rows * hc_row_bytes;
+    const uint64_t position_ids = stage0_rows * sizeof(int32_t);
+    const uint64_t proposal_scratch =
+        ds4_dspark_metal_page_charge(stage0_packed) +
+        ds4_dspark_metal_page_charge(stage0_proj) +
+        ds4_dspark_metal_page_charge(draft_tokens) +
+        ds4_dspark_metal_page_charge(draft_hc) +
+        ds4_dspark_metal_page_charge(target_hc) +
+        ds4_dspark_metal_page_charge(stage_input_hc) +
+        ds4_dspark_metal_page_charge(stage_output_hc) +
+        ds4_dspark_metal_page_charge(position_ids);
+    const uint64_t greedy_head_scratch =
+        ds4_dspark_metal_page_charge(
+            block_rows * UINT64_C(256) * sizeof(float)) +
+        ds4_dspark_metal_page_charge(
+            UINT64_C(129280) * sizeof(float)) +
+        ds4_dspark_metal_page_charge(block_rows * sizeof(float));
+    const uint64_t sampled_q_distribution =
+        ds4_dspark_metal_page_charge(
+            block_rows * UINT64_C(129280) * sizeof(float));
+    const uint64_t target_verifier_logits =
+        ds4_dspark_metal_page_charge(
+            stage0_rows * UINT64_C(129280) * sizeof(float));
+    /* Exact verifier rollback owns one saved frontier. Ratio-4 layers retain
+     * K/V plus two independently allocated index buffers; ratio-128 layers
+     * retain one K/V pair. Each component is charged at Metal page size. */
+    const uint64_t verifier_ratio4_snapshot =
+        UINT64_C(21) * (
+            UINT64_C(2) *
+                ds4_dspark_metal_page_charge(UINT64_C(32768)) +
+            UINT64_C(2) *
+                ds4_dspark_metal_page_charge(UINT64_C(8192)));
+    const uint64_t verifier_ratio128_snapshot =
+        UINT64_C(20) * UINT64_C(2) *
+            ds4_dspark_metal_page_charge(UINT64_C(262144));
+    /* Sampling reuses the baseline full-vocabulary arena serially. DSpark
+     * adds exactly two host probability rows (q-selected and the mutable p
+     * residual/bonus row) plus one 4352-value confidence feature vector. */
+    const uint64_t sampled_host_vocab_rows =
+        UINT64_C(2) * ds4_dspark_metal_page_charge(
+            UINT64_C(129280) * sizeof(float));
+    const uint64_t sampled_host_confidence_feature =
+        ds4_dspark_metal_page_charge(UINT64_C(4352) * sizeof(float));
+    const ds4_dspark_runtime_memory memory = {
+        .capture_current_bytes =
+            DS4_DSPARK_CAPTURE_STAGE_COUNT * row_bytes,
+        .capture_verifier_bytes =
+            DS4_DSPARK_CAPTURE_STAGE_COUNT *
+            DS4_DSPARK_VERIFY_CAPTURE_MAX_ROWS * row_bytes,
+        .capture_history_bytes =
+            DS4_DSPARK_CAPTURE_STAGE_COUNT *
+            DS4_DSPARK_HISTORY_ROWS * row_bytes,
+        .main_x_bytes = row_bytes,
+        .raw_ring_bytes =
+            (uint64_t)DS4_DSPARK_CAPTURE_STAGE_COUNT *
+            DS4_DSPARK_HISTORY_ROWS * DS4_DSPARK_RAW_WIDTH * sizeof(float),
+        .proposal_scratch_page_bytes = proposal_scratch,
+        .greedy_head_scratch_page_bytes = greedy_head_scratch,
+        .sampled_q_distribution_page_bytes = sampled_q_distribution,
+        .target_verifier_logits_page_bytes = target_verifier_logits,
+        .verifier_ratio4_snapshot_page_bytes = verifier_ratio4_snapshot,
+        .verifier_ratio128_snapshot_page_bytes =
+            verifier_ratio128_snapshot,
+        .sampled_host_vocab_rows_page_bytes = sampled_host_vocab_rows,
+        .sampled_host_confidence_feature_page_bytes =
+            sampled_host_confidence_feature,
+    };
+    ds4_dspark_runtime_memory result = memory;
+    result.capture_bytes = memory.capture_current_bytes +
+                           memory.capture_verifier_bytes +
+                           memory.capture_history_bytes;
+    result.core_bytes = result.capture_bytes + memory.main_x_bytes +
+                        memory.raw_ring_bytes + proposal_scratch;
+    result.verifier_frontier_snapshot_page_bytes =
+        verifier_ratio4_snapshot + verifier_ratio128_snapshot;
+    result.sampled_host_delta_page_bytes =
+        sampled_host_vocab_rows + sampled_host_confidence_feature;
+    result.total_bytes = result.core_bytes + greedy_head_scratch +
+                         sampled_q_distribution + target_verifier_logits +
+                         result.verifier_frontier_snapshot_page_bytes +
+                         result.sampled_host_delta_page_bytes;
+    if (result.capture_current_bytes != UINT64_C(49152) ||
+        result.capture_verifier_bytes != UINT64_C(786432) ||
+        result.capture_history_bytes != UINT64_C(6291456) ||
+        result.capture_bytes != UINT64_C(7127040) ||
+        result.main_x_bytes != UINT64_C(16384) ||
+        result.raw_ring_bytes != UINT64_C(786432) ||
+        result.proposal_scratch_page_bytes != UINT64_C(1458176) ||
+        result.core_bytes != UINT64_C(9388032) ||
+        result.greedy_head_scratch_page_bytes != UINT64_C(557056) ||
+        result.sampled_q_distribution_page_bytes != UINT64_C(2588672) ||
+        result.target_verifier_logits_page_bytes != UINT64_C(3112960) ||
+        result.verifier_ratio4_snapshot_page_bytes != UINT64_C(2064384) ||
+        result.verifier_ratio128_snapshot_page_bytes != UINT64_C(10485760) ||
+        result.verifier_frontier_snapshot_page_bytes != UINT64_C(12550144) ||
+        result.sampled_host_vocab_rows_page_bytes != UINT64_C(1048576) ||
+        result.sampled_host_confidence_feature_page_bytes != UINT64_C(32768) ||
+        result.sampled_host_delta_page_bytes != UINT64_C(1081344) ||
+        result.total_bytes != UINT64_C(29278208)) {
+        return false;
+    }
+    *out = result;
+    return true;
+}
 
 /* Host-side ownership for the three device capture rows.  This structure does
  * not contain activations: it only prevents a partially encoded token, a
@@ -517,6 +788,11 @@ static bool ds4_dspark_runtime_contract_self_check(void) {
     uint32_t slot = UINT32_MAX;
     ds4_dspark_cache_plan target_only;
     ds4_dspark_cache_plan combined;
+    ds4_dspark_equal_memory_cache_plan equal_envelope;
+    ds4_dspark_equal_memory_cache_plan equal_safety;
+    uint32_t long_parent = 0;
+    uint32_t extended_parent = 0;
+    ds4_dspark_runtime_memory memory;
     ds4_dspark_capture_state capture_state;
     bool capture = false;
     uint32_t capture_slot = UINT32_MAX;
@@ -553,6 +829,34 @@ static bool ds4_dspark_runtime_contract_self_check(void) {
            !ds4_dspark_capture_state_ready_at(&capture_state, 42u) &&
            ds4_dspark_history_state_self_check() &&
            ds4_dspark_failed_blit_state_self_check() &&
+           ds4_dspark_runtime_memory_make(&memory) &&
+           memory.capture_bytes == UINT64_C(7127040) &&
+           memory.core_bytes == UINT64_C(9388032) &&
+           memory.verifier_frontier_snapshot_page_bytes ==
+               UINT64_C(12550144) &&
+           memory.sampled_host_delta_page_bytes == UINT64_C(1081344) &&
+           memory.total_bytes == UINT64_C(29278208) &&
+           ds4_dspark_equal_memory_cache_plan_make(
+               4387u, 5000u, 4387u, 83u, &equal_envelope) &&
+           equal_envelope.equal_memory_ceiling_records == 4304u &&
+           equal_envelope.cycle_aligned_target_records == 4129u &&
+           equal_envelope.selected_parent_records == 4160u &&
+           ds4_dspark_equal_memory_cache_plan_make(
+               4387u, 4100u, 3871u, 83u, &equal_safety) &&
+           equal_safety.equal_memory_ceiling_records == 4304u &&
+           equal_safety.cycle_aligned_target_records == 3871u &&
+           equal_safety.selected_parent_records == 3902u &&
+           ds4_dspark_phase_parent_for_target(
+               4129u, 4160u, &long_parent) && long_parent == 4160u &&
+           ds4_dspark_phase_parent_for_target(
+               2065u, 4160u, &extended_parent) &&
+           extended_parent == 2096u &&
+           !ds4_dspark_phase_parent_for_target(
+               4098u, 4160u, &long_parent) &&
+           ds4_dspark_prefill_cap_floor(1u) == 6u &&
+           ds4_dspark_prefill_cap_floor(5u) == 6u &&
+           ds4_dspark_prefill_cap_floor(6u) == 6u &&
+           ds4_dspark_prefill_cap_floor(4096u) == 4096u &&
            ds4_dspark_cache_plan_make(
                DS4_DSPARK_TARGET_CACHE_FLOOR, false, &target_only) &&
            target_only.target_records == DS4_DSPARK_TARGET_CACHE_FLOOR &&

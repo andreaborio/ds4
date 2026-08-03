@@ -11055,6 +11055,10 @@ uint32_t ds4_gpu_stream_expert_cache_configured_count(void) {
     return budget;
 }
 
+uint32_t ds4_gpu_stream_expert_cache_effective_parent_count(void) {
+    return ds4_gpu_stream_expert_cache_parent_budget(0);
+}
+
 uint32_t ds4_gpu_stream_expert_cache_current_count(void) {
     return g_stream_expert_cache_entry_count;
 }
@@ -11234,10 +11238,15 @@ static int ds4_gpu_dspark_support_cache_combined_available(void) {
             g_dspark_expert_pack->model_size) {
         return 0;
     }
+    uint64_t target_record_bytes = 0;
     for (uint32_t layer = 0;
          layer < g_qwen35_expert_pack.n_layer;
          layer++) {
-        if (!g_qwen35_expert_pack.layers[layer].valid) return 0;
+        const ds4_gpu_qwen35_expert_pack_layer *entry =
+            &g_qwen35_expert_pack.layers[layer];
+        if (!entry->valid || entry->record_bytes == 0) return 0;
+        if (layer == 0) target_record_bytes = entry->record_bytes;
+        else if (entry->record_bytes != target_record_bytes) return 0;
     }
     uint64_t support_record_bytes = 0;
     for (uint32_t stage = 0; stage < DS4_DSPARK_SUPPORT_LAYER_COUNT; stage++) {
@@ -11246,6 +11255,15 @@ static int ds4_gpu_dspark_support_cache_combined_available(void) {
         if (!entry->valid || entry->layer != stage) return 0;
         if (stage == 0) support_record_bytes = entry->record_bytes;
         else if (entry->record_bytes != support_record_bytes) return 0;
+    }
+    if (support_record_bytes == 0 ||
+        support_record_bytes != target_record_bytes) {
+        fprintf(stderr,
+                "ds4: DSpark TARGET/SUPPORT record mismatch "
+                "(TARGET=%llu, SUPPORT=%llu)\n",
+                (unsigned long long)target_record_bytes,
+                (unsigned long long)support_record_bytes);
+        return 0;
     }
     return 1;
 }
@@ -12753,7 +12771,7 @@ static void ds4_gpu_stream_expert_cache_freeze_growth(
     g_stream_expert_cache_growth_guard_warned = 1;
     if (plan) {
         fprintf(stderr,
-                "ds4: Qwen guarded cache froze at %u expert slots before "
+                "ds4: guarded streaming cache froze at %u TARGET slots before "
                 "%.2f MiB slab growth: pressure %s, host %.2f/%.2f GiB, "
                 "Metal %.2f/%.2f GiB%s%s\n",
                 cap,
@@ -12767,7 +12785,7 @@ static void ds4_gpu_stream_expert_cache_freeze_growth(
                 reason ? reason : "");
     } else {
         fprintf(stderr,
-                "ds4: Qwen guarded cache froze at %u expert slots%s%s\n",
+                "ds4: guarded streaming cache froze at %u TARGET slots%s%s\n",
                 cap,
                 reason ? ": " : "",
                 reason ? reason : "");
@@ -12814,7 +12832,7 @@ static int ds4_gpu_stream_expert_cache_admit_slab_growth(
     if (plan_available && plan.allowed) {
         if (getenv("DS4_METAL_MEMORY_REPORT") != NULL) {
             fprintf(stderr,
-                    "ds4: Qwen slab admission decision=admit proposed=%.2f "
+                    "ds4: streaming TARGET slab admission=admit proposed=%.2f "
                     "MiB current_cache=%.2f GiB host=%.2f/%.2f GiB "
                     "Metal=%.2f/%.2f GiB pressure=normal\n",
                     ds4_gpu_mib(plan.slab_bytes),
@@ -12842,7 +12860,7 @@ static int ds4_gpu_stream_expert_cache_admit_slab_growth(
         /* Preserve the fixed working-set limit in the diagnostic without
          * adding another global solely for logging. */
         fprintf(stderr,
-                "ds4: Qwen slab admission decision=deny proposed=%.2f MiB, "
+                "ds4: streaming TARGET slab admission=deny proposed=%.2f MiB, "
                 "current_cache=%.2f GiB, host %.2f/%.2f GiB, Metal "
                 "%.2f/%.2f GiB, pressure %s\n",
                 ds4_gpu_mib(plan.slab_bytes),
@@ -38241,7 +38259,7 @@ int ds4_gpu_internal_dspark_support_cache_test(void) {
     enum {
         FILE_SIZE = 128 * 1024,
         MODEL_SIZE = 1024 * 1024,
-        RECORD_BYTES = 15,
+        RECORD_BYTES = 3,
         TARGET_LAYER_COUNT = DS4_DSPARK_TARGET_LAYER_COUNT,
         TARGET_RECORD_BYTES = 3,
         TARGET_LAYER_BYTES =
@@ -38302,11 +38320,11 @@ int ds4_gpu_internal_dspark_support_cache_test(void) {
         support_layers[stage].data_size = SUPPORT_LAYER_BYTES;
         support_layers[stage].record_bytes = RECORD_BYTES;
         support_layers[stage].component_offset[0] = 0;
-        support_layers[stage].component_offset[1] = 3;
-        support_layers[stage].component_offset[2] = 8;
-        support_layers[stage].component_bytes[0] = 3;
-        support_layers[stage].component_bytes[1] = 5;
-        support_layers[stage].component_bytes[2] = 7;
+        support_layers[stage].component_offset[1] = 1;
+        support_layers[stage].component_offset[2] = 2;
+        support_layers[stage].component_bytes[0] = 1;
+        support_layers[stage].component_bytes[1] = 1;
+        support_layers[stage].component_bytes[2] = 1;
     }
 
     support_bytes = malloc(
@@ -38393,6 +38411,23 @@ int ds4_gpu_internal_dspark_support_cache_test(void) {
              ds4_gpu_dspark_support_cache_combined_available();
     }
     if (ok) {
+        uint64_t saved_record_bytes[DS4_DSPARK_SUPPORT_LAYER_COUNT];
+        for (uint32_t stage = 0;
+             stage < DS4_DSPARK_SUPPORT_LAYER_COUNT; stage++) {
+            saved_record_bytes[stage] =
+                g_dspark_expert_pack->layers[stage].record_bytes;
+            g_dspark_expert_pack->layers[stage].record_bytes =
+                saved_record_bytes[stage] + 1u;
+        }
+        ok = !ds4_gpu_dspark_support_cache_combined_available();
+        for (uint32_t stage = 0;
+             stage < DS4_DSPARK_SUPPORT_LAYER_COUNT; stage++) {
+            g_dspark_expert_pack->layers[stage].record_bytes =
+                saved_record_bytes[stage];
+        }
+        ok = ok && ds4_gpu_dspark_support_cache_combined_available();
+    }
+    if (ok) {
         g_qwen35_expert_pack.n_layer = TARGET_LAYER_COUNT + 1;
         g_qwen35_expert_pack.bound_layers = TARGET_LAYER_COUNT + 1;
         ok = !ds4_gpu_dspark_support_cache_combined_available();
@@ -38451,7 +38486,71 @@ int ds4_gpu_internal_dspark_support_cache_test(void) {
              ds4_gpu_stream_expert_cache_configured_budget() == 259 &&
              ds4_gpu_dspark_support_cache_configured_budget() == 31;
     }
-
+    /* DeepSeek phase transitions compare the effective parent budget, not
+     * configured TARGET alone: TARGET is 259 on both sides while SUPPORT must
+     * be released for prefill and restored for combined decode. */
+    if (ok) {
+        ok = ds4_gpu_stream_expert_cache_effective_parent_count() == 290 &&
+             ds4_gpu_reconfigure_streaming_expert_cache_budget(259) &&
+             ds4_gpu_stream_expert_cache_effective_parent_count() == 259 &&
+             ds4_gpu_stream_expert_cache_configured_budget() == 259 &&
+             ds4_gpu_dspark_support_cache_configured_budget() == 0 &&
+             g_stream_expert_cache_entry_count == 259 &&
+             ds4_gpu_reconfigure_streaming_expert_cache_budget(290) &&
+             ds4_gpu_stream_expert_cache_effective_parent_count() == 290 &&
+             ds4_gpu_stream_expert_cache_configured_budget() == 259 &&
+             ds4_gpu_dspark_support_cache_configured_budget() == 31 &&
+             g_stream_expert_cache_entry_count == 259;
+    }
+    /* Exercise the qualified 64 GiB AUTO parent, not only the minimum seam.
+     * Shrinking from the decode tier deliberately drops its larger TARGET
+     * slabs; the floor is a budget invariant, not a promise to retain rows. */
+    if (ok) {
+        unsigned transition_step = 0;
+        if (!ds4_gpu_reconfigure_streaming_expert_cache_budget(4160)) {
+            transition_step = 1;
+        } else if (ds4_gpu_stream_expert_cache_effective_parent_count() !=
+                       4160 ||
+                   ds4_gpu_stream_expert_cache_configured_budget() != 4129 ||
+                   ds4_gpu_dspark_support_cache_configured_budget() != 31 ||
+                   g_stream_expert_cache_entry_count != 259) {
+            transition_step = 2;
+        } else if (!ds4_gpu_reconfigure_streaming_expert_cache_budget(259)) {
+            transition_step = 3;
+        } else if (ds4_gpu_stream_expert_cache_effective_parent_count() !=
+                       259 ||
+                   ds4_gpu_stream_expert_cache_configured_budget() != 259 ||
+                   ds4_gpu_dspark_support_cache_configured_budget() != 0 ||
+                   g_stream_expert_cache_entry_count != 0) {
+            transition_step = 4;
+        } else if (!ds4_gpu_reconfigure_streaming_expert_cache_budget(4160)) {
+            transition_step = 5;
+        } else if (ds4_gpu_stream_expert_cache_effective_parent_count() !=
+                       4160 ||
+                   ds4_gpu_stream_expert_cache_configured_budget() != 4129 ||
+                   ds4_gpu_dspark_support_cache_configured_budget() != 31 ||
+                   g_stream_expert_cache_entry_count != 0) {
+            transition_step = 6;
+        } else if (!ds4_gpu_reconfigure_streaming_expert_cache_budget(290)) {
+            transition_step = 7;
+        } else if (ds4_gpu_stream_expert_cache_effective_parent_count() !=
+                       290 ||
+                   ds4_gpu_stream_expert_cache_configured_budget() != 259 ||
+                   ds4_gpu_dspark_support_cache_configured_budget() != 31) {
+            transition_step = 8;
+        }
+        if (transition_step != 0) {
+            fprintf(stderr,
+                    "ds4: DSpark 4160/259 cache transition test failed at "
+                    "step %u (parent=%u TARGET=%u SUPPORT=%u resident=%u)\n",
+                    transition_step,
+                    ds4_gpu_stream_expert_cache_effective_parent_count(),
+                    ds4_gpu_stream_expert_cache_configured_budget(),
+                    ds4_gpu_dspark_support_cache_configured_budget(),
+                    g_stream_expert_cache_entry_count);
+            ok = 0;
+        }
+    }
     const uint32_t below_support_floor[] = {30, 31, 289};
     for (uint32_t i = 0;
          ok && i < sizeof(below_support_floor) /

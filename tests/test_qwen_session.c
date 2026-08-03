@@ -1,7 +1,8 @@
-/* White-box Qwen session tests.  The fake forward keeps this gate model-free
- * while exercising the production cache/checkpoint transaction and public
- * logits APIs at the real 248320-token vocabulary size. */
+/* White-box engine/session tests.  The fake forward keeps this gate model-free
+ * while exercising production accounting, cache/checkpoint transactions and
+ * public logits APIs at the real 248320-token vocabulary size. */
 
+#define DS4_TEST_HOOKS 1
 #include "../ds4.c"
 
 #include <math.h>
@@ -1082,6 +1083,7 @@ static void test_fail_closed_surfaces(ds4_session *session) {
 }
 
 int main(void) {
+    CHECK(ds4_test_dspark_memory_accounting());
     test_session_creation_boundary();
     test_model_aware_context_memory();
     test_qwen_metal_session_context_budget();

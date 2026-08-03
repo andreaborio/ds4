@@ -7342,6 +7342,70 @@ static bool model_map_span_vec_finish(ds4_model_map_span_vec *spans) {
     return spans->len != 0;
 }
 
+/* Turn an already sorted tensor union into one exact VM-page union. Separate
+ * tensor sets must be combined before this operation: aligning TARGET and
+ * SUPPORT independently would double-charge their shared boundary page. */
+static bool model_map_span_vec_page_align_for_size(
+        uint64_t                model_size,
+        uint64_t                page,
+        ds4_model_map_span_vec *spans,
+        uint64_t               *bytes_out) {
+    if (bytes_out) *bytes_out = 0;
+    if (!spans || !bytes_out || spans->len == 0 || page == 0 ||
+        (page & (page - 1u)) != 0 ||
+        model_size > UINT64_MAX - (page - 1u)) {
+        return false;
+    }
+    const uint64_t mapped_page_end =
+        (model_size + page - 1u) & ~(page - 1u);
+    uint32_t aligned_count = 0;
+    for (uint32_t i = 0; i < spans->len; i++) {
+        if (spans->v[i].end <= spans->v[i].off ||
+            spans->v[i].off >= mapped_page_end ||
+            spans->v[i].end > model_size ||
+            spans->v[i].end > UINT64_MAX - (page - 1u)) {
+            return false;
+        }
+        const uint64_t lo = spans->v[i].off & ~(page - 1u);
+        uint64_t hi = (spans->v[i].end + page - 1u) & ~(page - 1u);
+        if (hi > mapped_page_end) hi = mapped_page_end;
+        if (hi <= lo) return false;
+        if (aligned_count != 0 &&
+            lo <= spans->v[aligned_count - 1u].end) {
+            if (hi > spans->v[aligned_count - 1u].end) {
+                spans->v[aligned_count - 1u].end = hi;
+            }
+        } else {
+            spans->v[aligned_count++] =
+                (ds4_model_map_span){lo, hi, false};
+        }
+    }
+    spans->len = aligned_count;
+    uint64_t total = 0;
+    for (uint32_t i = 0; i < spans->len; i++) {
+        const uint64_t bytes = spans->v[i].end - spans->v[i].off;
+        if (total > UINT64_MAX - bytes) return false;
+        total += bytes;
+    }
+    if (total == 0) return false;
+    *bytes_out = total;
+    return true;
+}
+
+static bool model_map_span_vec_page_align(
+        const ds4_model         *model,
+        ds4_model_map_span_vec  *spans,
+        uint64_t                *bytes_out) {
+    if (bytes_out) *bytes_out = 0;
+    if (!model || !model->map || model->size == 0 || !spans || !bytes_out) {
+        return false;
+    }
+    const long page_long = sysconf(_SC_PAGESIZE);
+    return page_long > 0 &&
+           model_map_span_vec_page_align_for_size(
+               model->size, (uint64_t)page_long, spans, bytes_out);
+}
+
 /* The compact-indexer frontier warmup runs once after full-attention prefill.
  * SSD streaming normally maps one layer at a time, so the final layer mapping
  * cannot cover the normalization pair for every indexer layer touched by the
@@ -7818,6 +7882,248 @@ static DS4_MAYBE_UNUSED bool weights_model_map_non_routed_spans(
     return model_map_span_vec_finish(spans);
 }
 
+static bool model_tensor_pointer_member(
+        const ds4_model  *model,
+        const ds4_tensor *tensor) {
+    if (!model || !model->tensors || !tensor) return false;
+    for (uint64_t i = 0; i < model->n_tensors; i++) {
+        if (&model->tensors[i] == tensor) return true;
+    }
+    return false;
+}
+
+/* The 72 authenticated SUPPORT static tensors are mmap-backed ordinary GGUF
+ * tensors. The nine routed matrices live inside the SUPPORT ExpertMajor store
+ * and are deliberately absent from this list. */
+static bool dspark_weights_model_map_static_spans(
+        const ds4_model          *model,
+        const ds4_dspark_weights *weights,
+        ds4_model_map_span_vec   *spans,
+        uint64_t                 *payload_bytes_out) {
+    if (payload_bytes_out) *payload_bytes_out = 0;
+    if (!model || !weights || !spans || !payload_bytes_out ||
+        !model->native_dspark_store_v2 || model->alignment == 0 ||
+        model->native_expert_store_offset > model->size ||
+        model->native_expert_store_bytes >
+            model->size - model->native_expert_store_offset ||
+        model->native_dspark_store_offset > model->size ||
+        model->native_dspark_store_bytes >
+            model->size - model->native_dspark_store_offset) {
+        return false;
+    }
+    memset(spans, 0, sizeof(*spans));
+    const ds4_tensor *tensor[DS4_DSPARK_0731_STATIC_TENSOR_COUNT];
+    uint32_t count = 0;
+    for (uint32_t stage_index = 0;
+         stage_index < DS4_DSPARK_0731_STAGE_COUNT; stage_index++) {
+        const ds4_dspark_stage_weights *stage =
+            &weights->stage[stage_index];
+        const ds4_tensor *const stage_static[] = {
+            stage->hc_attn_base, stage->hc_attn_fn,
+            stage->hc_attn_scale, stage->attn_sinks,
+            stage->attn_q_a, stage->attn_q_a_norm,
+            stage->attn_q_b, stage->attn_kv,
+            stage->attn_kv_a_norm, stage->attn_output_a,
+            stage->attn_output_b, stage->attn_norm,
+            stage->hc_ffn_base, stage->hc_ffn_fn,
+            stage->hc_ffn_scale, stage->ffn_gate_inp,
+            stage->ffn_exp_probs_b, stage->ffn_norm,
+            stage->ffn_gate_shexp, stage->ffn_up_shexp,
+            stage->ffn_down_shexp,
+        };
+        for (uint32_t i = 0;
+             i < sizeof(stage_static) / sizeof(stage_static[0]); i++) {
+            if (count >= DS4_DSPARK_0731_STATIC_TENSOR_COUNT) goto fail;
+            tensor[count++] = stage_static[i];
+        }
+    }
+    const ds4_tensor *const special[] = {
+        weights->main_proj, weights->main_norm, weights->norm,
+        weights->hc_head_base, weights->hc_head_fn,
+        weights->hc_head_scale, weights->markov_w1,
+        weights->markov_w2, weights->confidence_proj,
+    };
+    for (uint32_t i = 0; i < sizeof(special) / sizeof(special[0]); i++) {
+        if (count >= DS4_DSPARK_0731_STATIC_TENSOR_COUNT) goto fail;
+        tensor[count++] = special[i];
+    }
+    if (count != DS4_DSPARK_0731_STATIC_TENSOR_COUNT) goto fail;
+
+    uint64_t payload = 0;
+    for (uint32_t i = 0; i < count; i++) {
+        const ds4_tensor *current = tensor[i];
+        if (!model_tensor_pointer_member(model, current) ||
+            !dspark_physical_tensor_range_valid(model, current) ||
+            dspark_ranges_overlap(
+                current->abs_offset, current->bytes,
+                model->native_expert_store_offset,
+                model->native_expert_store_bytes) ||
+            dspark_ranges_overlap(
+                current->abs_offset, current->bytes,
+                model->native_dspark_store_offset,
+                model->native_dspark_store_bytes)) {
+            goto fail;
+        }
+        for (uint32_t j = 0; j < i; j++) {
+            if (current == tensor[j]) goto fail;
+        }
+        if (payload > UINT64_MAX - current->bytes ||
+            current->abs_offset > UINT64_MAX - current->bytes) {
+            goto fail;
+        }
+        payload += current->bytes;
+        if (current->bytes > spans->max_tensor_bytes) {
+            spans->max_tensor_bytes = current->bytes;
+        }
+        model_map_span_vec_append(
+            spans, current->abs_offset,
+            current->abs_offset + current->bytes, false);
+    }
+    if (payload != DS4_DSPARK_0731_STATIC_PAYLOAD_BYTES ||
+        !model_map_span_vec_finish(spans) ||
+        model_map_span_vec_total_bytes(spans) != payload) {
+        goto fail;
+    }
+    *payload_bytes_out = payload;
+    return true;
+
+fail:
+    free(spans->v);
+    memset(spans, 0, sizeof(*spans));
+    *payload_bytes_out = 0;
+    return false;
+}
+
+static bool weights_model_map_combined_non_routed_spans(
+        const ds4_model          *model,
+        const ds4_weights        *target,
+        const ds4_dspark_weights *support,
+        ds4_model_map_span_vec   *spans,
+        uint64_t                 *support_payload_bytes_out) {
+    if (support_payload_bytes_out) *support_payload_bytes_out = 0;
+    if (!model || !target || !spans || !support_payload_bytes_out ||
+        !weights_model_map_non_routed_spans(target, spans)) {
+        return false;
+    }
+    if (!model->native_dspark_store_v2) return true;
+    if (!support) goto fail;
+
+    ds4_model_map_span_vec support_spans = {0};
+    uint64_t support_payload = 0;
+    if (!dspark_weights_model_map_static_spans(
+            model, support, &support_spans, &support_payload)) {
+        goto fail;
+    }
+    if (support_spans.max_tensor_bytes > spans->max_tensor_bytes) {
+        spans->max_tensor_bytes = support_spans.max_tensor_bytes;
+    }
+    for (uint32_t i = 0; i < support_spans.len; i++) {
+        model_map_span_vec_append(
+            spans, support_spans.v[i].off, support_spans.v[i].end, false);
+    }
+    free(support_spans.v);
+    if (!model_map_span_vec_finish(spans)) goto fail;
+    *support_payload_bytes_out = support_payload;
+    return true;
+
+fail:
+    free(spans->v);
+    memset(spans, 0, sizeof(*spans));
+    *support_payload_bytes_out = 0;
+    return false;
+}
+
+static const uint64_t DS4_DSPARK_TARGET_STATIC_PAGE_BYTES_16K =
+    UINT64_C(8801402880);
+static const uint64_t DS4_DSPARK_COMBINED_STATIC_PAGE_BYTES_16K =
+    UINT64_C(9354690560);
+static const uint64_t DS4_DSPARK_SUPPORT_STATIC_PAGE_DELTA_16K =
+    UINT64_C(553287680);
+static const uint64_t DS4_DSPARK_TARGET_STATIC_EXACT_BYTES =
+    UINT64_C(8801384796);
+static const uint64_t DS4_DSPARK_COMBINED_STATIC_EXACT_BYTES =
+    UINT64_C(9354675464);
+
+static bool weights_model_map_combined_non_routed_page_spans_for_size(
+        const ds4_model          *model,
+        const ds4_weights        *target,
+        const ds4_dspark_weights *support,
+        uint64_t                  page,
+        ds4_model_map_span_vec   *spans,
+        uint64_t                 *target_page_bytes_out,
+        uint64_t                 *support_page_delta_out,
+        uint64_t                 *combined_page_bytes_out,
+        uint64_t                 *support_payload_bytes_out) {
+    if (target_page_bytes_out) *target_page_bytes_out = 0;
+    if (support_page_delta_out) *support_page_delta_out = 0;
+    if (combined_page_bytes_out) *combined_page_bytes_out = 0;
+    if (support_payload_bytes_out) *support_payload_bytes_out = 0;
+    if (!model || !target || !spans || !target_page_bytes_out ||
+        !support_page_delta_out || !combined_page_bytes_out ||
+        !support_payload_bytes_out || page == 0) {
+        return false;
+    }
+
+    ds4_model_map_span_vec target_spans = {0};
+    if (!weights_model_map_non_routed_spans(target, &target_spans) ||
+        !model_map_span_vec_page_align_for_size(
+            model->size, page, &target_spans, target_page_bytes_out)) {
+        free(target_spans.v);
+        return false;
+    }
+    free(target_spans.v);
+
+    if (!weights_model_map_combined_non_routed_spans(
+            model, target, support, spans, support_payload_bytes_out) ||
+        !model_map_span_vec_page_align_for_size(
+            model->size, page, spans, combined_page_bytes_out) ||
+        *combined_page_bytes_out < *target_page_bytes_out) {
+        goto fail;
+    }
+    *support_page_delta_out =
+        *combined_page_bytes_out - *target_page_bytes_out;
+    if (model->native_dspark_store_v2 &&
+        (page != DS4_DSPARK_METAL_PAGE_BYTES ||
+         *support_payload_bytes_out !=
+             DS4_DSPARK_0731_STATIC_PAYLOAD_BYTES ||
+         *target_page_bytes_out !=
+             DS4_DSPARK_TARGET_STATIC_PAGE_BYTES_16K ||
+         *combined_page_bytes_out !=
+             DS4_DSPARK_COMBINED_STATIC_PAGE_BYTES_16K ||
+         *support_page_delta_out !=
+             DS4_DSPARK_SUPPORT_STATIC_PAGE_DELTA_16K)) {
+        goto fail;
+    }
+    return true;
+
+fail:
+    free(spans->v);
+    memset(spans, 0, sizeof(*spans));
+    *target_page_bytes_out = 0;
+    *support_page_delta_out = 0;
+    *combined_page_bytes_out = 0;
+    *support_payload_bytes_out = 0;
+    return false;
+}
+
+static bool weights_model_map_combined_non_routed_page_spans(
+        const ds4_model          *model,
+        const ds4_weights        *target,
+        const ds4_dspark_weights *support,
+        ds4_model_map_span_vec   *spans,
+        uint64_t                 *target_page_bytes_out,
+        uint64_t                 *support_page_delta_out,
+        uint64_t                 *combined_page_bytes_out,
+        uint64_t                 *support_payload_bytes_out) {
+    if (!model || !model->map) return false;
+    const long page_long = sysconf(_SC_PAGESIZE);
+    return page_long > 0 &&
+           weights_model_map_combined_non_routed_page_spans_for_size(
+               model, target, support, (uint64_t)page_long, spans,
+               target_page_bytes_out, support_page_delta_out,
+               combined_page_bytes_out, support_payload_bytes_out);
+}
+
 static DS4_MAYBE_UNUSED bool weights_model_map_non_routed_page_spans(
         const ds4_model   *m,
         const ds4_weights *w,
@@ -7830,53 +8136,11 @@ static DS4_MAYBE_UNUSED bool weights_model_map_non_routed_page_spans(
 
     if (!weights_model_map_non_routed_spans(w, spans)) return false;
 
-    const uint64_t page = (uint64_t)sysconf(_SC_PAGESIZE);
-    if (page == 0 || (page & (page - 1u)) != 0) {
+    if (!model_map_span_vec_page_align(m, spans, bytes_out)) {
         free(spans->v);
         memset(spans, 0, sizeof(*spans));
         return false;
     }
-    if (m->size > UINT64_MAX - (page - 1u)) {
-        free(spans->v);
-        memset(spans, 0, sizeof(*spans));
-        return false;
-    }
-    const uint64_t mapped_page_end =
-        (m->size + page - 1u) & ~(page - 1u);
-
-    /* Page-align and merge again: separate tensor spans can share one VM
-     * page.  AUTO and the optional pin must budget identical coverage. */
-    uint32_t aligned_count = 0;
-    for (uint32_t i = 0; i < spans->len; i++) {
-        uint64_t lo = spans->v[i].off & ~(page - 1u);
-        uint64_t hi = spans->v[i].end;
-        if (hi > UINT64_MAX - (page - 1u)) {
-            free(spans->v);
-            memset(spans, 0, sizeof(*spans));
-            return false;
-        }
-        hi = (hi + page - 1u) & ~(page - 1u);
-        if (hi > mapped_page_end) hi = mapped_page_end;
-        if (hi <= lo) continue;
-        if (aligned_count != 0 &&
-            lo <= spans->v[aligned_count - 1u].end) {
-            if (hi > spans->v[aligned_count - 1u].end) {
-                spans->v[aligned_count - 1u].end = hi;
-            }
-            continue;
-        }
-        spans->v[aligned_count++] =
-            (ds4_model_map_span){lo, hi, false};
-    }
-    spans->len = aligned_count;
-
-    const uint64_t bytes = model_map_span_vec_total_bytes(spans);
-    if (bytes == 0 || bytes == UINT64_MAX) {
-        free(spans->v);
-        memset(spans, 0, sizeof(*spans));
-        return false;
-    }
-    *bytes_out = bytes;
     return true;
 }
 
@@ -7892,21 +8156,465 @@ static DS4_MAYBE_UNUSED bool weights_strict_non_routed_bytes(
     return true;
 }
 
+static bool weights_combined_strict_non_routed_bytes(
+        const ds4_model          *model,
+        const ds4_weights        *target,
+        const ds4_dspark_weights *support,
+        uint64_t                 *target_page_bytes_out,
+        uint64_t                 *support_page_delta_out,
+        uint64_t                 *combined_page_bytes_out,
+        uint64_t                 *support_payload_bytes_out) {
+    ds4_model_map_span_vec spans = {0};
+    if (!weights_model_map_combined_non_routed_page_spans(
+            model, target, support, &spans,
+            target_page_bytes_out, support_page_delta_out,
+            combined_page_bytes_out, support_payload_bytes_out)) {
+        return false;
+    }
+    free(spans.v);
+    return true;
+}
+
+/* Byte-budget overrides operate on exact tensor coverage because the caller
+ * already reserves ordinary VM/page headroom separately. AUTO, pinning and
+ * slab growth instead use the 16 KiB page union above. */
+static bool weights_combined_exact_non_routed_bytes(
+        const ds4_model          *model,
+        const ds4_weights        *target,
+        const ds4_dspark_weights *support,
+        uint64_t                 *target_bytes_out,
+        uint64_t                 *combined_bytes_out,
+        uint64_t                 *support_payload_bytes_out) {
+    if (target_bytes_out) *target_bytes_out = 0;
+    if (combined_bytes_out) *combined_bytes_out = 0;
+    if (support_payload_bytes_out) *support_payload_bytes_out = 0;
+    if (!model || !target || !target_bytes_out || !combined_bytes_out ||
+        !support_payload_bytes_out) {
+        return false;
+    }
+    ds4_model_map_span_vec target_spans = {0};
+    ds4_model_map_span_vec combined_spans = {0};
+    if (!weights_model_map_non_routed_spans(target, &target_spans)) {
+        return false;
+    }
+    const uint64_t target_bytes =
+        model_map_span_vec_total_bytes(&target_spans);
+    free(target_spans.v);
+    if (target_bytes == 0 || target_bytes == UINT64_MAX ||
+        !weights_model_map_combined_non_routed_spans(
+            model, target, support, &combined_spans,
+            support_payload_bytes_out)) {
+        return false;
+    }
+    const uint64_t combined_bytes =
+        model_map_span_vec_total_bytes(&combined_spans);
+    free(combined_spans.v);
+    if (combined_bytes == 0 || combined_bytes == UINT64_MAX ||
+        combined_bytes < target_bytes ||
+        (model->native_dspark_store_v2 &&
+         (target_bytes != DS4_DSPARK_TARGET_STATIC_EXACT_BYTES ||
+          combined_bytes != DS4_DSPARK_COMBINED_STATIC_EXACT_BYTES ||
+          *support_payload_bytes_out !=
+              DS4_DSPARK_0731_STATIC_PAYLOAD_BYTES))) {
+        *support_payload_bytes_out = 0;
+        return false;
+    }
+    *target_bytes_out = target_bytes;
+    *combined_bytes_out = combined_bytes;
+    return true;
+}
+
+#ifdef DS4_TEST_HOOKS
+/* Model-free regression for the combined page-union and AUTO accounting
+ * contract. It uses sparse offsets only; no multi-gigabyte allocation or
+ * model mmap is created. */
+static bool ds4_test_dspark_memory_accounting(void) {
+    enum { SUPPORT_STATIC_COUNT = DS4_DSPARK_0731_STATIC_TENSOR_COUNT };
+    const uint64_t page = DS4_DSPARK_METAL_PAGE_BYTES;
+    const uint64_t target_exact_end =
+        DS4_DSPARK_TARGET_STATIC_PAGE_BYTES_16K - UINT64_C(2988);
+    const uint64_t combined_exact_end =
+        target_exact_end + DS4_DSPARK_0731_STATIC_PAYLOAD_BYTES;
+    if (combined_exact_end !=
+            DS4_DSPARK_COMBINED_STATIC_PAGE_BYTES_16K ||
+        ds4_dspark_prefill_cap_floor(1u) != 6u ||
+        ds4_dspark_prefill_cap_floor(5u) != 6u ||
+        ds4_dspark_prefill_cap_floor(6u) != 6u ||
+        ds4_dspark_prefill_cap_floor(4096u) != 4096u) {
+        return false;
+    }
+
+    ds4_tensor tensor[1u + SUPPORT_STATIC_COUNT];
+    ds4_tensor routed[DS4_DSPARK_0731_STAGE_COUNT * 3u];
+    memset(tensor, 0, sizeof(tensor));
+    memset(routed, 0, sizeof(routed));
+    tensor[0] = (ds4_tensor){
+        .ndim = 1u,
+        .dim = {target_exact_end},
+        .type = DS4_TENSOR_F32,
+        .rel_offset = 0,
+        .abs_offset = 0,
+        .elements = target_exact_end,
+        .bytes = target_exact_end,
+    };
+    uint64_t support_offset = target_exact_end;
+    for (uint32_t i = 0; i < SUPPORT_STATIC_COUNT; i++) {
+        const uint64_t bytes = i + 1u == SUPPORT_STATIC_COUNT ?
+            DS4_DSPARK_0731_STATIC_PAYLOAD_BYTES -
+                UINT64_C(4) * (SUPPORT_STATIC_COUNT - 1u) :
+            UINT64_C(4);
+        tensor[1u + i] = (ds4_tensor){
+            .ndim = 1u,
+            .dim = {bytes},
+            .type = DS4_TENSOR_F32,
+            .rel_offset = support_offset,
+            .abs_offset = support_offset,
+            .elements = bytes,
+            .bytes = bytes,
+        };
+        support_offset += bytes;
+    }
+    if (support_offset != combined_exact_end) return false;
+
+    ds4_model model = {
+        .map = (const uint8_t *)(uintptr_t)1u,
+        .size = combined_exact_end + 3u * page,
+        .n_tensors = 1u + SUPPORT_STATIC_COUNT,
+        .alignment = 4u,
+        .tensor_data_pos = 0,
+        .native_expert_store_v2 = true,
+        .native_expert_store_offset = combined_exact_end + page,
+        .native_expert_store_bytes = page,
+        .native_dspark_store_v2 = true,
+        .native_dspark_store_offset = combined_exact_end + 2u * page,
+        .native_dspark_store_bytes = page,
+        .native_dspark_record_bytes = DS4_DSPARK_0731_RECORD_BYTES,
+        .tensors = tensor,
+    };
+    ds4_weights target = {.token_embd = &tensor[0]};
+    ds4_dspark_weights support = {0};
+    uint32_t static_index = 1u;
+#define DS4_BIND_DSPARK_STATIC(field_) \
+    support.field_ = &tensor[static_index++]
+    for (uint32_t stage = 0; stage < DS4_DSPARK_0731_STAGE_COUNT;
+         stage++) {
+#define DS4_BIND_DSPARK_STAGE_STATIC(field_) \
+        support.stage[stage].field_ = &tensor[static_index++]
+        DS4_BIND_DSPARK_STAGE_STATIC(hc_attn_base);
+        DS4_BIND_DSPARK_STAGE_STATIC(hc_attn_fn);
+        DS4_BIND_DSPARK_STAGE_STATIC(hc_attn_scale);
+        DS4_BIND_DSPARK_STAGE_STATIC(attn_sinks);
+        DS4_BIND_DSPARK_STAGE_STATIC(attn_q_a);
+        DS4_BIND_DSPARK_STAGE_STATIC(attn_q_a_norm);
+        DS4_BIND_DSPARK_STAGE_STATIC(attn_q_b);
+        DS4_BIND_DSPARK_STAGE_STATIC(attn_kv);
+        DS4_BIND_DSPARK_STAGE_STATIC(attn_kv_a_norm);
+        DS4_BIND_DSPARK_STAGE_STATIC(attn_output_a);
+        DS4_BIND_DSPARK_STAGE_STATIC(attn_output_b);
+        DS4_BIND_DSPARK_STAGE_STATIC(attn_norm);
+        DS4_BIND_DSPARK_STAGE_STATIC(hc_ffn_base);
+        DS4_BIND_DSPARK_STAGE_STATIC(hc_ffn_fn);
+        DS4_BIND_DSPARK_STAGE_STATIC(hc_ffn_scale);
+        DS4_BIND_DSPARK_STAGE_STATIC(ffn_gate_inp);
+        DS4_BIND_DSPARK_STAGE_STATIC(ffn_exp_probs_b);
+        DS4_BIND_DSPARK_STAGE_STATIC(ffn_norm);
+        DS4_BIND_DSPARK_STAGE_STATIC(ffn_gate_shexp);
+        DS4_BIND_DSPARK_STAGE_STATIC(ffn_up_shexp);
+        DS4_BIND_DSPARK_STAGE_STATIC(ffn_down_shexp);
+#undef DS4_BIND_DSPARK_STAGE_STATIC
+        support.stage[stage].ffn_gate_exps = &routed[stage * 3u];
+        support.stage[stage].ffn_up_exps = &routed[stage * 3u + 1u];
+        support.stage[stage].ffn_down_exps = &routed[stage * 3u + 2u];
+    }
+    DS4_BIND_DSPARK_STATIC(main_proj);
+    DS4_BIND_DSPARK_STATIC(main_norm);
+    DS4_BIND_DSPARK_STATIC(norm);
+    DS4_BIND_DSPARK_STATIC(hc_head_base);
+    DS4_BIND_DSPARK_STATIC(hc_head_fn);
+    DS4_BIND_DSPARK_STATIC(hc_head_scale);
+    DS4_BIND_DSPARK_STATIC(markov_w1);
+    DS4_BIND_DSPARK_STATIC(markov_w2);
+    DS4_BIND_DSPARK_STATIC(confidence_proj);
+#undef DS4_BIND_DSPARK_STATIC
+    if (static_index != 1u + SUPPORT_STATIC_COUNT) return false;
+
+    ds4_model_map_span_vec combined = {0};
+    uint64_t target_page_bytes = 0;
+    uint64_t support_page_delta = 0;
+    uint64_t combined_page_bytes = 0;
+    uint64_t support_payload_bytes = 0;
+    bool ok = weights_model_map_combined_non_routed_page_spans_for_size(
+                  &model, &target, &support, page, &combined,
+                  &target_page_bytes, &support_page_delta,
+                  &combined_page_bytes, &support_payload_bytes) &&
+              target_page_bytes ==
+                  DS4_DSPARK_TARGET_STATIC_PAGE_BYTES_16K &&
+              support_page_delta ==
+                  DS4_DSPARK_SUPPORT_STATIC_PAGE_DELTA_16K &&
+              combined_page_bytes ==
+                  DS4_DSPARK_COMBINED_STATIC_PAGE_BYTES_16K &&
+              support_payload_bytes ==
+                  DS4_DSPARK_0731_STATIC_PAYLOAD_BYTES &&
+              combined.len == 1u && combined.v[0].off == 0u &&
+              combined.v[0].end == combined_exact_end &&
+              !dspark_ranges_overlap(
+                  combined.v[0].off, combined.v[0].end - combined.v[0].off,
+                  model.native_expert_store_offset,
+                  model.native_expert_store_bytes) &&
+              !dspark_ranges_overlap(
+                  combined.v[0].off, combined.v[0].end - combined.v[0].off,
+                  model.native_dspark_store_offset,
+                  model.native_dspark_store_bytes);
+    free(combined.v);
+    if (!ok) return false;
+
+    /* The target-only branch must reproduce the original page-union helper
+     * byte-for-byte. */
+    model.native_dspark_store_v2 = false;
+    ds4_model_map_span_vec original = {0};
+    ds4_model_map_span_vec refactored = {0};
+    uint64_t original_bytes = 0;
+    target_page_bytes = support_page_delta = combined_page_bytes =
+        support_payload_bytes = 0;
+    ok = weights_model_map_non_routed_spans(&target, &original) &&
+         model_map_span_vec_page_align_for_size(
+             model.size, page, &original, &original_bytes) &&
+         weights_model_map_combined_non_routed_page_spans_for_size(
+             &model, &target, NULL, page, &refactored,
+             &target_page_bytes, &support_page_delta,
+             &combined_page_bytes, &support_payload_bytes) &&
+         original_bytes == target_page_bytes &&
+         original_bytes == combined_page_bytes &&
+         support_page_delta == 0 && support_payload_bytes == 0 &&
+         original.len == refactored.len &&
+         memcmp(original.v, refactored.v,
+                (size_t)original.len * sizeof(original.v[0])) == 0;
+    free(original.v);
+    free(refactored.v);
+    model.native_dspark_store_v2 = true;
+    if (!ok) return false;
+
+    /* Malformed coverage is fail-closed: out-of-file/overflow spans,
+     * duplicate semantic bindings, store overlap and payload drift. */
+    ds4_model_map_span bad_span = {0, model.size + 1u, false};
+    ds4_model_map_span_vec bad = {
+        .v = &bad_span, .len = 1u, .cap = 1u, .max_tensor_bytes = 1u,
+    };
+    uint64_t bad_bytes = 0;
+    if (model_map_span_vec_page_align_for_size(
+            model.size, page, &bad, &bad_bytes)) {
+        return false;
+    }
+    bad_span = (ds4_model_map_span){0, 1u, false};
+    bad.len = 1u;
+    if (model_map_span_vec_page_align_for_size(
+            UINT64_MAX, page, &bad, &bad_bytes)) {
+        return false;
+    }
+    ds4_model_map_span_vec invalid = {0};
+    uint64_t invalid_payload = 0;
+    ds4_tensor *saved = support.stage[0].hc_attn_fn;
+    support.stage[0].hc_attn_fn = support.stage[0].hc_attn_base;
+    if (dspark_weights_model_map_static_spans(
+            &model, &support, &invalid, &invalid_payload)) {
+        free(invalid.v);
+        return false;
+    }
+    support.stage[0].hc_attn_fn = saved;
+    const uint64_t saved_store_offset = model.native_dspark_store_offset;
+    const uint64_t saved_store_bytes = model.native_dspark_store_bytes;
+    model.native_dspark_store_offset = target_exact_end;
+    model.native_dspark_store_bytes = 4u;
+    if (dspark_weights_model_map_static_spans(
+            &model, &support, &invalid, &invalid_payload)) {
+        free(invalid.v);
+        return false;
+    }
+    model.native_dspark_store_offset = saved_store_offset;
+    model.native_dspark_store_bytes = saved_store_bytes;
+    tensor[SUPPORT_STATIC_COUNT].bytes--;
+    if (dspark_weights_model_map_static_spans(
+            &model, &support, &invalid, &invalid_payload)) {
+        free(invalid.v);
+        return false;
+    }
+    tensor[SUPPORT_STATIC_COUNT].bytes++;
+
+    ds4_dspark_runtime_memory runtime = {0};
+    if (!ds4_dspark_runtime_memory_make(&runtime) ||
+        runtime.total_bytes != UINT64_C(29278208) ||
+        DS4_DSPARK_SUPPORT_STATIC_PAGE_DELTA_16K >
+            UINT64_MAX - runtime.total_bytes) {
+        return false;
+    }
+    const uint64_t fixed_bytes =
+        DS4_DSPARK_SUPPORT_STATIC_PAGE_DELTA_16K + runtime.total_bytes;
+    const uint64_t fixed_records =
+        fixed_bytes / DS4_DSPARK_0731_RECORD_BYTES +
+        (fixed_bytes % DS4_DSPARK_0731_RECORD_BYTES != 0);
+    if (fixed_bytes != UINT64_C(582565888) || fixed_records != 83u ||
+        (uint64_t)DS4_DSPARK_SUPPORT_CACHE_FLOOR *
+                DS4_DSPARK_0731_RECORD_BYTES != UINT64_C(219414528) ||
+        fixed_records * DS4_DSPARK_0731_RECORD_BYTES - fixed_bytes !=
+            UINT64_C(4898816)) {
+        return false;
+    }
+    ds4_dspark_equal_memory_cache_plan envelope_bound = {0};
+    ds4_dspark_equal_memory_cache_plan safety_bound = {0};
+    ds4_dspark_equal_memory_cache_plan below_floor = {0};
+    uint32_t long_parent = 0;
+    uint32_t extended_parent = 0;
+    if (!ds4_dspark_equal_memory_cache_plan_make(
+            4387u, 5000u, 4387u, (uint32_t)fixed_records,
+            &envelope_bound) ||
+        envelope_bound.equal_memory_ceiling_records != 4304u ||
+        envelope_bound.cycle_aligned_target_records != 4129u ||
+        envelope_bound.selected_parent_records != 4160u ||
+        !ds4_dspark_equal_memory_cache_plan_make(
+            4387u, 4100u, 3871u, (uint32_t)fixed_records,
+            &safety_bound) ||
+        safety_bound.equal_memory_ceiling_records != 4304u ||
+        safety_bound.cycle_aligned_target_records != 3871u ||
+        safety_bound.selected_parent_records != 3902u ||
+        ds4_dspark_equal_memory_cache_plan_make(
+            350u, 350u, 350u, (uint32_t)fixed_records, &below_floor) ||
+        !ds4_dspark_phase_parent_for_target(
+            4129u, 4160u, &long_parent) || long_parent != 4160u ||
+        !ds4_dspark_phase_parent_for_target(
+            2065u, 4160u, &extended_parent) || extended_parent != 2096u ||
+        ds4_dspark_phase_parent_for_target(
+            4098u, 4160u, &long_parent)) {
+        return false;
+    }
+
+    const uint64_t gib = UINT64_C(1024) * 1024u * 1024u;
+    const uint64_t base_runtime = 5u * gib;
+    const ds4_ssd_host_memory memory = {
+        .physical_bytes = 64u * gib,
+        .recommended_bytes = 64u * gib,
+        .free_bytes = 48u * gib,
+        .pressure_status_available = false,
+        .pressure_normal = false,
+    };
+    ds4_ssd_adaptive_cache_plan target_plan = {0};
+    ds4_ssd_adaptive_cache_plan combined_plan = {0};
+    ds4_ssd_adaptive_cache_plan double_plan = {0};
+    if (!ds4_ssd_adaptive_cache_plan_make_with_static_reserve(
+            &memory, base_runtime,
+            DS4_DSPARK_TARGET_STATIC_PAGE_BYTES_16K, false,
+            DS4_DSPARK_TARGET_LAYER_COUNT, DS4_DSPARK_TARGET_TOP_K,
+            DS4_DSPARK_0731_RECORD_BYTES,
+            DS4_DSPARK_TARGET_LAYER_COUNT * UINT64_C(256),
+            &target_plan) ||
+        !ds4_ssd_adaptive_cache_plan_make_with_static_reserve(
+            &memory, base_runtime + runtime.total_bytes,
+            DS4_DSPARK_COMBINED_STATIC_PAGE_BYTES_16K, false,
+            DS4_DSPARK_TARGET_LAYER_COUNT, DS4_DSPARK_TARGET_TOP_K,
+            DS4_DSPARK_0731_RECORD_BYTES,
+            DS4_DSPARK_TARGET_LAYER_COUNT * UINT64_C(256),
+            &combined_plan) ||
+        !ds4_ssd_adaptive_cache_plan_make_with_static_reserve(
+            &memory, base_runtime + 2u * runtime.total_bytes,
+            DS4_DSPARK_COMBINED_STATIC_PAGE_BYTES_16K +
+                DS4_DSPARK_SUPPORT_STATIC_PAGE_DELTA_16K,
+            false, DS4_DSPARK_TARGET_LAYER_COUNT,
+            DS4_DSPARK_TARGET_TOP_K, DS4_DSPARK_0731_RECORD_BYTES,
+            DS4_DSPARK_TARGET_LAYER_COUNT * UINT64_C(256),
+            &double_plan) ||
+        target_plan.wire_budget_bytes < combined_plan.wire_budget_bytes ||
+        target_plan.wire_budget_bytes - combined_plan.wire_budget_bytes !=
+            fixed_bytes ||
+        target_plan.wire_budget_bytes < double_plan.wire_budget_bytes ||
+        target_plan.wire_budget_bytes - double_plan.wire_budget_bytes !=
+            2u * fixed_bytes ||
+        combined_plan.cache_experts > target_plan.cache_experts ||
+        double_plan.cache_experts > combined_plan.cache_experts) {
+        return false;
+    }
+    const ds4_ssd_host_memory envelope_memory = {
+        .physical_bytes = 64u * gib,
+        .recommended_bytes = 64u * gib,
+        .free_bytes = 64u * gib,
+        .pressure_status_available = true,
+        .pressure_normal = true,
+    };
+    ds4_ssd_adaptive_cache_plan envelope_target_plan = {0};
+    ds4_ssd_adaptive_cache_plan envelope_combined_plan = {0};
+    if (!ds4_ssd_adaptive_cache_plan_make_with_static_reserve(
+            &envelope_memory, base_runtime,
+            DS4_DSPARK_TARGET_STATIC_PAGE_BYTES_16K, false,
+            DS4_DSPARK_TARGET_LAYER_COUNT, DS4_DSPARK_TARGET_TOP_K,
+            DS4_DSPARK_0731_RECORD_BYTES,
+            DS4_DSPARK_TARGET_LAYER_COUNT * UINT64_C(256),
+            &envelope_target_plan) ||
+        !ds4_ssd_adaptive_cache_plan_make_with_static_reserve(
+            &envelope_memory, base_runtime + runtime.total_bytes,
+            DS4_DSPARK_COMBINED_STATIC_PAGE_BYTES_16K, false,
+            DS4_DSPARK_TARGET_LAYER_COUNT, DS4_DSPARK_TARGET_TOP_K,
+            DS4_DSPARK_0731_RECORD_BYTES,
+            DS4_DSPARK_TARGET_LAYER_COUNT * UINT64_C(256),
+            &envelope_combined_plan) ||
+        envelope_target_plan.wire_budget_bytes !=
+            envelope_target_plan.cache_envelope_bytes ||
+        envelope_combined_plan.wire_budget_bytes !=
+            envelope_combined_plan.cache_envelope_bytes ||
+        envelope_target_plan.wire_budget_bytes !=
+            envelope_combined_plan.wire_budget_bytes) {
+        return false;
+    }
+    const uint32_t envelope_target_policy =
+        ds4_ssd_deepseek_expert_major_auto_cache_target(
+            &envelope_memory, &envelope_target_plan);
+    const uint32_t envelope_combined_policy =
+        ds4_ssd_deepseek_expert_major_auto_cache_target(
+            &envelope_memory, &envelope_combined_plan);
+    uint64_t envelope_combined_raw =
+        envelope_combined_plan.wire_budget_bytes /
+        DS4_DSPARK_0731_RECORD_BYTES;
+    const uint64_t max_records =
+        DS4_DSPARK_TARGET_LAYER_COUNT * UINT64_C(256);
+    if (envelope_combined_raw > max_records) {
+        envelope_combined_raw = max_records;
+    }
+    ds4_dspark_equal_memory_cache_plan envelope_end_to_end = {0};
+    if (envelope_target_policy != 4387u ||
+        envelope_combined_policy != 4387u ||
+        envelope_combined_raw > UINT32_MAX ||
+        !ds4_dspark_equal_memory_cache_plan_make(
+            envelope_target_policy, (uint32_t)envelope_combined_raw,
+            envelope_combined_policy, (uint32_t)fixed_records,
+            &envelope_end_to_end) ||
+        envelope_end_to_end.equal_memory_ceiling_records != 4304u ||
+        envelope_end_to_end.cycle_aligned_target_records != 4129u ||
+        envelope_end_to_end.selected_parent_records != 4160u) {
+        return false;
+    }
+    ds4_dspark_cache_plan cache_split = {0};
+    return ds4_dspark_cache_plan_make(
+               combined_plan.cache_experts, true, &cache_split) &&
+           cache_split.total_records == combined_plan.cache_experts &&
+           cache_split.support_records == DS4_DSPARK_SUPPORT_CACHE_FLOOR;
+}
+#endif
+
 /* Experimental A/B arm for unified-memory Macs.  mlock() is performed once at
  * startup and adds no work to prefill or decode.  It faults and wires the page
  * coverage of non-routed tensors, leaving routed experts under the normal SSD
  * cache policy.  A few boundary pages may contain bytes from both classes. */
 static DS4_MAYBE_UNUSED bool model_pin_non_routed_weights(
-        const ds4_model *m,
-        const ds4_weights *w) {
+        const ds4_model          *m,
+        const ds4_weights        *w,
+        const ds4_dspark_weights *dw) {
     if (!m || !m->map || m->size == 0 || !w) return false;
 
-    ds4_model_map_span_vec spans;
+    ds4_model_map_span_vec spans = {0};
+    uint64_t target_bytes = 0;
+    uint64_t support_delta = 0;
     uint64_t total_bytes = 0;
-    if (!weights_model_map_non_routed_page_spans(m,
-                                                 w,
-                                                 &spans,
-                                                 &total_bytes)) {
+    uint64_t support_payload = 0;
+    if (!weights_model_map_combined_non_routed_page_spans(
+            m, w, dw, &spans, &target_bytes, &support_delta,
+            &total_bytes, &support_payload)) {
         fprintf(stderr, "ds4: could not build non-routed pin spans\n");
         return false;
     }
@@ -7947,11 +8655,25 @@ static DS4_MAYBE_UNUSED bool model_pin_non_routed_weights(
         complete_ranges++;
     }
 
-    fprintf(stderr,
-            "ds4: pinned non-routed page coverage: %.6f GiB across %u page-aligned spans in %.3fs (startup-only)\n",
-            (double)total_bytes / 1073741824.0,
-            spans.len,
-            now_sec() - t0);
+    if (m->native_dspark_store_v2) {
+        fprintf(stderr,
+                "ds4: pinned non-routed page coverage: %.6f GiB across %u "
+                "page-aligned spans in %.3fs (TARGET %.6f GiB + SUPPORT "
+                "union delta %.6f GiB; startup-only)\n",
+                (double)total_bytes / 1073741824.0,
+                spans.len,
+                now_sec() - t0,
+                (double)target_bytes / 1073741824.0,
+                (double)support_delta / 1073741824.0);
+    } else {
+        fprintf(stderr,
+                "ds4: pinned non-routed page coverage: %.6f GiB across %u "
+                "page-aligned spans in %.3fs (startup-only)\n",
+                (double)total_bytes / 1073741824.0,
+                spans.len,
+                now_sec() - t0);
+    }
+    (void)support_payload;
     free(spans.v);
     return true;
 }
@@ -19294,10 +20016,6 @@ static DS4_MAYBE_UNUSED bool qwen35_gpu_forward_token(
 
 enum {
     DS4_STREAMING_PREFILL_CACHE_SEED_MAX_TOKENS = 64,
-    /* The existing speculative target verifier and logits scratch are bounded
-     * to 16 rows.  Combined DSpark sessions retain the same bound for the
-     * candidate post-layer captures until the CPU accepts an exact prefix. */
-    DS4_DSPARK_VERIFY_CAPTURE_MAX_ROWS = 16,
 };
 
 typedef struct {
@@ -30486,6 +31204,15 @@ static uint32_t metal_graph_prefill_cap_for_prompt(int prompt_len,
     return ds4_prefill_cap_for_prompt(prompt_len, prefill_chunk);
 }
 
+static uint32_t metal_graph_prefill_cap_for_model(
+        int      prompt_len,
+        uint32_t prefill_chunk,
+        bool     dspark_enabled) {
+    uint32_t cap =
+        metal_graph_prefill_cap_for_prompt(prompt_len, prefill_chunk);
+    return dspark_enabled ? ds4_dspark_prefill_cap_floor(cap) : cap;
+}
+
 /* When a server request shares a large prefix with the live checkpoint, extend
  * the KV cache with batched prefill instead of single-token decode.  On an M3
  * Max, prefill is faster from 2-token suffixes upward; keep the default at 4
@@ -31253,11 +31980,36 @@ static void ds4_engine_print_startup_memory(
         int               ctx_size) {
     if (!e || ctx_size <= 0) return;
 
-    const ds4_context_memory mem =
+    int estimated_ctx_size = ctx_size;
+    uint32_t estimated_prefill_chunk = e->prefill_chunk;
+    if (e->model.native_dspark_store_v2) {
+        const uint32_t required_rows =
+            DS4_DSPARK_SUPPORT_CANDIDATE_ROWS + 1u;
+        if (estimated_ctx_size < (int)required_rows) {
+            estimated_ctx_size = (int)required_rows;
+        }
+        if (estimated_prefill_chunk != 0 &&
+            estimated_prefill_chunk < required_rows) {
+            estimated_prefill_chunk = required_rows;
+        }
+    }
+    ds4_context_memory mem =
         ds4_context_memory_estimate_with_prefill_mode(e->backend,
-                                                      ctx_size,
-                                                      e->prefill_chunk,
+                                                      estimated_ctx_size,
+                                                      estimated_prefill_chunk,
                                                       e->ssd_streaming);
+    if (e->model.native_dspark_store_v2) {
+        ds4_dspark_runtime_memory dspark = {0};
+        if (!ds4_dspark_runtime_memory_make(&dspark) ||
+            mem.scratch_bytes > UINT64_MAX - dspark.total_bytes ||
+            mem.total_bytes > UINT64_MAX - dspark.total_bytes) {
+            fprintf(stderr,
+                    "ds4: memory: DSpark startup estimate overflowed\n");
+            return;
+        }
+        mem.scratch_bytes += dspark.total_bytes;
+        mem.total_bytes += dspark.total_bytes;
+    }
     const uint64_t kv_bytes =
         ds4_add_sat_u64(mem.raw_bytes, mem.compressed_bytes);
     uint64_t dynamic_expert_cache_bytes = e->ssd_streaming_cache_bytes;
@@ -39365,13 +40117,24 @@ static bool ds4_engine_configure_streaming_auto_cache(ds4_engine *e) {
         return false;
     }
 
+    uint64_t target_static_page_bytes = 0;
+    uint64_t support_static_page_delta = 0;
     uint64_t strict_non_routed_bytes = 0;
-    if (!weights_strict_non_routed_bytes(&e->model,
-                                         &e->weights,
-                                         &strict_non_routed_bytes)) {
+    uint64_t support_static_payload_bytes = 0;
+    if (e->model.native_dspark_store_v2 ?
+            !weights_combined_strict_non_routed_bytes(
+                &e->model, &e->weights, &e->dspark_weights,
+                &target_static_page_bytes, &support_static_page_delta,
+                &strict_non_routed_bytes,
+                &support_static_payload_bytes) :
+            !weights_strict_non_routed_bytes(
+                &e->model, &e->weights, &strict_non_routed_bytes)) {
         fprintf(stderr,
                 "ds4: SSD streaming auto cache could not measure strict non-routed model weights\n");
         return false;
+    }
+    if (!e->model.native_dspark_store_v2) {
+        target_static_page_bytes = strict_non_routed_bytes;
     }
 
     ds4_streaming_cache_geometry geometry;
@@ -39390,7 +40153,56 @@ static bool ds4_engine_configure_streaming_auto_cache(ds4_engine *e) {
         return false;
     }
 
-    ds4_ssd_adaptive_cache_plan plan;
+    ds4_dspark_runtime_memory dspark_memory = {0};
+    uint64_t dspark_fixed_bytes = 0;
+    uint32_t dspark_fixed_records = 0;
+    ds4_ssd_adaptive_cache_plan target_only_plan = {0};
+    bool target_only_plan_ready = false;
+    if (e->model.native_dspark_store_v2) {
+        if (!ds4_dspark_runtime_memory_make(&dspark_memory) ||
+            planned_runtime_bytes < dspark_memory.total_bytes ||
+            support_static_page_delta >
+                UINT64_MAX - dspark_memory.total_bytes ||
+            e->model.native_dspark_record_bytes !=
+                DS4_DSPARK_0731_RECORD_BYTES ||
+            geometry.per_expert_bytes != DS4_DSPARK_0731_RECORD_BYTES) {
+            fprintf(stderr,
+                    "ds4: DSpark fixed memory accounting overflowed\n");
+            return false;
+        }
+        dspark_fixed_bytes = support_static_page_delta +
+                            dspark_memory.total_bytes;
+        const uint64_t record_bytes = e->model.native_dspark_record_bytes;
+        const uint64_t records =
+            dspark_fixed_bytes / record_bytes +
+            (dspark_fixed_bytes % record_bytes != 0);
+        if (records == 0 || records > UINT32_MAX) {
+            fprintf(stderr,
+                    "ds4: DSpark fixed memory reserve cannot be expressed "
+                    "in ExpertMajor records\n");
+            return false;
+        }
+        dspark_fixed_records = (uint32_t)records;
+        target_only_plan_ready =
+            ds4_ssd_adaptive_cache_plan_make_with_static_reserve(
+                &memory,
+                planned_runtime_bytes - dspark_memory.total_bytes,
+                target_static_page_bytes,
+                e->non_routed_weights_pinned,
+                geometry.cacheable_layers,
+                DS4_N_EXPERT_USED,
+                geometry.per_expert_bytes,
+                geometry.max_cacheable_experts,
+                &target_only_plan);
+        if (!target_only_plan_ready) {
+            fprintf(stderr,
+                    "ds4: DSpark could not reconstruct the matching "
+                    "target-only AUTO policy from the same host snapshot\n");
+            return false;
+        }
+    }
+
+    ds4_ssd_adaptive_cache_plan plan = {0};
     const bool plan_ok =
         ds4_ssd_adaptive_cache_plan_make_with_static_reserve(
         &memory,
@@ -39433,6 +40245,34 @@ static bool ds4_engine_configure_streaming_auto_cache(ds4_engine *e) {
             return false;
         }
     }
+    ds4_dspark_equal_memory_cache_plan dspark_equal_memory = {0};
+    if (e->model.native_dspark_store_v2) {
+        const uint32_t target_only_policy_records =
+            deepseek_m5_expert_major && target_only_plan_ready ?
+                ds4_ssd_deepseek_expert_major_auto_cache_target(
+                    &memory, &target_only_plan) :
+                target_only_plan.cache_experts;
+        uint64_t combined_raw_capacity =
+            plan.wire_budget_bytes / geometry.per_expert_bytes;
+        if (combined_raw_capacity > geometry.max_cacheable_experts) {
+            combined_raw_capacity = geometry.max_cacheable_experts;
+        }
+        if (combined_raw_capacity > UINT32_MAX) {
+            combined_raw_capacity = UINT32_MAX;
+        }
+        if (target_only_policy_records == 0 ||
+            !ds4_dspark_equal_memory_cache_plan_make(
+                target_only_policy_records,
+                (uint32_t)combined_raw_capacity,
+                cache_experts, dspark_fixed_records,
+                &dspark_equal_memory)) {
+            fprintf(stderr,
+                    "ds4: DSpark equal-memory AUTO cap cannot retain the "
+                    "combined TARGET and SUPPORT safety floors\n");
+            return false;
+        }
+        cache_experts = dspark_equal_memory.selected_parent_records;
+    }
     e->ssd_streaming_cache_experts = cache_experts;
     e->ssd_streaming_cache_bytes =
         (uint64_t)cache_experts * geometry.per_expert_bytes;
@@ -39445,12 +40285,33 @@ static bool ds4_engine_configure_streaming_auto_cache(ds4_engine *e) {
          * decode; short contexts retain the larger measured decode target. */
         e->deepseek_prefill_cache_experts =
             (uint32_t)plan.floor.minimum_cache_experts;
-        e->deepseek_long_context_cache_experts =
+        const uint32_t decode_target_records =
+            e->model.native_dspark_store_v2 ?
+                dspark_equal_memory.cycle_aligned_target_records :
+                cache_experts;
+        const uint32_t long_target_records =
             ds4_ssd_deepseek_long_context_cache_target(
-                &memory, &plan, cache_experts, 8192u);
-        e->deepseek_extended_context_cache_experts =
-            ds4_ssd_deepseek_long_context_cache_target(&memory, &plan,
-                                                        cache_experts, 65536u);
+                &memory, &plan, decode_target_records, 8192u);
+        const uint32_t extended_target_records =
+            ds4_ssd_deepseek_long_context_cache_target(
+                &memory, &plan, decode_target_records, 65536u);
+        if (e->model.native_dspark_store_v2) {
+            if (!ds4_dspark_phase_parent_for_target(
+                    long_target_records, cache_experts,
+                    &e->deepseek_long_context_cache_experts) ||
+                !ds4_dspark_phase_parent_for_target(
+                    extended_target_records, cache_experts,
+                    &e->deepseek_extended_context_cache_experts)) {
+                fprintf(stderr,
+                        "ds4: DSpark long-context cache tiers cannot preserve "
+                        "complete TARGET cycles plus SUPPORT\n");
+                return false;
+            }
+        } else {
+            e->deepseek_long_context_cache_experts = long_target_records;
+            e->deepseek_extended_context_cache_experts =
+                extended_target_records;
+        }
         e->deepseek_decode_cache_experts = cache_experts;
     }
     fprintf(stderr,
@@ -39495,18 +40356,57 @@ static bool ds4_engine_configure_streaming_auto_cache(ds4_engine *e) {
             e->non_routed_weights_pinned ?
                 "already pinned and reflected in snapshot" : "pageable",
             (double)plan.pageable_static_reserve_bytes / 1073741824.0);
+    if (e->model.native_dspark_store_v2) {
+        ds4_dspark_cache_plan combined = {0};
+        if (!ds4_dspark_cache_plan_make(cache_experts, true, &combined)) {
+            return false;
+        }
+        fprintf(stderr,
+                "ds4:   DSpark static payload %.0f bytes; 16K page union "
+                "TARGET %.2f GiB + SUPPORT delta %.2f GiB = %.2f GiB; "
+                "speculative runtime %.2f MiB (capture %.2f MiB)\n",
+                (double)support_static_payload_bytes,
+                (double)target_static_page_bytes / 1073741824.0,
+                (double)support_static_page_delta / 1073741824.0,
+                (double)strict_non_routed_bytes / 1073741824.0,
+                (double)dspark_memory.total_bytes / 1048576.0,
+                (double)dspark_memory.capture_bytes / 1048576.0);
+        fprintf(stderr,
+                "ds4:   DSpark equal-memory cache: target-only policy %u, "
+                "combined raw capacity %u (generic policy diagnostic %u), "
+                "fixed equivalent %u, byte ceiling %u; cycle-aligned parent "
+                "%u = TARGET %u + SUPPORT %u\n",
+                dspark_equal_memory.target_only_policy_records,
+                dspark_equal_memory.combined_raw_capacity_records,
+                dspark_equal_memory.combined_policy_records,
+                dspark_equal_memory.fixed_equivalent_records,
+                dspark_equal_memory.equal_memory_ceiling_records,
+                combined.total_records,
+                combined.target_records,
+                combined.support_records);
+    }
     fprintf(stderr,
             "ds4:   routed expert size %.2f MiB; per-token working set "
             "%" PRIu64 ", safe floor %" PRIu64 " experts\n",
             (double)geometry.per_expert_bytes / 1048576.0,
             plan.floor.working_set_experts,
             plan.floor.minimum_cache_experts);
-    fprintf(stderr,
-            "ds4:   cached expert count: %u (%.2f GiB), rounded to complete "
-            "working-set cycles\n",
-            e->ssd_streaming_cache_experts,
-            (double)e->ssd_streaming_cache_bytes / 1073741824.0);
-    if (cache_policy_family && cache_experts != plan.cache_experts) {
+    if (e->model.native_dspark_store_v2) {
+        fprintf(stderr,
+                "ds4:   combined parent cache count: %u (%.2f GiB total "
+                "record-equivalent budget); TARGET/SUPPORT split shown "
+                "above\n",
+                e->ssd_streaming_cache_experts,
+                (double)e->ssd_streaming_cache_bytes / 1073741824.0);
+    } else {
+        fprintf(stderr,
+                "ds4:   cached expert count: %u (%.2f GiB), rounded to "
+                "complete working-set cycles\n",
+                e->ssd_streaming_cache_experts,
+                (double)e->ssd_streaming_cache_bytes / 1073741824.0);
+    }
+    if (!e->model.native_dspark_store_v2 && cache_policy_family &&
+        cache_experts != plan.cache_experts) {
         fprintf(stderr,
                 "ds4:   %s ExpertMajor AUTO selected %u experts across complete route cycles (pressure ceiling %u)\n",
                 cache_policy_family, cache_experts, plan.cache_experts);
@@ -39531,6 +40431,64 @@ static bool ds4_engine_configure_streaming_auto_cache(ds4_engine *e) {
     return true;
 #endif
 }
+
+#ifndef DS4_NO_GPU
+static bool ds4_engine_configure_dspark_growth_guard(ds4_engine *e) {
+    if (!e || !e->model.native_dspark_store_v2) return true;
+    if (!e->ssd_streaming || e->backend != DS4_BACKEND_METAL) return false;
+
+    ds4_model_map_span_vec spans = {0};
+    uint64_t target_page_bytes = 0;
+    uint64_t support_page_delta = 0;
+    uint64_t combined_page_bytes = 0;
+    uint64_t support_payload_bytes = 0;
+    if (!weights_model_map_combined_non_routed_page_spans(
+            &e->model, &e->weights, &e->dspark_weights, &spans,
+            &target_page_bytes, &support_page_delta,
+            &combined_page_bytes, &support_payload_bytes)) {
+        fprintf(stderr,
+                "ds4: DSpark slab-growth guard could not build its static "
+                "page union\n");
+        return false;
+    }
+    free(spans.v);
+    if (e->model.native_dspark_record_bytes !=
+            DS4_DSPARK_0731_RECORD_BYTES ||
+        DS4_DSPARK_SUPPORT_CACHE_FLOOR >
+            UINT64_MAX / e->model.native_dspark_record_bytes) {
+        fprintf(stderr,
+                "ds4: DSpark growth guard cannot express the SUPPORT floor\n");
+        return false;
+    }
+    const uint64_t support_floor_bytes =
+        (uint64_t)DS4_DSPARK_SUPPORT_CACHE_FLOOR *
+        e->model.native_dspark_record_bytes;
+    if (support_floor_bytes != UINT64_C(219414528) ||
+        e->residency_plan.runtime_bytes >
+            UINT64_MAX - support_floor_bytes) {
+        fprintf(stderr,
+                "ds4: DSpark growth guard SUPPORT reserve overflowed\n");
+        return false;
+    }
+    const uint64_t guarded_runtime_bytes =
+        e->residency_plan.runtime_bytes + support_floor_bytes;
+    ds4_gpu_set_streaming_expert_cache_growth_guard(
+        true, guarded_runtime_bytes, combined_page_bytes);
+    fprintf(stderr,
+            "ds4: DSpark TARGET slab-growth guard: modeled runtime %.2f MiB "
+            "+ SUPPORT floor %.2f MiB = %.2f MiB guarded runtime; static "
+            "16K union %.2f GiB (TARGET %.2f GiB + SUPPORT %.2f GiB; "
+            "payload %.0f bytes)\n",
+            (double)e->residency_plan.runtime_bytes / 1048576.0,
+            (double)support_floor_bytes / 1048576.0,
+            (double)guarded_runtime_bytes / 1048576.0,
+            (double)combined_page_bytes / 1073741824.0,
+            (double)target_page_bytes / 1073741824.0,
+            (double)support_page_delta / 1073741824.0,
+            (double)support_payload_bytes);
+    return true;
+}
+#endif
 
 static bool ds4_engine_normalize_residency_request(
         const ds4_engine_options *opt,
@@ -39593,8 +40551,32 @@ static bool ds4_engine_context_memory_estimate_private(
     if (!e || !out || ctx_size <= 0) return false;
 
     if (e->model.family != DS4_MODEL_FAMILY_QWEN35_MOE) {
+        int estimated_ctx_size = ctx_size;
+        uint32_t estimated_prefill_chunk = prefill_chunk;
+        if (e->model.native_dspark_store_v2) {
+            const uint32_t dspark_rows =
+                DS4_DSPARK_SUPPORT_CANDIDATE_ROWS + 1u;
+            if (estimated_ctx_size < (int)dspark_rows) {
+                estimated_ctx_size = (int)dspark_rows;
+            }
+            if (estimated_prefill_chunk != 0 &&
+                estimated_prefill_chunk < dspark_rows) {
+                estimated_prefill_chunk = dspark_rows;
+            }
+        }
         *out = ds4_context_memory_estimate_with_prefill(
-            e->backend, ctx_size, prefill_chunk);
+            e->backend, estimated_ctx_size, estimated_prefill_chunk);
+        if (e->model.native_dspark_store_v2) {
+            ds4_dspark_runtime_memory dspark = {0};
+            if (!ds4_dspark_runtime_memory_make(&dspark) ||
+                out->scratch_bytes > UINT64_MAX - dspark.total_bytes ||
+                out->total_bytes > UINT64_MAX - dspark.total_bytes) {
+                memset(out, 0, sizeof(*out));
+                return false;
+            }
+            out->scratch_bytes += dspark.total_bytes;
+            out->total_bytes += dspark.total_bytes;
+        }
         return true;
     }
     if ((uint32_t)ctx_size > QWEN35_CONTEXT_LENGTH) return false;
@@ -40053,10 +41035,18 @@ static bool ds4_engine_preflight_non_routed_pin(
         return false;
     }
 
+    uint64_t target_static_page_bytes = 0;
+    uint64_t support_static_page_delta = 0;
     uint64_t strict_non_routed_bytes = 0;
-    if (!weights_strict_non_routed_bytes(&e->model,
-                                         &e->weights,
-                                         &strict_non_routed_bytes)) {
+    uint64_t support_static_payload_bytes = 0;
+    if (e->model.native_dspark_store_v2 ?
+            !weights_combined_strict_non_routed_bytes(
+                &e->model, &e->weights, &e->dspark_weights,
+                &target_static_page_bytes, &support_static_page_delta,
+                &strict_non_routed_bytes,
+                &support_static_payload_bytes) :
+            !weights_strict_non_routed_bytes(
+                &e->model, &e->weights, &strict_non_routed_bytes)) {
         fprintf(stderr,
                 "ds4: non-routed pin preflight could not measure strict page coverage\n");
         return false;
@@ -40114,18 +41104,27 @@ static bool ds4_engine_preflight_non_routed_pin(
             plan.current_wire_budget_bytes :
             pinned_platform_plan.platform_wire_budget_bytes;
 
+    const uint64_t minimum_cache_experts =
+        e->model.native_dspark_store_v2 ?
+            DS4_DSPARK_COMBINED_CACHE_FLOOR :
+            plan.floor.minimum_cache_experts;
+    if (minimum_cache_experts > UINT64_MAX / geometry.per_expert_bytes) {
+        return false;
+    }
+    const uint64_t minimum_cache_bytes =
+        minimum_cache_experts * geometry.per_expert_bytes;
     uint64_t requested_cache_bytes = plan.cache_bytes;
     const char *request_kind = "AUTO";
     if (e->ssd_streaming_cache_experts != 0) {
         if ((uint64_t)e->ssd_streaming_cache_experts <
-                plan.floor.minimum_cache_experts ||
+                minimum_cache_experts ||
             (uint64_t)e->ssd_streaming_cache_experts >
                 UINT64_MAX / geometry.per_expert_bytes) {
             fprintf(stderr,
                     "ds4: refusing non-routed pin before an invalid explicit "
                     "expert-cache count of %u (minimum safe count is %" PRIu64 ")\n",
                     e->ssd_streaming_cache_experts,
-                    plan.floor.minimum_cache_experts);
+                    minimum_cache_experts);
             return false;
         }
         requested_cache_bytes =
@@ -40133,11 +41132,11 @@ static bool ds4_engine_preflight_non_routed_pin(
             geometry.per_expert_bytes;
         request_kind = "explicit expert count";
     } else if (e->ssd_streaming_cache_bytes != 0) {
-        if (e->ssd_streaming_cache_bytes < plan.floor.minimum_cache_bytes) {
+        if (e->ssd_streaming_cache_bytes < minimum_cache_bytes) {
             fprintf(stderr,
                     "ds4: refusing non-routed pin before an explicit cache "
                     "budget below the %.2f GiB minimum safe tier\n",
-                    (double)plan.floor.minimum_cache_bytes / 1073741824.0);
+                    (double)minimum_cache_bytes / 1073741824.0);
             return false;
         }
         requested_cache_bytes = e->ssd_streaming_cache_bytes;
@@ -40163,6 +41162,14 @@ static bool ds4_engine_preflight_non_routed_pin(
             request_kind,
             (double)requested_cache_bytes / 1073741824.0,
             (double)pin_safety_budget_bytes / 1073741824.0);
+    if (e->model.native_dspark_store_v2) {
+        fprintf(stderr,
+                "ds4: non-routed pin DSpark union: TARGET %.2f GiB + "
+                "SUPPORT %.2f GiB page delta (%.0f static payload bytes)\n",
+                (double)target_static_page_bytes / 1073741824.0,
+                (double)support_static_page_delta / 1073741824.0,
+                (double)support_static_payload_bytes);
+    }
     return true;
 }
 #endif
@@ -41341,12 +42348,16 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
         e->model.family == DS4_MODEL_FAMILY_DEEPSEEK4;
     const bool glm_family =
         e->model.family == DS4_MODEL_FAMILY_GLM_DSA;
-    if (!opt->inspect_only && e->model.native_dspark_store_v2) {
+    if (!opt->inspect_only && e->model.native_dspark_store_v2 &&
+        e->prefill_chunk != 0 &&
+        e->prefill_chunk < DS4_DSPARK_SUPPORT_CANDIDATE_ROWS + 1u) {
         fprintf(stderr,
-                "ds4: embedded DSpark support is inspection-only until its "
-                "Metal graph and independently budgeted SSD cache are qualified\n");
-        ds4_engine_close(e);
-        return 1;
+                "ds4: embedded DSpark raises explicit --prefill-chunk %u to "
+                "%u so the pending token plus five verifier rows fit the "
+                "admitted graph\n",
+                e->prefill_chunk,
+                DS4_DSPARK_SUPPORT_CANDIDATE_ROWS + 1u);
+        e->prefill_chunk = DS4_DSPARK_SUPPORT_CANDIDATE_ROWS + 1u;
     }
     if (!opt->inspect_only && qwen_family &&
         !e->model.native_expert_store_v2) {
@@ -41458,8 +42469,39 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
     weights_bind(&e->weights, &e->model);
     if (e->model.native_dspark_store_v2) {
         dspark_weights_bind(&e->dspark_weights, &e->model);
+        ds4_streaming_cache_geometry dspark_geometry = {0};
+        if (!ds4_streaming_cache_geometry_make(
+                &e->weights, &dspark_geometry) ||
+            e->model.native_dspark_record_bytes !=
+                DS4_DSPARK_0731_RECORD_BYTES ||
+            dspark_geometry.per_expert_bytes !=
+                DS4_DSPARK_0731_RECORD_BYTES) {
+            fprintf(stderr,
+                    "ds4: DSpark TARGET/SUPPORT ExpertMajor record geometry "
+                    "does not share the authenticated %" PRIu64
+                    "-byte identity\n",
+                    DS4_DSPARK_0731_RECORD_BYTES);
+            ds4_engine_close(e);
+            return 1;
+        }
+        if (!opt->inspect_only) {
+            fprintf(stderr,
+                    "ds4: DSpark TARGET/SUPPORT record identity validated: "
+                    "%" PRIu64 " bytes per record\n",
+                    dspark_geometry.per_expert_bytes);
+        }
     }
     if (!ds4_engine_resolve_residency(e, opt)) {
+        ds4_engine_close(e);
+        return 1;
+    }
+    if (!opt->inspect_only && e->model.native_dspark_store_v2 &&
+        !e->ssd_streaming) {
+        fprintf(stderr,
+                "ds4: embedded DSpark resolved %s but remains fail-closed; "
+                "resident ExpertMajor mappings are not created before graph "
+                "qualification\n",
+                ds4_residency_mode_name(e->residency));
         ds4_engine_close(e);
         return 1;
     }
@@ -41484,6 +42526,13 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
         }
     }
     if (pin_non_routed_requested) {
+        if (e->model.native_dspark_store_v2) {
+            fprintf(stderr,
+                    "ds4: embedded DSpark remains fail-closed and will not "
+                    "wire combined model pages before graph qualification\n");
+            ds4_engine_close(e);
+            return 1;
+        }
         if (opt->inspect_only) {
             fprintf(stderr,
                     "ds4: refusing non-routed pin in --inspect mode; inspection must not wire model pages\n");
@@ -41520,7 +42569,10 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
             ds4_engine_close(e);
             return 1;
         }
-        if (!model_pin_non_routed_weights(&e->model, &e->weights)) {
+        if (!model_pin_non_routed_weights(
+                &e->model, &e->weights,
+                e->model.native_dspark_store_v2 ?
+                    &e->dspark_weights : NULL)) {
             ds4_engine_close(e);
             return 1;
         }
@@ -41613,14 +42665,24 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
                 uint64_t model_target_bytes = 0;
                 uint64_t reserved_bytes = 0;
                 uint64_t non_routed_bytes = 0;
+                uint64_t target_static_exact_bytes = 0;
+                uint64_t support_static_payload_bytes = 0;
+                const bool non_routed_ready =
+                    e->model.native_dspark_store_v2 ?
+                        weights_combined_exact_non_routed_bytes(
+                            &e->model, &e->weights, &e->dspark_weights,
+                            &target_static_exact_bytes,
+                            &non_routed_bytes,
+                            &support_static_payload_bytes) :
+                        weights_streaming_non_routed_bytes(
+                            &e->weights, &non_routed_bytes);
                 if (!ds4_ssd_working_set_after_reserve(
                         recommended_bytes,
                         e->residency_plan.runtime_bytes,
                         external_and_headroom,
                         &model_target_bytes,
                         &reserved_bytes) ||
-                    !weights_streaming_non_routed_bytes(&e->weights,
-                                                        &non_routed_bytes) ||
+                    !non_routed_ready ||
                     model_target_bytes <= non_routed_bytes) {
                     fprintf(stderr,
                             "ds4: requested SSD cache has no safe %s budget after "
@@ -41629,6 +42691,8 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
                     ds4_engine_close(e);
                     return 1;
                 }
+                (void)target_static_exact_bytes;
+                (void)support_static_payload_bytes;
                 const uint64_t safe_cache_bytes =
                     model_target_bytes - non_routed_bytes;
                 if (e->ssd_streaming_cache_bytes > safe_cache_bytes) {
@@ -41667,6 +42731,19 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
                 (double)e->ssd_streaming_cache_bytes / 1073741824.0,
                 (double)per_expert_bytes / 1048576.0,
                 budget);
+        if (e->model.native_dspark_store_v2) {
+            ds4_dspark_cache_plan combined = {0};
+            if (!ds4_dspark_cache_plan_make(budget, true, &combined)) {
+                fprintf(stderr,
+                        "ds4: explicit DSpark SSD cache must hold at least "
+                        "%u parent records (TARGET %u + SUPPORT %u)\n",
+                        DS4_DSPARK_COMBINED_CACHE_FLOOR,
+                        DS4_DSPARK_TARGET_CACHE_FLOOR,
+                        DS4_DSPARK_SUPPORT_CACHE_FLOOR);
+                ds4_engine_close(e);
+                return 1;
+            }
+        }
     }
     if (opt->inspect_only) {
         *out = e;
@@ -41737,6 +42814,11 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
         }
 #endif
         if (!ds4_engine_configure_streaming_auto_cache(e)) {
+            ds4_engine_close(e);
+            *out = NULL;
+            return 1;
+        }
+        if (!ds4_engine_configure_dspark_growth_guard(e)) {
             ds4_engine_close(e);
             *out = NULL;
             return 1;
@@ -41826,6 +42908,38 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
         }
         ds4_gpu_set_streaming_expert_cache_budget(
             e->ssd_streaming_cache_experts);
+        if (e->model.native_dspark_store_v2) {
+            ds4_dspark_cache_plan combined = {0};
+            const uint32_t configured_target =
+                ds4_gpu_stream_expert_cache_configured_count();
+            if (!e->dspark_store_v2_ready ||
+                !ds4_dspark_cache_plan_make(
+                    e->ssd_streaming_cache_experts, true, &combined) ||
+                configured_target != combined.target_records) {
+                fprintf(stderr,
+                        "ds4: DSpark fail-closed budget validation failed "
+                        "(parent=%u, configured TARGET=%u)\n",
+                        e->ssd_streaming_cache_experts,
+                        configured_target);
+                ds4_engine_close(e);
+                *out = NULL;
+                return 1;
+            }
+            fprintf(stderr,
+                    "ds4: DSpark admission validated before execution gate: "
+                    "parent %u = TARGET %u + SUPPORT %u; no model spans, "
+                    "wired pages, cache slabs, or graph tensors allocated\n",
+                    combined.total_records,
+                    combined.target_records,
+                    combined.support_records);
+            fprintf(stderr,
+                    "ds4: embedded DSpark execution remains fail-closed until "
+                    "the three-stage Metal drafter and exact verifier are "
+                    "qualified\n");
+            ds4_engine_close(e);
+            *out = NULL;
+            return 1;
+        }
         (void)ds4_gpu_set_model_fd(e->model.fd);
         int model_map_ok = 0;
         uint64_t *load_offsets = NULL;
@@ -41865,7 +42979,13 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
             free(spans.v);
         } else if (e->model.native_expert_store_v2) {
             ds4_model_map_span_vec spans = {0};
-            if (!weights_model_map_non_routed_spans(&e->weights, &spans)) {
+            uint64_t support_payload_bytes = 0;
+            const bool spans_ready = e->model.native_dspark_store_v2 ?
+                weights_model_map_combined_non_routed_spans(
+                    &e->model, &e->weights, &e->dspark_weights, &spans,
+                    &support_payload_bytes) :
+                weights_model_map_non_routed_spans(&e->weights, &spans);
+            if (!spans_ready) {
                 fprintf(stderr,
                         "ds4: native expert-major resident non-routed map is invalid\n");
                 ds4_engine_close(e);
@@ -41890,8 +43010,12 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
                 load_span_count, spans.max_tensor_bytes);
             fprintf(stderr,
                     "ds4: native expert-major resident map: %.2f GiB "
-                    "non-routed plus expert-major layer buffers (%u spans)\n",
-                    (double)span_bytes / 1073741824.0, spans.len);
+                    "non-routed plus expert-major layer buffers (%u spans%s)\n",
+                    (double)span_bytes / 1073741824.0, spans.len,
+                    e->model.native_dspark_store_v2 ?
+                        "; includes authenticated SUPPORT static tensors" :
+                        "");
+            (void)support_payload_bytes;
             free(spans.v);
         } else {
             e->startup_model_span_bytes = e->model.size > e->model.tensor_data_pos ?
@@ -42280,8 +43404,8 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
         *out = s;
         return 0;
     }
-    s->prefill_cap = metal_graph_prefill_cap_for_prompt(ctx_size,
-                                                        e->prefill_chunk);
+    s->prefill_cap = metal_graph_prefill_cap_for_model(
+        ctx_size, e->prefill_chunk, e->model.native_dspark_store_v2);
     const uint32_t raw_cap = metal_graph_raw_cap_for_context(ctx_size, s->prefill_cap);
     const ds4_layer_weights *shape_layer = weights_first_bound_layer(&e->weights);
     if (!shape_layer) {

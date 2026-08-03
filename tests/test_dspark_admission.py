@@ -117,6 +117,7 @@ def tensor_bytes(tensor: Tensor) -> int:
 
 
 def deepseek_metadata(*, include_dspark: bool, alias: bool = False,
+                      include_tokenizer: bool = False,
                       case_alias: bool = False,
                       stage_count: int = 3,
                       target_layers: list[int] | None = None,
@@ -200,11 +201,26 @@ def deepseek_metadata(*, include_dspark: bool, alias: bool = False,
             metadata["DSpark.Source.Revision"] = (
                 STRING, DSPARK_PROVENANCE["dspark.source.revision"]
             )
+    if include_tokenizer:
+        special = [
+            "<｜begin▁of▁sentence｜>",
+            "<｜end▁of▁sentence｜>",
+            "<｜User｜>",
+            "<｜Assistant｜>",
+            "<think>",
+            "</think>",
+            "｜DSML｜",
+        ]
+        metadata["tokenizer.ggml.tokens"] = (
+            ARRAY, (STRING, special + ["x"] * (129_280 - len(special)))
+        )
+        metadata["tokenizer.ggml.merges"] = (ARRAY, (STRING, []))
     return metadata
 
 
-def common_block(prefix: str, *, router_type: int) -> list[Tensor]:
-    return [
+def common_block(prefix: str, *, router_type: int,
+                 include_router_bias: bool = True) -> list[Tensor]:
+    tensors = [
         Tensor(prefix + "hc_attn_base.weight", (24,), F32),
         Tensor(prefix + "hc_attn_fn.weight", (16384, 24), F16),
         Tensor(prefix + "hc_attn_scale.weight", (3,), F32),
@@ -221,12 +237,14 @@ def common_block(prefix: str, *, router_type: int) -> list[Tensor]:
         Tensor(prefix + "hc_ffn_fn.weight", (16384, 24), F16),
         Tensor(prefix + "hc_ffn_scale.weight", (3,), F32),
         Tensor(prefix + "ffn_gate_inp.weight", (4096, 256), router_type),
-        Tensor(prefix + "exp_probs_b.bias", (256,), F32),
         Tensor(prefix + "ffn_norm.weight", (4096,), F32),
         Tensor(prefix + "ffn_gate_shexp.weight", (4096, 2048), Q8_0),
         Tensor(prefix + "ffn_up_shexp.weight", (4096, 2048), Q8_0),
         Tensor(prefix + "ffn_down_shexp.weight", (2048, 4096), Q8_0),
     ]
+    if include_router_bias:
+        tensors.insert(16, Tensor(prefix + "exp_probs_b.bias", (256,), F32))
+    return tensors
 
 
 def target_non_routed_tensors() -> list[Tensor]:
@@ -240,7 +258,9 @@ def target_non_routed_tensors() -> list[Tensor]:
     ]
     for layer in range(43):
         prefix = f"blk.{layer}."
-        tensors += common_block(prefix, router_type=F16)
+        tensors += common_block(
+            prefix, router_type=F16, include_router_bias=layer >= 3
+        )
         if layer < 3:
             tensors.append(Tensor(
                 prefix + "ffn_gate_tid2eid.weight", (6, 129280), I32
@@ -260,7 +280,7 @@ def target_non_routed_tensors() -> list[Tensor]:
         if ratio == 4:
             tensors += [
                 Tensor(prefix + "indexer.attn_q_b.weight",
-                       (1024, 8192), Q8_0),
+                       (1024, 8192), F16),
                 Tensor(prefix + "indexer.proj.weight", (4096, 64), F16),
                 Tensor(prefix + "indexer_compressor_ape.weight",
                        (256, 4), F16),
@@ -368,6 +388,7 @@ def make_store(name: str, layers: int, source_tensors: int, *,
 
 
 def write_fixture(path: Path, *, combined: bool,
+                  include_tokenizer: bool = False,
                   metadata_alias: bool = False,
                   metadata_case_alias: bool = False,
                   metadata_stage_count: int = 3,
@@ -453,7 +474,8 @@ def write_fixture(path: Path, *, combined: bool,
             tensors.append(payloads[-1][0])
 
     metadata = deepseek_metadata(
-        include_dspark=combined, alias=metadata_alias,
+        include_dspark=combined, include_tokenizer=include_tokenizer,
+        alias=metadata_alias,
         case_alias=metadata_case_alias,
         stage_count=metadata_stage_count,
         target_layers=metadata_target_layers,
@@ -532,9 +554,10 @@ def write_fixture(path: Path, *, combined: bool,
 
 
 def run(binary: Path, model: Path, lock: Path, *, inspect: bool,
-        backend: str = "cpu"
+        backend: str = "cpu", extra_args: tuple[str, ...] = ()
         ) -> subprocess.CompletedProcess[str]:
     command = [str(binary), "-m", str(model), f"--{backend}"]
+    command += list(extra_args)
     command += ["--inspect"] if inspect else ["-p", "admission gate"]
     environment = os.environ.copy()
     environment["DS4_LOCK_FILE"] = str(lock)
@@ -551,6 +574,14 @@ def require(condition: bool, message: str,
         f"{message}\nreturncode={result.returncode}\n"
         f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}"
     )
+
+
+def metal_unavailable(output: str) -> bool:
+    return any(message in output for message in (
+        "metal backend requested but it is unavailable",
+        "Metal device not available",
+        "metal backend unavailable; aborting startup",
+    ))
 
 
 def main() -> int:
@@ -581,7 +612,7 @@ def main() -> int:
         target.unlink()
 
         combined = root / "combined.gguf"
-        write_fixture(combined, combined=True)
+        write_fixture(combined, combined=True, include_tokenizer=True)
         inspect_result = run(
             binary, combined, root / "combined-inspect.lock", inspect=True
         )
@@ -619,30 +650,58 @@ def main() -> int:
         require(inference_result.returncode != 0,
                 "combined artifact reached inference", inference_result)
         require(
-            "embedded DSpark support is inspection-only until its Metal graph "
-            "and independently budgeted SSD cache are qualified" in
+            "DeepSeek ExpertMajor v2 inference requires the Metal runtime" in
             inference_output,
-            "combined artifact did not fail at the explicit engine gate",
+            "combined artifact bypassed the generic CPU admission gate",
             inference_result,
         )
-        metal_inference_result = run(
-            binary, combined, root / "combined-metal-open.lock",
-            inspect=False, backend="metal",
+        metal_resident_result = run(
+            binary, combined, root / "combined-metal-resident.lock",
+            inspect=False, backend="metal", extra_args=("--resident",),
         )
-        metal_inference_output = (
-            metal_inference_result.stdout + metal_inference_result.stderr
+        metal_resident_output = (
+            metal_resident_result.stdout + metal_resident_result.stderr
         )
-        require(metal_inference_result.returncode != 0,
-                "combined artifact reached Metal inference",
-                metal_inference_result)
-        if "metal backend requested but it is unavailable" not in \
-                metal_inference_output:
+        require(metal_resident_result.returncode != 0,
+                "combined artifact reached resident Metal inference",
+                metal_resident_result)
+        if not metal_unavailable(metal_resident_output):
             require(
-                "embedded DSpark support is inspection-only until its Metal graph "
-                "and independently budgeted SSD cache are qualified" in
-                metal_inference_output,
-                "combined artifact bypassed the gate with --metal",
-                metal_inference_result,
+                "embedded DSpark resolved resident but remains fail-closed; "
+                "resident ExpertMajor mappings are not created before graph "
+                "qualification" in metal_resident_output,
+                "combined artifact bypassed the resident Metal gate",
+                metal_resident_result,
+            )
+        metal_ssd_result = run(
+            binary, combined, root / "combined-metal-ssd.lock",
+            inspect=False, backend="metal",
+            extra_args=("--ctx", "64", "--ssd-streaming-cache-experts",
+                        "290"),
+        )
+        metal_ssd_output = metal_ssd_result.stdout + metal_ssd_result.stderr
+        require(metal_ssd_result.returncode != 0,
+                "combined artifact reached SSD Metal inference",
+                metal_ssd_result)
+        if not metal_unavailable(metal_ssd_output):
+            require(
+                "DSpark admission validated before execution gate" in
+                metal_ssd_output,
+                "combined artifact did not reach the SSD admission gate",
+                metal_ssd_result,
+            )
+            require(
+                "no model spans, wired pages, cache slabs, or graph tensors "
+                "allocated" in metal_ssd_output,
+                "combined artifact allocated state before the SSD execution "
+                "gate",
+                metal_ssd_result,
+            )
+            require(
+                "embedded DSpark execution remains fail-closed" in
+                metal_ssd_output,
+                "combined artifact bypassed the SSD Metal gate",
+                metal_ssd_result,
             )
         combined.unlink()
 
