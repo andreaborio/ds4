@@ -119,9 +119,14 @@ still identifies the owned inode, and directory installation is followed by
 `fsync`. There is no destructive replacement mode: use a new output name or
 remove an obsolete artifact explicitly before invoking the tool.
 
-`build --dspark-support` and `verify --dspark-support` remain fail closed until
-one real generated output has been reviewed and its complete SHA-256 becomes
-the single composer pin.
+`build --dspark-support` and `verify --dspark-support` accept only the reviewed
+final-0731 support artifact whose complete SHA-256 is
+`aa2bd4b5b916e1aa0a01392d69cbdd9798a3f3050c29c22973c8ee4233af0413`.
+It was generated from the pinned official inputs above. An independent
+conversion with `antirez/deepseek-v4-gguf` commit
+`54b36ed9ba42da31b24f2d1a5feb075c2475dbb1` reproduced the descriptors and
+payload bytes of all 81 tensors exactly. The 640-byte whole-file difference is
+authenticated Hebrus provenance metadata, not a weight difference.
 
 The 5,989,114,272-byte support GGUF with SHA-256
 `8b3adf5942bec22ae2ea867cd7079cf13530ba83ffcffaf00f5de48664a1a34e`
@@ -131,20 +136,16 @@ reference and is rejected for combined-artifact publication. Matching its
 name, metadata, tensor inventory, and geometry does not prove that its weights
 come from the final checkpoint.
 
-Packaging can be enabled only after coding the generated support's distinct
-SHA-256 as the single accepted pin. No CLI hash override is provided. Runtime
-support remains gated by the architecture in
+No CLI hash override is provided. Runtime support remains gated by the
+architecture in
 [`../docs/adr/0008-deepseek-dspark-embedded-support-store.md`](../docs/adr/0008-deepseek-dspark-embedded-support-store.md).
 
-The generated artifact is not qualified by successful conversion. Before its
-digest can become the production pin, compare its metadata, tensor inventory,
-and per-tensor bytes independently against a second final-0731 converter. For
-quantizers that are intentionally not byte-identical, compare dequantized
-error per tensor and DSpark logits against the official implementation and the
-MLX oracle. Then run target-only versus combined quality and exact-output
-lanes, followed by the Apple 64 GiB AUTO-to-SSD 8K, 32K, and admitted-endpoint
-matrix. Record the reviewed artifact digest manually; generation must never
-edit or derive the composer production pin.
+Successful conversion and exact tensor reproduction do not qualify the
+runtime. DSpark logits and draft decisions must still match the official
+implementation and the MLX oracle. Then run target-only versus combined
+quality and exact-output lanes, followed by the Apple 64 GiB AUTO-to-SSD 8K,
+32K, and admitted-endpoint matrix. The reviewed digest is coded manually;
+generation must never edit or derive the composer production pin.
 
 ## Generate An Imatrix
 

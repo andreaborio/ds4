@@ -95,6 +95,14 @@ must then match the official implementation and the MLX oracle before the
 normal Apple AUTO-to-SSD performance matrix is allowed to make a promotion
 decision.
 
+The packaging prerequisite is satisfied by the 5,989,114,912-byte support
+artifact with SHA-256
+`aa2bd4b5b916e1aa0a01392d69cbdd9798a3f3050c29c22973c8ee4233af0413`.
+An independent conversion at `antirez/deepseek-v4-gguf` commit
+`54b36ed9ba42da31b24f2d1a5feb075c2475dbb1` reproduced all 81 tensor
+descriptors and payloads byte-for-byte. This clears only packaging; the graph,
+oracle, correctness, memory, and performance gates below remain mandatory.
+
 The first performance gate is normal M5 Pro 64 GiB AUTO resolving to SSD at an
 8K prompt frontier. Target-only and DSpark runs use equal total memory budgets
 and comparable cache/page state. Promotion requires all of the following:

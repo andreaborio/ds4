@@ -7,8 +7,8 @@ complete expert records (gate, up, down). The opaque store is self-describing;
 DS4 reconstructs the canonical logical tensor inventory at load time.
 
 The ``--dspark-support`` interface is reserved for a support GGUF generated
-from the final 0731 shards. It currently fails closed because that artifact and
-its SHA-256 pin do not exist. The older 8b3a... GGUF remains useful only as a
+from the final 0731 shards and accepts exactly the independently reviewed
+artifact pinned below. The older 8b3a... GGUF remains useful only as a
 structural reference; matching its name, shape, or hash does not establish
 final-checkpoint provenance.
 """
@@ -38,10 +38,13 @@ DSPARK_STORE_TENSOR = "ds4.dspark.expert_major.v2"
 DSPARK_PREVIEW_REFERENCE_SHA256 = bytes.fromhex(
     "8b3adf5942bec22ae2ea867cd7079cf13530ba83ffcffaf00f5de48664a1a34e"
 )
-# Set only after generating and validating a support GGUF from the final 0731
-# checkpoint shards 46-48. The preview reference above is deliberately not an
-# accepted publication pin.
-DSPARK_0731_FINAL_SUPPORT_SHA256: bytes | None = None
+# Generated from the pinned final-0731 checkpoint shards 46-48. A second
+# converter at antirez/deepseek-v4-gguf commit 54b36ed9ba42 independently
+# reproduced all 81 tensor payloads byte-for-byte; metadata differs because the
+# local artifact additionally records authenticated source provenance.
+DSPARK_0731_FINAL_SUPPORT_SHA256: bytes | None = bytes.fromhex(
+    "aa2bd4b5b916e1aa0a01392d69cbdd9798a3f3050c29c22973c8ee4233af0413"
+)
 DSPARK_0731_PROVENANCE = {
     "dspark.source.revision":
         "7872f01b1d1fe23eabc4c98b48bffcef5a386062",

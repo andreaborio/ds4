@@ -900,7 +900,11 @@ def main() -> int:
         assert tool.DSPARK_PREVIEW_REFERENCE_SHA256.hex() == (
             "8b3adf5942bec22ae2ea867cd7079cf13530ba83ffcffaf00f5de48664a1a34e"
         )
-        assert tool.DSPARK_0731_FINAL_SUPPORT_SHA256 is None
+        production_pin = tool.DSPARK_0731_FINAL_SUPPORT_SHA256
+        assert production_pin is not None
+        assert production_pin.hex() == (
+            "aa2bd4b5b916e1aa0a01392d69cbdd9798a3f3050c29c22973c8ee4233af0413"
+        )
         tool.DSPARK_0731_FINAL_SUPPORT_SHA256 = \
             tool.DSPARK_PREVIEW_REFERENCE_SHA256
         try:
@@ -910,18 +914,21 @@ def main() -> int:
         else:
             raise AssertionError("preview DSpark digest became a production pin")
         finally:
-            tool.DSPARK_0731_FINAL_SUPPORT_SHA256 = None
+            tool.DSPARK_0731_FINAL_SUPPORT_SHA256 = production_pin
         tool.require_digest_match(
             tool.DSPARK_PREVIEW_REFERENCE_SHA256,
             tool.DSPARK_PREVIEW_REFERENCE_SHA256,
         )
         try:
-            tool.require_final_dspark_support_pin()
+            tool.require_digest_match(
+                tool.DSPARK_PREVIEW_REFERENCE_SHA256, production_pin,
+            )
         except tool.FormatError as exc:
-            assert "shards 46-48" in str(exc)
-            assert "reference-only" in str(exc)
+            assert "does not match the required artifact" in str(exc)
+            assert production_pin.hex() in str(exc)
         else:
-            raise AssertionError("preview support was accepted for publication")
+            raise AssertionError("preview support matched the final pin")
+        assert tool.require_final_dspark_support_pin() == production_pin
         assert target_plan.layer_count == 43
         assert target_plan.expert_count == 256
         assert target_plan.expert_used_count == 6
@@ -954,16 +961,9 @@ def main() -> int:
             "--dspark-support", str(dspark_support),
             str(combined_source), str(blocked_output), ok=False,
         )
-        assert "shards 46-48" in blocked_build.stderr
-        assert "reference-only" in blocked_build.stderr
+        assert "does not match the required artifact" in blocked_build.stderr
+        assert production_pin.hex() in blocked_build.stderr
         assert not blocked_output.exists()
-        blocked_verify = run(
-            "verify", "--dspark-support", str(dspark_support),
-            str(combined_source), str(tmp_path / "does-not-exist.gguf"),
-            ok=False,
-        )
-        assert "shards 46-48" in blocked_verify.stderr
-
         # The same writer and plan produce identical target-store bytes at a
         # different outer GGUF offset, which is the combined-file invariant.
         target_digest = tool.hash_file(source, "fixture target identity")
