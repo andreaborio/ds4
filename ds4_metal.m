@@ -54456,7 +54456,7 @@ static int ds4_gpu_dspark_stage_preflight(
         const ds4_gpu_dspark_stage_descriptor *d) {
     if (!d || !d->model_map || d->model_map != g_model_map_ptr ||
         d->model_size == 0 || d->model_size != g_model_map_size ||
-        d->stage != 0u ||
+        d->stage >= DS4_DSPARK_0731_STAGE_COUNT ||
         !d->route_plan || d->position0 > UINT32_MAX - 4u ||
         d->committed_count < 2u || d->committed_count > 128u ||
         d->committed_start >= 128u ||
@@ -55118,6 +55118,151 @@ int ds4_gpu_dspark_stage_execute_candidate(
         (void)ds4_gpu_synchronize();
     }
     return ok && !g_stream_expert_cache_lease.active;
+}
+
+/* DSpark HC head: takes the final stage candidate and produces draft token
+ * IDs, corrected logits, and per-position confidence.  The caller owns all
+ * scratch tensors and the model map; this function only orchestrates Metal
+ * kernels.  Confidence sigmoid is computed on the CPU (5 values) to avoid
+ * adding a new public Metal API. */
+int ds4_gpu_dspark_head_execute(
+        const ds4_gpu_dspark_head_descriptor *d) {
+    if (!g_initialized && !ds4_gpu_init()) return 0;
+    if (!d || !d->model_map || d->model_size == 0 ||
+        !d->candidate || !d->flat_norm || !d->hc_mix || !d->hc_split ||
+        !d->hc_weights || !d->head_hidden || !d->head_normalized ||
+        !d->base_logits || !d->markov_emb || !d->corrected_logits ||
+        !d->confidence_feat || !d->confidence || !d->draft_tokens) {
+        return 0;
+    }
+    const uint64_t row_values = UINT64_C(5) * 4096u;
+    const uint64_t vocab = d->vocab_size;
+    const uint64_t markov = d->markov_rank;
+    const uint64_t feature = 4096u + markov;
+
+    int ok = ds4_gpu_begin_commands();
+    if (ok) {
+        ok = ds4_gpu_rms_norm_plain_rows_tensor(
+                 d->flat_norm, d->candidate, 4096u,
+                 5u * 4u, 1.0e-6f) &&
+             ds4_gpu_matmul_f16_tensor(
+                 d->hc_mix, d->model_map, d->model_size,
+                 d->weights.hc_fn,
+                 4096u * 4u, 24u, d->flat_norm, 5u) &&
+             ds4_gpu_hc_split_sinkhorn_tensor(
+                 d->hc_split, d->hc_mix, d->model_map, d->model_size,
+                 d->weights.hc_scale, d->weights.hc_base, 4u, 20u,
+                 1.0e-6f) &&
+             ds4_gpu_hc_weighted_sum_split_tensor(
+                 d->head_hidden, d->candidate, d->hc_split, 4096u, 4u) &&
+             ds4_gpu_bf16_round_f32_tensor(
+                 d->head_hidden, row_values) &&
+             ds4_gpu_tensor_copy(
+                 d->head_normalized, 0, d->head_hidden, 0,
+                 row_values * sizeof(float)) &&
+             ds4_gpu_rms_norm_weight_rows_tensor(
+                 d->head_normalized, d->head_normalized,
+                 d->model_map, d->model_size, d->weights.norm,
+                 4096u, 5u, 1.0e-6f) &&
+             ds4_gpu_bf16_round_f32_tensor(
+                 d->head_normalized, row_values) &&
+             ds4_gpu_matmul_q8_0_tensor(
+                 d->base_logits, d->model_map, d->model_size,
+                 d->weights.output, 4096u, vocab,
+                 d->head_normalized, 5u);
+    }
+    if (ds4_gpu_commands_active()) {
+        const int end_ok = ds4_gpu_end_commands();
+        ok = end_ok && ok;
+    }
+    if (!ok) return 0;
+
+    /* Markov correction: for each position, embed the previous token from
+     * markov_w1, project through markov_w2, add to base logits, and argmax. */
+    int32_t previous = d->noise_token_id;
+    if (previous < 0 || (uint32_t)previous >= vocab) return 0;
+    for (uint32_t pos = 0; ok && pos < 5u; pos++) {
+        ds4_gpu_tensor *base_row = ds4_gpu_tensor_view(
+            d->base_logits,
+            (uint64_t)pos * vocab * sizeof(float),
+            vocab * sizeof(float));
+        ds4_gpu_tensor *corrected_row = ds4_gpu_tensor_view(
+            d->corrected_logits,
+            (uint64_t)pos * vocab * sizeof(float),
+            vocab * sizeof(float));
+        ds4_gpu_tensor *draft_row = ds4_gpu_tensor_view(
+            d->draft_tokens,
+            (uint64_t)pos * sizeof(int32_t), sizeof(int32_t));
+        ds4_gpu_tensor *markov_row = ds4_gpu_tensor_view(
+            d->markov_emb,
+            (uint64_t)pos * markov * sizeof(float),
+            markov * sizeof(float));
+        if (!base_row || !corrected_row || !draft_row || !markov_row) {
+            ds4_gpu_tensor_free(draft_row);
+            ds4_gpu_tensor_free(corrected_row);
+            ds4_gpu_tensor_free(base_row);
+            ds4_gpu_tensor_free(markov_row);
+            return 0;
+        }
+        ok = ds4_gpu_begin_commands() &&
+             ds4_gpu_embed_token_q8_0_tensor(
+                 markov_row, d->model_map, d->model_size,
+                 d->weights.markov_w1, (uint32_t)vocab,
+                 (uint32_t)previous, (uint32_t)markov) &&
+             ds4_gpu_bf16_round_f32_tensor(markov_row, markov) &&
+             ds4_gpu_matmul_q8_0_tensor(
+                 corrected_row, d->model_map, d->model_size,
+                 d->weights.markov_w2, markov, vocab, markov_row, 1u) &&
+             ds4_gpu_add_tensor(
+                 corrected_row, corrected_row, base_row,
+                 (uint32_t)vocab);
+        if (ds4_gpu_commands_active()) {
+            const int end_ok = ds4_gpu_end_commands();
+            ok = end_ok && ok;
+        }
+        if (ok) {
+            ok = ds4_gpu_argmax_tensor(
+                     draft_row, corrected_row, (uint32_t)vocab) &&
+                 ds4_gpu_tensor_read(
+                     draft_row, 0, &previous, sizeof(previous)) &&
+                 previous >= 0 && (uint32_t)previous < vocab;
+        }
+        ds4_gpu_tensor_free(draft_row);
+        ds4_gpu_tensor_free(corrected_row);
+        ds4_gpu_tensor_free(base_row);
+        ds4_gpu_tensor_free(markov_row);
+    }
+    if (!ok) return 0;
+
+    /* Confidence: concat head_hidden and markov_emb, project, sigmoid. */
+    ok = ds4_gpu_begin_commands();
+    if (ok) {
+        for (uint32_t pos = 0; ok && pos < 5u; pos++) {
+            const uint64_t off = (uint64_t)pos * feature * sizeof(float);
+            ok = ds4_gpu_tensor_copy(
+                     d->confidence_feat, off,
+                     d->head_hidden,
+                     (uint64_t)pos * 4096u * sizeof(float),
+                     4096u * sizeof(float)) &&
+                 ds4_gpu_tensor_copy(
+                     d->confidence_feat,
+                     off + 4096u * sizeof(float),
+                     d->markov_emb,
+                     (uint64_t)pos * markov * sizeof(float),
+                     markov * sizeof(float));
+        }
+    }
+    if (ok) {
+        ok = ds4_gpu_matmul_q8_0_tensor(
+                 d->confidence, d->model_map, d->model_size,
+                 d->weights.confidence_proj, feature, 1u,
+                 d->confidence_feat, 5u);
+    }
+    if (ds4_gpu_commands_active()) {
+        const int end_ok = ds4_gpu_end_commands();
+        ok = end_ok && ok;
+    }
+    return ok;
 }
 
 #ifdef DS4_TEST_HOOKS

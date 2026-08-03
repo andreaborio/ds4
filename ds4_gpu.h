@@ -1371,6 +1371,46 @@ typedef struct {
 int ds4_gpu_dspark_stage_execute_candidate(
         const ds4_gpu_dspark_stage_descriptor *stage);
 
+/* DSpark HC head: RMSNorm + HC + Markov + confidence over the final stage
+ * candidate.  Produces draft logits and per-position confidence. */
+typedef struct {
+    uint64_t norm;             /* F32 [4096] */
+    uint64_t hc_fn;            /* F16 [16384, 4] */
+    uint64_t hc_scale;         /* F32 [1] */
+    uint64_t hc_base;          /* F32 [4] */
+    uint64_t markov_w1;        /* Q8_0 [vocab, markov_rank] */
+    uint64_t markov_w2;        /* Q8_0 [markov_rank, vocab] */
+    uint64_t confidence_proj;  /* Q8_0 [4096+markov_rank, 1] */
+    uint64_t output;           /* Q8_0 target model output projection */
+    uint64_t token_embd;      /* token embedding table */
+} ds4_gpu_dspark_head_offsets;
+
+typedef struct {
+    uint32_t position0;
+    int32_t noise_token_id;
+    uint32_t vocab_size;
+    uint32_t markov_rank;
+    const void *model_map;
+    uint64_t model_size;
+    ds4_gpu_dspark_head_offsets weights;
+    const ds4_gpu_tensor *candidate;   /* [5, 4, 4096] */
+    ds4_gpu_tensor *flat_norm;         /* [5, 4, 4096] */
+    ds4_gpu_tensor *hc_mix;            /* [5, 24] */
+    ds4_gpu_tensor *hc_split;          /* [5, 24] */
+    ds4_gpu_tensor *hc_weights;        /* [5, 4] */
+    ds4_gpu_tensor *head_hidden;       /* [5, 4096] */
+    ds4_gpu_tensor *head_normalized;   /* [5, 4096] */
+    ds4_gpu_tensor *base_logits;       /* [5, vocab] */
+    ds4_gpu_tensor *markov_emb;        /* [5, markov_rank] */
+    ds4_gpu_tensor *corrected_logits;  /* [5, vocab] */
+    ds4_gpu_tensor *confidence_feat;   /* [5, 4096+markov_rank] */
+    ds4_gpu_tensor *confidence;        /* [5] */
+    ds4_gpu_tensor *draft_tokens;      /* [5] int32 */
+} ds4_gpu_dspark_head_descriptor;
+
+int ds4_gpu_dspark_head_execute(
+        const ds4_gpu_dspark_head_descriptor *d);
+
 int ds4_gpu_attention_decode_mixed_batch_heads_tensor(
         ds4_gpu_tensor       *heads,
         const void             *model_map,
