@@ -1,9 +1,10 @@
-"""Payload-first 32/32/4 fixture for the stage-zero Metal white box.
+"""Payload-first fixtures for the stage-zero attention and FFN white boxes.
 
-The fixture is deliberately synthetic.  Its Q8_0 and F16 weights are first
+The fixtures are deliberately synthetic.  Their Q8_0 and F16 weights are first
 serialized in the formats consumed by the runtime and then reopened from those
-bytes; only the reopened matrices enter the numerical oracle.  This proves a
-test-hook contract, not parity with checkpoint weights.
+bytes; routed FFN weights exist only as valid IQ2_XXS/Q2_K payloads and are
+decoded lazily.  Only reopened matrices enter the numerical oracle.  This
+proves a test-hook contract, not parity with checkpoint weights.
 """
 
 from __future__ import annotations
@@ -48,6 +49,36 @@ class PackedWeight:
 
 
 @dataclass(frozen=True)
+class LazyPackedMatrix:
+    """One valid low-bit GGML matrix decoded only when an expert is used."""
+
+    storage: str
+    logical_shape: tuple[int, int]
+    payload: bytes
+
+    @property
+    def sha256(self) -> str:
+        return hashlib.sha256(self.payload).hexdigest()
+
+    def dequantized(self) -> np.ndarray:
+        if self.storage == "IQ2_XXS":
+            return unpack_iq2_xxs(self.payload, self.logical_shape)
+        if self.storage == "Q2_K":
+            return unpack_q2_k(self.payload, self.logical_shape)
+        raise ValueError(f"unsupported lazy fixture storage {self.storage}")
+
+
+@dataclass(frozen=True)
+class PhysicalFFNFixture:
+    """Five-row, production-width FFN fixture with a compact 256-wide mid."""
+
+    inputs: Mapping[str, object]
+    packed_weights: Mapping[str, PackedWeight]
+    routed_expert_weights: Mapping[int, Mapping[str, LazyPackedMatrix]]
+    expected_selected: np.ndarray
+
+
+@dataclass(frozen=True)
 class PhysicalStageZeroFixture:
     """Complete deterministic input for one C=2 or C=128 white-box run."""
 
@@ -57,6 +88,23 @@ class PhysicalStageZeroFixture:
     packed_weights: Mapping[str, PackedWeight]
     model_blob: bytes
     model_offsets: Mapping[str, int]
+
+
+FFN_HIDDEN_WIDTH = 4096
+FFN_MID_WIDTH = 256
+FFN_EXPERT_COUNT = 256
+FFN_TOPK = 6
+IQ2_XXS_BLOCK = 256
+IQ2_XXS_BLOCK_BYTES = 66
+Q2_K_BLOCK = 256
+Q2_K_BLOCK_BYTES = 84
+FFN_SELECTED_EXPERTS = np.asarray([
+    [5, 0, 4, 1, 3, 2],
+    [11, 6, 10, 7, 9, 8],
+    [17, 12, 16, 13, 15, 14],
+    [23, 18, 22, 19, 20, 21],
+    [255, 24, 30, 27, 29, 28],
+], dtype=np.int32)
 
 
 def _readonly(value: np.ndarray) -> np.ndarray:
@@ -136,6 +184,179 @@ def unpack_q8_0(payload: bytes, shape: tuple[int, ...]) -> PackedWeight:
     if not np.all(np.isfinite(reopened)):
         raise ValueError("Q8_0 payload decoded a non-finite value")
     return PackedWeight("Q8_0", tuple(shape), bytes(payload), _readonly(reopened))
+
+
+def pack_synthetic_iq2_xxs(
+    shape: tuple[int, int], *, seed: int
+) -> LazyPackedMatrix:
+    """Build deterministic valid IQ2_XXS blocks without an ideal matrix.
+
+    Every 8-value codebook index is zero, whose admitted GGML grid is eight
+    equal magnitude-8 lanes.  Expert/row/block asymmetry comes from the eight
+    independent 4-bit group scales and the four even-parity sign masks per
+    group.  Constructing codes directly is intentional: only payload-decoded
+    values exist, so no float matrix can leak around the low-bit contract.
+    """
+
+    if (len(shape) != 2 or shape[1] % IQ2_XXS_BLOCK):
+        raise ValueError("IQ2_XXS shape width must be divisible by 256")
+    rows, width = shape
+    if rows <= 0:
+        raise ValueError("IQ2_XXS shape must be non-empty")
+    block_count = rows * (width // IQ2_XXS_BLOCK)
+    block_index = np.arange(block_count, dtype=np.uint32)
+    blocks = np.zeros((block_count, IQ2_XXS_BLOCK_BYTES), dtype=np.uint8)
+    scales = np.where(
+        ((block_index + np.uint32(seed)) & np.uint32(1)) == 0,
+        np.float32(1.0 / 16.0),
+        np.float32(1.0 / 32.0),
+    ).astype("<f2")
+    blocks[:, :2] = scales.view(np.uint8).reshape(-1, 2)
+    for group32 in range(8):
+        packed_signs = np.zeros(block_count, dtype=np.uint32)
+        for group8 in range(4):
+            sign_index = (
+                np.uint32(seed * 17 + group32 * 11 + group8 * 23)
+                + block_index * np.uint32(29)
+            ) & np.uint32(127)
+            packed_signs |= sign_index << np.uint32(7 * group8)
+        scale_nibble = (
+            np.uint32(seed + group32 * 3) + block_index
+        ) & np.uint32(3)
+        packed_signs |= scale_nibble << np.uint32(28)
+        offset = 2 + group32 * 8
+        # Four zero grid-index bytes are followed by sign/scale little endian.
+        blocks[:, offset + 4:offset + 8] = packed_signs.astype(
+            "<u4"
+        ).view(np.uint8).reshape(-1, 4)
+    return LazyPackedMatrix(
+        "IQ2_XXS", shape, blocks.tobytes(order="C")
+    )
+
+
+def unpack_iq2_xxs(payload: bytes, shape: tuple[int, int]) -> np.ndarray:
+    """Decode the deliberately narrow but physically valid IQ2 fixture."""
+
+    if len(shape) != 2 or shape[1] % IQ2_XXS_BLOCK:
+        raise ValueError("IQ2_XXS shape width must be divisible by 256")
+    block_count = shape[0] * (shape[1] // IQ2_XXS_BLOCK)
+    if len(payload) != block_count * IQ2_XXS_BLOCK_BYTES:
+        raise ValueError("IQ2_XXS payload size does not match shape")
+    blocks = np.frombuffer(payload, dtype=np.uint8).reshape(
+        block_count, IQ2_XXS_BLOCK_BYTES
+    )
+    d = np.ascontiguousarray(blocks[:, :2]).view("<f2").astype(
+        np.float32
+    ).reshape(-1)
+    result = np.empty((block_count, IQ2_XXS_BLOCK), dtype=np.float32)
+    for group32 in range(8):
+        offset = 2 + group32 * 8
+        if np.any(blocks[:, offset:offset + 4] != 0):
+            raise ValueError("synthetic IQ2_XXS payload escaped grid index zero")
+        packed = np.ascontiguousarray(
+            blocks[:, offset + 4:offset + 8]
+        ).view("<u4").reshape(-1)
+        magnitude = (
+            d * np.float32(0.125)
+            * (np.float32(2.0) * (packed >> np.uint32(28)).astype(np.float32)
+               + np.float32(1.0))
+            * np.float32(8.0)
+        )
+        for group8 in range(4):
+            sign_index = (
+                packed >> np.uint32(7 * group8)
+            ) & np.uint32(127)
+            parity = np.array(sign_index, copy=True)
+            parity ^= parity >> np.uint32(4)
+            parity ^= parity >> np.uint32(2)
+            parity ^= parity >> np.uint32(1)
+            parity &= np.uint32(1)
+            sign_mask = sign_index | (parity << np.uint32(7))
+            first = group32 * 32 + group8 * 8
+            for lane in range(8):
+                negative = (
+                    sign_mask & np.uint32(1 << lane)
+                ) != 0
+                result[:, first + lane] = np.where(
+                    negative, -magnitude, magnitude
+                )
+    if not np.all(np.isfinite(result)):
+        raise ValueError("IQ2_XXS payload decoded a non-finite value")
+    return result.reshape(shape)
+
+
+def pack_synthetic_q2_k(
+    shape: tuple[int, int], *, seed: int
+) -> LazyPackedMatrix:
+    """Build asymmetric valid Q2_K blocks for compact down projections."""
+
+    if len(shape) != 2 or shape[1] % Q2_K_BLOCK:
+        raise ValueError("Q2_K shape width must be divisible by 256")
+    rows, width = shape
+    if rows <= 0:
+        raise ValueError("Q2_K shape must be non-empty")
+    block_count = rows * (width // Q2_K_BLOCK)
+    block_index = np.arange(block_count, dtype=np.uint32)
+    blocks = np.zeros((block_count, Q2_K_BLOCK_BYTES), dtype=np.uint8)
+    for group in range(16):
+        scale = np.uint8(1 + ((seed + group) % 3))
+        minimum = np.uint8(1 + ((seed + 2 * group) % 2))
+        blocks[:, group] = scale | np.uint8(minimum << 4)
+        q_base = 32 * (group // 8) + 16 * (group & 1)
+        shift = ((group // 2) & 3) * 2
+        for lane in range(16):
+            q = (
+                block_index
+                + np.uint32(seed * 13 + group * 7 + lane * 3)
+            ) & np.uint32(3)
+            blocks[:, 16 + q_base + lane] |= (
+                q << np.uint32(shift)
+            ).astype(np.uint8)
+    d = np.where(
+        ((block_index + np.uint32(seed)) & np.uint32(1)) == 0,
+        np.float32(1.0 / 128.0),
+        np.float32(1.0 / 256.0),
+    ).astype("<f2")
+    dmin = np.full(block_count, np.float32(1.0 / 256.0), dtype="<f2")
+    blocks[:, 80:82] = d.view(np.uint8).reshape(-1, 2)
+    blocks[:, 82:84] = dmin.view(np.uint8).reshape(-1, 2)
+    return LazyPackedMatrix("Q2_K", shape, blocks.tobytes(order="C"))
+
+
+def unpack_q2_k(payload: bytes, shape: tuple[int, int]) -> np.ndarray:
+    """Decode Q2_K with the same 16-value group addressing as Hebrus."""
+
+    if len(shape) != 2 or shape[1] % Q2_K_BLOCK:
+        raise ValueError("Q2_K shape width must be divisible by 256")
+    block_count = shape[0] * (shape[1] // Q2_K_BLOCK)
+    if len(payload) != block_count * Q2_K_BLOCK_BYTES:
+        raise ValueError("Q2_K payload size does not match shape")
+    blocks = np.frombuffer(payload, dtype=np.uint8).reshape(
+        block_count, Q2_K_BLOCK_BYTES
+    )
+    d = np.ascontiguousarray(blocks[:, 80:82]).view("<f2").astype(
+        np.float32
+    ).reshape(-1)
+    dmin = np.ascontiguousarray(blocks[:, 82:84]).view("<f2").astype(
+        np.float32
+    ).reshape(-1)
+    result = np.empty((block_count, Q2_K_BLOCK), dtype=np.float32)
+    for group in range(16):
+        q_base = 32 * (group // 8) + 16 * (group & 1)
+        shift = ((group // 2) & 3) * 2
+        sc = blocks[:, group]
+        scale = (sc & np.uint8(15)).astype(np.float32)
+        minimum = (sc >> np.uint8(4)).astype(np.float32)
+        for lane in range(16):
+            q = (
+                blocks[:, 16 + q_base + lane] >> np.uint8(shift)
+            ) & np.uint8(3)
+            result[:, group * 16 + lane] = (
+                d * scale * q.astype(np.float32) - dmin * minimum
+            )
+    if not np.all(np.isfinite(result)):
+        raise ValueError("Q2_K payload decoded a non-finite value")
+    return result.reshape(shape)
 
 
 def pack_f16(value: np.ndarray) -> PackedWeight:
@@ -452,4 +673,183 @@ def payload_manifest(fixture: PhysicalStageZeroFixture) -> dict[str, object]:
             name: weight_record(name, weight)
             for name, weight in fixture.packed_weights.items()
         },
+    }
+
+
+def _ffn_hidden_input() -> np.ndarray:
+    hidden = np.zeros((5, 4, FFN_HIDDEN_WIDTH), dtype=np.float32)
+    for token in range(5):
+        for lane in range(4):
+            base = np.float32(0.5 + lane / 16.0)
+            dust = np.float32(2.0 ** -12) * (
+                np.float32(1.0) if ((token + lane) & 1) == 0
+                else np.float32(-1.0)
+            )
+            hidden[token, lane, token] = base + dust
+    return hidden
+
+
+def _ffn_ideal_weights() -> dict[str, np.ndarray]:
+    hc_function = np.zeros((24, 4 * FFN_HIDDEN_WIDTH), dtype=np.float32)
+    for row in range(24):
+        lane = (row * 3 + 1) % 4
+        dimension = row % 5
+        hc_function[row, lane * FFN_HIDDEN_WIDTH + dimension] = np.float32(
+            ((row % 7) - 3) / 32.0
+        )
+
+    router = np.zeros(
+        (FFN_EXPERT_COUNT, FFN_HIDDEN_WIDTH), dtype=np.float32
+    )
+    bias = np.zeros(FFN_EXPERT_COUNT, dtype=np.float32)
+    for token, experts in enumerate(FFN_SELECTED_EXPERTS):
+        for slot, expert_value in enumerate(experts):
+            expert = int(expert_value)
+            router[expert, token] = np.float32(
+                127 * (14 + (expert % 7)) / 4096.0
+            )
+            for dust_lane in range(5, 32):
+                router[expert, dust_lane] = np.float32(
+                    (1.0 if ((expert + dust_lane) & 1) == 0 else -1.0)
+                    / 1024.0
+                )
+            bias[expert] = np.float32((5 - 2 * slot) * 0.4)
+
+    shared_rows = np.arange(FFN_MID_WIDTH, dtype=np.int64)
+    shared_gate = _single_q8_coefficient(
+        FFN_MID_WIDTH,
+        FFN_HIDDEN_WIDTH,
+        (shared_rows * 37 + 3) % FFN_HIDDEN_WIDTH,
+        np.where((shared_rows & 1) == 0, 1, -1),
+    )
+    # Make every fifth gate row consume one of the five live marker lanes so
+    # the official upper-only gate clamp is exercised on every token.
+    shared_gate[np.arange(5), :] = 0.0
+    shared_gate[np.arange(5), np.arange(5)] = np.float32(127.0 / 256.0)
+    shared_up = _single_q8_coefficient(
+        FFN_MID_WIDTH,
+        FFN_HIDDEN_WIDTH,
+        (shared_rows * 53 + 1) % FFN_HIDDEN_WIDTH,
+        np.where((shared_rows % 3) == 0, -1, 1),
+    )
+    shared_up[np.arange(5), :] = 0.0
+    shared_up[np.arange(5), np.arange(5)] = np.float32(-127.0 / 256.0)
+    down_rows = np.arange(FFN_HIDDEN_WIDTH, dtype=np.int64)
+    shared_down = _single_q8_coefficient(
+        FFN_HIDDEN_WIDTH,
+        FFN_MID_WIDTH,
+        (down_rows * 19 + 7) % FFN_MID_WIDTH,
+        np.where((down_rows % 5) < 2, -1, 1),
+    )
+    return {
+        "hc_ffn_function_weight": hc_function,
+        "hc_ffn_scale": np.asarray([0.25, 0.125, 0.0625], dtype=np.float32),
+        "hc_ffn_base": ((np.arange(24) % 9) - 4).astype(np.float32) / 32.0,
+        "ffn_norm_weight": (
+            (np.arange(FFN_HIDDEN_WIDTH) % 13).astype(np.float32) + 12.0
+        ) / 16.0,
+        "router_weight": router,
+        "selection_bias": bias,
+        "shared_gate_weight": shared_gate,
+        "shared_up_weight": shared_up,
+        "shared_down_weight": shared_down,
+    }
+
+
+def build_physical_ffn_fixture() -> PhysicalFFNFixture:
+    """Build the five-row, 30-distinct-expert FFN payload transaction."""
+
+    ideal = _ffn_ideal_weights()
+    packed = {
+        "hc_ffn_function_weight": pack_f16(
+            ideal["hc_ffn_function_weight"]
+        ),
+        "hc_ffn_scale": pack_f32(ideal["hc_ffn_scale"]),
+        "hc_ffn_base": pack_f32(ideal["hc_ffn_base"]),
+        "ffn_norm_weight": pack_f32(ideal["ffn_norm_weight"]),
+        "router_weight": pack_q8_0(ideal["router_weight"]),
+        "selection_bias": pack_f32(ideal["selection_bias"]),
+        "shared_gate_weight": pack_q8_0(ideal["shared_gate_weight"]),
+        "shared_up_weight": pack_q8_0(ideal["shared_up_weight"]),
+        "shared_down_weight": pack_q8_0(ideal["shared_down_weight"]),
+    }
+    routed: dict[int, Mapping[str, LazyPackedMatrix]] = {}
+    for expert_value in FFN_SELECTED_EXPERTS.reshape(-1):
+        expert = int(expert_value)
+        record = {
+            "gate": pack_synthetic_iq2_xxs(
+                (FFN_MID_WIDTH, FFN_HIDDEN_WIDTH), seed=expert * 3 + 1
+            ),
+            "up": pack_synthetic_iq2_xxs(
+                (FFN_MID_WIDTH, FFN_HIDDEN_WIDTH), seed=expert * 3 + 2
+            ),
+            "down": pack_synthetic_q2_k(
+                (FFN_HIDDEN_WIDTH, FFN_MID_WIDTH), seed=expert * 3 + 3
+            ),
+        }
+        routed[expert] = MappingProxyType(record)
+    inputs: dict[str, object] = {
+        "hidden_input": _ffn_hidden_input(),
+        "hc_function_weight": packed["hc_ffn_function_weight"],
+        "hc_scale": packed["hc_ffn_scale"].dequantized,
+        "hc_base": packed["hc_ffn_base"].dequantized,
+        "ffn_norm_weight": packed["ffn_norm_weight"].dequantized,
+        "router_weight": packed["router_weight"],
+        "selection_bias": packed["selection_bias"].dequantized,
+        "shared_gate_weight": packed["shared_gate_weight"],
+        "shared_up_weight": packed["shared_up_weight"],
+        "shared_down_weight": packed["shared_down_weight"],
+        "routed_expert_weights": MappingProxyType(routed),
+    }
+    return PhysicalFFNFixture(
+        MappingProxyType(inputs),
+        MappingProxyType(packed),
+        MappingProxyType(routed),
+        _readonly(np.array(FFN_SELECTED_EXPERTS, copy=True)),
+    )
+
+
+def ffn_payload_manifest(fixture: PhysicalFFNFixture) -> dict[str, object]:
+    """Return stable identities for the compact-mid production-width fixture."""
+
+    routed_digest = hashlib.sha256()
+    routed_bytes = 0
+    routed_records: dict[str, object] = {}
+    for expert in sorted(fixture.routed_expert_weights):
+        record = fixture.routed_expert_weights[expert]
+        component_record: dict[str, object] = {}
+        for role in ("gate", "up", "down"):
+            weight = record[role]
+            routed_digest.update(weight.payload)
+            routed_bytes += len(weight.payload)
+            component_record[role] = {
+                "storage": weight.storage,
+                "shape": list(weight.logical_shape),
+                "bytes": len(weight.payload),
+                "sha256": weight.sha256,
+            }
+        routed_records[str(expert)] = component_record
+    return {
+        "fixture_version": 1,
+        "geometry": {
+            "proposal_rows": 5,
+            "hc_lanes": 4,
+            "hidden_width": FFN_HIDDEN_WIDTH,
+            "expert_count": FFN_EXPERT_COUNT,
+            "topk": FFN_TOPK,
+            "compact_mid_width": FFN_MID_WIDTH,
+        },
+        "selected_experts": fixture.expected_selected.tolist(),
+        "non_routed": {
+            name: {
+                "storage": weight.storage,
+                "shape": list(weight.logical_shape),
+                "bytes": len(weight.payload),
+                "sha256": weight.sha256,
+            }
+            for name, weight in fixture.packed_weights.items()
+        },
+        "routed_payload_bytes": routed_bytes,
+        "routed_payload_sha256": routed_digest.hexdigest(),
+        "routed_records": routed_records,
     }

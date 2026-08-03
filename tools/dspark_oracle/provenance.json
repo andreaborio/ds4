@@ -162,7 +162,7 @@
     }
   },
   "validation": {
-    "capturedAt": "2026-08-03T09:53:59+02:00",
+    "capturedAt": "2026-08-03T13:53:46+02:00",
     "hardware": "Apple M5 Pro, 64 GB unified memory",
     "os": "macOS 26.5.2 (25F84)",
     "python": "3.13.13",
@@ -184,13 +184,21 @@
       "hcPreReductionFloat32": 0.00000003326538255965517,
       "hcPostExpansionFloat32": 0.00000025449105267583156,
       "hcFinalHeadFloat32": 0.00000009989789218067813,
-      "dsparkAttentionBfloat16": 0.000244140625
+      "dsparkAttentionBfloat16": 0.000244140625,
+      "ffnRouterLogitsFloat32": 0.015625,
+      "ffnRouterProbabilitiesFloat32": 0.0013456344604492188,
+      "ffnExpertWeightsFloat32": 0.00004869699478149414,
+      "ffnRoutedMidBfloat16": 0.00048828125,
+      "ffnRoutedDownBfloat16": 0.001953125,
+      "ffnRoutedSumFloat32": 0.001953125,
+      "ffnMoeOutputBfloat16": 0.0,
+      "ffnHcPostBfloat16": 0.0
     },
     "semanticAudit": {
-      "capturedAt": "2026-08-03T09:53:59+02:00",
+      "capturedAt": "2026-08-03T13:53:46+02:00",
       "deepSpecRevision": "005e03b81cec38b7da6399833d609ee89a2587f2",
-      "systemPython": "43 passed, 2 explicit optional MLX/support-file skips",
-      "mlxMetal": "44 passed, 1 explicit optional-support-file skip with mlx==0.32.0, mlx-metal==0.32.0, Device(gpu, 0)",
+      "systemPython": "55 passed, 2 explicit optional MLX/support-file skips",
+      "mlxMetal": "56 passed, 1 explicit optional-support-file skip with mlx==0.32.0, mlx-metal==0.32.0, Device(gpu, 0)",
       "findings": [
         "confidence scheduling uses the first per-position sigmoid below threshold, not cumulative survival",
         "greedy and caller-uniform sampled Markov drafts feed each selected token into the next proposal step",
@@ -204,7 +212,10 @@
         "the proposal ring is already committed through p and adds only five transient candidate rows; the full-ring attention view preserves pinned physical slot order 0..127 rather than chronological wrap order; accepted multi-row target-verifier prefixes commit atomically while rejection and zero-row rollback preserve prior storage",
         "five noncausal query rows attend through online 64-row blocks with FP32 max, denominator and accumulator, per-block BF16 exponential weights, denominator-only sinks and a final BF16 output boundary; the full-ring fixture changes 10,073 lanes under the rejected chronological ordering",
         "the pending target token is y[p+1], candidate inputs occupy p+1..p+5, and five DSpark head outputs propose p+2..p+6 rather than re-predicting y[p+1]",
-        "the final support GGUF v3 header contains exactly 81 descriptors split 26/24/31 across stages; real-file offsets and structural size are checked without reading payload bytes"
+        "the final support GGUF v3 header contains exactly 81 descriptors split 26/24/31 across stages; real-file offsets and structural size are checked without reading payload bytes",
+        "the production-width FFN fixture preserves five rows, four HC lanes, hidden width 4096, 256 experts and top six while reducing only the intermediate width to one valid 256-value IQ2_XXS/Q2_K block; 30 distinct payload-only routed records include expert ids 0, 29, 30 and 255",
+        "sqrt-softplus routing is F32, selection bias never enters expert weights, Hebrus resolves exact ties by lower expert id, the six unbiased values normalize to 1.5, duplicate candidate rows reuse six routed records, and invalid or zero-denominator rows fail closed without a SUPPORT expert id",
+        "shared Q8 and routed IQ2_XXS/Q2_K execution publishes BF16 at the official HC/norm, pre-down, per-down, MoE and HC-post seams; clamp-10 and ascending-expert-id F32 accumulation are independently observable"
       ]
     }
   }

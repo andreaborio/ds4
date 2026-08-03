@@ -181,6 +181,50 @@ This is still synthetic evidence. It does not claim checkpoint-weight parity,
 real-model graph parity, or product readiness; those require the native hook
 to consume the frozen payload blob and later real-weight captures.
 
+The payload-first FFN fixture continues from that attention handoff without
+reducing the product-facing axes: five candidate rows, four HC lanes, hidden
+width 4096, 256 routed experts, and top six routing. Only the expert
+intermediate width is reduced from 2048 to 256, which is one complete block for
+both IQ2_XXS gate/up and Q2_K down storage. The Q8_0 router and shared
+gate/up/down matrices, F16 HC function, and F32 norm/HC/router-bias tensors are
+serialized and reopened before use. Routed records are constructed directly
+as valid IQ2_XXS/Q2_K payloads and decoded lazily; there is no ideal routed
+float matrix. Thirty distinct selected records occupy 26,542,080 bytes and
+include expert ids 0, 29, 30, and 255. A separate duplicate-row mutation
+reduces the five-row route union to 24 experts, so both the 30-record SUPPORT
+floor and duplicate reuse are observable.
+
+The FFN dtype schedule is copied as semantics, not implementation, from the
+pinned official `inference/model.py` whose SHA-256 is recorded in
+`provenance.json`. Stage input, HC-pre, and FFN RMSNorm publish BF16. Routing
+promotes activation and logical weight to F32, applies
+`sqrt(softplus(logit))`, adds the F32 bias only for selection, and normalizes
+the six unbiased probabilities before multiplying by 1.5. The official
+`torch.topk` does not define tie order; score-descending/expert-id-ascending is
+the deterministic Hebrus/Metal policy. A non-finite row, F32 matmul overflow,
+or exact six-way denominator of zero publishes no route (`-1` ids and zero
+probabilities/weights), with no artificial denominator floor. Shared and routed
+gate/up linear results return from their BF16 weights before F32 clamp/SwiGLU.
+Gate has only the upper clamp 10;
+up is clamped to `[-10, 10]`. The weighted routed mid and unweighted shared mid
+publish BF16 immediately before down; each down result is BF16. Routed expert
+results are accumulated in ascending expert-id order in F32, independent of
+top-k slot order, shared down is added in F32, and only then does MoE publish
+BF16. HC-post publishes the final BF16 four-lane state. Bias removal, a
+seven-way exact tie, clamp removal, slot-order accumulation, payload-code
+mutation, 30-distinct routing, and duplicate routing are separate negative
+controls.
+
+On pinned MLX 0.32.0 / mlx-metal 0.32.0 on M5 Pro, every FFN boundary has its
+own ceiling. Hidden/HC/norm and the complete shared path are exact. Eight router
+logits differ by at most `0.015625`, their probabilities by
+`0.0013456344604492188`, and the 30 normalized route weights by
+`0.00004869699478149414`. The explicit pre-down BF16 boundary limits the
+propagation to `0.00048828125` in routed mid and `0.001953125` in routed down
+and the F32 routed sum; final MoE BF16 and HC-post BF16 are exact. These are
+operation-specific synthetic-fixture limits, not checkpoint accuracy claims or
+a tolerance for the future native graph.
+
 `schema.json` maps the pinned official Hugging Face config to the canonical
 combined-GGUF `dspark.*` records and to the standalone support header, including
 its six authenticated source-provenance fields. The target keeps

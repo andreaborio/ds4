@@ -162,6 +162,40 @@ class StageZeroAttentionHalf:
     hc_post_output: np.ndarray
 
 
+@dataclass(frozen=True)
+class RouterSelection:
+    """Final-0731 sqrt-softplus routing before expert execution."""
+
+    logits: np.ndarray
+    probabilities: np.ndarray
+    selected_experts: np.ndarray
+    expert_weights: np.ndarray
+
+
+@dataclass(frozen=True)
+class StageFFNMoE:
+    """Named official-dtype publications through one DSpark FFN half."""
+
+    hidden_input: np.ndarray
+    hc_pre_output: np.ndarray
+    ffn_normalized: np.ndarray
+    router_logits: np.ndarray
+    router_probabilities: np.ndarray
+    selected_experts: np.ndarray
+    expert_weights: np.ndarray
+    shared_gate: np.ndarray
+    shared_up: np.ndarray
+    shared_mid: np.ndarray
+    shared_down: np.ndarray
+    routed_gate: np.ndarray
+    routed_up: np.ndarray
+    routed_mid: np.ndarray
+    routed_down: np.ndarray
+    routed_sum: np.ndarray
+    moe_output: np.ndarray
+    hc_post_output: np.ndarray
+
+
 # These are the numerical guards in DeepSpec's pinned evaluator.  They are
 # deliberately named here: callers must not mistake them for a different
 # proposal distribution or an adjustable product policy.
@@ -176,6 +210,12 @@ DSPARK_ATTENTION_BLOCK = 64
 DSPARK_PROPOSAL_ROWS = 5
 DSPARK_ROPE_WIDTH = 64
 DSPARK_OUTPUT_GROUPS = 8
+DSPARK_HIDDEN_WIDTH = 4096
+DSPARK_ROUTED_EXPERTS = 256
+DSPARK_ROUTED_TOPK = 6
+DSPARK_FFN_FIXTURE_MID = 256
+DSPARK_EXPERT_WEIGHT_SCALE = 1.5
+DSPARK_SWIGLU_CLAMP = 10.0
 
 
 def post_layer_hc_mean(hidden_states: np.ndarray) -> np.ndarray:
@@ -691,6 +731,294 @@ def _stable_sigmoid(value: np.ndarray) -> np.ndarray:
     negative_exp = np.exp(value[~positive])
     result[~positive] = negative_exp / (1.0 + negative_exp)
     return result
+
+
+def _payload_matrix(value: object, name: str) -> np.ndarray:
+    """Open one fixture weight without accepting an undisclosed ideal matrix."""
+
+    opened = getattr(value, "dequantized", value)
+    if callable(opened):
+        opened = opened()
+    matrix = np.asarray(opened, dtype=np.float32)
+    if matrix.ndim != 2 or not np.all(np.isfinite(matrix)):
+        raise ValueError(f"{name} must decode to one finite matrix")
+    return matrix
+
+
+def _sqrt_softplus_f32(value: np.ndarray) -> np.ndarray:
+    source = np.asarray(value, dtype=np.float32)
+    softplus = (
+        np.maximum(source, np.float32(0.0))
+        + np.log1p(np.exp(-np.abs(source), dtype=np.float32), dtype=np.float32)
+    )
+    return np.sqrt(softplus, dtype=np.float32)
+
+
+def dspark_router_q8(
+    normalized: np.ndarray,
+    router_weight: object,
+    selection_bias: Sequence[float] | np.ndarray,
+    *,
+    topk: int = DSPARK_ROUTED_TOPK,
+    weight_scale: float = DSPARK_EXPERT_WEIGHT_SCALE,
+) -> RouterSelection:
+    """Run final-0731 routing with deterministic lower-id tie breaking.
+
+    The official gate promotes the BF16-normalized activation and the logical
+    router weight to float32, computes ``sqrt(softplus(logit))``, and adds the
+    F32 bias only to the selection score.  The selected experts are weighted
+    from the unbiased probabilities, normalized over the six selected values,
+    and multiplied by 1.5.  This function spells out the lower-expert-id tie
+    rule relied on by the native stable top-k implementation.
+    """
+
+    source = np.asarray(normalized, dtype=np.float32)
+    router = _payload_matrix(router_weight, "router weight")
+    bias = np.asarray(selection_bias, dtype=np.float32)
+    if source.ndim != 2 or source.shape[0] != DSPARK_PROPOSAL_ROWS:
+        raise ValueError("router input must have shape [5, hidden]")
+    if router.shape != (DSPARK_ROUTED_EXPERTS, source.shape[1]):
+        raise ValueError("router weight must have shape [256, hidden]")
+    if bias.shape != (DSPARK_ROUTED_EXPERTS,):
+        raise ValueError("router selection bias must have shape [256]")
+    if (isinstance(topk, bool) or topk != DSPARK_ROUTED_TOPK or
+            not np.isfinite(float(weight_scale)) or
+            float(weight_scale) != DSPARK_EXPERT_WEIGHT_SCALE):
+        raise ValueError("final 0731 requires topk=6 and weight_scale=1.5")
+    if not np.all(np.isfinite(source)) or not np.all(np.isfinite(bias)):
+        raise ValueError("router inputs must be finite")
+
+    # Finite operands may still overflow an F32 reduction. Keep raw logits
+    # observable, but never publish a route that a SUPPORT gather could use
+    # unless every derived value and the exact six-way denominator are valid.
+    with np.errstate(over="ignore", invalid="ignore"):
+        logits = np.matmul(source, router.T, dtype=np.float32)
+    probabilities = np.zeros_like(logits, dtype=np.float32)
+    expert_ids = np.arange(DSPARK_ROUTED_EXPERTS, dtype=np.int32)
+    selected = np.full(
+        (DSPARK_PROPOSAL_ROWS, DSPARK_ROUTED_TOPK), -1, dtype=np.int32
+    )
+    weights = np.zeros(selected.shape, dtype=np.float32)
+    for row in range(DSPARK_PROPOSAL_ROWS):
+        if not np.all(np.isfinite(logits[row])):
+            continue
+        row_probabilities = _sqrt_softplus_f32(logits[row])
+        with np.errstate(over="ignore", invalid="ignore"):
+            row_selection = row_probabilities + bias
+        if (not np.all(np.isfinite(row_probabilities)) or
+                not np.all(np.isfinite(row_selection))):
+            continue
+        # lexsort's last key is primary: descending score, then lower id.
+        order = np.lexsort((expert_ids, -row_selection))
+        row_selected = order[:DSPARK_ROUTED_TOPK]
+        unbiased = row_probabilities[row_selected]
+        denominator = np.sum(unbiased, dtype=np.float32)
+        if not np.isfinite(denominator) or not denominator > 0.0:
+            continue
+        probabilities[row] = row_probabilities
+        selected[row] = row_selected
+        weights[row] = (
+            unbiased / denominator * np.float32(weight_scale)
+        )
+    return RouterSelection(logits, probabilities, selected, weights)
+
+
+def _swiglu_f32(
+    gate: np.ndarray,
+    up: np.ndarray,
+    *,
+    clamp: float,
+) -> np.ndarray:
+    gate_f32 = np.asarray(gate, dtype=np.float32)
+    up_f32 = np.asarray(up, dtype=np.float32)
+    if clamp > 1.0e-6:
+        gate_clamped = np.minimum(gate_f32, np.float32(clamp))
+        up_clamped = np.clip(up_f32, np.float32(-clamp), np.float32(clamp))
+    else:
+        gate_clamped = gate_f32
+        up_clamped = up_f32
+    sigmoid = np.empty_like(gate_clamped)
+    positive = gate_clamped >= 0.0
+    sigmoid[positive] = np.float32(1.0) / (
+        np.float32(1.0)
+        + np.exp(-gate_clamped[positive], dtype=np.float32)
+    )
+    negative_exp = np.exp(gate_clamped[~positive], dtype=np.float32)
+    sigmoid[~positive] = negative_exp / (np.float32(1.0) + negative_exp)
+    return gate_clamped * sigmoid * up_clamped
+
+
+def stage_ffn_moe_payload_first(
+    hidden_input: np.ndarray,
+    hc_function_weight: object,
+    hc_scale: Sequence[float] | np.ndarray,
+    hc_base: Sequence[float] | np.ndarray,
+    ffn_norm_weight: Sequence[float] | np.ndarray,
+    router_weight: object,
+    selection_bias: Sequence[float] | np.ndarray,
+    shared_gate_weight: object,
+    shared_up_weight: object,
+    shared_down_weight: object,
+    routed_expert_weights: dict[int, dict[str, object]],
+    *,
+    norm_eps: float = 1.0e-6,
+    hc_eps: float = 1.0e-6,
+    hc_iterations: int = 20,
+    swiglu_clamp: float = DSPARK_SWIGLU_CLAMP,
+) -> StageFFNMoE:
+    """Execute the payload-first compact-mid FFN at official dtype seams.
+
+    Hidden width, HC lanes, proposal rows, expert inventory and top-k retain
+    final-0731 geometry.  Only the expert intermediate width is reduced from
+    2048 to one complete 256-value GGML block.  The dtype schedule follows the
+    pinned official source: HC-pre and FFN norm return BF16; routing remains
+    F32; clamp/SwiGLU/router weighting is F32; the mid returns to BF16 before
+    every down projection; individual downs are BF16; routed/shared summation
+    is F32 and publishes BF16 before HC-post, which also publishes BF16.
+    """
+
+    hidden_source = np.asarray(hidden_input, dtype=np.float32)
+    if hidden_source.shape != (
+        DSPARK_PROPOSAL_ROWS, 4, DSPARK_HIDDEN_WIDTH
+    ) or not np.all(np.isfinite(hidden_source)):
+        raise ValueError("FFN hidden input must have shape [5, 4, 4096]")
+    if (not np.isfinite(float(swiglu_clamp)) or
+            float(swiglu_clamp) < 0.0):
+        raise ValueError("SwiGLU clamp must be finite and non-negative")
+    function = _payload_matrix(hc_function_weight, "FFN HC function")
+    if function.shape != (24, 4 * DSPARK_HIDDEN_WIDTH):
+        raise ValueError("FFN HC function must have shape [24, 16384]")
+    norm_weight = np.asarray(ffn_norm_weight, dtype=np.float32)
+    if norm_weight.shape != (DSPARK_HIDDEN_WIDTH,) or not np.all(
+        np.isfinite(norm_weight)
+    ):
+        raise ValueError("FFN norm weight must have shape [4096]")
+
+    shared_gate_matrix = _payload_matrix(
+        shared_gate_weight, "shared gate weight"
+    )
+    shared_up_matrix = _payload_matrix(shared_up_weight, "shared up weight")
+    shared_down_matrix = _payload_matrix(
+        shared_down_weight, "shared down weight"
+    )
+    if (shared_gate_matrix.shape !=
+            (DSPARK_FFN_FIXTURE_MID, DSPARK_HIDDEN_WIDTH) or
+            shared_up_matrix.shape != shared_gate_matrix.shape or
+            shared_down_matrix.shape !=
+            (DSPARK_HIDDEN_WIDTH, DSPARK_FFN_FIXTURE_MID)):
+        raise ValueError("shared expert compact geometry mismatch")
+
+    hidden = _round_bfloat16(hidden_source)
+    reduced, split = hc_pre(
+        hidden,
+        function,
+        hc_scale,
+        hc_base,
+        norm_eps=norm_eps,
+        hc_eps=hc_eps,
+        iterations=hc_iterations,
+    )
+    hc_pre_output = _round_bfloat16(reduced)
+    ffn_normalized = _rms_norm_bfloat16(
+        hc_pre_output, norm_weight, eps=norm_eps
+    )
+    routing = dspark_router_q8(
+        ffn_normalized, router_weight, selection_bias
+    )
+
+    shared_gate = _round_bfloat16(np.matmul(
+        ffn_normalized, shared_gate_matrix.T, dtype=np.float32
+    ))
+    shared_up = _round_bfloat16(np.matmul(
+        ffn_normalized, shared_up_matrix.T, dtype=np.float32
+    ))
+    shared_mid_f32 = _swiglu_f32(
+        shared_gate, shared_up, clamp=float(swiglu_clamp)
+    )
+    shared_mid = _round_bfloat16(shared_mid_f32)
+    shared_down = _round_bfloat16(np.matmul(
+        shared_mid, shared_down_matrix.T, dtype=np.float32
+    ))
+
+    gate_result = np.empty(
+        (DSPARK_PROPOSAL_ROWS, DSPARK_ROUTED_TOPK,
+         DSPARK_FFN_FIXTURE_MID), dtype=np.float32
+    )
+    up_result = np.empty_like(gate_result)
+    mid_result = np.empty_like(gate_result)
+    down_result = np.empty(
+        (DSPARK_PROPOSAL_ROWS, DSPARK_ROUTED_TOPK,
+         DSPARK_HIDDEN_WIDTH), dtype=np.float32
+    )
+    for row in range(DSPARK_PROPOSAL_ROWS):
+        for slot in range(DSPARK_ROUTED_TOPK):
+            expert = int(routing.selected_experts[row, slot])
+            record = routed_expert_weights.get(expert)
+            if record is None or set(record) != {"gate", "up", "down"}:
+                raise ValueError(f"missing complete payload for expert {expert}")
+            gate_matrix = _payload_matrix(record["gate"], "routed gate")
+            up_matrix = _payload_matrix(record["up"], "routed up")
+            if (gate_matrix.shape !=
+                    (DSPARK_FFN_FIXTURE_MID, DSPARK_HIDDEN_WIDTH) or
+                    up_matrix.shape != gate_matrix.shape):
+                raise ValueError("routed gate/up compact geometry mismatch")
+            gate = _round_bfloat16(np.matmul(
+                gate_matrix, ffn_normalized[row], dtype=np.float32
+            ))
+            up = _round_bfloat16(np.matmul(
+                up_matrix, ffn_normalized[row], dtype=np.float32
+            ))
+            mid_f32 = _swiglu_f32(
+                gate, up, clamp=float(swiglu_clamp)
+            ) * routing.expert_weights[row, slot]
+            mid = _round_bfloat16(mid_f32)
+            # Release the two wide decoded matrices before opening down.
+            del gate_matrix, up_matrix
+            down_matrix = _payload_matrix(record["down"], "routed down")
+            if down_matrix.shape != (
+                DSPARK_HIDDEN_WIDTH, DSPARK_FFN_FIXTURE_MID
+            ):
+                raise ValueError("routed down compact geometry mismatch")
+            down = _round_bfloat16(np.matmul(
+                down_matrix, mid, dtype=np.float32
+            ))
+            gate_result[row, slot] = gate
+            up_result[row, slot] = up
+            mid_result[row, slot] = mid
+            down_result[row, slot] = down
+
+    routed_sum = np.zeros(
+        (DSPARK_PROPOSAL_ROWS, DSPARK_HIDDEN_WIDTH), dtype=np.float32
+    )
+    for row in range(DSPARK_PROPOSAL_ROWS):
+        # Official MoE walks expert ids in ascending order and accumulates y in
+        # float32; selection rank must not silently become reduction order.
+        order = np.argsort(routing.selected_experts[row], kind="stable")
+        for slot in order:
+            routed_sum[row] = routed_sum[row] + down_result[row, slot]
+    moe_output = _round_bfloat16(routed_sum + shared_down)
+    post = hc_post(moe_output, hidden, split)
+    hc_post_output = _round_bfloat16(post)
+    return StageFFNMoE(
+        hidden,
+        hc_pre_output,
+        ffn_normalized,
+        routing.logits,
+        routing.probabilities,
+        routing.selected_experts,
+        routing.expert_weights,
+        shared_gate,
+        shared_up,
+        shared_mid,
+        shared_down,
+        gate_result,
+        up_result,
+        mid_result,
+        down_result,
+        routed_sum,
+        moe_output,
+        hc_post_output,
+    )
 
 
 def hc_split_sinkhorn(

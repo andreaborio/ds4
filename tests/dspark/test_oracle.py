@@ -67,6 +67,13 @@ from tools.dspark_oracle import (  # noqa: E402
 )
 from tools.dspark_oracle import mlx_optional  # noqa: E402
 from tools.dspark_oracle import reference as dspark_reference  # noqa: E402
+from tools.dspark_oracle.physical_fixture import (  # noqa: E402
+    FFN_SELECTED_EXPERTS,
+    build_physical_ffn_fixture,
+    ffn_payload_manifest,
+    unpack_iq2_xxs,
+    unpack_q2_k,
+)
 from tools.dspark_oracle.support_schema import (  # noqa: E402
     SupportHeader,
     SupportSchemaError,
@@ -2978,9 +2985,342 @@ class OracleFixtureTests(unittest.TestCase):
             mlx_optional.MLX_BF16_PHYSICAL_STAGE_ZERO_ATTENTION_MAX_ABS_DRIFT,
             1.220703125e-4,
         )
+        self.assertEqual(
+            mlx_optional.MLX_FFN_OPERATION_MAX_ABS_DRIFT,
+            {
+                "hidden_input": 0.0,
+                "hc_pre_output": 0.0,
+                "ffn_normalized": 0.0,
+                "router_logits": 1.5625e-2,
+                "router_probabilities": 1.3456344604492188e-3,
+                "expert_weights": 4.869699478149414e-5,
+                "shared_gate": 0.0,
+                "shared_up": 0.0,
+                "shared_mid": 0.0,
+                "shared_down": 0.0,
+                "routed_gate": 0.0,
+                "routed_up": 0.0,
+                "routed_mid": 4.8828125e-4,
+                "routed_down": 1.953125e-3,
+                "routed_sum": 1.953125e-3,
+                "moe_output": 0.0,
+                "hc_post_output": 0.0,
+            },
+        )
         self.assertGreater(
             mlx_optional.MLX_F32_MARKOV_MATMUL_MAX_ABS_DRIFT,
             mlx_optional.MLX_F32_CONFIDENCE_MAX_ABS_DRIFT,
+        )
+
+    def test_physical_ffn_payload_geometry_and_codecs(self) -> None:
+        fixture = build_physical_ffn_fixture()
+        manifest = ffn_payload_manifest(fixture)
+        self.assertEqual(manifest["geometry"], {
+            "proposal_rows": 5,
+            "hc_lanes": 4,
+            "hidden_width": 4096,
+            "expert_count": 256,
+            "topk": 6,
+            "compact_mid_width": 256,
+        })
+        self.assertEqual(manifest["selected_experts"], FFN_SELECTED_EXPERTS.tolist())
+        self.assertEqual(manifest["routed_payload_bytes"], 26_542_080)
+        self.assertEqual(
+            manifest["routed_payload_sha256"],
+            "49bf413cc3e98472a7aceb53b1b4a16b83ab2182354dfe766815c3a064f274bb",
+        )
+        self.assertEqual(len(fixture.routed_expert_weights), 30)
+        self.assertEqual(
+            set(fixture.routed_expert_weights),
+            set(int(item) for item in FFN_SELECTED_EXPERTS.reshape(-1)),
+        )
+        self.assertTrue({0, 29, 30, 255}.issubset(
+            fixture.routed_expert_weights
+        ))
+
+        for expert in (0, 29, 30, 255):
+            record = fixture.routed_expert_weights[expert]
+            self.assertEqual(
+                [record[role].storage for role in ("gate", "up", "down")],
+                ["IQ2_XXS", "IQ2_XXS", "Q2_K"],
+            )
+            self.assertEqual(record["gate"].logical_shape, (256, 4096))
+            self.assertEqual(record["up"].logical_shape, (256, 4096))
+            self.assertEqual(record["down"].logical_shape, (4096, 256))
+            self.assertFalse(hasattr(record["gate"], "ideal"))
+            gate = record["gate"].dequantized()
+            up = record["up"].dequantized()
+            down = record["down"].dequantized()
+            self.assertEqual(gate.shape, (256, 4096))
+            self.assertEqual(down.shape, (4096, 256))
+            self.assertGreater(np.unique(gate).size, 8)
+            self.assertGreater(np.unique(down).size, 8)
+            self.assertGreater(int(np.count_nonzero(gate != up)), 100_000)
+
+        self.assertNotEqual(
+            fixture.routed_expert_weights[0]["gate"].payload,
+            fixture.routed_expert_weights[29]["gate"].payload,
+        )
+        broken_iq = bytearray(
+            fixture.routed_expert_weights[0]["gate"].payload
+        )
+        broken_iq[2] = 1
+        with self.assertRaisesRegex(ValueError, "grid index zero"):
+            unpack_iq2_xxs(bytes(broken_iq), (256, 4096))
+        broken_q2 = bytearray(
+            fixture.routed_expert_weights[0]["down"].payload
+        )
+        original_q2 = unpack_q2_k(bytes(broken_q2), (4096, 256))
+        broken_q2[16] ^= 0x03
+        mutated_q2 = unpack_q2_k(bytes(broken_q2), (4096, 256))
+        self.assertGreater(int(np.count_nonzero(original_q2 != mutated_q2)), 0)
+
+    def test_physical_ffn_freezes_official_bf16_and_routing_seams(self) -> None:
+        fixture = build_physical_ffn_fixture()
+        result = dspark_reference.stage_ffn_moe_payload_first(**fixture.inputs)
+        np.testing.assert_array_equal(
+            result.selected_experts, FFN_SELECTED_EXPERTS
+        )
+        self.assertEqual(np.unique(result.selected_experts).size, 30)
+        selection_scores = (
+            result.router_probabilities
+            + np.asarray(
+                fixture.inputs["selection_bias"], dtype=np.float32
+            )[None, :]
+        )
+        expert_ids = np.arange(256, dtype=np.int32)
+        cutoff_margins = []
+        for row in selection_scores:
+            order = np.lexsort((expert_ids, -row))
+            cutoff_margins.append(float(row[order[5]] - row[order[6]]))
+        self.assertEqual(min(cutoff_margins), 0.04725050926208496)
+        self.assertGreater(
+            min(cutoff_margins),
+            2.0 * max(
+                mlx_optional.MLX_FFN_OPERATION_MAX_ABS_DRIFT[
+                    "router_logits"
+                ],
+                mlx_optional.MLX_FFN_OPERATION_MAX_ABS_DRIFT[
+                    "router_probabilities"
+                ],
+            ),
+        )
+        np.testing.assert_allclose(
+            np.sum(result.expert_weights, axis=1, dtype=np.float32),
+            np.full(5, 1.5, dtype=np.float32),
+            rtol=0.0,
+            atol=1.1920928955078125e-7,
+        )
+        self.assertGreater(np.unique(result.expert_weights).size, 12)
+
+        bf16_fields = (
+            "hidden_input", "hc_pre_output", "ffn_normalized",
+            "shared_gate", "shared_up", "shared_mid", "shared_down",
+            "routed_gate", "routed_up", "routed_mid", "routed_down",
+            "moe_output", "hc_post_output",
+        )
+        for field in bf16_fields:
+            self._assert_bfloat16_boundary(getattr(result, field))
+        self.assertGreater(
+            int(np.count_nonzero(
+                result.router_probabilities
+                != self._round_fixture_bfloat16(result.router_probabilities)
+            )),
+            1_000,
+        )
+        self.assertGreater(
+            int(np.count_nonzero(
+                result.routed_sum
+                != self._round_fixture_bfloat16(result.routed_sum)
+            )),
+            10_000,
+        )
+
+        expected_shapes = {
+            "ffn_normalized": (5, 4096),
+            "router_logits": (5, 256),
+            "selected_experts": (5, 6),
+            "shared_mid": (5, 256),
+            "routed_mid": (5, 6, 256),
+            "routed_down": (5, 6, 4096),
+            "moe_output": (5, 4096),
+            "hc_post_output": (5, 4, 4096),
+        }
+        for field, shape in expected_shapes.items():
+            self.assertEqual(getattr(result, field).shape, shape, field)
+
+        expected_digests = {
+            "ffn_normalized": "c6a60e7d9980460fd4e0c7c0bf86e3714529c97985a85d7bcaafede9d28660f3",
+            "router_probabilities":
+                "c0348ed01aff47a3c2848dd67b5e5acddb2ffd4323e1443d5f9d4f018568b63a",
+            "expert_weights": "895dc2d1c4a85c9287b8b54650f2cd6594eca9c9bba28c6bac3c6e5ccc657838",
+            "shared_mid": "1e40914cd3afa5503dd02ec4ca16db794346320a23d7aedf1aa09da27fa03d2c",
+            "routed_mid": "0d97fe47189317749e687e17b936557b63e0876d3882723644d2fe115957c107",
+            "routed_sum": "a0fffc630dffb5e5453e4a592b3259cb518a1de0179c7565ec3639674af1ad85",
+            "moe_output": "7eeb6da946f8beb36c6929cbf2eded900ea9f25be78a99c2e41b4b49a807287a",
+            "hc_post_output": "aac836a61f36f6da2a586d7eba3b0fd1370fcc5a82e24572e7ad3caa7ba75acc",
+        }
+        for field, digest in expected_digests.items():
+            self.assertEqual(
+                self._array_digest(getattr(result, field), "<f4"),
+                digest,
+                field,
+            )
+
+    def test_physical_ffn_mutations_pin_bias_ties_clamp_and_sum_order(self) -> None:
+        fixture = build_physical_ffn_fixture()
+        result = dspark_reference.stage_ffn_moe_payload_first(**fixture.inputs)
+
+        zero_bias = np.zeros(256, dtype=np.float32)
+        unbiased = dspark_reference.dspark_router_q8(
+            result.ffn_normalized, fixture.inputs["router_weight"], zero_bias
+        )
+        self.assertFalse(np.array_equal(
+            unbiased.selected_experts, result.selected_experts
+        ))
+        for row in range(5):
+            self.assertEqual(
+                set(unbiased.selected_experts[row]),
+                set(result.selected_experts[row]),
+            )
+            base_by_id = {
+                int(expert): float(result.expert_weights[row, slot])
+                for slot, expert in enumerate(result.selected_experts[row])
+            }
+            unbiased_by_id = {
+                int(expert): float(unbiased.expert_weights[row, slot])
+                for slot, expert in enumerate(unbiased.selected_experts[row])
+            }
+            for expert in base_by_id:
+                self.assertAlmostEqual(
+                    base_by_id[expert], unbiased_by_id[expert], places=6
+                )
+        np.testing.assert_array_equal(
+            unbiased.probabilities, result.router_probabilities
+        )
+
+        tied_router = np.array(
+            fixture.inputs["router_weight"].dequantized, copy=True
+        )
+        tied_router[[0, 1, 2, 3, 4, 5, 25]] = tied_router[0]
+        tied = dspark_reference.dspark_router_q8(
+            result.ffn_normalized, tied_router, zero_bias
+        )
+        np.testing.assert_array_equal(
+            tied.selected_experts[0], np.arange(6, dtype=np.int32)
+        )
+        self.assertNotIn(25, tied.selected_experts[0])
+
+        duplicated_input = np.array(result.ffn_normalized, copy=True)
+        duplicated_input[1] = duplicated_input[0]
+        duplicated = dspark_reference.dspark_router_q8(
+            duplicated_input,
+            fixture.inputs["router_weight"],
+            fixture.inputs["selection_bias"],
+        )
+        np.testing.assert_array_equal(
+            duplicated.selected_experts[1], duplicated.selected_experts[0]
+        )
+        self.assertEqual(np.unique(duplicated.selected_experts).size, 24)
+        duplicated_stage_inputs = dict(fixture.inputs)
+        duplicated_hidden = np.array(
+            duplicated_stage_inputs["hidden_input"], copy=True
+        )
+        duplicated_hidden[1] = duplicated_hidden[0]
+        duplicated_stage_inputs["hidden_input"] = duplicated_hidden
+        duplicated_stage = dspark_reference.stage_ffn_moe_payload_first(
+            **duplicated_stage_inputs
+        )
+        np.testing.assert_array_equal(
+            duplicated_stage.selected_experts[1],
+            duplicated_stage.selected_experts[0],
+        )
+        self.assertEqual(
+            np.unique(duplicated_stage.selected_experts).size, 24
+        )
+
+        unclamped = dspark_reference.stage_ffn_moe_payload_first(
+            **fixture.inputs, swiglu_clamp=0.0
+        )
+        self.assertGreater(np.max(np.abs(result.routed_gate)), 10.0)
+        self.assertGreater(np.max(np.abs(result.routed_up)), 10.0)
+        self.assertGreater(
+            int(np.count_nonzero(result.shared_mid != unclamped.shared_mid)), 0
+        )
+        self.assertGreater(
+            int(np.count_nonzero(result.routed_mid != unclamped.routed_mid)),
+            1_000,
+        )
+        self.assertGreater(
+            int(np.count_nonzero(result.hc_post_output !=
+                                 unclamped.hc_post_output)),
+            10_000,
+        )
+
+        slot_order_sum = np.zeros_like(result.routed_sum)
+        for row in range(5):
+            for slot in range(6):
+                slot_order_sum[row] += result.routed_down[row, slot]
+        self.assertEqual(
+            int(np.count_nonzero(slot_order_sum != result.routed_sum)),
+            6_144,
+        )
+        self.assertEqual(
+            float(np.max(np.abs(slot_order_sum - result.routed_sum))),
+            1.9073486328125e-6,
+        )
+
+    def test_dspark_router_fails_closed_per_row_on_f32_extremes(self) -> None:
+        bias = np.zeros(256, dtype=np.float32)
+        normalized = np.zeros((5, 32), dtype=np.float32)
+        normalized[0] = 1.0
+        underflow_router = np.full((256, 32), -32.0, dtype=np.float32)
+        underflow = dspark_reference.dspark_router_q8(
+            normalized, underflow_router, bias
+        )
+        self.assertTrue(np.all(np.isfinite(underflow.logits)))
+        np.testing.assert_array_equal(
+            underflow.selected_experts[0],
+            np.full(6, -1, dtype=np.int32),
+        )
+        np.testing.assert_array_equal(
+            underflow.probabilities[0], np.zeros(256, dtype=np.float32)
+        )
+        np.testing.assert_array_equal(
+            underflow.expert_weights[0], np.zeros(6, dtype=np.float32)
+        )
+        np.testing.assert_array_equal(
+            underflow.selected_experts[1:],
+            np.tile(np.arange(6, dtype=np.int32), (4, 1)),
+        )
+        np.testing.assert_allclose(
+            underflow.expert_weights[1:],
+            np.full((4, 6), 0.25, dtype=np.float32),
+            rtol=0.0,
+            atol=1.4901161193847656e-8,
+        )
+
+        maximum = np.finfo(np.float32).max
+        overflow_router = np.full((256, 32), maximum, dtype=np.float32)
+        overflow_source = np.zeros((5, 32), dtype=np.float32)
+        overflow_source[0] = maximum
+        overflow = dspark_reference.dspark_router_q8(
+            overflow_source, overflow_router, bias
+        )
+        self.assertFalse(np.all(np.isfinite(overflow.logits[0])))
+        np.testing.assert_array_equal(
+            overflow.selected_experts[0],
+            np.full(6, -1, dtype=np.int32),
+        )
+        np.testing.assert_array_equal(
+            overflow.probabilities[0], np.zeros(256, dtype=np.float32)
+        )
+        np.testing.assert_array_equal(
+            overflow.expert_weights[0], np.zeros(6, dtype=np.float32)
+        )
+        np.testing.assert_array_equal(
+            overflow.selected_experts[1:],
+            np.tile(np.arange(6, dtype=np.int32), (4, 1)),
         )
 
     def assert_max_abs_drift(
@@ -3439,6 +3779,30 @@ class OracleFixtureTests(unittest.TestCase):
                         expected_boundary,
                         0.0,
                     )
+
+        ffn_fixture = build_physical_ffn_fixture()
+        numpy_ffn = dspark_reference.stage_ffn_moe_payload_first(
+            **ffn_fixture.inputs
+        )
+        mlx_ffn = mlx_optional.stage_ffn_moe_payload_first(
+            **ffn_fixture.inputs
+        )
+        np.testing.assert_array_equal(
+            mlx_ffn.selected_experts, numpy_ffn.selected_experts
+        )
+        self.assertEqual(
+            set(mlx_optional.MLX_FFN_OPERATION_MAX_ABS_DRIFT),
+            set(numpy_ffn.__dataclass_fields__) - {"selected_experts"},
+        )
+        for field, limit in (
+            mlx_optional.MLX_FFN_OPERATION_MAX_ABS_DRIFT.items()
+        ):
+            self.assert_max_abs_drift(
+                f"MLX payload-first FFN {field}",
+                getattr(mlx_ffn, field),
+                getattr(numpy_ffn, field),
+                limit,
+            )
 
     def test_runtime_capture_call_sites_match_oracle_contract(self) -> None:
         source = DS4_SOURCE_PATH.read_text(encoding="utf-8")

@@ -50,6 +50,31 @@ MLX_BF16_STAGE_ZERO_ATTENTION_MAX_ABS_DRIFT = 2.44140625e-4
 # Payload-first 32/32/4 physical fixture: C=2 is exact and the wrapped C=128
 # attention/inverse-RoPE boundaries differ in six adjacent BF16 lanes.
 MLX_BF16_PHYSICAL_STAGE_ZERO_ATTENTION_MAX_ABS_DRIFT = 1.220703125e-4
+# Payload-first FFN limits measured independently on MLX 0.32.0 / M5 Pro.
+# Router matmul reduction drift changes 8/1,280 logits/probabilities and the
+# six-way normalization changes all 30 weights.  Explicit BF16 before down
+# bounds the propagated change to one adjacent code in 256 routed-mid lanes;
+# down/routed-sum remain within one 2^-9 step and final MoE/HC publications are
+# exact.  Keep these field-specific rather than hiding them in one tolerance.
+MLX_FFN_OPERATION_MAX_ABS_DRIFT = {
+    "hidden_input": 0.0,
+    "hc_pre_output": 0.0,
+    "ffn_normalized": 0.0,
+    "router_logits": 1.5625e-2,
+    "router_probabilities": 1.3456344604492188e-3,
+    "expert_weights": 4.869699478149414e-5,
+    "shared_gate": 0.0,
+    "shared_up": 0.0,
+    "shared_mid": 0.0,
+    "shared_down": 0.0,
+    "routed_gate": 0.0,
+    "routed_up": 0.0,
+    "routed_mid": 4.8828125e-4,
+    "routed_down": 1.953125e-3,
+    "routed_sum": 1.953125e-3,
+    "moe_output": 0.0,
+    "hc_post_output": 0.0,
+}
 EXPECTED_MLX_VERSION = "0.32.0"
 EXPECTED_MLX_METAL_VERSION = "0.32.0"
 DSPARK_TARGET_LAYER_IDS = (40, 41, 42)
@@ -96,6 +121,30 @@ class MLXStageZeroAttentionHalf:
     attention_inverse_roped: np.ndarray
     output_a: np.ndarray
     output_b: np.ndarray
+    hc_post_output: np.ndarray
+
+
+@dataclass(frozen=True)
+class MLXStageFFNMoE:
+    """Host-visible MLX boundaries for the payload-first FFN fixture."""
+
+    hidden_input: np.ndarray
+    hc_pre_output: np.ndarray
+    ffn_normalized: np.ndarray
+    router_logits: np.ndarray
+    router_probabilities: np.ndarray
+    selected_experts: np.ndarray
+    expert_weights: np.ndarray
+    shared_gate: np.ndarray
+    shared_up: np.ndarray
+    shared_mid: np.ndarray
+    shared_down: np.ndarray
+    routed_gate: np.ndarray
+    routed_up: np.ndarray
+    routed_mid: np.ndarray
+    routed_down: np.ndarray
+    routed_sum: np.ndarray
+    moe_output: np.ndarray
     hc_post_output: np.ndarray
 
 
@@ -834,6 +883,225 @@ def stage_zero_attention_half(
         host(inverse_roped),
         host(output_a),
         host(output_b),
+        host(hc_post_output),
+    )
+
+
+def _opened_payload_matrix(value: object, name: str) -> np.ndarray:
+    opened = getattr(value, "dequantized", value)
+    if callable(opened):
+        opened = opened()
+    matrix = np.asarray(opened, dtype=np.float32)
+    if matrix.ndim != 2 or not np.all(np.isfinite(matrix)):
+        raise ValueError(f"{name} must decode to one finite matrix")
+    return matrix
+
+
+def stage_ffn_moe_payload_first(
+    hidden_input: np.ndarray,
+    hc_function_weight: object,
+    hc_scale: Sequence[float] | np.ndarray,
+    hc_base: Sequence[float] | np.ndarray,
+    ffn_norm_weight: Sequence[float] | np.ndarray,
+    router_weight: object,
+    selection_bias: Sequence[float] | np.ndarray,
+    shared_gate_weight: object,
+    shared_up_weight: object,
+    shared_down_weight: object,
+    routed_expert_weights: dict[int, dict[str, object]],
+    *,
+    norm_eps: float = 1.0e-6,
+    hc_eps: float = 1.0e-6,
+    hc_iterations: int = 20,
+    swiglu_clamp: float = 10.0,
+) -> MLXStageFFNMoE:
+    """Independently re-express the official FFN dtype schedule on MLX."""
+
+    hidden_source = np.asarray(hidden_input, dtype=np.float32)
+    if hidden_source.shape != (5, 4, 4096):
+        raise ValueError("FFN hidden input must have shape [5, 4, 4096]")
+    function_source = _opened_payload_matrix(
+        hc_function_weight, "FFN HC function"
+    )
+    norm_source = np.asarray(ffn_norm_weight, dtype=np.float32)
+    router_source = _opened_payload_matrix(router_weight, "router weight")
+    bias_source = np.asarray(selection_bias, dtype=np.float32)
+    shared_gate_source = _opened_payload_matrix(
+        shared_gate_weight, "shared gate"
+    )
+    shared_up_source = _opened_payload_matrix(shared_up_weight, "shared up")
+    shared_down_source = _opened_payload_matrix(
+        shared_down_weight, "shared down"
+    )
+    if (function_source.shape != (24, 4 * 4096) or
+            norm_source.shape != (4096,) or
+            router_source.shape != (256, 4096) or
+            bias_source.shape != (256,) or
+            shared_gate_source.shape != (256, 4096) or
+            shared_up_source.shape != (256, 4096) or
+            shared_down_source.shape != (4096, 256)):
+        raise ValueError("FFN fixture weight geometry mismatch")
+    if not all(np.all(np.isfinite(item)) for item in (
+        hidden_source, function_source, norm_source, router_source,
+        bias_source, shared_gate_source, shared_up_source, shared_down_source,
+    )):
+        raise ValueError("FFN fixture inputs must be finite")
+    if (not np.isfinite(float(swiglu_clamp)) or swiglu_clamp < 0.0):
+        raise ValueError("SwiGLU clamp must be finite and non-negative")
+
+    mx = _mlx()
+
+    def bf16(value: object) -> object:
+        return _mlx_bfloat16_boundary(mx, value)
+
+    def swiglu(gate: object, up: object) -> object:
+        if swiglu_clamp > 1.0e-6:
+            gate = mx.minimum(gate, float(swiglu_clamp))
+            up = mx.clip(up, -float(swiglu_clamp), float(swiglu_clamp))
+        return gate * mx.sigmoid(gate) * up
+
+    hidden = bf16(mx.array(hidden_source))
+    mx.eval(hidden)
+    hidden_host = np.asarray(hidden, dtype=np.float32)
+    reduced_host, _pre, post, combination = hc_pre(
+        hidden_host,
+        function_source,
+        hc_scale,
+        hc_base,
+        norm_eps=norm_eps,
+        hc_eps=hc_eps,
+        iterations=hc_iterations,
+    )
+    hc_pre_output = bf16(mx.array(reduced_host.astype(np.float32)))
+    ffn_normalized = _mlx_rms_norm_bfloat16(
+        mx,
+        hc_pre_output,
+        mx.array(norm_source),
+        eps=norm_eps,
+    )
+    router_logits = (
+        ffn_normalized.astype(mx.float32)
+        @ mx.transpose(mx.array(router_source, dtype=mx.float32))
+    )
+    router_probabilities = mx.sqrt(
+        mx.maximum(router_logits, 0.0)
+        + mx.log1p(mx.exp(-mx.abs(router_logits)))
+    )
+    mx.eval(ffn_normalized, router_logits, router_probabilities)
+    raw_probabilities_host = np.asarray(
+        router_probabilities, dtype=np.float32
+    )
+    expert_ids = np.arange(256, dtype=np.int32)
+    probabilities_host = np.zeros((5, 256), dtype=np.float32)
+    selected = np.full((5, 6), -1, dtype=np.int32)
+    route_weights = np.zeros((5, 6), dtype=np.float32)
+    for row in range(5):
+        logits_host = np.asarray(router_logits[row], dtype=np.float32)
+        row_probabilities = raw_probabilities_host[row]
+        with np.errstate(over="ignore", invalid="ignore"):
+            row_selection = row_probabilities + bias_source
+        if (not np.all(np.isfinite(logits_host)) or
+                not np.all(np.isfinite(row_probabilities)) or
+                not np.all(np.isfinite(row_selection))):
+            continue
+        row_selected = np.lexsort(
+            (expert_ids, -row_selection)
+        )[:6]
+        unbiased = row_probabilities[row_selected]
+        denominator = np.sum(unbiased, dtype=np.float32)
+        if not np.isfinite(denominator) or not denominator > 0.0:
+            continue
+        probabilities_host[row] = row_probabilities
+        selected[row] = row_selected
+        route_weights[row] = (
+            unbiased / denominator * np.float32(1.5)
+        )
+    router_probabilities = mx.array(probabilities_host, dtype=mx.float32)
+
+    normalized_host = np.asarray(ffn_normalized, dtype=np.float32)
+    shared_gate = bf16(
+        ffn_normalized @ mx.transpose(mx.array(shared_gate_source))
+    )
+    shared_up = bf16(
+        ffn_normalized @ mx.transpose(mx.array(shared_up_source))
+    )
+    shared_mid = bf16(swiglu(shared_gate, shared_up))
+    shared_down = bf16(
+        shared_mid @ mx.transpose(mx.array(shared_down_source))
+    )
+    mx.eval(shared_gate, shared_up, shared_mid, shared_down)
+
+    routed_gate = np.empty((5, 6, 256), dtype=np.float32)
+    routed_up = np.empty_like(routed_gate)
+    routed_mid = np.empty_like(routed_gate)
+    routed_down = np.empty((5, 6, 4096), dtype=np.float32)
+    for row in range(5):
+        x = mx.array(normalized_host[row])
+        for slot in range(6):
+            expert = int(selected[row, slot])
+            record = routed_expert_weights.get(expert)
+            if record is None or set(record) != {"gate", "up", "down"}:
+                raise ValueError(f"missing complete payload for expert {expert}")
+            gate_matrix = _opened_payload_matrix(record["gate"], "routed gate")
+            up_matrix = _opened_payload_matrix(record["up"], "routed up")
+            if gate_matrix.shape != (256, 4096) or up_matrix.shape != (256, 4096):
+                raise ValueError("routed gate/up compact geometry mismatch")
+            gate = bf16(mx.array(gate_matrix) @ x)
+            up = bf16(mx.array(up_matrix) @ x)
+            mid = bf16(
+                swiglu(gate, up) * float(route_weights[row, slot])
+            )
+            mx.eval(gate, up, mid)
+            routed_gate[row, slot] = np.asarray(gate, dtype=np.float32)
+            routed_up[row, slot] = np.asarray(up, dtype=np.float32)
+            routed_mid[row, slot] = np.asarray(mid, dtype=np.float32)
+            del gate_matrix, up_matrix
+            down_matrix = _opened_payload_matrix(record["down"], "routed down")
+            if down_matrix.shape != (4096, 256):
+                raise ValueError("routed down compact geometry mismatch")
+            down = bf16(mx.array(down_matrix) @ mid)
+            mx.eval(down)
+            routed_down[row, slot] = np.asarray(down, dtype=np.float32)
+
+    routed_sum_rows = []
+    for row in range(5):
+        value = mx.zeros((4096,), dtype=mx.float32)
+        for slot in np.argsort(selected[row], kind="stable"):
+            value = value + mx.array(routed_down[row, slot])
+        routed_sum_rows.append(value)
+    routed_sum = mx.stack(routed_sum_rows)
+    moe_output = bf16(routed_sum + shared_down)
+    mx.eval(routed_sum, moe_output)
+    post_host = hc_post(
+        np.asarray(moe_output, dtype=np.float32),
+        hidden_host,
+        post,
+        combination,
+    )
+    hc_post_output = bf16(mx.array(post_host.astype(np.float32)))
+    mx.eval(hc_post_output)
+
+    def host(value: object) -> np.ndarray:
+        return np.asarray(value, dtype=np.float64)
+
+    return MLXStageFFNMoE(
+        host(hidden),
+        host(hc_pre_output),
+        host(ffn_normalized),
+        host(router_logits),
+        host(router_probabilities),
+        np.array(selected, copy=True),
+        route_weights.astype(np.float64),
+        host(shared_gate),
+        host(shared_up),
+        host(shared_mid),
+        host(shared_down),
+        routed_gate.astype(np.float64),
+        routed_up.astype(np.float64),
+        routed_mid.astype(np.float64),
+        routed_down.astype(np.float64),
+        host(routed_sum),
+        host(moe_output),
         host(hc_post_output),
     )
 
