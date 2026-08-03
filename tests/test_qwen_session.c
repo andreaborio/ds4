@@ -1085,6 +1085,9 @@ static void test_fail_closed_surfaces(ds4_session *session) {
 int main(void) {
     CHECK(ds4_dspark_runtime_contract_self_check());
     CHECK(ds4_test_dspark_memory_accounting());
+#ifndef DS4_NO_GPU
+    CHECK(ds4_internal_dspark_raw_finalizer_test());
+#endif
     test_session_creation_boundary();
     test_model_aware_context_memory();
     test_qwen_metal_session_context_budget();

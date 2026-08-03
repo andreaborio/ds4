@@ -14,6 +14,10 @@ enum {
     DS4_DSPARK_TARGET_TOP_K = 6,
     DS4_DSPARK_SUPPORT_TOP_K = 6,
     DS4_DSPARK_SUPPORT_CANDIDATE_ROWS = 5,
+    /* The target verifier sees pending + five draft rows.  Row five is
+     * verifier-only and never expands the five-row DSpark candidate block. */
+    DS4_DSPARK_RAW_FINALIZER_MAX_ROWS =
+        DS4_DSPARK_SUPPORT_CANDIDATE_ROWS + 1,
     DS4_DSPARK_VERIFY_CAPTURE_MAX_ROWS = 16,
     DS4_DSPARK_RAW_WIDTH = 512,
     DS4_DSPARK_METAL_PAGE_BYTES = 16384,
@@ -165,7 +169,7 @@ static uint32_t ds4_dspark_prefill_cap_floor(uint32_t normal_cap) {
 }
 
 /* Conservative sampled-production-path allocation inventory. core_bytes is
- * the 9,388,032-byte drafter core; the default temperature-1 product path
+ * the 9,764,864-byte drafter core; the default temperature-1 product path
  * additionally owns greedy-head intermediates, all five q distributions, a
  * right-sized six-row target-verifier logits buffer (pending + five drafts),
  * and one frontier snapshot for exact restore-and-replay verification. This
@@ -179,8 +183,12 @@ typedef struct {
     uint64_t capture_verifier_bytes;
     uint64_t capture_history_bytes;
     uint64_t capture_bytes;
+    uint64_t raw_pack_bytes;
     uint64_t main_x_bytes;
+    uint64_t raw_projected_bytes;
+    uint64_t raw_normalized_bytes;
     uint64_t raw_ring_bytes;
+    uint64_t two_source_attention_staging_bytes;
     uint64_t proposal_scratch_page_bytes;
     uint64_t core_bytes;
     uint64_t greedy_head_scratch_page_bytes;
@@ -208,19 +216,19 @@ static bool ds4_dspark_runtime_memory_make(
         (uint64_t)DS4_DSPARK_CAPTURE_WIDTH * sizeof(float);
     const uint64_t hc_row_bytes = 4u * row_bytes;
     const uint64_t block_rows = DS4_DSPARK_SUPPORT_CANDIDATE_ROWS;
-    const uint64_t stage0_rows = block_rows + 1u;
-    const uint64_t stage0_packed =
-        stage0_rows * DS4_DSPARK_CAPTURE_STAGE_COUNT * row_bytes;
-    const uint64_t stage0_proj = row_bytes;
+    const uint64_t verifier_rows = DS4_DSPARK_RAW_FINALIZER_MAX_ROWS;
+    const uint64_t raw_pack =
+        verifier_rows * DS4_DSPARK_CAPTURE_STAGE_COUNT * row_bytes;
+    const uint64_t main_x = verifier_rows * row_bytes;
+    const uint64_t raw_stage =
+        verifier_rows * DS4_DSPARK_RAW_WIDTH * sizeof(float);
     const uint64_t draft_tokens = block_rows * sizeof(int32_t);
     const uint64_t draft_hc = block_rows * hc_row_bytes;
     const uint64_t target_hc = hc_row_bytes;
-    const uint64_t stage_input_hc = stage0_rows * hc_row_bytes;
+    const uint64_t stage_input_hc = verifier_rows * hc_row_bytes;
     const uint64_t stage_output_hc = block_rows * hc_row_bytes;
-    const uint64_t position_ids = stage0_rows * sizeof(int32_t);
+    const uint64_t position_ids = verifier_rows * sizeof(int32_t);
     const uint64_t proposal_scratch =
-        ds4_dspark_metal_page_charge(stage0_packed) +
-        ds4_dspark_metal_page_charge(stage0_proj) +
         ds4_dspark_metal_page_charge(draft_tokens) +
         ds4_dspark_metal_page_charge(draft_hc) +
         ds4_dspark_metal_page_charge(target_hc) +
@@ -238,7 +246,7 @@ static bool ds4_dspark_runtime_memory_make(
             block_rows * UINT64_C(129280) * sizeof(float));
     const uint64_t target_verifier_logits =
         ds4_dspark_metal_page_charge(
-            stage0_rows * UINT64_C(129280) * sizeof(float));
+            verifier_rows * UINT64_C(129280) * sizeof(float));
     /* Exact verifier rollback owns one saved frontier. Ratio-4 layers retain
      * K/V plus two independently allocated index buffers; ratio-128 layers
      * retain one K/V pair. Each component is charged at Metal page size. */
@@ -268,10 +276,20 @@ static bool ds4_dspark_runtime_memory_make(
         .capture_history_bytes =
             DS4_DSPARK_CAPTURE_STAGE_COUNT *
             DS4_DSPARK_HISTORY_ROWS * row_bytes,
-        .main_x_bytes = row_bytes,
+        .raw_pack_bytes = raw_pack,
+        .main_x_bytes = main_x,
+        .raw_projected_bytes = raw_stage,
+        .raw_normalized_bytes = raw_stage,
         .raw_ring_bytes =
             (uint64_t)DS4_DSPARK_CAPTURE_STAGE_COUNT *
             DS4_DSPARK_HISTORY_ROWS * DS4_DSPARK_RAW_WIDTH * sizeof(float),
+        /* The full-ring attention kernel reads physical slots 0..127 and
+         * appends at most five transient draft rows in one persistent/lazy
+         * staging allocation.  Threadgroup scratch is static and sub-page. */
+        .two_source_attention_staging_bytes =
+            (DS4_DSPARK_HISTORY_ROWS +
+             DS4_DSPARK_SUPPORT_CANDIDATE_ROWS) *
+            DS4_DSPARK_RAW_WIDTH * sizeof(float),
         .proposal_scratch_page_bytes = proposal_scratch,
         .greedy_head_scratch_page_bytes = greedy_head_scratch,
         .sampled_q_distribution_page_bytes = sampled_q_distribution,
@@ -287,8 +305,16 @@ static bool ds4_dspark_runtime_memory_make(
     result.capture_bytes = memory.capture_current_bytes +
                            memory.capture_verifier_bytes +
                            memory.capture_history_bytes;
-    result.core_bytes = result.capture_bytes + memory.main_x_bytes +
-                        memory.raw_ring_bytes + proposal_scratch;
+    result.core_bytes = result.capture_bytes + memory.raw_pack_bytes +
+                        memory.main_x_bytes +
+                        ds4_dspark_metal_page_charge(
+                            memory.raw_projected_bytes) +
+                        ds4_dspark_metal_page_charge(
+                            memory.raw_normalized_bytes) +
+                        memory.raw_ring_bytes +
+                        ds4_dspark_metal_page_charge(
+                            memory.two_source_attention_staging_bytes) +
+                        proposal_scratch;
     result.verifier_frontier_snapshot_page_bytes =
         verifier_ratio4_snapshot + verifier_ratio128_snapshot;
     result.sampled_host_delta_page_bytes =
@@ -301,10 +327,14 @@ static bool ds4_dspark_runtime_memory_make(
         result.capture_verifier_bytes != UINT64_C(786432) ||
         result.capture_history_bytes != UINT64_C(6291456) ||
         result.capture_bytes != UINT64_C(7127040) ||
-        result.main_x_bytes != UINT64_C(16384) ||
+        result.raw_pack_bytes != UINT64_C(294912) ||
+        result.main_x_bytes != UINT64_C(98304) ||
+        result.raw_projected_bytes != UINT64_C(12288) ||
+        result.raw_normalized_bytes != UINT64_C(12288) ||
         result.raw_ring_bytes != UINT64_C(786432) ||
-        result.proposal_scratch_page_bytes != UINT64_C(1458176) ||
-        result.core_bytes != UINT64_C(9388032) ||
+        result.two_source_attention_staging_bytes != UINT64_C(272384) ||
+        result.proposal_scratch_page_bytes != UINT64_C(1146880) ||
+        result.core_bytes != UINT64_C(9764864) ||
         result.greedy_head_scratch_page_bytes != UINT64_C(557056) ||
         result.sampled_q_distribution_page_bytes != UINT64_C(2588672) ||
         result.target_verifier_logits_page_bytes != UINT64_C(3112960) ||
@@ -314,7 +344,7 @@ static bool ds4_dspark_runtime_memory_make(
         result.sampled_host_vocab_rows_page_bytes != UINT64_C(1048576) ||
         result.sampled_host_confidence_feature_page_bytes != UINT64_C(32768) ||
         result.sampled_host_delta_page_bytes != UINT64_C(1081344) ||
-        result.total_bytes != UINT64_C(29278208)) {
+        result.total_bytes != UINT64_C(29655040)) {
         return false;
     }
     *out = result;
@@ -1094,6 +1124,29 @@ static bool ds4_dspark_raw_context_state_self_check(void) {
             &state, 0u, DS4_DSPARK_HISTORY_ROWS, &plan)) {
         return false;
     }
+
+    /* A current target row is first appended to committed main_kv ownership;
+     * the five draft rows remain a separate transient attention source.  The
+     * largest six-row finalizer batch must likewise commit every row before a
+     * view is exposed, including a physical 127 -> 0 wrap. */
+    ds4_dspark_raw_context_state_init(&state, true);
+    if (!ds4_dspark_raw_context_state_begin_seed(
+            &state, 127u, DS4_DSPARK_RAW_FINALIZER_MAX_ROWS, &plan) ||
+        plan.input_skip != 0u || plan.retained_rows != 6u ||
+        plan.first_physical_row != 127u || plan.first_rows != 1u ||
+        plan.second_rows != 5u || plan.length != 6u ||
+        plan.token_start != 127u || plan.frontier != 133u ||
+        ds4_dspark_raw_context_view_make(&state, 133u, &view) ||
+        !ds4_dspark_raw_context_self_check_commit(&state, &plan, ring) ||
+        !ds4_dspark_raw_context_view_make(&state, 133u, &view) ||
+        view.committed_rows != 6u ||
+        view.committed_token_start != 127u ||
+        view.candidate_start != 133u ||
+        view.transient_candidate_rows !=
+            DS4_DSPARK_SUPPORT_CANDIDATE_ROWS) {
+        return false;
+    }
+
     ds4_dspark_raw_context_state_init(&state, true);
     if (!ds4_dspark_raw_context_state_begin_seed(
             &state, 0u, DS4_DSPARK_HISTORY_ROWS, &plan) ||
@@ -1327,6 +1380,11 @@ static bool ds4_dspark_runtime_contract_self_check(void) {
     ds4_dspark_capture_state capture_state;
     bool capture = false;
     uint32_t capture_slot = UINT32_MAX;
+    bool raw_finalizer_present = true;
+#ifndef DS4_NO_GPU
+    raw_finalizer_present =
+        metal_graph_dspark_raw_finalizer_code_present();
+#endif
     ds4_dspark_capture_state_init(&capture_state, true);
     return DS4_DSPARK_CAPTURE_CONTRACT.stage_count == 3u &&
            DS4_DSPARK_CAPTURE_CONTRACT.hidden_width == 4096u &&
@@ -1361,13 +1419,19 @@ static bool ds4_dspark_runtime_contract_self_check(void) {
            ds4_dspark_history_state_self_check() &&
            ds4_dspark_raw_context_state_self_check() &&
            ds4_dspark_failed_blit_state_self_check() &&
+           raw_finalizer_present &&
            ds4_dspark_runtime_memory_make(&memory) &&
            memory.capture_bytes == UINT64_C(7127040) &&
-           memory.core_bytes == UINT64_C(9388032) &&
+           memory.raw_pack_bytes == UINT64_C(294912) &&
+           memory.main_x_bytes == UINT64_C(98304) &&
+           memory.raw_projected_bytes == UINT64_C(12288) &&
+           memory.raw_normalized_bytes == UINT64_C(12288) &&
+           memory.two_source_attention_staging_bytes == UINT64_C(272384) &&
+           memory.core_bytes == UINT64_C(9764864) &&
            memory.verifier_frontier_snapshot_page_bytes ==
                UINT64_C(12550144) &&
            memory.sampled_host_delta_page_bytes == UINT64_C(1081344) &&
-           memory.total_bytes == UINT64_C(29278208) &&
+           memory.total_bytes == UINT64_C(29655040) &&
            ds4_dspark_equal_memory_cache_plan_make(
                4387u, 5000u, 4387u, 83u, &equal_envelope) &&
            equal_envelope.equal_memory_ceiling_records == 4304u &&
