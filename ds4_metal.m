@@ -55119,3 +55119,483 @@ int ds4_gpu_dspark_stage_execute_candidate(
     }
     return ok && !g_stream_expert_cache_lease.active;
 }
+
+#ifdef DS4_TEST_HOOKS
+
+/* Test-only route plan callback: paired sort by (weight desc, id asc).
+ * Mirrors the production ds4_dspark_stage_route_plan_make logic without
+ * importing runtime/ds4_dspark_graph.inc into this translation unit. */
+typedef struct {
+    int called;
+    int fail;
+} ds4_gpu_dspark_stage_executor_route_ctx;
+
+static int ds4_gpu_dspark_stage_executor_route_plan(
+        const int32_t ids[30],
+        const float   weights[30],
+        int32_t       sorted_ids[30],
+        float         sorted_weights[30],
+        void         *opaque) {
+    ds4_gpu_dspark_stage_executor_route_ctx *ctx = opaque;
+    if (!ctx || ctx->called || ctx->fail) return 0;
+    ctx->called = 1;
+    for (uint32_t row = 0; row < 5u; row++) {
+        const uint32_t base = row * 6u;
+        for (uint32_t i = 0; i < 6u; i++) {
+            sorted_ids[base + i] = ids[base + i];
+            sorted_weights[base + i] = weights[base + i];
+        }
+        for (uint32_t i = 1; i < 6u; i++) {
+            const int32_t id = sorted_ids[base + i];
+            const float w = sorted_weights[base + i];
+            int32_t j = (int32_t)i - 1;
+            while (j >= 0 && (sorted_weights[base + j] < w ||
+                             (sorted_weights[base + j] == w &&
+                              sorted_ids[base + j] > id))) {
+                sorted_ids[base + j + 1] = sorted_ids[base + j];
+                sorted_weights[base + j + 1] = sorted_weights[base + j];
+                j--;
+            }
+            sorted_ids[base + j + 1] = id;
+            sorted_weights[base + j + 1] = w;
+        }
+    }
+    return 1;
+}
+
+/* Direct physical production stage-0 executor fixture.  Invokes the exact
+ * release ds4_gpu_dspark_stage_execute_candidate descriptor with a synthetic
+ * full-geometry model, installed SUPPORT expert pack, and graph-owned
+ * scratch/address state.  Required cases: C=2/start=0, C=128/start=2,
+ * paired-sort discrimination, non-finite candidate, lease/load failure,
+ * before-publish (route-plan) failure, TARGET telemetry identity, and warm
+ * rerun with zero SUPPORT pread. */
+int ds4_gpu_internal_dspark_stage_executor_test(void) {
+    if (!g_initialized && !ds4_gpu_init()) return 0;
+    if (g_qwen35_expert_pack.active || g_dspark_expert_pack ||
+        g_batch_cb || [g_pending_cbs count] != 0) return 0;
+
+    const uint64_t q8_1024 = 1024u / 32u * 34u;
+    const uint64_t q8_max = 32768u * q8_1024;
+    const uint64_t f32_base = q8_max;
+    const uint64_t off_hc_attn_base = f32_base;
+    const uint64_t off_hc_attn_scale = off_hc_attn_base + 24u * sizeof(float);
+    const uint64_t off_sinks = off_hc_attn_scale + 3u * sizeof(float);
+    const uint64_t off_q_a_norm = off_sinks + 64u * sizeof(float);
+    const uint64_t off_kv_a_norm = off_q_a_norm + 1024u * sizeof(float);
+    const uint64_t off_attn_norm = off_kv_a_norm + 512u * sizeof(float);
+    const uint64_t off_hc_ffn_base = off_attn_norm + 4096u * sizeof(float);
+    const uint64_t off_hc_ffn_scale = off_hc_ffn_base + 24u * sizeof(float);
+    const uint64_t off_exp_probs_b = off_hc_ffn_scale + 3u * sizeof(float);
+    const uint64_t off_ffn_norm = off_exp_probs_b + 256u * sizeof(float);
+    const uint64_t f16_base = off_ffn_norm + 4096u * sizeof(float);
+    const uint64_t off_hc_attn_fn = f16_base;
+    const uint64_t off_hc_ffn_fn = off_hc_attn_fn +
+        16384u * 24u * sizeof(uint16_t);
+    const uint64_t model_size = off_hc_ffn_fn +
+        16384u * 24u * sizeof(uint16_t);
+
+    uint8_t *model = calloc(1, (size_t)model_size);
+    if (!model) return 0;
+    for (uint64_t i = 0; i < 24u; i++)
+        ((float *)(model + off_hc_attn_base))[i] = 1.0f;
+    for (uint64_t i = 0; i < 3u; i++)
+        ((float *)(model + off_hc_attn_scale))[i] = 1.0f;
+    for (uint64_t i = 0; i < 1024u; i++)
+        ((float *)(model + off_q_a_norm))[i] = 1.0f;
+    for (uint64_t i = 0; i < 512u; i++)
+        ((float *)(model + off_kv_a_norm))[i] = 1.0f;
+    for (uint64_t i = 0; i < 4096u; i++)
+        ((float *)(model + off_attn_norm))[i] = 1.0f;
+    for (uint64_t i = 0; i < 24u; i++)
+        ((float *)(model + off_hc_ffn_base))[i] = 1.0f;
+    for (uint64_t i = 0; i < 3u; i++)
+        ((float *)(model + off_hc_ffn_scale))[i] = 1.0f;
+    for (uint64_t i = 0; i < 4096u; i++)
+        ((float *)(model + off_ffn_norm))[i] = 1.0f;
+    for (uint64_t i = 0; i < 16384u * 24u; i++)
+        ((uint16_t *)(model + off_hc_attn_fn))[i] = 0x3c00u;
+    for (uint64_t i = 0; i < 16384u * 24u; i++)
+        ((uint16_t *)(model + off_hc_ffn_fn))[i] = 0x3c00u;
+
+    int ok = ds4_gpu_set_model_map(model, model_size);
+    if (!ok) { free(model); return 0; }
+
+    const uint64_t target_bytes =
+        (uint64_t)DS4_DSPARK_TARGET_LAYER_COUNT * DS4_DSPARK_0731_STAGE_BYTES;
+    const uint64_t support_offset = 4096u + target_bytes;
+    const uint64_t file_size =
+        support_offset + DS4_DSPARK_0731_DATA_BYTES;
+    char path[] = "/tmp/ds4-dspark-stage-exec.XXXXXX";
+    int fd = mkstemp(path);
+    if (fd >= 0) (void)unlink(path);
+    ok = ok && fd >= 0 && file_size <= (uint64_t)LLONG_MAX &&
+        ftruncate(fd, (off_t)file_size) == 0;
+    int target_fd = ok ? fcntl(fd, F_DUPFD_CLOEXEC, 0) : -1;
+    int support_fd = ok ? fcntl(fd, F_DUPFD_CLOEXEC, 0) : -1;
+    ok = ok && target_fd >= 0 && support_fd >= 0;
+
+    ds4_gpu_expert_store_layer_v2 target_layers[DS4_DSPARK_TARGET_LAYER_COUNT];
+    ds4_gpu_expert_store_layer_v2 support_layers[DS4_DSPARK_SUPPORT_LAYER_COUNT];
+    if (ok) {
+        for (uint32_t layer = 0; layer < DS4_DSPARK_TARGET_LAYER_COUNT; layer++) {
+            target_layers[layer] = (ds4_gpu_expert_store_layer_v2) {
+                .layer = layer,
+                .data_offset = 4096u + (uint64_t)layer * DS4_DSPARK_0731_STAGE_BYTES,
+                .data_size = DS4_DSPARK_0731_STAGE_BYTES,
+                .record_bytes = DS4_DSPARK_0731_RECORD_BYTES,
+                .component_offset = {0, DS4_DSPARK_FULL_GATE_BYTES,
+                                     2u * DS4_DSPARK_FULL_GATE_BYTES},
+                .component_bytes = {DS4_DSPARK_FULL_GATE_BYTES,
+                                    DS4_DSPARK_FULL_GATE_BYTES,
+                                    DS4_DSPARK_FULL_DOWN_BYTES},
+            };
+        }
+        for (uint32_t stage = 0; stage < DS4_DSPARK_SUPPORT_LAYER_COUNT; stage++) {
+            support_layers[stage] = target_layers[0];
+            support_layers[stage].layer = stage;
+            support_layers[stage].data_offset = support_offset +
+                (uint64_t)stage * DS4_DSPARK_0731_STAGE_BYTES;
+        }
+    }
+    uint8_t *record = ok ? malloc(DS4_DSPARK_0731_RECORD_BYTES) : NULL;
+    ok = ok && record;
+    static const int32_t support_experts[6] = {0, 1, 2, 3, 4, 5};
+    if (ok) {
+        for (uint32_t slot = 0; slot < 6u; slot++) {
+            memset(record, 0, DS4_DSPARK_0731_RECORD_BYTES);
+            for (uint32_t block = 0; block < DS4_DSPARK_FULL_BLOCKS; block++) {
+                ds4_gpu_dspark_routed_test_fill_iq2(
+                    record + block * DS4_DSPARK_ROUTED_TEST_GATE_BYTES,
+                    (uint32_t)support_experts[slot] * 17u + block);
+                ds4_gpu_dspark_routed_test_fill_iq2(
+                    record + DS4_DSPARK_FULL_GATE_BYTES +
+                        block * DS4_DSPARK_ROUTED_TEST_GATE_BYTES,
+                    (uint32_t)support_experts[slot] * 19u + block);
+            }
+            ds4_gpu_dspark_routed_test_fill_q2_width(
+                record + 2u * DS4_DSPARK_FULL_GATE_BYTES,
+                DS4_DSPARK_FULL_MID,
+                (uint32_t)support_experts[slot] * 23u);
+            ok = ds4_gpu_internal_qwen35_expert_pack_pwrite_all(
+                fd, record, DS4_DSPARK_0731_RECORD_BYTES,
+                support_layers[0].data_offset +
+                    (uint64_t)support_experts[slot] *
+                        DS4_DSPARK_0731_RECORD_BYTES);
+            if (!ok) break;
+        }
+    }
+    free(record);
+
+    ds4_gpu_set_ssd_streaming(true);
+    ds4_gpu_set_streaming_expert_cache_required_floor(
+        DS4_DSPARK_TARGET_CACHE_FLOOR);
+    ds4_gpu_set_streaming_expert_cache_budget(290);
+    if (ok) {
+        ok = ds4_gpu_expert_store_v2_install_for_store(
+                   DS4_GPU_EXPERT_STORE_TARGET, target_fd, file_size,
+                   DS4_DSPARK_TARGET_LAYER_COUNT,
+                   DS4_DSPARK_SUPPORT_EXPERT_COUNT,
+                   DS4_EXPERT_STORE_STORAGE_GGML, 0, target_layers) &&
+             ds4_gpu_dspark_routed_test_bind_store(
+                 DS4_GPU_EXPERT_STORE_TARGET,
+                 DS4_DSPARK_TARGET_LAYER_COUNT, 0,
+                 DS4_DSPARK_0731_STAGE_BYTES,
+                 DS4_DSPARK_FULL_GATE_BYTES, file_size) &&
+             ds4_gpu_expert_store_v2_install_for_store(
+                 DS4_GPU_EXPERT_STORE_SUPPORT, support_fd, file_size,
+                 DS4_DSPARK_SUPPORT_LAYER_COUNT,
+                 DS4_DSPARK_SUPPORT_EXPERT_COUNT,
+                 DS4_EXPERT_STORE_STORAGE_GGML, 0, support_layers) &&
+             ds4_gpu_dspark_routed_test_bind_store(
+                 DS4_GPU_EXPERT_STORE_SUPPORT,
+                 DS4_DSPARK_SUPPORT_LAYER_COUNT, target_bytes,
+                 DS4_DSPARK_0731_STAGE_BYTES,
+                 DS4_DSPARK_FULL_GATE_BYTES, file_size) &&
+             ds4_gpu_dspark_support_cache_combined_available();
+    }
+
+    const uint64_t hidden_bytes = UINT64_C(5) * 4u * 4096u * sizeof(float);
+    const uint64_t row_bytes = UINT64_C(5) * 4096u * sizeof(float);
+    ds4_gpu_dspark_stage_scratch s = {0};
+    if (ok) {
+        s.hidden_work = ds4_gpu_tensor_alloc(hidden_bytes);
+        s.hc_plain_norm = ds4_gpu_tensor_alloc(hidden_bytes);
+        s.hc_mix = ds4_gpu_tensor_alloc(5u * 24u * sizeof(float));
+        s.hc_split = ds4_gpu_tensor_alloc(5u * 24u * sizeof(float));
+        s.hc_pre = ds4_gpu_tensor_alloc(row_bytes);
+        s.normalized = ds4_gpu_tensor_alloc(row_bytes);
+        s.q = ds4_gpu_tensor_alloc(UINT64_C(5) * 64u * 512u * sizeof(float));
+        s.q_rank = ds4_gpu_tensor_alloc(UINT64_C(5) * 1024u * sizeof(float));
+        s.kv = ds4_gpu_tensor_alloc(UINT64_C(5) * 512u * sizeof(float));
+        s.attention_staging = ds4_gpu_tensor_alloc(UINT64_C(133) * 512u * sizeof(float));
+        s.attention_out = ds4_gpu_tensor_alloc(UINT64_C(5) * 64u * 512u * sizeof(float));
+        s.attention_low = ds4_gpu_tensor_alloc(UINT64_C(5) * 8192u * sizeof(float));
+        s.attention_row = ds4_gpu_tensor_alloc(row_bytes);
+        s.attention_hc = ds4_gpu_tensor_alloc(hidden_bytes);
+        s.router_logits = ds4_gpu_tensor_alloc(5u * 256u * sizeof(float));
+        s.router_bias = ds4_gpu_tensor_alloc(256u * sizeof(float));
+        s.router_probs = ds4_gpu_tensor_alloc(5u * 256u * sizeof(float));
+        s.router_ids = ds4_gpu_tensor_alloc(30u * sizeof(int32_t));
+        s.router_weights = ds4_gpu_tensor_alloc(30u * sizeof(float));
+        s.sorted_ids = ds4_gpu_tensor_alloc(30u * sizeof(int32_t));
+        s.sorted_weights = ds4_gpu_tensor_alloc(30u * sizeof(float));
+        s.routed_gate = ds4_gpu_tensor_alloc(30u * 2048u * sizeof(float));
+        s.routed_up = ds4_gpu_tensor_alloc(30u * 2048u * sizeof(float));
+        s.routed_mid = ds4_gpu_tensor_alloc(30u * 2048u * sizeof(float));
+        s.routed_down = ds4_gpu_tensor_alloc(30u * 4096u * sizeof(float));
+        s.routed_sum = ds4_gpu_tensor_alloc(row_bytes);
+        s.shared_gate = ds4_gpu_tensor_alloc(5u * 2048u * sizeof(float));
+        s.shared_up = ds4_gpu_tensor_alloc(5u * 2048u * sizeof(float));
+        s.shared_mid = ds4_gpu_tensor_alloc(5u * 2048u * sizeof(float));
+        s.shared_down = ds4_gpu_tensor_alloc(row_bytes);
+        s.moe = ds4_gpu_tensor_alloc(row_bytes);
+        s.candidate = ds4_gpu_tensor_alloc(hidden_bytes);
+        ok = s.hidden_work && s.hc_plain_norm && s.hc_mix && s.hc_split &&
+             s.hc_pre && s.normalized && s.q && s.q_rank && s.kv &&
+             s.attention_staging && s.attention_out && s.attention_low &&
+             s.attention_row && s.attention_hc && s.router_logits &&
+             s.router_bias && s.router_probs && s.router_ids &&
+             s.router_weights && s.sorted_ids && s.sorted_weights &&
+             s.routed_gate && s.routed_up && s.routed_mid && s.routed_down &&
+             s.routed_sum && s.shared_gate && s.shared_up && s.shared_mid &&
+             s.shared_down && s.moe && s.candidate;
+    }
+
+    ds4_gpu_tensor *committed_kv = ok ? ds4_gpu_tensor_alloc(
+        UINT64_C(128) * 512u * sizeof(float)) : NULL;
+    ds4_gpu_tensor *hidden_input = ok ? ds4_gpu_tensor_alloc(hidden_bytes) : NULL;
+    ds4_gpu_tensor *address_page = ok ? ds4_gpu_tensor_alloc(
+        DS4_DSPARK_SUPPORT_ADDRESS_TABLE_PAGE_BYTES) : NULL;
+    ds4_gpu_tensor *candidate_shadow = ok ? ds4_gpu_tensor_alloc(
+        hidden_bytes) : NULL;
+    ok = ok && committed_kv && hidden_input && address_page &&
+          candidate_shadow;
+
+    if (ok) {
+        ok = ds4_gpu_tensor_fill_f32(committed_kv, 1.0f, 128u * 512u) &&
+             ds4_gpu_tensor_fill_f32(hidden_input, 1.0f, 5u * 4u * 4096u) &&
+             ds4_gpu_tensor_fill_f32(candidate_shadow, 0.0f,
+                                      5u * 4u * 4096u);
+    }
+
+    ds4_gpu_dspark_stage_descriptor d;
+    ds4_gpu_dspark_stage_executor_route_ctx route_ctx = {0};
+    if (ok) {
+        memset(&d, 0, sizeof(d));
+        d.stage = 0u;
+        d.model_map = model;
+        d.model_size = model_size;
+        d.weights.hc_attn_base = off_hc_attn_base;
+        d.weights.hc_attn_fn = off_hc_attn_fn;
+        d.weights.hc_attn_scale = off_hc_attn_scale;
+        d.weights.attn_sinks = off_sinks;
+        d.weights.attn_q_a = 0;
+        d.weights.attn_q_a_norm = off_q_a_norm;
+        d.weights.attn_q_b = 0;
+        d.weights.attn_kv = 0;
+        d.weights.attn_kv_a_norm = off_kv_a_norm;
+        d.weights.attn_output_a = 0;
+        d.weights.attn_output_b = 0;
+        d.weights.attn_norm = off_attn_norm;
+        d.weights.hc_ffn_base = off_hc_ffn_base;
+        d.weights.hc_ffn_fn = off_hc_ffn_fn;
+        d.weights.hc_ffn_scale = off_hc_ffn_scale;
+        d.weights.ffn_gate_inp = 0;
+        d.weights.ffn_exp_probs_b = off_exp_probs_b;
+        d.weights.ffn_norm = off_ffn_norm;
+        d.weights.ffn_gate_shexp = 0;
+        d.weights.ffn_up_shexp = 0;
+        d.weights.ffn_down_shexp = 0;
+        d.committed_kv = committed_kv;
+        d.hidden_input = hidden_input;
+        d.selected_address_page = address_page;
+        d.candidate_shadow = candidate_shadow;
+        d.route_plan = ds4_gpu_dspark_stage_executor_route_plan;
+        d.route_plan_opaque = &route_ctx;
+        d.scratch = s;
+    }
+
+    /* C=2/start=0: success, finite, route called, TARGET telemetry unchanged */
+    if (ok) {
+        d.position0 = 2u;
+        d.committed_count = 2u;
+        d.committed_start = 0u;
+        route_ctx.called = 0;
+        route_ctx.fail = 0;
+        const uint64_t pread_before = g_dspark_support_cache_pread_bytes;
+        const uint64_t t_hits = g_stream_expert_cache_hits;
+        const uint64_t t_misses = g_stream_expert_cache_misses;
+        const uint64_t t_evict = g_stream_expert_cache_evictions;
+        const uint64_t t_pread = g_stream_expert_cache_pread_bytes;
+        const uint32_t t_entries = g_stream_expert_cache_entry_count;
+        const int executed = ds4_gpu_dspark_stage_execute_candidate(&d);
+        const int finite = ds4_gpu_dspark_stage_candidate_finite(
+            d.selected_address_page);
+        ok = ok && executed && finite && route_ctx.called &&
+             g_stream_expert_cache_hits == t_hits &&
+             g_stream_expert_cache_misses == t_misses &&
+             g_stream_expert_cache_evictions == t_evict &&
+             g_stream_expert_cache_pread_bytes == t_pread &&
+             g_stream_expert_cache_entry_count == t_entries &&
+             g_dspark_support_cache_pread_bytes > pread_before;
+    }
+
+    /* C=128/start=2: wrapped full ring */
+    if (ok) {
+        d.position0 = 130u;
+        d.committed_count = 128u;
+        d.committed_start = 2u;
+        route_ctx.called = 0;
+        route_ctx.fail = 0;
+        const int executed = ds4_gpu_dspark_stage_execute_candidate(&d);
+        const int finite = ds4_gpu_dspark_stage_candidate_finite(
+            d.selected_address_page);
+        ok = ok && executed && finite && route_ctx.called;
+    }
+
+    /* Warm rerun: zero SUPPORT pread (records cached from prior call) */
+    if (ok) {
+        d.position0 = 130u;
+        d.committed_count = 128u;
+        d.committed_start = 2u;
+        route_ctx.called = 0;
+        route_ctx.fail = 0;
+        const uint64_t pread_before = g_dspark_support_cache_pread_bytes;
+        const int executed = ds4_gpu_dspark_stage_execute_candidate(&d);
+        const int finite = ds4_gpu_dspark_stage_candidate_finite(
+            d.selected_address_page);
+        ok = ok && executed && finite && route_ctx.called &&
+             g_dspark_support_cache_pread_bytes == pread_before;
+    }
+
+    /* Paired-sort discrimination: sorted ids ascending within each row */
+    if (ok) {
+        int32_t sorted[30];
+        float sw[30];
+        ok = ds4_gpu_tensor_read(d.scratch.sorted_ids, 0, sorted, sizeof(sorted)) &&
+             ds4_gpu_tensor_read(d.scratch.sorted_weights, 0, sw, sizeof(sw));
+        if (ok) {
+            for (uint32_t row = 0; row < 5u; row++) {
+                const uint32_t base = row * 6u;
+                for (uint32_t i = 0; i < 6u; i++) {
+                    if (sorted[base + i] < 0 ||
+                        sorted[base + i] >= (int32_t)DS4_DSPARK_SUPPORT_EXPERT_COUNT)
+                        ok = 0;
+                    if (i > 0 && sorted[base + i] <= sorted[base + i - 1])
+                        ok = 0;
+                }
+            }
+        }
+    }
+
+    /* Non-finite candidate: NaN hidden input must fail the finite flag.
+     * Construct NaN via bits to avoid -ffast-math NAN-macro UB. */
+    if (ok) {
+        uint32_t nan_bits = 0x7fc00000u;
+        float nan_val;
+        memcpy(&nan_val, &nan_bits, sizeof(nan_val));
+        ds4_gpu_tensor_fill_f32(hidden_input, nan_val, 5u * 4u * 4096u);
+        d.position0 = 2u;
+        d.committed_count = 2u;
+        d.committed_start = 0u;
+        route_ctx.called = 0;
+        route_ctx.fail = 0;
+        const int executed = ds4_gpu_dspark_stage_execute_candidate(&d);
+        const int finite = ds4_gpu_dspark_stage_candidate_finite(
+            d.selected_address_page);
+        ok = ok && (!executed || !finite);
+        ds4_gpu_tensor_fill_f32(hidden_input, 1.0f, 5u * 4u * 4096u);
+    }
+
+    /* Before-publish (route-plan) failure: callback returns 0 */
+    if (ok) {
+        d.position0 = 2u;
+        d.committed_count = 2u;
+        d.committed_start = 0u;
+        route_ctx.called = 0;
+        route_ctx.fail = 1;
+        const int executed = ds4_gpu_dspark_stage_execute_candidate(&d);
+        ok = ok && !executed && !route_ctx.called;
+        route_ctx.fail = 0;
+    }
+
+    /* Lease/load failure: SUPPORT pack cleared */
+    if (ok) {
+        ds4_gpu_expert_store_v2_clear_for_store(DS4_GPU_EXPERT_STORE_SUPPORT);
+        d.position0 = 2u;
+        d.committed_count = 2u;
+        d.committed_start = 0u;
+        route_ctx.called = 0;
+        route_ctx.fail = 0;
+        const int executed = ds4_gpu_dspark_stage_execute_candidate(&d);
+        ok = ok && !executed;
+        (void)ds4_gpu_expert_store_v2_install_for_store(
+            DS4_GPU_EXPERT_STORE_SUPPORT, support_fd, file_size,
+            DS4_DSPARK_SUPPORT_LAYER_COUNT,
+            DS4_DSPARK_SUPPORT_EXPERT_COUNT,
+            DS4_EXPERT_STORE_STORAGE_GGML, 0, support_layers);
+        (void)ds4_gpu_dspark_routed_test_bind_store(
+            DS4_GPU_EXPERT_STORE_SUPPORT,
+            DS4_DSPARK_SUPPORT_LAYER_COUNT, target_bytes,
+            DS4_DSPARK_0731_STAGE_BYTES,
+            DS4_DSPARK_FULL_GATE_BYTES, file_size);
+    }
+
+    if (g_batch_cb || [g_pending_cbs count] != 0 ||
+        g_stream_expert_cache_owned_seq != 0) {
+        (void)ds4_gpu_synchronize();
+    }
+    if (g_dspark_expert_pack)
+        ds4_gpu_expert_store_v2_clear_for_store(DS4_GPU_EXPERT_STORE_SUPPORT);
+    if (g_qwen35_expert_pack.active)
+        ds4_gpu_expert_store_v2_clear_for_store(DS4_GPU_EXPERT_STORE_TARGET);
+    ds4_gpu_set_streaming_expert_cache_budget(0);
+    ds4_gpu_set_streaming_expert_cache_required_floor(0);
+    ds4_gpu_set_ssd_streaming(false);
+    (void)ds4_gpu_synchronize();
+    ds4_gpu_set_model_map(NULL, 0);
+    if (s.hidden_work) ds4_gpu_tensor_free(s.hidden_work);
+    if (s.hc_plain_norm) ds4_gpu_tensor_free(s.hc_plain_norm);
+    if (s.hc_mix) ds4_gpu_tensor_free(s.hc_mix);
+    if (s.hc_split) ds4_gpu_tensor_free(s.hc_split);
+    if (s.hc_pre) ds4_gpu_tensor_free(s.hc_pre);
+    if (s.normalized) ds4_gpu_tensor_free(s.normalized);
+    if (s.q) ds4_gpu_tensor_free(s.q);
+    if (s.q_rank) ds4_gpu_tensor_free(s.q_rank);
+    if (s.kv) ds4_gpu_tensor_free(s.kv);
+    if (s.attention_staging) ds4_gpu_tensor_free(s.attention_staging);
+    if (s.attention_out) ds4_gpu_tensor_free(s.attention_out);
+    if (s.attention_low) ds4_gpu_tensor_free(s.attention_low);
+    if (s.attention_row) ds4_gpu_tensor_free(s.attention_row);
+    if (s.attention_hc) ds4_gpu_tensor_free(s.attention_hc);
+    if (s.router_logits) ds4_gpu_tensor_free(s.router_logits);
+    if (s.router_bias) ds4_gpu_tensor_free(s.router_bias);
+    if (s.router_probs) ds4_gpu_tensor_free(s.router_probs);
+    if (s.router_ids) ds4_gpu_tensor_free(s.router_ids);
+    if (s.router_weights) ds4_gpu_tensor_free(s.router_weights);
+    if (s.sorted_ids) ds4_gpu_tensor_free(s.sorted_ids);
+    if (s.sorted_weights) ds4_gpu_tensor_free(s.sorted_weights);
+    if (s.routed_gate) ds4_gpu_tensor_free(s.routed_gate);
+    if (s.routed_up) ds4_gpu_tensor_free(s.routed_up);
+    if (s.routed_mid) ds4_gpu_tensor_free(s.routed_mid);
+    if (s.routed_down) ds4_gpu_tensor_free(s.routed_down);
+    if (s.routed_sum) ds4_gpu_tensor_free(s.routed_sum);
+    if (s.shared_gate) ds4_gpu_tensor_free(s.shared_gate);
+    if (s.shared_up) ds4_gpu_tensor_free(s.shared_up);
+    if (s.shared_mid) ds4_gpu_tensor_free(s.shared_mid);
+    if (s.shared_down) ds4_gpu_tensor_free(s.shared_down);
+    if (s.moe) ds4_gpu_tensor_free(s.moe);
+    if (s.candidate) ds4_gpu_tensor_free(s.candidate);
+    if (committed_kv) ds4_gpu_tensor_free(committed_kv);
+    if (hidden_input) ds4_gpu_tensor_free(hidden_input);
+    if (address_page) ds4_gpu_tensor_free(address_page);
+    if (candidate_shadow) ds4_gpu_tensor_free(candidate_shadow);
+    if (target_fd >= 0) (void)close(target_fd);
+    if (support_fd >= 0) (void)close(support_fd);
+    if (fd >= 0) (void)close(fd);
+    free(model);
+    return ok;
+}
+
+#endif
