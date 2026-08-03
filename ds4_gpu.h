@@ -1752,6 +1752,9 @@ int ds4_gpu_internal_qwen35_expert_pack_test(void);
 /* Canonical-vs-embedded GLM Q2 regression for direct and grouped execution. */
 int ds4_gpu_internal_expert_store_v2_kernel_test(void);
 #ifdef DS4_TEST_HOOKS
+/* Model-free rollback and authenticated lease-error unwind regressions. */
+int ds4_gpu_internal_qwen35_stream_staging_rollback_test(void);
+int ds4_gpu_internal_qwen35_lease_error_unwind_test(void);
 /* TARGET/SUPPORT descriptor namespace and offset-isolation regression. */
 int ds4_gpu_internal_dspark_dual_store_test(void);
 /* Separate SUPPORT SSD cache quota, namespace, I/O and teardown regression. */
