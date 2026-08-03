@@ -1083,6 +1083,7 @@ static void test_fail_closed_surfaces(ds4_session *session) {
 }
 
 int main(void) {
+    CHECK(ds4_dspark_runtime_contract_self_check());
     CHECK(ds4_test_dspark_memory_accounting());
     test_session_creation_boundary();
     test_model_aware_context_memory();

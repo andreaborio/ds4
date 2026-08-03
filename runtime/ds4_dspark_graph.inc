@@ -364,6 +364,61 @@ typedef struct {
     uint64_t frontier;
 } ds4_dspark_history_append_plan;
 
+/* Transactional ownership for the three final-0731 raw-context rings.  The
+ * rings share one committed absolute interval, but each stage publishes its
+ * writes independently.  generation identifies the one active range and
+ * ready_mask is deliberately transaction-local: committed metadata changes
+ * only after all three stage bits belong to that generation.
+ *
+ * A failed transaction invalidates this raw state because a completed stage
+ * may already have overwritten physical wrap slots that belonged to the old
+ * committed window.  It does not invalidate target KV or the 4096-wide
+ * capture/history state, which have separate owners above. */
+typedef struct {
+    bool enabled;
+    bool valid;
+    bool in_progress;
+    uint8_t ready_mask;
+    uint32_t length;
+    uint32_t pending_rows;
+    uint64_t token_start;
+    uint64_t frontier;
+    uint64_t generation;
+    uint64_t committed_generation;
+    uint64_t pending_start;
+    uint64_t pending_token_start;
+    uint64_t pending_frontier;
+    uint32_t pending_length;
+} ds4_dspark_raw_context_state;
+
+/* A seed or append writes at most two contiguous regions per stage.  The
+ * physical row is derived from the absolute retained_start modulo 128; it is
+ * never derived from the current logical length. */
+typedef struct {
+    uint32_t input_skip;
+    uint32_t retained_rows;
+    uint32_t first_physical_row;
+    uint32_t first_rows;
+    uint32_t second_rows;
+    uint32_t length;
+    uint64_t generation;
+    uint64_t range_start;
+    uint64_t token_start;
+    uint64_t frontier;
+} ds4_dspark_raw_context_plan;
+
+/* Proposal rows are not ring ownership.  The official drafter exposes the
+ * committed context plus exactly five temporary candidate rows.  The
+ * verifier's six-row input/logits scratch is pending + five drafts; it is not
+ * a sixth candidate row and remains covered by the separate memory inventory
+ * above. */
+typedef struct {
+    uint32_t committed_rows;
+    uint32_t transient_candidate_rows;
+    uint64_t committed_token_start;
+    uint64_t candidate_start;
+} ds4_dspark_raw_context_view;
+
 static const ds4_dspark_capture_contract DS4_DSPARK_CAPTURE_CONTRACT = {
     .target_layer = {40, 41, 42},
     .stage_count = DS4_DSPARK_CAPTURE_STAGE_COUNT,
@@ -722,6 +777,482 @@ static bool ds4_dspark_history_state_self_check(void) {
            state.frontier == 0u;
 }
 
+static uint64_t ds4_dspark_raw_context_next_generation(uint64_t generation) {
+    return generation == UINT64_MAX ? 1u : generation + 1u;
+}
+
+static uint32_t ds4_dspark_raw_context_physical_row(uint64_t absolute) {
+    return (uint32_t)(absolute % DS4_DSPARK_HISTORY_ROWS);
+}
+
+static bool ds4_dspark_raw_context_state_coherent(
+        const ds4_dspark_raw_context_state *state) {
+    if (!state || state->length > DS4_DSPARK_HISTORY_ROWS ||
+        state->pending_length > DS4_DSPARK_HISTORY_ROWS ||
+        (state->ready_mask &
+         (uint8_t)~((1u << DS4_DSPARK_CAPTURE_STAGE_COUNT) - 1u)) != 0) {
+        return false;
+    }
+    if (state->valid) {
+        if (state->length == 0 || state->committed_generation == 0 ||
+            state->token_start > UINT64_MAX - state->length ||
+            state->token_start + state->length != state->frontier) {
+            return false;
+        }
+    } else if (state->length != 0 || state->token_start != 0 ||
+               state->frontier != 0 || state->committed_generation != 0) {
+        return false;
+    }
+    if (state->in_progress) {
+        if (state->generation == 0 || state->pending_rows == 0 ||
+            state->pending_length == 0 ||
+            state->pending_start > UINT64_MAX - state->pending_rows ||
+            state->pending_start + state->pending_rows !=
+                state->pending_frontier ||
+            state->pending_token_start >
+                UINT64_MAX - state->pending_length ||
+            state->pending_token_start + state->pending_length !=
+                state->pending_frontier) {
+            return false;
+        }
+    } else if (state->ready_mask != 0 || state->pending_rows != 0 ||
+               state->pending_start != 0 ||
+               state->pending_token_start != 0 ||
+               state->pending_frontier != 0 ||
+               state->pending_length != 0 ||
+               (state->valid &&
+                state->committed_generation != state->generation)) {
+        return false;
+    }
+    return true;
+}
+
+static void ds4_dspark_raw_context_state_init(
+        ds4_dspark_raw_context_state *state,
+        bool                          enabled) {
+    if (!state) return;
+    memset(state, 0, sizeof(*state));
+    state->enabled = enabled;
+}
+
+static void ds4_dspark_raw_context_state_clear_pending(
+        ds4_dspark_raw_context_state *state) {
+    state->in_progress = false;
+    state->ready_mask = 0;
+    state->pending_rows = 0;
+    state->pending_start = 0;
+    state->pending_token_start = 0;
+    state->pending_frontier = 0;
+    state->pending_length = 0;
+}
+
+/* Clear only DSpark raw ownership.  generation survives so a late completion
+ * from the failed transaction cannot become current again. */
+static void ds4_dspark_raw_context_state_invalidate(
+        ds4_dspark_raw_context_state *state) {
+    if (!state) return;
+    state->valid = false;
+    state->length = 0;
+    state->token_start = 0;
+    state->frontier = 0;
+    state->committed_generation = 0;
+    ds4_dspark_raw_context_state_clear_pending(state);
+}
+
+/* Reset also advances the epoch.  This is the fail-closed hook for target KV
+ * resets or rewinds that cannot retain a coherent raw prefix. */
+static void ds4_dspark_raw_context_state_reset(
+        ds4_dspark_raw_context_state *state) {
+    if (!state) return;
+    state->generation =
+        ds4_dspark_raw_context_next_generation(state->generation);
+    ds4_dspark_raw_context_state_invalidate(state);
+}
+
+static bool ds4_dspark_raw_context_state_begin(
+        ds4_dspark_raw_context_state *state,
+        bool                          seed,
+        uint64_t                      start,
+        uint32_t                      rows,
+        ds4_dspark_raw_context_plan  *out) {
+    if (!state || !out || !state->enabled || state->in_progress || rows == 0 ||
+        start > UINT64_MAX - rows ||
+        !ds4_dspark_raw_context_state_coherent(state) ||
+        (seed ? state->valid :
+                (!state->valid || start != state->frontier))) {
+        return false;
+    }
+    const uint32_t retained = rows < DS4_DSPARK_HISTORY_ROWS ?
+        rows : DS4_DSPARK_HISTORY_ROWS;
+    const uint32_t input_skip = rows - retained;
+    const uint64_t retained_start = start + input_skip;
+    const uint64_t frontier = start + rows;
+    const uint64_t logical_rows =
+        (seed ? 0u : state->length) + (uint64_t)rows;
+    const uint32_t length = logical_rows < DS4_DSPARK_HISTORY_ROWS ?
+        (uint32_t)logical_rows : DS4_DSPARK_HISTORY_ROWS;
+    const uint64_t token_start = frontier - length;
+    const uint32_t physical =
+        ds4_dspark_raw_context_physical_row(retained_start);
+    uint32_t first = DS4_DSPARK_HISTORY_ROWS - physical;
+    if (first > retained) first = retained;
+    const uint64_t generation =
+        ds4_dspark_raw_context_next_generation(state->generation);
+    const ds4_dspark_raw_context_plan plan = {
+        .input_skip = input_skip,
+        .retained_rows = retained,
+        .first_physical_row = physical,
+        .first_rows = first,
+        .second_rows = retained - first,
+        .length = length,
+        .generation = generation,
+        .range_start = start,
+        .token_start = token_start,
+        .frontier = frontier,
+    };
+    state->generation = generation;
+    state->in_progress = true;
+    state->ready_mask = 0;
+    state->pending_rows = rows;
+    state->pending_start = start;
+    state->pending_token_start = token_start;
+    state->pending_frontier = frontier;
+    state->pending_length = length;
+    *out = plan;
+    return true;
+}
+
+static bool ds4_dspark_raw_context_state_begin_seed(
+        ds4_dspark_raw_context_state *state,
+        uint64_t                      start,
+        uint32_t                      rows,
+        ds4_dspark_raw_context_plan  *out) {
+    return ds4_dspark_raw_context_state_begin(
+        state, true, start, rows, out);
+}
+
+static bool ds4_dspark_raw_context_state_begin_append(
+        ds4_dspark_raw_context_state *state,
+        uint64_t                      start,
+        uint32_t                      rows,
+        ds4_dspark_raw_context_plan  *out) {
+    return ds4_dspark_raw_context_state_begin(
+        state, false, start, rows, out);
+}
+
+static bool ds4_dspark_raw_context_state_mark_stage_ready(
+        ds4_dspark_raw_context_state *state,
+        uint64_t                      generation,
+        uint32_t                      stage) {
+    if (!state || !state->enabled || !state->in_progress ||
+        generation == 0 || generation != state->generation ||
+        stage >= DS4_DSPARK_CAPTURE_STAGE_COUNT ||
+        !ds4_dspark_raw_context_state_coherent(state)) {
+        return false;
+    }
+    const uint8_t bit = (uint8_t)(1u << stage);
+    if ((state->ready_mask & bit) != 0) return false;
+    state->ready_mask |= bit;
+    return true;
+}
+
+static bool ds4_dspark_raw_context_state_commit(
+        ds4_dspark_raw_context_state *state,
+        uint64_t                      generation) {
+    const uint8_t complete =
+        (uint8_t)((1u << DS4_DSPARK_CAPTURE_STAGE_COUNT) - 1u);
+    if (!state || !state->enabled || !state->in_progress ||
+        generation == 0 || generation != state->generation ||
+        state->ready_mask != complete ||
+        !ds4_dspark_raw_context_state_coherent(state)) {
+        return false;
+    }
+    state->valid = true;
+    state->length = state->pending_length;
+    state->token_start = state->pending_token_start;
+    state->frontier = state->pending_frontier;
+    state->committed_generation = generation;
+    ds4_dspark_raw_context_state_clear_pending(state);
+    return ds4_dspark_raw_context_state_coherent(state);
+}
+
+static bool ds4_dspark_raw_context_state_abort(
+        ds4_dspark_raw_context_state *state,
+        uint64_t                      generation) {
+    if (!state || !state->enabled || !state->in_progress ||
+        generation == 0 || generation != state->generation) {
+        return false;
+    }
+    ds4_dspark_raw_context_state_invalidate(state);
+    return ds4_dspark_raw_context_state_coherent(state);
+}
+
+static bool ds4_dspark_raw_context_state_ready_at(
+        const ds4_dspark_raw_context_state *state,
+        uint64_t                            frontier) {
+    return state && state->enabled && state->valid && !state->in_progress &&
+           state->length != 0 && state->committed_generation != 0 &&
+           state->committed_generation == state->generation &&
+           state->frontier == frontier &&
+           ds4_dspark_raw_context_state_coherent(state);
+}
+
+/* A rewind inside the retained absolute interval can publish its prefix by
+ * shortening metadata.  Rewinding outside that interval, or while device
+ * writes are in flight, invalidates raw ownership instead of guessing. */
+static bool ds4_dspark_raw_context_state_rewind(
+        ds4_dspark_raw_context_state *state,
+        uint64_t                      frontier) {
+    if (!state || !state->enabled) return false;
+    if (!state->valid || state->in_progress ||
+        !ds4_dspark_raw_context_state_coherent(state) ||
+        frontier < state->token_start || frontier > state->frontier) {
+        ds4_dspark_raw_context_state_reset(state);
+        return false;
+    }
+    if (frontier == state->frontier) return true;
+    if (frontier == state->token_start) {
+        ds4_dspark_raw_context_state_reset(state);
+        return true;
+    }
+    state->generation =
+        ds4_dspark_raw_context_next_generation(state->generation);
+    state->length = (uint32_t)(frontier - state->token_start);
+    state->frontier = frontier;
+    state->committed_generation = state->generation;
+    return ds4_dspark_raw_context_state_coherent(state);
+}
+
+static bool ds4_dspark_raw_context_view_make(
+        const ds4_dspark_raw_context_state *state,
+        uint64_t                            candidate_start,
+        ds4_dspark_raw_context_view        *out) {
+    if (!state || !out ||
+        candidate_start >
+            UINT64_MAX - DS4_DSPARK_SUPPORT_CANDIDATE_ROWS ||
+        !ds4_dspark_raw_context_state_ready_at(state, candidate_start)) {
+        return false;
+    }
+    *out = (ds4_dspark_raw_context_view){
+        .committed_rows = state->length,
+        .transient_candidate_rows = DS4_DSPARK_SUPPORT_CANDIDATE_ROWS,
+        .committed_token_start = state->token_start,
+        .candidate_start = candidate_start,
+    };
+    return true;
+}
+
+static void ds4_dspark_raw_context_self_check_write(
+        const ds4_dspark_raw_context_plan *plan,
+        uint32_t                           stage,
+        uint64_t ring[DS4_DSPARK_CAPTURE_STAGE_COUNT]
+                     [DS4_DSPARK_HISTORY_ROWS]) {
+    for (uint32_t row = 0; row < plan->retained_rows; row++) {
+        const uint64_t absolute =
+            plan->range_start + plan->input_skip + row;
+        ring[stage][ds4_dspark_raw_context_physical_row(absolute)] = absolute;
+    }
+}
+
+static bool ds4_dspark_raw_context_self_check_commit(
+        ds4_dspark_raw_context_state      *state,
+        const ds4_dspark_raw_context_plan *plan,
+        uint64_t ring[DS4_DSPARK_CAPTURE_STAGE_COUNT]
+                     [DS4_DSPARK_HISTORY_ROWS]) {
+    for (uint32_t stage = 0; stage < DS4_DSPARK_CAPTURE_STAGE_COUNT; stage++) {
+        ds4_dspark_raw_context_self_check_write(plan, stage, ring);
+        if (!ds4_dspark_raw_context_state_mark_stage_ready(
+                state, plan->generation, stage)) {
+            return false;
+        }
+    }
+    if (!ds4_dspark_raw_context_state_commit(state, plan->generation)) {
+        return false;
+    }
+    for (uint32_t stage = 0; stage < DS4_DSPARK_CAPTURE_STAGE_COUNT; stage++) {
+        for (uint64_t absolute = state->token_start;
+             absolute < state->frontier; absolute++) {
+            if (ring[stage][ds4_dspark_raw_context_physical_row(absolute)] !=
+                absolute) {
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
+static bool ds4_dspark_raw_context_state_self_check(void) {
+    ds4_dspark_raw_context_state state;
+    ds4_dspark_raw_context_plan plan;
+    ds4_dspark_raw_context_view view;
+    uint64_t ring[DS4_DSPARK_CAPTURE_STAGE_COUNT]
+                 [DS4_DSPARK_HISTORY_ROWS];
+    memset(ring, 0xff, sizeof(ring));
+
+    ds4_dspark_raw_context_state_init(&state, false);
+    if (ds4_dspark_raw_context_state_begin_seed(
+            &state, 0u, DS4_DSPARK_HISTORY_ROWS, &plan)) {
+        return false;
+    }
+    ds4_dspark_raw_context_state_init(&state, true);
+    if (!ds4_dspark_raw_context_state_begin_seed(
+            &state, 0u, DS4_DSPARK_HISTORY_ROWS, &plan) ||
+        plan.input_skip != 0u || plan.retained_rows != 128u ||
+        plan.first_physical_row != 0u || plan.first_rows != 128u ||
+        plan.second_rows != 0u || plan.length != 128u ||
+        state.valid || state.length != 0u || state.frontier != 0u ||
+        !ds4_dspark_raw_context_self_check_commit(&state, &plan, ring) ||
+        state.token_start != 0u || state.length != 128u ||
+        state.frontier != 128u ||
+        !ds4_dspark_raw_context_state_ready_at(&state, 128u) ||
+        ds4_dspark_raw_context_state_ready_at(&state, 127u) ||
+        !ds4_dspark_raw_context_view_make(&state, 128u, &view) ||
+        view.committed_rows != 128u ||
+        view.transient_candidate_rows != 5u ||
+        view.committed_token_start != 0u || view.candidate_start != 128u ||
+        DS4_DSPARK_SUPPORT_CANDIDATE_ROWS != 5u ||
+        ds4_dspark_raw_context_view_make(&state, 129u, &view)) {
+        return false;
+    }
+
+    const uint64_t seed_generation = state.generation;
+    if (!ds4_dspark_raw_context_state_begin_append(
+            &state, 128u, 1u, &plan) ||
+        plan.first_physical_row != 0u || plan.first_rows != 1u ||
+        plan.second_rows != 0u || plan.token_start != 1u ||
+        plan.frontier != 129u || state.frontier != 128u ||
+        ds4_dspark_raw_context_state_mark_stage_ready(
+            &state, seed_generation, 0u) ||
+        ds4_dspark_raw_context_state_commit(&state, plan.generation)) {
+        return false;
+    }
+    if (!ds4_dspark_raw_context_self_check_commit(&state, &plan, ring) ||
+        state.token_start != 1u || state.length != 128u ||
+        state.frontier != 129u || ring[0][0] != 128u ||
+        ds4_dspark_raw_context_state_begin_append(
+            &state, 130u, 1u, &plan)) {
+        return false;
+    }
+
+    const uint64_t committed_generation = state.generation;
+    if (!ds4_dspark_raw_context_state_begin_append(
+            &state, 129u, 2u, &plan)) {
+        return false;
+    }
+    const uint64_t partial_generation = plan.generation;
+    ds4_dspark_raw_context_self_check_write(&plan, 0u, ring);
+    if (ds4_dspark_raw_context_state_mark_stage_ready(
+            &state, committed_generation, 0u) ||
+        !ds4_dspark_raw_context_state_mark_stage_ready(
+            &state, partial_generation, 0u) ||
+        ds4_dspark_raw_context_state_mark_stage_ready(
+            &state, partial_generation, 0u) ||
+        state.ready_mask != 1u ||
+        ds4_dspark_raw_context_state_abort(
+            &state, committed_generation) ||
+        !state.in_progress || state.ready_mask != 1u ||
+        !ds4_dspark_raw_context_state_abort(&state, partial_generation) ||
+        state.valid || state.in_progress || state.length != 0u ||
+        state.frontier != 0u ||
+        ds4_dspark_raw_context_state_ready_at(&state, 129u)) {
+        return false;
+    }
+
+    if (ds4_dspark_raw_context_next_generation(UINT64_MAX) != 1u ||
+        !ds4_dspark_raw_context_state_begin_seed(
+            &state, 500u, 130u, &plan) ||
+        plan.input_skip != 2u || plan.retained_rows != 128u ||
+        plan.first_physical_row != 118u || plan.first_rows != 10u ||
+        plan.second_rows != 118u || plan.token_start != 502u ||
+        plan.frontier != 630u ||
+        !ds4_dspark_raw_context_self_check_commit(&state, &plan, ring) ||
+        state.token_start != 502u || state.length != 128u ||
+        state.frontier != 630u ||
+        ds4_dspark_raw_context_state_rewind(&state, 631u) ||
+        state.valid || state.in_progress) {
+        return false;
+    }
+
+    if (!ds4_dspark_raw_context_state_begin_seed(
+            &state, 700u, 1u, &plan) ||
+        !ds4_dspark_raw_context_self_check_commit(&state, &plan, ring) ||
+        !ds4_dspark_raw_context_state_begin_append(
+            &state, 701u, 1u, &plan) ||
+        ds4_dspark_raw_context_state_rewind(&state, 701u) ||
+        state.valid || state.in_progress) {
+        return false;
+    }
+
+    if (!ds4_dspark_raw_context_state_begin_seed(
+            &state, 1000u, 1u, &plan)) {
+        return false;
+    }
+    const uint64_t reset_stale_generation = plan.generation;
+    ds4_dspark_raw_context_state_reset(&state);
+    if (state.valid || state.in_progress ||
+        ds4_dspark_raw_context_state_mark_stage_ready(
+            &state, reset_stale_generation, 0u) ||
+        !ds4_dspark_raw_context_state_begin_seed(
+            &state, 1000u, 1u, &plan) ||
+        !ds4_dspark_raw_context_self_check_commit(&state, &plan, ring) ||
+        state.token_start != 1000u || state.length != 1u ||
+        state.frontier != 1001u ||
+        !ds4_dspark_raw_context_state_begin_append(
+            &state, 1001u, 127u, &plan) ||
+        plan.first_physical_row != 105u || plan.first_rows != 23u ||
+        plan.second_rows != 104u ||
+        !ds4_dspark_raw_context_self_check_commit(&state, &plan, ring) ||
+        state.token_start != 1000u || state.length != 128u ||
+        state.frontier != 1128u) {
+        return false;
+    }
+
+    const uint64_t before_rewind_generation = state.generation;
+    if (!ds4_dspark_raw_context_state_rewind(&state, 1100u) ||
+        state.generation == before_rewind_generation ||
+        state.token_start != 1000u || state.length != 100u ||
+        state.frontier != 1100u ||
+        !ds4_dspark_raw_context_state_ready_at(&state, 1100u) ||
+        ds4_dspark_raw_context_physical_row(1100u) != 76u ||
+        ds4_dspark_raw_context_state_rewind(&state, 999u) ||
+        state.valid || state.length != 0u || state.frontier != 0u) {
+        return false;
+    }
+
+    if (!ds4_dspark_raw_context_state_begin_seed(
+            &state, 2000u, 2u, &plan) ||
+        !ds4_dspark_raw_context_self_check_commit(&state, &plan, ring)) {
+        return false;
+    }
+
+    ds4_dspark_raw_context_state_reset(&state);
+    if (!ds4_dspark_raw_context_state_begin_seed(
+            &state,
+            UINT64_MAX - DS4_DSPARK_SUPPORT_CANDIDATE_ROWS - 1u,
+            1u,
+            &plan) ||
+        !ds4_dspark_raw_context_self_check_commit(&state, &plan, ring) ||
+        !ds4_dspark_raw_context_view_make(
+            &state,
+            UINT64_MAX - DS4_DSPARK_SUPPORT_CANDIDATE_ROWS,
+            &view)) {
+        return false;
+    }
+    ds4_dspark_raw_context_state_reset(&state);
+    if (!ds4_dspark_raw_context_state_begin_seed(
+            &state, UINT64_MAX - 1u, 1u, &plan) ||
+        !ds4_dspark_raw_context_self_check_commit(&state, &plan, ring) ||
+        ds4_dspark_raw_context_view_make(&state, UINT64_MAX, &view)) {
+        return false;
+    }
+    const uint64_t before_reset_generation = state.generation;
+    ds4_dspark_raw_context_state_reset(&state);
+    return state.generation != before_reset_generation && !state.valid &&
+           !state.in_progress && state.length == 0u &&
+           state.token_start == 0u && state.frontier == 0u &&
+           ds4_dspark_raw_context_state_coherent(&state);
+}
+
 /* Device append/publication commits a stage bit only after every blit for that
  * stage succeeds.  A failure injected after the first valid blit therefore
  * leaves both transactions incomplete; finish(false) must make the partially
@@ -828,6 +1359,7 @@ static bool ds4_dspark_runtime_contract_self_check(void) {
            ds4_dspark_capture_state_ready_at(&capture_state, 43u) &&
            !ds4_dspark_capture_state_ready_at(&capture_state, 42u) &&
            ds4_dspark_history_state_self_check() &&
+           ds4_dspark_raw_context_state_self_check() &&
            ds4_dspark_failed_blit_state_self_check() &&
            ds4_dspark_runtime_memory_make(&memory) &&
            memory.capture_bytes == UINT64_C(7127040) &&
