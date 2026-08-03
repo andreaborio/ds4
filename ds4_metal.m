@@ -183,6 +183,7 @@ static id<MTLArgumentEncoder> g_moe_table_q4_pair_up_encoder;
 static id<MTLArgumentEncoder> g_moe_table_q4_sum_down_encoder;
 static id<MTLComputePipelineState> g_rope_tail_batch_pipeline;
 static id<MTLComputePipelineState> g_dsv4_fp8_kv_quantize_pipeline;
+static id<MTLComputePipelineState> g_dsv4_bf16_round_f32_pipeline;
 static id<MTLComputePipelineState> g_dsv4_indexer_qat_pipeline;
 static id<MTLComputePipelineState> g_dsv4_kv_fp8_store_pipeline;
 static id<MTLComputePipelineState> g_dsv4_ratio4_shift_pipeline;
@@ -6978,6 +6979,24 @@ int ds4_gpu_init(void) {
             return 0;
         }
 
+        fn = [library newFunctionWithName:@"kernel_dsv4_bf16_round_f32"];
+        if (!fn) {
+            fprintf(stderr, "ds4: Metal kernel_dsv4_bf16_round_f32 function not found\n");
+            g_queue = nil;
+            g_device = nil;
+            return 0;
+        }
+        error = nil;
+        g_dsv4_bf16_round_f32_pipeline =
+            [g_device newComputePipelineStateWithFunction:fn error:&error];
+        if (!g_dsv4_bf16_round_f32_pipeline) {
+            fprintf(stderr, "ds4: Metal kernel_dsv4_bf16_round_f32 pipeline failed: %s\n",
+                    [[error localizedDescription] UTF8String]);
+            g_queue = nil;
+            g_device = nil;
+            return 0;
+        }
+
         fn = [library newFunctionWithName:@"kernel_dsv4_indexer_hadamard_fp4_f32"];
         if (!fn) {
             fprintf(stderr, "ds4: Metal kernel_dsv4_indexer_hadamard_fp4_f32 function not found\n");
@@ -9375,6 +9394,7 @@ void ds4_gpu_cleanup(void) {
         g_moe_table_q4_sum_down_encoder = nil;
         g_rope_tail_batch_pipeline = nil;
         g_dsv4_fp8_kv_quantize_pipeline = nil;
+        g_dsv4_bf16_round_f32_pipeline = nil;
         g_dsv4_indexer_qat_pipeline = nil;
         g_dsv4_kv_fp8_store_pipeline = nil;
         g_dsv4_ratio4_shift_pipeline = nil;
@@ -22796,6 +22816,55 @@ int ds4_gpu_dsv4_fp8_kv_quantize_tensor(
     return 1;
 }
 
+int ds4_gpu_bf16_round_f32_tensor(ds4_gpu_tensor *x, uint64_t count) {
+    if (!g_initialized && !ds4_gpu_init()) return 0;
+    if (!x || count == 0 || count > UINT32_MAX ||
+        count > UINT64_MAX / sizeof(uint32_t)) {
+        return 0;
+    }
+
+    const uint64_t required = count * sizeof(uint32_t);
+    if (required > (uint64_t)NSUIntegerMax ||
+        ds4_gpu_tensor_bytes(x) < required) {
+        return 0;
+    }
+
+    @autoreleasepool {
+        id<MTLBuffer> xbuf = ds4_gpu_tensor_buffer(x);
+        const NSUInteger xoff = ds4_gpu_tensor_offset(x);
+        const NSUInteger nbytes = (NSUInteger)required;
+        if (!xbuf || (xoff % sizeof(uint32_t)) != 0 ||
+            xoff > [xbuf length] ||
+            nbytes > [xbuf length] - xoff) {
+            return 0;
+        }
+
+        int owned = 0;
+        id<MTLCommandBuffer> cb = ds4_gpu_command_buffer(&owned);
+        if (!cb) return 0;
+
+        id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
+        if (!enc) return 0;
+        [enc setComputePipelineState:g_dsv4_bf16_round_f32_pipeline];
+        [enc setBuffer:xbuf offset:xoff atIndex:0];
+        [enc setBytes:&count length:sizeof(count) atIndex:1];
+
+        const NSUInteger nth = MIN(
+            (NSUInteger)256,
+            [g_dsv4_bf16_round_f32_pipeline maxTotalThreadsPerThreadgroup]);
+        const NSUInteger ng = ((NSUInteger)count + nth - 1u) / nth;
+        [enc dispatchThreadgroups:MTLSizeMake(ng, 1, 1)
+             threadsPerThreadgroup:MTLSizeMake(nth, 1, 1)];
+        ds4_gpu_end_compute_encoder(cb, enc);
+
+        if (!ds4_gpu_finish_command_buffer(
+                cb, owned, "DSpark BF16 round/reopen")) {
+            return 0;
+        }
+    }
+    return 1;
+}
+
 int ds4_gpu_dsv4_indexer_qat_tensor(
         ds4_gpu_tensor *x,
         uint32_t          n_rows,
@@ -27468,6 +27537,202 @@ static int ds4_gpu_encode_flash_attention_gathered_heads(
     return 1;
 }
 
+enum {
+    DS4_GPU_DSPARK_ATTENTION_QUERY_ROWS = 5,
+    DS4_GPU_DSPARK_ATTENTION_DRAFT_ROWS = 5,
+    DS4_GPU_DSPARK_ATTENTION_RING_CAP = 128,
+    DS4_GPU_DSPARK_ATTENTION_HEAD_DIM = 512,
+    DS4_GPU_DSPARK_ATTENTION_HEADS = 64,
+};
+
+static int ds4_gpu_buffer_ranges_overlap(
+        id<MTLBuffer> a,
+        NSUInteger    a_offset,
+        NSUInteger    a_bytes,
+        id<MTLBuffer> b,
+        NSUInteger    b_offset,
+        NSUInteger    b_bytes) {
+    if (!a || !b || a != b || a_bytes == 0 || b_bytes == 0) return 0;
+    if (a_offset > NSUIntegerMax - a_bytes ||
+        b_offset > NSUIntegerMax - b_bytes) {
+        return 1;
+    }
+    return a_offset < b_offset + b_bytes &&
+           b_offset < a_offset + a_bytes;
+}
+
+/* The final checkpoint writes current main_kv into the committed ring before
+ * this call. Before the ring fills, slots 0..count-1 are visible. Once full,
+ * the pinned top-k index order remains physical slots 0..127 regardless of
+ * the oldest-token cursor. The five transient rows follow that physical
+ * cache order and all five queries see the complete set non-causally. */
+static int ds4_gpu_encode_dspark_attention_two_source_f32(
+        id<MTLCommandBuffer>   cb,
+        ds4_gpu_tensor      *heads,
+        id<MTLBuffer>          sinks_buf,
+        NSUInteger             sinks_offset,
+        const ds4_gpu_tensor *q,
+        const ds4_gpu_tensor *committed_kv,
+        const ds4_gpu_tensor *transient_draft_kv,
+        uint32_t               committed_count,
+        uint32_t               committed_cap,
+        uint32_t               committed_start,
+        uint32_t               n_head,
+        uint32_t               head_dim) {
+    if (!cb || !heads || !sinks_buf || !q || !committed_kv ||
+        !transient_draft_kv ||
+        committed_cap != DS4_GPU_DSPARK_ATTENTION_RING_CAP ||
+        committed_count < 2u || committed_count > committed_cap ||
+        committed_start >= committed_cap ||
+        (committed_count < committed_cap && committed_start != 0) ||
+        n_head != DS4_GPU_DSPARK_ATTENTION_HEADS ||
+        head_dim != DS4_GPU_DSPARK_ATTENTION_HEAD_DIM) {
+        return 0;
+    }
+
+    const uint32_t n_keys =
+        committed_count + DS4_GPU_DSPARK_ATTENTION_DRAFT_ROWS;
+    const uint64_t row_bytes64 = (uint64_t)head_dim * sizeof(float);
+    const uint64_t query_rows =
+        (uint64_t)DS4_GPU_DSPARK_ATTENTION_QUERY_ROWS * n_head;
+    if (query_rows > UINT64_MAX / row_bytes64 ||
+        (uint64_t)committed_cap > UINT64_MAX / row_bytes64 ||
+        (uint64_t)DS4_GPU_DSPARK_ATTENTION_DRAFT_ROWS >
+            UINT64_MAX / row_bytes64 ||
+        (uint64_t)n_keys > UINT64_MAX / row_bytes64) {
+        return 0;
+    }
+
+    const uint64_t q_bytes64 = query_rows * row_bytes64;
+    const uint64_t committed_bytes64 =
+        (uint64_t)committed_cap * row_bytes64;
+    const uint64_t transient_bytes64 =
+        (uint64_t)DS4_GPU_DSPARK_ATTENTION_DRAFT_ROWS * row_bytes64;
+    const uint64_t kv_bytes64 = (uint64_t)n_keys * row_bytes64;
+    if (q_bytes64 > NSUIntegerMax || committed_bytes64 > NSUIntegerMax ||
+        transient_bytes64 > NSUIntegerMax || kv_bytes64 > NSUIntegerMax) {
+        return 0;
+    }
+
+    const NSUInteger q_bytes = (NSUInteger)q_bytes64;
+    const NSUInteger committed_bytes = (NSUInteger)committed_bytes64;
+    const NSUInteger transient_bytes = (NSUInteger)transient_bytes64;
+    const NSUInteger kv_bytes = (NSUInteger)kv_bytes64;
+    const NSUInteger row_bytes = (NSUInteger)row_bytes64;
+    id<MTLBuffer> qbuf = ds4_gpu_tensor_buffer(q);
+    id<MTLBuffer> committed_buf = ds4_gpu_tensor_buffer(committed_kv);
+    id<MTLBuffer> transient_buf =
+        ds4_gpu_tensor_buffer(transient_draft_kv);
+    id<MTLBuffer> headsbuf = ds4_gpu_tensor_buffer(heads);
+    const NSUInteger qoff = ds4_gpu_tensor_offset(q);
+    const NSUInteger committed_off = ds4_gpu_tensor_offset(committed_kv);
+    const NSUInteger transient_off =
+        ds4_gpu_tensor_offset(transient_draft_kv);
+    const NSUInteger heads_off = ds4_gpu_tensor_offset(heads);
+    if (!qbuf || !committed_buf || !transient_buf || !headsbuf ||
+        ds4_gpu_tensor_bytes(q) < q_bytes64 ||
+        ds4_gpu_tensor_bytes(committed_kv) < committed_bytes64 ||
+        ds4_gpu_tensor_bytes(transient_draft_kv) < transient_bytes64 ||
+        ds4_gpu_tensor_bytes(heads) < q_bytes64 ||
+        (qoff % sizeof(float)) != 0 ||
+        (committed_off % sizeof(float)) != 0 ||
+        (transient_off % sizeof(float)) != 0 ||
+        (heads_off % sizeof(float)) != 0 ||
+        qoff > [qbuf length] || q_bytes > [qbuf length] - qoff ||
+        committed_off > [committed_buf length] ||
+        committed_bytes > [committed_buf length] - committed_off ||
+        transient_off > [transient_buf length] ||
+        transient_bytes > [transient_buf length] - transient_off ||
+        heads_off > [headsbuf length] ||
+        q_bytes > [headsbuf length] - heads_off) {
+        return 0;
+    }
+
+    /* Input/input overlap would make the two logical source identities
+     * ambiguous; output/input or output/sinks overlap would allow the command
+     * sequence to mutate an input before completion. */
+    if (ds4_gpu_buffer_ranges_overlap(qbuf, qoff, q_bytes,
+                                      committed_buf, committed_off,
+                                      committed_bytes) ||
+        ds4_gpu_buffer_ranges_overlap(qbuf, qoff, q_bytes,
+                                      transient_buf, transient_off,
+                                      transient_bytes) ||
+        ds4_gpu_buffer_ranges_overlap(committed_buf, committed_off,
+                                      committed_bytes,
+                                      transient_buf, transient_off,
+                                      transient_bytes) ||
+        ds4_gpu_buffer_ranges_overlap(headsbuf, heads_off, q_bytes,
+                                      qbuf, qoff, q_bytes) ||
+        ds4_gpu_buffer_ranges_overlap(headsbuf, heads_off, q_bytes,
+                                      committed_buf, committed_off,
+                                      committed_bytes) ||
+        ds4_gpu_buffer_ranges_overlap(headsbuf, heads_off, q_bytes,
+                                      transient_buf, transient_off,
+                                      transient_bytes) ||
+        ds4_gpu_buffer_ranges_overlap(headsbuf, heads_off, q_bytes,
+                                      sinks_buf, sinks_offset,
+                                      (NSUInteger)n_head * sizeof(float))) {
+        return 0;
+    }
+
+    id<MTLComputePipelineState> pipeline = ds4_gpu_get_pipeline(
+        "kernel_dspark_attention_two_source_f32");
+    const NSUInteger threads = 256u;
+    if (!pipeline ||
+        pipeline.threadExecutionWidth != 32u ||
+        pipeline.maxTotalThreadsPerThreadgroup < threads) {
+        fprintf(stderr,
+                "ds4: Metal DSpark attention pipeline unsupported "
+                "(simd=%llu threads=%llu/%llu)\n",
+                (unsigned long long)(pipeline
+                    ? pipeline.threadExecutionWidth : 0u),
+                (unsigned long long)threads,
+                (unsigned long long)(pipeline
+                    ? pipeline.maxTotalThreadsPerThreadgroup : 0u));
+        return 0;
+    }
+
+    if (!ds4_gpu_ensure_scratch_buffer(&g_flash_attn_kv_buffer,
+                                         &g_flash_attn_kv_bytes,
+                                         kv_bytes,
+                                         "ds4_dspark_attention_kv_f32")) {
+        return 0;
+    }
+
+    /* Physical slot order is part of the pinned BF16 block schedule. */
+    if (!ds4_gpu_encode_cpy_f32_f32_1d(
+            cb, committed_buf, committed_off,
+            g_flash_attn_kv_buffer, 0,
+            committed_count * head_dim) ||
+        !ds4_gpu_encode_cpy_f32_f32_1d(
+            cb, transient_buf, transient_off,
+            g_flash_attn_kv_buffer,
+            (NSUInteger)committed_count * row_bytes,
+            DS4_GPU_DSPARK_ATTENTION_DRAFT_ROWS * head_dim)) {
+        return 0;
+    }
+
+    const struct {
+        uint32_t n_keys;
+    } args = {
+        .n_keys = n_keys,
+    };
+
+    id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
+    if (!enc) return 0;
+    [enc setComputePipelineState:pipeline];
+    [enc setBytes:&args length:sizeof(args) atIndex:0];
+    [enc setBuffer:qbuf offset:qoff atIndex:1];
+    [enc setBuffer:g_flash_attn_kv_buffer offset:0 atIndex:2];
+    [enc setBuffer:sinks_buf offset:sinks_offset atIndex:3];
+    [enc setBuffer:headsbuf offset:heads_off atIndex:4];
+    [enc dispatchThreadgroups:
+         MTLSizeMake(DS4_GPU_DSPARK_ATTENTION_QUERY_ROWS, n_head, 1)
+         threadsPerThreadgroup:MTLSizeMake(threads, 1, 1)];
+    ds4_gpu_end_compute_encoder(cb, enc);
+    return 1;
+}
+
 static int ds4_gpu_encode_flash_attention_decode_raw_batch_heads(
         id<MTLCommandBuffer>   cb,
         ds4_gpu_tensor      *heads,
@@ -28109,6 +28374,59 @@ int ds4_gpu_attention_decode_raw_batch_heads_tensor(
         if (!ds4_gpu_finish_command_buffer(cb, owned, "graph decode raw batch attention heads")) return 0;
     }
 
+    return 1;
+}
+
+int ds4_gpu_dspark_attention_two_source_f32_tensor(
+        ds4_gpu_tensor       *heads,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                sinks_offset,
+        const ds4_gpu_tensor *q,
+        const ds4_gpu_tensor *committed_kv,
+        const ds4_gpu_tensor *transient_draft_kv,
+        uint32_t                committed_count,
+        uint32_t                committed_cap,
+        uint32_t                committed_start,
+        uint32_t                n_head,
+        uint32_t                head_dim) {
+    if (!g_initialized && !ds4_gpu_init()) return 0;
+    if (!heads || !model_map || !q || !committed_kv ||
+        !transient_draft_kv ||
+        committed_cap != DS4_GPU_DSPARK_ATTENTION_RING_CAP ||
+        committed_count < 2u || committed_count > committed_cap ||
+        committed_start >= committed_cap ||
+        (committed_count < committed_cap && committed_start != 0) ||
+        n_head != DS4_GPU_DSPARK_ATTENTION_HEADS ||
+        head_dim != DS4_GPU_DSPARK_ATTENTION_HEAD_DIM ||
+        (uint64_t)n_head > UINT64_MAX / sizeof(float) ||
+        sinks_offset > model_size ||
+        (uint64_t)n_head * sizeof(float) > model_size - sinks_offset) {
+        return 0;
+    }
+
+    @autoreleasepool {
+        uint64_t sinks_inner = 0;
+        id<MTLBuffer> sinks_buf = ds4_gpu_wrap_model_range(
+            model_map, model_size, sinks_offset,
+            (uint64_t)n_head * sizeof(float), &sinks_inner);
+        if (!sinks_buf || sinks_inner > NSUIntegerMax) return 0;
+
+        int owned = 0;
+        id<MTLCommandBuffer> cb = ds4_gpu_command_buffer(&owned);
+        if (!cb) return 0;
+        if (!ds4_gpu_encode_dspark_attention_two_source_f32(
+                cb, heads, sinks_buf, (NSUInteger)sinks_inner,
+                q, committed_kv, transient_draft_kv,
+                committed_count, committed_cap, committed_start,
+                n_head, head_dim)) {
+            return 0;
+        }
+        if (!ds4_gpu_finish_command_buffer(
+                cb, owned, "DSpark two-source official attention")) {
+            return 0;
+        }
+    }
     return 1;
 }
 
@@ -38623,6 +38941,617 @@ static int ds4_gpu_internal_qwen35_expert_pack_pwrite_all(
 }
 
 #ifdef DS4_TEST_HOOKS
+static uint32_t ds4_gpu_bf16_round_f32_oracle(uint32_t bits) {
+    const uint32_t magnitude = bits & UINT32_C(0x7fffffff);
+    if (magnitude >= UINT32_C(0x7f800000)) {
+        if (magnitude == UINT32_C(0x7f800000)) return bits;
+        return (bits & UINT32_C(0xffff0000)) | UINT32_C(0x00400000);
+    }
+    return (bits + UINT32_C(0x00007fff) + ((bits >> 16u) & 1u)) &
+           UINT32_C(0xffff0000);
+}
+
+int ds4_gpu_internal_bf16_round_f32_test(void) {
+    static const struct {
+        uint32_t input;
+        uint32_t expected;
+    } cases[] = {
+        {UINT32_C(0x00000000), UINT32_C(0x00000000)}, // +0
+        {UINT32_C(0x80000000), UINT32_C(0x80000000)}, // -0
+        {UINT32_C(0x3f808000), UINT32_C(0x3f800000)}, // even tie down
+        {UINT32_C(0x3f818000), UINT32_C(0x3f820000)}, // odd tie up
+        {UINT32_C(0xbf808000), UINT32_C(0xbf800000)}, // negative even tie
+        {UINT32_C(0xbf818000), UINT32_C(0xbf820000)}, // negative odd tie
+        {UINT32_C(0x00008000), UINT32_C(0x00000000)}, // subnormal even tie
+        {UINT32_C(0x00008001), UINT32_C(0x00010000)}, // above subnormal tie
+        {UINT32_C(0x007fffff), UINT32_C(0x00800000)}, // F32 subnormal edge
+        {UINT32_C(0x00800000), UINT32_C(0x00800000)}, // F32 min normal
+        {UINT32_C(0x7f7f0000), UINT32_C(0x7f7f0000)}, // max BF16 finite
+        {UINT32_C(0x7f7fffff), UINT32_C(0x7f800000)}, // +finite overflow
+        {UINT32_C(0xff7fffff), UINT32_C(0xff800000)}, // -finite overflow
+        {UINT32_C(0x7f800000), UINT32_C(0x7f800000)}, // +inf
+        {UINT32_C(0xff800000), UINT32_C(0xff800000)}, // -inf
+        {UINT32_C(0x7f800001), UINT32_C(0x7fc00000)}, // low-payload sNaN
+        {UINT32_C(0xff812345), UINT32_C(0xffc10000)}, // signed NaN payload
+        {UINT32_C(0x7fcabcde), UINT32_C(0x7fca0000)}, // retained qNaN payload
+    };
+    enum { CASE_COUNT = sizeof(cases) / sizeof(cases[0]) };
+    const uint64_t payload_bytes = (uint64_t)CASE_COUNT * sizeof(uint32_t);
+    const uint64_t parent_bytes = payload_bytes + 2u * sizeof(uint32_t);
+    uint32_t input[CASE_COUNT + 2u];
+    uint32_t unchanged[CASE_COUNT + 2u];
+    uint32_t actual[CASE_COUNT + 2u];
+    input[0] = UINT32_C(0xdeadbeef);
+    input[CASE_COUNT + 1u] = UINT32_C(0xfeedface);
+    int ok = 1;
+    for (uint32_t i = 0; i < CASE_COUNT; i++) {
+        input[i + 1u] = cases[i].input;
+        if (ds4_gpu_bf16_round_f32_oracle(cases[i].input) !=
+            cases[i].expected) {
+            ok = 0;
+        }
+    }
+    memcpy(unchanged, input, sizeof(input));
+
+    ds4_gpu_tensor *parent = ds4_gpu_tensor_alloc(parent_bytes);
+    ds4_gpu_tensor *payload = parent ? ds4_gpu_tensor_view(
+        parent, sizeof(uint32_t), payload_bytes) : NULL;
+    ds4_gpu_tensor *undersized = parent ? ds4_gpu_tensor_view(
+        parent, sizeof(uint32_t), payload_bytes - 1u) : NULL;
+    ds4_gpu_tensor *misaligned = parent ? ds4_gpu_tensor_view(
+        parent, 1u, payload_bytes) : NULL;
+    ok = ok && parent && payload && undersized && misaligned &&
+         ds4_gpu_tensor_write(parent, 0, input, sizeof(input));
+
+    // One in-place operand makes inter-tensor overlap inapplicable.  The
+    // adjacent live sentinels instead prove that the encoded view is isolated.
+    if (ok) {
+        ok = ds4_gpu_bf16_round_f32_tensor(NULL, CASE_COUNT) == 0 &&
+             ds4_gpu_bf16_round_f32_tensor(payload, 0) == 0 &&
+             ds4_gpu_bf16_round_f32_tensor(undersized, CASE_COUNT) == 0 &&
+             ds4_gpu_bf16_round_f32_tensor(misaligned, CASE_COUNT) == 0 &&
+             ds4_gpu_bf16_round_f32_tensor(payload, UINT64_MAX) == 0 &&
+             ds4_gpu_tensor_read(parent, 0, actual, sizeof(actual)) &&
+             memcmp(actual, unchanged, sizeof(actual)) == 0;
+    }
+
+    int began = 0;
+    if (ok) {
+        began = ds4_gpu_begin_commands();
+        ok = began &&
+             ds4_gpu_bf16_round_f32_tensor(payload, CASE_COUNT) != 0;
+    }
+    if (began && ds4_gpu_commands_active()) {
+        const int end_ok = ds4_gpu_end_commands();
+        ok = end_ok && ok;
+    }
+    if (ok) {
+        ok = ds4_gpu_tensor_read(parent, 0, actual, sizeof(actual)) &&
+             actual[0] == input[0] &&
+             actual[CASE_COUNT + 1u] == input[CASE_COUNT + 1u];
+    }
+    for (uint32_t i = 0; ok && i < CASE_COUNT; i++) {
+        const uint32_t expected =
+            ds4_gpu_bf16_round_f32_oracle(cases[i].input);
+        if (actual[i + 1u] != expected) {
+            fprintf(stderr,
+                    "ds4: BF16 Metal regression case %u got 0x%08x expected 0x%08x\n",
+                    i, actual[i + 1u], expected);
+            ok = 0;
+        }
+    }
+
+    ds4_gpu_tensor_free(misaligned);
+    ds4_gpu_tensor_free(undersized);
+    ds4_gpu_tensor_free(payload);
+    ds4_gpu_tensor_free(parent);
+    return ok;
+}
+
+static float ds4_gpu_dspark_attention_test_bf16(float value) {
+    uint32_t bits = 0;
+    memcpy(&bits, &value, sizeof(bits));
+    bits = ds4_gpu_bf16_round_f32_oracle(bits);
+    memcpy(&value, &bits, sizeof(value));
+    return value;
+}
+
+static uint32_t ds4_gpu_dspark_attention_test_bf16_order(uint32_t bits) {
+    const uint32_t high = bits >> 16u;
+    return (high & UINT32_C(0x8000))
+        ? UINT32_C(0x8000) - (high & UINT32_C(0x7fff))
+        : UINT32_C(0x8000) + high;
+}
+
+static int ds4_gpu_dspark_attention_cpu_reference(
+        float       *out,
+        const float *q,
+        const float *kv,
+        const float *sinks,
+        uint32_t     n_keys,
+        uint32_t     n_head) {
+    if (!out || !q || !kv || !sinks || n_keys == 0 || n_head == 0) {
+        return 0;
+    }
+    const uint32_t head_dim = DS4_GPU_DSPARK_ATTENTION_HEAD_DIM;
+    double *scores = malloc((size_t)n_keys * sizeof(*scores));
+    double *acc = malloc((size_t)head_dim * sizeof(*acc));
+    if (!scores || !acc) {
+        free(scores);
+        free(acc);
+        return 0;
+    }
+    const double scale = 1.0 / sqrt((double)head_dim);
+    for (uint32_t qr = 0;
+         qr < DS4_GPU_DSPARK_ATTENTION_QUERY_ROWS;
+         qr++) {
+        for (uint32_t h = 0; h < n_head; h++) {
+            const float *qrow = q +
+                ((uint64_t)qr * n_head + h) * head_dim;
+            double maximum = (double)sinks[h];
+            for (uint32_t k = 0; k < n_keys; k++) {
+                const float *kvrow = kv + (uint64_t)k * head_dim;
+                double dot = 0.0;
+                for (uint32_t d = 0; d < head_dim; d++) {
+                    dot += (double)qrow[d] * (double)kvrow[d];
+                }
+                scores[k] = dot * scale;
+                if (scores[k] > maximum) maximum = scores[k];
+            }
+            double denominator = exp((double)sinks[h] - maximum);
+            memset(acc, 0, (size_t)head_dim * sizeof(*acc));
+            for (uint32_t k = 0; k < n_keys; k++) {
+                const double weight = exp(scores[k] - maximum);
+                const float *kvrow = kv + (uint64_t)k * head_dim;
+                denominator += weight;
+                for (uint32_t d = 0; d < head_dim; d++) {
+                    acc[d] += weight * (double)kvrow[d];
+                }
+            }
+            float *dst = out +
+                ((uint64_t)qr * n_head + h) * head_dim;
+            for (uint32_t d = 0; d < head_dim; d++) {
+                dst[d] = (float)(acc[d] / denominator);
+            }
+        }
+    }
+    free(scores);
+    free(acc);
+    return 1;
+}
+
+static int ds4_gpu_dspark_attention_cpu_official_reference(
+        float       *out,
+        const float *q,
+        const float *kv,
+        const float *sinks,
+        uint32_t     n_keys,
+        uint32_t     n_head) {
+    if (!out || !q || !kv || !sinks || n_keys == 0 ||
+        n_keys > 133u || n_head != DS4_GPU_DSPARK_ATTENTION_HEADS) {
+        return 0;
+    }
+    const uint32_t head_dim = DS4_GPU_DSPARK_ATTENTION_HEAD_DIM;
+    float *scores = malloc((size_t)n_keys * sizeof(*scores));
+    float *acc = malloc((size_t)head_dim * sizeof(*acc));
+    if (!scores || !acc) {
+        free(scores);
+        free(acc);
+        return 0;
+    }
+    const float scale = 1.0f / sqrtf((float)head_dim);
+    for (uint32_t qr = 0;
+         qr < DS4_GPU_DSPARK_ATTENTION_QUERY_ROWS;
+         qr++) {
+        for (uint32_t h = 0; h < n_head; h++) {
+            const float *qrow = q +
+                ((uint64_t)qr * n_head + h) * head_dim;
+            for (uint32_t key = 0; key < n_keys; key++) {
+                const float *kvrow = kv + (uint64_t)key * head_dim;
+                float lanes[32] = {0};
+                for (uint32_t lane = 0; lane < 32u; lane++) {
+                    for (uint32_t d = lane; d < head_dim; d += 32u) {
+                        lanes[lane] = fmaf(qrow[d], kvrow[d], lanes[lane]);
+                    }
+                }
+                for (uint32_t stride = 16u; stride != 0; stride >>= 1u) {
+                    for (uint32_t lane = 0; lane < stride; lane++) {
+                        lanes[lane] += lanes[lane + stride];
+                    }
+                }
+                scores[key] = lanes[0] * scale;
+            }
+
+            float running_max = -FLT_MAX;
+            float running_sum = 0.0f;
+            memset(acc, 0, (size_t)head_dim * sizeof(*acc));
+            for (uint32_t block = 0; block < n_keys; block += 64u) {
+                const uint32_t end = block + 64u < n_keys
+                    ? block + 64u : n_keys;
+                const float previous_max = running_max;
+                for (uint32_t key = block; key < end; key++) {
+                    running_max = fmaxf(running_max, scores[key]);
+                }
+                const float block_scale = block == 0u
+                    ? 0.0f : expf(previous_max - running_max);
+                float block_sum = 0.0f;
+                for (uint32_t key = block; key < end; key++) {
+                    const float weight = expf(scores[key] - running_max);
+                    block_sum += weight;
+                    scores[key] =
+                        ds4_gpu_dspark_attention_test_bf16(weight);
+                }
+                running_sum = running_sum * block_scale + block_sum;
+                for (uint32_t d = 0; d < head_dim; d++) {
+                    acc[d] *= block_scale;
+                }
+                for (uint32_t key = block; key < end; key++) {
+                    const float weight = scores[key];
+                    const float *kvrow = kv + (uint64_t)key * head_dim;
+                    for (uint32_t d = 0; d < head_dim; d++) {
+                        acc[d] += weight * kvrow[d];
+                    }
+                }
+            }
+            const float denominator = running_sum +
+                expf(sinks[h] - running_max);
+            float *dst = out +
+                ((uint64_t)qr * n_head + h) * head_dim;
+            for (uint32_t d = 0; d < head_dim; d++) {
+                dst[d] = ds4_gpu_dspark_attention_test_bf16(
+                    acc[d] / denominator);
+            }
+        }
+    }
+    free(scores);
+    free(acc);
+    return 1;
+}
+
+static int ds4_gpu_dspark_two_source_attention_case(
+        const void *model_map,
+        uint64_t    model_size,
+        uint32_t    committed_count,
+        uint32_t    committed_start,
+        const char *label,
+        float      *max_abs_out) {
+    enum { N_HEAD = DS4_GPU_DSPARK_ATTENTION_HEADS };
+    const uint32_t cap = DS4_GPU_DSPARK_ATTENTION_RING_CAP;
+    const uint32_t dim = DS4_GPU_DSPARK_ATTENTION_HEAD_DIM;
+    const uint32_t draft = DS4_GPU_DSPARK_ATTENTION_DRAFT_ROWS;
+    const uint32_t query_rows = DS4_GPU_DSPARK_ATTENTION_QUERY_ROWS;
+    const uint32_t n_keys = committed_count + draft;
+    const uint64_t ring_values = (uint64_t)cap * dim;
+    const uint64_t draft_values = (uint64_t)draft * dim;
+    const uint64_t q_values = (uint64_t)query_rows * N_HEAD * dim;
+    const uint64_t staged_values = (uint64_t)n_keys * dim;
+    const uint64_t ring_bytes = ring_values * sizeof(float);
+    const uint64_t draft_bytes = draft_values * sizeof(float);
+    const uint64_t q_bytes = q_values * sizeof(float);
+
+    float *ring = malloc((size_t)ring_bytes);
+    float *ring_before = malloc((size_t)ring_bytes);
+    float *draft_kv = malloc((size_t)draft_bytes);
+    float *draft_before = malloc((size_t)draft_bytes);
+    float *q = malloc((size_t)q_bytes);
+    float *staged = malloc((size_t)staged_values * sizeof(float));
+    float *staged_chronological =
+        malloc((size_t)staged_values * sizeof(float));
+    float *expected = malloc((size_t)q_bytes);
+    float *expected_official = malloc((size_t)q_bytes);
+    float *expected_chronological = malloc((size_t)q_bytes);
+    float *actual = malloc((size_t)q_bytes);
+    float *unchanged = malloc((size_t)q_bytes);
+    int ok = ring && ring_before && draft_kv && draft_before && q && staged &&
+             staged_chronological && expected && expected_official &&
+             expected_chronological && actual && unchanged;
+    if (!ok) goto cleanup_host;
+
+    for (uint64_t i = 0; i < ring_values; i++) {
+        ring[i] = ds4_gpu_dspark_attention_test_bf16(
+            -0.42f + 0.000003f * (float)(i % 65521u));
+    }
+    for (uint32_t logical = 0; logical < committed_count; logical++) {
+        const uint32_t physical = (committed_start + logical) % cap;
+        for (uint32_t d = 0; d < dim; d++) {
+            const float value =
+                0.17f * sinf((float)(logical + 1u) * 0.071f +
+                             (float)(d + 3u) * 0.013f) +
+                0.06f * cosf((float)(logical + 5u) * 0.037f -
+                             (float)(d + 7u) * 0.009f);
+            ring[(uint64_t)physical * dim + d] =
+                ds4_gpu_dspark_attention_test_bf16(value);
+        }
+    }
+    /* The pinned top-k list observes physical slots, not oldest-token order. */
+    memcpy(staged, ring, (size_t)committed_count * dim * sizeof(float));
+    for (uint32_t logical = 0; logical < committed_count; logical++) {
+        const uint32_t physical = (committed_start + logical) % cap;
+        memcpy(staged_chronological + (uint64_t)logical * dim,
+               ring + (uint64_t)physical * dim,
+               (size_t)dim * sizeof(float));
+    }
+    for (uint32_t row = 0; row < draft; row++) {
+        for (uint32_t d = 0; d < dim; d++) {
+            const float value =
+                -0.11f * cosf((float)(row + 2u) * 0.19f +
+                              (float)(d + 1u) * 0.017f) +
+                 0.03f * sinf((float)(row + 9u) * 0.11f -
+                              (float)(d + 4u) * 0.007f);
+            draft_kv[(uint64_t)row * dim + d] =
+                ds4_gpu_dspark_attention_test_bf16(value);
+            staged[((uint64_t)committed_count + row) * dim + d] =
+                draft_kv[(uint64_t)row * dim + d];
+            staged_chronological[
+                ((uint64_t)committed_count + row) * dim + d] =
+                draft_kv[(uint64_t)row * dim + d];
+        }
+    }
+    for (uint32_t row = 0; row < query_rows; row++) {
+        for (uint32_t h = 0; h < N_HEAD; h++) {
+            for (uint32_t d = 0; d < dim; d++) {
+                const float value =
+                    0.12f * sinf((float)(row + 1u) * 0.23f +
+                                 (float)(h + 2u) * 0.31f +
+                                 (float)(d + 1u) * 0.011f) -
+                    0.04f * cosf((float)(row + h + 3u) * 0.17f -
+                                 (float)(d + 5u) * 0.005f);
+                q[((uint64_t)row * N_HEAD + h) * dim + d] =
+                    ds4_gpu_dspark_attention_test_bf16(value);
+            }
+        }
+    }
+    memcpy(ring_before, ring, (size_t)ring_bytes);
+    memcpy(draft_before, draft_kv, (size_t)draft_bytes);
+    for (uint64_t i = 0; i < q_values; i++) unchanged[i] = 13.25f;
+    const float *sinks = (const float *)model_map;
+    ok = ds4_gpu_dspark_attention_cpu_reference(
+             expected, q, staged, sinks, n_keys, N_HEAD) &&
+         ds4_gpu_dspark_attention_cpu_official_reference(
+             expected_official, q, staged, sinks, n_keys, N_HEAD) &&
+         ds4_gpu_dspark_attention_cpu_official_reference(
+             expected_chronological, q, staged_chronological,
+             sinks, n_keys, N_HEAD);
+    if (ok && committed_count == cap && committed_start != 0u) {
+        /* The fixture must distinguish the pinned physical 64-row blocks from
+         * an accidentally chronological rotation after ring wrap. */
+        uint64_t order_different = 0;
+        uint32_t order_max_ulp = 0;
+        for (uint64_t i = 0; i < q_values; i++) {
+            uint32_t physical_bits = 0;
+            uint32_t chronological_bits = 0;
+            memcpy(&physical_bits, expected_official + i,
+                   sizeof(physical_bits));
+            memcpy(&chronological_bits, expected_chronological + i,
+                   sizeof(chronological_bits));
+            const uint32_t physical_order =
+                ds4_gpu_dspark_attention_test_bf16_order(physical_bits);
+            const uint32_t chronological_order =
+                ds4_gpu_dspark_attention_test_bf16_order(
+                    chronological_bits);
+            const uint32_t ulp = physical_order > chronological_order
+                ? physical_order - chronological_order
+                : chronological_order - physical_order;
+            if (ulp != 0) order_different++;
+            if (ulp > order_max_ulp) order_max_ulp = ulp;
+        }
+        fprintf(stderr,
+                "ds4: DSpark wrap physical-vs-chronological "
+                "different=%llu max_bf16_ulp=%u\n",
+                (unsigned long long)order_different, order_max_ulp);
+        ok = order_different != 0 && order_max_ulp > 1u;
+    }
+
+    ds4_gpu_tensor *ring_gpu = ok
+        ? ds4_gpu_tensor_alloc(ring_bytes) : NULL;
+    ds4_gpu_tensor *draft_gpu = ok
+        ? ds4_gpu_tensor_alloc(draft_bytes) : NULL;
+    ds4_gpu_tensor *q_gpu = ok ? ds4_gpu_tensor_alloc(q_bytes) : NULL;
+    ds4_gpu_tensor *heads_gpu = ok
+        ? ds4_gpu_tensor_alloc(q_bytes) : NULL;
+    ds4_gpu_tensor *short_ring = ring_gpu
+        ? ds4_gpu_tensor_view(ring_gpu, 0, ring_bytes - 1u) : NULL;
+    ok = ok && ring_gpu && draft_gpu && q_gpu && heads_gpu && short_ring &&
+         ds4_gpu_tensor_write(ring_gpu, 0, ring, ring_bytes) &&
+         ds4_gpu_tensor_write(draft_gpu, 0, draft_kv, draft_bytes) &&
+         ds4_gpu_tensor_write(q_gpu, 0, q, q_bytes) &&
+         ds4_gpu_tensor_write(heads_gpu, 0, unchanged, q_bytes);
+
+    /* Every rejection happens before an encoder can write an output.  The
+     * alias cases use otherwise correctly sized tensors, so they exercise the
+     * range policy rather than falling through an undersized check. */
+    if (ok) {
+        ok = ds4_gpu_dspark_attention_two_source_f32_tensor(
+                 NULL, model_map, model_size, 0, q_gpu, ring_gpu, draft_gpu,
+                 committed_count, cap, committed_start, N_HEAD, dim) == 0 &&
+             ds4_gpu_dspark_attention_two_source_f32_tensor(
+                 heads_gpu, model_map, model_size, 0, q_gpu, ring_gpu,
+                 draft_gpu, 0, cap, committed_start, N_HEAD, dim) == 0 &&
+             ds4_gpu_dspark_attention_two_source_f32_tensor(
+                 heads_gpu, model_map, model_size, 0, q_gpu, ring_gpu,
+                 draft_gpu, 1u, cap, 0u, N_HEAD, dim) == 0 &&
+             ds4_gpu_dspark_attention_two_source_f32_tensor(
+                 heads_gpu, model_map, model_size, 0, q_gpu, ring_gpu,
+                 draft_gpu, cap + 1u, cap, committed_start, N_HEAD, dim) == 0 &&
+             ds4_gpu_dspark_attention_two_source_f32_tensor(
+                 heads_gpu, model_map, model_size, 0, q_gpu, ring_gpu,
+                 draft_gpu, committed_count, cap - 1u, committed_start,
+                 N_HEAD, dim) == 0 &&
+             ds4_gpu_dspark_attention_two_source_f32_tensor(
+                 heads_gpu, model_map, model_size, 0, q_gpu, ring_gpu,
+                 draft_gpu, committed_count, cap, cap, N_HEAD, dim) == 0 &&
+             (committed_count == cap ||
+              ds4_gpu_dspark_attention_two_source_f32_tensor(
+                  heads_gpu, model_map, model_size, 0, q_gpu, ring_gpu,
+                  draft_gpu, committed_count, cap, 1u,
+                  N_HEAD, dim) == 0) &&
+             ds4_gpu_dspark_attention_two_source_f32_tensor(
+                 heads_gpu, model_map, model_size, 0, q_gpu, short_ring,
+                 draft_gpu, committed_count, cap, committed_start,
+                 N_HEAD, dim) == 0 &&
+             ds4_gpu_dspark_attention_two_source_f32_tensor(
+                 q_gpu, model_map, model_size, 0, q_gpu, ring_gpu, draft_gpu,
+                 committed_count, cap, committed_start, N_HEAD, dim) == 0 &&
+             ds4_gpu_dspark_attention_two_source_f32_tensor(
+                 heads_gpu, model_map, model_size, 0, q_gpu, ring_gpu, q_gpu,
+                 committed_count, cap, committed_start, N_HEAD, dim) == 0 &&
+             ds4_gpu_dspark_attention_two_source_f32_tensor(
+                 heads_gpu, model_map, model_size, 0, q_gpu, ring_gpu,
+                 draft_gpu, committed_count, cap, committed_start,
+                 N_HEAD, dim - 1u) == 0 &&
+             ds4_gpu_dspark_attention_two_source_f32_tensor(
+                 heads_gpu, model_map, model_size, 0, q_gpu, ring_gpu,
+                 draft_gpu, committed_count, cap, committed_start,
+                 N_HEAD - 1u, dim) == 0 &&
+             ds4_gpu_dspark_attention_two_source_f32_tensor(
+                 heads_gpu, model_map, model_size, model_size - 1u,
+                 q_gpu, ring_gpu, draft_gpu, committed_count, cap,
+                 committed_start, N_HEAD, dim) == 0 &&
+             ds4_gpu_tensor_read(heads_gpu, 0, actual, q_bytes) &&
+             memcmp(actual, unchanged, (size_t)q_bytes) == 0 &&
+             ds4_gpu_tensor_read(ring_gpu, 0, ring, ring_bytes) &&
+             memcmp(ring, ring_before, (size_t)ring_bytes) == 0 &&
+             ds4_gpu_tensor_read(draft_gpu, 0, draft_kv, draft_bytes) &&
+             memcmp(draft_kv, draft_before, (size_t)draft_bytes) == 0;
+    }
+
+    int began = 0;
+    if (ok && committed_count < cap) {
+        began = ds4_gpu_begin_commands();
+        ok = began != 0;
+    }
+    if (ok) {
+        ok = ds4_gpu_dspark_attention_two_source_f32_tensor(
+                 heads_gpu, model_map, model_size, 0,
+                 q_gpu, ring_gpu, draft_gpu,
+                 committed_count, cap, committed_start, N_HEAD, dim) != 0;
+    }
+    if (began && ds4_gpu_commands_active()) {
+        ok = ds4_gpu_end_commands() != 0 && ok;
+    }
+    if (ok) {
+        ok = ds4_gpu_tensor_read(heads_gpu, 0, actual, q_bytes) &&
+             ds4_gpu_tensor_read(ring_gpu, 0, ring, ring_bytes) &&
+             memcmp(ring, ring_before, (size_t)ring_bytes) == 0 &&
+             ds4_gpu_tensor_read(draft_gpu, 0, draft_kv, draft_bytes) &&
+             memcmp(draft_kv, draft_before, (size_t)draft_bytes) == 0;
+    }
+
+    float max_abs = 0.0f;
+    float max_abs_math = 0.0f;
+    uint64_t adjacent_ulp_lanes = 0;
+    uint32_t max_bf16_ulp = 0;
+    uint64_t worst = 0;
+    uint64_t worst_math = 0;
+    for (uint64_t i = 0; ok && i < q_values; i++) {
+        uint32_t actual_bits = 0;
+        uint32_t expected_bits = 0;
+        memcpy(&actual_bits, actual + i, sizeof(actual_bits));
+        memcpy(&expected_bits, expected_official + i,
+               sizeof(expected_bits));
+        const float error = fabsf(actual[i] - expected_official[i]);
+        const float math_error = fabsf(actual[i] - expected[i]);
+        if (!isfinite(actual[i]) || error > max_abs) {
+            max_abs = error;
+            worst = i;
+        }
+        if (math_error > max_abs_math) {
+            max_abs_math = math_error;
+            worst_math = i;
+        }
+        const uint32_t actual_order =
+            ds4_gpu_dspark_attention_test_bf16_order(actual_bits);
+        const uint32_t expected_order =
+            ds4_gpu_dspark_attention_test_bf16_order(expected_bits);
+        const uint32_t ulp = actual_order > expected_order
+            ? actual_order - expected_order
+            : expected_order - actual_order;
+        if (ulp != 0) adjacent_ulp_lanes++;
+        if (ulp > max_bf16_ulp) max_bf16_ulp = ulp;
+        if ((actual_bits & UINT32_C(0x0000ffff)) != 0 || ulp > 1u) {
+            fprintf(stderr,
+                    "ds4: DSpark %s official BF16 mismatch at %llu: got "
+                    "0x%08x expected 0x%08x ulp=%u\n",
+                    label, (unsigned long long)i,
+                    actual_bits, expected_bits, ulp);
+            ok = 0;
+        }
+    }
+    fprintf(stderr,
+            "ds4: DSpark %s attention max_abs official=%.9g "
+            "max_bf16_ulp=%u adjacent_lanes=%llu stable-f32=%.9g "
+            "official-worst=%llu stable-worst=%llu\n",
+            label, max_abs, max_bf16_ulp,
+            (unsigned long long)adjacent_ulp_lanes, max_abs_math,
+            (unsigned long long)worst,
+            (unsigned long long)worst_math);
+    if (max_abs_out) *max_abs_out = max_abs;
+
+    ds4_gpu_tensor_free(short_ring);
+    ds4_gpu_tensor_free(heads_gpu);
+    ds4_gpu_tensor_free(q_gpu);
+    ds4_gpu_tensor_free(draft_gpu);
+    ds4_gpu_tensor_free(ring_gpu);
+
+cleanup_host:
+    free(unchanged);
+    free(actual);
+    free(expected_chronological);
+    free(expected_official);
+    free(expected);
+    free(staged_chronological);
+    free(staged);
+    free(q);
+    free(draft_before);
+    free(draft_kv);
+    free(ring_before);
+    free(ring);
+    return ok;
+}
+
+static void *g_dspark_attention_test_model_map;
+
+int ds4_gpu_internal_dspark_two_source_attention_test(void) {
+    const long page_long = sysconf(_SC_PAGESIZE);
+    if (page_long <= 0 || (!g_initialized && !ds4_gpu_init())) return 0;
+    const size_t page = (size_t)page_long;
+    if (!g_dspark_attention_test_model_map) {
+        void *mapping = mmap(NULL, page, PROT_READ | PROT_WRITE,
+                             MAP_PRIVATE | MAP_ANON, -1, 0);
+        if (mapping == MAP_FAILED) return 0;
+        g_dspark_attention_test_model_map = mapping;
+    }
+    void *model_map = g_dspark_attention_test_model_map;
+    float *sinks = model_map;
+    for (uint32_t h = 0; h < DS4_GPU_DSPARK_ATTENTION_HEADS; h++) {
+        sinks[h] = -0.19f + 0.007f * (float)h;
+    }
+    int ok = ds4_gpu_set_model_map(model_map, page) != 0;
+    float no_wrap_max_abs = 0.0f;
+    float wrap_max_abs = 0.0f;
+    if (ok) {
+        /* Before the ring fills, visible physical slots are 0..count-1. */
+        ok = ds4_gpu_dspark_two_source_attention_case(
+            model_map, page, 27u, 0u, "partial",
+            &no_wrap_max_abs);
+    }
+    if (ok) {
+        /* A full ring whose oldest token is slot 125 must still be consumed
+         * in pinned physical slot order, followed by the five draft rows. */
+        ok = ds4_gpu_dspark_two_source_attention_case(
+            model_map, page, 128u, 125u, "wrap",
+            &wrap_max_abs);
+    }
+    fprintf(stderr,
+            "ds4: DSpark two-source official BF16 max_abs "
+            "partial=%.9g wrap=%.9g max_bf16_ulp_threshold=1\n",
+            no_wrap_max_abs, wrap_max_abs);
+    /* The Metal no-copy view owns no deallocator. Keep this one test page
+     * mapped until process exit so the remainder of --metal-kernels retains
+     * its device state and counters. */
+    return ok;
+}
+
 static int ds4_gpu_dspark_capture_hc_mean_row(
         ds4_gpu_tensor       *out,
         const ds4_gpu_tensor *residual_hc,

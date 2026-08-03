@@ -43,6 +43,141 @@ struct ds4_metal_args_dsv4_softmax_pool {
     uint64_t nb1;
 };
 
+struct ds4_metal_args_dspark_attention_f32 {
+    uint32_t n_keys;
+};
+
+static inline float ds4_dspark_bf16_rne(float value) {
+    const uint bits = as_type<uint>(value);
+    const uint magnitude = bits & 0x7fffffffu;
+    if (magnitude >= 0x7f800000u) {
+        if (magnitude == 0x7f800000u) return value;
+        return as_type<float>((bits & 0xffff0000u) | 0x00400000u);
+    }
+    const uint retained_lsb = (bits >> 16u) & 1u;
+    return as_type<float>(
+        (bits + 0x00007fffu + retained_lsb) & 0xffff0000u);
+}
+
+// Final-0731 DSpark sparse attention.  One 256-thread group owns one
+// (query,head) pair.  Q/KV enter as BF16-rounded values reopened in F32.
+// The online softmax follows the pinned 64-row TileLang schedule: the
+// denominator stays F32, each block's unnormalised exp weights are rounded to
+// BF16 before the V multiply, the sink affects only the denominator, and the
+// output is rounded to BF16 before returning in F32 storage.
+kernel void kernel_dspark_attention_two_source_f32(
+        constant ds4_metal_args_dspark_attention_f32 &args [[buffer(0)]],
+        device const float *q [[buffer(1)]],
+        device const float *kv [[buffer(2)]],
+        device const float *sinks [[buffer(3)]],
+        device float *out [[buffer(4)]],
+        uint tid [[thread_index_in_threadgroup]],
+        uint simd_lane [[thread_index_in_simdgroup]],
+        uint simd_group [[simdgroup_index_in_threadgroup]],
+        uint3 tgpig [[threadgroup_position_in_grid]]) {
+    constexpr uint head_dim = 512;
+    constexpr uint block_rows = 64;
+    constexpr uint max_keys = 133;
+    constexpr uint simdgroups = 8;
+    threadgroup float scores[max_keys];
+    threadgroup float running_max;
+    threadgroup float running_sum;
+    threadgroup float block_scale;
+
+    const uint query_row = tgpig.x;
+    const uint head = tgpig.y;
+    q += ((ulong)query_row * 64u + head) * head_dim;
+    out += ((ulong)query_row * 64u + head) * head_dim;
+
+    for (uint key = simd_group; key < args.n_keys; key += simdgroups) {
+        const device float *kv_row = kv + (ulong)key * head_dim;
+        float dot = 0.0f;
+        for (uint dim = simd_lane; dim < head_dim; dim += 32u) {
+            dot = fma(q[dim], kv_row[dim], dot);
+        }
+        dot += simd_shuffle_down(dot, 16u);
+        dot += simd_shuffle_down(dot, 8u);
+        dot += simd_shuffle_down(dot, 4u);
+        dot += simd_shuffle_down(dot, 2u);
+        dot += simd_shuffle_down(dot, 1u);
+        if (simd_lane == 0u) {
+            scores[key] = dot * 0.04419417382415922f; // 1/sqrt(512)
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    float acc0 = 0.0f;
+    float acc1 = 0.0f;
+    if (tid == 0u) {
+        running_max = -FLT_MAX;
+        running_sum = 0.0f;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint block = 0u; block < args.n_keys; block += block_rows) {
+        const uint end = min(block + block_rows, args.n_keys);
+        if (tid == 0u) {
+            const float previous_max = running_max;
+            float next_max = previous_max;
+            for (uint key = block; key < end; key++) {
+                next_max = max(next_max, scores[key]);
+            }
+            block_scale = isinf(previous_max) ? 0.0f
+                                               : exp(previous_max - next_max);
+            float block_sum = 0.0f;
+            for (uint key = block; key < end; key++) {
+                const float weight = exp(scores[key] - next_max);
+                block_sum += weight;
+                scores[key] = ds4_dspark_bf16_rne(weight);
+            }
+            running_max = next_max;
+            running_sum = running_sum * block_scale + block_sum;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        acc0 *= block_scale;
+        acc1 *= block_scale;
+        for (uint key = block; key < end; key++) {
+            const float weight = scores[key];
+            const device float *kv_row = kv + (ulong)key * head_dim;
+            acc0 += weight * kv_row[tid];
+            acc1 += weight * kv_row[tid + 256u];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    const float denominator = running_sum + exp(sinks[head] - running_max);
+    out[tid] = ds4_dspark_bf16_rne(acc0 / denominator);
+    out[tid + 256u] = ds4_dspark_bf16_rne(acc1 / denominator);
+}
+
+// Reopens each F32 lane after an exact BF16 round-to-nearest-even step.  Raw
+// integer arithmetic keeps zero signs and NaN payload/sign handling independent
+// of the Metal compiler's floating-point canonicalization choices.
+kernel void kernel_dsv4_bf16_round_f32(
+        device uint *x [[buffer(0)]],
+        constant ulong &count [[buffer(1)]],
+        uint gid [[thread_position_in_grid]]) {
+    if ((ulong)gid >= count) {
+        return;
+    }
+
+    const uint bits = x[gid];
+    const uint magnitude = bits & 0x7fffffffu;
+    if (magnitude >= 0x7f800000u) {
+        if (magnitude == 0x7f800000u) {
+            return; // Preserve both infinities exactly.
+        }
+        // Preserve sign and the retained payload while guaranteeing that a NaN
+        // with payload only in the discarded half cannot collapse to infinity.
+        x[gid] = (bits & 0xffff0000u) | 0x00400000u;
+        return;
+    }
+
+    const uint retained_lsb = (bits >> 16u) & 1u;
+    x[gid] = (bits + 0x00007fffu + retained_lsb) & 0xffff0000u;
+}
+
 struct ds4_metal_args_dsv4_indexed_attention {
     uint32_t n_tokens;
     uint32_t n_head;

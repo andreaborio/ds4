@@ -3983,7 +3983,11 @@ static void test_metal_kernel_group(void) {
     TEST_ASSERT(
         hebrus_gpu_internal_stream_expert_cache_scan_limit_test() != 0);
     TEST_ASSERT(ds4_gpu_internal_qwen35_expert_group_test() != 0);
+    TEST_ASSERT(ds4_gpu_internal_bf16_round_f32_test() != 0);
     test_metal_selected_slots_runtime_count();
+    /* This test retains one model-map page for its Metal no-copy sink view;
+     * keep it last so later tests do not replace that view. */
+    TEST_ASSERT(ds4_gpu_internal_dspark_two_source_attention_test() != 0);
 }
 
 static void test_metal_qwen35_expert_pack(void) {

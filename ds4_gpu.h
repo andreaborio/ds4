@@ -765,6 +765,10 @@ int ds4_gpu_dsv4_fp8_kv_quantize_tensor(
         uint32_t          head_dim,
         uint32_t          n_rot);
 
+/* Round F32 lanes to BF16 with round-to-nearest-even, retaining F32 storage.
+ * Infinities remain bit-exact; NaNs retain sign/high payload and are quieted. */
+int ds4_gpu_bf16_round_f32_tensor(ds4_gpu_tensor *x, uint64_t count);
+
 int ds4_gpu_dsv4_indexer_qat_tensor(
         ds4_gpu_tensor *x,
         uint32_t          n_rows,
@@ -1247,6 +1251,25 @@ int ds4_gpu_attention_decode_raw_batch_heads_tensor(
         uint32_t                raw_cap,
         uint32_t                raw_start,
         uint32_t                window,
+        uint32_t                n_head,
+        uint32_t                head_dim);
+
+/* Final-0731 DSpark attention: five query rows attend non-causally to the
+ * committed ring in pinned physical-cache order plus exactly five transient
+ * draft rows. q, committed_kv, and transient_draft_kv use F32 storage but
+ * must already contain BF16-rounded values reopened as F32; this primitive
+ * does not round its inputs. The ring already contains current main_kv. */
+int ds4_gpu_dspark_attention_two_source_f32_tensor(
+        ds4_gpu_tensor       *heads,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                sinks_offset,
+        const ds4_gpu_tensor *q,
+        const ds4_gpu_tensor *committed_kv,
+        const ds4_gpu_tensor *transient_draft_kv,
+        uint32_t                committed_count,
+        uint32_t                committed_cap,
+        uint32_t                committed_start,
         uint32_t                n_head,
         uint32_t                head_dim);
 
@@ -1763,6 +1786,10 @@ int ds4_gpu_internal_dspark_support_cache_test(void);
 int ds4_gpu_internal_dspark_hc_mean_test(void);
 /* Device ring append/publication regression for DSpark capture history. */
 int ds4_gpu_internal_dspark_history_test(void);
+/* Physical Metal BF16 round/reopen bit-semantics and range regression. */
+int ds4_gpu_internal_bf16_round_f32_test(void);
+/* Final-0731 DSpark two-source non-causal F32 attention regression. */
+int ds4_gpu_internal_dspark_two_source_attention_test(void);
 #endif
 
 /* =========================================================================
