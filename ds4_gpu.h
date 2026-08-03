@@ -1800,6 +1800,8 @@ int ds4_gpu_internal_dspark_q_head_norm_bf16_test(void);
 int ds4_gpu_internal_dspark_two_source_attention_test(void);
 /* Payload-first final-0731 stage-zero 32/32/4 physical Metal white box. */
 int ds4_gpu_internal_dspark_stage_zero_physical_test(void);
+/* Fixed 5x256/top-6 DSpark router oracle; disconnected from production. */
+int ds4_gpu_internal_dspark_router_f32_test(void);
 #endif
 
 /* =========================================================================

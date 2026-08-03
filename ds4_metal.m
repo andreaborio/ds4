@@ -6744,6 +6744,10 @@ int ds4_gpu_init(void) {
 
         if (drift_norm_unify)     macros[@"DS4_METAL_NORM_RSQRT_DISABLE"] = @"1";
         if (drift_kv_raw_f32)     macros[@"DS4_METAL_KV_RAW_F32"]         = @"1";
+#ifdef DS4_TEST_HOOKS
+        /* Compile disconnected device oracles only into the test library. */
+        macros[@"DS4_TEST_HOOKS"] = @"1";
+#endif
         fprintf(stderr,
                 "ds4: drift-patch flags norm_unify=%s kv_raw_f32=%s math_safe=%s tensor_matmul=%s\n",
                 drift_norm_unify     ? "on"  : "off",
@@ -27893,6 +27897,164 @@ static int ds4_gpu_buffer_ranges_overlap(
            b_offset < a_offset + a_bytes;
 }
 
+#ifdef DS4_TEST_HOOKS
+enum {
+    DS4_GPU_DSPARK_ROUTER_ROWS = 5,
+    DS4_GPU_DSPARK_ROUTER_EXPERTS = 256,
+    DS4_GPU_DSPARK_ROUTER_TOPK = 6,
+    DS4_GPU_DSPARK_ROUTER_THREADS = 256,
+};
+
+/* Device-only numerical seam for the fixed final-0731 router.  It remains
+ * private to this translation unit until a production DSpark stage executor
+ * owns its complete FFN/SUPPORT lifetime. */
+static int ds4_gpu_dspark_router_f32_tensor(
+        const ds4_gpu_tensor *logits,
+        const ds4_gpu_tensor *bias,
+        ds4_gpu_tensor       *probabilities,
+        ds4_gpu_tensor       *selected,
+        ds4_gpu_tensor       *weights) {
+    if (!g_initialized && !ds4_gpu_init()) return 0;
+    if (!logits || !bias || !probabilities || !selected || !weights) return 0;
+
+    const uint64_t logits_bytes64 =
+        (uint64_t)DS4_GPU_DSPARK_ROUTER_ROWS *
+        DS4_GPU_DSPARK_ROUTER_EXPERTS * sizeof(float);
+    const uint64_t bias_bytes64 =
+        (uint64_t)DS4_GPU_DSPARK_ROUTER_EXPERTS * sizeof(float);
+    const uint64_t selected_bytes64 =
+        (uint64_t)DS4_GPU_DSPARK_ROUTER_ROWS *
+        DS4_GPU_DSPARK_ROUTER_TOPK * sizeof(int32_t);
+    const uint64_t weights_bytes64 =
+        (uint64_t)DS4_GPU_DSPARK_ROUTER_ROWS *
+        DS4_GPU_DSPARK_ROUTER_TOPK * sizeof(float);
+    if (logits_bytes64 > NSUIntegerMax || bias_bytes64 > NSUIntegerMax ||
+        selected_bytes64 > NSUIntegerMax || weights_bytes64 > NSUIntegerMax ||
+        ds4_gpu_tensor_bytes(logits) < logits_bytes64 ||
+        ds4_gpu_tensor_bytes(bias) < bias_bytes64 ||
+        ds4_gpu_tensor_bytes(probabilities) < logits_bytes64 ||
+        ds4_gpu_tensor_bytes(selected) < selected_bytes64 ||
+        ds4_gpu_tensor_bytes(weights) < weights_bytes64) {
+        return 0;
+    }
+
+    const NSUInteger logits_bytes = (NSUInteger)logits_bytes64;
+    const NSUInteger bias_bytes = (NSUInteger)bias_bytes64;
+    const NSUInteger selected_bytes = (NSUInteger)selected_bytes64;
+    const NSUInteger weights_bytes = (NSUInteger)weights_bytes64;
+    id<MTLBuffer> logits_buffer = ds4_gpu_tensor_buffer(logits);
+    id<MTLBuffer> bias_buffer = ds4_gpu_tensor_buffer(bias);
+    id<MTLBuffer> probabilities_buffer =
+        ds4_gpu_tensor_buffer(probabilities);
+    id<MTLBuffer> selected_buffer = ds4_gpu_tensor_buffer(selected);
+    id<MTLBuffer> weights_buffer = ds4_gpu_tensor_buffer(weights);
+    const NSUInteger logits_offset = ds4_gpu_tensor_offset(logits);
+    const NSUInteger bias_offset = ds4_gpu_tensor_offset(bias);
+    const NSUInteger probabilities_offset =
+        ds4_gpu_tensor_offset(probabilities);
+    const NSUInteger selected_offset = ds4_gpu_tensor_offset(selected);
+    const NSUInteger weights_offset = ds4_gpu_tensor_offset(weights);
+    if (!logits_buffer || !bias_buffer || !probabilities_buffer ||
+        !selected_buffer || !weights_buffer ||
+        (logits_offset % sizeof(float)) != 0 ||
+        (bias_offset % sizeof(float)) != 0 ||
+        (probabilities_offset % sizeof(float)) != 0 ||
+        (selected_offset % sizeof(int32_t)) != 0 ||
+        (weights_offset % sizeof(float)) != 0 ||
+        logits_offset > [logits_buffer length] ||
+        logits_bytes > [logits_buffer length] - logits_offset ||
+        bias_offset > [bias_buffer length] ||
+        bias_bytes > [bias_buffer length] - bias_offset ||
+        probabilities_offset > [probabilities_buffer length] ||
+        logits_bytes > [probabilities_buffer length] - probabilities_offset ||
+        selected_offset > [selected_buffer length] ||
+        selected_bytes > [selected_buffer length] - selected_offset ||
+        weights_offset > [weights_buffer length] ||
+        weights_bytes > [weights_buffer length] - weights_offset) {
+        return 0;
+    }
+
+    /* Inputs may share readonly storage.  Every publication must be disjoint
+     * from both inputs and from the other publications. */
+    if (ds4_gpu_buffer_ranges_overlap(
+            probabilities_buffer, probabilities_offset, logits_bytes,
+            logits_buffer, logits_offset, logits_bytes) ||
+        ds4_gpu_buffer_ranges_overlap(
+            probabilities_buffer, probabilities_offset, logits_bytes,
+            bias_buffer, bias_offset, bias_bytes) ||
+        ds4_gpu_buffer_ranges_overlap(
+            probabilities_buffer, probabilities_offset, logits_bytes,
+            selected_buffer, selected_offset, selected_bytes) ||
+        ds4_gpu_buffer_ranges_overlap(
+            probabilities_buffer, probabilities_offset, logits_bytes,
+            weights_buffer, weights_offset, weights_bytes) ||
+        ds4_gpu_buffer_ranges_overlap(
+            selected_buffer, selected_offset, selected_bytes,
+            logits_buffer, logits_offset, logits_bytes) ||
+        ds4_gpu_buffer_ranges_overlap(
+            selected_buffer, selected_offset, selected_bytes,
+            bias_buffer, bias_offset, bias_bytes) ||
+        ds4_gpu_buffer_ranges_overlap(
+            selected_buffer, selected_offset, selected_bytes,
+            weights_buffer, weights_offset, weights_bytes) ||
+        ds4_gpu_buffer_ranges_overlap(
+            weights_buffer, weights_offset, weights_bytes,
+            logits_buffer, logits_offset, logits_bytes) ||
+        ds4_gpu_buffer_ranges_overlap(
+            weights_buffer, weights_offset, weights_bytes,
+            bias_buffer, bias_offset, bias_bytes)) {
+        return 0;
+    }
+
+    id<MTLComputePipelineState> pipeline = ds4_gpu_get_pipeline(
+        "kernel_dspark_router_f32_5x256_top6");
+    if (!pipeline || pipeline.threadExecutionWidth != 32u ||
+        pipeline.maxTotalThreadsPerThreadgroup <
+            DS4_GPU_DSPARK_ROUTER_THREADS) {
+        fprintf(stderr,
+                "ds4: Metal DSpark router pipeline unsupported "
+                "(simd=%llu threads=%u/%llu)\n",
+                (unsigned long long)(pipeline
+                    ? pipeline.threadExecutionWidth : 0u),
+                DS4_GPU_DSPARK_ROUTER_THREADS,
+                (unsigned long long)(pipeline
+                    ? pipeline.maxTotalThreadsPerThreadgroup : 0u));
+        return 0;
+    }
+
+    int owned = 0;
+    id<MTLCommandBuffer> cb = ds4_gpu_command_buffer(&owned);
+    if (!cb) return 0;
+    id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
+    if (!enc) {
+        if (owned) {
+            (void)ds4_gpu_finish_command_buffer(
+                cb, 1, "DSpark router failed encode");
+        }
+        return 0;
+    }
+    [enc setComputePipelineState:pipeline];
+    [enc setBuffer:logits_buffer offset:logits_offset atIndex:0];
+    [enc setBuffer:bias_buffer offset:bias_offset atIndex:1];
+    [enc setBuffer:probabilities_buffer
+          offset:probabilities_offset atIndex:2];
+    [enc setBuffer:selected_buffer offset:selected_offset atIndex:3];
+    [enc setBuffer:weights_buffer offset:weights_offset atIndex:4];
+    const NSUInteger scratch_bytes = ds4_gpu_align_up_ns(
+        DS4_GPU_DSPARK_ROUTER_EXPERTS *
+            (sizeof(float) + sizeof(int32_t)) + sizeof(uint32_t),
+        16u);
+    [enc setThreadgroupMemoryLength:scratch_bytes atIndex:0];
+    [enc dispatchThreadgroups:
+         MTLSizeMake(DS4_GPU_DSPARK_ROUTER_ROWS, 1, 1)
+         threadsPerThreadgroup:
+         MTLSizeMake(DS4_GPU_DSPARK_ROUTER_THREADS, 1, 1)];
+    ds4_gpu_end_compute_encoder(cb, enc);
+    return ds4_gpu_finish_command_buffer(
+        cb, owned, "DSpark fixed router oracle");
+}
+#endif
+
 /* The final checkpoint writes current main_kv into the committed ring before
  * this call. Before the ring fills, slots 0..count-1 are visible. Once full,
  * the pinned top-k index order remains physical slots 0..127 regardless of
@@ -39273,6 +39435,617 @@ static int ds4_gpu_internal_qwen35_expert_pack_pwrite_all(
 }
 
 #ifdef DS4_TEST_HOOKS
+typedef struct {
+    ds4_gpu_tensor *logits_parent;
+    ds4_gpu_tensor *bias_parent;
+    ds4_gpu_tensor *probabilities_parent;
+    ds4_gpu_tensor *selected_parent;
+    ds4_gpu_tensor *weights_parent;
+    ds4_gpu_tensor *logits;
+    ds4_gpu_tensor *bias;
+    ds4_gpu_tensor *probabilities;
+    ds4_gpu_tensor *selected;
+    ds4_gpu_tensor *weights;
+} ds4_gpu_dspark_router_test_tensors;
+
+typedef struct {
+    float probabilities[
+        DS4_GPU_DSPARK_ROUTER_ROWS * DS4_GPU_DSPARK_ROUTER_EXPERTS];
+    int32_t selected[
+        DS4_GPU_DSPARK_ROUTER_ROWS * DS4_GPU_DSPARK_ROUTER_TOPK];
+    float weights[
+        DS4_GPU_DSPARK_ROUTER_ROWS * DS4_GPU_DSPARK_ROUTER_TOPK];
+} ds4_gpu_dspark_router_test_result;
+
+static void ds4_gpu_dspark_router_test_tensors_free(
+        ds4_gpu_dspark_router_test_tensors *tensors) {
+    if (!tensors) return;
+    ds4_gpu_tensor_free(tensors->weights);
+    ds4_gpu_tensor_free(tensors->selected);
+    ds4_gpu_tensor_free(tensors->probabilities);
+    ds4_gpu_tensor_free(tensors->bias);
+    ds4_gpu_tensor_free(tensors->logits);
+    ds4_gpu_tensor_free(tensors->weights_parent);
+    ds4_gpu_tensor_free(tensors->selected_parent);
+    ds4_gpu_tensor_free(tensors->probabilities_parent);
+    ds4_gpu_tensor_free(tensors->bias_parent);
+    ds4_gpu_tensor_free(tensors->logits_parent);
+    memset(tensors, 0, sizeof(*tensors));
+}
+
+static int ds4_gpu_dspark_router_test_tensors_alloc(
+        ds4_gpu_dspark_router_test_tensors *tensors) {
+    if (!tensors) return 0;
+    memset(tensors, 0, sizeof(*tensors));
+    const uint64_t logits_bytes =
+        (uint64_t)DS4_GPU_DSPARK_ROUTER_ROWS *
+        DS4_GPU_DSPARK_ROUTER_EXPERTS * sizeof(float);
+    const uint64_t bias_bytes =
+        (uint64_t)DS4_GPU_DSPARK_ROUTER_EXPERTS * sizeof(float);
+    const uint64_t selected_bytes =
+        (uint64_t)DS4_GPU_DSPARK_ROUTER_ROWS *
+        DS4_GPU_DSPARK_ROUTER_TOPK * sizeof(int32_t);
+    const uint64_t weights_bytes =
+        (uint64_t)DS4_GPU_DSPARK_ROUTER_ROWS *
+        DS4_GPU_DSPARK_ROUTER_TOPK * sizeof(float);
+    tensors->logits_parent = ds4_gpu_tensor_alloc(
+        logits_bytes + 2u * sizeof(uint32_t));
+    tensors->bias_parent = ds4_gpu_tensor_alloc(
+        bias_bytes + 2u * sizeof(uint32_t));
+    tensors->probabilities_parent = ds4_gpu_tensor_alloc(
+        logits_bytes + 2u * sizeof(uint32_t));
+    tensors->selected_parent = ds4_gpu_tensor_alloc(
+        selected_bytes + 2u * sizeof(uint32_t));
+    tensors->weights_parent = ds4_gpu_tensor_alloc(
+        weights_bytes + 2u * sizeof(uint32_t));
+    if (tensors->logits_parent) {
+        tensors->logits = ds4_gpu_tensor_view(
+            tensors->logits_parent, sizeof(uint32_t), logits_bytes);
+    }
+    if (tensors->bias_parent) {
+        tensors->bias = ds4_gpu_tensor_view(
+            tensors->bias_parent, sizeof(uint32_t), bias_bytes);
+    }
+    if (tensors->probabilities_parent) {
+        tensors->probabilities = ds4_gpu_tensor_view(
+            tensors->probabilities_parent, sizeof(uint32_t), logits_bytes);
+    }
+    if (tensors->selected_parent) {
+        tensors->selected = ds4_gpu_tensor_view(
+            tensors->selected_parent, sizeof(uint32_t), selected_bytes);
+    }
+    if (tensors->weights_parent) {
+        tensors->weights = ds4_gpu_tensor_view(
+            tensors->weights_parent, sizeof(uint32_t), weights_bytes);
+    }
+    if (!tensors->logits_parent || !tensors->bias_parent ||
+        !tensors->probabilities_parent || !tensors->selected_parent ||
+        !tensors->weights_parent || !tensors->logits || !tensors->bias ||
+        !tensors->probabilities || !tensors->selected || !tensors->weights) {
+        ds4_gpu_dspark_router_test_tensors_free(tensors);
+        return 0;
+    }
+    return 1;
+}
+
+static int ds4_gpu_dspark_router_test_run(
+        ds4_gpu_dspark_router_test_tensors *tensors,
+        const float                       *logits,
+        const float                       *bias,
+        ds4_gpu_dspark_router_test_result *result) {
+    enum {
+        LOGIT_VALUES =
+            DS4_GPU_DSPARK_ROUTER_ROWS * DS4_GPU_DSPARK_ROUTER_EXPERTS,
+        BIAS_VALUES = DS4_GPU_DSPARK_ROUTER_EXPERTS,
+        ROUTE_VALUES =
+            DS4_GPU_DSPARK_ROUTER_ROWS * DS4_GPU_DSPARK_ROUTER_TOPK,
+    };
+    uint32_t logits_words[LOGIT_VALUES + 2u];
+    uint32_t bias_words[BIAS_VALUES + 2u];
+    uint32_t probabilities_words[LOGIT_VALUES + 2u];
+    int32_t selected_words[ROUTE_VALUES + 2u];
+    uint32_t weights_words[ROUTE_VALUES + 2u];
+    uint32_t logits_after[LOGIT_VALUES + 2u];
+    uint32_t bias_after[BIAS_VALUES + 2u];
+    if (!tensors || !logits || !bias || !result) return 0;
+
+    logits_words[0] = UINT32_C(0x13579bdf);
+    logits_words[LOGIT_VALUES + 1u] = UINT32_C(0xfdb97531);
+    bias_words[0] = UINT32_C(0x2468ace0);
+    bias_words[BIAS_VALUES + 1u] = UINT32_C(0x0eca8642);
+    probabilities_words[0] = UINT32_C(0x11223344);
+    probabilities_words[LOGIT_VALUES + 1u] = UINT32_C(0x44332211);
+    selected_words[0] = INT32_C(0x12345678);
+    selected_words[ROUTE_VALUES + 1u] = INT32_C(0x76543210);
+    weights_words[0] = UINT32_C(0xa1b2c3d4);
+    weights_words[ROUTE_VALUES + 1u] = UINT32_C(0xd4c3b2a1);
+    memcpy(logits_words + 1u, logits, LOGIT_VALUES * sizeof(float));
+    memcpy(bias_words + 1u, bias, BIAS_VALUES * sizeof(float));
+    for (uint32_t i = 0; i < LOGIT_VALUES; i++) {
+        probabilities_words[i + 1u] = UINT32_C(0x7fc12345);
+    }
+    for (uint32_t i = 0; i < ROUTE_VALUES; i++) {
+        selected_words[i + 1u] = INT32_C(0x5a5a5a5a);
+        weights_words[i + 1u] = UINT32_C(0x7fc54321);
+    }
+
+    int ok = ds4_gpu_tensor_write(
+                 tensors->logits_parent, 0,
+                 logits_words, sizeof(logits_words)) &&
+             ds4_gpu_tensor_write(
+                 tensors->bias_parent, 0,
+                 bias_words, sizeof(bias_words)) &&
+             ds4_gpu_tensor_write(
+                 tensors->probabilities_parent, 0,
+                 probabilities_words, sizeof(probabilities_words)) &&
+             ds4_gpu_tensor_write(
+                 tensors->selected_parent, 0,
+                 selected_words, sizeof(selected_words)) &&
+             ds4_gpu_tensor_write(
+                 tensors->weights_parent, 0,
+                 weights_words, sizeof(weights_words)) &&
+             ds4_gpu_dspark_router_f32_tensor(
+                 tensors->logits, tensors->bias,
+                 tensors->probabilities, tensors->selected,
+                 tensors->weights) &&
+             ds4_gpu_tensor_read(
+                 tensors->logits_parent, 0,
+                 logits_after, sizeof(logits_after)) &&
+             ds4_gpu_tensor_read(
+                 tensors->bias_parent, 0,
+                 bias_after, sizeof(bias_after)) &&
+             ds4_gpu_tensor_read(
+                 tensors->probabilities_parent, 0,
+                 probabilities_words, sizeof(probabilities_words)) &&
+             ds4_gpu_tensor_read(
+                 tensors->selected_parent, 0,
+                 selected_words, sizeof(selected_words)) &&
+             ds4_gpu_tensor_read(
+                 tensors->weights_parent, 0,
+                 weights_words, sizeof(weights_words));
+    if (ok) {
+        ok = memcmp(logits_words, logits_after, sizeof(logits_words)) == 0 &&
+             memcmp(bias_words, bias_after, sizeof(bias_words)) == 0 &&
+             probabilities_words[0] == UINT32_C(0x11223344) &&
+             probabilities_words[LOGIT_VALUES + 1u] ==
+                 UINT32_C(0x44332211) &&
+             selected_words[0] == INT32_C(0x12345678) &&
+             selected_words[ROUTE_VALUES + 1u] ==
+                 INT32_C(0x76543210) &&
+             weights_words[0] == UINT32_C(0xa1b2c3d4) &&
+             weights_words[ROUTE_VALUES + 1u] ==
+                 UINT32_C(0xd4c3b2a1);
+    }
+    if (ok) {
+        memcpy(result->probabilities,
+               probabilities_words + 1u,
+               sizeof(result->probabilities));
+        memcpy(result->selected,
+               selected_words + 1u,
+               sizeof(result->selected));
+        memcpy(result->weights,
+               weights_words + 1u,
+               sizeof(result->weights));
+    }
+    return ok;
+}
+
+static float ds4_gpu_dspark_router_test_probability(float value) {
+    return sqrtf(fmaxf(value, 0.0f) + log1pf(expf(-fabsf(value))));
+}
+
+static int ds4_gpu_dspark_router_test_isfinite(float value) {
+    uint32_t bits = 0;
+    memcpy(&bits, &value, sizeof(bits));
+    return (bits & UINT32_C(0x7fffffff)) < UINT32_C(0x7f800000);
+}
+
+static float ds4_gpu_dspark_router_test_float_bits(uint32_t bits) {
+    float value = 0.0f;
+    memcpy(&value, &bits, sizeof(value));
+    return value;
+}
+
+static int ds4_gpu_dspark_router_test_better(
+        const float *scores,
+        int32_t      a,
+        int32_t      b) {
+    return scores[(uint32_t)a] > scores[(uint32_t)b] ||
+        (scores[(uint32_t)a] == scores[(uint32_t)b] && a < b);
+}
+
+static void ds4_gpu_dspark_router_test_reference(
+        const float                       *logits,
+        const float                       *bias,
+        ds4_gpu_dspark_router_test_result *result) {
+    for (uint32_t row = 0; row < DS4_GPU_DSPARK_ROUTER_ROWS; row++) {
+        const uint32_t logit_base =
+            row * DS4_GPU_DSPARK_ROUTER_EXPERTS;
+        const uint32_t route_base = row * DS4_GPU_DSPARK_ROUTER_TOPK;
+        float scores[DS4_GPU_DSPARK_ROUTER_EXPERTS];
+        int32_t indices[DS4_GPU_DSPARK_ROUTER_EXPERTS];
+        int valid = 1;
+        for (uint32_t expert = 0;
+             expert < DS4_GPU_DSPARK_ROUTER_EXPERTS; expert++) {
+            const float raw = logits[logit_base + expert];
+            const float probability = ds4_gpu_dspark_router_test_isfinite(raw)
+                ? ds4_gpu_dspark_router_test_probability(raw) : 0.0f;
+            const float score =
+                ds4_gpu_dspark_router_test_isfinite(probability) &&
+                ds4_gpu_dspark_router_test_isfinite(bias[expert])
+                ? probability + bias[expert] : 0.0f;
+            const int lane_valid =
+                ds4_gpu_dspark_router_test_isfinite(raw) &&
+                ds4_gpu_dspark_router_test_isfinite(bias[expert]) &&
+                ds4_gpu_dspark_router_test_isfinite(probability) &&
+                ds4_gpu_dspark_router_test_isfinite(score);
+            result->probabilities[logit_base + expert] =
+                lane_valid ? probability : 0.0f;
+            scores[expert] = lane_valid ? score : 0.0f;
+            indices[expert] = (int32_t)expert;
+            valid = valid && lane_valid;
+        }
+        if (!valid) {
+            memset(result->probabilities + logit_base, 0,
+                   DS4_GPU_DSPARK_ROUTER_EXPERTS * sizeof(float));
+            for (uint32_t slot = 0;
+                 slot < DS4_GPU_DSPARK_ROUTER_TOPK; slot++) {
+                result->selected[route_base + slot] = -1;
+                result->weights[route_base + slot] = 0.0f;
+            }
+            continue;
+        }
+
+        for (uint32_t i = 1;
+             i < DS4_GPU_DSPARK_ROUTER_EXPERTS; i++) {
+            const int32_t key = indices[i];
+            uint32_t j = i;
+            while (j != 0u && ds4_gpu_dspark_router_test_better(
+                                      scores, key, indices[j - 1u])) {
+                indices[j] = indices[j - 1u];
+                j--;
+            }
+            indices[j] = key;
+        }
+        float denominator = 0.0f;
+        for (uint32_t slot = 0;
+             slot < DS4_GPU_DSPARK_ROUTER_TOPK; slot++) {
+            const int32_t expert = indices[slot];
+            result->selected[route_base + slot] = expert;
+            denominator += result->probabilities[
+                logit_base + (uint32_t)expert];
+        }
+        if (!ds4_gpu_dspark_router_test_isfinite(denominator) ||
+            !(denominator > 0.0f)) {
+            memset(result->probabilities + logit_base, 0,
+                   DS4_GPU_DSPARK_ROUTER_EXPERTS * sizeof(float));
+            for (uint32_t slot = 0;
+                 slot < DS4_GPU_DSPARK_ROUTER_TOPK; slot++) {
+                result->selected[route_base + slot] = -1;
+                result->weights[route_base + slot] = 0.0f;
+            }
+            continue;
+        }
+        for (uint32_t slot = 0;
+             slot < DS4_GPU_DSPARK_ROUTER_TOPK; slot++) {
+            const uint32_t expert = (uint32_t)indices[slot];
+            result->weights[route_base + slot] =
+                result->probabilities[logit_base + expert] /
+                denominator * 1.5f;
+        }
+    }
+}
+
+static int ds4_gpu_dspark_router_test_matches_reference(
+        const float                             *logits,
+        const float                             *bias,
+        const ds4_gpu_dspark_router_test_result *actual,
+        const char                              *case_name) {
+    ds4_gpu_dspark_router_test_result expected;
+    ds4_gpu_dspark_router_test_reference(logits, bias, &expected);
+    for (uint32_t i = 0;
+         i < DS4_GPU_DSPARK_ROUTER_ROWS *
+             DS4_GPU_DSPARK_ROUTER_EXPERTS; i++) {
+        const float error = fabsf(
+            actual->probabilities[i] - expected.probabilities[i]);
+        const float tolerance =
+            8.0e-6f * fmaxf(1.0f, fabsf(expected.probabilities[i]));
+        if (!ds4_gpu_dspark_router_test_isfinite(actual->probabilities[i]) ||
+            error > tolerance) {
+            fprintf(stderr,
+                    "ds4: DSpark router %s probability[%u] got %.9g "
+                    "expected %.9g error %.9g\n",
+                    case_name, i, actual->probabilities[i],
+                    expected.probabilities[i], error);
+            return 0;
+        }
+    }
+    for (uint32_t i = 0;
+         i < DS4_GPU_DSPARK_ROUTER_ROWS * DS4_GPU_DSPARK_ROUTER_TOPK;
+         i++) {
+        if (actual->selected[i] != expected.selected[i]) {
+            fprintf(stderr,
+                    "ds4: DSpark router %s selected[%u] got %d expected %d\n",
+                    case_name, i, actual->selected[i], expected.selected[i]);
+            return 0;
+        }
+        const float error = fabsf(actual->weights[i] - expected.weights[i]);
+        if (!ds4_gpu_dspark_router_test_isfinite(actual->weights[i]) ||
+            error > 8.0e-6f) {
+            fprintf(stderr,
+                    "ds4: DSpark router %s weight[%u] got %.9g "
+                    "expected %.9g error %.9g\n",
+                    case_name, i, actual->weights[i],
+                    expected.weights[i], error);
+            return 0;
+        }
+    }
+    return 1;
+}
+
+int ds4_gpu_internal_dspark_router_f32_test(void) {
+    enum {
+        LOGIT_VALUES =
+            DS4_GPU_DSPARK_ROUTER_ROWS * DS4_GPU_DSPARK_ROUTER_EXPERTS,
+        ROUTE_VALUES =
+            DS4_GPU_DSPARK_ROUTER_ROWS * DS4_GPU_DSPARK_ROUTER_TOPK,
+    };
+    if (!g_initialized && !ds4_gpu_init()) return 0;
+    ds4_gpu_dspark_router_test_tensors tensors = {0};
+    ds4_gpu_dspark_router_test_result all_tie = {0};
+    ds4_gpu_dspark_router_test_result first = {0};
+    ds4_gpu_dspark_router_test_result second = {0};
+    float logits[LOGIT_VALUES];
+    float bias[DS4_GPU_DSPARK_ROUTER_EXPERTS];
+    int ok = ds4_gpu_dspark_router_test_tensors_alloc(&tensors);
+
+    /* Reject malformed or aliased views without encoding. */
+    ds4_gpu_tensor *short_selected = ok ? ds4_gpu_tensor_view(
+        tensors.selected, 0,
+        (uint64_t)ROUTE_VALUES * sizeof(int32_t) - sizeof(int32_t)) : NULL;
+    ds4_gpu_tensor *misaligned_logits = ok ? ds4_gpu_tensor_view(
+        tensors.logits_parent, 1u,
+        (uint64_t)LOGIT_VALUES * sizeof(float)) : NULL;
+    if (ok) {
+        ok = short_selected && misaligned_logits &&
+             !ds4_gpu_dspark_router_f32_tensor(
+                 NULL, tensors.bias, tensors.probabilities,
+                 tensors.selected, tensors.weights) &&
+             !ds4_gpu_dspark_router_f32_tensor(
+                 tensors.logits, NULL, tensors.probabilities,
+                 tensors.selected, tensors.weights) &&
+             !ds4_gpu_dspark_router_f32_tensor(
+                 tensors.logits, tensors.bias, tensors.probabilities,
+                 short_selected, tensors.weights) &&
+             !ds4_gpu_dspark_router_f32_tensor(
+                 misaligned_logits, tensors.bias, tensors.probabilities,
+                 tensors.selected, tensors.weights) &&
+             !ds4_gpu_dspark_router_f32_tensor(
+                 tensors.logits, tensors.bias, tensors.logits,
+                 tensors.selected, tensors.weights);
+    }
+    ds4_gpu_tensor_free(misaligned_logits);
+    ds4_gpu_tensor_free(short_selected);
+
+    /* Every score is distinct; monotonic sqrt-softplus must select 255..250. */
+    for (uint32_t expert = 0;
+         expert < DS4_GPU_DSPARK_ROUTER_EXPERTS; expert++) {
+        bias[expert] = 0.0f;
+    }
+    for (uint32_t row = 0; row < DS4_GPU_DSPARK_ROUTER_ROWS; row++) {
+        for (uint32_t expert = 0;
+             expert < DS4_GPU_DSPARK_ROUTER_EXPERTS; expert++) {
+            logits[row * DS4_GPU_DSPARK_ROUTER_EXPERTS + expert] =
+                -2.0f + (float)expert * (1.0f / 64.0f) +
+                (float)row * (1.0f / 4096.0f);
+        }
+    }
+    if (ok) {
+        ok = ds4_gpu_dspark_router_test_run(
+                 &tensors, logits, bias, &first) &&
+             ds4_gpu_dspark_router_test_matches_reference(
+                 logits, bias, &first, "distinct");
+    }
+    for (uint32_t row = 0; ok && row < DS4_GPU_DSPARK_ROUTER_ROWS; row++) {
+        for (uint32_t slot = 0;
+             slot < DS4_GPU_DSPARK_ROUTER_TOPK; slot++) {
+            ok = first.selected[row * DS4_GPU_DSPARK_ROUTER_TOPK + slot] ==
+                (int32_t)(255u - slot);
+            if (!ok) break;
+        }
+    }
+
+    /* Total all-score tie: the lower expert id is the secondary key. */
+    memset(logits, 0, sizeof(logits));
+    if (ok) {
+        ok = ds4_gpu_dspark_router_test_run(
+                 &tensors, logits, bias, &all_tie) &&
+             ds4_gpu_dspark_router_test_matches_reference(
+                 logits, bias, &all_tie, "all-tie");
+    }
+    for (uint32_t row = 0; ok && row < DS4_GPU_DSPARK_ROUTER_ROWS; row++) {
+        for (uint32_t slot = 0;
+             slot < DS4_GPU_DSPARK_ROUTER_TOPK; slot++) {
+            ok = all_tie.selected[
+                row * DS4_GPU_DSPARK_ROUTER_TOPK + slot] == (int32_t)slot;
+            if (!ok) break;
+        }
+    }
+
+    /* Five strict winners plus a three-way tie at the cutoff. */
+    for (uint32_t i = 0; i < LOGIT_VALUES; i++) logits[i] = -8.0f;
+    for (uint32_t row = 0; row < DS4_GPU_DSPARK_ROUTER_ROWS; row++) {
+        const uint32_t base = row * DS4_GPU_DSPARK_ROUTER_EXPERTS;
+        for (uint32_t i = 0; i < 5u; i++) {
+            logits[base + 100u + i] = 5.0f - (float)i * 0.5f;
+        }
+        logits[base + 20u] = 1.0f;
+        logits[base + 21u] = 1.0f;
+        logits[base + 22u] = 1.0f;
+    }
+    if (ok) {
+        ok = ds4_gpu_dspark_router_test_run(
+                 &tensors, logits, bias, &first) &&
+             ds4_gpu_dspark_router_test_matches_reference(
+                 logits, bias, &first, "cutoff-tie") &&
+             ds4_gpu_dspark_router_test_run(
+                 &tensors, logits, bias, &second) &&
+             memcmp(&first, &second, sizeof(first)) == 0;
+    }
+    static const int32_t cutoff_expected[DS4_GPU_DSPARK_ROUTER_TOPK] = {
+        100, 101, 102, 103, 104, 20,
+    };
+    for (uint32_t row = 0; ok && row < DS4_GPU_DSPARK_ROUTER_ROWS; row++) {
+        ok = memcmp(first.selected + row * DS4_GPU_DSPARK_ROUTER_TOPK,
+                    cutoff_expected, sizeof(cutoff_expected)) == 0;
+    }
+
+    /* Equal logits make the isolation explicit: bias changes ids while the
+     * six unbiased probabilities and normalized weights remain byte-identical. */
+    memset(logits, 0, sizeof(logits));
+    for (uint32_t i = 0; i < 6u; i++) bias[200u + i] = 1.0f;
+    if (ok) {
+        ok = ds4_gpu_dspark_router_test_run(
+                 &tensors, logits, bias, &first) &&
+             ds4_gpu_dspark_router_test_matches_reference(
+                 logits, bias, &first, "bias-selection") &&
+             memcmp(first.probabilities, all_tie.probabilities,
+                    sizeof(first.probabilities)) == 0 &&
+             memcmp(first.weights, all_tie.weights,
+                    sizeof(first.weights)) == 0;
+    }
+    for (uint32_t row = 0; ok && row < DS4_GPU_DSPARK_ROUTER_ROWS; row++) {
+        for (uint32_t slot = 0;
+             slot < DS4_GPU_DSPARK_ROUTER_TOPK; slot++) {
+            ok = first.selected[row * DS4_GPU_DSPARK_ROUTER_TOPK + slot] ==
+                (int32_t)(200u + slot);
+            if (!ok) break;
+        }
+    }
+
+    /* A non-finite raw logit invalidates only its row and cannot reach the
+     * probability gather.  The remaining rows still route normally. */
+    memset(logits, 0, sizeof(logits));
+    memset(bias, 0, sizeof(bias));
+    logits[7u] = ds4_gpu_dspark_router_test_float_bits(
+        UINT32_C(0x7fc00001));
+    logits[DS4_GPU_DSPARK_ROUTER_EXPERTS + 8u] =
+        ds4_gpu_dspark_router_test_float_bits(UINT32_C(0x7f800000));
+    logits[2u * DS4_GPU_DSPARK_ROUTER_EXPERTS + 9u] =
+        ds4_gpu_dspark_router_test_float_bits(UINT32_C(0xff800000));
+    if (ok) {
+        ok = ds4_gpu_dspark_router_test_run(
+                 &tensors, logits, bias, &first) &&
+             ds4_gpu_dspark_router_test_matches_reference(
+                 logits, bias, &first, "invalid-logits");
+    }
+    for (uint32_t row = 0; ok && row < 3u; row++) {
+        for (uint32_t slot = 0;
+             slot < DS4_GPU_DSPARK_ROUTER_TOPK; slot++) {
+            const uint32_t index = row * DS4_GPU_DSPARK_ROUTER_TOPK + slot;
+            ok = first.selected[index] == -1 &&
+                first.weights[index] == 0.0f;
+            if (!ok) break;
+        }
+    }
+    for (uint32_t row = 3u;
+         ok && row < DS4_GPU_DSPARK_ROUTER_ROWS; row++) {
+        for (uint32_t slot = 0;
+             slot < DS4_GPU_DSPARK_ROUTER_TOPK; slot++) {
+            ok = first.selected[row * DS4_GPU_DSPARK_ROUTER_TOPK + slot] ==
+                (int32_t)slot;
+            if (!ok) break;
+        }
+    }
+
+    /* Finite inputs can still produce an unusable route denominator after
+     * F32 underflow.  Close only the affected rows; no selected expert id may
+     * escape to the later SUPPORT gather/I/O transaction. */
+    memset(logits, 0, sizeof(logits));
+    memset(bias, 0, sizeof(bias));
+    const float negative_flt_max = ds4_gpu_dspark_router_test_float_bits(
+        UINT32_C(0xff7fffff));
+    for (uint32_t expert = 0;
+         expert < DS4_GPU_DSPARK_ROUTER_EXPERTS; expert++) {
+        logits[expert] = negative_flt_max;
+        logits[DS4_GPU_DSPARK_ROUTER_EXPERTS + expert] = -1000.0f;
+    }
+    if (ok) {
+        ok = ds4_gpu_dspark_router_test_run(
+                 &tensors, logits, bias, &first) &&
+             ds4_gpu_dspark_router_test_matches_reference(
+                 logits, bias, &first, "zero-denominator-rows");
+    }
+    for (uint32_t row = 0; ok && row < 2u; row++) {
+        for (uint32_t expert = 0;
+             ok && expert < DS4_GPU_DSPARK_ROUTER_EXPERTS; expert++) {
+            ok = first.probabilities[
+                row * DS4_GPU_DSPARK_ROUTER_EXPERTS + expert] == 0.0f;
+        }
+        for (uint32_t slot = 0;
+             ok && slot < DS4_GPU_DSPARK_ROUTER_TOPK; slot++) {
+            const uint32_t index = row * DS4_GPU_DSPARK_ROUTER_TOPK + slot;
+            ok = first.selected[index] == -1 &&
+                first.weights[index] == 0.0f;
+        }
+    }
+    for (uint32_t row = 2u;
+         ok && row < DS4_GPU_DSPARK_ROUTER_ROWS; row++) {
+        for (uint32_t slot = 0;
+             slot < DS4_GPU_DSPARK_ROUTER_TOPK; slot++) {
+            ok = first.selected[row * DS4_GPU_DSPARK_ROUTER_TOPK + slot] ==
+                (int32_t)slot;
+            if (!ok) break;
+        }
+    }
+
+    /* The same condition across the complete five-row proposal block remains
+     * deterministic and publishes no route at all. */
+    for (uint32_t i = 0; i < LOGIT_VALUES; i++) logits[i] = -1000.0f;
+    if (ok) {
+        ok = ds4_gpu_dspark_router_test_run(
+                 &tensors, logits, bias, &first) &&
+             ds4_gpu_dspark_router_test_matches_reference(
+                 logits, bias, &first, "zero-denominator-block");
+    }
+    for (uint32_t i = 0; ok && i < LOGIT_VALUES; i++) {
+        ok = first.probabilities[i] == 0.0f;
+    }
+    for (uint32_t i = 0; ok && i < ROUTE_VALUES; i++) {
+        ok = first.selected[i] == -1 && first.weights[i] == 0.0f;
+    }
+
+    /* Bias is shared across the five rows, so each invalid class closes the
+     * complete proposal block and publishes only -1/zero sentinels. */
+    static const uint32_t invalid_bias_bits[] = {
+        UINT32_C(0x7fc00001),
+        UINT32_C(0x7f800000),
+        UINT32_C(0xff800000),
+    };
+    memset(logits, 0, sizeof(logits));
+    for (uint32_t invalid = 0;
+         ok && invalid <
+             sizeof(invalid_bias_bits) / sizeof(invalid_bias_bits[0]);
+         invalid++) {
+        memset(bias, 0, sizeof(bias));
+        bias[17u] = ds4_gpu_dspark_router_test_float_bits(
+            invalid_bias_bits[invalid]);
+        ok = ds4_gpu_dspark_router_test_run(
+                 &tensors, logits, bias, &first) &&
+             ds4_gpu_dspark_router_test_matches_reference(
+                 logits, bias, &first, "invalid-bias");
+        for (uint32_t i = 0; ok && i < LOGIT_VALUES; i++) {
+            ok = first.probabilities[i] == 0.0f;
+        }
+        for (uint32_t i = 0; ok && i < ROUTE_VALUES; i++) {
+            ok = first.selected[i] == -1 && first.weights[i] == 0.0f;
+        }
+    }
+
+    ds4_gpu_dspark_router_test_tensors_free(&tensors);
+    return ok;
+}
+
 static uint32_t ds4_gpu_bf16_round_f32_oracle(uint32_t bits) {
     const uint32_t magnitude = bits & UINT32_C(0x7fffffff);
     if (magnitude >= UINT32_C(0x7f800000)) {

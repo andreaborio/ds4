@@ -199,6 +199,159 @@ kernel void kernel_dspark_attention_two_source_f32(
     out[tid + 256u] = ds4_dspark_bf16_rne(acc1 / denominator);
 }
 
+#ifdef DS4_TEST_HOOKS
+// Disconnected final-0731 DSpark router oracle.  The production graph does not
+// call this kernel yet, so keep its fixed five-row geometry and host wrapper
+// test-only until the stage executor owns the complete SUPPORT transaction.
+// Bias changes selection only; the published route weights always come from
+// the unbiased sqrt(softplus(logit)) probabilities.
+static inline float ds4_dspark_router_probability(float value) {
+    float softplus;
+    if (value > 20.0f) {
+        softplus = value;
+    } else if (value < -20.0f) {
+        softplus = exp(value);
+    } else if (value < -10.0f) {
+        // Metal does not expose log1p.  Retain its small-x terms instead of
+        // rounding 1 + exp(value) to one in the negative tail.
+        const float exponential = exp(value);
+        softplus = exponential - 0.5f * exponential * exponential +
+            (exponential * exponential * exponential) / 3.0f;
+    } else if (value > 10.0f) {
+        softplus = value + log(1.0f + exp(-value));
+    } else {
+        softplus = log(1.0f + exp(value));
+    }
+    return sqrt(softplus);
+}
+
+static inline bool ds4_dspark_router_better(
+        threadgroup const float *scores,
+        int32_t                  a,
+        int32_t                  b) {
+    const float sa = scores[(uint)a];
+    const float sb = scores[(uint)b];
+    return sa > sb || (sa == sb && a < b);
+}
+
+kernel void kernel_dspark_router_f32_5x256_top6(
+        device const float *logits [[buffer(0)]],
+        device const float *bias [[buffer(1)]],
+        device float *probabilities [[buffer(2)]],
+        device int32_t *selected [[buffer(3)]],
+        device float *weights [[buffer(4)]],
+        threadgroup uchar *scratch_bytes [[threadgroup(0)]],
+        uint row [[threadgroup_position_in_grid]],
+        uint tid [[thread_position_in_threadgroup]]) {
+    constexpr uint rows = 5;
+    constexpr uint experts = 256;
+    constexpr uint topk = 6;
+    if (row >= rows || tid >= experts) return;
+
+    threadgroup float *scores =
+        (threadgroup float *)scratch_bytes;
+    threadgroup int32_t *indices =
+        (threadgroup int32_t *)(scores + experts);
+    threadgroup uint *row_valid =
+        (threadgroup uint *)(indices + experts);
+
+    device const float *row_logits = logits + (ulong)row * experts;
+    device float *row_probabilities =
+        probabilities + (ulong)row * experts;
+    device int32_t *row_selected = selected + (ulong)row * topk;
+    device float *row_weights = weights + (ulong)row * topk;
+
+    const float raw = row_logits[tid];
+    const float correction = bias[tid];
+    const bool raw_valid = isfinite(raw);
+    const float probability = raw_valid
+        ? ds4_dspark_router_probability(raw) : 0.0f;
+    const bool probability_valid = raw_valid && isfinite(probability);
+    const float score = probability_valid && isfinite(correction)
+        ? probability + correction : 0.0f;
+    const bool lane_valid = probability_valid && isfinite(correction) &&
+        isfinite(score);
+
+    row_probabilities[tid] = lane_valid ? probability : 0.0f;
+    scores[tid] = lane_valid ? score : 0.0f;
+    indices[tid] = lane_valid ? (int32_t)tid : -1;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (tid == 0u) {
+        uint valid = 1u;
+        for (uint expert = 0u; expert < experts; expert++) {
+            if (indices[expert] < 0) {
+                valid = 0u;
+                break;
+            }
+        }
+        row_valid[0] = valid;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Keep every compare total: higher score first, then lower expert id.
+    // Invalid rows still complete the barriers, but never publish an index.
+    for (uint width = 2u; width <= experts; width <<= 1u) {
+        for (uint stride = width >> 1u; stride != 0u; stride >>= 1u) {
+            const uint other = tid ^ stride;
+            if (other > tid) {
+                const int32_t a = indices[tid] < 0
+                    ? (int32_t)tid : indices[tid];
+                const int32_t b = indices[other] < 0
+                    ? (int32_t)other : indices[other];
+                const bool descending = (tid & width) == 0u;
+                const bool swap = descending
+                    ? ds4_dspark_router_better(scores, b, a)
+                    : ds4_dspark_router_better(scores, a, b);
+                if (swap) {
+                    indices[tid] = b;
+                    indices[other] = a;
+                } else {
+                    indices[tid] = a;
+                    indices[other] = b;
+                }
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+    }
+
+    if (row_valid[0] != 0u && tid < topk) {
+        row_selected[tid] = indices[tid];
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (tid == 0u && row_valid[0] != 0u) {
+        float denominator = 0.0f;
+        for (uint slot = 0u; slot < topk; slot++) {
+            denominator += row_probabilities[(uint)row_selected[slot]];
+        }
+        if (!isfinite(denominator) || !(denominator > 0.0f)) {
+            row_valid[0] = 0u;
+        } else {
+            // Sorting is complete, so its score scratch can publish the one
+            // exact unbiased denominator to all six weight lanes.
+            scores[0] = denominator;
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (row_valid[0] == 0u) {
+        row_probabilities[tid] = 0.0f;
+        if (tid < topk) {
+            row_selected[tid] = -1;
+            row_weights[tid] = 0.0f;
+        }
+    } else if (tid < topk) {
+        // Only tid 0 performed the gather, after complete row validation and
+        // publication of six in-range ids.  No invalid row reaches this read.
+        const float denominator = scores[0];
+        row_weights[tid] =
+            row_probabilities[(uint)row_selected[tid]] /
+            denominator * 1.5f;
+    }
+}
+#endif
+
 // Reopens each F32 lane after an exact BF16 round-to-nearest-even step.  Raw
 // integer arithmetic keeps zero signs and NaN payload/sign handling independent
 // of the Metal compiler's floating-point canonicalization choices.
