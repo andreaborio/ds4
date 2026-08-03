@@ -492,13 +492,28 @@ typedef struct {
     bool restore_then_replay;
 } ds4_dspark_verifier_consumption;
 
+typedef enum {
+    DS4_DSPARK_TAIL_NO_OUTPUT = 0,
+    DS4_DSPARK_TAIL_PENDING_ONLY = 1,
+    DS4_DSPARK_TAIL_VERIFY = 2,
+} ds4_dspark_tail_kind;
+
+typedef struct {
+    ds4_dspark_tail_kind kind;
+    uint32_t available_rows;
+    uint32_t draft_depth;
+    uint32_t verifier_rows;
+    uint32_t maximum_emitted_rows;
+} ds4_dspark_tail_plan;
+
 /* Session-owned lifecycle for one proposed output block.  This contract is
- * deliberately pure: it owns only verifier geometry and a monotonic cookie.
+ * deliberately pure: it owns only block geometry and a monotonic cookie.
  * It does not own or advance tokens, RNG, snapshots, KV/cache state, logits,
  * device work, or caller output.  Those effects remain disconnected until a
  * later tranche wires every CLI/server/agent consumer to this lifecycle. */
 typedef struct {
     uint64_t cookie;
+    ds4_dspark_tail_kind kind;
     uint32_t block_rows;
     uint32_t evaluated_rows;
 } ds4_dspark_generation_block;
@@ -508,6 +523,8 @@ typedef struct {
     bool active;
     uint64_t last_cookie;
     uint64_t active_cookie;
+    uint64_t frontier;
+    ds4_dspark_tail_kind kind;
     uint32_t block_rows;
     uint32_t evaluated_rows;
     ds4_dspark_verifier_plan verifier_plan;
@@ -524,20 +541,6 @@ typedef enum {
     DS4_DSPARK_SESSION_OPERATION_SAVE = 4,
     DS4_DSPARK_SESSION_OPERATION_COUNT = 5,
 } ds4_dspark_session_operation;
-
-typedef enum {
-    DS4_DSPARK_TAIL_NO_OUTPUT = 0,
-    DS4_DSPARK_TAIL_PENDING_ONLY = 1,
-    DS4_DSPARK_TAIL_VERIFY = 2,
-} ds4_dspark_tail_kind;
-
-typedef struct {
-    ds4_dspark_tail_kind kind;
-    uint32_t available_rows;
-    uint32_t draft_depth;
-    uint32_t verifier_rows;
-    uint32_t maximum_emitted_rows;
-} ds4_dspark_tail_plan;
 
 /* A frontier snapshot does not copy the target raw-SWA ring.  Future verifier
  * rows may therefore remain as invisible garbage after restore, but they must
@@ -664,17 +667,52 @@ static bool ds4_dspark_verifier_plan_is_zero(
            !plan->restore_then_replay;
 }
 
+static bool ds4_dspark_tail_plan_coherent(
+        const ds4_dspark_tail_plan *plan) {
+    if (!plan ||
+        plan->kind < DS4_DSPARK_TAIL_NO_OUTPUT ||
+        plan->kind > DS4_DSPARK_TAIL_VERIFY ||
+        plan->draft_depth > DS4_DSPARK_SUPPORT_CANDIDATE_ROWS) {
+        return false;
+    }
+    if (plan->kind == DS4_DSPARK_TAIL_NO_OUTPUT) {
+        return plan->available_rows == 0 && plan->draft_depth == 0 &&
+               plan->verifier_rows == 0 &&
+               plan->maximum_emitted_rows == 0;
+    }
+    if (plan->kind == DS4_DSPARK_TAIL_PENDING_ONLY) {
+        return plan->available_rows != 0 && plan->draft_depth == 0 &&
+               plan->verifier_rows == 0 &&
+               plan->maximum_emitted_rows == 1u;
+    }
+    return plan->available_rows >= 2u &&
+           plan->verifier_rows == plan->draft_depth + 1u &&
+           plan->maximum_emitted_rows == plan->draft_depth + 2u &&
+           plan->maximum_emitted_rows <= plan->available_rows;
+}
+
 static bool ds4_dspark_generation_block_state_coherent(
         const ds4_dspark_generation_block_state *state) {
     if (!state || !state->initialized) return false;
     if (!state->active) {
-        return state->active_cookie == 0 && state->block_rows == 0 &&
+        return state->active_cookie == 0 && state->frontier == 0 &&
+               state->kind == DS4_DSPARK_TAIL_NO_OUTPUT &&
+               state->block_rows == 0 &&
                state->evaluated_rows == 0 &&
                ds4_dspark_verifier_plan_is_zero(&state->verifier_plan);
     }
-    return state->active_cookie != 0 &&
-           state->active_cookie == state->last_cookie &&
+    if (state->active_cookie == 0 ||
+        state->active_cookie != state->last_cookie) {
+        return false;
+    }
+    if (state->kind == DS4_DSPARK_TAIL_PENDING_ONLY) {
+        return state->frontier != UINT64_MAX && state->block_rows == 1u &&
+               state->evaluated_rows == 0 &&
+               ds4_dspark_verifier_plan_is_zero(&state->verifier_plan);
+    }
+    return state->kind == DS4_DSPARK_TAIL_VERIFY &&
            ds4_dspark_verifier_plan_coherent(&state->verifier_plan) &&
+           state->frontier == state->verifier_plan.frontier &&
            state->block_rows == state->verifier_plan.emitted_rows &&
            state->evaluated_rows ==
                state->verifier_plan.committed_evaluated_rows;
@@ -685,6 +723,8 @@ static void ds4_dspark_generation_block_state_clear_active(
     if (!state) return;
     state->active = false;
     state->active_cookie = 0;
+    state->frontier = 0;
+    state->kind = DS4_DSPARK_TAIL_NO_OUTPUT;
     state->block_rows = 0;
     state->evaluated_rows = 0;
     memset(&state->verifier_plan, 0, sizeof(state->verifier_plan));
@@ -730,12 +770,15 @@ static bool ds4_dspark_generation_block_state_begin(
     const uint64_t cookie = state->last_cookie + 1u;
     const ds4_dspark_generation_block block = {
         .cookie = cookie,
+        .kind = DS4_DSPARK_TAIL_VERIFY,
         .block_rows = plan->emitted_rows,
         .evaluated_rows = plan->committed_evaluated_rows,
     };
     state->active = true;
     state->last_cookie = cookie;
     state->active_cookie = cookie;
+    state->frontier = plan->frontier;
+    state->kind = block.kind;
     state->block_rows = block.block_rows;
     state->evaluated_rows = block.evaluated_rows;
     state->verifier_plan = *plan;
@@ -743,9 +786,43 @@ static bool ds4_dspark_generation_block_state_begin(
     return true;
 }
 
+/* A one-slot or known-terminal tail exposes the already sampled pending token
+ * without constructing a depth-zero verifier plan.  No target row has been
+ * evaluated, so adopting either prefix C=0 or C=1 leaves the target frontier
+ * unchanged. */
+static bool ds4_dspark_generation_block_state_begin_pending_only(
+        ds4_dspark_generation_block_state *state,
+        uint64_t                            frontier,
+        const ds4_dspark_tail_plan         *tail,
+        ds4_dspark_generation_block        *out) {
+    if (!state || !out || !ds4_dspark_generation_block_state_coherent(state) ||
+        state->active || state->last_cookie == UINT64_MAX ||
+        frontier == UINT64_MAX || !ds4_dspark_tail_plan_coherent(tail) ||
+        tail->kind != DS4_DSPARK_TAIL_PENDING_ONLY) {
+        return false;
+    }
+    const uint64_t cookie = state->last_cookie + 1u;
+    const ds4_dspark_generation_block block = {
+        .cookie = cookie,
+        .kind = DS4_DSPARK_TAIL_PENDING_ONLY,
+        .block_rows = 1u,
+        .evaluated_rows = 0,
+    };
+    state->active = true;
+    state->last_cookie = cookie;
+    state->active_cookie = cookie;
+    state->frontier = frontier;
+    state->kind = block.kind;
+    state->block_rows = block.block_rows;
+    state->evaluated_rows = block.evaluated_rows;
+    *out = block;
+    return true;
+}
+
 /* Successful commit always closes the transaction.  consumed_rows=0 is the
- * abort form: consumption_make derives a zero-row restore result and no
- * proposed output becomes session-visible. */
+ * abort form.  A verifier block derives the exact restore/replay result; a
+ * pending-only block has no target mutation to restore and accepts only C=0
+ * or C=1. */
 static bool ds4_dspark_generation_block_state_commit(
         ds4_dspark_generation_block_state *state,
         uint64_t                            cookie,
@@ -758,9 +835,18 @@ static bool ds4_dspark_generation_block_state_commit(
         return false;
     }
     ds4_dspark_verifier_consumption consumption;
-    if (!ds4_dspark_verifier_consumption_make(
-            &state->verifier_plan, consumed_rows, &consumption)) {
-        return false;
+    if (state->kind == DS4_DSPARK_TAIL_PENDING_ONLY) {
+        consumption = (ds4_dspark_verifier_consumption){
+            .committed_frontier = state->frontier,
+            .consumed_rows = consumed_rows,
+            .final_pending_consumed = consumed_rows == 1u,
+        };
+    } else {
+        if (state->kind != DS4_DSPARK_TAIL_VERIFY ||
+            !ds4_dspark_verifier_consumption_make(
+                &state->verifier_plan, consumed_rows, &consumption)) {
+            return false;
+        }
     }
     ds4_dspark_generation_block_state_clear_active(state);
     *out = consumption;
@@ -797,12 +883,14 @@ static bool ds4_dspark_tail_plan_make(
         .available_rows = available,
     };
     if (available == 0) {
+        if (!ds4_dspark_tail_plan_coherent(&plan)) return false;
         *out = plan;
         return true;
     }
     if (available == 1u || pending_terminal) {
         plan.kind = DS4_DSPARK_TAIL_PENDING_ONLY;
         plan.maximum_emitted_rows = 1u;
+        if (!ds4_dspark_tail_plan_coherent(&plan)) return false;
         *out = plan;
         return true;
     }
@@ -812,6 +900,7 @@ static bool ds4_dspark_tail_plan_make(
         desired_depth : tail_depth;
     plan.verifier_rows = plan.draft_depth + 1u;
     plan.maximum_emitted_rows = plan.draft_depth + 2u;
+    if (!ds4_dspark_tail_plan_coherent(&plan)) return false;
     *out = plan;
     return true;
 }
@@ -866,9 +955,12 @@ static bool ds4_dspark_generation_block_state_self_check(void) {
                         &state, &plan, &block) || !state.active ||
                     block.cookie == 0 || block.cookie != state.last_cookie ||
                     block.cookie != state.active_cookie ||
+                    block.kind != DS4_DSPARK_TAIL_VERIFY ||
                     block.block_rows != plan.emitted_rows ||
                     block.evaluated_rows !=
                         plan.committed_evaluated_rows ||
+                    state.kind != block.kind ||
+                    state.frontier != plan.frontier ||
                     state.block_rows != block.block_rows ||
                     state.evaluated_rows != block.evaluated_rows ||
                     !ds4_dspark_generation_block_state_coherent(&state)) {
@@ -925,6 +1017,8 @@ static bool ds4_dspark_generation_block_state_self_check(void) {
                     actual.restore_then_replay !=
                         expected.restore_then_replay ||
                     state.active || state.active_cookie != 0 ||
+                    state.kind != DS4_DSPARK_TAIL_NO_OUTPUT ||
+                    state.frontier != 0 ||
                     state.last_cookie != block.cookie ||
                     !ds4_dspark_generation_block_state_coherent(&state)) {
                     return false;
@@ -1100,6 +1194,262 @@ static bool ds4_dspark_generation_block_state_self_check(void) {
     return true;
 }
 
+/* PENDING_ONLY is a real generation block, but not a verifier round.  Exhaust
+ * both adopted prefixes under the three ways the tail can select it: caller
+ * maximum, context room, or a terminal pending token. */
+static bool ds4_dspark_pending_only_state_self_check(void) {
+    const uint64_t frontier = UINT64_C(1000);
+    const struct {
+        uint32_t maximum_rows;
+        uint32_t context_room;
+        uint32_t desired_depth;
+        bool pending_terminal;
+        uint32_t available_rows;
+    } cases[] = {
+        {1u, 7u, DS4_DSPARK_SUPPORT_CANDIDATE_ROWS, false, 1u},
+        {7u, 1u, DS4_DSPARK_SUPPORT_CANDIDATE_ROWS, false, 1u},
+        {7u, 7u, DS4_DSPARK_SUPPORT_CANDIDATE_ROWS, true, 7u},
+    };
+    const ds4_dspark_session_operation guarded_operations[] = {
+        DS4_DSPARK_SESSION_OPERATION_SAMPLE,
+        DS4_DSPARK_SESSION_OPERATION_EVAL,
+        DS4_DSPARK_SESSION_OPERATION_SYNC,
+        DS4_DSPARK_SESSION_OPERATION_REWIND,
+        DS4_DSPARK_SESSION_OPERATION_SAVE,
+    };
+    ds4_dspark_verifier_plan verifier_plan;
+    const uint32_t raw_cap =
+        DS4_DSPARK_HISTORY_ROWS + DS4_DSPARK_RAW_FINALIZER_MAX_ROWS;
+    if (!ds4_dspark_verifier_plan_make(
+            frontier, 0u, 0u, raw_cap, DS4_DSPARK_HISTORY_ROWS,
+            &verifier_plan)) {
+        return false;
+    }
+
+    for (uint32_t case_index = 0;
+         case_index < sizeof(cases) / sizeof(cases[0]); case_index++) {
+        ds4_dspark_tail_plan tail;
+        if (!ds4_dspark_tail_plan_make(
+                cases[case_index].maximum_rows,
+                cases[case_index].context_room,
+                cases[case_index].desired_depth,
+                cases[case_index].pending_terminal, &tail) ||
+            !ds4_dspark_tail_plan_coherent(&tail) ||
+            tail.kind != DS4_DSPARK_TAIL_PENDING_ONLY ||
+            tail.available_rows != cases[case_index].available_rows ||
+            tail.draft_depth != 0 || tail.verifier_rows != 0 ||
+            tail.maximum_emitted_rows != 1u) {
+            return false;
+        }
+        for (uint32_t consumed = 0; consumed <= 1u; consumed++) {
+            ds4_dspark_generation_block_state state;
+            ds4_dspark_generation_block_state snapshot;
+            ds4_dspark_generation_block block;
+            ds4_dspark_generation_block second_block;
+            ds4_dspark_verifier_consumption consumption;
+            ds4_dspark_generation_block_state_init(&state);
+            if (!ds4_dspark_generation_block_state_begin_pending_only(
+                    &state, frontier, &tail, &block) ||
+                block.cookie == 0 ||
+                block.kind != DS4_DSPARK_TAIL_PENDING_ONLY ||
+                block.block_rows != 1u || block.evaluated_rows != 0 ||
+                !state.active || state.active_cookie != block.cookie ||
+                state.last_cookie != block.cookie ||
+                state.kind != DS4_DSPARK_TAIL_PENDING_ONLY ||
+                state.frontier != frontier || state.block_rows != 1u ||
+                state.evaluated_rows != 0 ||
+                !ds4_dspark_verifier_plan_is_zero(&state.verifier_plan) ||
+                !ds4_dspark_generation_block_state_coherent(&state)) {
+                return false;
+            }
+            for (uint32_t index = 0;
+                 index < sizeof(guarded_operations) /
+                             sizeof(guarded_operations[0]); index++) {
+                if (ds4_dspark_generation_block_state_allows(
+                        &state, guarded_operations[index])) {
+                    return false;
+                }
+            }
+
+            memcpy(&snapshot, &state, sizeof(snapshot));
+            if (ds4_dspark_generation_block_state_begin_pending_only(
+                    &state, frontier, &tail, &second_block) ||
+                memcmp(&state, &snapshot, sizeof(state)) != 0 ||
+                ds4_dspark_generation_block_state_begin(
+                    &state, &verifier_plan, &second_block) ||
+                memcmp(&state, &snapshot, sizeof(state)) != 0 ||
+                ds4_dspark_generation_block_state_commit(
+                    &state, 0u, consumed, &consumption) ||
+                memcmp(&state, &snapshot, sizeof(state)) != 0 ||
+                ds4_dspark_generation_block_state_commit(
+                    &state, block.cookie + 1u, consumed, &consumption) ||
+                memcmp(&state, &snapshot, sizeof(state)) != 0 ||
+                ds4_dspark_generation_block_state_commit(
+                    &state, block.cookie, 2u, &consumption) ||
+                memcmp(&state, &snapshot, sizeof(state)) != 0 ||
+                ds4_dspark_generation_block_state_commit(
+                    &state, block.cookie, consumed, NULL) ||
+                memcmp(&state, &snapshot, sizeof(state)) != 0) {
+                return false;
+            }
+
+            if (!ds4_dspark_generation_block_state_commit(
+                    &state, block.cookie, consumed, &consumption) ||
+                consumption.committed_frontier != frontier ||
+                consumption.consumed_rows != consumed ||
+                consumption.committed_evaluated_rows != 0 ||
+                consumption.replay_rows != 0 ||
+                consumption.final_pending_consumed != (consumed == 1u) ||
+                consumption.keep_verifier_state ||
+                consumption.restore_then_replay || state.active ||
+                state.active_cookie != 0 || state.frontier != 0 ||
+                state.kind != DS4_DSPARK_TAIL_NO_OUTPUT ||
+                state.block_rows != 0 || state.evaluated_rows != 0 ||
+                state.last_cookie != block.cookie ||
+                !ds4_dspark_verifier_plan_is_zero(&state.verifier_plan) ||
+                !ds4_dspark_generation_block_state_coherent(&state)) {
+                return false;
+            }
+            for (uint32_t index = 0;
+                 index < sizeof(guarded_operations) /
+                             sizeof(guarded_operations[0]); index++) {
+                if (!ds4_dspark_generation_block_state_allows(
+                        &state, guarded_operations[index])) {
+                    return false;
+                }
+            }
+
+            memcpy(&snapshot, &state, sizeof(snapshot));
+            if (ds4_dspark_generation_block_state_commit(
+                    &state, block.cookie, consumed, &consumption) ||
+                memcmp(&state, &snapshot, sizeof(state)) != 0 ||
+                !ds4_dspark_generation_block_state_begin_pending_only(
+                    &state, frontier, &tail, &second_block) ||
+                second_block.cookie != block.cookie + 1u) {
+                return false;
+            }
+            memcpy(&snapshot, &state, sizeof(snapshot));
+            if (ds4_dspark_generation_block_state_commit(
+                    &state, block.cookie, consumed, &consumption) ||
+                memcmp(&state, &snapshot, sizeof(state)) != 0) {
+                return false;
+            }
+            const uint64_t invalidated_cookie = state.last_cookie;
+            ds4_dspark_generation_block_state_invalidate(&state);
+            if (state.last_cookie != invalidated_cookie || state.active ||
+                !ds4_dspark_generation_block_state_coherent(&state) ||
+                !ds4_dspark_generation_block_state_begin_pending_only(
+                    &state, frontier, &tail, &second_block) ||
+                second_block.cookie != invalidated_cookie + 1u) {
+                return false;
+            }
+            memcpy(&snapshot, &state, sizeof(snapshot));
+            if (ds4_dspark_generation_block_state_commit(
+                    &state, invalidated_cookie, consumed, &consumption) ||
+                memcmp(&state, &snapshot, sizeof(state)) != 0) {
+                return false;
+            }
+            ds4_dspark_generation_block_state_free(&state);
+            memcpy(&snapshot, &state, sizeof(snapshot));
+            if (ds4_dspark_generation_block_state_coherent(&state) ||
+                ds4_dspark_generation_block_state_begin_pending_only(
+                    &state, frontier, &tail, &second_block) ||
+                memcmp(&state, &snapshot, sizeof(state)) != 0) {
+                return false;
+            }
+        }
+    }
+
+    ds4_dspark_tail_plan tail;
+    ds4_dspark_generation_block_state state;
+    ds4_dspark_generation_block_state snapshot;
+    ds4_dspark_generation_block block;
+    ds4_dspark_verifier_consumption consumption;
+    if (!ds4_dspark_tail_plan_make(1u, 1u, 0u, false, &tail)) return false;
+
+    /* Cookie and frontier overflow fail without changing ownership bytes. */
+    ds4_dspark_generation_block_state_init(&state);
+    memcpy(&snapshot, &state, sizeof(snapshot));
+    if (ds4_dspark_generation_block_state_begin_pending_only(
+            &state, UINT64_MAX, &tail, &block) ||
+        memcmp(&state, &snapshot, sizeof(state)) != 0) {
+        return false;
+    }
+    state.last_cookie = UINT64_MAX - 1u;
+    if (!ds4_dspark_generation_block_state_begin_pending_only(
+            &state, UINT64_MAX - 1u, &tail, &block) ||
+        block.cookie != UINT64_MAX ||
+        !ds4_dspark_generation_block_state_commit(
+            &state, block.cookie, 1u, &consumption) ||
+        consumption.committed_frontier != UINT64_MAX - 1u ||
+        consumption.committed_evaluated_rows != 0 ||
+        !consumption.final_pending_consumed) {
+        return false;
+    }
+    memcpy(&snapshot, &state, sizeof(snapshot));
+    if (ds4_dspark_generation_block_state_begin_pending_only(
+            &state, frontier, &tail, &block) ||
+        memcmp(&state, &snapshot, sizeof(state)) != 0) {
+        return false;
+    }
+
+    /* Every malformed tail or missing input is rejected byte-identically. */
+    const ds4_dspark_tail_plan malformed[] = {
+        {
+            .kind = DS4_DSPARK_TAIL_NO_OUTPUT,
+            .available_rows = 1u,
+            .maximum_emitted_rows = 1u,
+        },
+        {
+            .kind = DS4_DSPARK_TAIL_PENDING_ONLY,
+            .available_rows = 1u,
+            .draft_depth = 1u,
+            .maximum_emitted_rows = 1u,
+        },
+        {
+            .kind = DS4_DSPARK_TAIL_PENDING_ONLY,
+            .available_rows = 1u,
+            .verifier_rows = 1u,
+            .maximum_emitted_rows = 1u,
+        },
+        {
+            .kind = DS4_DSPARK_TAIL_PENDING_ONLY,
+            .available_rows = 1u,
+            .maximum_emitted_rows = 2u,
+        },
+        {
+            .kind = DS4_DSPARK_TAIL_VERIFY,
+            .available_rows = 2u,
+            .verifier_rows = 1u,
+            .maximum_emitted_rows = 2u,
+        },
+        {
+            .kind = (ds4_dspark_tail_kind)3,
+            .available_rows = 1u,
+            .maximum_emitted_rows = 1u,
+        },
+    };
+    ds4_dspark_generation_block_state_init(&state);
+    for (uint32_t index = 0;
+         index < sizeof(malformed) / sizeof(malformed[0]); index++) {
+        memcpy(&snapshot, &state, sizeof(snapshot));
+        if (ds4_dspark_generation_block_state_begin_pending_only(
+                &state, frontier, &malformed[index], &block) ||
+            memcmp(&state, &snapshot, sizeof(state)) != 0) {
+            return false;
+        }
+    }
+    memcpy(&snapshot, &state, sizeof(snapshot));
+    return !ds4_dspark_generation_block_state_begin_pending_only(
+               &state, frontier, NULL, &block) &&
+           memcmp(&state, &snapshot, sizeof(state)) == 0 &&
+           !ds4_dspark_generation_block_state_begin_pending_only(
+               &state, frontier, &tail, NULL) &&
+           memcmp(&state, &snapshot, sizeof(state)) == 0 &&
+           !ds4_dspark_generation_block_state_begin_pending_only(
+               NULL, frontier, &tail, &block);
+}
+
 /* Exhaust the complete D=0..5, A=0..D state space and every consumer prefix.
  * This runs inside the existing model-free runtime contract gate, so the pure
  * plan cannot drift while the product DSpark entry remains disconnected. */
@@ -1228,6 +1578,7 @@ static bool ds4_dspark_verifier_contract_self_check(void) {
 
     /* Malformed geometry, overflow, and missing outputs all fail closed. */
     return ds4_dspark_generation_block_state_self_check() &&
+           ds4_dspark_pending_only_state_self_check() &&
            !ds4_dspark_verifier_plan_make(
                frontier, 0u, 0u, raw_cap, raw_window, NULL) &&
            !ds4_dspark_verifier_plan_make(
