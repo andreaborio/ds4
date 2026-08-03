@@ -119,6 +119,68 @@ exact; at wrapped `C=128`, attention differs in two lanes and inverse RoPE in
 ten. Every difference is one adjacent BF16 code with maximum absolute drift
 `0.000244140625`.
 
+`physical_fixture.py` adds a separate payload-first handoff fixture for the
+native Metal white box. It uses Q8-compatible reduced geometry: hidden width
+32, Q-LoRA rank 32, output rank four (so the flattened low dimension is 32),
+while retaining five rows, 64 heads, width 512, eight output groups, and both
+`C=2` and wrapped `C=128` cache states. The five Q8_0 projections and the F16
+HC function are serialized first and reopened from their bytes; the oracle
+never receives their ideal float matrices. Q8_0 follows the repository C
+quantizer exactly: codes use float32 `d=amax/127` and `roundf` ties away from
+zero, while dequantization uses the serialized little-endian F16 `d`. The
+cross-language test compiles the current `gguf-tools/quants.c` into a temporary
+dynamic library and compares its bytes with the Python packer for the scale
+discriminator, 32-wide fixture rows, sparse 4096-wide rows with zero blocks, a
+seeded dense matrix, all five fixture Q8 payloads, and the HC F16 payload. No
+compiled test asset is retained.
+
+The model-map handoff is 64-byte aligned, 1,281,856 bytes, and has SHA-256
+`1388a4a205ae61c59a25df4a03af312e2dea1fb13d35f6503362f06dd0ee1492`;
+the tests freeze every tensor offset, size, and payload digest. Small dyadic
+values that quantize to zero distinguish every ideal Q8 matrix from its
+reopened payload, and substituting the ideal matrix is observable separately
+for Q-A, Q-B, KV, output-A, and output-B. The live payload uses one nonzero
+code per row with `d=2^-8`. Every activation entering a Q8 projection is also
+F16-exact, so the fixture is conditioned for the required generic half-staged
+Q-A/Q-B/KV/output-B paths with one exact product and no reduction-order
+ambiguity. The native hook is required to use direct grouped Q8 matvec for
+output-A and to capture actual dispatch selection; the manifest records only
+those required paths, not proof that the runtime selected them. Output-A
+crosses an explicit BF16 boundary before output-B. The 256-pair Q-head
+reduction and NumPy mean publish identical BF16 means on this fixture, but the
+end-to-end construction does not make every internal square/mean/add
+publication independently observable. The dedicated native `0x384A` helper
+test covers those internal boundaries. The one-live-code construction
+validates payload layout and named publications; it does not qualify the dense
+Q8 accumulation exercised by checkpoint weights. That remains a separate
+real-weight capture gate.
+
+The raw `[5, 4, 32]` hidden source has deterministic `+/-2^-12` F32 dust in
+all 640 lanes. Every lane rounds back to the existing exact BF16 boundary, so
+all downstream boundary digests remain stable while a native hook that skips
+the ingress publication is observable. Its separate 2,560-byte source digest
+is `e15d38302793fb96779672dcc38a99ef59b0de2f07ea25c17c348d37335dad57`;
+it is not part of the aligned weight blob.
+
+The C handoff also freezes the complete physical stage-zero F32 ring buffer,
+not a chronological reconstruction: `C=2` is capacity 128, start 0, length 2,
+SHA-256 `e27748d96d6d36cd5b12f42a710eb76d0e29b27c774fc11d153e9536d4526c9d`;
+wrapped `C=128` is capacity 128, start 2, length 128, SHA-256
+`d085299feb54f6010b64b7a7550dbb3b90d4c03c800de9384db0aa2fa36ea338`.
+Stage zero overwrites draft template row zero with its computed KV. Template
+rows for stages one and two are validated but numerically irrelevant to this
+stage-zero result, so they are not a required C handoff payload.
+
+The physical fixture retains 29 distinct Q-A values, 52 Q-B values, 64
+distinct head signatures, and all 160 output-A and output-B lanes. Rank and
+head permutations, rank-major output flattening, payload-code mutation, and
+physical-versus-chronological cache order are all observable. MLX 0.32 Metal
+is exact for `C=2`; wrapped `C=128` differs in six attention and six
+inverse-RoPE lanes, each one adjacent BF16 code and at most `0.0001220703125`.
+This is still synthetic evidence. It does not claim checkpoint-weight parity,
+real-model graph parity, or product readiness; those require the native hook
+to consume the frozen payload blob and later real-weight captures.
+
 `schema.json` maps the pinned official Hugging Face config to the canonical
 combined-GGUF `dspark.*` records and to the standalone support header, including
 its six authenticated source-provenance fields. The target keeps

@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import ast
+import ctypes
 import hashlib
 import inspect
 import json
@@ -29,7 +30,12 @@ from tools.dspark_oracle import (  # noqa: E402
     DSPARK_STAGE_COUNT,
     DSPARK_TARGET_LAYER_IDS,
     MetadataError,
+    PHYSICAL_HIDDEN_WIDTH,
+    PHYSICAL_MODEL_ALIGNMENT,
+    PHYSICAL_OUTPUT_RANK,
+    PHYSICAL_Q_RANK,
     append_raw_cache,
+    build_physical_stage_zero_fixture,
     capture_target_hidden_rows,
     commit_raw_cache_transaction,
     concatenate_target_captures,
@@ -46,6 +52,8 @@ from tools.dspark_oracle import (  # noqa: E402
     markov_greedy_draft,
     markov_sampled_draft,
     post_layer_hc_mean,
+    pack_q8_0,
+    payload_manifest,
     prefill_raw_cache,
     prepare_stage_zero,
     proposal_token_layout,
@@ -54,6 +62,7 @@ from tools.dspark_oracle import (  # noqa: E402
     run_synthetic_stage_chain,
     speculative_sample_exact,
     stage_zero_attention_half,
+    unpack_q8_0,
     validate_0731_metadata,
 )
 from tools.dspark_oracle import mlx_optional  # noqa: E402
@@ -1636,6 +1645,638 @@ class OracleFixtureTests(unittest.TestCase):
             1429,
         )
 
+    def test_physical_stage_zero_payloads_match_q8_f16_contract(self) -> None:
+        # Frozen directly from gguf-tools/quants.c.  The first block proves C
+        # roundf ties away from zero; the second proves that codes use the
+        # original F32 d while dequantization reopens the stored F16 d.
+        golden_source = np.zeros((2, 32), dtype=np.float32)
+        golden_source[0, :6] = [127.0, -127.0, 0.5, -0.5, 1.5, -1.5]
+        golden_source[1, :6] = [
+            1.0, -1.0, 0.5, -0.5,
+            np.float32(1.0 / 127.0), np.float32(-1.0 / 127.0),
+        ]
+        scale_discriminator = np.asarray(
+            [0x3B810001], dtype=np.uint32
+        ).view(np.float32)[0]
+        golden_source[1, 6:8] = [
+            scale_discriminator, -scale_discriminator
+        ]
+        golden_payload = bytes.fromhex(
+            "003c7f8101ff02fe0000000000000000000000000000000000000000000000000000"
+            "08207f8140c001ff0000000000000000000000000000000000000000000000000000"
+        )
+        packed_golden = pack_q8_0(golden_source)
+        self.assertEqual(packed_golden.payload, golden_payload)
+        self.assertEqual(
+            hashlib.sha256(golden_payload).hexdigest(),
+            "442988c83babde0175668c56b6a864bca70a8a51bbc0ae9b1ba4f4b33ccaa994",
+        )
+        np.testing.assert_array_equal(
+            packed_golden.dequantized[0, :6],
+            np.asarray([127, -127, 1, -1, 2, -2], dtype=np.float32),
+        )
+        np.testing.assert_array_equal(
+            packed_golden.dequantized[1, :6],
+            np.asarray([
+                0.99993896484375, -0.99993896484375,
+                0.50390625, -0.50390625,
+                0.00787353515625, -0.00787353515625,
+            ], dtype=np.float32),
+        )
+        original_d = np.float32(1.0) / np.float32(127.0)
+        reopened_d = np.frombuffer(
+            golden_payload[34:36], dtype="<f2"
+        ).astype(np.float32)[0]
+        original_scaled = np.float32(
+            scale_discriminator * np.float32(1.0 / original_d)
+        )
+        reopened_scaled = np.float32(
+            scale_discriminator * np.float32(1.0 / reopened_d)
+        )
+        self.assertLess(original_scaled, np.float32(0.5))
+        self.assertGreater(reopened_scaled, np.float32(0.5))
+        def round_away(value: np.float32) -> int:
+            return int(np.copysign(
+                np.floor(np.abs(value) + np.float32(0.5)), value
+            ))
+
+        self.assertEqual(
+            [round_away(original_scaled), round_away(-original_scaled)],
+            [0, 0],
+        )
+        self.assertEqual(
+            [round_away(reopened_scaled), round_away(-reopened_scaled)],
+            [1, -1],
+        )
+        self.assertEqual(golden_payload[34 + 2 + 6:34 + 2 + 8], b"\0\0")
+
+        expected_payloads = {
+            "hc_function_weight": (0, 6144,
+                "4ccb8dccef22e4ea75135b33950e1c1d0b27962b83c2149c92ca059622054b99"),
+            "hc_scale": (6144, 12,
+                "59727b504e27a54d55b2183e4d218ffc4388e9ad46bc149b3fb59b5228349fc2"),
+            "hc_base": (6208, 96,
+                "6810f80a9ad75534de871ddf2477436f611481a1433311f2eceb5a9401e15511"),
+            "attention_norm_weight": (6336, 128,
+                "d5aa67b0772c9b552f4fbb972085cae582b2c0b47e8f1e38fbadac8638e83771"),
+            "q_a_weight": (6464, 1088,
+                "425cea3fa14fe7a5a38d1456908c9152c1d29a67899e9dc34a73d8d5c0d9e688"),
+            "q_a_norm_weight": (7552, 128,
+                "b638277a8690e175a9137feff1e43c067f9faf4e2f600caf468fb05b0403b717"),
+            "q_b_weight": (7680, 1114112,
+                "383b935ecc401de51e2dbb90c847276664f1bf2dd52642c43217aa83c0e138ed"),
+            "kv_weight": (1121792, 17408,
+                "fedfb98e161898f5d182a7f6d4405b4e80eb5721aede2c1352ed14d651819f0c"),
+            "kv_norm_weight": (1139200, 2048,
+                "1a397dca862f8f5b132e0a5a72de5e81e26ce975c92f95c5cf6498ef733882f0"),
+            "attention_sinks": (1141248, 256,
+                "c50a37025f0389dc726442d3f2876da4f1e83a6e413dc1985ca28237d8e1bebc"),
+            "output_a_weight": (1141504, 139264,
+                "640796379d715fd577dd23b5cbd4367e4ef5f6c48e3e7b18b039ac87241bda79"),
+            "output_b_weight": (1280768, 1088,
+                "da9e31cab8b4fd9bc7e8b2b91f9fa7219c8668eac54ba64739511b39d4fb837d"),
+        }
+        fixture = build_physical_stage_zero_fixture(128)
+        manifest = payload_manifest(fixture)
+        self.assertEqual(manifest["fixture_version"], 1)
+        self.assertEqual(manifest["geometry"], {
+            "proposal_rows": 5,
+            "hc_lanes": 4,
+            "hidden_width": 32,
+            "q_rank": 32,
+            "attention_heads": 64,
+            "head_width": 512,
+            "output_groups": 8,
+            "output_rank": 4,
+        })
+        self.assertEqual(manifest["alignment"], PHYSICAL_MODEL_ALIGNMENT)
+        self.assertEqual(manifest["blob_bytes"], 1281856)
+        self.assertEqual(
+            manifest["blob_sha256"],
+            "1388a4a205ae61c59a25df4a03af312e2dea1fb13d35f6503362f06dd0ee1492",
+        )
+        self.assertEqual(manifest["raw_hidden_input"], {
+            "shape": [5, 4, 32],
+            "bytes": 5 * 4 * 32 * 4,
+            "sha256":
+                "e15d38302793fb96779672dcc38a99ef59b0de2f07ea25c17c348d37335dad57",
+        })
+        self.assertEqual(manifest["stage_zero_raw_cache"], {
+            "capacity": 128,
+            "token_start": 2,
+            "length": 128,
+            "shape": [128, 512],
+            "bytes": 128 * 512 * 4,
+            "sha256":
+                "d085299feb54f6010b64b7a7550dbb3b90d4c03c800de9384db0aa2fa36ea338",
+        })
+        partial_manifest = payload_manifest(
+            build_physical_stage_zero_fixture(2)
+        )
+        self.assertEqual(partial_manifest["stage_zero_raw_cache"], {
+            "capacity": 128,
+            "token_start": 0,
+            "length": 2,
+            "shape": [128, 512],
+            "bytes": 128 * 512 * 4,
+            "sha256":
+                "e27748d96d6d36cd5b12f42a710eb76d0e29b27c774fc11d153e9536d4526c9d",
+        })
+        expected_required_paths = {
+            "q_a_weight": "generic_mm_half_staged",
+            "q_b_weight": "generic_mm_half_staged",
+            "kv_weight": "generic_mm_half_staged",
+            "output_a_weight": "direct_grouped_q8_matvec_f32",
+            "output_b_weight": "generic_mm_half_staged",
+        }
+        self.assertEqual(
+            manifest["required_q8_paths"], expected_required_paths
+        )
+        previous_end = 0
+        for name, (offset, size, digest) in expected_payloads.items():
+            weight = fixture.packed_weights[name]
+            self.assertEqual(fixture.model_offsets[name], offset)
+            self.assertEqual(len(weight.payload), size)
+            self.assertEqual(weight.sha256, digest)
+            self.assertEqual(offset % PHYSICAL_MODEL_ALIGNMENT, 0)
+            self.assertEqual(
+                fixture.model_blob[offset:offset + size], weight.payload
+            )
+            self.assertEqual(
+                fixture.model_blob[previous_end:offset],
+                bytes(offset - previous_end),
+            )
+            previous_end = offset + size
+            np.testing.assert_array_equal(
+                fixture.inputs[name], weight.dequantized
+            )
+            if weight.storage == "Q8_0":
+                self.assertGreater(int(np.count_nonzero(
+                    fixture.ideal_weights[name] != weight.dequantized
+                )), 0)
+            else:
+                np.testing.assert_array_equal(
+                    fixture.ideal_weights[name], weight.dequantized
+                )
+        self.assertEqual(previous_end, len(fixture.model_blob))
+
+        for name in expected_required_paths:
+            weight = fixture.packed_weights[name]
+            input_width = weight.logical_shape[-1]
+            output_rows = int(np.prod(weight.logical_shape[:-1]))
+            self.assertEqual(manifest["weights"][name]["oracle_shape"],
+                             list(weight.logical_shape))
+            self.assertEqual(manifest["weights"][name]["gguf_ne"],
+                             [input_width, output_rows])
+            self.assertEqual(manifest["weights"][name]["row_bytes"],
+                             input_width // 32 * 34)
+            self.assertEqual(manifest["weights"][name]["output_rows"],
+                             output_rows)
+            payload_blocks = np.frombuffer(
+                weight.payload, dtype=np.uint8
+            ).reshape(-1, 34)
+            scales = np.ascontiguousarray(
+                payload_blocks[:, :2]
+            ).view("<f2").astype(np.float32).reshape(-1)
+            self.assertTrue(np.all(
+                (scales == 0.0) | (scales == np.float32(1.0 / 256.0))
+            ))
+            rows = int(np.prod(weight.logical_shape[:-1]))
+            codes = payload_blocks[:, 2:].view(np.int8).reshape(rows, -1)
+            np.testing.assert_array_equal(
+                np.count_nonzero(codes, axis=1), np.ones(rows, dtype=np.int64)
+            )
+            self.assertTrue(np.all(
+                np.asarray(weight.dequantized, dtype=np.float32)
+                == np.asarray(weight.dequantized, dtype=np.float16).astype(np.float32)
+            ))
+
+        with self.assertRaisesRegex(ValueError, "divisible by 32"):
+            pack_q8_0(np.zeros((2, 31), dtype=np.float32))
+        invalid = np.zeros((1, 32), dtype=np.float32)
+        invalid[0, 0] = np.nan
+        with self.assertRaisesRegex(ValueError, "finite"):
+            pack_q8_0(invalid)
+        with self.assertRaisesRegex(ValueError, "size"):
+            unpack_q8_0(bytes(33), (1, 32))
+        with self.assertRaisesRegex(ValueError, "only C=2 or C=128"):
+            build_physical_stage_zero_fixture(True)
+
+    def test_physical_payloads_match_current_c_quantizer(self) -> None:
+        """Cross-check Python bytes against the repository C implementation."""
+
+        with tempfile.TemporaryDirectory(
+            prefix="ds4q-cross-language-"
+        ) as temporary:
+            if sys.platform == "darwin":
+                library_path = Path(temporary) / "libds4q.dylib"
+                shared_flags = ["-dynamiclib"]
+            else:
+                library_path = Path(temporary) / "libds4q.so"
+                shared_flags = ["-shared", "-fPIC"]
+            compile_command = [
+                os.environ.get("CC", "cc"),
+                *shared_flags,
+                "-O2",
+                "-Wall",
+                "-Wextra",
+                "-std=c11",
+                "-I",
+                str(ROOT / "gguf-tools"),
+                "-o",
+                str(library_path),
+                str(ROOT / "gguf-tools" / "quants.c"),
+                "-lm",
+                "-pthread",
+            ]
+            compiled = subprocess.run(
+                compile_command,
+                cwd=ROOT,
+                capture_output=True,
+                text=True,
+                timeout=60,
+                check=False,
+            )
+            if compiled.returncode:
+                self.fail(
+                    "current gguf-tools/quants.c did not compile for the "
+                    "cross-language oracle\n"
+                    f"stdout:\n{compiled.stdout}\n"
+                    f"stderr:\n{compiled.stderr}"
+                )
+
+            library = ctypes.CDLL(str(library_path))
+            quantize = library.ds4q_quantize_chunk
+            quantize.argtypes = [
+                ctypes.c_int,
+                ctypes.POINTER(ctypes.c_float),
+                ctypes.c_void_p,
+                ctypes.c_int64,
+                ctypes.c_int64,
+                ctypes.c_int64,
+                ctypes.POINTER(ctypes.c_float),
+            ]
+            quantize.restype = ctypes.c_size_t
+            f32_to_f16 = library.ds4q_f32_to_f16_row
+            f32_to_f16.argtypes = [
+                ctypes.POINTER(ctypes.c_float),
+                ctypes.POINTER(ctypes.c_uint16),
+                ctypes.c_int64,
+            ]
+            f32_to_f16.restype = None
+
+            def c_pack_q8_0(value: np.ndarray) -> bytes:
+                source = np.ascontiguousarray(value, dtype=np.float32)
+                width = source.shape[-1]
+                rows = int(np.prod(source.shape[:-1], dtype=np.int64))
+                expected_bytes = rows * (width // 32) * 34
+                destination = (ctypes.c_uint8 * expected_bytes)()
+                written = quantize(
+                    8,
+                    source.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
+                    ctypes.cast(destination, ctypes.c_void_p),
+                    0,
+                    rows,
+                    width,
+                    None,
+                )
+                self.assertEqual(written, expected_bytes)
+                return bytes(destination)
+
+            golden = np.zeros((2, 32), dtype=np.float32)
+            golden[0, :6] = [127.0, -127.0, 0.5, -0.5, 1.5, -1.5]
+            golden[1, :6] = [
+                1.0, -1.0, 0.5, -0.5,
+                np.float32(1.0 / 127.0),
+                np.float32(-1.0 / 127.0),
+            ]
+            discriminator = np.asarray(
+                [0x3B810001], dtype=np.uint32
+            ).view(np.float32)[0]
+            golden[1, 6:8] = [discriminator, -discriminator]
+
+            sparse_4096 = np.zeros((3, 4096), dtype=np.float32)
+            sparse_4096[0, 0] = np.float32(127.0 / 256.0)
+            sparse_4096[1, 4095] = np.float32(-127.0 / 256.0)
+            sparse_4096[2, 2017] = np.float32(127.0 / 256.0)
+
+            generator = np.random.default_rng(0xD54A)
+            dense_codes = generator.integers(
+                -126, 127, size=(11, 96), dtype=np.int16
+            )
+            dense_codes.reshape(-1, 32)[:, 0] = np.where(
+                (np.arange(dense_codes.size // 32) & 1) == 0, 127, -127
+            )
+            seeded_dense = (
+                dense_codes.astype(np.float32) * np.float32(1.0 / 256.0)
+            )
+
+            fixture = build_physical_stage_zero_fixture(128)
+            q8_cases = {
+                "golden_scale_discriminator": golden,
+                "fixture32": fixture.ideal_weights["q_a_weight"],
+                "sparse4096_zero_blocks": sparse_4096,
+                "seeded_dense": seeded_dense,
+            }
+            q8_cases.update({
+                f"fixture_{name}": fixture.ideal_weights[name]
+                for name in (
+                    "q_b_weight",
+                    "kv_weight",
+                    "output_a_weight",
+                    "output_b_weight",
+                )
+            })
+            for label, source in q8_cases.items():
+                with self.subTest(payload=label):
+                    c_payload = c_pack_q8_0(source)
+                    self.assertEqual(c_payload, pack_q8_0(source).payload)
+                    if label.startswith("fixture_") or label == "fixture32":
+                        weight_name = (
+                            "q_a_weight" if label == "fixture32"
+                            else label.removeprefix("fixture_")
+                        )
+                        self.assertEqual(
+                            c_payload,
+                            fixture.packed_weights[weight_name].payload,
+                        )
+
+            hc_source = np.ascontiguousarray(
+                fixture.ideal_weights["hc_function_weight"],
+                dtype=np.float32,
+            ).reshape(-1)
+            c_f16 = (ctypes.c_uint16 * hc_source.size)()
+            f32_to_f16(
+                hc_source.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
+                c_f16,
+                hc_source.size,
+            )
+            self.assertEqual(
+                bytes(c_f16),
+                fixture.packed_weights["hc_function_weight"].payload,
+            )
+
+    def test_physical_stage_zero_freezes_payload_derived_boundaries(self) -> None:
+        common = {
+            "hidden_input": "84b3088e8ba5e270e498bb24ace221c1790a6bedd88eb65351143894366eb870",
+            "hc_pre_output": "ff7b9064c8d35fbc6410e40cac370530dfe492b52e6ffde5c9711d1810092ba3",
+            "attention_normalized": "79395379438bf9bdfbf7d56687c193f78ca8db594b3f49a93a496a9de95d3022",
+            "q_a": "31ae0c918831c05069b5d78191269416fd97152d2bcfb4ccdbeb12f5c35f2764",
+            "q_a_normalized": "e68b314d4beada722e99ab0fc07451cde2c44ff5c28779b8ad82928b8524e37d",
+            "q_b": "a21ff121b34184f686f9b1e987bec618f32403ffdafb09514be8a3c104e9c8ba",
+            "q_head_normalized": "3a16369a4b7563951550e33128a19482b558cdd39d8ec0e1b206ef5fd93be1de",
+            "kv_projected": "748c0b94b250ff8569e9ae06c0ce24de624f301d5dbf13c163ef13aaf80259a1",
+            "kv_normalized": "fd61dd84c3db71d59d4aeaf85f3f74bf3b74544c7d743d421a28ce747fb87c3a",
+            "kv_nonrope_scales": "57c0e9e040e2ecb200d5b6695df6c53edb9c166cc4552aa32614fbeaeadb6b46",
+        }
+        specific = {
+            2: {
+                "positions": [2, 3, 4, 5, 6],
+                "q_roped": "d33ef0cb710957fd468e7a354fb9e5a3ffe950a14ed4c66bffda3a31d77e4a2e",
+                "kv_roped": "6444b8649c5a5aa491045e1ba5ee76aecdf2b15b14174f96dcab3653fdfd93dc",
+                "kv_stored": "3905eb6d3b0ee06cbdab1f52914f425483e1549cbfebcb68b33c2c8e1d42c03a",
+                "attention_output": "4e040df2c259d4f07383a32661e76e7e751d4fb2f2cf6dc18a6a297af1a86484",
+                "attention_inverse_roped": "4a1f8f6e9a601116517cd9a47cf9428eb4c755c378c00df38c27bf3bef33b8be",
+                "output_a": "0abb6633e98af7ddccbb1b1468e469e7c79febb9e954457bc0643f5cb712d130",
+                "output_b": "5596c4de9d19abb8802a1315682c231c03f8db1368e888f17884d5e80239f35f",
+                "hc_post_output": "6405889c5b0a836a19700880ea80e1d617deb0b83e784dbf937c015baf289135",
+            },
+            128: {
+                "positions": [130, 131, 132, 133, 134],
+                "q_roped": "412662520f68811c3dce9da664d3898df83cf05630efdaabba17eb7f8d321a12",
+                "kv_roped": "2acd0b7f04d9f0ada1c9f4604c7349fe0e2b7a0a513de770915e8def02035fe0",
+                "kv_stored": "754aef76ba986691af72a92819b9563fa191aa7501af41dccc9928e1167b6380",
+                "attention_output": "c2d1b7b01469a2cf540af8de106509213017fe5157784253db6700bec5c45b13",
+                "attention_inverse_roped": "a816c89adbfb97e27cc844e00758a454ab6498d2199cff3e8188f66c4e008014",
+                "output_a": "9ee20059b62050e73231bbe74396983e6483337533f37a21bed7744f50fe425e",
+                "output_b": "2d169b04ad0e5c20670e5a39daf149f93fbdb3684a3eea772fd8cf26cd7d352b",
+                "hc_post_output": "f73b649e92b56e39f3ffe71710800793afff8fb7433a849851613d4555180b9f",
+            },
+        }
+        expected_shapes = {
+            "hidden_input": (5, 4, PHYSICAL_HIDDEN_WIDTH),
+            "hc_pre_output": (5, PHYSICAL_HIDDEN_WIDTH),
+            "attention_normalized": (5, PHYSICAL_HIDDEN_WIDTH),
+            "q_a": (5, PHYSICAL_Q_RANK),
+            "q_a_normalized": (5, PHYSICAL_Q_RANK),
+            "q_b": (5, 64, 512),
+            "q_head_normalized": (5, 64, 512),
+            "q_roped": (5, 64, 512),
+            "kv_projected": (5, 512),
+            "kv_normalized": (5, 512),
+            "kv_roped": (5, 512),
+            "kv_stored": (5, 512),
+            "attention_output": (5, 64, 512),
+            "attention_inverse_roped": (5, 64, 512),
+            "output_a": (5, 8, PHYSICAL_OUTPUT_RANK),
+            "output_b": (5, PHYSICAL_HIDDEN_WIDTH),
+            "hc_post_output": (5, 4, PHYSICAL_HIDDEN_WIDTH),
+        }
+
+        for count in (2, 128):
+            fixture = build_physical_stage_zero_fixture(count)
+            state = fixture.inputs["raw_cache"]
+            before = np.array(state.rows, copy=True)
+            result = stage_zero_attention_half(**fixture.inputs)
+            np.testing.assert_array_equal(state.rows, before)
+            raw_hidden = np.asarray(
+                fixture.inputs["hidden_input"], dtype=np.float32
+            )
+            self.assertEqual(
+                int(np.count_nonzero(raw_hidden != result.hidden_input)), 640
+            )
+            np.testing.assert_array_equal(
+                self._round_fixture_bfloat16(raw_hidden), result.hidden_input
+            )
+            # Stage zero replaces draft_rows[0] with payload-derived KV.  The
+            # stage-1/2 template is validated for shape/finite input only and
+            # is intentionally irrelevant to this stage-zero attention result.
+            alternate_drafts = dict(fixture.inputs)
+            alternate = np.array(
+                alternate_drafts["other_stage_draft_rows"], copy=True
+            )
+            alternate[1:] *= np.float32(-3.0)
+            alternate_drafts["other_stage_draft_rows"] = alternate
+            alternate_result = stage_zero_attention_half(**alternate_drafts)
+            for field in result.__dataclass_fields__:
+                np.testing.assert_array_equal(
+                    getattr(alternate_result, field), getattr(result, field),
+                    err_msg=f"stage-1/2 draft template changed {field}",
+                )
+            self.assertEqual(
+                result.absolute_positions.tolist(), specific[count]["positions"]
+            )
+            for field, shape in expected_shapes.items():
+                boundary = getattr(result, field)
+                self.assertEqual(boundary.shape, shape, field)
+                self._assert_bfloat16_boundary(boundary)
+            for field, digest in common.items():
+                self.assertEqual(
+                    self._array_digest(getattr(result, field), "<f4"),
+                    digest,
+                    field,
+                )
+            for field, digest in specific[count].items():
+                if field == "positions":
+                    continue
+                self.assertEqual(
+                    self._array_digest(getattr(result, field), "<f4"),
+                    digest,
+                    field,
+                )
+
+            self.assertGreaterEqual(np.unique(result.q_a).size, 29)
+            self.assertGreaterEqual(np.unique(result.q_b).size, 52)
+            self.assertTrue(np.all(np.any(result.q_a != 0.0, axis=0)))
+            self.assertEqual(
+                len({row.tobytes() for row in result.q_b.transpose(1, 0, 2)}),
+                64,
+            )
+            self.assertEqual(int(np.count_nonzero(result.output_a)), 160)
+            self.assertEqual(int(np.count_nonzero(result.output_b)), 160)
+
+            mm_inputs = {
+                "q_a_weight": result.attention_normalized,
+                "q_b_weight": result.q_a_normalized,
+                "kv_weight": result.attention_normalized,
+                "output_a_weight": result.attention_inverse_roped,
+                "output_b_weight": result.output_a,
+            }
+            for weight_name, activation in mm_inputs.items():
+                np.testing.assert_array_equal(
+                    activation,
+                    np.asarray(activation, dtype=np.float16).astype(np.float32),
+                    err_msg=f"{weight_name} input is not F16-exact",
+                )
+
+            squared = self._round_fixture_bfloat16(np.square(result.q_b))
+            tree = squared[..., :256] + squared[..., 256:]
+            for stride in (128, 64, 32, 16, 8, 4, 2, 1):
+                tree[..., :stride] = (
+                    tree[..., :stride] + tree[..., stride:2 * stride]
+                )
+            tree_mean = self._round_fixture_bfloat16(
+                tree[..., :1] / np.float32(512.0)
+            )
+            numpy_mean = self._round_fixture_bfloat16(np.mean(
+                squared, axis=-1, keepdims=True, dtype=np.float32
+            ))
+            np.testing.assert_array_equal(tree_mean, numpy_mean)
+
+    def test_physical_stage_zero_mutations_are_observable(self) -> None:
+        fixture = build_physical_stage_zero_fixture(128)
+        inputs = dict(fixture.inputs)
+        result = stage_zero_attention_half(**inputs)
+
+        original_round = dspark_reference._round_bfloat16
+        round_calls = 0
+
+        def skip_ingress_publication(value: np.ndarray) -> np.ndarray:
+            nonlocal round_calls
+            round_calls += 1
+            if round_calls == 1:
+                return np.asarray(value, dtype=np.float32)
+            return original_round(value)
+
+        with mock.patch.object(
+            dspark_reference,
+            "_round_bfloat16",
+            side_effect=skip_ingress_publication,
+        ):
+            skipped_ingress = stage_zero_attention_half(**inputs)
+        self.assertEqual(round_calls, 26)
+        self.assertEqual(int(np.count_nonzero(
+            skipped_ingress.hidden_input != result.hidden_input
+        )), 640)
+        self.assertEqual(int(np.count_nonzero(
+            skipped_ingress.hc_post_output != result.hc_post_output
+        )), 4)
+
+        state = inputs["raw_cache"]
+        chronological_state = type(state)(
+            state.capacity, state.token_start, state.length,
+            logical_raw_cache(state),
+        )
+        chronological_inputs = dict(inputs)
+        chronological_inputs["raw_cache"] = chronological_state
+        chronological = stage_zero_attention_half(**chronological_inputs)
+        self.assertEqual(int(np.count_nonzero(
+            chronological.attention_output != result.attention_output
+        )), 436)
+        self.assertEqual(float(np.max(np.abs(
+            chronological.attention_output - result.attention_output
+        ))), 0.0001220703125)
+
+        rank_inputs = dict(inputs)
+        rank_inputs["q_a_weight"] = np.roll(
+            np.asarray(inputs["q_a_weight"], dtype=np.float32), 1, axis=0
+        )
+        rank_mutation = stage_zero_attention_half(**rank_inputs)
+        self.assertEqual(int(np.count_nonzero(
+            rank_mutation.q_a != result.q_a
+        )), 160)
+        self.assertEqual(int(np.count_nonzero(
+            rank_mutation.attention_output != result.attention_output
+        )), 50134)
+
+        head_inputs = dict(inputs)
+        q_b_weight = np.asarray(inputs["q_b_weight"], dtype=np.float32)
+        head_inputs["q_b_weight"] = np.roll(
+            q_b_weight.reshape(64, 512, 32), 1, axis=0
+        ).reshape(64 * 512, 32)
+        head_mutation = stage_zero_attention_half(**head_inputs)
+        changed_heads = (
+            head_mutation.attention_output != result.attention_output
+        ).reshape(5, 64, 512).any(axis=(0, 2))
+        self.assertTrue(np.all(changed_heads))
+        self.assertEqual(int(np.count_nonzero(
+            head_mutation.attention_output != result.attention_output
+        )), 49198)
+
+        wrong_layout = self._round_fixture_bfloat16(
+            np.transpose(result.output_a, (0, 2, 1)).reshape(5, -1)
+            @ np.asarray(inputs["output_b_weight"], dtype=np.float32).T
+        )
+        self.assertEqual(
+            int(np.count_nonzero(wrong_layout != result.output_b)), 150
+        )
+
+        q_a_payload = bytearray(
+            fixture.packed_weights["q_a_weight"].payload
+        )
+        self.assertEqual(q_a_payload[2], 127)
+        q_a_payload[2] = 126
+        payload_inputs = dict(inputs)
+        payload_inputs["q_a_weight"] = unpack_q8_0(
+            bytes(q_a_payload), (32, 32)
+        ).dequantized
+        payload_mutation = stage_zero_attention_half(**payload_inputs)
+        self.assertEqual(int(np.count_nonzero(
+            payload_mutation.q_a != result.q_a
+        )), 5)
+        self.assertEqual(int(np.count_nonzero(
+            payload_mutation.attention_output != result.attention_output
+        )), 295)
+
+        ideal_controls = {
+            "q_a_weight": ("q_a", 160),
+            "q_b_weight": ("q_b", 30720),
+            "kv_weight": ("kv_projected", 2560),
+            "output_a_weight": ("output_a", 156),
+            "output_b_weight": ("output_b", 80),
+        }
+        for weight_name, (field, expected_count) in ideal_controls.items():
+            ideal_inputs = dict(inputs)
+            ideal_inputs[weight_name] = fixture.ideal_weights[weight_name]
+            ideal_result = stage_zero_attention_half(**ideal_inputs)
+            self.assertEqual(
+                int(np.count_nonzero(
+                    getattr(ideal_result, field) != getattr(result, field)
+                )),
+                expected_count,
+                f"{weight_name} ideal matrix was indistinguishable from payload",
+            )
+
     def test_stage_zero_attention_half_binds_rope_to_cache_frontier(
         self,
     ) -> None:
@@ -2333,6 +2974,10 @@ class OracleFixtureTests(unittest.TestCase):
             mlx_optional.MLX_BF16_STAGE_ZERO_ATTENTION_MAX_ABS_DRIFT,
             2.44140625e-4,
         )
+        self.assertEqual(
+            mlx_optional.MLX_BF16_PHYSICAL_STAGE_ZERO_ATTENTION_MAX_ABS_DRIFT,
+            1.220703125e-4,
+        )
         self.assertGreater(
             mlx_optional.MLX_F32_MARKOV_MATMUL_MAX_ABS_DRIFT,
             mlx_optional.MLX_F32_CONFIDENCE_MAX_ABS_DRIFT,
@@ -2745,6 +3390,54 @@ class OracleFixtureTests(unittest.TestCase):
                     np.testing.assert_array_equal(
                         code_distance[difference],
                         np.ones(expected_differences, dtype=np.int32),
+                    )
+
+        # The payload-first 32/32/4 fixture is the handoff contract for the
+        # native white-box Metal test.  C=2 is exact; wrapped C=128 differs
+        # only at the online attention result and inverse RoPE publication.
+        for committed_count in (2, 128):
+            physical = build_physical_stage_zero_fixture(committed_count)
+            stage_inputs = dict(physical.inputs)
+            numpy_stage = stage_zero_attention_half(**stage_inputs)
+            mlx_stage = self._mlx_stage_zero_attention_half(stage_inputs)
+            for field in numpy_stage.__dataclass_fields__:
+                actual_boundary = getattr(mlx_stage, field)
+                expected_boundary = getattr(numpy_stage, field)
+                if field in (
+                    "attention_output", "attention_inverse_roped"
+                ):
+                    self.assert_max_abs_drift(
+                        f"MLX physical stage-zero C={committed_count} {field}",
+                        actual_boundary,
+                        expected_boundary,
+                        mlx_optional.
+                        MLX_BF16_PHYSICAL_STAGE_ZERO_ATTENTION_MAX_ABS_DRIFT,
+                    )
+                    difference = actual_boundary != expected_boundary
+                    expected_differences = 0 if committed_count == 2 else 6
+                    self.assertEqual(
+                        int(np.count_nonzero(difference)), expected_differences
+                    )
+                    if expected_differences:
+                        actual_codes = np.asarray(
+                            actual_boundary, dtype=np.float32
+                        ).view(np.uint32) >> np.uint32(16)
+                        expected_codes = np.asarray(
+                            expected_boundary, dtype=np.float32
+                        ).view(np.uint32) >> np.uint32(16)
+                        np.testing.assert_array_equal(
+                            np.abs(
+                                actual_codes.astype(np.int32)
+                                - expected_codes.astype(np.int32)
+                            )[difference],
+                            np.ones(expected_differences, dtype=np.int32),
+                        )
+                else:
+                    self.assert_max_abs_drift(
+                        f"MLX physical stage-zero C={committed_count} {field}",
+                        actual_boundary,
+                        expected_boundary,
+                        0.0,
                     )
 
     def test_runtime_capture_call_sites_match_oracle_contract(self) -> None:

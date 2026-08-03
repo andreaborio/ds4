@@ -47,6 +47,9 @@ MLX_BF16_ATTENTION_OUTPUT_MAX_ABS_DRIFT = 2.44140625e-4
 # C=2 is exact; the wrapped C=128 attention result differs in two lanes (ten at
 # inverse RoPE), each by at most one 2^-12 BF16 step.
 MLX_BF16_STAGE_ZERO_ATTENTION_MAX_ABS_DRIFT = 2.44140625e-4
+# Payload-first 32/32/4 physical fixture: C=2 is exact and the wrapped C=128
+# attention/inverse-RoPE boundaries differ in six adjacent BF16 lanes.
+MLX_BF16_PHYSICAL_STAGE_ZERO_ATTENTION_MAX_ABS_DRIFT = 1.220703125e-4
 EXPECTED_MLX_VERSION = "0.32.0"
 EXPECTED_MLX_METAL_VERSION = "0.32.0"
 DSPARK_TARGET_LAYER_IDS = (40, 41, 42)

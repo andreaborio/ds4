@@ -6,6 +6,21 @@ implemented in the production Metal path.
 """
 
 from .metadata import DSparkMetadata, MetadataError, validate_0731_metadata
+from .physical_fixture import (
+    PHYSICAL_HIDDEN_WIDTH,
+    PHYSICAL_MODEL_ALIGNMENT,
+    PHYSICAL_OUTPUT_RANK,
+    PHYSICAL_Q8_REQUIRED_PATHS,
+    PHYSICAL_Q_RANK,
+    PackedWeight,
+    PhysicalStageZeroFixture,
+    build_physical_stage_zero_fixture,
+    pack_f16,
+    pack_f32,
+    pack_q8_0,
+    payload_manifest,
+    unpack_q8_0,
+)
 from .reference import (
     ConfidenceSchedule,
     DSPARK_RAW_CACHE_WIDTH,
@@ -65,6 +80,13 @@ __all__ = [
     "HCSplit",
     "MarkovDraft",
     "MetadataError",
+    "PHYSICAL_HIDDEN_WIDTH",
+    "PHYSICAL_MODEL_ALIGNMENT",
+    "PHYSICAL_OUTPUT_RANK",
+    "PHYSICAL_Q8_REQUIRED_PATHS",
+    "PHYSICAL_Q_RANK",
+    "PackedWeight",
+    "PhysicalStageZeroFixture",
     "ProposalTokenLayout",
     "RawCacheState",
     "SpeculativeSample",
@@ -74,6 +96,7 @@ __all__ = [
     "StageZeroAttentionHalf",
     "TargetCaptureRows",
     "append_raw_cache",
+    "build_physical_stage_zero_fixture",
     "capture_target_hidden_rows",
     "commit_raw_cache_transaction",
     "concatenate_target_captures",
@@ -92,6 +115,10 @@ __all__ = [
     "markov_sampled_draft",
     "markov_step_bias",
     "post_layer_hc_mean",
+    "pack_f16",
+    "pack_f32",
+    "pack_q8_0",
+    "payload_manifest",
     "prefill_raw_cache",
     "prepare_stage_zero",
     "proposal_token_layout",
@@ -100,5 +127,6 @@ __all__ = [
     "run_synthetic_stage_chain",
     "speculative_sample_exact",
     "stage_zero_attention_half",
+    "unpack_q8_0",
     "validate_0731_metadata",
 ]
