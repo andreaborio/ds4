@@ -4777,12 +4777,15 @@ kernel void kernel_mul_mv_addr_iq2_xxs_f32(
         sgitg);
 }
 
-#ifdef DS4_TEST_HOOKS
-/* Boundary-correct DSpark checkpoint primitive.  Keep the selected-address
- * ABI identical to the IQ2 gate/up dispatch above, but invoke the existing
- * Q2_K row implementation once per route.  The test-only host encoder uses
- * this unfused form so every expert down result can cross BF16 before the
- * expert-id-ordered reduction. */
+/* Boundary-correct DSpark down projection.  Keep the selected-address ABI
+ * identical to the IQ2 gate/up dispatch above, but invoke the existing Q2_K
+ * row implementation once per route.  The unfused form is what lets every
+ * expert down result cross BF16 before the expert-id-ordered reduction.
+ *
+ * This kernel must stay outside DS4_TEST_HOOKS: the release DSpark stage
+ * executor encodes it (ds4_gpu_dspark_stage_support_encode), and its pipeline
+ * is built unconditionally during ds4_gpu_init(), which aborts the whole
+ * Metal backend when the function is missing. */
 kernel void kernel_mul_mv_addr_q2_K_f32(
         constant ds4_metal_args_mul_mv_id & args,
         device const uint64_t * addrs,
@@ -4840,7 +4843,6 @@ kernel void kernel_mul_mv_addr_q2_K_f32(
         tiisg,
         sgitg);
 }
-#endif
 
 kernel void kernel_mul_mv_addr_iq2_xxs_pair_swiglu_masked_f32(
         constant ds4_metal_args_mul_mv_id & args,
