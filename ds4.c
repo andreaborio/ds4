@@ -27310,8 +27310,11 @@ static bool metal_graph_encode_decode_layer(
             }
         }
         if (async_load_started) {
+            const double block_t0 = now_sec();
             const bool finish_ok =
                 metal_graph_selected_async_load_finish(&async_load);
+            ds4_gpu_sync_profile_note_host_block_ms(
+                (now_sec() - block_t0) * 1000.0);
             ok = ok && finish_ok;
         } else if (ok) {
             ok = shared_flushed_for_async ?

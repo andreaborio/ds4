@@ -1550,13 +1550,47 @@ static void ds4_gpu_sync_profile_note_commit(id<MTLCommandBuffer> cb,
     }
 }
 
+/* The encode window belongs to the thread that owns the batch.  Event waits
+ * can also happen on the selected-load worker; those must count as waits but
+ * must not shift the owner's encode window, or the same wall interval gets
+ * subtracted twice (once here, once by the host-block note). */
+static pthread_t g_sync_profile_owner_thread;
+static int g_sync_profile_owner_set;
+static uint64_t g_sync_profile_event_waits_worker;
+static double g_sync_profile_event_wait_worker_ms;
+
 static void ds4_gpu_sync_profile_note_batch_open(void) {
     if (!ds4_gpu_sync_profile_enabled()) return;
     g_sync_profile_encode_open_ms = ds4_gpu_now_ms();
+    g_sync_profile_owner_thread = pthread_self();
+    g_sync_profile_owner_set = 1;
+}
+
+/* Main-thread time spent blocked on the selected-load worker (its shared
+ * event wait plus the pread batch), reported by the call site in ds4.c.  It
+ * overlaps an open batch, so it is subtracted from the encode metric the same
+ * way event waits are: what remains in encode is genuine host encoding. */
+static uint64_t g_sync_profile_host_blocks;
+static double g_sync_profile_host_block_ms;
+
+void ds4_gpu_sync_profile_note_host_block_ms(double waited_ms) {
+    if (!ds4_gpu_sync_profile_enabled()) return;
+    if (waited_ms < 0.0) return;
+    g_sync_profile_host_blocks++;
+    g_sync_profile_host_block_ms += waited_ms;
+    if (g_sync_profile_encode_open_ms > 0.0) {
+        g_sync_profile_encode_open_ms += waited_ms;
+    }
 }
 
 static void ds4_gpu_sync_profile_note_event_wait(double waited_ms) {
     if (!ds4_gpu_sync_profile_enabled()) return;
+    if (g_sync_profile_owner_set &&
+        !pthread_equal(pthread_self(), g_sync_profile_owner_thread)) {
+        g_sync_profile_event_waits_worker++;
+        g_sync_profile_event_wait_worker_ms += waited_ms;
+        return;
+    }
     g_sync_profile_event_waits++;
     g_sync_profile_event_wait_ms += waited_ms;
     /* An event wait can happen while the next batch is already open (the
@@ -1594,7 +1628,8 @@ static void ds4_gpu_sync_profile_report(void) {
     if (g_sync_profile_encode_count != 0) {
         const double accounted = g_sync_profile_encode_ms +
                                  g_sync_profile_wait_ms +
-                                 g_sync_profile_event_wait_ms;
+                                 g_sync_profile_event_wait_ms +
+                                 g_sync_profile_host_block_ms;
         fprintf(stderr,
                 "ds4: metal sync profile encode_total=%.1f ms encode_mean=%.3f ms "
                 "batches=%llu commits_flush=%llu commits_event=%llu "
@@ -1609,6 +1644,14 @@ static void ds4_gpu_sync_profile_report(void) {
                 g_sync_profile_event_wait_ms,
                 span - accounted,
                 span > 0.0 ? 100.0 * (span - accounted) / span : 0.0);
+        fprintf(stderr,
+                "ds4: metal sync profile host_blocks=%llu "
+                "host_block_total=%.1f ms worker_event_waits=%llu "
+                "worker_event_wait_total=%.1f ms\n",
+                (unsigned long long)g_sync_profile_host_blocks,
+                g_sync_profile_host_block_ms,
+                (unsigned long long)g_sync_profile_event_waits_worker,
+                g_sync_profile_event_wait_worker_ms);
     }
 }
 
@@ -9149,9 +9192,7 @@ int ds4_gpu_begin_commands(void) {
     g_batch_has_work = NO;
     if (g_batch_cb) {
         ds4_gpu_stream_expert_cache_note_batch_created();
-        if (ds4_gpu_sync_profile_enabled()) {
-            g_sync_profile_encode_open_ms = ds4_gpu_now_ms();
-        }
+        ds4_gpu_sync_profile_note_batch_open();
     }
     return g_batch_cb != nil;
 }

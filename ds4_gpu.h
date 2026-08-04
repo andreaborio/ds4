@@ -1972,7 +1972,14 @@ int ds4_gpu_internal_dspark_router_f32_test(void);
 int ds4_gpu_internal_dspark_stage_executor_test(void);
 
 int ds4_gpu_internal_dspark_head_execute_test(void);
+
 #endif
+
+/* Sync-profile hook (DS4_METAL_SYNC_PROFILE): the decode loop reports the
+ * wall time the main thread spends blocked on the selected-load worker, so
+ * the profile can separate real host encoding from waiting.  A no-op when
+ * the profile is disabled. */
+void ds4_gpu_sync_profile_note_host_block_ms(double waited_ms);
 
 /* =========================================================================
  * Hyper-Connection Kernels.
