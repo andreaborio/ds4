@@ -1486,12 +1486,169 @@ static int ds4_gpu_wait_pending_command_buffers(const char *label) {
     return ok;
 }
 
+/* Opt-in CPU-GPU synchronisation profile.
+ *
+ * Every owned command buffer ends in a host wait, so the count of these calls
+ * is the count of real synchronisation points and the measured wait is the
+ * wall time the host spends blocked on the GPU.  The wait is NOT by itself
+ * wasted time: it also covers legitimate GPU execution.  What it bounds is
+ * the size of the prize for merging command buffers, which is why the report
+ * separates the number of boundaries from the time spent at them. */
+static double ds4_gpu_now_ms(void);
+static int ds4_gpu_sync_profile_enabled(void);
+
+static uint64_t g_sync_profile_count;
+static double   g_sync_profile_wait_ms;
+static double   g_sync_profile_max_ms;
+static double   g_sync_profile_first_ms;
+
+static double g_sync_profile_gpu_ms;
+/* Host wall time spent building a batch before it is committed.  Together
+ * with the wait and the device span it closes the per-token budget: what is
+ * neither device execution nor blocking is host-side encoding and cache
+ * bookkeeping. */
+static double g_sync_profile_encode_open_ms;
+static double g_sync_profile_encode_ms;
+static uint64_t g_sync_profile_encode_count;
+/* Streaming decode commits most buffers without an owned wait: flushed
+ * pipeline batches and the per-layer selected-readback event batches.  The
+ * owned-wait counter alone is therefore blind to the real per-layer
+ * round-trip structure, which is exactly the mistake that produced the first
+ * wrong bottleneck diagnosis.  Count every commit kind, time every shared
+ * event wait, and accumulate device time for non-owned buffers from their
+ * completion handlers. */
+static uint64_t g_sync_profile_commit_flush;
+static uint64_t g_sync_profile_commit_event;
+static uint64_t g_sync_profile_event_waits;
+static double g_sync_profile_event_wait_ms;
+static pthread_mutex_t g_sync_profile_gpu_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+static void ds4_gpu_sync_profile_note_commit(id<MTLCommandBuffer> cb,
+                                             int is_event_commit) {
+    if (!ds4_gpu_sync_profile_enabled()) return;
+    const double now = ds4_gpu_now_ms();
+    if (g_sync_profile_encode_open_ms > 0.0) {
+        g_sync_profile_encode_ms += now - g_sync_profile_encode_open_ms;
+        g_sync_profile_encode_count++;
+        g_sync_profile_encode_open_ms = 0.0;
+    }
+    if (g_sync_profile_count == 0 && g_sync_profile_first_ms == 0.0) {
+        g_sync_profile_first_ms = now;
+    }
+    if (is_event_commit) g_sync_profile_commit_event++;
+    else g_sync_profile_commit_flush++;
+    if (cb) {
+        [cb addCompletedHandler:^(id<MTLCommandBuffer> done) {
+            const CFTimeInterval s = [done GPUStartTime];
+            const CFTimeInterval e = [done GPUEndTime];
+            if (e > s) {
+                pthread_mutex_lock(&g_sync_profile_gpu_mutex);
+                g_sync_profile_gpu_ms += (e - s) * 1000.0;
+                pthread_mutex_unlock(&g_sync_profile_gpu_mutex);
+            }
+        }];
+    }
+}
+
+static void ds4_gpu_sync_profile_note_batch_open(void) {
+    if (!ds4_gpu_sync_profile_enabled()) return;
+    g_sync_profile_encode_open_ms = ds4_gpu_now_ms();
+}
+
+static void ds4_gpu_sync_profile_note_event_wait(double waited_ms) {
+    if (!ds4_gpu_sync_profile_enabled()) return;
+    g_sync_profile_event_waits++;
+    g_sync_profile_event_wait_ms += waited_ms;
+    /* An event wait can happen while the next batch is already open (the
+     * flush-then-wait path).  Shift the open timestamp forward so the encode
+     * metric measures host encoding, not the blocked wait it overlaps. */
+    if (g_sync_profile_encode_open_ms > 0.0) {
+        g_sync_profile_encode_open_ms += waited_ms;
+    }
+}
+
+static void ds4_gpu_sync_profile_report(void) {
+    if (g_sync_profile_count == 0) return;
+    const double span = ds4_gpu_now_ms() - g_sync_profile_first_ms;
+    fprintf(stderr,
+            "ds4: metal sync profile boundaries=%llu wait_total=%.1f ms "
+            "wait_mean=%.3f ms wait_max=%.3f ms span=%.1f ms blocked=%.1f%%\n",
+            (unsigned long long)g_sync_profile_count,
+            g_sync_profile_wait_ms,
+            g_sync_profile_wait_ms / (double)g_sync_profile_count,
+            g_sync_profile_max_ms,
+            span,
+            span > 0.0 ? 100.0 * g_sync_profile_wait_ms / span : 0.0);
+    /* GPUStartTime/GPUEndTime measure device execution only.  Comparing it
+     * with the host wait separates real GPU work from submission and
+     * completion overhead: a wait far above the GPU span means the host is
+     * paying latency, not compute. */
+    fprintf(stderr,
+            "ds4: metal sync profile gpu_total=%.1f ms gpu_mean=%.3f ms "
+            "gpu_share_of_wait=%.1f%% gpu_share_of_span=%.1f%%\n",
+            g_sync_profile_gpu_ms,
+            g_sync_profile_gpu_ms / (double)g_sync_profile_count,
+            g_sync_profile_wait_ms > 0.0
+                ? 100.0 * g_sync_profile_gpu_ms / g_sync_profile_wait_ms : 0.0,
+            span > 0.0 ? 100.0 * g_sync_profile_gpu_ms / span : 0.0);
+    if (g_sync_profile_encode_count != 0) {
+        const double accounted = g_sync_profile_encode_ms +
+                                 g_sync_profile_wait_ms +
+                                 g_sync_profile_event_wait_ms;
+        fprintf(stderr,
+                "ds4: metal sync profile encode_total=%.1f ms encode_mean=%.3f ms "
+                "batches=%llu commits_flush=%llu commits_event=%llu "
+                "event_waits=%llu event_wait_total=%.1f ms "
+                "unaccounted=%.1f ms (%.1f%%)\n",
+                g_sync_profile_encode_ms,
+                g_sync_profile_encode_ms / (double)g_sync_profile_encode_count,
+                (unsigned long long)g_sync_profile_encode_count,
+                (unsigned long long)g_sync_profile_commit_flush,
+                (unsigned long long)g_sync_profile_commit_event,
+                (unsigned long long)g_sync_profile_event_waits,
+                g_sync_profile_event_wait_ms,
+                span - accounted,
+                span > 0.0 ? 100.0 * (span - accounted) / span : 0.0);
+    }
+}
+
+static int ds4_gpu_sync_profile_enabled(void) {
+    static int initialized;
+    static int enabled;
+    if (!initialized) {
+        enabled = getenv("DS4_METAL_SYNC_PROFILE") != NULL;
+        if (enabled) atexit(ds4_gpu_sync_profile_report);
+        initialized = 1;
+    }
+    return enabled;
+}
+
 static int ds4_gpu_finish_command_buffer(id<MTLCommandBuffer> cb, int owned, const char *label) {
     if (!owned) return 1;
+
+    const int profile = ds4_gpu_sync_profile_enabled();
+    const double t0 = profile ? ds4_gpu_now_ms() : 0.0;
+    if (profile && g_sync_profile_encode_open_ms > 0.0) {
+        g_sync_profile_encode_ms += t0 - g_sync_profile_encode_open_ms;
+        g_sync_profile_encode_count++;
+        g_sync_profile_encode_open_ms = 0.0;
+    }
 
     [cb commit];
     int ok = ds4_gpu_wait_pending_command_buffers(label);
     if (!ds4_gpu_wait_command_buffer(cb, label)) ok = 0;
+    if (profile) {
+        const double dt = ds4_gpu_now_ms() - t0;
+        if (g_sync_profile_count == 0) g_sync_profile_first_ms = t0;
+        g_sync_profile_count++;
+        g_sync_profile_wait_ms += dt;
+        if (dt > g_sync_profile_max_ms) g_sync_profile_max_ms = dt;
+        const CFTimeInterval gpu_start = [cb GPUStartTime];
+        const CFTimeInterval gpu_end = [cb GPUEndTime];
+        if (gpu_end > gpu_start) {
+            g_sync_profile_gpu_ms += (gpu_end - gpu_start) * 1000.0;
+        }
+    }
     ds4_gpu_stream_expert_cache_note_owned_completed();
     [g_transient_buffers removeAllObjects];
     ds4_gpu_model_buffer_cache_maybe_evict(label);
@@ -8990,7 +9147,12 @@ int ds4_gpu_begin_commands(void) {
     if (g_batch_cb) return 0;
     g_batch_cb = ds4_gpu_new_command_buffer();
     g_batch_has_work = NO;
-    if (g_batch_cb) ds4_gpu_stream_expert_cache_note_batch_created();
+    if (g_batch_cb) {
+        ds4_gpu_stream_expert_cache_note_batch_created();
+        if (ds4_gpu_sync_profile_enabled()) {
+            g_sync_profile_encode_open_ms = ds4_gpu_now_ms();
+        }
+    }
     return g_batch_cb != nil;
 }
 
@@ -9009,13 +9171,17 @@ int ds4_gpu_flush_commands(void) {
     id<MTLCommandBuffer> cb = g_batch_cb;
     g_batch_cb = nil;
     g_batch_has_work = NO;
+    ds4_gpu_sync_profile_note_commit(cb, 0);
     [cb commit];
     [g_pending_cbs addObject:cb];
     ds4_gpu_stream_expert_cache_note_batch_committed();
 
     g_batch_cb = ds4_gpu_new_command_buffer();
     g_batch_has_work = NO;
-    if (g_batch_cb) ds4_gpu_stream_expert_cache_note_batch_created();
+    if (g_batch_cb) {
+        ds4_gpu_stream_expert_cache_note_batch_created();
+        ds4_gpu_sync_profile_note_batch_open();
+    }
     if (!g_batch_cb) {
         (void)ds4_gpu_wait_pending_command_buffers("command batch");
         [g_transient_buffers removeAllObjects];
@@ -9076,12 +9242,15 @@ int ds4_gpu_commit_and_wait_selected_readback(uint64_t event_value, const char *
         id<MTLCommandBuffer> cb = g_batch_cb;
         g_batch_cb = nil;
         g_batch_has_work = NO;
+        ds4_gpu_sync_profile_note_commit(cb, 1);
         [cb commit];
         ds4_gpu_stream_expert_cache_note_batch_committed();
 
         const char *what = label ? label : "selected-id overlap";
+        const double wait_t0 = ds4_gpu_now_ms();
         const BOOL signaled =
             [g_selected_readback_event waitUntilSignaledValue:event_value timeoutMS:60000];
+        ds4_gpu_sync_profile_note_event_wait(ds4_gpu_now_ms() - wait_t0);
         [g_pending_cbs addObject:cb];
         if (!signaled) {
             fprintf(stderr, "ds4: timeout waiting for Metal shared event in %s\n", what);
@@ -9106,7 +9275,10 @@ int ds4_gpu_commit_and_wait_selected_readback(uint64_t event_value, const char *
 
         g_batch_cb = ds4_gpu_new_command_buffer();
         g_batch_has_work = NO;
-        if (g_batch_cb) ds4_gpu_stream_expert_cache_note_batch_created();
+        if (g_batch_cb) {
+            ds4_gpu_stream_expert_cache_note_batch_created();
+            ds4_gpu_sync_profile_note_batch_open();
+        }
         if (!g_batch_cb) {
             (void)ds4_gpu_wait_pending_command_buffers(what);
             [g_transient_buffers removeAllObjects];
@@ -9127,8 +9299,10 @@ int ds4_gpu_wait_selected_readback_ready(uint64_t event_value, const char *label
         if (!g_selected_readback_event) return 0;
 
         const char *what = label ? label : "selected-id readback";
+        const double wait_t0 = ds4_gpu_now_ms();
         const BOOL signaled =
             [g_selected_readback_event waitUntilSignaledValue:event_value timeoutMS:60000];
+        ds4_gpu_sync_profile_note_event_wait(ds4_gpu_now_ms() - wait_t0);
         if (!signaled) {
             fprintf(stderr, "ds4: timeout waiting for Metal shared event in %s\n", what);
             return 0;
@@ -9160,10 +9334,13 @@ static int ds4_gpu_signal_batch_and_wait_event(const char *label) {
         const uint64_t value = ++g_selected_readback_event_value;
         [cb encodeSignalEvent:g_selected_readback_event value:value];
         g_batch_has_work = YES;
+        ds4_gpu_sync_profile_note_commit(cb, 1);
         [cb commit];
         ds4_gpu_stream_expert_cache_note_batch_committed();
 
+        const double wait_t0 = ds4_gpu_now_ms();
         const BOOL signaled = [g_selected_readback_event waitUntilSignaledValue:value timeoutMS:60000];
+        ds4_gpu_sync_profile_note_event_wait(ds4_gpu_now_ms() - wait_t0);
         [g_pending_cbs addObject:cb];
         if (!signaled) {
             fprintf(stderr, "ds4: timeout waiting for Metal shared event in %s\n",
