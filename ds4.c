@@ -26138,6 +26138,10 @@ static void metal_graph_selected_async_load_run(
             return;
         }
     }
+    /* From here to success is the post-signal load latency: in the GPU-wait
+     * decode design this is the only possible device stall, so its
+     * distribution is what the sync profile needs to see. */
+    const double load_t0 = now_sec();
     for (uint32_t i = 0; i < DS4_N_EXPERT_USED; i++) {
         if (job->selected_ids[i] < 0 ||
             (uint32_t)job->selected_ids[i] >= DS4_N_EXPERT) {
@@ -26162,6 +26166,8 @@ static void metal_graph_selected_async_load_run(
         return;
     }
 
+    ds4_gpu_sync_profile_note_worker_load_ms(
+        (now_sec() - load_t0) * 1000.0);
     job->ok = true;
 }
 
@@ -44393,18 +44399,37 @@ static const char *ds4_glm_router_ahead_mode_name(
     return "invalid";
 }
 
+/* L1 GPU-wait decode mode (docs/work/active/l1-decode-overlap-plan-20260804.md).
+ * P0 ships the flag, the telemetry and the risk microbench only: the legacy
+ * per-layer worker-blocking path stays active regardless of the flag, and a
+ * one-time notice makes the state unambiguous in logs. */
+static bool metal_graph_use_deepseek_decode_gpu_wait(void) {
+    static int cache = -1;
+    if (cache < 0) {
+        cache = getenv("DS4_METAL_ENABLE_DEEPSEEK_DECODE_GPU_WAIT") != NULL;
+        if (cache) {
+            fprintf(stderr,
+                    "ds4: deepseek decode gpu-wait mode requested "
+                    "(P0: telemetry only, legacy path active)\n");
+        }
+    }
+    return cache > 0;
+}
+
 static void ds4_engine_print_effective_metal_ssd_profile(
         const ds4_engine *e) {
     if (!e || e->backend != DS4_BACKEND_METAL || !e->ssd_streaming) return;
     fprintf(stderr,
             "ds4: effective profile=%s indexed-prefill-prepare=%s "
-            "router-ahead=%s lookahead=%u streaming-expert-readahead=%s\n",
+            "router-ahead=%s lookahead=%u streaming-expert-readahead=%s "
+            "decode-gpu-wait=%s\n",
             e->metal_ssd_profile.name,
             e->metal_ssd_profile.glm_indexed_prefill_prepare ? "on" : "off",
             ds4_glm_router_ahead_mode_name(
                     e->metal_ssd_profile.glm_router_ahead),
             e->metal_ssd_profile.glm_router_ahead_lookahead,
-            e->metal_ssd_profile.streaming_expert_readahead ? "on" : "off");
+            e->metal_ssd_profile.streaming_expert_readahead ? "on" : "off",
+            metal_graph_use_deepseek_decode_gpu_wait() ? "requested" : "off");
 }
 
 int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {

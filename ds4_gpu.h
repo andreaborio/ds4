@@ -1973,6 +1973,8 @@ int ds4_gpu_internal_dspark_stage_executor_test(void);
 
 int ds4_gpu_internal_dspark_head_execute_test(void);
 
+int ds4_gpu_internal_shared_event_resume_latency_test(void);
+
 #endif
 
 /* Sync-profile hook (DS4_METAL_SYNC_PROFILE): the decode loop reports the
@@ -1980,6 +1982,7 @@ int ds4_gpu_internal_dspark_head_execute_test(void);
  * the profile can separate real host encoding from waiting.  A no-op when
  * the profile is disabled. */
 void ds4_gpu_sync_profile_note_host_block_ms(double waited_ms);
+void ds4_gpu_sync_profile_note_worker_load_ms(double load_ms);
 
 /* =========================================================================
  * Hyper-Connection Kernels.

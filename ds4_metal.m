@@ -1573,6 +1573,29 @@ static void ds4_gpu_sync_profile_note_batch_open(void) {
 static uint64_t g_sync_profile_host_blocks;
 static double g_sync_profile_host_block_ms;
 
+/* Worker-side job latency (event wait excluded): read ids, cache bookkeeping
+ * and the pread batch.  In the GPU-wait decode design this latency is the
+ * only possible device stall, so its distribution decides the design's p95.
+ * Buckets: <0.2 ms, <0.5 ms, <2 ms, >=2 ms. */
+static uint64_t g_sync_profile_worker_loads;
+static double g_sync_profile_worker_load_ms;
+static double g_sync_profile_worker_load_max_ms;
+static uint64_t g_sync_profile_worker_load_bucket[4];
+
+void ds4_gpu_sync_profile_note_worker_load_ms(double load_ms) {
+    if (!ds4_gpu_sync_profile_enabled()) return;
+    if (load_ms < 0.0) return;
+    g_sync_profile_worker_loads++;
+    g_sync_profile_worker_load_ms += load_ms;
+    if (load_ms > g_sync_profile_worker_load_max_ms) {
+        g_sync_profile_worker_load_max_ms = load_ms;
+    }
+    const uint32_t bucket = load_ms < 0.2 ? 0u :
+                            load_ms < 0.5 ? 1u :
+                            load_ms < 2.0 ? 2u : 3u;
+    g_sync_profile_worker_load_bucket[bucket]++;
+}
+
 void ds4_gpu_sync_profile_note_host_block_ms(double waited_ms) {
     if (!ds4_gpu_sync_profile_enabled()) return;
     if (waited_ms < 0.0) return;
@@ -1652,6 +1675,21 @@ static void ds4_gpu_sync_profile_report(void) {
                 g_sync_profile_host_block_ms,
                 (unsigned long long)g_sync_profile_event_waits_worker,
                 g_sync_profile_event_wait_worker_ms);
+        if (g_sync_profile_worker_loads != 0) {
+            fprintf(stderr,
+                    "ds4: metal sync profile worker_loads=%llu "
+                    "load_total=%.1f ms load_mean=%.3f ms load_max=%.3f ms "
+                    "buckets[<0.2/<0.5/<2/>=2ms]=%llu/%llu/%llu/%llu\n",
+                    (unsigned long long)g_sync_profile_worker_loads,
+                    g_sync_profile_worker_load_ms,
+                    g_sync_profile_worker_load_ms /
+                        (double)g_sync_profile_worker_loads,
+                    g_sync_profile_worker_load_max_ms,
+                    (unsigned long long)g_sync_profile_worker_load_bucket[0],
+                    (unsigned long long)g_sync_profile_worker_load_bucket[1],
+                    (unsigned long long)g_sync_profile_worker_load_bucket[2],
+                    (unsigned long long)g_sync_profile_worker_load_bucket[3]);
+        }
     }
 }
 
@@ -56378,6 +56416,53 @@ static int ds4_gpu_dspark_head_test_check_hidden(
         }
     }
     return 1;
+}
+
+/* Measure the CPU-signal to GPU-resume latency of MTLSharedEvent, the risk
+ * gate of the GPU-wait decode plan (L1 P0).  A command buffer is committed
+ * with an encoded wait on an unsignaled value; after a settle sleep the CPU
+ * signals and times until completion.  The reported wall time is an upper
+ * bound on resume latency: it includes one trivial blit and the completion
+ * callback.  The plan's threshold is 0.5 ms mean; the test itself only
+ * asserts a generous sanity bound so CI noise cannot flake it. */
+int ds4_gpu_internal_shared_event_resume_latency_test(void) {
+    if (!g_initialized && !ds4_gpu_init()) return 0;
+    if (g_batch_cb || [g_pending_cbs count] != 0) return 0;
+    if (@available(macOS 12.0, *)) {
+        id<MTLSharedEvent> event = [g_device newSharedEvent];
+        id<MTLBuffer> scratch =
+            [g_device newBufferWithLength:256
+                                  options:MTLResourceStorageModeShared];
+        if (!event || !scratch) return 0;
+        const uint32_t rounds = 32;
+        double total_ms = 0.0, min_ms = 1.0e9, max_ms = 0.0;
+        for (uint32_t i = 0; i < rounds; i++) {
+            const uint64_t value = (uint64_t)i + 1u;
+            id<MTLCommandBuffer> cb = [g_queue commandBuffer];
+            if (!cb) return 0;
+            [cb encodeWaitForEvent:event value:value];
+            id<MTLBlitCommandEncoder> blit = [cb blitCommandEncoder];
+            [blit fillBuffer:scratch range:NSMakeRange(0, 256) value:0xa5];
+            [blit endEncoding];
+            [cb commit];
+            usleep(1000);
+            const double t0 = ds4_gpu_now_ms();
+            [event setSignaledValue:value];
+            [cb waitUntilCompleted];
+            const double dt = ds4_gpu_now_ms() - t0;
+            if (cb.status == MTLCommandBufferStatusError) return 0;
+            total_ms += dt;
+            if (dt < min_ms) min_ms = dt;
+            if (dt > max_ms) max_ms = dt;
+        }
+        fprintf(stderr,
+                "ds4: shared-event resume latency rounds=%u min=%.3f ms "
+                "mean=%.3f ms max=%.3f ms (L1 plan threshold: mean < 0.5)\n",
+                rounds, min_ms, total_ms / rounds, max_ms);
+        /* Sanity only: a mean above 5 ms would sink the design outright. */
+        return total_ms / rounds < 5.0;
+    }
+    return 0;
 }
 
 int ds4_gpu_internal_dspark_head_execute_test(void) {
