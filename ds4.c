@@ -42228,9 +42228,40 @@ static bool ds4_engine_configure_streaming_auto_cache(ds4_engine *e) {
 #else
     if (!e ||
         !e->ssd_streaming ||
-        !ds4_backend_supports_ssd_streaming(e->backend) ||
-        e->ssd_streaming_cache_experts != 0 ||
+        !ds4_backend_supports_ssd_streaming(e->backend)) {
+        return true;
+    }
+    if (e->ssd_streaming_cache_experts != 0 ||
         e->ssd_streaming_cache_bytes != 0) {
+        /*
+         * An explicit cache budget skips this planner entirely.  On DeepSeek
+         * ExpertMajor v2 that is not merely a different size: the planner is
+         * also what establishes the phase cache schedule
+         * (deepseek_prefill/long_context/extended/decode_cache_experts), and
+         * without it the routed expert path yields zeroed weights.  Decode
+         * then emits a repeated begin-of-sentence token at high speed with no
+         * error, which is the worst possible failure mode.
+         *
+         * Measured 2026-08-04 on the final 0731 target-only model: AUTO emits
+         * correct text at 10.1 t/s, while --ssd-streaming-cache-experts 4387
+         * emits garbage at 14+ t/s with hit rate 0.000 and zero pread.  Fail
+         * closed until the explicit path configures the same schedule; the
+         * flag stays available for the families that do not need it.
+         */
+        if (e->model.family == DS4_MODEL_FAMILY_DEEPSEEK4 &&
+            e->model.native_expert_store_v2 &&
+            !e->model.native_dspark_store_v2) {
+            fprintf(stderr,
+                    "ds4: an explicit SSD expert-cache budget is not supported "
+                    "for DeepSeek ExpertMajor v2 yet: it bypasses the phase "
+                    "cache schedule and silently produces zeroed routed "
+                    "experts. Use AUTO residency (omit "
+                    "--ssd-streaming-cache-experts) instead\n");
+            return false;
+        }
+        /* A combined DSpark artifact keeps the explicit path: it is rejected
+         * by its own execution gate before any decode, and the admission
+         * suite drives that gate with an explicit budget. */
         return true;
     }
     if (!ds4_backend_supports_streaming_auto_cache(e->backend)) {
