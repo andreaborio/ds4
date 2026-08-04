@@ -55120,41 +55120,68 @@ int ds4_gpu_dspark_stage_execute_candidate(
     return ok && !g_stream_expert_cache_lease.active;
 }
 
-/* DSpark HC head: takes the final stage candidate and produces draft token
- * IDs, corrected logits, and per-position confidence.  The caller owns all
- * scratch tensors and the model map; this function only orchestrates Metal
- * kernels.  Confidence sigmoid is computed on the CPU (5 values) to avoid
- * adding a new public Metal API. */
+/* DSpark HC head: takes the published final-stage candidate and produces
+ * draft token IDs, corrected logits, and per-position confidence logits.
+ * The caller owns every scratch tensor, per-position view and the model map;
+ * this function only orchestrates Metal kernels and allocates nothing.
+ *
+ * The HC collapse follows the pinned final-0731 contract, identical in shape
+ * to the qualified target output head: one inverse-RMS over the flattened
+ * 4 * 4096 row, an F16 mix to exactly four lane values, independent sigmoid
+ * gates plus epsilon, and a weighted sum of the raw lanes.  The stage-side
+ * Sinkhorn split is a different operator with a different weight geometry and
+ * must not appear here.
+ *
+ * The Markov chain is sequential by contract: position p consumes the token
+ * drafted at p-1, seeded by the pending target token.  The per-position
+ * readback is therefore required, not an optimisation defect.
+ *
+ * Confidence sigmoid is deferred to the caller (at most five values, CPU) so
+ * that the accept prefix is computed with the exact frozen comparison. */
 int ds4_gpu_dspark_head_execute(
         const ds4_gpu_dspark_head_descriptor *d) {
     if (!g_initialized && !ds4_gpu_init()) return 0;
     if (!d || !d->model_map || d->model_size == 0 ||
-        !d->candidate || !d->flat_norm || !d->hc_mix || !d->hc_split ||
+        !d->candidate || !d->flat_norm || !d->hc_mix ||
         !d->hc_weights || !d->head_hidden || !d->head_normalized ||
-        !d->base_logits || !d->markov_emb || !d->corrected_logits ||
+        !d->logits_row || !d->markov_emb || !d->corrected_logits ||
         !d->confidence_feat || !d->confidence || !d->draft_tokens) {
         return 0;
     }
+    if (d->active_rows == 0u || d->active_rows > 5u ||
+        d->vocab_size == 0u || d->markov_rank == 0u ||
+        !(d->norm_eps > 0.0f) || !(d->hc_eps > 0.0f) ||
+        d->pending_token_id < 0 ||
+        (uint32_t)d->pending_token_id >= d->vocab_size) {
+        return 0;
+    }
+    for (uint32_t pos = 0; pos < d->active_rows; pos++) {
+        if (!d->corrected_row[pos] || !d->markov_row[pos] ||
+            !d->draft_row[pos]) {
+            return 0;
+        }
+    }
+    const uint64_t hc_dim = UINT64_C(4) * 4096u;
     const uint64_t row_values = UINT64_C(5) * 4096u;
     const uint64_t vocab = d->vocab_size;
     const uint64_t markov = d->markov_rank;
     const uint64_t feature = 4096u + markov;
 
+    /* HC collapse and the base logits for the whole block.  The vocabulary
+     * projection is encoded once so its weight is read once per proposal. */
     int ok = ds4_gpu_begin_commands();
     if (ok) {
         ok = ds4_gpu_rms_norm_plain_rows_tensor(
-                 d->flat_norm, d->candidate, 4096u,
-                 5u * 4u, 1.0e-6f) &&
+                 d->flat_norm, d->candidate, (uint32_t)hc_dim, 5u,
+                 d->norm_eps) &&
              ds4_gpu_matmul_f16_tensor(
                  d->hc_mix, d->model_map, d->model_size,
-                 d->weights.hc_fn,
-                 4096u * 4u, 24u, d->flat_norm, 5u) &&
-             ds4_gpu_hc_split_sinkhorn_tensor(
-                 d->hc_split, d->hc_mix, d->model_map, d->model_size,
-                 d->weights.hc_scale, d->weights.hc_base, 4u, 20u,
-                 1.0e-6f) &&
-             ds4_gpu_hc_weighted_sum_split_tensor(
-                 d->head_hidden, d->candidate, d->hc_split, 4096u, 4u) &&
+                 d->weights.hc_fn, hc_dim, 4u, d->flat_norm, 5u) &&
+             ds4_gpu_output_hc_weights_tensor(
+                 d->hc_weights, d->hc_mix, d->model_map, d->model_size,
+                 d->weights.hc_scale, d->weights.hc_base, 4u, d->hc_eps) &&
+             ds4_gpu_hc_weighted_sum_tensor(
+                 d->head_hidden, d->candidate, d->hc_weights, 4096u, 4u) &&
              ds4_gpu_bf16_round_f32_tensor(
                  d->head_hidden, row_values) &&
              ds4_gpu_tensor_copy(
@@ -55163,11 +55190,11 @@ int ds4_gpu_dspark_head_execute(
              ds4_gpu_rms_norm_weight_rows_tensor(
                  d->head_normalized, d->head_normalized,
                  d->model_map, d->model_size, d->weights.norm,
-                 4096u, 5u, 1.0e-6f) &&
+                 4096u, 5u, d->norm_eps) &&
              ds4_gpu_bf16_round_f32_tensor(
                  d->head_normalized, row_values) &&
              ds4_gpu_matmul_q8_0_tensor(
-                 d->base_logits, d->model_map, d->model_size,
+                 d->corrected_logits, d->model_map, d->model_size,
                  d->weights.output, 4096u, vocab,
                  d->head_normalized, 5u);
     }
@@ -55177,67 +55204,44 @@ int ds4_gpu_dspark_head_execute(
     }
     if (!ok) return 0;
 
-    /* Markov correction: for each position, embed the previous token from
-     * markov_w1, project through markov_w2, add to base logits, and argmax. */
-    int32_t previous = d->noise_token_id;
-    if (previous < 0 || (uint32_t)previous >= vocab) return 0;
-    for (uint32_t pos = 0; ok && pos < 5u; pos++) {
-        ds4_gpu_tensor *base_row = ds4_gpu_tensor_view(
-            d->base_logits,
-            (uint64_t)pos * vocab * sizeof(float),
-            vocab * sizeof(float));
-        ds4_gpu_tensor *corrected_row = ds4_gpu_tensor_view(
-            d->corrected_logits,
-            (uint64_t)pos * vocab * sizeof(float),
-            vocab * sizeof(float));
-        ds4_gpu_tensor *draft_row = ds4_gpu_tensor_view(
-            d->draft_tokens,
-            (uint64_t)pos * sizeof(int32_t), sizeof(int32_t));
-        ds4_gpu_tensor *markov_row = ds4_gpu_tensor_view(
-            d->markov_emb,
-            (uint64_t)pos * markov * sizeof(float),
-            markov * sizeof(float));
-        if (!base_row || !corrected_row || !draft_row || !markov_row) {
-            ds4_gpu_tensor_free(draft_row);
-            ds4_gpu_tensor_free(corrected_row);
-            ds4_gpu_tensor_free(base_row);
-            ds4_gpu_tensor_free(markov_row);
-            return 0;
-        }
+    /* Sequential Markov correction: embed the previous token through W1,
+     * cross BF16, project through W2 into the single bias row, accumulate
+     * onto this position's base logits, then argmax. */
+    int32_t previous = d->pending_token_id;
+    for (uint32_t pos = 0; ok && pos < d->active_rows; pos++) {
         ok = ds4_gpu_begin_commands() &&
              ds4_gpu_embed_token_q8_0_tensor(
-                 markov_row, d->model_map, d->model_size,
+                 d->markov_row[pos], d->model_map, d->model_size,
                  d->weights.markov_w1, (uint32_t)vocab,
                  (uint32_t)previous, (uint32_t)markov) &&
-             ds4_gpu_bf16_round_f32_tensor(markov_row, markov) &&
+             ds4_gpu_bf16_round_f32_tensor(d->markov_row[pos], markov) &&
              ds4_gpu_matmul_q8_0_tensor(
-                 corrected_row, d->model_map, d->model_size,
-                 d->weights.markov_w2, markov, vocab, markov_row, 1u) &&
+                 d->logits_row, d->model_map, d->model_size,
+                 d->weights.markov_w2, markov, vocab,
+                 d->markov_row[pos], 1u) &&
              ds4_gpu_add_tensor(
-                 corrected_row, corrected_row, base_row,
-                 (uint32_t)vocab);
+                 d->corrected_row[pos], d->corrected_row[pos],
+                 d->logits_row, (uint32_t)vocab);
         if (ds4_gpu_commands_active()) {
             const int end_ok = ds4_gpu_end_commands();
             ok = end_ok && ok;
         }
         if (ok) {
             ok = ds4_gpu_argmax_tensor(
-                     draft_row, corrected_row, (uint32_t)vocab) &&
+                     d->draft_row[pos], d->corrected_row[pos],
+                     (uint32_t)vocab) &&
                  ds4_gpu_tensor_read(
-                     draft_row, 0, &previous, sizeof(previous)) &&
-                 previous >= 0 && (uint32_t)previous < vocab;
+                     d->draft_row[pos], 0, &previous, sizeof(previous)) &&
+                 previous >= 0 && (uint64_t)previous < vocab;
         }
-        ds4_gpu_tensor_free(draft_row);
-        ds4_gpu_tensor_free(corrected_row);
-        ds4_gpu_tensor_free(base_row);
-        ds4_gpu_tensor_free(markov_row);
     }
     if (!ok) return 0;
 
-    /* Confidence: concat head_hidden and markov_emb, project, sigmoid. */
+    /* Confidence features are [collapsed hidden before RMSNorm, W1(previous)]
+     * for previous tokens exactly [pending, d0, d1, d2, d3]. */
     ok = ds4_gpu_begin_commands();
     if (ok) {
-        for (uint32_t pos = 0; ok && pos < 5u; pos++) {
+        for (uint32_t pos = 0; ok && pos < d->active_rows; pos++) {
             const uint64_t off = (uint64_t)pos * feature * sizeof(float);
             ok = ds4_gpu_tensor_copy(
                      d->confidence_feat, off,
@@ -55256,7 +55260,7 @@ int ds4_gpu_dspark_head_execute(
         ok = ds4_gpu_matmul_q8_0_tensor(
                  d->confidence, d->model_map, d->model_size,
                  d->weights.confidence_proj, feature, 1u,
-                 d->confidence_feat, 5u);
+                 d->confidence_feat, d->active_rows);
     }
     if (ds4_gpu_commands_active()) {
         const int end_ok = ds4_gpu_end_commands();
@@ -55741,6 +55745,598 @@ int ds4_gpu_internal_dspark_stage_executor_test(void) {
     if (fd >= 0) (void)close(fd);
     free(model);
     return ok;
+}
+
+/* =========================================================================
+ * Direct release HC head fixture.
+ * =========================================================================
+ *
+ * This exercises the exact release ds4_gpu_dspark_head_execute descriptor at
+ * production width.  It is the first caller of that function outside the
+ * disconnected graph, so it is the only evidence that the head computes the
+ * pinned final-0731 collapse rather than the stage-side Sinkhorn split.
+ *
+ * Every synthetic weight uses a Q8_0 scale of exactly 1.0, so a dequantized
+ * value equals its stored code and expectations are integer-exact.  The base
+ * logits are deliberately zero in the Markov cases, which makes the argmax
+ * decision depend only on the Markov bias and therefore exactly predictable.
+ */
+enum {
+    DS4_DSPARK_HEAD_TEST_ROWS = 5,
+    DS4_DSPARK_HEAD_TEST_HC = 4,
+    DS4_DSPARK_HEAD_TEST_WIDTH = 4096,
+    DS4_DSPARK_HEAD_TEST_HC_DIM =
+        DS4_DSPARK_HEAD_TEST_HC * DS4_DSPARK_HEAD_TEST_WIDTH,
+    DS4_DSPARK_HEAD_TEST_VOCAB = 64,
+    DS4_DSPARK_HEAD_TEST_MARKOV = 32,
+    DS4_DSPARK_HEAD_TEST_FEATURE =
+        DS4_DSPARK_HEAD_TEST_WIDTH + DS4_DSPARK_HEAD_TEST_MARKOV,
+    DS4_DSPARK_HEAD_TEST_Q8_BLOCK = 32,
+    DS4_DSPARK_HEAD_TEST_Q8_BLOCK_BYTES = 34,
+    DS4_DSPARK_HEAD_TEST_ALIGN = 64,
+    DS4_DSPARK_HEAD_TEST_SENTINEL = -12345,
+};
+
+typedef struct {
+    uint64_t norm;
+    uint64_t hc_fn;
+    uint64_t hc_scale;
+    uint64_t hc_base;
+    uint64_t output;
+    uint64_t markov_w1;
+    uint64_t markov_w2;
+    uint64_t confidence_proj;
+    uint64_t size;
+} ds4_gpu_dspark_head_test_offsets;
+
+typedef struct {
+    float scale;
+    float base[DS4_DSPARK_HEAD_TEST_HC];
+    float lane[DS4_DSPARK_HEAD_TEST_ROWS][DS4_DSPARK_HEAD_TEST_HC];
+    int8_t hc_fn_code;          /* every F16 mix weight, 0 disables the mix */
+    int32_t pending;
+    uint32_t active_rows;
+    /* W1[token] = e_{token % MARKOV}; W2[v][j] = 1 iff v is chain[j] or,
+     * when tie[j] is non-negative, also tie[j]. */
+    int32_t chain[DS4_DSPARK_HEAD_TEST_MARKOV];
+    int32_t tie[DS4_DSPARK_HEAD_TEST_MARKOV];
+    /* Confidence projection is a single basis vector so the published logit
+     * is one exact feature value: index 0 is the collapsed hidden, index
+     * WIDTH is the first Markov embedding value. */
+    uint32_t confidence_index;
+} ds4_gpu_dspark_head_test_case;
+
+typedef struct {
+    float hidden[DS4_DSPARK_HEAD_TEST_ROWS * DS4_DSPARK_HEAD_TEST_WIDTH];
+    int32_t drafts[DS4_DSPARK_HEAD_TEST_ROWS];
+    float confidence[DS4_DSPARK_HEAD_TEST_ROWS];
+} ds4_gpu_dspark_head_test_result;
+
+static uint64_t ds4_gpu_dspark_head_test_align(uint64_t value) {
+    return (value + DS4_DSPARK_HEAD_TEST_ALIGN - 1u) &
+        ~(uint64_t)(DS4_DSPARK_HEAD_TEST_ALIGN - 1u);
+}
+
+static uint64_t ds4_gpu_dspark_head_test_q8_bytes(uint32_t values) {
+    return (uint64_t)(values / DS4_DSPARK_HEAD_TEST_Q8_BLOCK) *
+        DS4_DSPARK_HEAD_TEST_Q8_BLOCK_BYTES;
+}
+
+/* Write one Q8_0 row with scale exactly 1.0 so codes survive dequantization. */
+static void ds4_gpu_dspark_head_test_write_q8_row(
+        uint8_t       *dst,
+        const int8_t  *codes,
+        uint32_t       values) {
+    const uint16_t one = 0x3c00u;
+    for (uint32_t block = 0;
+         block < values / DS4_DSPARK_HEAD_TEST_Q8_BLOCK; block++) {
+        uint8_t *out = dst +
+            (uint64_t)block * DS4_DSPARK_HEAD_TEST_Q8_BLOCK_BYTES;
+        memcpy(out, &one, sizeof(one));
+        memcpy(out + sizeof(one),
+               codes + (uint64_t)block * DS4_DSPARK_HEAD_TEST_Q8_BLOCK,
+               DS4_DSPARK_HEAD_TEST_Q8_BLOCK);
+    }
+}
+
+static uint16_t ds4_gpu_dspark_head_test_bf16_code(double value) {
+    const float narrowed = (float)value;
+    uint32_t bits = 0;
+    memcpy(&bits, &narrowed, sizeof(bits));
+    const uint32_t lower = bits & UINT32_C(0xffff);
+    uint32_t rounded = bits >> 16;
+    if (lower > UINT32_C(0x8000) ||
+        (lower == UINT32_C(0x8000) && (rounded & 1u) != 0u)) {
+        rounded++;
+    }
+    return (uint16_t)rounded;
+}
+
+static uint16_t ds4_gpu_dspark_head_test_observed_code(float value) {
+    uint32_t bits = 0;
+    memcpy(&bits, &value, sizeof(bits));
+    return (uint16_t)(bits >> 16);
+}
+
+static double ds4_gpu_dspark_head_test_sigmoid(double value) {
+    if (value >= 0.0) return 1.0 / (1.0 + exp(-value));
+    const double positive = exp(value);
+    return positive / (1.0 + positive);
+}
+
+static uint8_t *ds4_gpu_dspark_head_test_build_model(
+        const ds4_gpu_dspark_head_test_case *c,
+        ds4_gpu_dspark_head_test_offsets    *out) {
+    ds4_gpu_dspark_head_test_offsets o;
+    memset(&o, 0, sizeof(o));
+    uint64_t cursor = DS4_DSPARK_HEAD_TEST_ALIGN;
+    o.norm = cursor;
+    cursor = ds4_gpu_dspark_head_test_align(
+        cursor + (uint64_t)DS4_DSPARK_HEAD_TEST_WIDTH * sizeof(float));
+    o.hc_fn = cursor;
+    cursor = ds4_gpu_dspark_head_test_align(
+        cursor + (uint64_t)DS4_DSPARK_HEAD_TEST_HC_DIM *
+            DS4_DSPARK_HEAD_TEST_HC * sizeof(uint16_t));
+    o.hc_scale = cursor;
+    cursor = ds4_gpu_dspark_head_test_align(cursor + sizeof(float));
+    o.hc_base = cursor;
+    cursor = ds4_gpu_dspark_head_test_align(
+        cursor + (uint64_t)DS4_DSPARK_HEAD_TEST_HC * sizeof(float));
+    o.output = cursor;
+    cursor = ds4_gpu_dspark_head_test_align(
+        cursor + (uint64_t)DS4_DSPARK_HEAD_TEST_VOCAB *
+            ds4_gpu_dspark_head_test_q8_bytes(DS4_DSPARK_HEAD_TEST_WIDTH));
+    o.markov_w1 = cursor;
+    cursor = ds4_gpu_dspark_head_test_align(
+        cursor + (uint64_t)DS4_DSPARK_HEAD_TEST_VOCAB *
+            ds4_gpu_dspark_head_test_q8_bytes(DS4_DSPARK_HEAD_TEST_MARKOV));
+    o.markov_w2 = cursor;
+    cursor = ds4_gpu_dspark_head_test_align(
+        cursor + (uint64_t)DS4_DSPARK_HEAD_TEST_VOCAB *
+            ds4_gpu_dspark_head_test_q8_bytes(DS4_DSPARK_HEAD_TEST_MARKOV));
+    o.confidence_proj = cursor;
+    cursor = ds4_gpu_dspark_head_test_align(
+        cursor + ds4_gpu_dspark_head_test_q8_bytes(
+            DS4_DSPARK_HEAD_TEST_FEATURE));
+    o.size = cursor;
+
+    uint8_t *model = calloc(1, (size_t)o.size);
+    if (!model) return NULL;
+
+    float *norm = (float *)(model + o.norm);
+    for (uint32_t i = 0; i < DS4_DSPARK_HEAD_TEST_WIDTH; i++) norm[i] = 1.0f;
+
+    /* F16 1.0 when the case enables the mix, otherwise exact zero. */
+    uint16_t *fn = (uint16_t *)(model + o.hc_fn);
+    const uint16_t fn_value = c->hc_fn_code != 0 ? 0x3c00u : 0x0000u;
+    for (uint64_t i = 0;
+         i < (uint64_t)DS4_DSPARK_HEAD_TEST_HC_DIM * DS4_DSPARK_HEAD_TEST_HC;
+         i++) {
+        fn[i] = fn_value;
+    }
+    ((float *)(model + o.hc_scale))[0] = c->scale;
+    for (uint32_t lane = 0; lane < DS4_DSPARK_HEAD_TEST_HC; lane++)
+        ((float *)(model + o.hc_base))[lane] = c->base[lane];
+
+    /* Output projection stays all-zero: the base logits are exactly zero so
+     * the drafted token depends only on the Markov bias. */
+
+    int8_t codes[DS4_DSPARK_HEAD_TEST_WIDTH];
+    const uint64_t markov_row_bytes =
+        ds4_gpu_dspark_head_test_q8_bytes(DS4_DSPARK_HEAD_TEST_MARKOV);
+    for (uint32_t token = 0; token < DS4_DSPARK_HEAD_TEST_VOCAB; token++) {
+        memset(codes, 0, DS4_DSPARK_HEAD_TEST_MARKOV);
+        codes[token % DS4_DSPARK_HEAD_TEST_MARKOV] = 1;
+        ds4_gpu_dspark_head_test_write_q8_row(
+            model + o.markov_w1 + (uint64_t)token * markov_row_bytes,
+            codes, DS4_DSPARK_HEAD_TEST_MARKOV);
+    }
+    for (uint32_t v = 0; v < DS4_DSPARK_HEAD_TEST_VOCAB; v++) {
+        memset(codes, 0, DS4_DSPARK_HEAD_TEST_MARKOV);
+        for (uint32_t j = 0; j < DS4_DSPARK_HEAD_TEST_MARKOV; j++) {
+            if (c->chain[j] == (int32_t)v || c->tie[j] == (int32_t)v)
+                codes[j] = 1;
+        }
+        ds4_gpu_dspark_head_test_write_q8_row(
+            model + o.markov_w2 + (uint64_t)v * markov_row_bytes,
+            codes, DS4_DSPARK_HEAD_TEST_MARKOV);
+    }
+    {
+        int8_t feature[DS4_DSPARK_HEAD_TEST_FEATURE];
+        memset(feature, 0, sizeof(feature));
+        if (c->confidence_index < DS4_DSPARK_HEAD_TEST_FEATURE)
+            feature[c->confidence_index] = 1;
+        ds4_gpu_dspark_head_test_write_q8_row(
+            model + o.confidence_proj, feature,
+            DS4_DSPARK_HEAD_TEST_FEATURE);
+    }
+    *out = o;
+    return model;
+}
+
+/* Run one case through the exact release descriptor.  Returns 1 on success. */
+static int ds4_gpu_dspark_head_test_run(
+        const ds4_gpu_dspark_head_test_case *c,
+        ds4_gpu_dspark_head_test_result     *result,
+        int                                  break_row_view) {
+    ds4_gpu_dspark_head_test_offsets o;
+    uint8_t *model = ds4_gpu_dspark_head_test_build_model(c, &o);
+    if (!model) return 0;
+    if (!ds4_gpu_set_model_map(model, o.size)) { free(model); return 0; }
+
+    const uint64_t rows = DS4_DSPARK_HEAD_TEST_ROWS;
+    const uint64_t hidden_bytes =
+        rows * DS4_DSPARK_HEAD_TEST_WIDTH * sizeof(float);
+    const uint64_t candidate_bytes =
+        rows * DS4_DSPARK_HEAD_TEST_HC_DIM * sizeof(float);
+    const uint64_t vocab_bytes =
+        (uint64_t)DS4_DSPARK_HEAD_TEST_VOCAB * sizeof(float);
+    const uint64_t markov_bytes =
+        (uint64_t)DS4_DSPARK_HEAD_TEST_MARKOV * sizeof(float);
+
+    ds4_gpu_tensor *candidate = ds4_gpu_tensor_alloc(candidate_bytes);
+    ds4_gpu_tensor *flat_norm = ds4_gpu_tensor_alloc(candidate_bytes);
+    ds4_gpu_tensor *hc_mix = ds4_gpu_tensor_alloc(
+        rows * DS4_DSPARK_HEAD_TEST_HC * sizeof(float));
+    ds4_gpu_tensor *hc_weights = ds4_gpu_tensor_alloc(
+        rows * DS4_DSPARK_HEAD_TEST_HC * sizeof(float));
+    ds4_gpu_tensor *hidden = ds4_gpu_tensor_alloc(hidden_bytes);
+    ds4_gpu_tensor *normalized = ds4_gpu_tensor_alloc(hidden_bytes);
+    ds4_gpu_tensor *logits_row = ds4_gpu_tensor_alloc(vocab_bytes);
+    ds4_gpu_tensor *corrected = ds4_gpu_tensor_alloc(rows * vocab_bytes);
+    ds4_gpu_tensor *markov_emb = ds4_gpu_tensor_alloc(rows * markov_bytes);
+    ds4_gpu_tensor *feature = ds4_gpu_tensor_alloc(
+        rows * DS4_DSPARK_HEAD_TEST_FEATURE * sizeof(float));
+    ds4_gpu_tensor *confidence = ds4_gpu_tensor_alloc(rows * sizeof(float));
+    ds4_gpu_tensor *drafts = ds4_gpu_tensor_alloc(rows * sizeof(int32_t));
+
+    ds4_gpu_dspark_head_descriptor d;
+    memset(&d, 0, sizeof(d));
+    int ok = candidate && flat_norm && hc_mix && hc_weights && hidden &&
+             normalized && logits_row && corrected && markov_emb &&
+             feature && confidence && drafts;
+    for (uint32_t row = 0; ok && row < rows; row++) {
+        d.corrected_row[row] = ds4_gpu_tensor_view(
+            corrected, (uint64_t)row * vocab_bytes, vocab_bytes);
+        d.markov_row[row] = ds4_gpu_tensor_view(
+            markov_emb, (uint64_t)row * markov_bytes, markov_bytes);
+        d.draft_row[row] = ds4_gpu_tensor_view(
+            drafts, (uint64_t)row * sizeof(int32_t), sizeof(int32_t));
+        ok = d.corrected_row[row] && d.markov_row[row] && d.draft_row[row];
+    }
+    if (ok && break_row_view >= 0 && break_row_view < (int)rows) {
+        ds4_gpu_tensor_free(d.markov_row[break_row_view]);
+        d.markov_row[break_row_view] = NULL;
+    }
+
+    if (ok) {
+        float *lanes = calloc((size_t)rows * DS4_DSPARK_HEAD_TEST_HC_DIM,
+                              sizeof(float));
+        ok = lanes != NULL;
+        if (ok) {
+            for (uint32_t row = 0; row < rows; row++) {
+                for (uint32_t lane = 0;
+                     lane < DS4_DSPARK_HEAD_TEST_HC; lane++) {
+                    float *dst = lanes +
+                        ((uint64_t)row * DS4_DSPARK_HEAD_TEST_HC + lane) *
+                            DS4_DSPARK_HEAD_TEST_WIDTH;
+                    for (uint32_t i = 0;
+                         i < DS4_DSPARK_HEAD_TEST_WIDTH; i++) {
+                        dst[i] = c->lane[row][lane];
+                    }
+                }
+            }
+            ok = ds4_gpu_tensor_write(candidate, 0, lanes, candidate_bytes);
+            free(lanes);
+        }
+    }
+    if (ok) {
+        int32_t sentinel[DS4_DSPARK_HEAD_TEST_ROWS];
+        float zero[DS4_DSPARK_HEAD_TEST_ROWS];
+        for (uint32_t row = 0; row < rows; row++) {
+            sentinel[row] = DS4_DSPARK_HEAD_TEST_SENTINEL;
+            zero[row] = 0.0f;
+        }
+        ok = ds4_gpu_tensor_write(drafts, 0, sentinel, sizeof(sentinel)) &&
+             ds4_gpu_tensor_write(confidence, 0, zero, sizeof(zero));
+    }
+
+    if (ok) {
+        d.pending_token_id = c->pending;
+        d.active_rows = c->active_rows;
+        d.vocab_size = DS4_DSPARK_HEAD_TEST_VOCAB;
+        d.markov_rank = DS4_DSPARK_HEAD_TEST_MARKOV;
+        d.norm_eps = 1.0e-6f;
+        d.hc_eps = 1.0e-6f;
+        d.model_map = model;
+        d.model_size = o.size;
+        d.weights.norm = o.norm;
+        d.weights.hc_fn = o.hc_fn;
+        d.weights.hc_scale = o.hc_scale;
+        d.weights.hc_base = o.hc_base;
+        d.weights.markov_w1 = o.markov_w1;
+        d.weights.markov_w2 = o.markov_w2;
+        d.weights.confidence_proj = o.confidence_proj;
+        d.weights.output = o.output;
+        d.candidate = candidate;
+        d.flat_norm = flat_norm;
+        d.hc_mix = hc_mix;
+        d.hc_weights = hc_weights;
+        d.head_hidden = hidden;
+        d.head_normalized = normalized;
+        d.logits_row = logits_row;
+        d.corrected_logits = corrected;
+        d.markov_emb = markov_emb;
+        d.confidence_feat = feature;
+        d.confidence = confidence;
+        d.draft_tokens = drafts;
+        ok = ds4_gpu_dspark_head_execute(&d) != 0;
+    }
+    if (ok && result) {
+        ok = ds4_gpu_tensor_read(hidden, 0, result->hidden, hidden_bytes) &&
+             ds4_gpu_tensor_read(drafts, 0, result->drafts,
+                                 sizeof(result->drafts)) &&
+             ds4_gpu_tensor_read(confidence, 0, result->confidence,
+                                 sizeof(result->confidence));
+    }
+
+    for (uint32_t row = 0; row < rows; row++) {
+        ds4_gpu_tensor_free(d.corrected_row[row]);
+        ds4_gpu_tensor_free(d.markov_row[row]);
+        ds4_gpu_tensor_free(d.draft_row[row]);
+    }
+    ds4_gpu_tensor_free(drafts);
+    ds4_gpu_tensor_free(confidence);
+    ds4_gpu_tensor_free(feature);
+    ds4_gpu_tensor_free(markov_emb);
+    ds4_gpu_tensor_free(corrected);
+    ds4_gpu_tensor_free(logits_row);
+    ds4_gpu_tensor_free(normalized);
+    ds4_gpu_tensor_free(hidden);
+    ds4_gpu_tensor_free(hc_weights);
+    ds4_gpu_tensor_free(hc_mix);
+    ds4_gpu_tensor_free(flat_norm);
+    ds4_gpu_tensor_free(candidate);
+    free(model);
+    return ok;
+}
+
+static void ds4_gpu_dspark_head_test_case_init(
+        ds4_gpu_dspark_head_test_case *c) {
+    memset(c, 0, sizeof(*c));
+    c->active_rows = DS4_DSPARK_HEAD_TEST_ROWS;
+    c->confidence_index = 0;
+    for (uint32_t j = 0; j < DS4_DSPARK_HEAD_TEST_MARKOV; j++) {
+        /* Deterministic non-identity permutation over the vocabulary. */
+        c->chain[j] = (int32_t)((j * 7u + 3u) % DS4_DSPARK_HEAD_TEST_VOCAB);
+        c->tie[j] = -1;
+    }
+}
+
+/* Expected collapse for one row, computed exactly like the frozen oracle. */
+static double ds4_gpu_dspark_head_test_expected_hidden(
+        const ds4_gpu_dspark_head_test_case *c,
+        uint32_t                             row) {
+    double square_sum = 0.0;
+    double flat_sum = 0.0;
+    for (uint32_t lane = 0; lane < DS4_DSPARK_HEAD_TEST_HC; lane++) {
+        const double value = (double)c->lane[row][lane];
+        square_sum += value * value * (double)DS4_DSPARK_HEAD_TEST_WIDTH;
+        flat_sum += value * (double)DS4_DSPARK_HEAD_TEST_WIDTH;
+    }
+    const double inverse_rms = 1.0 / sqrt(
+        square_sum / (double)DS4_DSPARK_HEAD_TEST_HC_DIM + 1.0e-6);
+    const double mix = c->hc_fn_code != 0 ? flat_sum * inverse_rms : 0.0;
+    double collapsed = 0.0;
+    for (uint32_t lane = 0; lane < DS4_DSPARK_HEAD_TEST_HC; lane++) {
+        const double gate = ds4_gpu_dspark_head_test_sigmoid(
+            mix * (double)c->scale + (double)c->base[lane]) + 1.0e-6;
+        collapsed += gate * (double)c->lane[row][lane];
+    }
+    return collapsed;
+}
+
+static int ds4_gpu_dspark_head_test_check_hidden(
+        const ds4_gpu_dspark_head_test_case   *c,
+        const ds4_gpu_dspark_head_test_result *r,
+        const char                            *label) {
+    for (uint32_t row = 0; row < DS4_DSPARK_HEAD_TEST_ROWS; row++) {
+        const double expected =
+            ds4_gpu_dspark_head_test_expected_hidden(c, row);
+        const uint16_t want = ds4_gpu_dspark_head_test_bf16_code(expected);
+        for (uint32_t i = 0; i < DS4_DSPARK_HEAD_TEST_WIDTH; i += 512u) {
+            const float observed =
+                r->hidden[(uint64_t)row * DS4_DSPARK_HEAD_TEST_WIDTH + i];
+            const uint16_t got =
+                ds4_gpu_dspark_head_test_observed_code(observed);
+            const int delta = (int)got - (int)want;
+            if (delta > 1 || delta < -1) {
+                fprintf(stderr,
+                        "ds4: DSpark head %s row %u lane value %u expected "
+                        "bf16 0x%04x observed 0x%04x (%.9g vs %.9g)\n",
+                        label, row, i, want, got, (double)observed, expected);
+                return 0;
+            }
+        }
+    }
+    return 1;
+}
+
+int ds4_gpu_internal_dspark_head_execute_test(void) {
+    if (!g_initialized && !ds4_gpu_init()) return 0;
+    if (g_qwen35_expert_pack.active || g_dspark_expert_pack ||
+        g_batch_cb || [g_pending_cbs count] != 0) return 0;
+
+    ds4_gpu_dspark_head_test_case c;
+    ds4_gpu_dspark_head_test_result r;
+    ds4_gpu_dspark_head_test_result again;
+
+    /* Case 1: the mix is disabled, so every gate is exactly
+     * sigmoid(base[lane]) + eps.  Asymmetric bases make the four gates
+     * distinct and none of them sums to one: a Sinkhorn split or any
+     * normalised weighting cannot reproduce this collapse. */
+    ds4_gpu_dspark_head_test_case_init(&c);
+    c.scale = 0.0f;
+    c.base[0] = -2.0f; c.base[1] = 0.0f; c.base[2] = 1.5f; c.base[3] = 3.0f;
+    c.hc_fn_code = 0;
+    c.pending = 1;
+    for (uint32_t row = 0; row < DS4_DSPARK_HEAD_TEST_ROWS; row++) {
+        for (uint32_t lane = 0; lane < DS4_DSPARK_HEAD_TEST_HC; lane++)
+            c.lane[row][lane] = (float)(row + 1u) * (float)(lane + 1u) * 0.25f;
+    }
+    if (!ds4_gpu_dspark_head_test_run(&c, &r, -1)) return 0;
+    if (!ds4_gpu_dspark_head_test_check_hidden(&c, &r, "gate isolation"))
+        return 0;
+
+    /* The confidence projection selects feature index zero, which is the
+     * collapsed hidden before RMSNorm.  This pins the feature layout. */
+    for (uint32_t row = 0; row < DS4_DSPARK_HEAD_TEST_ROWS; row++) {
+        const uint16_t want = ds4_gpu_dspark_head_test_observed_code(
+            r.hidden[(uint64_t)row * DS4_DSPARK_HEAD_TEST_WIDTH]);
+        const uint16_t got =
+            ds4_gpu_dspark_head_test_bf16_code((double)r.confidence[row]);
+        const int delta = (int)got - (int)want;
+        if (delta > 1 || delta < -1) {
+            fprintf(stderr,
+                    "ds4: DSpark head confidence row %u expected hidden "
+                    "0x%04x observed 0x%04x\n", row, want, got);
+            return 0;
+        }
+    }
+
+    /* Case 2: the same collapse with the mix enabled exercises the inverse
+     * RMS over the flattened 16384-wide row and the exactly four-wide F16
+     * mix.  A head that read a wider mix would consume weights past the
+     * pinned tensor and could not match this expectation. */
+    ds4_gpu_dspark_head_test_case mix = c;
+    mix.hc_fn_code = 1;
+    mix.scale = 0.0001f;
+    if (!ds4_gpu_dspark_head_test_run(&mix, &r, -1)) return 0;
+    if (!ds4_gpu_dspark_head_test_check_hidden(&mix, &r, "mix path"))
+        return 0;
+
+    /* Case 3: the Markov chain is seeded by the pending token, not by any
+     * other identifier.  Base logits are zero, so each drafted token is
+     * exactly chain[previous % rank]. */
+    ds4_gpu_dspark_head_test_case chain_case = c;
+    chain_case.pending = 5;
+    if (!ds4_gpu_dspark_head_test_run(&chain_case, &r, -1)) return 0;
+    int32_t expected_chain[DS4_DSPARK_HEAD_TEST_ROWS];
+    int32_t previous = chain_case.pending;
+    for (uint32_t row = 0; row < DS4_DSPARK_HEAD_TEST_ROWS; row++) {
+        expected_chain[row] =
+            chain_case.chain[previous % DS4_DSPARK_HEAD_TEST_MARKOV];
+        previous = expected_chain[row];
+    }
+    for (uint32_t row = 0; row < DS4_DSPARK_HEAD_TEST_ROWS; row++) {
+        if (r.drafts[row] != expected_chain[row]) {
+            fprintf(stderr,
+                    "ds4: DSpark head chain row %u expected %d observed %d\n",
+                    row, expected_chain[row], r.drafts[row]);
+            return 0;
+        }
+    }
+
+    /* A different pending token must move the whole chain: this is what
+     * distinguishes the pending seed from a fixed sentinel seed. */
+    ds4_gpu_dspark_head_test_case other = chain_case;
+    other.pending = 6;
+    if (!ds4_gpu_dspark_head_test_run(&other, &again, -1)) return 0;
+    if (again.drafts[0] == r.drafts[0]) {
+        fprintf(stderr,
+                "ds4: DSpark head ignored the pending token seed\n");
+        return 0;
+    }
+    if (again.drafts[0] !=
+        other.chain[other.pending % DS4_DSPARK_HEAD_TEST_MARKOV]) {
+        fprintf(stderr, "ds4: DSpark head seeded the chain incorrectly\n");
+        return 0;
+    }
+
+    /* Case 4: an exact tie between two vocabulary entries must resolve to
+     * the lower token id, matching greedy decode. */
+    ds4_gpu_dspark_head_test_case tie = chain_case;
+    const uint32_t seed_slot =
+        (uint32_t)(tie.pending % DS4_DSPARK_HEAD_TEST_MARKOV);
+    tie.chain[seed_slot] = 40;
+    tie.tie[seed_slot] = 9;
+    if (!ds4_gpu_dspark_head_test_run(&tie, &r, -1)) return 0;
+    if (r.drafts[0] != 9) {
+        fprintf(stderr,
+                "ds4: DSpark head tie resolved to %d, expected the lower "
+                "token id 9\n", r.drafts[0]);
+        return 0;
+    }
+
+    /* Case 5: a restricted block drafts only the active rows and leaves the
+     * remaining draft slots untouched. */
+    ds4_gpu_dspark_head_test_case partial = chain_case;
+    partial.active_rows = 2u;
+    if (!ds4_gpu_dspark_head_test_run(&partial, &r, -1)) return 0;
+    for (uint32_t row = 0; row < 2u; row++) {
+        if (r.drafts[row] != expected_chain[row]) {
+            fprintf(stderr,
+                    "ds4: DSpark head active row %u expected %d observed %d\n",
+                    row, expected_chain[row], r.drafts[row]);
+            return 0;
+        }
+    }
+    for (uint32_t row = 2u; row < DS4_DSPARK_HEAD_TEST_ROWS; row++) {
+        if (r.drafts[row] != DS4_DSPARK_HEAD_TEST_SENTINEL) {
+            fprintf(stderr,
+                    "ds4: DSpark head wrote inactive draft row %u\n", row);
+            return 0;
+        }
+    }
+
+    /* Case 6: the confidence feature also carries the Markov embedding of
+     * the previous token, so selecting the first Markov feature publishes a
+     * non-zero logit exactly when that embedding lane is selected. */
+    ds4_gpu_dspark_head_test_case feature_case = chain_case;
+    feature_case.confidence_index = DS4_DSPARK_HEAD_TEST_WIDTH;
+    if (!ds4_gpu_dspark_head_test_run(&feature_case, &r, -1)) return 0;
+    for (uint32_t row = 0; row < DS4_DSPARK_HEAD_TEST_ROWS; row++) {
+        const int32_t token = row == 0u
+            ? feature_case.pending : expected_chain[row - 1u];
+        const float want =
+            (token % DS4_DSPARK_HEAD_TEST_MARKOV) == 0 ? 1.0f : 0.0f;
+        if (r.confidence[row] != want) {
+            fprintf(stderr,
+                    "ds4: DSpark head confidence feature row %u expected "
+                    "%.1f observed %.9g\n", row, (double)want,
+                    (double)r.confidence[row]);
+            return 0;
+        }
+    }
+
+    /* Case 7: a warm rerun of an identical case is byte identical. */
+    if (!ds4_gpu_dspark_head_test_run(&chain_case, &r, -1) ||
+        !ds4_gpu_dspark_head_test_run(&chain_case, &again, -1)) {
+        return 0;
+    }
+    if (memcmp(r.drafts, again.drafts, sizeof(r.drafts)) != 0 ||
+        memcmp(r.confidence, again.confidence,
+               sizeof(r.confidence)) != 0 ||
+        memcmp(r.hidden, again.hidden, sizeof(r.hidden)) != 0) {
+        fprintf(stderr, "ds4: DSpark head rerun was not byte identical\n");
+        return 0;
+    }
+
+    /* Case 8: the descriptor fails closed.  Each of these must be rejected
+     * before any Metal work is encoded. */
+    ds4_gpu_dspark_head_test_case bad = chain_case;
+    bad.active_rows = 0u;
+    if (ds4_gpu_dspark_head_test_run(&bad, NULL, -1)) return 0;
+    bad.active_rows = DS4_DSPARK_HEAD_TEST_ROWS + 1u;
+    if (ds4_gpu_dspark_head_test_run(&bad, NULL, -1)) return 0;
+    bad = chain_case;
+    bad.pending = -1;
+    if (ds4_gpu_dspark_head_test_run(&bad, NULL, -1)) return 0;
+    bad.pending = DS4_DSPARK_HEAD_TEST_VOCAB;
+    if (ds4_gpu_dspark_head_test_run(&bad, NULL, -1)) return 0;
+    if (ds4_gpu_dspark_head_test_run(&chain_case, NULL, 3)) return 0;
+
+    return 1;
 }
 
 #endif

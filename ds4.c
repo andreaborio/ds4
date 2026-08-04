@@ -2965,7 +2965,7 @@ static void model_validate_dspark_0731_metadata(ds4_model *m) {
         }
     }
     if (m->dspark_block_size != 5u ||
-        m->dspark_markov_rank != 256u ||
+        m->dspark_markov_rank != DS4_DSPARK_MARKOV_RANK ||
         m->dspark_noise_token_id != 128799u ||
         m->dspark_stage_count != DS4_DSPARK_0731_STAGE_COUNT ||
         n_layers != DS4_DSPARK_0731_STAGE_COUNT ||
@@ -2975,7 +2975,8 @@ static void model_validate_dspark_0731_metadata(ds4_model *m) {
             DS4_DSPARK_CAPTURE_CONTRACT.target_layer[1] ||
         m->dspark_target_layers[2] !=
             DS4_DSPARK_CAPTURE_CONTRACT.target_layer[2] ||
-        !ds4_dspark_runtime_contract_self_check()) {
+        !ds4_dspark_runtime_contract_self_check() ||
+        !ds4_dspark_head_storage_contract_check(DS4_N_VOCAB)) {
         ds4_die("DSpark support metadata does not match the final 0731 contract");
     }
 
@@ -20223,17 +20224,29 @@ typedef struct {
     /* HC head scratch: RMSNorm + HC + Markov + confidence over the final
      * stage candidate.  base_logits and corrected_logits are the dominant
      * footprint (5 * vocab * 4 bytes each). */
-    ds4_gpu_tensor *dspark_head_flat_norm;
-    ds4_gpu_tensor *dspark_head_hc_mix;
-    ds4_gpu_tensor *dspark_head_hc_split;
-    ds4_gpu_tensor *dspark_head_hc_weights;
-    ds4_gpu_tensor *dspark_head_hidden;
-    ds4_gpu_tensor *dspark_head_normalized;
-    ds4_gpu_tensor *dspark_head_base_logits;
+    /* HC head scratch.  Everything that fits inside an already accounted
+     * prefill batch tensor is an exact-size view and costs no new bytes; the
+     * three real allocations are exactly the ones the DSpark runtime
+     * inventory charges (markov embeddings, one vocabulary row, confidence).
+     * dspark_head_corrected_logits consumes the accounted sampled q
+     * distribution: it holds the base logits and then the corrected block. */
+    ds4_gpu_tensor *dspark_head_flat_norm;      /* view */
+    ds4_gpu_tensor *dspark_head_hc_mix;         /* view */
+    ds4_gpu_tensor *dspark_head_hc_weights;     /* view */
+    ds4_gpu_tensor *dspark_head_hidden;         /* view */
+    ds4_gpu_tensor *dspark_head_normalized;     /* view */
+    ds4_gpu_tensor *dspark_head_confidence_feat;/* view */
     ds4_gpu_tensor *dspark_head_markov_emb;
+    ds4_gpu_tensor *dspark_head_logits_row;
     ds4_gpu_tensor *dspark_head_corrected_logits;
-    ds4_gpu_tensor *dspark_head_confidence_feat;
     ds4_gpu_tensor *dspark_head_confidence;
+    /* Exact per-position views so the head allocates nothing while drafting. */
+    ds4_gpu_tensor
+        *dspark_head_corrected_row[DS4_DSPARK_SUPPORT_CANDIDATE_ROWS];
+    ds4_gpu_tensor
+        *dspark_head_markov_row[DS4_DSPARK_SUPPORT_CANDIDATE_ROWS];
+    ds4_gpu_tensor
+        *dspark_head_draft_row[DS4_DSPARK_SUPPORT_CANDIDATE_ROWS];
     ds4_gpu_dspark_stage_scratch dspark_stage_scratch;
     ds4_dspark_stage_candidate_state dspark_stage_candidate_state;
     ds4_dspark_capture_state dspark_capture_state;
@@ -20819,6 +20832,64 @@ static bool metal_graph_dspark_raw_storage_valid(
     return true;
 }
 
+/* Every HC head tensor is pinned to its exact byte length.  Several Metal
+ * helpers derive their row count from tensor byte length, so an oversized
+ * buffer would silently execute extra rows instead of failing closed. */
+static bool metal_graph_dspark_head_storage_valid(const ds4_gpu_graph *g) {
+    const uint64_t rows = DS4_DSPARK_SUPPORT_CANDIDATE_ROWS;
+    const uint64_t hidden_bytes =
+        (uint64_t)DS4_DSPARK_CAPTURE_WIDTH * sizeof(float);
+    const uint64_t vocab_bytes = (uint64_t)DS4_N_VOCAB * sizeof(float);
+    const uint64_t markov_bytes =
+        (uint64_t)DS4_DSPARK_MARKOV_RANK * sizeof(float);
+    const uint64_t lane_bytes = (uint64_t)DS4_N_HC * sizeof(float);
+    if (!g || DS4_N_HC != 4u ||
+        !g->dspark_head_flat_norm ||
+        ds4_gpu_tensor_bytes(g->dspark_head_flat_norm) !=
+            rows * DS4_N_HC * hidden_bytes ||
+        !g->dspark_head_hc_mix ||
+        ds4_gpu_tensor_bytes(g->dspark_head_hc_mix) != rows * lane_bytes ||
+        !g->dspark_head_hc_weights ||
+        ds4_gpu_tensor_bytes(g->dspark_head_hc_weights) !=
+            rows * lane_bytes ||
+        !g->dspark_head_hidden ||
+        ds4_gpu_tensor_bytes(g->dspark_head_hidden) != rows * hidden_bytes ||
+        !g->dspark_head_normalized ||
+        ds4_gpu_tensor_bytes(g->dspark_head_normalized) !=
+            rows * hidden_bytes ||
+        !g->dspark_head_confidence_feat ||
+        ds4_gpu_tensor_bytes(g->dspark_head_confidence_feat) !=
+            rows * (uint64_t)DS4_DSPARK_CONFIDENCE_FEATURE_WIDTH *
+                sizeof(float) ||
+        !g->dspark_head_markov_emb ||
+        ds4_gpu_tensor_bytes(g->dspark_head_markov_emb) !=
+            rows * markov_bytes ||
+        !g->dspark_head_logits_row ||
+        ds4_gpu_tensor_bytes(g->dspark_head_logits_row) != vocab_bytes ||
+        !g->dspark_head_corrected_logits ||
+        ds4_gpu_tensor_bytes(g->dspark_head_corrected_logits) !=
+            rows * vocab_bytes ||
+        !g->dspark_head_confidence ||
+        ds4_gpu_tensor_bytes(g->dspark_head_confidence) !=
+            rows * sizeof(float)) {
+        return false;
+    }
+    for (uint32_t row = 0; row < rows; row++) {
+        if (!g->dspark_head_corrected_row[row] ||
+            ds4_gpu_tensor_bytes(g->dspark_head_corrected_row[row]) !=
+                vocab_bytes ||
+            !g->dspark_head_markov_row[row] ||
+            ds4_gpu_tensor_bytes(g->dspark_head_markov_row[row]) !=
+                markov_bytes ||
+            !g->dspark_head_draft_row[row] ||
+            ds4_gpu_tensor_bytes(g->dspark_head_draft_row[row]) !=
+                sizeof(int32_t)) {
+            return false;
+        }
+    }
+    return true;
+}
+
 static bool metal_graph_dspark_proposal_storage_valid(
         const ds4_gpu_graph *g) {
     const uint64_t row_bytes =
@@ -20847,12 +20918,7 @@ static bool metal_graph_dspark_proposal_storage_valid(
             ds4_gpu_tensor_bytes(g->dspark_position_ids) ==
                 (uint64_t)DS4_DSPARK_RAW_FINALIZER_MAX_ROWS *
                     sizeof(int32_t) &&
-            g->dspark_head_flat_norm &&
-            g->dspark_head_hc_mix && g->dspark_head_hc_split &&
-            g->dspark_head_hc_weights && g->dspark_head_hidden &&
-            g->dspark_head_normalized && g->dspark_head_base_logits &&
-            g->dspark_head_markov_emb && g->dspark_head_corrected_logits &&
-            g->dspark_head_confidence_feat && g->dspark_head_confidence;
+            metal_graph_dspark_head_storage_valid(g);
 }
 
 static void metal_graph_dspark_stage_views_free(ds4_gpu_graph *g) {
@@ -20985,6 +21051,94 @@ static bool metal_graph_dspark_stage_views_alloc(ds4_gpu_graph *g) {
 fail:
 #undef DS4_DSPARK_STAGE_VIEW
     metal_graph_dspark_stage_views_free(g);
+    return false;
+}
+
+static void metal_graph_dspark_head_views_free(ds4_gpu_graph *g) {
+    if (!g) return;
+    for (uint32_t row = 0;
+         row < DS4_DSPARK_SUPPORT_CANDIDATE_ROWS; row++) {
+        ds4_gpu_tensor_free(g->dspark_head_draft_row[row]);
+        ds4_gpu_tensor_free(g->dspark_head_markov_row[row]);
+        ds4_gpu_tensor_free(g->dspark_head_corrected_row[row]);
+        g->dspark_head_draft_row[row] = NULL;
+        g->dspark_head_markov_row[row] = NULL;
+        g->dspark_head_corrected_row[row] = NULL;
+    }
+    ds4_gpu_tensor_free(g->dspark_head_confidence_feat);
+    ds4_gpu_tensor_free(g->dspark_head_normalized);
+    ds4_gpu_tensor_free(g->dspark_head_hidden);
+    ds4_gpu_tensor_free(g->dspark_head_hc_weights);
+    ds4_gpu_tensor_free(g->dspark_head_hc_mix);
+    ds4_gpu_tensor_free(g->dspark_head_flat_norm);
+    g->dspark_head_confidence_feat = NULL;
+    g->dspark_head_normalized = NULL;
+    g->dspark_head_hidden = NULL;
+    g->dspark_head_hc_weights = NULL;
+    g->dspark_head_hc_mix = NULL;
+    g->dspark_head_flat_norm = NULL;
+}
+
+/* Bind every HC head tensor that fits inside an already accounted prefill
+ * batch tensor as an exact-size view, plus the per-position views the head
+ * needs while drafting.  Nothing here allocates device memory, so the DSpark
+ * runtime inventory stays exact.  The owners are the same ones the stage
+ * scratch borrows: by the time the head runs, its own stage has published and
+ * the only live head input is the separately allocated candidate shadow. */
+static bool metal_graph_dspark_head_views_alloc(
+        ds4_gpu_graph *g,
+        uint64_t       vocab) {
+    enum {
+        ROWS = DS4_DSPARK_SUPPORT_CANDIDATE_ROWS,
+        HIDDEN = DS4_DSPARK_CAPTURE_WIDTH,
+        HC = 4,
+        MARKOV = DS4_DSPARK_MARKOV_RANK,
+        FEATURE = DS4_DSPARK_CONFIDENCE_FEATURE_WIDTH,
+    };
+    if (!g || vocab == 0 || g->dspark_head_flat_norm ||
+        !g->dspark_head_markov_emb || !g->dspark_head_corrected_logits ||
+        !g->dspark_head_confidence) {
+        return false;
+    }
+#define DS4_DSPARK_HEAD_VIEW(field, owner, values) do {                     \
+        g->field = metal_graph_dspark_stage_view(                           \
+            (owner), (uint64_t)(values) * sizeof(float));                   \
+        if (!g->field) goto fail;                                           \
+    } while (0)
+    DS4_DSPARK_HEAD_VIEW(dspark_head_flat_norm, g->batch_flat_hc,
+                         ROWS * HC * HIDDEN);
+    DS4_DSPARK_HEAD_VIEW(dspark_head_hc_mix, g->batch_hc_mix, ROWS * HC);
+    DS4_DSPARK_HEAD_VIEW(dspark_head_hc_weights, g->batch_hc_split,
+                         ROWS * HC);
+    DS4_DSPARK_HEAD_VIEW(dspark_head_hidden, g->batch_attn_cur,
+                         ROWS * HIDDEN);
+    DS4_DSPARK_HEAD_VIEW(dspark_head_normalized, g->batch_attn_norm,
+                         ROWS * HIDDEN);
+    DS4_DSPARK_HEAD_VIEW(dspark_head_confidence_feat, g->batch_q,
+                         ROWS * FEATURE);
+#undef DS4_DSPARK_HEAD_VIEW
+    for (uint32_t row = 0; row < (uint32_t)ROWS; row++) {
+        g->dspark_head_corrected_row[row] = ds4_gpu_tensor_view(
+            g->dspark_head_corrected_logits,
+            (uint64_t)row * vocab * sizeof(float),
+            vocab * sizeof(float));
+        g->dspark_head_markov_row[row] = ds4_gpu_tensor_view(
+            g->dspark_head_markov_emb,
+            (uint64_t)row * MARKOV * sizeof(float),
+            (uint64_t)MARKOV * sizeof(float));
+        g->dspark_head_draft_row[row] = ds4_gpu_tensor_view(
+            g->dspark_draft_tokens,
+            (uint64_t)row * sizeof(int32_t), sizeof(int32_t));
+        if (!g->dspark_head_corrected_row[row] ||
+            !g->dspark_head_markov_row[row] ||
+            !g->dspark_head_draft_row[row]) {
+            goto fail;
+        }
+    }
+    return true;
+
+fail:
+    metal_graph_dspark_head_views_free(g);
     return false;
 }
 
@@ -21438,6 +21592,179 @@ static bool metal_graph_dspark_stage_candidate_discard(
                     &g->dspark_stage_candidate_state, cookie);
 }
 
+/* Exactly the frozen sigmoid the confidence oracle uses, evaluated in double
+ * and published as the float32 probability the accept prefix compares.  The
+ * translation unit is compiled with -ffast-math, so two rules apply: the two
+ * halves must stay separated by their sign test and must not be algebraically
+ * rearranged (one ULP moves an accept boundary), and the non-finite test must
+ * be a bit-pattern test, because -ffast-math is free to fold isfinite() to a
+ * constant. */
+static float dspark_confidence_probability(float logit) {
+    uint32_t bits = 0;
+    memcpy(&bits, &logit, sizeof(bits));
+    if ((bits & UINT32_C(0x7f800000)) == UINT32_C(0x7f800000)) return -1.0f;
+    const double value = (double)logit;
+    if (value >= 0.0) return (float)(1.0 / (1.0 + exp(-value)));
+    const double positive = exp(value);
+    return (float)(positive / (1.0 + positive));
+}
+
+/* Three-stage DSpark proposal: serialize stages 0->1->2, then run the HC
+ * head (Markov correction and confidence).  Each stage publishes into the
+ * candidate shadow; the published bytes, never the executor scratch, become
+ * the next stage's hidden input and finally the head input.
+ *
+ * The candidate publication state owns a single slot, so a stage's cookie
+ * must be consumed before the next stage may begin.  That is not a
+ * limitation to route around: the three stages share one candidate buffer,
+ * so at most one publication can be truthful at a time.  The final stage's
+ * cookie is deliberately held across the head, which both blocks a
+ * concurrent begin and keeps the consumed bytes observable.
+ *
+ * Returns the number of draft tokens accepted by confidence scheduling
+ * (0..active_rows), or -1 on failure.  Output entries at or beyond the
+ * return value are not written.
+ *
+ * This function is production-private and unreachable from session,
+ * admission, CLI and server.  The caller must already own a fully
+ * initialized combined graph, an installed SUPPORT pack, bound 0731 weights
+ * and a committed raw context whose ready frontier covers position0. */
+static int metal_graph_dspark_proposal_execute_private(
+        ds4_gpu_graph            *g,
+        const ds4_model          *model,
+        const ds4_weights        *target_weights,
+        const ds4_dspark_weights *weights,
+        uint32_t                  position0,
+        int32_t                   pending_token_id,
+        uint32_t                  active_rows,
+        float                     confidence_threshold,
+        int32_t                  *draft_tokens_out,
+        float                    *confidence_out) {
+    if (!g || !model || !target_weights || !weights ||
+        !draft_tokens_out || !confidence_out ||
+        position0 > UINT32_MAX - 4u) return -1;
+    if (active_rows == 0u ||
+        active_rows > DS4_DSPARK_SUPPORT_CANDIDATE_ROWS) return -1;
+    if (pending_token_id < 0 ||
+        (uint64_t)pending_token_id >= (uint64_t)DS4_N_VOCAB) return -1;
+    if (!(confidence_threshold >= 0.0f) ||
+        !(confidence_threshold <= 1.0f)) return -1;
+    if (model->dspark_markov_rank != DS4_DSPARK_MARKOV_RANK) return -1;
+    if (ds4_gpu_commands_active() != 0 ||
+        g->dspark_raw_context_state.in_progress) return -1;
+
+    const uint64_t hidden_bytes =
+        (uint64_t)DS4_DSPARK_SUPPORT_CANDIDATE_ROWS *
+        DS4_N_HC * DS4_N_EMBD * sizeof(float);
+    if (!g->dspark_draft_hc || !g->dspark_stage_hidden_input_view ||
+        ds4_gpu_tensor_bytes(g->dspark_draft_hc) != hidden_bytes ||
+        ds4_gpu_tensor_bytes(g->dspark_stage_hidden_input_view) !=
+            hidden_bytes) {
+        return -1;
+    }
+
+    uint64_t cookie = 0u;
+    for (uint32_t stage = 0;
+         stage + 1u < DS4_DSPARK_0731_STAGE_COUNT; stage++) {
+        if (!metal_graph_dspark_stage_execute_private(
+                g, model, weights, stage, position0, &cookie)) {
+            return -1;
+        }
+        /* Chain the published shadow, not the executor scratch: a failed
+         * publication blit may have touched the scratch bytes. */
+        int ok = ds4_gpu_begin_commands() &&
+                 ds4_gpu_tensor_copy(
+                     g->dspark_stage_hidden_input_view, 0,
+                     g->dspark_draft_hc, 0, hidden_bytes);
+        if (ds4_gpu_commands_active()) {
+            const int end_ok = ds4_gpu_end_commands();
+            ok = end_ok && ok;
+        }
+        if (!metal_graph_dspark_stage_candidate_discard(g, cookie)) {
+            ds4_dspark_stage_candidate_state_invalidate(
+                &g->dspark_stage_candidate_state);
+            return -1;
+        }
+        if (!ok) return -1;
+    }
+
+    const uint32_t final_stage = DS4_DSPARK_0731_STAGE_COUNT - 1u;
+    if (!metal_graph_dspark_stage_execute_private(
+            g, model, weights, final_stage, position0, &cookie)) {
+        return -1;
+    }
+
+    /* Run the HC head over the published final-stage candidate. */
+    ds4_gpu_dspark_head_descriptor head = {0};
+    head.pending_token_id = pending_token_id;
+    head.active_rows = active_rows;
+    head.vocab_size = DS4_N_VOCAB;
+    head.markov_rank = model->dspark_markov_rank;
+    head.norm_eps = DS4_RMS_EPS;
+    head.hc_eps = DS4_HC_EPS;
+    head.model_map = model->map;
+    head.model_size = model->size;
+    head.weights.norm = weights->norm->abs_offset;
+    head.weights.hc_fn = weights->hc_head_fn->abs_offset;
+    head.weights.hc_scale = weights->hc_head_scale->abs_offset;
+    head.weights.hc_base = weights->hc_head_base->abs_offset;
+    head.weights.markov_w1 = weights->markov_w1->abs_offset;
+    head.weights.markov_w2 = weights->markov_w2->abs_offset;
+    head.weights.confidence_proj = weights->confidence_proj->abs_offset;
+    head.weights.output = target_weights->output->abs_offset;
+    head.candidate = g->dspark_draft_hc;
+    head.flat_norm = g->dspark_head_flat_norm;
+    head.hc_mix = g->dspark_head_hc_mix;
+    head.hc_weights = g->dspark_head_hc_weights;
+    head.head_hidden = g->dspark_head_hidden;
+    head.head_normalized = g->dspark_head_normalized;
+    head.logits_row = g->dspark_head_logits_row;
+    head.corrected_logits = g->dspark_head_corrected_logits;
+    head.markov_emb = g->dspark_head_markov_emb;
+    head.confidence_feat = g->dspark_head_confidence_feat;
+    head.confidence = g->dspark_head_confidence;
+    head.draft_tokens = g->dspark_draft_tokens;
+    for (uint32_t row = 0;
+         row < DS4_DSPARK_SUPPORT_CANDIDATE_ROWS; row++) {
+        head.corrected_row[row] = g->dspark_head_corrected_row[row];
+        head.markov_row[row] = g->dspark_head_markov_row[row];
+        head.draft_row[row] = g->dspark_head_draft_row[row];
+    }
+
+    int result = -1;
+    int32_t drafts[DS4_DSPARK_SUPPORT_CANDIDATE_ROWS];
+    float conf[DS4_DSPARK_SUPPORT_CANDIDATE_ROWS];
+    if (ds4_gpu_dspark_head_execute(&head) &&
+        ds4_gpu_tensor_read(
+            g->dspark_draft_tokens, 0, drafts, sizeof(drafts)) &&
+        ds4_gpu_tensor_read(
+            g->dspark_head_confidence, 0, conf, sizeof(conf))) {
+        /* Confidence scheduling keeps the prefix before the first
+         * probability strictly below the threshold. */
+        int accepted = 0;
+        for (uint32_t row = 0; row < active_rows; row++) {
+            const float probability =
+                dspark_confidence_probability(conf[row]);
+            if (!(probability >= 0.0f) || probability < confidence_threshold ||
+                drafts[row] < 0 ||
+                (uint64_t)drafts[row] >= (uint64_t)DS4_N_VOCAB) {
+                break;
+            }
+            draft_tokens_out[row] = drafts[row];
+            confidence_out[row] = probability;
+            accepted++;
+        }
+        result = accepted;
+    }
+
+    if (!metal_graph_dspark_stage_candidate_discard(g, cookie)) {
+        ds4_dspark_stage_candidate_state_invalidate(
+            &g->dspark_stage_candidate_state);
+        result = -1;
+    }
+    return result;
+}
+
 static bool metal_graph_dspark_raw_finalizer_code_present(void) {
     uint64_t source = 0;
     uint64_t destination = 0;
@@ -21446,9 +21773,14 @@ static bool metal_graph_dspark_raw_finalizer_code_present(void) {
         return false;
     }
     uint64_t cookie = 0u;
+    int32_t draft_scratch = 0;
+    float conf_scratch = 0.0f;
     if (metal_graph_dspark_stage_execute_private(
             NULL, NULL, NULL, 0u, 0u, &cookie) ||
-        metal_graph_dspark_stage_candidate_discard(NULL, 0u)) {
+        metal_graph_dspark_stage_candidate_discard(NULL, 0u) ||
+        metal_graph_dspark_proposal_execute_private(
+            NULL, NULL, NULL, NULL, 0u, 0, 1u, 0.0f,
+            &draft_scratch, &conf_scratch) != -1) {
         return false;
     }
     if (!metal_graph_dspark_raw_pack_offsets(
@@ -21632,18 +21964,13 @@ static void metal_graph_free(ds4_gpu_graph *g) {
     ds4_gpu_tensor_free(g->dspark_stage_input_hc);
     ds4_gpu_tensor_free(g->dspark_target_hc);
     ds4_gpu_tensor_free(g->dspark_draft_hc);
+    /* Views first: they borrow storage that the allocations below own. */
+    metal_graph_dspark_head_views_free(g);
     ds4_gpu_tensor_free(g->dspark_draft_tokens);
     ds4_gpu_tensor_free(g->dspark_head_confidence);
-    ds4_gpu_tensor_free(g->dspark_head_confidence_feat);
     ds4_gpu_tensor_free(g->dspark_head_corrected_logits);
+    ds4_gpu_tensor_free(g->dspark_head_logits_row);
     ds4_gpu_tensor_free(g->dspark_head_markov_emb);
-    ds4_gpu_tensor_free(g->dspark_head_base_logits);
-    ds4_gpu_tensor_free(g->dspark_head_normalized);
-    ds4_gpu_tensor_free(g->dspark_head_hidden);
-    ds4_gpu_tensor_free(g->dspark_head_hc_weights);
-    ds4_gpu_tensor_free(g->dspark_head_hc_split);
-    ds4_gpu_tensor_free(g->dspark_head_hc_mix);
-    ds4_gpu_tensor_free(g->dspark_head_flat_norm);
     metal_graph_dspark_workspace_free(&g->dspark_workspace);
     for (uint32_t stage = 0;
          stage < DS4_DSPARK_CAPTURE_STAGE_COUNT; stage++) {
@@ -22837,37 +23164,20 @@ static bool metal_graph_alloc_raw_cap(
             g->dspark_raw_ring[stage] = ds4_gpu_tensor_alloc(
                 raw_ring_bytes);
         }
-        /* HC head scratch tensors.  base_logits and corrected_logits
-         * dominate the footprint (5 * DS4_N_VOCAB * sizeof(float) each). */
+        /* HC head storage.  Only the three inventory-charged buffers plus the
+         * accounted sampled q distribution are allocated; every other head
+         * tensor is an exact-size view into an existing prefill batch tensor,
+         * exactly as the stage scratch does.  Exact sizes matter: several
+         * Metal helpers derive their row count from tensor byte length. */
         const uint64_t dspark_vocab = DS4_N_VOCAB;
-        const uint64_t head_hidden_bytes =
-            (uint64_t)DS4_DSPARK_SUPPORT_CANDIDATE_ROWS *
-            DS4_DSPARK_CAPTURE_WIDTH * sizeof(float);
-        g->dspark_head_flat_norm = ds4_gpu_tensor_alloc(head_hidden_bytes);
-        g->dspark_head_hc_mix = ds4_gpu_tensor_alloc(
-            (uint64_t)DS4_DSPARK_SUPPORT_CANDIDATE_ROWS * 24u * sizeof(float));
-        g->dspark_head_hc_split = ds4_gpu_tensor_alloc(
-            (uint64_t)DS4_DSPARK_SUPPORT_CANDIDATE_ROWS * 24u * sizeof(float));
-        g->dspark_head_hc_weights = ds4_gpu_tensor_alloc(
-            (uint64_t)DS4_DSPARK_SUPPORT_CANDIDATE_ROWS *
-            DS4_N_HC * sizeof(float));
-        g->dspark_head_hidden = ds4_gpu_tensor_alloc(
-            (uint64_t)DS4_DSPARK_SUPPORT_CANDIDATE_ROWS *
-            DS4_DSPARK_CAPTURE_WIDTH * sizeof(float));
-        g->dspark_head_normalized = ds4_gpu_tensor_alloc(
-            (uint64_t)DS4_DSPARK_SUPPORT_CANDIDATE_ROWS *
-            DS4_DSPARK_CAPTURE_WIDTH * sizeof(float));
-        g->dspark_head_base_logits = ds4_gpu_tensor_alloc(
-            (uint64_t)DS4_DSPARK_SUPPORT_CANDIDATE_ROWS *
-            dspark_vocab * sizeof(float));
         g->dspark_head_markov_emb = ds4_gpu_tensor_alloc(
-            (uint64_t)DS4_DSPARK_SUPPORT_CANDIDATE_ROWS * 256u * sizeof(float));
+            (uint64_t)DS4_DSPARK_SUPPORT_CANDIDATE_ROWS *
+            DS4_DSPARK_MARKOV_RANK * sizeof(float));
+        g->dspark_head_logits_row = ds4_gpu_tensor_alloc(
+            dspark_vocab * sizeof(float));
         g->dspark_head_corrected_logits = ds4_gpu_tensor_alloc(
             (uint64_t)DS4_DSPARK_SUPPORT_CANDIDATE_ROWS *
             dspark_vocab * sizeof(float));
-        g->dspark_head_confidence_feat = ds4_gpu_tensor_alloc(
-            (uint64_t)DS4_DSPARK_SUPPORT_CANDIDATE_ROWS *
-            (DS4_DSPARK_CAPTURE_WIDTH + 256u) * sizeof(float));
         g->dspark_head_confidence = ds4_gpu_tensor_alloc(
             (uint64_t)DS4_DSPARK_SUPPORT_CANDIDATE_ROWS * sizeof(float));
     }
@@ -22939,8 +23249,11 @@ static bool metal_graph_alloc_raw_cap(
     g->batch_routed_down = ds4_gpu_tensor_alloc(pc * DS4_N_EXPERT_USED * DS4_N_EMBD * sizeof(float));
     g->batch_routed_out = ds4_gpu_tensor_alloc(pc * DS4_N_EMBD * sizeof(float));
 
+    /* Both view sets borrow the prefill batch tensors allocated just above,
+     * so they must be bound after them and never before. */
     const bool dspark_stage_views_ok = !enable_dspark ||
-        metal_graph_dspark_stage_views_alloc(g);
+        (metal_graph_dspark_stage_views_alloc(g) &&
+         metal_graph_dspark_head_views_alloc(g, DS4_N_VOCAB));
 
     bool layer_cache_ok = true;
     for (uint32_t il = 0; layer_cache_ok && il < DS4_N_LAYER; il++) {

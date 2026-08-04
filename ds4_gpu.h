@@ -1371,41 +1371,63 @@ typedef struct {
 int ds4_gpu_dspark_stage_execute_candidate(
         const ds4_gpu_dspark_stage_descriptor *stage);
 
-/* DSpark HC head: RMSNorm + HC + Markov + confidence over the final stage
- * candidate.  Produces draft logits and per-position confidence. */
+/* DSpark HC head: final-0731 HC collapse, RMSNorm, target output projection,
+ * sequential Markov correction and confidence over the published candidate.
+ *
+ * The collapse is the same operation the qualified target output head uses:
+ * one inverse-RMS over the flattened four-lane row, a [hc_dim, n_hc] F16 mix,
+ * independent sigmoid gates plus epsilon, and a weighted sum of the RAW lanes.
+ * The gates are not a distribution: they neither sum to one nor pass through
+ * Sinkhorn.  See output_hc_head_one() and metal_graph_encode_output_head_mtp()
+ * for the target-side equivalent, and hc_head() in the frozen oracle. */
 typedef struct {
     uint64_t norm;             /* F32 [4096] */
     uint64_t hc_fn;            /* F16 [16384, 4] */
     uint64_t hc_scale;         /* F32 [1] */
     uint64_t hc_base;          /* F32 [4] */
-    uint64_t markov_w1;        /* Q8_0 [vocab, markov_rank] */
+    uint64_t markov_w1;        /* Q8_0 [markov_rank, vocab] */
     uint64_t markov_w2;        /* Q8_0 [markov_rank, vocab] */
     uint64_t confidence_proj;  /* Q8_0 [4096+markov_rank, 1] */
     uint64_t output;           /* Q8_0 target model output projection */
-    uint64_t token_embd;      /* token embedding table */
 } ds4_gpu_dspark_head_offsets;
 
 typedef struct {
-    uint32_t position0;
-    int32_t noise_token_id;
+    /* y[p+1]: the pending target token seeds the sequential Markov chain.
+     * The five drafted tokens are outputs p+2 .. p+6. */
+    int32_t pending_token_id;
+    /* 1..5 drafted candidate rows.  This is head scoped: it bounds the
+     * sequential Markov chain, the confidence rows and therefore the accepted
+     * prefix.  It does NOT yet shrink stage work.  The stage executor still
+     * routes and evaluates all five rows, so SUPPORT record traffic per
+     * proposal is unchanged by a smaller value.  Restricting the final stage
+     * is a separate, measurement-gated change: only the last stage may be
+     * restricted at all, because DSpark attention is non-causal across the
+     * five candidate rows and earlier stages must publish all of them. */
+    uint32_t active_rows;
     uint32_t vocab_size;
     uint32_t markov_rank;
+    float norm_eps;
+    float hc_eps;
     const void *model_map;
     uint64_t model_size;
     ds4_gpu_dspark_head_offsets weights;
-    const ds4_gpu_tensor *candidate;   /* [5, 4, 4096] */
-    ds4_gpu_tensor *flat_norm;         /* [5, 4, 4096] */
-    ds4_gpu_tensor *hc_mix;            /* [5, 24] */
-    ds4_gpu_tensor *hc_split;          /* [5, 24] */
+    const ds4_gpu_tensor *candidate;   /* [5, 4, 4096] published shadow */
+    ds4_gpu_tensor *flat_norm;         /* [5, 4 * 4096] */
+    ds4_gpu_tensor *hc_mix;            /* [5, 4] */
     ds4_gpu_tensor *hc_weights;        /* [5, 4] */
-    ds4_gpu_tensor *head_hidden;       /* [5, 4096] */
+    ds4_gpu_tensor *head_hidden;       /* [5, 4096], collapse before RMSNorm */
     ds4_gpu_tensor *head_normalized;   /* [5, 4096] */
-    ds4_gpu_tensor *base_logits;       /* [5, vocab] */
+    ds4_gpu_tensor *logits_row;        /* [vocab], one Markov bias row */
+    ds4_gpu_tensor *corrected_logits;  /* [5, vocab], base then corrected */
     ds4_gpu_tensor *markov_emb;        /* [5, markov_rank] */
-    ds4_gpu_tensor *corrected_logits;  /* [5, vocab] */
     ds4_gpu_tensor *confidence_feat;   /* [5, 4096+markov_rank] */
     ds4_gpu_tensor *confidence;        /* [5] */
     ds4_gpu_tensor *draft_tokens;      /* [5] int32 */
+    /* Exact per-position views owned by the caller's graph.  The head must
+     * not allocate a tensor view on the decode hot path. */
+    ds4_gpu_tensor *corrected_row[5];
+    ds4_gpu_tensor *markov_row[5];
+    ds4_gpu_tensor *draft_row[5];
 } ds4_gpu_dspark_head_descriptor;
 
 int ds4_gpu_dspark_head_execute(
@@ -1948,6 +1970,8 @@ int ds4_gpu_internal_dspark_three_stage_proposal_test(void);
 int ds4_gpu_internal_dspark_router_f32_test(void);
 /* Direct physical production stage-0 executor fixture. */
 int ds4_gpu_internal_dspark_stage_executor_test(void);
+
+int ds4_gpu_internal_dspark_head_execute_test(void);
 #endif
 
 /* =========================================================================

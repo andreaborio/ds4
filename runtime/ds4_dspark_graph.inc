@@ -15,6 +15,12 @@ enum {
     DS4_DSPARK_SUPPORT_TOP_K = 6,
     DS4_DSPARK_SUPPORT_EXPERT_COUNT = 256,
     DS4_DSPARK_SUPPORT_CANDIDATE_ROWS = 5,
+    /* Pinned final-0731 head geometry.  Admission rejects any support model
+     * whose declared rank differs, so the graph may size head storage from
+     * this constant before a model pointer is available. */
+    DS4_DSPARK_MARKOV_RANK = 256,
+    DS4_DSPARK_CONFIDENCE_FEATURE_WIDTH =
+        DS4_DSPARK_CAPTURE_WIDTH + DS4_DSPARK_MARKOV_RANK,
     /* The target verifier sees pending + five draft rows.  Row five is
      * verifier-only and never expands the five-row DSpark candidate block. */
     DS4_DSPARK_RAW_FINALIZER_MAX_ROWS =
@@ -3714,6 +3720,128 @@ static bool ds4_dspark_cache_plan_make(
     return true;
 }
 
+/* Freeze the exact publication sequence a three-stage proposal must follow.
+ *
+ * The candidate state owns a single slot and the three stages share one
+ * candidate buffer, so a truthful proposal consumes each stage's publication
+ * before starting the next.  This check proves both halves: the sequence the
+ * proposal uses succeeds end to end, and the alternative that keeps earlier
+ * cookies alive is rejected at the second begin rather than silently
+ * producing a stale publication. */
+static bool ds4_dspark_stage_chain_sequence_self_check(void) {
+    ds4_dspark_stage_candidate_state state;
+    ds4_dspark_stage_route_plan route;
+    ds4_dspark_stage_candidate_publication publication;
+    int32_t expert_id[DS4_DSPARK_SUPPORT_CANDIDATE_ROWS]
+                     [DS4_DSPARK_SUPPORT_TOP_K];
+    float weight[DS4_DSPARK_SUPPORT_CANDIDATE_ROWS]
+                [DS4_DSPARK_SUPPORT_TOP_K];
+    /* Powers of two summing to exactly the pinned route scale 1.5, so the
+     * synthetic plan satisfies the same authentication a real router output
+     * must satisfy without relying on any rounding envelope. */
+    static const float kRouteWeights[DS4_DSPARK_SUPPORT_TOP_K] = {
+        0.5f, 0.25f, 0.25f, 0.25f, 0.125f, 0.125f
+    };
+    for (uint32_t row = 0;
+         row < DS4_DSPARK_SUPPORT_CANDIDATE_ROWS; row++) {
+        for (uint32_t slot = 0; slot < DS4_DSPARK_SUPPORT_TOP_K; slot++) {
+            expert_id[row][slot] = (int32_t)(row * 8u + slot);
+            weight[row][slot] = kRouteWeights[slot];
+        }
+    }
+    if (!ds4_dspark_stage_route_plan_make(
+            &expert_id[0][0], &weight[0][0], &route)) {
+        return false;
+    }
+
+    /* The sequence the proposal performs. */
+    ds4_dspark_stage_candidate_state_init(&state);
+    uint64_t previous_cookie = 0u;
+    for (uint32_t stage = 0;
+         stage < DS4_DSPARK_CAPTURE_STAGE_COUNT; stage++) {
+        uint64_t cookie = 0u;
+        if (!ds4_dspark_stage_candidate_state_begin(&state, stage, &cookie) ||
+            cookie == 0u || cookie == previous_cookie ||
+            !ds4_dspark_stage_candidate_state_set_shadow(
+                &state, cookie, &route) ||
+            !ds4_dspark_stage_candidate_state_publish(&state, cookie) ||
+            !ds4_dspark_stage_candidate_state_ready(
+                &state, cookie, &publication) ||
+            publication.stage != stage ||
+            publication.cookie != cookie) {
+            return false;
+        }
+        /* A stale cookie must never resolve, even while the slot is ready. */
+        if (previous_cookie != 0u &&
+            ds4_dspark_stage_candidate_state_ready(
+                &state, previous_cookie, &publication)) {
+            return false;
+        }
+        if (!ds4_dspark_stage_candidate_state_consume(&state, cookie) ||
+            ds4_dspark_stage_candidate_state_consume(&state, cookie)) {
+            return false;
+        }
+        previous_cookie = cookie;
+    }
+
+    /* Holding a publication across the next begin must fail closed: this is
+     * the defect the single-slot contract exists to prevent. */
+    ds4_dspark_stage_candidate_state_init(&state);
+    uint64_t held = 0u;
+    uint64_t second = 0u;
+    if (!ds4_dspark_stage_candidate_state_begin(&state, 0u, &held) ||
+        !ds4_dspark_stage_candidate_state_set_shadow(&state, held, &route) ||
+        !ds4_dspark_stage_candidate_state_publish(&state, held) ||
+        ds4_dspark_stage_candidate_state_begin(&state, 1u, &second) ||
+        second != 0u) {
+        return false;
+    }
+    /* After the held publication is consumed the next stage may begin. */
+    if (!ds4_dspark_stage_candidate_state_consume(&state, held) ||
+        !ds4_dspark_stage_candidate_state_begin(&state, 1u, &second) ||
+        second == 0u || second == held) {
+        return false;
+    }
+    if (!ds4_dspark_stage_candidate_state_abort(&state, second) ||
+        state.phase != DS4_DSPARK_STAGE_CANDIDATE_EMPTY) {
+        return false;
+    }
+    return true;
+}
+
+/* Every HC head allocation must already be charged by the runtime inventory.
+ *
+ * The head owns exactly four real allocations.  Three are the greedy head
+ * scratch the inventory reserves (Markov embeddings, one vocabulary row, the
+ * confidence column) and the fourth reuses the accounted sampled q
+ * distribution, which is what the corrected block becomes for the sampled
+ * lane.  Everything else the head touches is a view into storage that is
+ * already accounted, so it adds no bytes.  Admission charges before it
+ * executes, so a head that allocated outside this set would spend a budget
+ * the plan never reserved: this check makes that fail closed instead. */
+static bool ds4_dspark_head_storage_contract_check(uint64_t vocab) {
+    ds4_dspark_runtime_memory memory;
+    if (vocab == 0u || !ds4_dspark_runtime_memory_make(&memory)) return false;
+    const uint64_t rows = DS4_DSPARK_SUPPORT_CANDIDATE_ROWS;
+    const uint64_t markov_bytes =
+        rows * DS4_DSPARK_MARKOV_RANK * sizeof(float);
+    const uint64_t logits_row_bytes = vocab * sizeof(float);
+    const uint64_t confidence_bytes = rows * sizeof(float);
+    const uint64_t corrected_bytes = rows * vocab * sizeof(float);
+    const uint64_t greedy_charged =
+        ds4_dspark_metal_page_charge(markov_bytes) +
+        ds4_dspark_metal_page_charge(logits_row_bytes) +
+        ds4_dspark_metal_page_charge(confidence_bytes);
+    /* This equivalence is page granular, so a small-tensor drift that stays
+     * inside one 16 KiB page (for example a Markov rank change) does not trip
+     * it.  That drift is caught byte exactly elsewhere: metadata admission
+     * pins the model rank against DS4_DSPARK_MARKOV_RANK, and the graph-time
+     * validator pins every head tensor to its exact byte length. */
+    return greedy_charged == memory.greedy_head_scratch_page_bytes &&
+           ds4_dspark_metal_page_charge(corrected_bytes) ==
+               memory.sampled_q_distribution_page_bytes;
+}
+
 static bool ds4_dspark_runtime_contract_self_check(void) {
     uint32_t slot = UINT32_MAX;
     ds4_dspark_cache_plan target_only;
@@ -3749,6 +3877,7 @@ static bool ds4_dspark_runtime_contract_self_check(void) {
            DS4_DSPARK_CAPTURE_CONTRACT.hc_lanes == 4u &&
            verifier_frontier_ok &&
            stage_candidate_ok &&
+           ds4_dspark_stage_chain_sequence_self_check() &&
            !ds4_dspark_capture_slot_after_layer(39u, &slot) &&
            ds4_dspark_capture_slot_after_layer(40u, &slot) && slot == 0u &&
            ds4_dspark_capture_slot_after_layer(41u, &slot) && slot == 1u &&
