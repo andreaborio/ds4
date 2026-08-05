@@ -76,3 +76,52 @@ il vecchio verificatore esatto (ancora fail-closed sotto streaming).
 Fallimento del verificatore batched = **errore duro**: lo stato KV è già
 avanzato su entrambe le righe e non c'è snapshot per tornare indietro, quindi
 proseguire produrrebbe esattamente la corruzione silenziosa da cui partivamo.
+
+---
+
+## Dove stanno i 54.7 ms — misurato (fasi del verificatore)
+
+Strumentate le quattro fasi di `metal_graph_verify_suffix_tops`
+(`DS4_VERIFY_PHASE_TIMING=1`), mediane su 40 round a 2 righe:
+
+| fase | ms |
+|---|---:|
+| upload token + embedding | 0.01 |
+| **loop dei 43 layer** | **139.52** |
+| testa di output batched | 2.49 |
+| readback logits | 0.00 |
+| totale | 142.0 (il round misurava 141.1) |
+
+**Tutto il costo è nel loop dei layer.** Non è la macchina attorno: upload,
+testa e readback insieme fanno 2.5 ms.
+
+### Il percorso batched non amortizza quasi nulla
+
+139.5 ms per **due righe** contro 77.3 ms per un token sequenziale **intero**
+= 1.80×, dove il conto dei byte predice 1.19×.
+
+Il modello che torna coi numeri misurati: il denso amortizza davvero (29.4 ms
+una volta sola), il routed raddoppia (2×9.1), ma il **lavoro non-peso scala per
+riga**: 38.5 ms/riga di attenzione, indexer, attivazioni e lanci.
+29.4 + 18.2 + 2×38.5 = 124.6 ms contro 139.5 misurati — il grosso è spiegato.
+
+**Il vero blocco della speculazione non sono i pesi: è che metà del costo di un
+token di decode non è streaming di pesi e non si amortizza tra righe.** È anche
+il 50% di ogni token normale, quindi vale ben oltre la speculazione.
+
+### Nota: il percorso batched si rompe a 1 riga
+
+Provato a verificare una riga sola per confrontare i costi con lo stesso
+strumento: `gpu layer 0 ffn batch encode failed` →
+"Metal native expert-major layer 0 is not covered by the current SSD mapping".
+Il batch FFN ha rami dipendenti da `n_tokens`: a 1 riga prende un percorso
+expert-major nativo che pretende una mappatura SSD da prefill. Non è una
+configurazione d'uso reale (il knob diagnostico è stato rimosso), ma va saputo
+prima di riusare il verificatore batched a profondità 1.
+
+## Prossimo passo
+
+Attaccare i 38.5 ms/riga non-peso: attenzione + indexer con sole 2 query contro
+kernel tarati per tile di prefill, più le attivazioni per riga. Se scendessero
+anche solo alla metà, la speculazione passerebbe da 0.94× a ~1.25× **e ogni
+token normale guadagnerebbe**, perché quel costo c'è anche a una riga sola.

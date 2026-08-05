@@ -33063,6 +33063,9 @@ static bool metal_graph_verify_suffix_tops(
         return false;
     }
 
+    static int phase_timing = -1;
+    if (phase_timing < 0) phase_timing = getenv("DS4_VERIFY_PHASE_TIMING") != NULL;
+    const double ph_t0 = phase_timing ? now_sec() : 0.0;
     bool ok = metal_graph_upload_prompt_tokens(g->prefill_tokens, prompt, start, n_tokens);
     if (ok) ok = metal_graph_upload_prompt_embeddings_hc(g->batch_cur_hc,
                                                          g->prefill_tokens,
@@ -33083,6 +33086,7 @@ static bool metal_graph_verify_suffix_tops(
     const bool saved_capture = g->spec_capture_prefix1;
     g->spec_capture_prefix1 = capture_prefix1 && n_tokens == 2;
 
+    const double ph_upload = phase_timing ? now_sec() : 0.0;
     ok = ds4_gpu_begin_commands() != 0;
     for (uint32_t il = 0; ok && il < DS4_N_LAYER; il++) {
         ok = metal_graph_encode_layer_batch(g,
@@ -33104,6 +33108,7 @@ static bool metal_graph_verify_suffix_tops(
         return false;
     }
 
+    const double ph_layers = phase_timing ? now_sec() : 0.0;
     ok = ds4_gpu_begin_commands() != 0;
     if (ok) ok = metal_graph_encode_output_head_batch(g,
                                                       model,
@@ -33137,11 +33142,21 @@ static bool metal_graph_verify_suffix_tops(
                                    row_tops,
                                    (uint64_t)top_rows * sizeof(row_tops[0])) != 0;
     }
+    const double ph_head = phase_timing ? now_sec() : 0.0;
     if (ok && row_logits) {
         ok = ds4_gpu_tensor_read(g->spec_logits,
                                    0,
                                    row_logits,
                                    (uint64_t)n_tokens * DS4_N_VOCAB * sizeof(row_logits[0])) != 0;
+    }
+    if (phase_timing) {
+        fprintf(stderr,
+                "ds4: verify phase rows=%u upload=%.2f layers=%.2f head=%.2f read=%.2f ms\n",
+                n_tokens,
+                (ph_upload - ph_t0) * 1000.0,
+                (ph_layers - ph_upload) * 1000.0,
+                (ph_head - ph_layers) * 1000.0,
+                (now_sec() - ph_head) * 1000.0);
     }
     if (!ok) metal_graph_dspark_capture_invalidate(g);
     return ok;
