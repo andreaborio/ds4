@@ -23216,8 +23216,14 @@ static bool metal_graph_alloc_raw_cap(
         g->mtp_raw_cache = metal_graph_alloc_kv_cache_tensor(
                 managed_kv_cache,
                 (uint64_t)raw_cap * DS4_N_HEAD_DIM * sizeof(float));
-        g->spec_logits = ds4_gpu_tensor_alloc((uint64_t)16 * DS4_N_VOCAB * sizeof(float));
         g->mtp_n_raw = 0;
+    }
+
+    /* Per-row verifier logits.  Owned by the batched suffix verifier, which
+     * the n-gram speculative round uses without any of the MTP head tensors
+     * above, so this cannot live inside the MTP block. */
+    if (enable_mtp || ds4_ngram_spec_frontier_requested()) {
+        g->spec_logits = ds4_gpu_tensor_alloc((uint64_t)16 * DS4_N_VOCAB * sizeof(float));
     }
 
     g->prefill_tokens = ds4_gpu_tensor_alloc(pc * sizeof(int32_t));
@@ -49583,30 +49589,41 @@ int ds4_session_eval_ngram_spec_argmax(ds4_session *s, int first_token,
     return -1;
 #else
     ds4_engine *e = s->engine;
+    static int spec_time = -1;
+    if (spec_time < 0) spec_time = getenv("DS4_NGRAM_SPEC_TIMING") != NULL;
+    const double round_t0 = spec_time ? now_sec() : 0.0;
     if (ds4_session_eval(s, first_token, err, errlen) != 0) return -1;
+    const double t_seq = spec_time ? now_sec() : 0.0;
     int n_accept = 0;
     accepted[n_accept++] = first_token;
     if (first_token == eos_token || max_tokens == 1 ||
         n_accept >= accepted_cap) {
         return n_accept;
     }
-    /* The exact two-row verifier is qualified resident-only.  Under SSD
-     * streaming its rows interleave with the expert-cache worker in a way
-     * that measurably corrupts later state: a paired run diverged from
-     * sequential greedy after the first verify rounds and two identical
-     * speculative runs even diverged from each other.  Fail closed exactly
-     * like --mtp does until the verifier is qualified under streaming. */
-    if (e->ssd_streaming &&
+    /*
+     * Verification runs on the BATCHED path (one layer-major pass over both
+     * rows), not the row-at-a-time exact verifier.  That is what makes
+     * speculation pay here at all: dense weights are ~82% of the bytes a
+     * decode token reads and a batched pass reads them once for both rows,
+     * so the second token is nearly free in bandwidth.  The row-at-a-time
+     * verifier reads them twice and cannot win at any acceptance rate.
+     *
+     * It is also the path that works: the exact verifier corrupts state
+     * under SSD streaming (paired runs diverged from sequential greedy and
+     * from each other).  DS4_NGRAM_SPEC_EXACT selects it for diagnosis; it
+     * stays fail-closed under streaming.
+     */
+    const bool use_exact_verifier = getenv("DS4_NGRAM_SPEC_EXACT") != NULL;
+    if (use_exact_verifier && e->ssd_streaming &&
         getenv("DS4_NGRAM_SPEC_UNSAFE_STREAMING") == NULL) {
         static bool warned_streaming;
         if (!warned_streaming) {
             warned_streaming = true;
             fprintf(stderr,
-                    "ds4: ngram-spec drafting is fail-closed under SSD "
-                    "streaming (exact verifier is resident-only); "
-                    "decoding sequentially. "
-                    "DS4_NGRAM_SPEC_UNSAFE_STREAMING=1 overrides for "
-                    "diagnosis only: outputs are known to corrupt\n");
+                    "ds4: ngram-spec exact verifier is fail-closed under SSD "
+                    "streaming (known to corrupt); decoding sequentially. "
+                    "Unset DS4_NGRAM_SPEC_EXACT to use the batched verifier, "
+                    "or DS4_NGRAM_SPEC_UNSAFE_STREAMING=1 for diagnosis\n");
         }
         return n_accept;
     }
@@ -49652,12 +49669,16 @@ int ds4_session_eval_ngram_spec_argmax(ds4_session *s, int first_token,
     float *row0_logits = xmalloc((size_t)DS4_N_VOCAB * sizeof(row0_logits[0]));
     const int start = s->checkpoint.len;
     int row0_top = -1;
-    const bool have_frontier = spec_frontier_snapshot(&frontier, s);
-    bool ok = have_frontier;
-    if (spec_log && !have_frontier) {
+    /* The batched verifier commits a rejected round through the prefix-1
+     * capture, so it needs no full-frontier snapshot; the exact path still
+     * does. */
+    const bool have_frontier =
+        use_exact_verifier ? spec_frontier_snapshot(&frontier, s) : false;
+    bool ok = use_exact_verifier ? have_frontier : true;
+    if (spec_log && use_exact_verifier && !have_frontier) {
         fprintf(stderr, "ds4: ngram-spec snapshot FAIL\n");
     }
-    if (ok) {
+    if (ok && use_exact_verifier) {
         ok = metal_graph_verify_decode2_exact(&s->graph,
                                               &e->model,
                                               &e->weights,
@@ -49667,6 +49688,56 @@ int ds4_session_eval_ngram_spec_argmax(ds4_session *s, int first_token,
                                               &row0_top,
                                               row0_logits,
                                               row_logits);
+    } else if (ok) {
+        /* One layer-major pass over both rows.  The verifier reads the
+         * drafted tokens from the checkpoint, so they go in first and come
+         * back out below on anything short of a full accept. */
+        int row_tops[2] = {-1, -1};
+        token_vec_push(&s->checkpoint, t1);
+        token_vec_push(&s->checkpoint, t2);
+        ok = metal_graph_verify_suffix_tops(&s->graph,
+                                            &e->model,
+                                            &e->weights,
+                                            &s->checkpoint,
+                                            (uint32_t)start,
+                                            2u,
+                                            getenv("DS4_NGRAM_SPEC_NO_PREFIX1") == NULL,
+                                            row_tops,
+                                            NULL);
+        s->checkpoint.len = start;
+        if (spec_time) {
+            const double t_verify = now_sec();
+            fprintf(stderr,
+                    "ds4: ngram-spec timing seq=%.2f ms verify2=%.2f ms "
+                    "(ratio %.2f)\n",
+                    (t_seq - round_t0) * 1000.0,
+                    (t_verify - t_seq) * 1000.0,
+                    (t_seq - round_t0) > 0.0 ?
+                        (t_verify - t_seq) / (t_seq - round_t0) : 0.0);
+        }
+        if (ok) {
+            row0_top = row_tops[0];
+            ok = metal_graph_read_spec_logits_row(&s->graph, 1u, row_logits) &&
+                 metal_graph_read_spec_logits_row(&s->graph, 0u, row0_logits);
+        }
+        if (!ok) {
+            /* The batched verifier has already advanced the KV and the
+             * per-layer compressor frontiers for both rows, and this path
+             * carries no full snapshot to roll back to (the prefix-1 capture
+             * only covers a rejected round, not a failed one).  Continuing
+             * would decode from a state no sequential run could produce —
+             * exactly the silent corruption this feature was blocked on.
+             * Fail the generation instead. */
+            metal_graph_dspark_verify_capture_abort(&s->graph);
+            s->checkpoint_valid = false;
+            snprintf(err, errlen,
+                     "ngram-spec batched verifier failed; session state is no "
+                     "longer valid");
+            spec_frontier_free(&frontier);
+            free(row0_logits);
+            free(row_logits);
+            return -1;
+        }
     }
     if (spec_log) {
         fprintf(stderr, "ds4: ngram-spec verify ok=%d row0_top=%d t2=%d\n",
