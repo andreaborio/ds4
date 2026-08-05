@@ -90,3 +90,63 @@ toglie byte.
 1.66× dichiarato all'inizio della campagna. Il passo successivo a costo basso
 è **Q6_K sui tre tensori di attenzione grandi** (4.29 GiB → 3.3 GiB, ~1.12×
 end-to-end) come prova di qualità prima di considerare Q4_K.
+
+---
+
+## Aggiornamento: gli stessi byte SENZA toccare la precisione
+
+Obiezione dell'utente, corretta: i tre tensori grandi sono `attn_output_a/b` e
+`attn_q_b`, cioè proprio quelli su cui una quantizzazione più aggressiva si
+paga in qualità. Il modello è stato costruito apposta con `AProjQ8`.
+
+Ma i byte densi si leggono **una volta per passaggio, non per token**. Misura
+sulla stessa sonda (Q8_0, shape 4096×8192, tre ripetizioni concordi):
+
+| righe nel passaggio | ms | costo per token |
+|---|---:|---:|
+| n=1 | 0.130 | 1.00× |
+| n=2 | 0.134 | **1.95-2.15×** |
+| n=4 | 0.138 | **3.78-4.03×** |
+
+**Un passaggio a 4 token costa quanto un passaggio a 1 token.** Il matvec
+denso è interamente banda-limitato sui pesi: aggiungere righe è gratis fino
+ad almeno 4. Quindi ogni token speculativo verificato è quasi gratuito in
+byte — lo stesso guadagno della requantizzazione, **senza cambiare un solo
+peso**.
+
+### Economia della speculazione su questo modello
+
+Passaggio batched a 2 righe: denso 7.20 (una volta) + routed 2×1.70 = **10.60
+GiB**, contro 8.90 GiB/token sequenziale. **Pareggio a solo il 19% di
+accettazione.** Con i token/round già misurati su R2 (1.59):
+10.60/1.59 = 6.67 GiB/token = **1.33×** — stessa taglia della requantizzazione
+Q4_K (1.29×), a precisione invariata.
+
+La vecchia soglia del gate MTP (75% di accettazione) era giusta per un modello
+compute-bound. Qui il pareggio è al 19%: **la soglia va rifatta**.
+
+### Ma il verificatore attuale NON batcha
+
+`metal_graph_verify_decode_exact` fa `for il { for row { encode_decode_layer
+(n_tok=1) } }`: due passaggi separati a una riga per layer, quindi legge i pesi
+densi **due volte** e non incassa nulla. Questo spiega da solo perché MTP fu
+misurato NO-GO e perché R2 dava −10%: su un decode banda-limitato, una
+speculazione che non batcha non può vincere, qualunque sia l'accettazione.
+
+L'infrastruttura però c'è già: `metal_graph_encode_layer_batch(g, model,
+layer, il, pos0, n_tokens)` è l'encoder del prefill, e il verificatore alloca
+già `batch_cur_hc`/`batch_next_hc` con le row view che quell'encoder usa.
+
+**Avvertenza onesta**: le riduzioni batched possono scegliere un token diverso
+sui quasi-pareggi — è esattamente il motivo per cui il verificatore "esatto"
+fu scritto riga-per-riga. Quindi non è bit-identico al greedy sequenziale. Ma
+è la stessa aritmetica che il prefill usa già per l'intero prompt: è un ordine
+di riduzione diverso, non una perdita di precisione nei pesi.
+
+### Raccomandazione aggiornata
+
+Prima **la speculazione batched** (nessun artefatto nuovo, nessuna perdita di
+precisione, ~1.3×), poi eventualmente la requantizzazione come leva
+indipendente che si somma. Il modello 0731 **non ha teste MTP** (zero tensori,
+malgrado `nextn_predict_layers=1` nei metadati), quindi il drafter dev'essere
+quello n-gram: R2, che è già costruito e va sbloccato.

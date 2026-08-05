@@ -57157,6 +57157,71 @@ int ds4_gpu_internal_dense_matvec_bandwidth_test(void) {
         }
     }
 
+    /* Tiny-batch amortization: the same Q8_0 weights driven with n_tok rows.
+     * Speculation lives or dies on this curve — if a 2-row pass costs about
+     * what a 1-row pass costs, then a verified speculative token is nearly
+     * free in bytes, which is the same win as requantizing WITHOUT touching
+     * any weight. */
+    double batch_ms[5] = {0, 0, 0, 0, 0};
+    batch_ms[1] = best_ms[0]; /* n=1 has no ext kernel: plain matvec above. */
+    for (uint32_t n_tok = 2; n_tok <= 4; n_tok *= 2) {
+        const int16_t nsg = 2;
+        const int16_t nxpsg = ds4_gpu_mv_ext_nxpsg(in_dim, n_tok);
+        const int16_t r1ptg = ds4_gpu_mv_ext_r1ptg(n_tok);
+        const char *fn = ds4_gpu_mv_ext_name(1, r1ptg);
+        id<MTLComputePipelineState> p =
+            fn ? ds4_gpu_get_mul_mv_ext_pipeline(fn, nsg, nxpsg) : nil;
+        if (!p) continue;
+        const int16_t nypsg = 32 / nxpsg;
+        const uint64_t r0ptg = (uint64_t)nypsg * (uint64_t)nsg;
+        ds4_gpu_mul_mv_ext_args a =
+            ds4_gpu_make_mv_ext_args(in_dim, out_dim, n_tok, 34, q8_row);
+        id<MTLBuffer> xb_n =
+            [g_device newBufferWithLength:(NSUInteger)(in_dim * n_tok * sizeof(float))
+                                  options:MTLResourceStorageModeShared];
+        id<MTLBuffer> ob_n =
+            [g_device newBufferWithLength:(NSUInteger)(out_dim * n_tok * sizeof(float))
+                                  options:MTLResourceStorageModeShared];
+        if (!xb_n || !ob_n) continue;
+        float *xn = (float *)[xb_n contents];
+        for (uint64_t i = 0; i < in_dim * n_tok; i++) xn[i] = 0.01f;
+        double best = 1e18;
+        for (int pass = 0; pass < 3; pass++) {
+            id<MTLCommandBuffer> cb = ds4_gpu_new_command_buffer();
+            if (!cb) break;
+            id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
+            [enc setComputePipelineState:p];
+            for (uint32_t it = 0; it < iters; it++) {
+                [enc setBytes:&a length:sizeof(a) atIndex:0];
+                [enc setBuffer:w8 offset:(NSUInteger)(q8_bytes * (it % q8_slices)) atIndex:1];
+                [enc setBuffer:xb_n offset:0 atIndex:2];
+                [enc setBuffer:ob_n offset:0 atIndex:3];
+                [enc dispatchThreadgroups:MTLSizeMake(((NSUInteger)out_dim + r0ptg - 1u) / r0ptg,
+                                                      ((NSUInteger)n_tok + (NSUInteger)r1ptg - 1u) / (NSUInteger)r1ptg,
+                                                      1)
+                     threadsPerThreadgroup:MTLSizeMake(32, (NSUInteger)nsg, 1)];
+            }
+            ds4_gpu_end_compute_encoder(cb, enc);
+            [cb commit];
+            [cb waitUntilCompleted];
+            if (cb.status != MTLCommandBufferStatusCompleted) break;
+            const double ms =
+                ([cb GPUEndTime] - [cb GPUStartTime]) * 1000.0 / (double)iters;
+            if (ms > 0.0 && ms < best) best = ms;
+        }
+        batch_ms[n_tok] = best < 1e17 ? best : 0.0;
+    }
+    if (batch_ms[1] > 0.0) {
+        fprintf(stderr,
+                "ds4: dense Q8_0 tiny-batch  n=1 %.4f ms  n=2 %.4f ms (%.2fx/tok)  "
+                "n=4 %.4f ms (%.2fx/tok)\n",
+                batch_ms[1],
+                batch_ms[2],
+                batch_ms[2] > 0.0 ? batch_ms[1] / (batch_ms[2] / 2.0) : 0.0,
+                batch_ms[4],
+                batch_ms[4] > 0.0 ? batch_ms[1] / (batch_ms[4] / 4.0) : 0.0);
+    }
+
     const double gib8 = (double)q8_bytes / (double)(1ull << 30);
     const double gib4 = (double)q4_bytes / (double)(1ull << 30);
     fprintf(stderr,
