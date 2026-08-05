@@ -40,6 +40,7 @@ typedef struct {
     int ctx_alloc;
     int step_incr;
     int gen_tokens;
+    int ngram_spec;
     int power_percent;
     uint32_t prefill_chunk;
     uint32_t ssd_streaming_cache_experts;
@@ -219,6 +220,8 @@ static bench_config parse_options(int argc, char **argv) {
             c.step_mul = parse_double_arg(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "--gen-tokens") || !strcmp(arg, "--tokens") || !strcmp(arg, "-n")) {
             c.gen_tokens = parse_nonnegative_int(need_arg(&i, argc, argv, arg), arg);
+        } else if (!strcmp(arg, "--ngram-spec")) {
+            c.ngram_spec = 1;
         } else if (!strcmp(arg, "--csv")) {
             c.csv_path = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--dump-frontier-logits-dir")) {
@@ -559,6 +562,86 @@ static void abort_transactional_generation_block(
     ds4_session_invalidate(session);
 }
 
+/* Opt-in measurement lane for the exact n-gram speculative round.  It uses
+ * the dedicated session entry, not the generation-block transaction: blocks
+ * stay depth zero until the ledger work lands.  EOS is not terminal here for
+ * the same fixed-horizon reason as the transactional lane, so the round is
+ * asked for exactly the remaining budget and eos_token is a value no token
+ * can equal. */
+static int run_ngram_spec_greedy_decode(
+        ds4_session *session,
+        int          frontier,
+        int          gen_tokens,
+        int          vocab,
+        int         *token_ids,
+        double      *token_ms,
+        int         *token_count_out,
+        double      *first_token_ready_sec_out,
+        double       generation_start_sec,
+        char        *err,
+        size_t       errlen) {
+    if (!session || gen_tokens <= 0 || vocab <= 0 || !token_ms ||
+        !token_count_out || !first_token_ready_sec_out) {
+        if (err && errlen) snprintf(err, errlen, "invalid ngram decode request");
+        return 1;
+    }
+    if (ds4_session_pos(session) != frontier) {
+        if (err && errlen) snprintf(err, errlen, "invalid ngram decode frontier");
+        return 1;
+    }
+    int token_count = 0;
+    *token_count_out = 0;
+    *first_token_ready_sec_out = 0.0;
+    uint64_t rounds = 0, drafted_commits = 0, drafted_rejects = 0;
+    int next_token = ds4_session_argmax(session);
+    if (next_token < 0) {
+        if (err && errlen) snprintf(err, errlen, "ngram decode has no logits");
+        return 1;
+    }
+    while (token_count < gen_tokens) {
+        int accepted[4] = {0};
+        const int want = gen_tokens - token_count;
+        const double round_t0 = bench_now_sec();
+        const int n = ds4_session_eval_ngram_spec_argmax(
+            session, next_token, want, -1, accepted, 3, err, errlen);
+        const double round_ms = (bench_now_sec() - round_t0) * 1000.0;
+        if (n <= 0) return 1;
+        rounds++;
+        if (n == 3) drafted_commits++;
+        else if (n == 2) drafted_rejects++;
+        for (int i = 0; i < n && token_count < gen_tokens; i++) {
+            const int token = accepted[i];
+            if (token < 0 || token >= vocab) {
+                if (err && errlen) snprintf(err, errlen, "invalid ngram token");
+                return 1;
+            }
+            if (token_ids) token_ids[token_count] = token;
+            token_ms[token_count] = round_ms / (double)n;
+            if (token_count == 0) {
+                *first_token_ready_sec_out =
+                    bench_now_sec() - generation_start_sec;
+            }
+            token_count++;
+        }
+        next_token = ds4_session_argmax(session);
+        if (next_token < 0) {
+            if (err && errlen) snprintf(err, errlen, "ngram decode lost logits");
+            return 1;
+        }
+    }
+    fprintf(stderr,
+            "ds4-bench: ngram-spec rounds=%llu drafted=%llu "
+            "(committed2=%llu rejected=%llu) tokens=%d tokens_per_round=%.3f\n",
+            (unsigned long long)rounds,
+            (unsigned long long)(drafted_commits + drafted_rejects),
+            (unsigned long long)drafted_commits,
+            (unsigned long long)drafted_rejects,
+            token_count,
+            rounds ? (double)token_count / (double)rounds : 0.0);
+    *token_count_out = token_count;
+    return 0;
+}
+
 /* Consume the public generation-block transaction for one fixed-horizon greedy
  * decode.  EOS is deliberately not terminal: benchmark arms compare the same
  * exact number of ordinary argmax tickets, including any EOS token selected by
@@ -744,6 +827,12 @@ int main(int argc, char **argv) {
         return 0;
     }
     bench_config cfg = parse_options(argc, argv);
+    if (cfg.ngram_spec) {
+        /* The session graph must allocate the verifier frontier before the
+         * engine opens; the opt-in travels through the environment because
+         * graph allocation has no view of benchmark options. */
+        setenv("DS4_ENABLE_NGRAM_SPEC", "1", 1);
+    }
 
     ds4_engine_options opt = {
         .model_path = cfg.model_path,
@@ -1002,20 +1091,35 @@ int main(int argc, char **argv) {
         ds4_gpu_stream_expert_io_measurement_begin();
 #endif
         const double gen_t0 = bench_now_sec();
-        if (cfg.gen_tokens > 0 &&
-            run_transactional_greedy_decode(
-                session,
-                frontier,
-                cfg.gen_tokens,
-                generation_vocab,
-                decode_token_ids,
-                decode_token_ms,
-                &decode_token_count,
-                &first_token_ready_sec,
-                gen_t0,
-                err,
-                sizeof(err)) != 0)
-        {
+        int decode_rc = 0;
+        if (cfg.gen_tokens > 0) {
+            decode_rc = cfg.ngram_spec ?
+                run_ngram_spec_greedy_decode(
+                    session,
+                    frontier,
+                    cfg.gen_tokens,
+                    generation_vocab,
+                    decode_token_ids,
+                    decode_token_ms,
+                    &decode_token_count,
+                    &first_token_ready_sec,
+                    gen_t0,
+                    err,
+                    sizeof(err)) :
+                run_transactional_greedy_decode(
+                    session,
+                    frontier,
+                    cfg.gen_tokens,
+                    generation_vocab,
+                    decode_token_ids,
+                    decode_token_ms,
+                    &decode_token_count,
+                    &first_token_ready_sec,
+                    gen_t0,
+                    err,
+                    sizeof(err));
+        }
+        if (decode_rc != 0) {
             fprintf(stderr,
                     "ds4-bench: transactional decode at frontier %d failed: %s\n",
                     frontier,

@@ -479,6 +479,15 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
                                         int max_tokens, int eos_token,
                                         int *accepted, int accepted_cap,
                                         char *err, size_t errlen);
+/* Greedy decode round with an exact prompt-lookup speculative suffix: no
+ * draft model, candidates come from the session's own token history and are
+ * committed only when the exact two-row verifier reproduces them.  Output is
+ * byte-identical to sequential greedy decode.  Must not run while a
+ * generation-block cookie is active. */
+int ds4_session_eval_ngram_spec_argmax(ds4_session *s, int first_token,
+                                       int max_tokens, int eos_token,
+                                       int *accepted, int accepted_cap,
+                                       char *err, size_t errlen);
 void ds4_session_invalidate(ds4_session *s);
 void ds4_session_rewind(ds4_session *s, int pos);
 int ds4_session_pos(ds4_session *s);

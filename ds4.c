@@ -22908,6 +22908,17 @@ static bool metal_graph_ensure_batch_ffn_out(ds4_gpu_graph *g) {
 
 /* Allocate the Metal graph state for a chosen raw-cache capacity.  The model
  * weights are not copied here; tensors reference the mapped GGUF. */
+/* The exact n-gram speculative round reuses the MTP verifier frontier
+ * (snapshot plus prefix-1 storage, ~12.5 MiB).  It has no draft model, so the
+ * only allocation it needs is this opt-in. */
+static bool ds4_ngram_spec_frontier_requested(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        cached = getenv("DS4_ENABLE_NGRAM_SPEC") != NULL;
+    }
+    return cached > 0;
+}
+
 static bool metal_graph_alloc_raw_cap(
         ds4_gpu_graph *g,
         const ds4_weights     *weights,
@@ -22921,7 +22932,8 @@ static bool metal_graph_alloc_raw_cap(
     g->mtp_enabled = enable_mtp;
     const ds4_dspark_verifier_snapshot_plan verifier_snapshot =
         ds4_dspark_verifier_snapshot_plan_make(
-            enable_mtp, enable_dspark);
+            enable_mtp || ds4_ngram_spec_frontier_requested(),
+            enable_dspark);
     ds4_dspark_capture_state_init(&g->dspark_capture_state, enable_dspark);
     ds4_dspark_capture_state_init(
         &g->dspark_verify_capture_state, enable_dspark);
@@ -49332,6 +49344,204 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
                     n_accept);
         }
     }
+    return n_accept;
+#endif
+}
+
+#ifndef DS4_NO_GPU
+/* Most recent earlier continuation of the bigram that ends with the token
+ * about to be committed.  The conceptual sequence is the session checkpoint
+ * followed by next_token; a match at position j proposes checkpoint[j+1] as
+ * the speculative token after next_token.  Purely advisory: a wrong proposal
+ * costs one rejected verifier row, never a wrong output. */
+static int ds4_session_ngram_spec_lookup(const token_vec *checkpoint,
+                                         int              next_token) {
+    if (!checkpoint || checkpoint->len < 3) return -1;
+    const int *v = checkpoint->v;
+    const int len = checkpoint->len;
+    const int prev = v[len - 1];
+    for (int j = len - 2; j >= 1; j--) {
+        if (v[j] == next_token && v[j - 1] == prev) {
+            return v[j + 1];
+        }
+    }
+    return -1;
+}
+#endif
+
+/* Greedy decode round with an exact prompt-lookup speculative suffix.
+ *
+ * Evaluate first_token exactly as ds4_session_eval would, then try to commit
+ * up to two more tokens in one batched pass: t1 is the argmax of the fresh
+ * logits (so committing it is ordinary greedy by construction), and t2 is the
+ * n-gram continuation drafted from the session's own token history.  The
+ * two-row exact verifier evaluates [t1, t2] layer-major; a full accept
+ * commits both with the final-row logits, a mismatch commits only t1 through
+ * the prefix-1 path.  Either way every committed token and every published
+ * logit is byte-identical to sequential greedy decode, because t1 is the
+ * measured argmax and t2 is only kept when the verifier's row-0 argmax
+ * reproduces it.
+ *
+ * Returns the number of tokens appended to accepted[] (1..3), 0 when the
+ * caller passed no room, -1 on failure.  This entry is deliberately separate
+ * from the transactional generation-block API: blocks stay depth zero until
+ * the ledger work lands, and this path must never run with an active
+ * generation cookie. */
+int ds4_session_eval_ngram_spec_argmax(ds4_session *s, int first_token,
+                                       int max_tokens, int eos_token,
+                                       int *accepted, int accepted_cap,
+                                       char *err, size_t errlen) {
+    if (ds4_session_generation_reject_unsettled(s, err, errlen) != 0) {
+        return -1;
+    }
+    if (!s || max_tokens <= 0 || !accepted || accepted_cap <= 0) return 0;
+    if (ds4_session_is_qwen35(s) || ds4_session_is_cpu(s) ||
+        ds4_session_is_glm(s)) {
+        if (ds4_session_eval(s, first_token, err, errlen) != 0) return -1;
+        accepted[0] = first_token;
+        return 1;
+    }
+#ifdef DS4_NO_GPU
+    (void)eos_token;
+    snprintf(err, errlen, "GPU support is not compiled in");
+    return -1;
+#else
+    ds4_engine *e = s->engine;
+    if (ds4_session_eval(s, first_token, err, errlen) != 0) return -1;
+    int n_accept = 0;
+    accepted[n_accept++] = first_token;
+    if (first_token == eos_token || max_tokens == 1 ||
+        n_accept >= accepted_cap) {
+        return n_accept;
+    }
+    /* The exact two-row verifier is qualified resident-only.  Under SSD
+     * streaming its rows interleave with the expert-cache worker in a way
+     * that measurably corrupts later state: a paired run diverged from
+     * sequential greedy after the first verify rounds and two identical
+     * speculative runs even diverged from each other.  Fail closed exactly
+     * like --mtp does until the verifier is qualified under streaming. */
+    if (e->ssd_streaming) {
+        static bool warned_streaming;
+        if (!warned_streaming) {
+            warned_streaming = true;
+            fprintf(stderr,
+                    "ds4: ngram-spec drafting is fail-closed under SSD "
+                    "streaming (exact verifier is resident-only); "
+                    "decoding sequentially\n");
+        }
+        return n_accept;
+    }
+    static int spec_log = -1;
+    if (spec_log < 0) spec_log = getenv("DS4_NGRAM_SPEC_LOG") != NULL;
+
+    /* t1 is the exact greedy continuation of the fresh logits. */
+    const int t1 = ds4_session_argmax(s);
+    if (spec_log) {
+        fprintf(stderr,
+                "ds4: ngram-spec len=%d room=%d t1=%d\n",
+                s->checkpoint.len, s->ctx_size - s->checkpoint.len, t1);
+    }
+    if (t1 < 0 || t1 == eos_token) return n_accept;
+    if (accepted_cap - n_accept < 1 || max_tokens - n_accept < 1) {
+        return n_accept;
+    }
+    const int room = s->ctx_size - s->checkpoint.len;
+    if (room < 3) return n_accept;
+
+    const int t2 = ds4_session_ngram_spec_lookup(&s->checkpoint, t1);
+    if (spec_log) {
+        fprintf(stderr, "ds4: ngram-spec lookup t2=%d\n", t2);
+    }
+    if (t2 < 0 || (uint64_t)t2 >= DS4_N_VOCAB) return n_accept;
+    if (max_tokens - n_accept < 2 || accepted_cap - n_accept < 2) {
+        return n_accept;
+    }
+
+    char tier_err[192] = {0};
+    if (ds4_session_deepseek_apply_context_cache_tier(s,
+            (uint32_t)s->checkpoint.len + 2u,
+            tier_err, sizeof(tier_err)) != 0) {
+        if (spec_log) {
+            fprintf(stderr, "ds4: ngram-spec tier FAIL: %s\n", tier_err);
+        }
+        return n_accept;
+    }
+
+    ds4_spec_frontier frontier;
+    memset(&frontier, 0, sizeof(frontier));
+    float *row_logits = xmalloc((size_t)DS4_N_VOCAB * sizeof(row_logits[0]));
+    float *row0_logits = xmalloc((size_t)DS4_N_VOCAB * sizeof(row0_logits[0]));
+    const int start = s->checkpoint.len;
+    int row0_top = -1;
+    const bool have_frontier = spec_frontier_snapshot(&frontier, s);
+    bool ok = have_frontier;
+    if (spec_log && !have_frontier) {
+        fprintf(stderr, "ds4: ngram-spec snapshot FAIL\n");
+    }
+    if (ok) {
+        ok = metal_graph_verify_decode2_exact(&s->graph,
+                                              &e->model,
+                                              &e->weights,
+                                              t1,
+                                              t2,
+                                              (uint32_t)start,
+                                              &row0_top,
+                                              row0_logits,
+                                              row_logits);
+    }
+    if (spec_log) {
+        fprintf(stderr, "ds4: ngram-spec verify ok=%d row0_top=%d t2=%d\n",
+                ok ? 1 : 0, row0_top, t2);
+    }
+    const bool full_accept = ok && row0_top == t2;
+    if (full_accept) {
+        ok = metal_graph_dspark_verify_capture_publish(
+            &s->graph, 2u, (uint64_t)start + 2u);
+    }
+    if (ok && full_accept) {
+        memcpy(s->logits, row_logits,
+               (size_t)DS4_N_VOCAB * sizeof(s->logits[0]));
+        token_vec_push(&s->checkpoint, t1);
+        token_vec_push(&s->checkpoint, t2);
+        accepted[n_accept++] = t1;
+        accepted[n_accept++] = t2;
+        s->checkpoint_valid = true;
+        spec_frontier_free(&frontier);
+        free(row0_logits);
+        free(row_logits);
+        return n_accept;
+    }
+    if (ok) {
+        s->checkpoint.len = start;
+        ok = spec_frontier_commit_prefix1(s);
+    }
+    if (ok) {
+        ok = metal_graph_dspark_verify_capture_publish(
+            &s->graph, 1u, (uint64_t)start + 1u);
+    }
+    if (ok) {
+        memcpy(s->logits, row0_logits,
+               (size_t)DS4_N_VOCAB * sizeof(s->logits[0]));
+        token_vec_push(&s->checkpoint, t1);
+        accepted[n_accept++] = t1;
+        s->checkpoint_valid = true;
+        spec_frontier_free(&frontier);
+        free(row0_logits);
+        free(row_logits);
+        return n_accept;
+    }
+    /* Verifier failure: restore the pre-round frontier and fall back to the
+     * already-committed first token; the caller resumes sequentially. */
+    if (have_frontier) {
+        s->checkpoint.len = start;
+        metal_graph_dspark_capture_invalidate(&s->graph);
+        (void)spec_frontier_restore(&frontier, s);
+    } else {
+        metal_graph_dspark_capture_invalidate(&s->graph);
+    }
+    spec_frontier_free(&frontier);
+    free(row0_logits);
+    free(row_logits);
     return n_accept;
 #endif
 }
