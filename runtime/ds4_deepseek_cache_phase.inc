@@ -20,6 +20,26 @@ static bool ds4_session_deepseek_phase_cache_enabled(
     return true;
 }
 
+/* Opt-in: keep the warm decode cache across batched mid-session prefills up
+ * to this many tokens.  Zero (default) preserves the historical teardown.
+ * Environment policy is immutable after process startup. */
+static uint32_t ds4_session_deepseek_prefill_cache_keep_max(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char *env =
+            getenv("DS4_DEEPSEEK_PREFILL_CACHE_KEEP_MAX_TOKENS");
+        long v = 0;
+        if (env && env[0]) {
+            char *end = NULL;
+            v = strtol(env, &end, 10);
+            if (end == env || v < 0) v = 0;
+            if (v > (long)UINT32_MAX) v = (long)UINT32_MAX;
+        }
+        cached = (int)v;
+    }
+    return (uint32_t)cached;
+}
+
 static int ds4_session_deepseek_prepare_prefill_cache(
         ds4_session *s,
         uint32_t     prefill_tokens,
@@ -38,7 +58,8 @@ static int ds4_session_deepseek_prepare_prefill_cache(
             selected_max,
             s->engine->deepseek_prefill_cache_experts,
             s->engine->deepseek_long_context_cache_experts,
-            s->engine->deepseek_extended_context_cache_experts);
+            s->engine->deepseek_extended_context_cache_experts,
+            ds4_session_deepseek_prefill_cache_keep_max());
     if (parent_target == 0) return 0;
     const uint32_t current =
         ds4_gpu_stream_expert_cache_effective_parent_count();

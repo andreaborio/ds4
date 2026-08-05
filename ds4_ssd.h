@@ -254,7 +254,8 @@ uint32_t ds4_ssd_deepseek_prefill_phase_cache_target(
         uint32_t batched_prefill_max_tokens,
         uint32_t prefill_target,
         uint32_t long_context_target,
-        uint32_t extended_context_target);
+        uint32_t extended_context_target,
+        uint32_t keep_batched_max_tokens);
 uint32_t ds4_ssd_deepseek_post_prefill_cache_target(
         uint32_t resulting_context_tokens,
         uint32_t long_context_target,

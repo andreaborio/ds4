@@ -1193,25 +1193,41 @@ int main(void) {
     /* Resume decisions use the work size for the batching floor and the total
      * resulting context for the post-prefill cap. */
     assert(ds4_ssd_deepseek_prefill_phase_cache_target(
-               8192, 8192, 760, 259, 4129, 2065) == 259);
+               8192, 8192, 760, 259, 4129, 2065, 0) == 259);
     assert(ds4_ssd_deepseek_prefill_phase_cache_target(
-               2048, 9000, 760, 259, 4129, 2065) == 259);
+               2048, 9000, 760, 259, 4129, 2065, 0) == 259);
     assert(ds4_ssd_deepseek_prefill_phase_cache_target(
-               4096, 8192, 760, 259, 4129, 2065) == 259);
+               4096, 8192, 760, 259, 4129, 2065, 0) == 259);
     assert(ds4_ssd_deepseek_prefill_phase_cache_target(
-               292, 8192, 760, 259, 4129, 2065) == 4129);
+               292, 8192, 760, 259, 4129, 2065, 0) == 4129);
     assert(ds4_ssd_deepseek_prefill_phase_cache_target(
-               292, 65536, 760, 259, 4129, 2065) == 2065);
+               292, 65536, 760, 259, 4129, 2065, 0) == 2065);
     assert(ds4_ssd_deepseek_prefill_phase_cache_target(
-               128, 128, 760, 259, 4129, 2065) == 0);
+               128, 128, 760, 259, 4129, 2065, 0) == 0);
     assert(ds4_ssd_deepseek_prefill_phase_cache_target(
-               32, 32, 0, 259, 4129, 2065) == 259);
+               32, 32, 0, 259, 4129, 2065, 0) == 259);
     assert(ds4_ssd_deepseek_prefill_phase_cache_target(
-               31, 8192, 0, 259, 4129, 2065) == 4129);
+               31, 8192, 0, 259, 4129, 2065, 0) == 4129);
     assert(ds4_ssd_deepseek_prefill_phase_cache_target(
-               31, 8063, 0, 259, 4129, 2065) == 0);
+               31, 8063, 0, 259, 4129, 2065, 0) == 0);
     assert(ds4_ssd_deepseek_prefill_phase_cache_target(
-               31, 8064, 0, 259, 4129, 2065) == 4129);
+               31, 8064, 0, 259, 4129, 2065, 0) == 4129);
+
+    /* Opt-in keep: batched mid-session prefills at or under the keep bound
+     * leave the warm decode cache alone; larger ones still tear down. */
+    assert(ds4_ssd_deepseek_prefill_phase_cache_target(
+               2048, 9000, 760, 259, 4129, 2065, 4096) == 0);
+    assert(ds4_ssd_deepseek_prefill_phase_cache_target(
+               4096, 8192, 760, 259, 4129, 2065, 4096) == 0);
+    assert(ds4_ssd_deepseek_prefill_phase_cache_target(
+               4097, 8192, 760, 259, 4129, 2065, 4096) == 259);
+    assert(ds4_ssd_deepseek_prefill_phase_cache_target(
+               8192, 8192, 760, 259, 4129, 2065, 4096) == 259);
+    /* The keep bound must not affect the non-batched tiers. */
+    assert(ds4_ssd_deepseek_prefill_phase_cache_target(
+               292, 8192, 760, 259, 4129, 2065, 4096) == 4129);
+    assert(ds4_ssd_deepseek_prefill_phase_cache_target(
+               128, 128, 760, 259, 4129, 2065, 4096) == 0);
     assert(ds4_ssd_deepseek_post_prefill_cache_target(
                8063, 4129, 2065, 4387) == 4387);
     assert(ds4_ssd_deepseek_post_prefill_cache_target(

@@ -959,11 +959,27 @@ uint32_t ds4_ssd_deepseek_prefill_phase_cache_target(
         uint32_t batched_prefill_max_tokens,
         uint32_t prefill_target,
         uint32_t long_context_target,
-        uint32_t extended_context_target) {
+        uint32_t extended_context_target,
+        uint32_t keep_batched_max_tokens) {
     if (prefill_tokens == 0 || prefill_target == 0) return 0;
     const bool batched_prefill = batched_prefill_max_tokens == 0 ?
         prefill_tokens >= 32u : prefill_tokens > batched_prefill_max_tokens;
-    if (batched_prefill) return prefill_target;
+    if (batched_prefill) {
+        /* Mid-session turns of moderate size do not need the prefill-phase
+         * teardown: the shrink to the correctness floor exists to give the
+         * grouped prefill memory headroom on huge prompts, but on a 1-4K
+         * turn it only destroys a warm decode cache and then pays a full
+         * reseed.  Measured on the 0731 target (2026-08-05): a ~2.4K-token
+         * turn costs ~5-7 s of extra TTFT and the following decode runs
+         * ~1.8x slower while the cache re-warms.  Zero keeps the cache;
+         * callers gate this opt-in and pass 0 to preserve the historical
+         * behaviour. */
+        if (keep_batched_max_tokens != 0 &&
+            prefill_tokens <= keep_batched_max_tokens) {
+            return 0;
+        }
+        return prefill_target;
+    }
     /* Enter the lower-memory tier one standard 128-token acceptance window
      * before its hard frontier. This prevents a near-boundary prefill from
      * growing a large cache only to drain and shrink it a few decode tokens
