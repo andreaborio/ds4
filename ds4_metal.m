@@ -57037,6 +57037,140 @@ int ds4_gpu_internal_shared_event_resume_latency_test(void) {
  * the selected-table fill must fail closed on a bogus table.  The worker's
  * signal-always contract lives in ds4.c and is exercised end to end once the
  * encode side lands (P2); here the primitives it relies on are pinned. */
+/* Dense matvec bandwidth probe: Q8_0 (what the 0731 attention projections use
+ * today) against Q4_K on the same logical shape.  Decode is bandwidth bound
+ * and dense weights are ~82% of the bytes read per token, so this ratio caps
+ * what any dense requantization can buy.
+ *
+ * Two traps this probe has to avoid, both of which produced nonsense first:
+ *  - Cache residency.  A single 34 MiB matrix re-read 200 times lives in the
+ *    SLC and reports numbers above DRAM bandwidth.  The weights come from a
+ *    pool far larger than any cache and every iteration reads a different
+ *    slice, which is also what decode does: 43 layers of distinct matrices.
+ *  - Row partitioning differs between the two kernels.  Q8_0 gives one
+ *    threadgroup NR0 rows and splits columns across simdgroups; Q4_K gives
+ *    each simdgroup its own nr0 rows, so it needs NSG times fewer
+ *    threadgroups.  Dispatching the Q8_0 way made Q4_K read past its buffer
+ *    and look 2.8x slower than it is. */
+int ds4_gpu_internal_dense_matvec_bandwidth_test(void) {
+    if (!g_initialized && !ds4_gpu_init()) return 0;
+
+    const uint64_t in_dim = 4096, out_dim = 8192;
+    const uint64_t q8_row = (in_dim / 32u) * 34u;
+    const uint64_t q4_row = (in_dim / 256u) * 144u;
+    const uint64_t q8_bytes = q8_row * out_dim;
+    const uint64_t q4_bytes = q4_row * out_dim;
+    const uint32_t iters =
+        (uint32_t)ds4_gpu_env_u64("DS4_METAL_DENSE_MV_BENCH_ITERS", 64u, 1u, 4096u);
+    /* Pool >> any cache, so each iteration streams from DRAM. */
+    const uint64_t pool_bytes =
+        ds4_gpu_env_u64("DS4_METAL_DENSE_MV_BENCH_POOL_MB", 1024u, 64u, 8192u)
+        * 1024ull * 1024ull;
+    const uint32_t q8_slices = (uint32_t)(pool_bytes / q8_bytes);
+    const uint32_t q4_slices = (uint32_t)(pool_bytes / q4_bytes);
+    if (q8_slices < 2 || q4_slices < 2) return 0;
+
+    id<MTLBuffer> w8 = [g_device newBufferWithLength:(NSUInteger)(q8_bytes * q8_slices)
+                                             options:MTLResourceStorageModeShared];
+    id<MTLBuffer> w4 = [g_device newBufferWithLength:(NSUInteger)(q4_bytes * q4_slices)
+                                             options:MTLResourceStorageModeShared];
+    id<MTLBuffer> xb = [g_device newBufferWithLength:(NSUInteger)(in_dim * sizeof(float))
+                                             options:MTLResourceStorageModeShared];
+    id<MTLBuffer> ob = [g_device newBufferWithLength:(NSUInteger)(out_dim * sizeof(float))
+                                             options:MTLResourceStorageModeShared];
+    if (!w8 || !w4 || !xb || !ob) return 0;
+    memset([w8 contents], 0x11, (size_t)(q8_bytes * q8_slices));
+    memset([w4 contents], 0x22, (size_t)(q4_bytes * q4_slices));
+    float *xf = (float *)[xb contents];
+    for (uint64_t i = 0; i < in_dim; i++) xf[i] = 0.01f;
+
+    double best_ms[2] = {1e18, 1e18};
+    for (int kind = 0; kind < 2; kind++) {
+        const int q4 = kind == 1;
+        ds4_gpu_q8_0_matvec_args a = ds4_gpu_make_q8_0_mv_args(in_dim, out_dim);
+        ds4_gpu_mv_dispatch d = ds4_gpu_make_q8_0_mv_dispatch();
+        if (q4) {
+            a.nb00 = 144;
+            a.nb01 = q4_row;
+            a.nb02 = q4_row * out_dim;
+            a.nb03 = a.nb02;
+            d.function_name = "kernel_mul_mv_q4_K_f32";
+            d.nsg = (int16_t)ds4_gpu_env_u64("DS4_METAL_DENSE_MV_BENCH_Q4_NSG",
+                                             4u, 1u, 8u);
+            d.nr0 = 2;
+            d.smem = 0;
+        }
+        a.nr0 = d.nr0;
+        /* Q4_K: NSG*nr0 rows per threadgroup.  Q8_0: nr0 rows. */
+        const NSUInteger rows_per_tg = q4 ?
+            (NSUInteger)d.nsg * (NSUInteger)d.nr0 : (NSUInteger)d.nr0;
+        const NSUInteger n_tg =
+            ((NSUInteger)out_dim + rows_per_tg - 1u) / rows_per_tg;
+        id<MTLComputePipelineState> p =
+            ds4_gpu_get_mul_mv_pipeline(d.function_name, d.nsg);
+        if (!p) {
+            fprintf(stderr, "ds4: dense matvec bench: pipeline %s unavailable\n",
+                    d.function_name);
+            return 0;
+        }
+        memset([ob contents], 0, (size_t)(out_dim * sizeof(float)));
+        for (int pass = 0; pass < 3; pass++) {
+            id<MTLCommandBuffer> cb = ds4_gpu_new_command_buffer();
+            if (!cb) return 0;
+            id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
+            [enc setComputePipelineState:p];
+            for (uint32_t it = 0; it < iters; it++) {
+                const uint32_t slice =
+                    it % (q4 ? q4_slices : q8_slices);
+                [enc setBytes:&a length:sizeof(a) atIndex:0];
+                [enc setBuffer:(q4 ? w4 : w8)
+                        offset:(NSUInteger)((q4 ? q4_bytes : q8_bytes) * slice)
+                       atIndex:1];
+                [enc setBuffer:xb offset:0 atIndex:2];
+                [enc setBuffer:ob offset:0 atIndex:3];
+                if (d.smem != 0) {
+                    [enc setThreadgroupMemoryLength:d.smem atIndex:0];
+                }
+                [enc dispatchThreadgroups:MTLSizeMake(n_tg, 1, 1)
+                     threadsPerThreadgroup:MTLSizeMake(32, (NSUInteger)d.nsg, 1)];
+            }
+            ds4_gpu_end_compute_encoder(cb, enc);
+            [cb commit];
+            [cb waitUntilCompleted];
+            if (cb.status != MTLCommandBufferStatusCompleted) return 0;
+            const double ms =
+                ([cb GPUEndTime] - [cb GPUStartTime]) * 1000.0 / (double)iters;
+            if (ms > 0.0 && ms < best_ms[kind]) best_ms[kind] = ms;
+        }
+        /* Coverage check: a wrong dispatch leaves tail rows untouched, which
+         * would make an incomplete kernel look fast. */
+        const float *of = (const float *)[ob contents];
+        uint32_t zeros = 0;
+        for (uint64_t i = 0; i < out_dim; i++) if (of[i] == 0.0f) zeros++;
+        if (zeros != 0) {
+            fprintf(stderr,
+                    "ds4: dense matvec bench: %s left %u/%llu output rows unwritten\n",
+                    d.function_name,
+                    zeros,
+                    (unsigned long long)out_dim);
+            return 0;
+        }
+    }
+
+    const double gib8 = (double)q8_bytes / (double)(1ull << 30);
+    const double gib4 = (double)q4_bytes / (double)(1ull << 30);
+    fprintf(stderr,
+            "ds4: dense matvec %llux%llu  Q8_0 %.4f ms (%.1f GiB/s)  "
+            "Q4_K %.4f ms (%.1f GiB/s)  speedup %.2fx (bytes %.2fx)\n",
+            (unsigned long long)in_dim,
+            (unsigned long long)out_dim,
+            best_ms[0], gib8 / (best_ms[0] / 1000.0),
+            best_ms[1], gib4 / (best_ms[1] / 1000.0),
+            best_ms[0] / best_ms[1],
+            gib8 / gib4);
+    return best_ms[0] > 0.0 && best_ms[1] > 0.0;
+}
+
 int ds4_gpu_internal_experts_ready_event_test(void) {
     if (!g_initialized && !ds4_gpu_init()) return 0;
     if (g_batch_cb || [g_pending_cbs count] != 0) return 0;

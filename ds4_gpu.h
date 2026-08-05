@@ -1977,6 +1977,8 @@ int ds4_gpu_internal_shared_event_resume_latency_test(void);
 
 int ds4_gpu_internal_experts_ready_event_test(void);
 
+int ds4_gpu_internal_dense_matvec_bandwidth_test(void);
+
 #endif
 
 /* Sync-profile hook (DS4_METAL_SYNC_PROFILE): the decode loop reports the
