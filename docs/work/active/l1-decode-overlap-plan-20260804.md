@@ -299,3 +299,121 @@ Identità 512 ✓. A/B/B/A steady 8K in corso (ordine OFF/ON/ON/OFF).
    worker freeze + grow/trim al confine.
 3. Cancellazione: kill del bench a metà decode ripetuto (SIGINT loop) — nessun
    hang, nessun timeout command buffer nel log.
+
+---
+
+## P5 — VERDETTO MISURATO (2026-08-05)
+
+Tutte le run con identità output verificata (`cmp` su evidence). Coppie
+appaiate, ordine alternato tra i round.
+
+### 32K + 512 (miglior punto operativo, quello sulla model card)
+
+| round | OFF | ON | delta | hit OFF/ON |
+|---|---|---|---|---|
+| 1 (OFF→ON) | 11.65 t/s | 12.03 t/s | **+3.3%** | 0.925 / 0.916 |
+| 2 (ON→OFF) | 11.60 t/s | 12.12 t/s | **+4.5%** | 0.916 / 0.916 |
+| **pooled** | **11.63** | **12.08** | **+3.9%** | — |
+
+TPOT p50: 76.4/77.0 → 73.8/73.5 ms. Il round 2 è la coppia pulita: **hit
+identico 0.916 su entrambi**, quindi il guadagno non viene da fortuna di
+cache. Nel round 1 ON vince pur avendo hit PIÙ BASSO (più miss da servire).
+
+### Altri punti
+
+| lane | OFF | ON | delta |
+|---|---|---|---|
+| ctx 512, gen 96 | 10.95 | 11.48 | +4.8% |
+| 8K, gen 512 (2 round A/B/B/A) | 10.56 medio | 10.47 medio | ~parità (rumore) |
+
+### Verdetto contro le soglie pre-registrate
+
+Soglie: successo ≥1.25×, successo pieno ≥1.45×, **kill <1.10×**.
+Misurato **1.039×** a 32K → **sotto la linea di kill**.
+
+**Decisione: NON promuovere a default; NON revertire.** Il codice resta
+opt-in e inerte (flag OFF = zero differenze di percorso), output identico,
++4-5% a due punti su tre. Revertire distruggerebbe lavoro corretto e
+misurato per un numero che è positivo ovunque; promuoverlo a default
+violerebbe la soglia. Sta in mezzo: strumento disponibile, non attivo.
+
+### Perché 1.04× e non 1.3× — il collo si è SPOSTATO
+
+Il disegno ha fatto quello che prometteva: encode del main **dimezzato**
+(2950→1281 ms/128 tok nel sync profile). Ma togliere l'host dal percorso
+critico non regala tempo se al suo posto ci va il worker: ora è la GPU ad
+aspettare il **pread**, non l'host ad aspettare il worker.
+
+Aritmetica: a 8K il pread costa 8.3 ms/token misurati (~40 miss); a 32K le
+miss si dimezzano e infatti lì il guadagno emerge. Il tetto di L1 non è più
+"quanto host si toglie" ma **quanto pread resta scoperto**.
+
+### Cosa resta come leva (non fatto, per il prossimo giro)
+
+1. **Readahead L+1**: caricare gli esperti del layer successivo mentre la GPU
+   macina il MoE corrente. Richiede predizione dei selected id (il router di
+   L+1 non è ancora calcolato) — GLM ha già `router_ahead`, DS no. È l'unica
+   leva che attacca il collo VERO.
+2. Profilo 32K ON/OFF in corso per quantificare esattamente quanto pread
+   resta scoperto in modalità GPU-wait (aggiorna questa sezione).
+
+### Attribuzione finale — profilo 32K appaiato (ON/OFF, stessa sessione)
+
+| metrica | OFF | ON | nota |
+|---|---|---|---|
+| encode_total | 6641 ms | **3764 ms** | −43%: il disegno funziona |
+| gpu_total | 190099 ms | 190076 ms | **identico** (0.01%): stessi kernel, stesso lavoro |
+| host_block_total | 36386 ms | 36934 ms | **invariato** |
+| worker_event_wait | 31874 ms | 31708 ms | invariato |
+| decode | 11.80 t/s | 12.16 t/s | +3.1% |
+| pread | 6.13 ms/tok | 6.39 ms/tok | — |
+
+**Dove finisce il risparmio.** Encode risparmiato = 5.62 ms/token; guadagno
+TPOT = 2.06 ms/token → solo il **37%** si materializza. Il resto era già
+sovrapposto all'esecuzione GPU: lo stavamo togliendo da un percorso che non
+era critico.
+
+**Il blocco host NON è dead time** (stessa falsificazione del verdetto M2 su
+GLM, vedi memoria `glm-m2-pipelined-verdict`). Per layer-token: host_block
+1.80 ms, di cui **1.55 ms (86%) è il worker che dorme aspettando il router
+sulla GPU** — tempo in cui la GPU sta calcolando attention+router, lavoro
+necessario. Il pread+install del worker è 0.36 ms. Il totale host_block
+(36.9 s) è il 98% del wall di decode (37.5 s): non perché l'host sprechi
+tempo, ma perché il decode È l'attesa di lavoro GPU seriale.
+
+### Tetto rivisto dell'INTERA direzione overlap
+
+Il pread misurato è 6.39 ms su TPOT 73.33 = **8.7%**. Anche con un prefetch
+perfetto che nasconda *tutto* il pread (readahead L+1 ideale, zero miss
+esposte) il tetto assoluto è **1.095×**.
+
+Le stime precedenti (1.66× → 1.30×) erano sbagliate perché trattavano
+host_block come tempo morto recuperabile. Non lo è: è per l'86% attesa di
+GPU. **La direzione overlap è esaurita**: L1 ne ha preso 1.04×, il residuo
+teorico totale è ~1.05× ancora, e richiede il router-ahead che DS non ha.
+
+Per andare oltre serve ridurre il LAVORO GPU o i BYTE, non riorganizzare
+l'attesa: gpu_total è identico tra le due modalità ed è l'83% dello span.
+
+### P3 — sicurezza del flag (2026-08-05)
+
+1. **Buco chiuso**: `gpu_wait_moe_supported()` ora richiede
+   `stream_expert_slab_enabled()`. Senza slab la residenza slab-wide non
+   dichiarerebbe NULLA e il dispatch leggerebbe buffer mai resi residenti.
+   Nella config DeepSeek il growth guard forza gli slab, quindi il gate non
+   scatta mai in produzione — ma rende esplicito un invariante che prima era
+   accidentale.
+2. **Invariante di residenza** (sempre attivo, ~48 confronti/layer contro un
+   pread da 6.4 ms): ogni indirizzo pubblicato nella tabella compatta deve
+   cadere dentro uno slab dichiarato, altrimenti abort pulito. Converte una
+   classe di corruzione silenziosa in un fallimento visibile.
+3. **Eviction sotto stress**: già coperta dalle lane. La run 32K ON ha fatto
+   **11.073 evizioni** (vs 9.855 OFF) con output byte-identico; ogni lane
+   parte dal floor 259 dopo il prefill e risale, quindi il percorso
+   floor→ramp→regime è esercitato in tutte le misure.
+4. **Cancellazione**: 3/3 round con SIGINT a metà decode → processo terminato
+   sempre, **zero** timeout di command buffer nei log. L'evento
+   experts-ready non può lasciare la coda appesa (signal-always).
+
+Validazione: kernels/oracle/admission/qwen/diff-check tutti verdi, gate
+strutturale del bench OK, build senza warning.

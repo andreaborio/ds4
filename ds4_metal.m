@@ -9281,6 +9281,7 @@ int ds4_gpu_commands_active(void) {
 
 static int ds4_gpu_stream_gpu_wait_on_worker(void);
 static int ds4_gpu_stream_compact_addr_ensure_buffers(uint32_t layer);
+static int ds4_gpu_stream_expert_slab_enabled(void);
 
 static int ds4_gpu_stream_expert_cache_wait_inflight(const char *label) {
     const char *what = label ? label : "streaming expert cache in-flight";
@@ -9495,6 +9496,14 @@ int ds4_gpu_stream_gpu_wait_moe_supported(void) {
     if (!g_initialized && !ds4_gpu_init()) return 0;
     if (g_moe_mul_mv_addr_iq2_xxs_pair_swiglu_pipeline == nil ||
         g_moe_mul_mv_addr_q2_k_sum6_pipeline == nil) {
+        return 0;
+    }
+    if (!ds4_gpu_stream_expert_slab_enabled()) {
+        /* Residency in this mode is declared slab-wide: without slabs the
+         * per-expert buffers would never be made resident for a dispatch
+         * encoded before the addresses exist. */
+        fprintf(stderr,
+                "ds4: deepseek decode gpu-wait requires the streaming expert slab allocator\n");
         return 0;
     }
 #if TARGET_OS_OSX
@@ -17081,6 +17090,40 @@ int ds4_gpu_stream_compact_addr_fill_gpu_wait(
             return 0;
         }
     }
+    /* Residency invariant.  The dispatch that consumes this table declares
+     * the slab set, not these buffers; an address outside every slab would
+     * be read by the GPU without being resident.  Cheap enough to always
+     * run (6 addresses x a handful of slabs) and it converts a class of
+     * silent corruption into a clean abort. */
+    for (uint32_t i = 0; i < n_selected; i++) {
+        const uint64_t addrs[3] = {
+            gate_values[i], up_values[i], down_values[i],
+        };
+        for (uint32_t k = 0; k < 3; k++) {
+            int inside = 0;
+            for (uint32_t sb = 0; sb < g_stream_expert_cache_slab_count; sb++) {
+                id<MTLBuffer> slab = g_stream_expert_cache_slabs[sb];
+                if (!slab) continue;
+                const uint64_t base = ds4_gpu_buffer_address(slab, 0);
+                if (base == 0) continue;
+                if (addrs[k] >= base &&
+                    addrs[k] < base + (uint64_t)[slab length]) {
+                    inside = 1;
+                    break;
+                }
+            }
+            if (!inside) {
+                fprintf(stderr,
+                        "ds4: Metal GPU-wait table fill: address %llu (i=%u kind=%u) is outside every declared slab at layer %u\n",
+                        (unsigned long long)addrs[k],
+                        i,
+                        k,
+                        table->layer);
+                return 0;
+            }
+        }
+    }
+
     return ds4_gpu_stream_compact_addr_store(table->layer,
                                              gate_values,
                                              up_values,
