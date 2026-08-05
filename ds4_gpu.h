@@ -1975,6 +1975,8 @@ int ds4_gpu_internal_dspark_head_execute_test(void);
 
 int ds4_gpu_internal_shared_event_resume_latency_test(void);
 
+int ds4_gpu_internal_experts_ready_event_test(void);
+
 #endif
 
 /* Sync-profile hook (DS4_METAL_SYNC_PROFILE): the decode loop reports the
@@ -1983,6 +1985,30 @@ int ds4_gpu_internal_shared_event_resume_latency_test(void);
  * the profile is disabled. */
 void ds4_gpu_sync_profile_note_host_block_ms(double waited_ms);
 void ds4_gpu_sync_profile_note_worker_load_ms(double load_ms);
+
+/* L1 GPU-wait decode primitives (see
+ * docs/work/active/l1-decode-overlap-plan-20260804.md).
+ *
+ * The experts-ready event lets the queue wait for the selected-load worker
+ * instead of the host: the encode side reserves a value and encodes a wait
+ * before the routed MoE; the worker fills the compact address table and then
+ * signals that value from the CPU.  The worker contract is signal-ALWAYS:
+ * whoever reserves a value must guarantee it is eventually signaled, on
+ * success and on every failure path, or the queue deadlocks until the 60 s
+ * command-buffer timeout. */
+int ds4_gpu_experts_ready_ensure(void);
+uint64_t ds4_gpu_experts_ready_reserve_value(void);
+void ds4_gpu_experts_ready_signal(uint64_t value);
+int ds4_gpu_encode_wait_experts_ready(uint64_t value);
+
+/* Resolve the cache entries for up to six selected experts of one layer and
+ * fill that layer's compact GPU address table.  Requires every id to be
+ * resident (the caller runs it after a successful selected load).  Fails
+ * without touching the table when any entry is missing or stale. */
+int ds4_gpu_stream_compact_addr_prepare_selected(
+        const ds4_gpu_stream_expert_table *table,
+        const int32_t                     *selected_ids,
+        uint32_t                           n_selected);
 
 /* =========================================================================
  * Hyper-Connection Kernels.

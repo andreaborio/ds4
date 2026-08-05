@@ -26111,6 +26111,12 @@ typedef struct metal_graph_selected_async_load {
     const ds4_layer_weights  *layer;
     uint32_t                  il;
     uint64_t                  event_value;
+    /* L1 GPU-wait decode: when non-zero, the queue holds a routed MoE behind
+     * this experts-ready value.  The worker fills the compact address table
+     * on success and signals the value UNCONDITIONALLY on exit: a reserved
+     * value that is never signaled deadlocks the queue until the command
+     * buffer timeout, so failure paths signal too and report through ok. */
+    uint64_t                  experts_ready_value;
     uint64_t                  gate_expert_bytes;
     uint64_t                  down_expert_bytes;
     int32_t                   selected_ids[DS4_MAX_EXPERT_USED];
@@ -26178,6 +26184,11 @@ static void metal_graph_selected_async_load_run(
         return;
     }
 
+    if (job->experts_ready_value != 0 &&
+        !ds4_gpu_stream_compact_addr_prepare_selected(
+            &table, job->selected_ids, DS4_N_EXPERT_USED)) {
+        return;
+    }
     ds4_gpu_sync_profile_note_worker_load_ms(
         (now_sec() - load_t0) * 1000.0);
     job->ok = true;
@@ -26196,6 +26207,10 @@ static void *metal_graph_selected_async_load_worker_main(void *arg) {
         pthread_mutex_unlock(&g_metal_graph_selected_async_load_mutex);
 
         metal_graph_selected_async_load_run(&job);
+        /* Signal-always: the encode side may already hold a routed MoE
+         * behind this value.  Success or failure, the queue must move; the
+         * failure is reported through job.ok and aborts the generation. */
+        ds4_gpu_experts_ready_signal(job.experts_ready_value);
 
         pthread_mutex_lock(&g_metal_graph_selected_async_load_mutex);
         g_metal_graph_selected_async_load_job = job;
@@ -49420,14 +49435,17 @@ int ds4_session_eval_ngram_spec_argmax(ds4_session *s, int first_token,
      * sequential greedy after the first verify rounds and two identical
      * speculative runs even diverged from each other.  Fail closed exactly
      * like --mtp does until the verifier is qualified under streaming. */
-    if (e->ssd_streaming) {
+    if (e->ssd_streaming &&
+        getenv("DS4_NGRAM_SPEC_UNSAFE_STREAMING") == NULL) {
         static bool warned_streaming;
         if (!warned_streaming) {
             warned_streaming = true;
             fprintf(stderr,
                     "ds4: ngram-spec drafting is fail-closed under SSD "
                     "streaming (exact verifier is resident-only); "
-                    "decoding sequentially\n");
+                    "decoding sequentially. "
+                    "DS4_NGRAM_SPEC_UNSAFE_STREAMING=1 overrides for "
+                    "diagnosis only: outputs are known to corrupt\n");
         }
         return n_accept;
     }

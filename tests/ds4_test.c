@@ -3996,6 +3996,7 @@ static void test_metal_kernel_group(void) {
     TEST_ASSERT(ds4_gpu_internal_dspark_stage_executor_test() != 0);
     TEST_ASSERT(ds4_gpu_internal_dspark_head_execute_test() != 0);
     TEST_ASSERT(ds4_gpu_internal_shared_event_resume_latency_test() != 0);
+    TEST_ASSERT(ds4_gpu_internal_experts_ready_event_test() != 0);
     test_metal_selected_slots_runtime_count();
     /* This test retains one model-map page for its Metal no-copy sink view;
      * keep it last so later tests do not replace that view. */

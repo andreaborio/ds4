@@ -99,6 +99,12 @@ static id<MTLComputeCommandEncoder> g_batch_enc;
 static BOOL g_batch_has_work;
 static NSMutableArray<id<MTLCommandBuffer>> *g_pending_cbs;
 static id<MTLSharedEvent> g_selected_readback_event;
+/* L1 GPU-wait decode: the queue waits on this event before each routed MoE;
+ * the selected-load worker signals it from the CPU once the compact address
+ * table for that layer is filled.  Values are reserved monotonically by the
+ * encode side. */
+static id<MTLSharedEvent> g_experts_ready_event;
+static uint64_t g_experts_ready_reserved_value;
 static uint64_t g_selected_readback_event_value;
 static id<MTLComputePipelineState> g_set_rows_f32_i32_pipeline;
 static id<MTLComputePipelineState> g_get_rows_f32_pipeline;
@@ -9393,6 +9399,47 @@ int ds4_gpu_wait_selected_readback_ready(uint64_t event_value, const char *label
     return 0;
 }
 
+int ds4_gpu_experts_ready_ensure(void) {
+    if (!g_initialized && !ds4_gpu_init()) return 0;
+    if (@available(macOS 12.0, *)) {
+        if (!g_experts_ready_event) {
+            g_experts_ready_event = [g_device newSharedEvent];
+        }
+        return g_experts_ready_event != nil;
+    }
+    return 0;
+}
+
+uint64_t ds4_gpu_experts_ready_reserve_value(void) {
+    if (!ds4_gpu_experts_ready_ensure()) return 0;
+    return ++g_experts_ready_reserved_value;
+}
+
+void ds4_gpu_experts_ready_signal(uint64_t value) {
+    if (value == 0) return;
+    if (@available(macOS 12.0, *)) {
+        if (g_experts_ready_event) {
+            /* setSignaledValue is documented as safe from any thread; the
+             * selected-load worker is the expected caller. */
+            g_experts_ready_event.signaledValue = value;
+        }
+    }
+}
+
+int ds4_gpu_encode_wait_experts_ready(uint64_t value) {
+    if (!g_initialized && !ds4_gpu_init()) return 0;
+    if (value == 0 || !g_batch_cb) return 0;
+    if (@available(macOS 12.0, *)) {
+        if (!g_experts_ready_event) return 0;
+        /* The wait must sit between encoders on the command buffer. */
+        ds4_gpu_close_batch_encoder();
+        [g_batch_cb encodeWaitForEvent:g_experts_ready_event value:value];
+        g_batch_has_work = YES;
+        return 1;
+    }
+    return 0;
+}
+
 static int ds4_gpu_signal_batch_and_wait_event(const char *label) {
     if (!g_initialized && !ds4_gpu_init()) return 0;
     if (!g_batch_cb) return 0;
@@ -13884,6 +13931,67 @@ static int ds4_gpu_stream_compact_addr_prepare(
     *down_addrs = db;
     *selected_ids = ib;
     return 1;
+}
+
+static ds4_gpu_stream_expert_cache_entry *ds4_gpu_stream_expert_cache_peek(
+        const void *model_map,
+        uint64_t    model_size,
+        uint32_t    layer,
+        uint32_t    expert,
+        uint32_t    n_total_expert,
+        uint32_t    n_selected,
+        uint64_t    gate_abs_offset,
+        uint64_t    up_abs_offset,
+        uint64_t    down_abs_offset,
+        uint64_t    gate_expert_bytes,
+        uint64_t    down_expert_bytes);
+
+/* Fill one layer's compact address table for exactly the selected experts,
+ * resolving each id through the cache.  Runs on the selected-load worker
+ * after a successful load, so every id must already be resident; a missing
+ * or stale entry fails without touching the table.  On success the table
+ * buffers are ready for a routed MoE encoded ahead of time behind an
+ * experts-ready wait. */
+int ds4_gpu_stream_compact_addr_prepare_selected(
+        const ds4_gpu_stream_expert_table *table,
+        const int32_t                     *selected_ids,
+        uint32_t                           n_selected) {
+    if (!table || !selected_ids || n_selected == 0 || n_selected > 6 ||
+        table->layer >= DS4_METAL_STREAM_EXPERT_CACHE_MAX_LAYER ||
+        table->gate_expert_bytes == 0 || table->down_expert_bytes == 0) {
+        return 0;
+    }
+    ds4_gpu_stream_expert_cache_entry *entries[6] = { NULL };
+    for (uint32_t i = 0; i < n_selected; i++) {
+        const int32_t id = selected_ids[i];
+        if (id < 0 || (uint32_t)id >= table->n_total_expert) return 0;
+        const uint64_t gate_rel =
+            (uint64_t)id * table->gate_expert_bytes;
+        const uint64_t down_rel =
+            (uint64_t)id * table->down_expert_bytes;
+        entries[i] = ds4_gpu_stream_expert_cache_peek(
+            table->model_map,
+            table->model_size,
+            table->layer,
+            (uint32_t)id,
+            table->n_total_expert,
+            n_selected,
+            table->gate_offset + gate_rel,
+            table->up_offset + gate_rel,
+            table->down_offset + down_rel,
+            table->gate_expert_bytes,
+            table->down_expert_bytes);
+        if (!entries[i]) return 0;
+    }
+    id<MTLBuffer> gate_addrs = nil, up_addrs = nil, down_addrs = nil;
+    id<MTLBuffer> ids_buf = nil;
+    return ds4_gpu_stream_compact_addr_prepare(table->layer,
+                                               entries,
+                                               n_selected,
+                                               &gate_addrs,
+                                               &up_addrs,
+                                               &down_addrs,
+                                               &ids_buf);
 }
 
 static int ds4_gpu_stream_selected_ids_prepare(
@@ -56463,6 +56571,45 @@ int ds4_gpu_internal_shared_event_resume_latency_test(void) {
         return total_ms / rounds < 5.0;
     }
     return 0;
+}
+
+/* L1 P1 gate: the experts-ready event must hold the queue until the CPU
+ * signal, in both orders (signal before commit and signal after commit), and
+ * the selected-table fill must fail closed on a bogus table.  The worker's
+ * signal-always contract lives in ds4.c and is exercised end to end once the
+ * encode side lands (P2); here the primitives it relies on are pinned. */
+int ds4_gpu_internal_experts_ready_event_test(void) {
+    if (!g_initialized && !ds4_gpu_init()) return 0;
+    if (g_batch_cb || [g_pending_cbs count] != 0) return 0;
+    if (!ds4_gpu_experts_ready_ensure()) return 0;
+
+    /* Order 1: signal already published before the commit. */
+    const uint64_t v1 = ds4_gpu_experts_ready_reserve_value();
+    if (v1 == 0) return 0;
+    if (!ds4_gpu_begin_commands()) return 0;
+    if (!ds4_gpu_encode_wait_experts_ready(v1)) { (void)ds4_gpu_end_commands(); return 0; }
+    ds4_gpu_experts_ready_signal(v1);
+    if (!ds4_gpu_end_commands()) return 0;
+
+    /* Order 2: commit first (non-owned), then signal from the host, then
+     * drain.  This is the production shape: MoE held in the queue while the
+     * worker finishes the load. */
+    const uint64_t v2 = ds4_gpu_experts_ready_reserve_value();
+    if (v2 != v1 + 1u) return 0;
+    if (!ds4_gpu_begin_commands()) return 0;
+    if (!ds4_gpu_encode_wait_experts_ready(v2)) { (void)ds4_gpu_end_commands(); return 0; }
+    if (!ds4_gpu_flush_commands()) return 0;
+    ds4_gpu_experts_ready_signal(v2);
+    if (!ds4_gpu_synchronize()) return 0;
+
+    /* Fail-closed: a bogus table must be rejected without touching state. */
+    ds4_gpu_stream_expert_table bogus = {0};
+    const int32_t ids[6] = {0, 1, 2, 3, 4, 5};
+    if (ds4_gpu_stream_compact_addr_prepare_selected(&bogus, ids, 6)) {
+        return 0;
+    }
+    if (ds4_gpu_encode_wait_experts_ready(0)) return 0;
+    return 1;
 }
 
 int ds4_gpu_internal_dspark_head_execute_test(void) {
