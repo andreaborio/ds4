@@ -4743,6 +4743,37 @@ static const char *ds4_gpu_source =
 
 static uint32_t g_metal_source_override_count;
 
+/* Directories to look for the kernel sources in, in order.  The sources live
+ * next to the repository under metal/, so a binary run from anywhere has
+ * to find them relative to ITSELF, not to the working directory: the build
+ * layout puts the executable at build/<arch>/bin/, three levels below the
+ * sources.  Walking the executable's ancestors also covers an installed
+ * layout that keeps metal/ beside the binary.  The working directory stays
+ * first so an in-repo run keeps its existing behaviour, and
+ * DS4_METAL_SOURCE_DIR overrides everything. */
+static NSArray<NSString *> *ds4_gpu_source_roots(void) {
+    static NSArray<NSString *> *cached;
+    if (cached) return cached;
+
+    NSMutableArray<NSString *> *roots = [NSMutableArray array];
+    const char *explicit_dir = getenv("DS4_METAL_SOURCE_DIR");
+    if (explicit_dir && explicit_dir[0]) {
+        [roots addObject:[NSString stringWithUTF8String:explicit_dir]];
+    }
+    [roots addObject:@"."];
+
+    NSString *exe = [[NSBundle mainBundle] executablePath];
+    if (exe) {
+        NSString *dir = [exe stringByDeletingLastPathComponent];
+        for (int up = 0; up < 6 && [dir length] > 1; up++) {
+            [roots addObject:dir];
+            dir = [dir stringByDeletingLastPathComponent];
+        }
+    }
+    cached = roots;
+    return cached;
+}
+
 static NSString *ds4_gpu_full_source(void) {
     NSString *base = [NSString stringWithUTF8String:ds4_gpu_source];
     NSFileManager *fm = [NSFileManager defaultManager];
@@ -4785,8 +4816,9 @@ static NSString *ds4_gpu_full_source(void) {
             [paths addObject:[NSString stringWithUTF8String:override_path]];
             g_metal_source_override_count++;
         }
-        [paths addObject:spec[1]];
-        [paths addObject:[@"./" stringByAppendingString:spec[1]]];
+        for (NSString *root in ds4_gpu_source_roots()) {
+            [paths addObject:[root stringByAppendingPathComponent:spec[1]]];
+        }
 
         NSString *loaded = nil;
         NSString *loaded_path = nil;
