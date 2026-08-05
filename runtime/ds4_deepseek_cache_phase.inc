@@ -20,19 +20,29 @@ static bool ds4_session_deepseek_phase_cache_enabled(
     return true;
 }
 
-/* Opt-in: keep the warm decode cache across batched mid-session prefills up
- * to this many tokens.  Zero (default) preserves the historical teardown.
- * Environment policy is immutable after process startup. */
+/* Keep the warm decode cache across batched mid-session prefills up to this
+ * many tokens.  The prefill-phase teardown exists to give grouped prefill
+ * memory headroom on huge prompts; on a conversational turn it only destroys
+ * a warm cache and pays a full reseed (measured: ~27 GiB re-read, ~5-7 s of
+ * extra TTFT and a following decode ~1.8x slower).  Default 4096 covers
+ * ordinary turns and leaves the teardown in place for genuinely large
+ * prompts, where the headroom is what it is for.  Set the variable to 0 to
+ * restore the historical always-teardown behaviour.  Environment policy is
+ * immutable after process startup. */
+#define DS4_DEEPSEEK_PREFILL_CACHE_KEEP_MAX_DEFAULT 4096u
+
 static uint32_t ds4_session_deepseek_prefill_cache_keep_max(void) {
     static int cached = -1;
     if (cached < 0) {
         const char *env =
             getenv("DS4_DEEPSEEK_PREFILL_CACHE_KEEP_MAX_TOKENS");
-        long v = 0;
+        long v = (long)DS4_DEEPSEEK_PREFILL_CACHE_KEEP_MAX_DEFAULT;
         if (env && env[0]) {
             char *end = NULL;
             v = strtol(env, &end, 10);
-            if (end == env || v < 0) v = 0;
+            if (end == env || v < 0) {
+                v = (long)DS4_DEEPSEEK_PREFILL_CACHE_KEEP_MAX_DEFAULT;
+            }
             if (v > (long)UINT32_MAX) v = (long)UINT32_MAX;
         }
         cached = (int)v;

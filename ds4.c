@@ -44606,6 +44606,14 @@ static const char *ds4_glm_router_ahead_mode_name(
 static bool metal_graph_use_deepseek_decode_gpu_wait(void) {
     static int cache = -1;
     if (cache < 0) {
+        /* Opt-in, and it stays opt-in: the win is smaller than this host's
+         * run-to-run spread.  Output identity and determinism hold at ctx
+         * 512, 8K and 32K, but the speed claim does not survive repetition.
+         * Two paired rounds in the morning gave +3.9% at 32K; four paired
+         * runs the same evening gave 1.013x, with a spread of 10.77-12.03
+         * t/s WITHIN one arm (11.7%).  Nothing below roughly 10% can be
+         * called on this machine without far more repetitions, and the whole
+         * overlap direction tops out at 1.095x anyway. */
         cache = getenv("DS4_METAL_ENABLE_DEEPSEEK_DECODE_GPU_WAIT") != NULL;
         if (cache &&
             (getenv("DS4_MOE_RECORD_SELECTED_IDS") != NULL ||
@@ -44617,9 +44625,6 @@ static bool metal_graph_use_deepseek_decode_gpu_wait(void) {
                     "ds4: deepseek decode gpu-wait disabled: selected-id "
                     "trace/replay/hotlist requires host ids\n");
             cache = 0;
-        } else if (cache) {
-            fprintf(stderr,
-                    "ds4: deepseek decode gpu-wait mode active\n");
         }
     }
     return cache > 0;
@@ -44638,7 +44643,7 @@ static void ds4_engine_print_effective_metal_ssd_profile(
                     e->metal_ssd_profile.glm_router_ahead),
             e->metal_ssd_profile.glm_router_ahead_lookahead,
             e->metal_ssd_profile.streaming_expert_readahead ? "on" : "off",
-            metal_graph_use_deepseek_decode_gpu_wait() ? "requested" : "off");
+            metal_graph_use_deepseek_decode_gpu_wait() ? "on" : "off");
 }
 
 int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
