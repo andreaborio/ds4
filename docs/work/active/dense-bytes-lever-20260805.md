@@ -150,3 +150,50 @@ precisione, ~1.3×), poi eventualmente la requantizzazione come leva
 indipendente che si somma. Il modello 0731 **non ha teste MTP** (zero tensori,
 malgrado `nextn_predict_layers=1` nei metadati), quindi il drafter dev'essere
 quello n-gram: R2, che è già costruito e va sbloccato.
+
+---
+
+## Il MoE routed NON è il collo — misurato (2026-08-05, sera)
+
+Il profiler per stage indicava `routed_moe` come voce dominante della verifica
+batched. **Falsificato con una misura pulita.** Sonda
+`ds4_gpu_internal_routed_moe_bandwidth_test`: kernel veri del motore
+(`kernel_mul_mv_addr_iq2_xxs_pair_swiglu_f32` + `..._q2_k_sum6_f32`), shape di
+decode reali, pool da 1 GiB fuori cache, una tabella indirizzi **per slice**.
+
+| | GiB/s | ms/token |
+|---|---:|---:|
+| denso Q8_0 | 244-250 | 29.4 (7.20 GiB) |
+| **routed MoE** (6 esperti/layer) | **186** | **9.1** (1.70 GiB) |
+
+Il routed gira al **76% del ritmo denso**, non a 1/5. Con 43 layer costa 9.1
+ms/token: c'è margine per ~2 ms, non per 25.
+
+### Due trappole in più, oltre a quelle del probe denso
+
+3. **Riempimento uniforme**: IQ2_XXS e Q2_K derivano le scale dal payload, e
+   un fill costante decodifica a zero esatto — il controllo di copertura non
+   distingueva un kernel che funziona da uno che non parte. Ora il riempimento
+   è pseudo-casuale.
+4. **Una sola tabella indirizzi riscritta per iterazione**: l'encoder registra
+   buffer+offset, non i byte, quindi tutti i dispatch leggevano l'ultima
+   tabella scritta (e fuori range). Ora c'è una tabella per slice.
+
+## Il budget del token, ricostruito con numeri puliti
+
+streaming pesi = 29.4 (denso) + 9.1 (routed) = **38.5 ms/token**, cioè il
+**43-53% del TPOT** a seconda del contesto. Il resto è attenzione/KV,
+attivazioni, lanci e tempo host — non lettura di pesi.
+
+Conseguenza sulla requantizzazione: portare il denso Q8_0 a Q4_K risparmia
+**11.8 ms/token**, quindi **1.15× a 8K e 1.19× a 32K** — non l'1.29× stimato
+prima assumendo che tutto il tempo GPU scalasse coi byte. Resta la leva
+singola più grande, ma la taglia onesta è quella.
+
+## E la riga speculativa marginale resta inspiegata
+
+La seconda riga costa 63.8 ms misurati (141.1 verifica − 77.3 sequenziale). I
+pesi routed della seconda riga sono **9.1 ms, il 14%**. Restano **54.7 ms non
+spiegati dai pesi**: sono i costi fissi e la granularità di tile del percorso
+batched (quello del prefill) usato con sole 2 righe. È lì che va guardato se
+si vuole far pagare la speculazione — non nel MoE.

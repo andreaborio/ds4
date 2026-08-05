@@ -57236,6 +57236,211 @@ int ds4_gpu_internal_dense_matvec_bandwidth_test(void) {
     return best_ms[0] > 0.0 && best_ms[1] > 0.0;
 }
 
+/* Routed-MoE bandwidth probe.  The dense probe above showed dense matvec at
+ * the machine's peak; the batched speculative verifier then measured a second
+ * row costing 0.83 of a full pass instead of the 0.19 its bytes predict, with
+ * the stage profiler pointing at the routed MoE.  That profiler synchronizes
+ * per stage and inflates absolutes, so this measures the routed kernels the
+ * same way the dense ones were measured: real decode shapes, weights streamed
+ * from a pool far larger than any cache, correct dispatch, output coverage
+ * checked.
+ *
+ * One layer, one row: 6 experts x (gate + up IQ2_XXS + down Q2_K) =
+ * 6 x 7,077,888 bytes.  Across 43 layers that is the 1.70 GiB a decode token
+ * reads in routed weights. */
+int ds4_gpu_internal_routed_moe_bandwidth_test(void) {
+    if (!g_initialized && !ds4_gpu_init()) return 0;
+
+    const uint32_t in_dim = 4096, mid_dim = 2048, n_sel = 6, n_total = 256;
+    const uint64_t gate_row = (uint64_t)in_dim / 256u * 66u;      /* IQ2_XXS */
+    const uint64_t gate_expert = gate_row * mid_dim;
+    const uint64_t down_row = (uint64_t)mid_dim / 256u * 84u;     /* Q2_K */
+    const uint64_t down_expert = down_row * in_dim;
+    const uint64_t record = gate_expert * 2u + down_expert;
+    const uint32_t iters =
+        (uint32_t)ds4_gpu_env_u64("DS4_METAL_ROUTED_MV_BENCH_ITERS", 64u, 1u, 4096u);
+    const uint64_t pool_bytes =
+        ds4_gpu_env_u64("DS4_METAL_ROUTED_MV_BENCH_POOL_MB", 1024u, 128u, 8192u)
+        * 1024ull * 1024ull;
+    const uint32_t slices = (uint32_t)(pool_bytes / (record * n_sel));
+    if (slices < 2) return 0;
+
+    /* Use the pipelines the engine built at init with its own function
+     * constants, so this measures exactly what decode runs. */
+    id<MTLComputePipelineState> pair = g_moe_mul_mv_addr_iq2_xxs_pair_swiglu_pipeline;
+    id<MTLComputePipelineState> sum6 = g_moe_mul_mv_addr_q2_k_sum6_pipeline;
+    if (!pair || !sum6) {
+        fprintf(stderr, "ds4: routed mv bench: addr pipelines unavailable\n");
+        return 0;
+    }
+
+    const uint64_t gate_pool = gate_expert * n_sel * slices;
+    const uint64_t down_pool = down_expert * n_sel * slices;
+    id<MTLBuffer> gbuf = [g_device newBufferWithLength:(NSUInteger)gate_pool
+                                               options:MTLResourceStorageModeShared];
+    id<MTLBuffer> ubuf = [g_device newBufferWithLength:(NSUInteger)gate_pool
+                                               options:MTLResourceStorageModeShared];
+    id<MTLBuffer> dbuf = [g_device newBufferWithLength:(NSUInteger)down_pool
+                                               options:MTLResourceStorageModeShared];
+    if (!gbuf || !ubuf || !dbuf) return 0;
+    /* Varied bytes, not a constant fill: IQ2_XXS and Q2_K derive block scales
+     * from the payload, and a uniform pattern can decode to exactly zero,
+     * which would make the coverage check below unable to tell a working
+     * kernel from a kernel that never ran. */
+    {
+        uint32_t st = 0x9e3779b9u;
+        uint8_t *gp = (uint8_t *)[gbuf contents];
+        uint8_t *up = (uint8_t *)[ubuf contents];
+        uint8_t *dp = (uint8_t *)[dbuf contents];
+        for (uint64_t i = 0; i < gate_pool; i++) {
+            st ^= st << 13; st ^= st >> 17; st ^= st << 5;
+            gp[i] = (uint8_t)st;
+            up[i] = (uint8_t)(st >> 8);
+        }
+        for (uint64_t i = 0; i < down_pool; i++) {
+            st ^= st << 13; st ^= st >> 17; st ^= st << 5;
+            dp[i] = (uint8_t)st;
+        }
+    }
+
+    /* One address table PER SLICE, all filled before the commit: the encoder
+     * records a buffer+offset, not the bytes, so a single table rewritten per
+     * iteration would leave every dispatch reading the last one. */
+    const NSUInteger addr_bytes = 6u * sizeof(uint64_t);
+    const NSUInteger addr_pool = addr_bytes * slices;
+    id<MTLBuffer> ga = [g_device newBufferWithLength:addr_pool options:MTLResourceStorageModeShared];
+    id<MTLBuffer> ua = [g_device newBufferWithLength:addr_pool options:MTLResourceStorageModeShared];
+    id<MTLBuffer> da = [g_device newBufferWithLength:addr_pool options:MTLResourceStorageModeShared];
+    id<MTLBuffer> ids = [g_device newBufferWithLength:6u * sizeof(int32_t) options:MTLResourceStorageModeShared];
+    id<MTLBuffer> wts = [g_device newBufferWithLength:6u * sizeof(float) options:MTLResourceStorageModeShared];
+    id<MTLBuffer> xb = [g_device newBufferWithLength:(NSUInteger)(in_dim * sizeof(float))
+                                             options:MTLResourceStorageModeShared];
+    id<MTLBuffer> ga_out = [g_device newBufferWithLength:(NSUInteger)(n_sel * mid_dim * sizeof(float))
+                                                 options:MTLResourceStorageModeShared];
+    id<MTLBuffer> up_out = [g_device newBufferWithLength:(NSUInteger)(n_sel * mid_dim * sizeof(float))
+                                                 options:MTLResourceStorageModeShared];
+    id<MTLBuffer> mid_out = [g_device newBufferWithLength:(NSUInteger)(n_sel * mid_dim * sizeof(float))
+                                                  options:MTLResourceStorageModeShared];
+    id<MTLBuffer> out = [g_device newBufferWithLength:(NSUInteger)(in_dim * sizeof(float))
+                                              options:MTLResourceStorageModeShared];
+    if (!ga || !ua || !da || !ids || !wts || !xb || !ga_out || !up_out || !mid_out || !out) return 0;
+    int32_t *idp = (int32_t *)[ids contents];
+    float *wp = (float *)[wts contents];
+    for (uint32_t i = 0; i < 6; i++) { idp[i] = (int32_t)i; wp[i] = 1.0f / 6.0f; }
+    float *xf = (float *)[xb contents];
+    for (uint32_t i = 0; i < in_dim; i++) xf[i] = 0.01f;
+    memset([out contents], 0, (size_t)(in_dim * sizeof(float)));
+
+    ds4_gpu_mul_mv_id_args gate_args =
+        ds4_gpu_make_mul_mv_id_args(in_dim, mid_dim, n_total, gate_row,
+                                    gate_expert, 1, n_sel, 1,
+                                    ds4_gpu_routed_mv_nr0(DS4_METAL_TENSOR_IQ2_XXS));
+    ds4_gpu_mul_mv_id_args down_args =
+        ds4_gpu_make_mul_mv_id_args(mid_dim, in_dim, n_total, down_row,
+                                    down_expert, n_sel, n_sel, 1,
+                                    ds4_gpu_routed_mv_nr0(DS4_METAL_TENSOR_Q2_K));
+    ds4_gpu_dsv4_moe_swiglu_weight_args act = {
+        .width = mid_dim,
+        .rows = n_sel,
+        .gate_row_stride = (uint64_t)mid_dim * sizeof(float),
+        .up_row_stride = (uint64_t)mid_dim * sizeof(float),
+        .mid_row_stride = (uint64_t)mid_dim * sizeof(float),
+        .weight_stride = sizeof(float),
+        .write_clamped = 0,
+        .clamp_value = 7.0f,
+    };
+    const NSUInteger gate_smem = ds4_gpu_routed_mv_smem(DS4_METAL_TENSOR_IQ2_XXS);
+    const NSUInteger down_smem = ds4_gpu_routed_mv_smem(DS4_METAL_TENSOR_Q2_K);
+    const NSUInteger nsg = 2;
+
+    double best = 1e18;
+    for (int pass = 0; pass < 3; pass++) {
+        id<MTLCommandBuffer> cb = ds4_gpu_new_command_buffer();
+        if (!cb) return 0;
+        for (uint32_t sl = 0; sl < slices; sl++) {
+            uint64_t *gv = (uint64_t *)((char *)[ga contents] + sl * addr_bytes);
+            uint64_t *uv = (uint64_t *)((char *)[ua contents] + sl * addr_bytes);
+            uint64_t *dv = (uint64_t *)((char *)[da contents] + sl * addr_bytes);
+            for (uint32_t i = 0; i < 6; i++) {
+                const uint64_t e = (uint64_t)sl * n_sel + i;
+                gv[i] = ds4_gpu_buffer_address(gbuf, (NSUInteger)(e * gate_expert));
+                uv[i] = ds4_gpu_buffer_address(ubuf, (NSUInteger)(e * gate_expert));
+                dv[i] = ds4_gpu_buffer_address(dbuf, (NSUInteger)(e * down_expert));
+                if (!gv[i] || !uv[i] || !dv[i]) return 0;
+            }
+        }
+        for (uint32_t it = 0; it < iters; it++) {
+            const NSUInteger addr_off = (NSUInteger)(it % slices) * addr_bytes;
+            /* gate+up+SwiGLU */
+            id<MTLComputeCommandEncoder> e1 = ds4_gpu_compute_encoder(cb);
+            [e1 setComputePipelineState:pair];
+            [e1 setBytes:&gate_args length:sizeof(gate_args) atIndex:0];
+            [e1 setBytes:&act length:sizeof(act) atIndex:1];
+            [e1 setBuffer:ga offset:addr_off atIndex:2];
+            [e1 setBuffer:ua offset:addr_off atIndex:3];
+            [e1 setBuffer:xb offset:0 atIndex:4];
+            [e1 setBuffer:ga_out offset:0 atIndex:5];
+            [e1 setBuffer:up_out offset:0 atIndex:6];
+            [e1 setBuffer:mid_out offset:0 atIndex:7];
+            [e1 setBuffer:ids offset:0 atIndex:8];
+            [e1 setBuffer:wts offset:0 atIndex:9];
+            [e1 useResource:gbuf usage:MTLResourceUsageRead];
+            [e1 useResource:ubuf usage:MTLResourceUsageRead];
+            if (gate_smem) [e1 setThreadgroupMemoryLength:gate_smem atIndex:0];
+            {
+                const NSUInteger nr0 = (NSUInteger)gate_args.nr0;
+                const NSUInteger rpg = nr0 * nsg;
+                [e1 dispatchThreadgroups:MTLSizeMake(((NSUInteger)gate_args.ne01 + rpg - 1u) / rpg, 1, n_sel)
+                   threadsPerThreadgroup:MTLSizeMake(32, nsg, 1)];
+            }
+            ds4_gpu_end_compute_encoder(cb, e1);
+            /* down + weighted sum over the 6 experts */
+            id<MTLComputeCommandEncoder> e2 = ds4_gpu_compute_encoder(cb);
+            [e2 setComputePipelineState:sum6];
+            [e2 setBytes:&down_args length:sizeof(down_args) atIndex:0];
+            [e2 setBuffer:da offset:addr_off atIndex:1];
+            [e2 setBuffer:mid_out offset:0 atIndex:2];
+            [e2 setBuffer:out offset:0 atIndex:3];
+            [e2 setBuffer:ids offset:0 atIndex:4];
+            [e2 useResource:dbuf usage:MTLResourceUsageRead];
+            if (down_smem) [e2 setThreadgroupMemoryLength:down_smem atIndex:0];
+            {
+                const NSUInteger rpg = (NSUInteger)down_args.nr0 * nsg;
+                [e2 dispatchThreadgroups:MTLSizeMake(((NSUInteger)down_args.ne01 + rpg - 1u) / rpg, 1, 1)
+                   threadsPerThreadgroup:MTLSizeMake(32, nsg, 1)];
+            }
+            ds4_gpu_end_compute_encoder(cb, e2);
+        }
+        [cb commit];
+        [cb waitUntilCompleted];
+        if (cb.status != MTLCommandBufferStatusCompleted) {
+            fprintf(stderr, "ds4: routed mv bench: command buffer failed\n");
+            return 0;
+        }
+        const double ms = ([cb GPUEndTime] - [cb GPUStartTime]) * 1000.0 / (double)iters;
+        if (ms > 0.0 && ms < best) best = ms;
+    }
+
+    const float *of = (const float *)[out contents];
+    uint32_t zeros = 0;
+    for (uint32_t i = 0; i < in_dim; i++) if (of[i] == 0.0f) zeros++;
+    if (zeros == in_dim) {
+        fprintf(stderr, "ds4: routed mv bench: output never written\n");
+        return 0;
+    }
+
+    const double gib = (double)(record * n_sel) / (double)(1ull << 30);
+    fprintf(stderr,
+            "ds4: routed MoE one layer (6 experts, %.1f MiB)  %.4f ms  %.1f GiB/s  "
+            "=> %.1f ms/token over %d layers\n",
+            gib * 1024.0,
+            best,
+            gib / (best / 1000.0),
+            best * 43.0,
+            43);
+    return best > 0.0;
+}
+
 int ds4_gpu_internal_experts_ready_event_test(void) {
     if (!g_initialized && !ds4_gpu_init()) return 0;
     if (g_batch_cb || [g_pending_cbs count] != 0) return 0;

@@ -3999,6 +3999,7 @@ static void test_metal_kernel_group(void) {
     TEST_ASSERT(ds4_gpu_internal_experts_ready_event_test() != 0);
     if (getenv("DS4_METAL_DENSE_MV_BENCH")) {
         TEST_ASSERT(ds4_gpu_internal_dense_matvec_bandwidth_test() != 0);
+        TEST_ASSERT(ds4_gpu_internal_routed_moe_bandwidth_test() != 0);
     }
     test_metal_selected_slots_runtime_count();
     /* This test retains one model-map page for its Metal no-copy sink view;
