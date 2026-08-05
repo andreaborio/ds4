@@ -20143,6 +20143,10 @@ typedef struct {
     uint32_t spec_prefix1_n_comp[DS4_MAX_LAYER];
     uint32_t spec_prefix1_n_index_comp[DS4_MAX_LAYER];
     bool spec_capture_prefix1;
+    /* L1 P2: true only between GPU-wait activation and token-end drain of
+     * the batched streaming decode.  Every other encode path (verify,
+     * prefill, non-batched decode) must see false. */
+    bool gpu_wait_decode;
     uint32_t raw_cap;
     /* Maximum compressed-row capacity across layers.  Shared work buffers use
      * this worst-case size because ratio-4 indexer layers can still reach it. */
@@ -26103,6 +26107,8 @@ static bool metal_graph_decode_selected_readahead_override(
     return true;
 }
 
+static bool metal_graph_use_deepseek_decode_gpu_wait(void);
+
 typedef struct metal_graph_selected_async_load {
     bool                      active;
     bool                      ok;
@@ -26146,6 +26152,9 @@ static void metal_graph_selected_async_load_run(
     if (job->event_value != 0) {
         if (ds4_gpu_wait_selected_readback_ready(job->event_value,
                                                  "selected-id async expert load") == 0) {
+            fprintf(stderr,
+                    "ds4: Metal async selected load: router event wait failed at layer %u\n",
+                    job->il);
             return;
         }
         if (ds4_gpu_tensor_read(job->router_selected,
@@ -26153,6 +26162,9 @@ static void metal_graph_selected_async_load_run(
                                 job->selected_ids,
                                 (uint64_t)DS4_N_EXPERT_USED *
                                     sizeof(job->selected_ids[0])) == 0) {
+            fprintf(stderr,
+                    "ds4: Metal async selected load: router id read failed at layer %u\n",
+                    job->il);
             return;
         }
     }
@@ -26181,13 +26193,39 @@ static void metal_graph_selected_async_load_run(
                 &table,
                 job->selected_ids,
                 DS4_N_EXPERT_USED) == 0) {
+        fprintf(stderr,
+                "ds4: Metal async selected load: expert load failed at layer %u\n",
+                job->il);
         return;
     }
 
-    if (job->experts_ready_value != 0 &&
-        !ds4_gpu_stream_compact_addr_prepare_selected(
-            &table, job->selected_ids, DS4_N_EXPERT_USED)) {
-        return;
+    if (job->experts_ready_value != 0) {
+        /* Publish-then-install: the queue only needs the bytes and the
+         * table, so signal as soon as both exist and keep the cache install
+         * bookkeeping off the path that gates the routed MoE.  The pending
+         * slots stay locked until the install below, and the next job
+         * cannot start (and thus cannot evict) until this one reports done.
+         */
+        if (!ds4_gpu_stream_expert_pending_load_wait_io()) {
+            fprintf(stderr,
+                    "ds4: Metal async selected load: pread wait failed at layer %u\n",
+                    job->il);
+            return;
+        }
+        if (!ds4_gpu_stream_compact_addr_fill_gpu_wait(
+                &table, job->selected_ids, DS4_N_EXPERT_USED)) {
+            fprintf(stderr,
+                    "ds4: Metal async selected load: compact table fill failed at layer %u\n",
+                    job->il);
+            return;
+        }
+        ds4_gpu_experts_ready_signal(job->experts_ready_value);
+        if (!ds4_gpu_stream_expert_pending_load_commit()) {
+            fprintf(stderr,
+                    "ds4: Metal async selected load: expert install failed at layer %u\n",
+                    job->il);
+            return;
+        }
     }
     ds4_gpu_sync_profile_note_worker_load_ms(
         (now_sec() - load_t0) * 1000.0);
@@ -26206,7 +26244,9 @@ static void *metal_graph_selected_async_load_worker_main(void *arg) {
             g_metal_graph_selected_async_load_job;
         pthread_mutex_unlock(&g_metal_graph_selected_async_load_mutex);
 
+        if (job.experts_ready_value != 0) ds4_gpu_stream_gpu_wait_worker_set(1);
         metal_graph_selected_async_load_run(&job);
+        if (job.experts_ready_value != 0) ds4_gpu_stream_gpu_wait_worker_set(0);
         /* Signal-always: the encode side may already hold a routed MoE
          * behind this value.  Success or failure, the queue must move; the
          * failure is reported through job.ok and aborts the generation. */
@@ -26252,7 +26292,8 @@ static DS4_MAYBE_UNUSED bool metal_graph_selected_async_load_start_tensor(
         uint32_t                         il,
         uint64_t                         event_value,
         uint64_t                         gate_expert_bytes,
-        uint64_t                         down_expert_bytes) {
+        uint64_t                         down_expert_bytes,
+        uint64_t                         experts_ready_value) {
     if (!job || !router_selected || event_value == 0) return false;
     if (!metal_graph_selected_async_load_ensure_worker()) return false;
     memset(job, 0, sizeof(*job));
@@ -26263,6 +26304,7 @@ static DS4_MAYBE_UNUSED bool metal_graph_selected_async_load_start_tensor(
     job->event_value = event_value;
     job->gate_expert_bytes = gate_expert_bytes;
     job->down_expert_bytes = down_expert_bytes;
+    job->experts_ready_value = experts_ready_value;
 
     pthread_mutex_lock(&g_metal_graph_selected_async_load_mutex);
     if (g_metal_graph_selected_async_load_has_job ||
@@ -26287,7 +26329,8 @@ static DS4_MAYBE_UNUSED bool metal_graph_selected_async_load_start(
         uint32_t                         il,
         uint64_t                         event_value,
         uint64_t                         gate_expert_bytes,
-        uint64_t                         down_expert_bytes) {
+        uint64_t                         down_expert_bytes,
+        uint64_t                         experts_ready_value) {
     return metal_graph_selected_async_load_start_tensor(
             job,
             g ? g->router_selected : NULL,
@@ -26296,10 +26339,11 @@ static DS4_MAYBE_UNUSED bool metal_graph_selected_async_load_start(
             il,
             event_value,
             gate_expert_bytes,
-            down_expert_bytes);
+            down_expert_bytes,
+            experts_ready_value);
 }
 
-static bool metal_graph_selected_async_load_finish(
+static bool metal_graph_selected_async_load_wait_done(
         metal_graph_selected_async_load *job) {
     if (!job || !job->active) return false;
     pthread_mutex_lock(&g_metal_graph_selected_async_load_mutex);
@@ -26311,9 +26355,35 @@ static bool metal_graph_selected_async_load_finish(
     g_metal_graph_selected_async_load_done = false;
     pthread_mutex_unlock(&g_metal_graph_selected_async_load_mutex);
     job->active = false;
-    if (!job->ok) return false;
+    return job->ok;
+}
+
+static bool metal_graph_selected_async_load_finish(
+        metal_graph_selected_async_load *job) {
+    if (!metal_graph_selected_async_load_wait_done(job)) return false;
     return ds4_gpu_routed_moe_set_selected_override(job->selected_ids,
                                                    DS4_N_EXPERT_USED) != 0;
+}
+
+/* L1 P2: the one in-flight GPU-wait worker job (pipeline depth 1).  The
+ * drain waits for WORKER completion only — never for the GPU — and does not
+ * set the selected-id override: in GPU-wait mode the routed MoE was encoded
+ * without host ids and a stale override would poison the next legacy call. */
+static metal_graph_selected_async_load g_metal_graph_gpu_wait_pending_job;
+static bool g_metal_graph_gpu_wait_pending = false;
+
+static bool metal_graph_gpu_wait_drain(void) {
+    if (!g_metal_graph_gpu_wait_pending) return true;
+    g_metal_graph_gpu_wait_pending = false;
+    const double block_t0 = now_sec();
+    const bool ok = metal_graph_selected_async_load_wait_done(
+            &g_metal_graph_gpu_wait_pending_job);
+    ds4_gpu_sync_profile_note_host_block_ms((now_sec() - block_t0) * 1000.0);
+    if (!ok) {
+        fprintf(stderr,
+                "ds4: Metal GPU-wait selected expert load failed; aborting generation\n");
+    }
+    return ok;
 }
 
 
@@ -27280,12 +27350,53 @@ static bool metal_graph_encode_decode_layer(
         metal_graph_selected_async_load async_load = {0};
         bool async_load_started = false;
         bool shared_flushed_for_async = false;
+        const bool gpu_wait_decode = async_selected_load && g->gpu_wait_decode;
+        uint64_t experts_ready_value = 0;
         const bool async_early_commit =
             async_selected_load &&
-            metal_graph_use_iq2_selected_async_early_commit(g);
+            (gpu_wait_decode ||
+             metal_graph_use_iq2_selected_async_early_commit(g));
         if (ok && async_early_commit) {
             ok = ds4_gpu_flush_commands() != 0;
             shared_flushed_for_async = ok;
+        }
+        if (ok && gpu_wait_decode) {
+            /*
+             * GPU-wait decode.  The router signal for this layer is already
+             * committed, so the worker can start now: it waits the router
+             * event, reads the ids, loads the experts, fills this layer's
+             * compact address table and signals the experts-ready value the
+             * routed MoE below is encoded to wait on.  Pipeline depth is 1:
+             * the previous layer's job is consumed first, and that drain
+             * waits for the worker only — the host never waits the GPU here.
+             */
+            ok = metal_graph_gpu_wait_drain();
+            if (ok) ok = ds4_gpu_experts_ready_ensure() != 0;
+            if (ok) {
+                experts_ready_value = ds4_gpu_experts_ready_reserve_value();
+                ok = experts_ready_value != 0;
+            }
+            if (ok) {
+                async_load_started =
+                    metal_graph_selected_async_load_start(&async_load,
+                                                           g,
+                                                           model,
+                                                           layer,
+                                                           il,
+                                                           selected_event,
+                                                           gate_expert_bytes,
+                                                           down_expert_bytes,
+                                                           experts_ready_value);
+                ok = async_load_started;
+            }
+            if (ok) {
+                g_metal_graph_gpu_wait_pending_job = async_load;
+                g_metal_graph_gpu_wait_pending = true;
+            } else if (experts_ready_value != 0) {
+                /* Reserved but never handed to the worker: honor the
+                 * signal-always contract from here or the queue stalls. */
+                ds4_gpu_experts_ready_signal(experts_ready_value);
+            }
         }
         if (ok && fuse_shared_gate_up) {
             ok = ds4_gpu_shared_gate_up_swiglu_q8_0_tensor(g->shared_gate,
@@ -27319,7 +27430,19 @@ static bool metal_graph_encode_decode_layer(
                                               g->shared_mid, 1) != 0;
         }
         DS4_METAL_PROFILE_DECODE_STAGE("shared_down");
-        if (ok && async_selected_load) {
+        if (ok && gpu_wait_decode) {
+            /*
+             * Commit the shared FFN first so it executes while the worker's
+             * pread is still in flight — without this the dense work sits
+             * uncommitted behind the wait and the GPU idles for the whole
+             * load.  Then hold the routed MoE in the queue until the worker
+             * publishes the expert addresses.  Everything after this point
+             * for this layer is encode-only on the host.
+             */
+            ok = ds4_gpu_flush_commands() != 0;
+            if (ok) ok = ds4_gpu_encode_wait_experts_ready(experts_ready_value) != 0;
+        }
+        if (ok && async_selected_load && !gpu_wait_decode) {
             /*
              * Submit the shared FFN before the loader thread can enter the
              * expert cache.  The cache may need to flush/wait in-flight Metal
@@ -27339,10 +27462,14 @@ static bool metal_graph_encode_decode_layer(
                                                            il,
                                                            selected_event,
                                                            gate_expert_bytes,
-                                                           down_expert_bytes);
+                                                           down_expert_bytes,
+                                                           0);
             }
         }
-        if (async_load_started) {
+        if (gpu_wait_decode) {
+            /* Worker completion is consumed at the next layer's start or at
+             * the token boundary; nothing to wait for here. */
+        } else if (async_load_started) {
             const double block_t0 = now_sec();
             const bool finish_ok =
                 metal_graph_selected_async_load_finish(&async_load);
@@ -27358,7 +27485,7 @@ static bool metal_graph_encode_decode_layer(
                     selected_event,
                     "selected-id shared-overlap") != 0;
         }
-        if (ok && !async_load_started) {
+        if (ok && !async_load_started && !gpu_wait_decode) {
             int32_t selected_ids[DS4_MAX_EXPERT_USED];
             ok = ds4_gpu_tensor_read(g->router_selected,
                                      0,
@@ -27378,6 +27505,9 @@ static bool metal_graph_encode_decode_layer(
                             selected_ids,
                             DS4_N_EXPERT_USED) != 0;
             }
+        }
+        if (ok && gpu_wait_decode) {
+            ds4_gpu_stream_gpu_wait_moe_set_pending((int32_t)il);
         }
         if (ok) ok = ds4_gpu_routed_moe_one_tensor(g->routed_out,
                                                      g->routed_gate,
@@ -27400,6 +27530,7 @@ static bool metal_graph_encode_decode_layer(
                                                      DS4_N_EXPERT_USED, DS4_SWIGLU_CLAMP_EXP, g->ffn_norm,
                                                      il,
                                                      false) != 0;
+        if (gpu_wait_decode) ds4_gpu_stream_gpu_wait_moe_set_pending(-1);
         DS4_METAL_PROFILE_DECODE_STAGE("routed_moe");
         if (ok) {
             metal_graph_debug_dump_tensor("ffn_moe_gate_clamped", g->routed_gate,
@@ -31064,6 +31195,19 @@ static bool metal_graph_eval_token_raw_swa_streaming(
     if (ok && !static_decode_map && DS4_N_LAYER > 0) {
         metal_graph_stream_readahead_layer_decode(model, weights, 0);
     }
+    g->gpu_wait_decode = false;
+    if (ok && batch_static_decode &&
+        metal_graph_use_deepseek_decode_gpu_wait() &&
+        ds4_gpu_stream_gpu_wait_moe_supported()) {
+        /* Token boundary: no command buffer is parked and the worker is
+         * idle, so this is the only place slab capacity may grow. */
+        ok = metal_graph_gpu_wait_drain();
+        if (ok) {
+            (void)ds4_gpu_stream_expert_cache_gpu_wait_token_trim();
+            (void)ds4_gpu_stream_expert_cache_gpu_wait_token_grow();
+        }
+        g->gpu_wait_decode = ok;
+    }
     if (ok) ok = ds4_gpu_begin_commands() != 0;
     if (ok) {
         ok = ds4_gpu_embed_token_hc_tensor(g->cur_hc,
@@ -31102,6 +31246,14 @@ static bool metal_graph_eval_token_raw_swa_streaming(
         }
         const double t_encoded = (profile || throttle) ? now_sec() : 0.0;
         if (ok) ok = ds4_gpu_end_commands() != 0;
+        if (g->gpu_wait_decode) {
+            /* The GPU has completed (or eval failed), so the worker has
+             * signaled; this consumes its result and surfaces load errors
+             * before the token is committed. */
+            const bool tail_ok = metal_graph_gpu_wait_drain();
+            ok = ok && tail_ok;
+            g->gpu_wait_decode = false;
+        }
         const double t_done = (profile || throttle) ? now_sec() : 0.0;
         if (ok && logits) {
             ok = ds4_gpu_tensor_read(g->logits, 0, logits, (uint64_t)DS4_N_VOCAB * sizeof(float)) != 0;
@@ -44434,10 +44586,19 @@ static bool metal_graph_use_deepseek_decode_gpu_wait(void) {
     static int cache = -1;
     if (cache < 0) {
         cache = getenv("DS4_METAL_ENABLE_DEEPSEEK_DECODE_GPU_WAIT") != NULL;
-        if (cache) {
+        if (cache &&
+            (getenv("DS4_MOE_RECORD_SELECTED_IDS") != NULL ||
+             getenv("DS4_MOE_REPLAY_SELECTED_IDS") != NULL ||
+             getenv("DS4_MOE_RECORD_SELECTED_HOTLIST") != NULL)) {
+            /* These need host-visible ids at encode time; in GPU-wait mode
+             * only the worker ever sees them. */
             fprintf(stderr,
-                    "ds4: deepseek decode gpu-wait mode requested "
-                    "(P0: telemetry only, legacy path active)\n");
+                    "ds4: deepseek decode gpu-wait disabled: selected-id "
+                    "trace/replay/hotlist requires host ids\n");
+            cache = 0;
+        } else if (cache) {
+            fprintf(stderr,
+                    "ds4: deepseek decode gpu-wait mode active\n");
         }
     }
     return cache > 0;

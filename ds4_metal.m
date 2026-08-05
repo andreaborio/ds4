@@ -9279,8 +9279,22 @@ int ds4_gpu_commands_active(void) {
     return g_batch_cb != nil;
 }
 
+static int ds4_gpu_stream_gpu_wait_on_worker(void);
+static int ds4_gpu_stream_compact_addr_ensure_buffers(uint32_t layer);
+
 static int ds4_gpu_stream_expert_cache_wait_inflight(const char *label) {
     const char *what = label ? label : "streaming expert cache in-flight";
+    if (ds4_gpu_stream_gpu_wait_on_worker()) {
+        /* The queue may be parked behind the experts-ready value this very
+         * worker owes; waiting for command buffers here would deadlock, and
+         * flushing would race the main thread's open encoder.  Fail the load
+         * instead: the caller reports through job.ok and signal-always keeps
+         * the queue moving. */
+        fprintf(stderr,
+                "ds4: Metal streaming expert cache cannot wait in-flight buffers on the GPU-wait worker (%s)\n",
+                what);
+        return 0;
+    }
     if (g_batch_cb && ds4_gpu_flush_commands() == 0) return 0;
     if ([g_pending_cbs count] != 0 &&
         ds4_gpu_wait_pending_command_buffers(what) == 0) {
@@ -9438,6 +9452,75 @@ int ds4_gpu_encode_wait_experts_ready(uint64_t value) {
         return 1;
     }
     return 0;
+}
+
+/* L1 P2: GPU-wait decode mode state.  While a routed MoE for exactly one
+ * layer is being encoded ahead of its expert load, the encode path switches
+ * to slab-wide residency and skips every cache access that would need the
+ * selected ids or resident entries.  The flag is set and cleared on the main
+ * thread immediately around the routed MoE call, so the encode helpers can
+ * key off it without threading a parameter through every signature. */
+static volatile int32_t g_stream_gpu_wait_moe_pending_layer = -1;
+static pthread_t g_stream_gpu_wait_worker_thread;
+static volatile int g_stream_gpu_wait_worker_active;
+
+void ds4_gpu_stream_gpu_wait_moe_set_pending(int32_t layer) {
+    g_stream_gpu_wait_moe_pending_layer = layer;
+}
+
+static int ds4_gpu_stream_gpu_wait_moe_pending(uint32_t layer) {
+    const int32_t pending = g_stream_gpu_wait_moe_pending_layer;
+    return pending >= 0 && (uint32_t)pending == layer;
+}
+
+static int ds4_gpu_stream_gpu_wait_residency_active(void) {
+    return g_stream_gpu_wait_moe_pending_layer >= 0;
+}
+
+void ds4_gpu_stream_gpu_wait_worker_set(int active) {
+    if (active) g_stream_gpu_wait_worker_thread = pthread_self();
+    g_stream_gpu_wait_worker_active = active;
+}
+
+/* True on the selected-load worker while it serves a GPU-wait job.  In that
+ * window the worker must never touch the process-global command batch (the
+ * main thread is encoding into it) and must never wait on command buffers
+ * (the queue may be parked on the very value this worker will signal). */
+static int ds4_gpu_stream_gpu_wait_on_worker(void) {
+    return g_stream_gpu_wait_worker_active &&
+           pthread_equal(pthread_self(), g_stream_gpu_wait_worker_thread);
+}
+
+int ds4_gpu_stream_gpu_wait_moe_supported(void) {
+    if (!g_initialized && !ds4_gpu_init()) return 0;
+    if (g_moe_mul_mv_addr_iq2_xxs_pair_swiglu_pipeline == nil ||
+        g_moe_mul_mv_addr_q2_k_sum6_pipeline == nil) {
+        return 0;
+    }
+#if TARGET_OS_OSX
+    if (@available(macOS 13.0, *)) {
+        return 1;
+    }
+#endif
+    return 0;
+}
+
+int ds4_gpu_stream_gpu_wait_compact_addr_bind(
+        uint32_t layer,
+        id<MTLBuffer> *gate_addrs,
+        id<MTLBuffer> *up_addrs,
+        id<MTLBuffer> *down_addrs,
+        id<MTLBuffer> *selected_ids) {
+    if (layer >= DS4_METAL_STREAM_EXPERT_CACHE_MAX_LAYER ||
+        !gate_addrs || !up_addrs || !down_addrs || !selected_ids) {
+        return 0;
+    }
+    if (!ds4_gpu_stream_compact_addr_ensure_buffers(layer)) return 0;
+    *gate_addrs = g_stream_compact_gate_addr_buffers[layer];
+    *up_addrs = g_stream_compact_up_addr_buffers[layer];
+    *down_addrs = g_stream_compact_down_addr_buffers[layer];
+    *selected_ids = g_stream_compact_selected_buffers[layer];
+    return *gate_addrs && *up_addrs && *down_addrs && *selected_ids;
 }
 
 static int ds4_gpu_signal_batch_and_wait_event(const char *label) {
@@ -13425,6 +13508,13 @@ ds4_gpu_stream_expert_alloc_slab_slot(
             g_stream_expert_cache_slab_slot_count[slab - 1]) {
         slab--;
     } else {
+        if (ds4_gpu_stream_gpu_wait_on_worker()) {
+            /* A new slab would not be in the residency set the main thread
+             * declared for the buffers already in the queue.  Slab growth
+             * happens only at token boundaries in GPU-wait mode; inside the
+             * token the load reuses existing slots via eviction. */
+            return DS4_STREAM_EXPERT_SLAB_REUSE_REQUIRED;
+        }
         if (g_stream_expert_cache_slab_count >=
             DS4_METAL_STREAM_EXPERT_CACHE_MAX_SLABS) {
             return DS4_STREAM_EXPERT_SLAB_REUSE_REQUIRED;
@@ -13501,6 +13591,90 @@ ds4_gpu_stream_expert_alloc_slab_slot(
         (g_stream_expert_cache_growth_guard_enabled ?
             DS4_STREAM_EXPERT_SLAB_REUSE_REQUIRED :
             DS4_STREAM_EXPERT_SLAB_NOT_APPLICABLE);
+}
+
+/* Token-boundary slab growth for GPU-wait decode.  Inside a token the
+ * worker's slab growth is frozen (see ds4_gpu_stream_expert_alloc_slab_slot),
+ * so the cache can only keep ramping if the main thread pre-grows capacity
+ * here, at a point where no command buffer is parked and the worker is idle.
+ * This mirrors the growth branch of ds4_gpu_stream_expert_alloc_slab_slot:
+ * same caps, same admission, same registration — it only skips handing out a
+ * slot.  Returns 1 unless a hard invariant broke; "cannot grow" is normal
+ * (budget reached, admission refused) and keeps eviction as the steady state.
+ */
+static void ds4_gpu_stream_expert_cache_prune_global(
+        uint32_t protect_layer,
+        const int32_t *protect_ids,
+        uint32_t n_protect);
+
+/* Token-boundary budget trim for GPU-wait decode.  The legacy per-call
+ * prune_global runs on the encode thread, which in GPU-wait mode never
+ * touches the cache; without this, a phase-schedule shrink (65K+ anti-swap
+ * tier, or the pre-prefill floor) would leave the cache oversized and defeat
+ * the anti-swap sizing. */
+int ds4_gpu_stream_expert_cache_gpu_wait_token_trim(void) {
+    ds4_gpu_stream_expert_cache_prune_global(UINT32_MAX, NULL, 0);
+    return 1;
+}
+
+int ds4_gpu_stream_expert_cache_gpu_wait_token_grow(void) {
+    const uint64_t slot_bytes = g_stream_expert_cache_slab_slot_bytes;
+    if (!ds4_gpu_stream_expert_slab_enabled() || slot_bytes == 0) return 1;
+    if (g_stream_expert_cache_free_slot_count != 0) return 1;
+    const uint32_t slab_count = g_stream_expert_cache_slab_count;
+    if (slab_count != 0 &&
+        g_stream_expert_cache_slab_slots_used[slab_count - 1] <
+            g_stream_expert_cache_slab_slot_count[slab_count - 1]) {
+        return 1;
+    }
+    if (slab_count >= DS4_METAL_STREAM_EXPERT_CACHE_MAX_SLABS) return 1;
+    if (g_stream_expert_cache_growth_budget_cap_active &&
+        g_stream_expert_cache_slab_total_slots >=
+            g_stream_expert_cache_growth_budget_cap) {
+        return 1;
+    }
+    const uint32_t budget = ds4_gpu_stream_expert_cache_configured_budget();
+    if (budget != 0 && g_stream_expert_cache_slab_total_slots >= budget) {
+        return 1;
+    }
+    uint64_t target = ds4_gpu_stream_expert_slab_target_bytes();
+    uint64_t slots64 = target / slot_bytes;
+    if (slots64 == 0) slots64 = 1;
+    if (slots64 > UINT32_MAX) slots64 = UINT32_MAX;
+    uint32_t slots = (uint32_t)slots64;
+    if (budget != 0) {
+        const uint32_t remaining =
+            budget - g_stream_expert_cache_slab_total_slots;
+        if (slots > remaining) slots = remaining;
+    }
+    if (slots == 0) return 1;
+    if ((uint64_t)slots > UINT64_MAX / slot_bytes ||
+        !ds4_gpu_stream_expert_cache_admit_slab_growth(
+            (uint64_t)slots * slot_bytes)) {
+        return 1;
+    }
+    id<MTLBuffer> slab_buffer = nil;
+    while (slots != 0) {
+        if ((uint64_t)slots <= UINT64_MAX / slot_bytes &&
+            (uint64_t)slots * slot_bytes <= (uint64_t)NSUIntegerMax) {
+            slab_buffer =
+                ds4_gpu_stream_expert_alloc_slab_buffer(
+                        (uint64_t)slots * slot_bytes,
+                        @"ds4_stream_expert_slab");
+            if (slab_buffer) break;
+        }
+        if (g_stream_expert_cache_growth_guard_enabled) break;
+        slots /= 2u;
+    }
+    if (!slab_buffer || slots == 0) return 1;
+    const uint32_t slab = g_stream_expert_cache_slab_count++;
+    g_stream_expert_cache_slabs[slab] = slab_buffer;
+    g_stream_expert_cache_slab_start_slot[slab] =
+        g_stream_expert_cache_slab_total_slots;
+    g_stream_expert_cache_slab_slot_count[slab] = slots;
+    g_stream_expert_cache_slab_slots_used[slab] = 0;
+    g_stream_expert_cache_slab_total_slots += slots;
+    return 1;
 }
 
 static uint64_t ds4_gpu_stream_expert_buffer_object_count(
@@ -13877,6 +14051,30 @@ static int ds4_gpu_stream_compact_addr_ensure_buffers(uint32_t layer) {
     return 1;
 }
 
+static int ds4_gpu_stream_compact_addr_store(
+        uint32_t        layer,
+        const uint64_t *gate_values,
+        const uint64_t *up_values,
+        const uint64_t *down_values,
+        const int32_t  *slot_ids) {
+    const NSUInteger addr_bytes = 6u * sizeof(uint64_t);
+    const NSUInteger ids_bytes = 6u * sizeof(int32_t);
+    id<MTLBuffer> gb = g_stream_compact_gate_addr_buffers[layer];
+    id<MTLBuffer> ub = g_stream_compact_up_addr_buffers[layer];
+    id<MTLBuffer> db = g_stream_compact_down_addr_buffers[layer];
+    id<MTLBuffer> ib = g_stream_compact_selected_buffers[layer];
+    if (!gb || !ub || !db || !ib) return 0;
+    memcpy([gb contents], gate_values, addr_bytes);
+    memcpy([ub contents], up_values, addr_bytes);
+    memcpy([db contents], down_values, addr_bytes);
+    memcpy([ib contents], slot_ids, ids_bytes);
+    [gb didModifyRange:NSMakeRange(0, addr_bytes)];
+    [ub didModifyRange:NSMakeRange(0, addr_bytes)];
+    [db didModifyRange:NSMakeRange(0, addr_bytes)];
+    [ib didModifyRange:NSMakeRange(0, ids_bytes)];
+    return 1;
+}
+
 static int ds4_gpu_stream_compact_addr_prepare(
         uint32_t layer,
         ds4_gpu_stream_expert_cache_entry * const entries[6],
@@ -13911,25 +14109,17 @@ static int ds4_gpu_stream_compact_addr_prepare(
         }
     }
 
-    const NSUInteger addr_bytes = 6u * sizeof(uint64_t);
-    const NSUInteger ids_bytes = 6u * sizeof(int32_t);
-    id<MTLBuffer> gb = g_stream_compact_gate_addr_buffers[layer];
-    id<MTLBuffer> ub = g_stream_compact_up_addr_buffers[layer];
-    id<MTLBuffer> db = g_stream_compact_down_addr_buffers[layer];
-    id<MTLBuffer> ib = g_stream_compact_selected_buffers[layer];
-    memcpy([gb contents], gate_values, addr_bytes);
-    memcpy([ub contents], up_values, addr_bytes);
-    memcpy([db contents], down_values, addr_bytes);
-    memcpy([ib contents], slot_ids, ids_bytes);
-    [gb didModifyRange:NSMakeRange(0, addr_bytes)];
-    [ub didModifyRange:NSMakeRange(0, addr_bytes)];
-    [db didModifyRange:NSMakeRange(0, addr_bytes)];
-    [ib didModifyRange:NSMakeRange(0, ids_bytes)];
-
-    *gate_addrs = gb;
-    *up_addrs = ub;
-    *down_addrs = db;
-    *selected_ids = ib;
+    if (!ds4_gpu_stream_compact_addr_store(layer,
+                                            gate_values,
+                                            up_values,
+                                            down_values,
+                                            slot_ids)) {
+        return 0;
+    }
+    *gate_addrs = g_stream_compact_gate_addr_buffers[layer];
+    *up_addrs = g_stream_compact_up_addr_buffers[layer];
+    *down_addrs = g_stream_compact_down_addr_buffers[layer];
+    *selected_ids = g_stream_compact_selected_buffers[layer];
     return 1;
 }
 
@@ -13961,6 +14151,17 @@ int ds4_gpu_stream_compact_addr_prepare_selected(
         table->gate_expert_bytes == 0 || table->down_expert_bytes == 0) {
         return 0;
     }
+    /* The worker's begin_selected_load stages the pread pool and parks the
+     * results in the pending-load struct; nothing is in the cache table until
+     * this install step runs.  In the legacy flow the main thread ran it from
+     * the resolution path; here the worker owns the whole sequence. */
+    ds4_gpu_stream_expert_cache_entry *installed[DS4_METAL_STREAM_SELECTED_MAX] = { NULL };
+    if (!ds4_gpu_stream_expert_pending_load_finish(installed)) {
+        fprintf(stderr,
+                "ds4: Metal compact table fill: pending expert load install failed at layer %u\n",
+                table->layer);
+        return 0;
+    }
     ds4_gpu_stream_expert_cache_entry *entries[6] = { NULL };
     for (uint32_t i = 0; i < n_selected; i++) {
         const int32_t id = selected_ids[i];
@@ -13981,7 +14182,13 @@ int ds4_gpu_stream_compact_addr_prepare_selected(
             table->down_offset + down_rel,
             table->gate_expert_bytes,
             table->down_expert_bytes);
-        if (!entries[i]) return 0;
+        if (!entries[i]) {
+            fprintf(stderr,
+                    "ds4: Metal compact table fill: expert %d not resident at layer %u\n",
+                    id,
+                    table->layer);
+            return 0;
+        }
     }
     id<MTLBuffer> gate_addrs = nil, up_addrs = nil, down_addrs = nil;
     id<MTLBuffer> ids_buf = nil;
@@ -16720,19 +16927,51 @@ static int ds4_gpu_stream_expert_pending_load_install(
     return 1;
 }
 
-static int ds4_gpu_stream_expert_pending_load_finish(
-        ds4_gpu_stream_expert_cache_entry **entries) {
-    ds4_gpu_stream_expert_pending_load *p = &g_stream_expert_pending_load;
-    if (!p->active) return 1;
+static int g_stream_expert_pending_io_waited = 0;
+static double g_stream_expert_pending_io_elapsed_ms = 0.0;
 
-    const double start_ms = p->start_ms;
+/* Wait only for the staged pread pool, leaving the pending load parked.  The
+ * GPU-wait worker uses this to publish expert addresses (and signal the
+ * queue) as soon as the bytes are on the slot buffers, deferring the cache
+ * install bookkeeping to after the signal — off the path that gates the
+ * routed MoE. */
+int ds4_gpu_stream_expert_pending_load_wait_io(void) {
+    ds4_gpu_stream_expert_pending_load *p = &g_stream_expert_pending_load;
+    if (!p->active || g_stream_expert_pending_io_waited) return 1;
     if (!ds4_gpu_stream_expert_pread_pool_wait()) {
         ds4_gpu_stream_expert_pending_load_release_buffers(p);
         p->active = 0;
+        g_stream_expert_pending_io_waited = 0;
         return 0;
     }
-    const double elapsed_ms =
-        ds4_gpu_stream_expert_pread_pool_elapsed_ms(start_ms);
+    g_stream_expert_pending_io_elapsed_ms =
+        ds4_gpu_stream_expert_pread_pool_elapsed_ms(p->start_ms);
+    g_stream_expert_pending_io_waited = 1;
+    return 1;
+}
+
+static int ds4_gpu_stream_expert_pending_load_finish(
+        ds4_gpu_stream_expert_cache_entry **entries) {
+    ds4_gpu_stream_expert_pending_load *p = &g_stream_expert_pending_load;
+    if (!p->active) {
+        g_stream_expert_pending_io_waited = 0;
+        return 1;
+    }
+
+    const double start_ms = p->start_ms;
+    double elapsed_ms;
+    if (g_stream_expert_pending_io_waited) {
+        elapsed_ms = g_stream_expert_pending_io_elapsed_ms;
+        g_stream_expert_pending_io_waited = 0;
+    } else {
+        if (!ds4_gpu_stream_expert_pread_pool_wait()) {
+            ds4_gpu_stream_expert_pending_load_release_buffers(p);
+            p->active = 0;
+            return 0;
+        }
+        elapsed_ms =
+            ds4_gpu_stream_expert_pread_pool_elapsed_ms(start_ms);
+    }
     p->active = 0;
     const int ok = ds4_gpu_stream_expert_pending_load_install(p,
                                                               entries,
@@ -16742,6 +16981,117 @@ static int ds4_gpu_stream_expert_pending_load_finish(
     p->n_loads = 0;
     p->prepare_ms = 0.0;
     return ok;
+}
+
+/* GPU-wait fast path: publish this layer's compact address table from a mix
+ * of resident cache entries (hits) and the parked pending-load slot buffers
+ * (misses, after wait_io).  No cache mutation happens here, so it can run
+ * before the install step and the experts-ready signal can fire as soon as
+ * the bytes exist. */
+int ds4_gpu_stream_compact_addr_fill_gpu_wait(
+        const ds4_gpu_stream_expert_table *table,
+        const int32_t                     *selected_ids,
+        uint32_t                           n_selected) {
+    if (!table || !selected_ids || n_selected == 0 || n_selected > 6 ||
+        table->layer >= DS4_METAL_STREAM_EXPERT_CACHE_MAX_LAYER ||
+        table->gate_expert_bytes == 0 || table->down_expert_bytes == 0) {
+        return 0;
+    }
+    if (!ds4_gpu_stream_compact_addr_ensure_buffers(table->layer)) return 0;
+
+    ds4_gpu_stream_expert_pending_load *p = &g_stream_expert_pending_load;
+    const int pending_usable =
+        p->active &&
+        g_stream_expert_pending_io_waited &&
+        p->layer == table->layer &&
+        p->n_selected == n_selected;
+
+    uint64_t gate_values[6] = {0, 0, 0, 0, 0, 0};
+    uint64_t up_values[6] = {0, 0, 0, 0, 0, 0};
+    uint64_t down_values[6] = {0, 0, 0, 0, 0, 0};
+    const int32_t slot_ids[6] = {0, 1, 2, 3, 4, 5};
+
+    for (uint32_t i = 0; i < n_selected; i++) {
+        const int32_t id = selected_ids[i];
+        if (id < 0 || (uint32_t)id >= table->n_total_expert) return 0;
+        uint32_t pending_load_i = UINT32_MAX;
+        if (pending_usable &&
+            p->selected_ids[i] == id &&
+            (p->missing_mask & (1u << i)) != 0) {
+            /* The staged buffers are compacted by load order, not selection
+             * order; duplicates point at their primary through source_slots.
+             */
+            const uint32_t src_sel =
+                p->source_slots[i] != UINT32_MAX ? p->source_slots[i] : i;
+            for (uint32_t l = 0; l < p->n_loads; l++) {
+                if (p->load_slots[l] == src_sel) {
+                    pending_load_i = l;
+                    break;
+                }
+            }
+        }
+        if (pending_load_i != UINT32_MAX) {
+            gate_values[i] =
+                ds4_gpu_buffer_address(p->gate_bufs[pending_load_i],
+                                       p->gate_inners[pending_load_i]);
+            up_values[i] =
+                ds4_gpu_buffer_address(p->up_bufs[pending_load_i],
+                                       p->up_inners[pending_load_i]);
+            down_values[i] =
+                ds4_gpu_buffer_address(p->down_bufs[pending_load_i],
+                                       p->down_inners[pending_load_i]);
+        } else {
+            const uint64_t gate_rel =
+                (uint64_t)id * table->gate_expert_bytes;
+            const uint64_t down_rel =
+                (uint64_t)id * table->down_expert_bytes;
+            ds4_gpu_stream_expert_cache_entry *e =
+                ds4_gpu_stream_expert_cache_peek(
+                    table->model_map,
+                    table->model_size,
+                    table->layer,
+                    (uint32_t)id,
+                    table->n_total_expert,
+                    n_selected,
+                    table->gate_offset + gate_rel,
+                    table->up_offset + gate_rel,
+                    table->down_offset + down_rel,
+                    table->gate_expert_bytes,
+                    table->down_expert_bytes);
+            if (!e) {
+                fprintf(stderr,
+                        "ds4: Metal GPU-wait table fill: expert %d neither resident nor pending at layer %u\n",
+                        id,
+                        table->layer);
+                return 0;
+            }
+            gate_values[i] = ds4_gpu_buffer_address(e->gate_buffer, e->gate_inner);
+            up_values[i] = ds4_gpu_buffer_address(e->up_buffer, e->up_inner);
+            down_values[i] = ds4_gpu_buffer_address(e->down_buffer, e->down_inner);
+        }
+        if (gate_values[i] == 0 || up_values[i] == 0 || down_values[i] == 0) {
+            fprintf(stderr,
+                    "ds4: Metal GPU-wait table fill: zero address i=%u id=%d layer=%u pending=%d mask=0x%x load_i=%u\n",
+                    i,
+                    id,
+                    table->layer,
+                    pending_usable,
+                    p->missing_mask,
+                    pending_load_i);
+            return 0;
+        }
+    }
+    return ds4_gpu_stream_compact_addr_store(table->layer,
+                                             gate_values,
+                                             up_values,
+                                             down_values,
+                                             slot_ids);
+}
+
+/* Exported install step for the GPU-wait worker: consume the parked pending
+ * load into the cache after the experts-ready signal has fired. */
+int ds4_gpu_stream_expert_pending_load_commit(void) {
+    return ds4_gpu_stream_expert_pending_load_finish(NULL);
 }
 
 static void ds4_gpu_stream_expert_pending_load_clear(void) {
@@ -33676,6 +34026,19 @@ static int ds4_gpu_encode_mul_mv_table_q4_pair_swiglu(
     return 1;
 }
 
+/* Declare every expert-cache slab resident on the encoder.  The GPU-wait
+ * encode path references experts through addresses the worker publishes
+ * later, so per-entry declarations are impossible; slabs are stable for the
+ * whole token (worker growth is frozen, slabs are never freed mid-decode),
+ * which makes the slab set a sound over-approximation. */
+static void ds4_gpu_stream_expert_cache_use_all_slabs(
+        id<MTLComputeCommandEncoder> enc) {
+    for (uint32_t i = 0; i < g_stream_expert_cache_slab_count; i++) {
+        id<MTLBuffer> slab = g_stream_expert_cache_slabs[i];
+        if (slab) [enc useResource:slab usage:MTLResourceUsageRead];
+    }
+}
+
 static int ds4_gpu_encode_mul_mv_addr_q4_pair_swiglu(
         id<MTLCommandBuffer>        cb,
         id<MTLComputePipelineState> pipeline,
@@ -34329,13 +34692,16 @@ static int ds4_gpu_encode_mul_mv_addr_iq2_pair_swiglu(
         args->ne02 <= 0 || args->ne02 > 384) {
         return 0;
     }
-    for (uint32_t i = 0; i < n_entries; i++) {
-        if (!entries[i] || !entries[i]->gate_buffer || !entries[i]->up_buffer) return 0;
-    }
-    if (!ds4_gpu_stream_expert_cache_mark_entries_inflight(entries,
-                                                           n_entries,
-                                                           0)) {
-        return 0;
+    const bool slab_residency = ds4_gpu_stream_gpu_wait_residency_active();
+    if (!slab_residency) {
+        for (uint32_t i = 0; i < n_entries; i++) {
+            if (!entries[i] || !entries[i]->gate_buffer || !entries[i]->up_buffer) return 0;
+        }
+        if (!ds4_gpu_stream_expert_cache_mark_entries_inflight(entries,
+                                                               n_entries,
+                                                               0)) {
+            return 0;
+        }
     }
 
     const NSUInteger nr0 = (NSUInteger)args->nr0;
@@ -34355,9 +34721,13 @@ static int ds4_gpu_encode_mul_mv_addr_iq2_pair_swiglu(
     [enc setBuffer:dst_mid    offset:dst_mid_off atIndex:7];
     [enc setBuffer:ids        offset:ids_off     atIndex:8];
     [enc setBuffer:weights    offset:weights_off atIndex:9];
-    for (uint32_t i = 0; i < n_entries; i++) {
-        [enc useResource:entries[i]->gate_buffer usage:MTLResourceUsageRead];
-        [enc useResource:entries[i]->up_buffer usage:MTLResourceUsageRead];
+    if (slab_residency) {
+        ds4_gpu_stream_expert_cache_use_all_slabs(enc);
+    } else {
+        for (uint32_t i = 0; i < n_entries; i++) {
+            [enc useResource:entries[i]->gate_buffer usage:MTLResourceUsageRead];
+            [enc useResource:entries[i]->up_buffer usage:MTLResourceUsageRead];
+        }
     }
     if (threadgroup_bytes != 0) {
         [enc setThreadgroupMemoryLength:threadgroup_bytes atIndex:0];
@@ -34631,13 +35001,16 @@ static int ds4_gpu_encode_mul_mv_addr_iq2(
         args->ne02 <= 0 || args->ne02 > 384) {
         return 0;
     }
-    for (uint32_t i = 0; i < n_entries; i++) {
-        if (!entries[i] || !entries[i]->down_buffer) return 0;
-    }
-    if (!ds4_gpu_stream_expert_cache_mark_entries_inflight(entries,
-                                                           n_entries,
-                                                           0)) {
-        return 0;
+    const bool slab_residency = ds4_gpu_stream_gpu_wait_residency_active();
+    if (!slab_residency) {
+        for (uint32_t i = 0; i < n_entries; i++) {
+            if (!entries[i] || !entries[i]->down_buffer) return 0;
+        }
+        if (!ds4_gpu_stream_expert_cache_mark_entries_inflight(entries,
+                                                               n_entries,
+                                                               0)) {
+            return 0;
+        }
     }
 
     const NSUInteger nr0 = (NSUInteger)args->nr0;
@@ -34655,8 +35028,12 @@ static int ds4_gpu_encode_mul_mv_addr_iq2(
     [enc setBuffer:src1  offset:src1_off atIndex:2];
     [enc setBuffer:dst   offset:dst_off  atIndex:3];
     [enc setBuffer:ids   offset:ids_off  atIndex:4];
-    for (uint32_t i = 0; i < n_entries; i++) {
-        [enc useResource:entries[i]->down_buffer usage:MTLResourceUsageRead];
+    if (slab_residency) {
+        ds4_gpu_stream_expert_cache_use_all_slabs(enc);
+    } else {
+        for (uint32_t i = 0; i < n_entries; i++) {
+            [enc useResource:entries[i]->down_buffer usage:MTLResourceUsageRead];
+        }
     }
     if (threadgroup_bytes != 0) {
         [enc setThreadgroupMemoryLength:threadgroup_bytes atIndex:0];
@@ -34688,13 +35065,16 @@ static int ds4_gpu_encode_mul_mv_addr_q2_sum6(
         args->ne02 <= 0 || args->ne02 > 384) {
         return 0;
     }
-    for (uint32_t i = 0; i < n_entries; i++) {
-        if (!entries[i] || !entries[i]->down_buffer) return 0;
-    }
-    if (!ds4_gpu_stream_expert_cache_mark_entries_inflight(entries,
-                                                           n_entries,
-                                                           0)) {
-        return 0;
+    const bool slab_residency = ds4_gpu_stream_gpu_wait_residency_active();
+    if (!slab_residency) {
+        for (uint32_t i = 0; i < n_entries; i++) {
+            if (!entries[i] || !entries[i]->down_buffer) return 0;
+        }
+        if (!ds4_gpu_stream_expert_cache_mark_entries_inflight(entries,
+                                                               n_entries,
+                                                               0)) {
+            return 0;
+        }
     }
 
     const NSUInteger rows_per_group = (NSUInteger)args->nr0 * nsg;
@@ -34707,8 +35087,12 @@ static int ds4_gpu_encode_mul_mv_addr_q2_sum6(
     [enc setBuffer:src1  offset:src1_off atIndex:2];
     [enc setBuffer:dst   offset:dst_off  atIndex:3];
     [enc setBuffer:ids   offset:ids_off  atIndex:4];
-    for (uint32_t i = 0; i < n_entries; i++) {
-        [enc useResource:entries[i]->down_buffer usage:MTLResourceUsageRead];
+    if (slab_residency) {
+        ds4_gpu_stream_expert_cache_use_all_slabs(enc);
+    } else {
+        for (uint32_t i = 0; i < n_entries; i++) {
+            [enc useResource:entries[i]->down_buffer usage:MTLResourceUsageRead];
+        }
     }
     if (threadgroup_bytes != 0) {
         [enc setThreadgroupMemoryLength:threadgroup_bytes atIndex:0];
@@ -37375,6 +37759,8 @@ static int ds4_gpu_routed_moe_one_tensor_impl(
             const char *selected_id_source = "readback";
             bool selected_ids_available = true;
             bool selected_exec_ids_from_host = false;
+            const bool gpu_wait_pending =
+                ds4_gpu_stream_gpu_wait_moe_pending(layer_index);
             const int stream_expert_cache_size_known =
                 ds4_gpu_stream_expert_cache_note_expert_size(
                     cache_gate_expert_bytes,
@@ -37488,6 +37874,36 @@ static int ds4_gpu_routed_moe_one_tensor_impl(
                     down_slot_offsets[i] = entry->down_inner;
                     stream_expert_resident_mask |= 1u << i;
                 }
+            } else if (gpu_wait_pending) {
+                /* GPU-wait decode: the routed MoE is encoded before the
+                 * selected experts are known on the host.  The dispatch
+                 * reads per-expert base addresses from this layer's compact
+                 * table, which the selected-load worker fills before it
+                 * signals the experts-ready value the queue is waiting on.
+                 * No id-dependent bookkeeping can run here; hotness, hit
+                 * accounting and eviction all happen on the worker. */
+                if (!use_stream_expert_cache) {
+                    fprintf(stderr,
+                            "ds4: Metal GPU-wait routed MoE requires the streaming expert cache\n");
+                    return 0;
+                }
+                selected_id_source = "gpu-wait-worker";
+                selected_ids_available = false;
+                g_routed_moe_selected_override_n = 0;
+                id<MTLBuffer> compact_selected = nil;
+                if (!ds4_gpu_stream_gpu_wait_compact_addr_bind(layer_index,
+                                                               &stream_gate_addr_buf,
+                                                               &stream_up_addr_buf,
+                                                               &stream_down_addr_buf,
+                                                               &compact_selected)) {
+                    fprintf(stderr,
+                            "ds4: Metal GPU-wait routed MoE could not bind the compact address table\n");
+                    return 0;
+                }
+                selected_exec_buf = compact_selected;
+                selected_exec_off = 0;
+                use_stream_expert_addr_table = true;
+                use_stream_compact_addr_table = true;
             } else if (use_iq2_full_expert_addr_table) {
                 selected_id_source = "gpu-full-addr";
                 selected_ids_available = false;
@@ -37741,7 +38157,7 @@ static int ds4_gpu_routed_moe_one_tensor_impl(
                     }
                 }
             }
-            if (use_stream_expert_cache) {
+            if (use_stream_expert_cache && !gpu_wait_pending) {
                 use_stream_expert_addr_table =
                     ((use_iq2_selected_slots &&
                       ds4_gpu_stream_expert_addr_table_kernel_requested() &&

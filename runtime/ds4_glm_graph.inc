@@ -2271,7 +2271,8 @@ static bool glm_graph_encode_sparse_ffn_one(
                         il,
                         selected_event,
                         gate_out * gate_row_bytes,
-                        down_out * down_row_bytes);
+                        down_out * down_row_bytes,
+                        0);
                 async_load_started = ok;
             }
             if (async_profile) {

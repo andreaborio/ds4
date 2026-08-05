@@ -2010,6 +2010,33 @@ int ds4_gpu_stream_compact_addr_prepare_selected(
         const int32_t                     *selected_ids,
         uint32_t                           n_selected);
 
+/* L1 P2 — GPU-wait decode mode.  set_pending marks the layer whose routed
+ * MoE is being encoded ahead of its expert load (-1 clears); while set, the
+ * Metal encode helpers switch to slab-wide residency and skip id-dependent
+ * cache work.  worker_set marks the selected-load worker thread for the
+ * duration of a GPU-wait job: slab growth and in-flight command-buffer
+ * waits are refused there (both would deadlock or race the encode thread).
+ * token_grow is the main-thread, token-boundary complement that keeps the
+ * cache ramp alive while intra-token growth is frozen.  supported reports
+ * whether the compact address kernels and gpuAddress are available. */
+void ds4_gpu_stream_gpu_wait_moe_set_pending(int32_t layer);
+int ds4_gpu_stream_gpu_wait_moe_supported(void);
+void ds4_gpu_stream_gpu_wait_worker_set(int active);
+int ds4_gpu_stream_expert_cache_gpu_wait_token_grow(void);
+int ds4_gpu_stream_expert_cache_gpu_wait_token_trim(void);
+
+/* GPU-wait worker fast path: wait_io completes only the staged preads; the
+ * fill publishes the layer's compact table from resident entries plus the
+ * parked pending-load buffers, so the experts-ready signal can fire before
+ * the cache install bookkeeping runs. */
+int ds4_gpu_stream_expert_pending_load_wait_io(void);
+/* Install the parked pending load into the cache. */
+int ds4_gpu_stream_expert_pending_load_commit(void);
+int ds4_gpu_stream_compact_addr_fill_gpu_wait(
+        const ds4_gpu_stream_expert_table *table,
+        const int32_t                     *selected_ids,
+        uint32_t                           n_selected);
+
 /* =========================================================================
  * Hyper-Connection Kernels.
  * =========================================================================
