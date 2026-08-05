@@ -1201,8 +1201,10 @@ def hc_post(
     # Keep the four-lane reduction explicit.  MLX's generic Metal matmul may
     # select reduced-precision accumulation even for this 4x4 operation,
     # obscuring the elementwise HC equation that the production kernel uses.
+    # Qualified orientation (src-major), matching reference.hc_post.
     combined = mx.sum(
-        combination_weights[..., :, :, None] * saved[..., None, :, :],
+        mx.swapaxes(combination_weights, -1, -2)[..., :, :, None] *
+        saved[..., None, :, :],
         axis=-2,
     )
     result = post_weights[..., :, None] * branch[..., None, :] + combined

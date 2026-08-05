@@ -1,0 +1,10 @@
+La primavera a Milano sboccia tra i Navigli, dove i caffè all'aperto si riempiono di sole e fiori.
+The sky appears blue because sunlight, when passing through Earth's atmosphere, is scattered in all directions by gases and particles, and blue light is scattered much more than other colors due to its shorter wavelength. This phenomenon, known as Rayleigh scattering, causes the blue light from the sun to reach our eyes from every part of the sky, making it look blue on a clear day.
+Ecco una semplice funzione Python che inverte una stringa:
+
+```python
+def inverti_stringa(s):
+    return s[::-1]
+```
+
+Questa funzione utilizza lo slicing con passo negativo (`[::-1]`), che crea una copia della stringa con i caratteri in ordine inverso. È il metodo più conciso ed efficiente in Python per invertire una stringa.

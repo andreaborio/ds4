@@ -42917,7 +42917,7 @@ static int ds4_gpu_dspark_physical_check_exact_boundaries(
                 "C=2 output_b", 1) &&
             ds4_gpu_dspark_physical_tensor_sha_matches(
                 t->hc_post_output, hidden_bytes,
-                "6405889c5b0a836a19700880ea80e1d617deb0b83e784dbf937c015baf289135",
+                "ef9b5f0601835169c6eca72c12ee9bd6c79ceafa4089733b75e7a8c9b7405989",
                 "C=2 hc_post_output", 1);
     }
     return
@@ -42935,7 +42935,7 @@ static int ds4_gpu_dspark_physical_check_exact_boundaries(
             "C=128 output_b", 1) &&
         ds4_gpu_dspark_physical_tensor_sha_matches(
             t->hc_post_output, hidden_bytes,
-            "f73b649e92b56e39f3ffe71710800793afff8fb7433a849851613d4555180b9f",
+            "3b7c6972f78b46aa17d17fe1d539c0ef97567c7f71420f9e6080c0ca8ea384dd",
             "C=128 hc_post_output", 1);
 }
 
@@ -43185,7 +43185,11 @@ static int ds4_gpu_dspark_physical_check_hc_expand_envelope(
                     const float residual = hidden[
                         (row * DS4_DSPARK_PHYSICAL_HC + src) *
                             DS4_DSPARK_PHYSICAL_HIDDEN + dim];
-                    acc = fmaf(comb[dst * DS4_DSPARK_PHYSICAL_HC + src],
+                    /* Qualified orientation: comb columns index the source
+                     * channel.  The first freeze of this reference used the
+                     * dst-major transpose and pinned the very regression it
+                     * was meant to prevent (see the golden greedy gate). */
+                    acc = fmaf(comb[src * DS4_DSPARK_PHYSICAL_HC + dst],
                                residual, acc);
                 }
                 expected[
@@ -47556,7 +47560,7 @@ static int ds4_gpu_dspark_routed_test_check_outputs(
         ds4_gpu_dspark_physical_tensor_sha_matches(
             context->hc_post,
             hidden_bytes,
-            "fdd19689c272e919aa765312ab0f63270e1160104730daf05018fbfb83d6e146",
+            "079d99c0c4312800327c017da8055567878afd549a8af89ed7365b65df2ad0b6",
             "FFN HC-post BF16",
             1) &&
         sum_bytes != 0 &&
@@ -54748,8 +54752,8 @@ int ds4_gpu_hc_expand_tensor(
             .nb_res2 = (uint64_t)n_hc * n_embd * sizeof(float),
             .nb_post0 = sizeof(float),
             .nb_post1 = (uint64_t)n_hc * sizeof(float),
-            .nb_comb0 = (uint64_t)n_hc * sizeof(float),
-            .nb_comb1 = sizeof(float),
+            .nb_comb0 = sizeof(float),
+            .nb_comb1 = (uint64_t)n_hc * sizeof(float),
             .nb_comb2 = (uint64_t)n_hc * n_hc * sizeof(float),
             .nb0 = sizeof(float),
             .nb1 = (uint64_t)n_embd * sizeof(float),
@@ -54854,8 +54858,8 @@ int ds4_gpu_hc_expand_split_tensor(
             .nb_res2 = (uint64_t)n_hc * n_embd * sizeof(float),
             .nb_post0 = sizeof(float),
             .nb_post1 = mix_hc * sizeof(float),
-            .nb_comb0 = (uint64_t)n_hc * sizeof(float),
-            .nb_comb1 = sizeof(float),
+            .nb_comb0 = sizeof(float),
+            .nb_comb1 = (uint64_t)n_hc * sizeof(float),
             .nb_comb2 = mix_hc * sizeof(float),
             .nb0 = sizeof(float),
             .nb1 = (uint64_t)n_embd * sizeof(float),
@@ -54975,8 +54979,8 @@ int ds4_gpu_hc_expand_add_split_tensor(
             .nb_res2 = (uint64_t)n_hc * n_embd * sizeof(float),
             .nb_post0 = sizeof(float),
             .nb_post1 = mix_hc * sizeof(float),
-            .nb_comb0 = (uint64_t)n_hc * sizeof(float),
-            .nb_comb1 = sizeof(float),
+            .nb_comb0 = sizeof(float),
+            .nb_comb1 = (uint64_t)n_hc * sizeof(float),
             .nb_comb2 = mix_hc * sizeof(float),
             .nb0 = sizeof(float),
             .nb1 = (uint64_t)n_embd * sizeof(float),
@@ -55105,8 +55109,8 @@ int ds4_gpu_shared_down_hc_expand_q8_0_tensor(
             .nb_res2 = (uint64_t)n_hc * n_embd * sizeof(float),
             .nb_post0 = sizeof(float),
             .nb_post1 = mix_hc * sizeof(float),
-            .nb_comb0 = (uint64_t)n_hc * sizeof(float),
-            .nb_comb1 = sizeof(float),
+            .nb_comb0 = sizeof(float),
+            .nb_comb1 = (uint64_t)n_hc * sizeof(float),
             .nb_comb2 = mix_hc * sizeof(float),
             .nb0 = sizeof(float),
             .nb1 = (uint64_t)n_embd * sizeof(float),
@@ -55221,8 +55225,8 @@ int ds4_gpu_matmul_q8_0_hc_expand_tensor(
             .nb_res2 = (uint64_t)n_hc * n_embd * sizeof(float),
             .nb_post0 = sizeof(float),
             .nb_post1 = mix_hc * sizeof(float),
-            .nb_comb0 = (uint64_t)n_hc * sizeof(float),
-            .nb_comb1 = sizeof(float),
+            .nb_comb0 = sizeof(float),
+            .nb_comb1 = (uint64_t)n_hc * sizeof(float),
             .nb_comb2 = mix_hc * sizeof(float),
             .nb0 = sizeof(float),
             .nb1 = (uint64_t)n_embd * sizeof(float),

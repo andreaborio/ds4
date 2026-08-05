@@ -1212,7 +1212,10 @@ def hc_post(
         raise ValueError("HC post weights do not match residual rows")
     if split.combination.shape != saved.shape[:-2] + (4, 4):
         raise ValueError("HC combination matrix does not match residual rows")
-    combined = np.einsum("...ji,...id->...jd", split.combination, saved)
+    # Qualified orientation: the combination matrix is consumed src-major
+    # (columns index the destination lane).  The first freeze of this oracle
+    # used the dst-major transpose and pinned a production regression.
+    combined = np.einsum("...ij,...id->...jd", split.combination, saved)
     return split.post[..., :, None] * branch[..., None, :] + combined
 
 

@@ -2659,7 +2659,7 @@ class OracleFixtureTests(unittest.TestCase):
                 "attention_inverse_roped": "4a1f8f6e9a601116517cd9a47cf9428eb4c755c378c00df38c27bf3bef33b8be",
                 "output_a": "0abb6633e98af7ddccbb1b1468e469e7c79febb9e954457bc0643f5cb712d130",
                 "output_b": "5596c4de9d19abb8802a1315682c231c03f8db1368e888f17884d5e80239f35f",
-                "hc_post_output": "6405889c5b0a836a19700880ea80e1d617deb0b83e784dbf937c015baf289135",
+                "hc_post_output": "ef9b5f0601835169c6eca72c12ee9bd6c79ceafa4089733b75e7a8c9b7405989",
             },
             128: {
                 "positions": [130, 131, 132, 133, 134],
@@ -2670,7 +2670,7 @@ class OracleFixtureTests(unittest.TestCase):
                 "attention_inverse_roped": "a816c89adbfb97e27cc844e00758a454ab6498d2199cff3e8188f66c4e008014",
                 "output_a": "9ee20059b62050e73231bbe74396983e6483337533f37a21bed7744f50fe425e",
                 "output_b": "2d169b04ad0e5c20670e5a39daf149f93fbdb3684a3eea772fd8cf26cd7d352b",
-                "hc_post_output": "f73b649e92b56e39f3ffe71710800793afff8fb7433a849851613d4555180b9f",
+                "hc_post_output": "3b7c6972f78b46aa17d17fe1d539c0ef97567c7f71420f9e6080c0ca8ea384dd",
             },
         }
         expected_shapes = {
@@ -2810,7 +2810,7 @@ class OracleFixtureTests(unittest.TestCase):
         )), 640)
         self.assertEqual(int(np.count_nonzero(
             skipped_ingress.hc_post_output != result.hc_post_output
-        )), 4)
+        )), 10)
 
         state = inputs["raw_cache"]
         chronological_state = type(state)(
@@ -4327,7 +4327,7 @@ class OracleFixtureTests(unittest.TestCase):
             "routed_mid": "34b567efc1a2592fd40812ca6b8275c2fbdea2bc9785b48350a95aaae2e62a0b",
             "routed_sum": "27961fe0a417ea622f29513f457f778cdd8bfc27d40a36cbc3234d0d4c81b9d6",
             "moe_output": "3ab416a9dec8128b8a919ae11f23014afc993a2caba664e09c09fd0888823d54",
-            "hc_post_output": "fdd19689c272e919aa765312ab0f63270e1160104730daf05018fbfb83d6e146",
+            "hc_post_output": "079d99c0c4312800327c017da8055567878afd549a8af89ed7365b65df2ad0b6",
         }
         for field, digest in expected_digests.items():
             self.assertEqual(
@@ -4479,7 +4479,7 @@ class OracleFixtureTests(unittest.TestCase):
             "shared_mid": (1, 0.004547107499092817),
             "shared_down": (16, 0.5781235694885254),
             "moe_output": (2_055, 0.57421875),
-            "hc_post_output": (8_219, 0.703125),
+            "hc_post_output": (8_220, 0.703125),
         }
         for field, (different, maximum) in clamp_controls.items():
             delta = np.abs(
@@ -4716,7 +4716,7 @@ class OracleFixtureTests(unittest.TestCase):
             "hidden_input":
                 "bf0c4d85aeea6ccf4a50627856bd3fe0d39344176a48833f35539df57bfe89e6",
             "hc_post_output":
-                "fdd19689c272e919aa765312ab0f63270e1160104730daf05018fbfb83d6e146",
+                "079d99c0c4312800327c017da8055567878afd549a8af89ed7365b65df2ad0b6",
         }
         for field, digest in shared_hashes.items():
             self.assertEqual(
