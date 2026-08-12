@@ -1,34 +1,33 @@
-# On-edge adaptive imatrix (privacy-first)
+# On-edge adaptive imatrix
 
-A locally-run, low-bit GGUF is quantized with an **importance matrix (imatrix)** that decides
-where to spend the scarce per-weight bits. The imatrix is normally collected offline on a fixed
-corpus (`ds4 --imatrix-dataset … --imatrix-out …`). This feature lets `ds4-server` **collect the
-imatrix from the live prompt stream on the device**, so a quantized model can be **re-calibrated to
-its actual workload** — *without ever storing a single user prompt*.
+A locally-run, low-bit GGUF is quantized with an **importance matrix (imatrix)**
+that decides where to spend the scarce per-weight bits. The imatrix is normally
+collected offline on a fixed corpus (`hebrus --imatrix-dataset … --imatrix-out
+…`). This feature lets `hebrus-server` collect an imatrix from the live prompt
+stream on the device, so a quantized model can be recalibrated to its actual
+workload. The collector does not intentionally serialize raw prompt text,
+token IDs, positions, or request IDs into the imatrix file.
 
-This is a general model-optimization technique for any locally-run quantized model (a private
-individual, a company, a clinic). It is especially relevant where the prompts are sensitive
-(e.g. patient data, GDPR Art. 9): the only artifact produced is the imatrix, which is **aggregate
-statistics, not text**.
+The output contains derived activation statistics and static tensor names, not
+a text transcript. Treat it as potentially sensitive data nonetheless: what
+derived statistics reveal depends on the workload and threat model.
 
-## Why it's privacy-safe by construction
+## Data written by the collector
 
-The imatrix holds, per `(layer, expert)`, the **sum of squared activations** (a second moment) plus
-integer hit counts — structurally incapable of holding prompt content. There are **no token ids,
-no text, no positions, no request ids**. The on-disk `.dat` is a fresh full rewrite of static
-weight-tensor names + count-normalized mean-square vectors (the standard llama.cpp legacy format).
-Prompts live transiently in RAM for the forward pass and are freed on the existing paths; **nothing
-on this path writes prompt text to disk** (that is what `--trace` does — and `--trace` is unrelated
-and stays off).
-
-Think of it as a *histogram*, not a *log*: you can keep, export, or ship the imatrix to re-quantize,
-and it carries no user data.
+The imatrix holds, per `(layer, expert)`, sums of squared activations and integer
+hit counts. The on-disk `.dat` is a full rewrite of static weight-tensor names
+and count-normalized mean-square vectors in the llama.cpp legacy format. This
+collector path does not intentionally write raw prompt text or token metadata.
+Other features have separate data policies: notably, `--trace` records prompts,
+cache decisions, output, and tool calls. Keep imatrix files access-controlled,
+review the applicable data policy before sharing them, and delete them when no
+longer needed.
 
 ## Usage
 
 ```sh
-ds4-server -m model.gguf --imatrix-out edge.dat            # collect from live traffic
-ds4-server -m model.gguf --imatrix-out edge.dat --imatrix-every 128 --imatrix-min-requests 32
+hebrus-server -m model.gguf --imatrix-out edge.dat            # collect from live traffic
+hebrus-server -m model.gguf --imatrix-out edge.dat --imatrix-every 128 --imatrix-min-requests 32
 ```
 
 - `--imatrix-out FILE` — enable; accumulate routed-MoE importance from live prefills, snapshot to FILE.
@@ -79,9 +78,10 @@ gguf-tools/deepseek4-quantize --hf <fp-source> --template model.gguf \
 2. **Valid `.dat`:** `--imatrix-every 4 --imatrix-min-requests 2`, 12 live prompts → snapshots fired
    at 4 and 8 prompts; `edge.dat` = 430 MB, **129 entries** (= 43 layers × 3, identical structure to
    an offline-collected imatrix); `deepseek4-quantize` loads it (`loaded imatrix …: 129 entries`).
-3. **Privacy:** grep of the `.dat` for prompt keywords (patient, emergency, year-old, diagnosis,
-   treatment) → **0 occurrences**; only binary float bytes + static tensor names. No other file is
-   written on the prefill path.
+3. **Observed file-content check:** grep of the measured `.dat` for selected
+   prompt keywords returned zero occurrences; inspection showed binary float
+   data and static tensor names. This check is not a general proof that derived
+   activation statistics cannot reveal information about a workload.
 4. **Slowdown (prefill only; decode unaffected).** Measured on the server path, same prompts OFF vs
    ON, fresh restarts. Short MCQ prompts (~300 tok): **+6 %** (SSD-streaming-dominated). Long prompts
    (~4 k tok, 4 distinct, mean): **+31 %** (OFF 26.0 s → ON 34.1 s) — once the prefill is

@@ -1,6 +1,6 @@
 # Expert prune mask + full expert profile
 
-Two opt-in hooks (fork addition #5, see [`README.md`](README.md)) for studying *which* routed
+Two opt-in research hooks for studying *which* routed
 experts a domain actually needs — used by the [forgequant](https://github.com/andreaborio/forgequant)
 expert-pruning experiments. Both default **off** and add zero behavioral change unless their env
 vars are set.

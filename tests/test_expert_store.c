@@ -9,7 +9,6 @@
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
-#include <string.h>
 #include <unistd.h>
 
 #define CHECK(condition) do { \
@@ -35,11 +34,10 @@ static bool family_is_supported(uint64_t family) {
 }
 
 int main(int argc, char **argv) {
-    if (argc != 5 && argc != 7 && argc != 8) {
+    if (argc != 5 && argc != 7) {
         fprintf(stderr,
                 "usage: %s NATIVE.gguf STORE_OFFSET STORE_BYTES FAMILY "
-                "[STORAGE_FORMAT GROUP_SIZE "
-                "[dspark-0731|dspark-0731-reject|store-reject]]\n",
+                "[STORAGE_FORMAT GROUP_SIZE]\n",
                 argv[0]);
         return 2;
     }
@@ -51,36 +49,20 @@ int main(int argc, char **argv) {
     const uint32_t family = (uint32_t)family64;
     uint64_t storage64 = DS4_EXPERT_STORE_STORAGE_GGML;
     uint64_t group64 = 0;
-    if (argc >= 7) {
+    if (argc == 7) {
         CHECK(parse_u64(argv[5], &storage64));
         CHECK(parse_u64(argv[6], &group64));
         CHECK(storage64 <= UINT32_MAX);
         CHECK(group64 <= UINT32_MAX);
     }
-    const bool validate_dspark =
-        argc == 8 && strcmp(argv[7], "dspark-0731") == 0;
-    const bool reject_dspark =
-        argc == 8 && strcmp(argv[7], "dspark-0731-reject") == 0;
-    const bool reject_store =
-        argc == 8 && strcmp(argv[7], "store-reject") == 0;
-    if (argc == 8)
-        CHECK(validate_dspark || reject_dspark || reject_store);
     const int fd = open(argv[1], O_RDONLY);
     CHECK(fd >= 0);
 
     char error[256] = {0};
     ds4_expert_store *store = NULL;
-    const bool opened = ds4_expert_store_open_embedded(
-        &store, fd, offset, bytes, family, error, sizeof(error));
-    if (reject_store) {
-        CHECK(!opened);
-        CHECK(store == NULL);
-        CHECK(error[0] != '\0');
-        CHECK(close(fd) == 0);
-        puts("expert-store v2 C reader rejection: OK");
-        return 0;
-    }
-    CHECK(opened);
+    CHECK(ds4_expert_store_open_embedded(
+        &store, fd, offset, bytes, family,
+        error, sizeof(error)));
     CHECK(store != NULL);
     const ds4_expert_store_manifest *manifest =
         ds4_expert_store_manifest_get(store);
@@ -94,14 +76,6 @@ int main(int argc, char **argv) {
         CHECK(manifest->expert_count == 3);
         CHECK(manifest->expert_used_count == 2);
         CHECK(manifest->source_tensor_count == 7);
-    }
-    if (validate_dspark) {
-        CHECK(ds4_expert_store_validate_dspark_0731(
-            store, error, sizeof(error)));
-    } else if (reject_dspark) {
-        CHECK(!ds4_expert_store_validate_dspark_0731(
-            store, error, sizeof(error)));
-        CHECK(error[0] != '\0');
     }
     CHECK(ds4_expert_store_fd(store) >= 0);
     CHECK(ds4_expert_store_file_offset(store) == offset);

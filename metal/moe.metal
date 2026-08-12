@@ -301,36 +301,6 @@ kernel void kernel_dsv4_moe_sum6_f32(
     }
 }
 
-/* Fast-math may reassociate the production reduction even when its source is
- * written left-to-right.  The DSpark stage executor forces every
- * intermediate publication through a volatile thread scalar, matching the
- * official expert-id-ascending F32 fold exactly. */
-kernel void kernel_dspark_moe_sum6_sequential_f32(
-        constant ds4_metal_dsv4_moe_sum_args &args,
-        device const char *src,
-        device       char *dst,
-        uint token[[threadgroup_position_in_grid]],
-        uint tid[[thread_position_in_threadgroup]],
-        uint ntg[[threads_per_threadgroup]]) {
-    if (token >= args.tokens) return;
-
-    device const float *s =
-        (device const float *)(src +
-            (uint64_t)token * args.src_token_stride);
-    device float *d =
-        (device float *)(dst +
-            (uint64_t)token * args.dst_token_stride);
-
-    for (uint col = tid; col < args.width; col += ntg) {
-        volatile thread float v = s[col];
-        v = v + s[args.width + col];
-        v = v + s[2u * args.width + col];
-        v = v + s[3u * args.width + col];
-        v = v + s[4u * args.width + col];
-        v = v + s[5u * args.width + col];
-        d[col] = v;
-    }
-}
 /* Qwen3.6 routes every token to eight experts.  Keep the reduction in one
  * dispatch so the resident path does not serialize seven generic add kernels
  * after the down projection.  The accumulation order matches the historical
@@ -4785,73 +4755,6 @@ kernel void kernel_mul_mv_addr_iq2_xxs_f32(
     };
 
     kernel_mul_mv_iq2_xxs_f32_impl<N_R0_IQ2_XXS>(
-        args0,
-        src0_cur,
-        src1_cur,
-        dst_cur,
-        shmem,
-        tgpig,
-        tiisg,
-        sgitg);
-}
-
-/* Boundary-correct DSpark down projection.  Keep the selected-address ABI
- * identical to the IQ2 gate/up dispatch above, but invoke the existing Q2_K
- * row implementation once per route.  The unfused form is what lets every
- * expert down result cross BF16 before the expert-id-ordered reduction.
- *
- * This kernel must stay outside DS4_TEST_HOOKS: the release DSpark stage
- * executor encodes it (ds4_gpu_dspark_stage_support_encode), and its pipeline
- * is built unconditionally during ds4_gpu_init(), which aborts the whole
- * Metal backend when the function is missing. */
-kernel void kernel_mul_mv_addr_q2_K_f32(
-        constant ds4_metal_args_mul_mv_id & args,
-        device const uint64_t * addrs,
-        device const char * src1,
-        device       char * dst,
-        device const char * ids,
-        threadgroup  char * shmem [[threadgroup(0)]],
-        uint3  tgpig[[threadgroup_position_in_grid]],
-        ushort tiitg[[thread_index_in_threadgroup]],
-        ushort tiisg[[thread_index_in_simdgroup]],
-        ushort sgitg[[simdgroup_index_in_threadgroup]]) {
-    (void)tiitg;
-
-    const int iid1 = tgpig.z / args.nei0;
-    const int idx  = tgpig.z % args.nei0;
-
-    tgpig.z = 0;
-
-    const int32_t i02 =
-        ((device const int32_t *)(ids + iid1 * args.nbi1))[idx];
-    if (i02 < 0 || i02 >= args.ne02 || i02 >= 384) {
-        return;
-    }
-    const uint64_t addr = addrs[(uint)i02];
-    if (addr == 0) {
-        return;
-    }
-
-    const int64_t i11 = idx % args.ne11;
-    const int64_t i12 = iid1;
-
-    device const char *src0_cur =
-        reinterpret_cast<device const char *>(addr);
-    device const char *src1_cur =
-        src1 + i11 * args.nb11 + i12 * args.nb12;
-    device char *dst_cur =
-        dst + (idx * args.ne0 + i12 * args.ne1 * args.ne0) *
-            sizeof(float);
-
-    ds4_metal_args_mul_mv args0 = {
-        args.ne00, args.ne01, 1,
-        args.nb00, args.nb01, args.nb02, args.nb02,
-        args.ne10, 1, 1,
-        args.nb10, args.nb11, args.nb12, args.nb12,
-        args.ne0, 1, args.nr0, 1, 1,
-    };
-
-    kernel_mul_mv_q2_K_f32_impl<N_R0_Q2_K>(
         args0,
         src0_cur,
         src1_cur,

@@ -178,6 +178,32 @@ class BrandBoundaryAuditTests(unittest.TestCase):
         self.assertEqual(refreshed.returncode, 0, refreshed.stderr)
         self.assertEqual(self.fixture.run("--check").returncode, 0)
 
+    def test_new_untracked_file_requires_exact_classification(self) -> None:
+        self.seed_one_token()
+        self.fixture.write("draft.c", "const char *legacy = \"DS4\";\n")
+
+        checked = self.fixture.run("--check")
+        self.assertEqual(checked.returncode, 1, checked.stderr)
+        self.assertIn(
+            "unclassified brand token group: draft.c:content:DS4",
+            checked.stderr,
+        )
+
+    def test_worktree_deletion_removes_path_and_content_groups(self) -> None:
+        self.seed_one_token()
+        self.fixture.write("ds4_notes.txt", "DS4 bridge\n")
+        self.fixture.track("ds4_notes.txt")
+        self.fixture.write_manifest([
+            entry("engine.c", "content", "ds4", 1),
+            entry("ds4_notes.txt", "path", "ds4", 1),
+            entry("ds4_notes.txt", "content", "DS4", 1),
+        ])
+        (self.fixture.root / "ds4_notes.txt").unlink()
+
+        checked = self.fixture.run("--check")
+        self.assertEqual(checked.returncode, 0, checked.stderr)
+        self.assertIn("2 reductions", checked.stdout)
+
     def test_new_token_in_existing_file_is_unclassified(self) -> None:
         self.seed_one_token()
         self.fixture.write("engine.c", "const char *engine = \"ds4 DS4\";\n")

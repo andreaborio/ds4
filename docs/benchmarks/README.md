@@ -7,6 +7,7 @@ because their numbers remain useful.
 
 | Record | Status | Scope |
 | --- | --- | --- |
+| [`2026-08-05-deepseek-decode-and-kv-findings.md`](2026-08-05-deepseek-decode-and-kv-findings.md) | Retained operational evidence and rejected performance directions | DeepSeek 0731 conversational cache retention, disk-KV restart reuse, GPU-wait non-promotion, and dense/routed tiny-batch diagnostics on one M5 Pro 64 GiB host |
 | [`2026-07-30-qwen-16g-128k-phase-arenas.md`](2026-07-30-qwen-16g-128k-phase-arenas.md) | Additive 128K physical evidence; 16 GiB ceiling qualified, refreshed 8K/32K timing pending | Qwen Stable Affine4 guarded SSD on a physical M1 Pro 16 GiB; four bounded 32K macro arenas, pressure-safe decode transition, 128 decoded tokens, and zero swap |
 | [`2026-07-29-qwen-m1-pro-32g-main.md`](2026-07-29-qwen-m1-pro-32g-main.md) | Additive physical evidence; Affine4 and Q2 technical AUTO lanes clean through 32K, Q2 64 GiB Beta minimum unchanged | Current `main` on a physical M1 Pro 32 GiB; resident/SSD AUTO boundary, exact artifact verification, profile tradeoff, context growth, and zero-swap stability |
 | [`2026-07-29-qwen-m1-pro-16g-main.md`](2026-07-29-qwen-m1-pro-16g-main.md) | Additive physical evidence; Affine4 clean through 16K, Q2 technical lanes clean through 8K, strict Affine4 32K arm rejected after new swapout | Post-fix `main` on a physical M1 Pro 16 GiB; AUTO guarded-SSD behavior, Q2/Affine4 profile tradeoff, context growth, and invalid manual chunk cohort |

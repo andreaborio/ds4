@@ -1,6 +1,7 @@
 name: Performance report
 description: Report a reproducible performance regression, result, or optimization opportunity with controlled evidence.
 title: "[Performance]: "
+labels: ["performance", "needs-reproduction"]
 body:
   - type: markdown
     attributes:

@@ -235,378 +235,121 @@ typedef struct {
     bool color_open;
     bool use_color;
     bool last_output_newline;
-    bool failed;
     char pending[16];
     size_t pending_len;
 } token_printer;
 
-static char token_printer_input_byte(
-        const char *prefix_bytes,
-        size_t prefix_len,
-        const char *text,
-        size_t index) {
-    return index < prefix_len ? prefix_bytes[index] : text[index - prefix_len];
+static bool bytes_has_prefix(const char *p, size_t n, const char *prefix) {
+    size_t plen = strlen(prefix);
+    return n >= plen && memcmp(p, prefix, plen) == 0;
 }
 
-static bool token_printer_input_matches(
-        const char *prefix_bytes,
-        size_t prefix_len,
-        const char *text,
-        size_t total,
-        size_t offset,
-        const char *literal,
-        bool partial) {
-    const size_t literal_len = strlen(literal);
-    const size_t remaining = total - offset;
-    if ((!partial && remaining < literal_len) ||
-        (partial && remaining >= literal_len)) {
-        return false;
-    }
-    const size_t compared = partial ? remaining : literal_len;
-    for (size_t i = 0; i < compared; i++) {
-        if (token_printer_input_byte(
-                prefix_bytes, prefix_len, text, offset + i) != literal[i]) {
-            return false;
-        }
-    }
-    return true;
+static bool bytes_is_partial_prefix(const char *p, size_t n, const char *prefix) {
+    size_t plen = strlen(prefix);
+    return n < plen && memcmp(prefix, p, n) == 0;
 }
 
-static bool token_printer_flush(token_printer *p) {
-    if (p->failed) return false;
-    if (fflush(p->fp) != 0 || ferror(p->fp)) p->failed = true;
-    return !p->failed;
-}
-
-static bool token_printer_set_grey(token_printer *p) {
-    if (p->failed) return false;
+static void token_printer_set_grey(token_printer *p) {
     if (p->use_color && !p->color_open) {
-        if (fputs("\x1b[90m", p->fp) == EOF || ferror(p->fp)) {
-            p->failed = true;
-        } else {
-            p->color_open = true;
-        }
+        fputs("\x1b[90m", p->fp);
+        p->color_open = true;
     }
-    return !p->failed;
 }
 
-static bool token_printer_reset_color(token_printer *p) {
-    if (p->failed) return false;
+static void token_printer_reset_color(token_printer *p) {
     if (p->use_color && p->color_open) {
-        if (fputs("\x1b[0m", p->fp) == EOF || ferror(p->fp)) {
-            p->failed = true;
-        } else {
-            p->color_open = false;
-        }
+        fputs("\x1b[0m", p->fp);
+        p->color_open = false;
     }
-    return !p->failed;
 }
 
-static bool token_printer_write_char(token_printer *p, char c) {
-    if (p->failed) return false;
-    if (p->in_think && !token_printer_set_grey(p)) return false;
-    if (fputc((unsigned char)c, p->fp) == EOF || ferror(p->fp)) {
-        p->failed = true;
-        return false;
-    }
+static void token_printer_write_char(token_printer *p, char c) {
+    if (p->in_think) token_printer_set_grey(p);
+    fputc((unsigned char)c, p->fp);
     p->last_output_newline = c == '\n';
-    return true;
 }
 
-static bool token_printer_process(
-        token_printer *p, const char *text, size_t len, bool finish) {
+static void token_printer_process(token_printer *p, const char *text, size_t len, bool finish) {
     const char *think_open = "<think>";
     const char *think_close = "</think>";
-    char prefix_bytes[sizeof(p->pending)];
-    const size_t prefix_len = p->pending_len;
-    const size_t total = prefix_len + len;
-    if (prefix_len) memcpy(prefix_bytes, p->pending, prefix_len);
+    size_t total = p->pending_len + len;
+    char *buf = malloc(total ? total : 1);
+    if (!buf) return;
+    if (p->pending_len) memcpy(buf, p->pending, p->pending_len);
+    if (len) memcpy(buf + p->pending_len, text, len);
     p->pending_len = 0;
 
     size_t i = 0;
-    while (i < total && !p->failed) {
+    while (i < total) {
+        const char *cur = buf + i;
         const size_t rem = total - i;
-        if (token_printer_input_matches(
-                prefix_bytes, prefix_len, text, total, i, think_open, false)) {
+        if (bytes_has_prefix(cur, rem, think_open)) {
             p->in_think = true;
             i += strlen(think_open);
             continue;
         }
-        if (token_printer_input_matches(
-                prefix_bytes, prefix_len, text, total, i, think_close, false)) {
+        if (bytes_has_prefix(cur, rem, think_close)) {
             p->in_think = false;
-            if (!token_printer_reset_color(p)) break;
-            if (!p->last_output_newline &&
-                !token_printer_write_char(p, '\n')) {
-                break;
+            token_printer_reset_color(p);
+            if (!p->last_output_newline) {
+                fputc('\n', p->fp);
+                p->last_output_newline = true;
             }
             i += strlen(think_close);
             continue;
         }
-        if (!finish &&
-            token_printer_input_byte(prefix_bytes, prefix_len, text, i) == '<' &&
-            (token_printer_input_matches(
-                 prefix_bytes, prefix_len, text, total, i, think_open, true) ||
-             token_printer_input_matches(
-                 prefix_bytes, prefix_len, text, total, i, think_close, true)))
+        if (!finish && cur[0] == '<' &&
+            (bytes_is_partial_prefix(cur, rem, think_open) ||
+             bytes_is_partial_prefix(cur, rem, think_close)))
         {
-            if (rem >= sizeof(p->pending)) {
-                p->failed = true;
-                break;
+            if (rem < sizeof(p->pending)) {
+                memcpy(p->pending, cur, rem);
+                p->pending_len = rem;
             }
-            for (size_t j = 0; j < rem; j++) {
-                p->pending[j] = token_printer_input_byte(
-                    prefix_bytes, prefix_len, text, i + j);
-            }
-            p->pending_len = rem;
             break;
         }
-        if (!token_printer_write_char(
-                p, token_printer_input_byte(prefix_bytes, prefix_len, text, i))) {
-            break;
-        }
+        token_printer_write_char(p, cur[0]);
         i++;
     }
-    return !p->failed;
+
+    free(buf);
 }
 
-static bool token_printer_finish(token_printer *p) {
+static void token_printer_finish(token_printer *p) {
     if (p->format_thinking) {
-        if (!token_printer_process(p, NULL, 0, true)) return false;
-        if (!token_printer_reset_color(p)) return false;
+        token_printer_process(p, NULL, 0, true);
+        token_printer_reset_color(p);
     }
-    return token_printer_flush(p);
+    fflush(p->fp);
 }
 
 static void generation_done(void *ud) {
     token_printer *p = ud;
-    if (!token_printer_finish(p)) return;
-    if (!p->last_output_newline && !token_printer_write_char(p, '\n')) {
-        return;
+    token_printer_finish(p);
+    if (!p->last_output_newline) {
+        fputc('\n', p->fp);
+        p->last_output_newline = true;
     }
-    (void)token_printer_flush(p);
+    fflush(p->fp);
 }
 
-static bool token_printer_write_text(
-        token_printer *p, const char *text, size_t len) {
-    if (p->failed) return false;
+static void token_printer_write_text(token_printer *p, const char *text, size_t len) {
     if (p->format_thinking) {
-        if (!token_printer_process(p, text, len, false)) return false;
+        token_printer_process(p, text, len, false);
     } else if (len) {
-        if (fwrite(text, 1, len, p->fp) != len || ferror(p->fp)) {
-            p->failed = true;
-            return false;
-        }
+        fwrite(text, 1, len, p->fp);
         p->last_output_newline = text[len - 1] == '\n';
     }
-    return token_printer_flush(p);
 }
 
 static void print_generated_token(void *ud, int token) {
     token_printer *p = ud;
     size_t len = 0;
     char *text = ds4_token_text(p->engine, token, &len);
-    (void)token_printer_write_text(p, text, len);
+    token_printer_write_text(p, text, len);
+    fflush(p->fp);
     free(text);
 }
-
-typedef enum {
-    TRANSACTIONAL_FINISH_OUTPUT_LIMIT = 0,
-    TRANSACTIONAL_FINISH_TERMINAL,
-    TRANSACTIONAL_FINISH_CONTEXT_LIMIT,
-    TRANSACTIONAL_FINISH_INTERRUPTED,
-    TRANSACTIONAL_FINISH_ERROR,
-} transactional_finish_reason;
-
-typedef struct {
-    int generated;
-    transactional_finish_reason reason;
-} transactional_decode_result;
-
-static uint64_t cli_generation_seed(const cli_generation_options *gen) {
-    return gen->seed ? gen->seed :
-        ((uint64_t)time(NULL) ^ ((uint64_t)getpid() << 32) ^ (uint64_t)clock());
-}
-
-/* Own the caller side of the public generation transaction.  A token is
- * adopted only after its bytes have been written/flushed or retained in the
- * formatter's inline pending buffer.  Every valid opened cookie reaches the
- * single commit site; malformed blocks are closed fail-closed by invalidating
- * the session before any returned token is observed. */
-static int run_transactional_decode(
-        ds4_engine *engine,
-        ds4_session *session,
-        const cli_generation_options *gen,
-        ds4_think_mode think_mode,
-        token_printer *printer,
-        ds4_tokens *transcript,
-        int max_tokens,
-        transactional_decode_result *result,
-        char *err,
-        size_t errlen) {
-    transactional_decode_result next = {
-        .reason = TRANSACTIONAL_FINISH_OUTPUT_LIMIT,
-    };
-    ds4_generation_rng rng = {
-        .state = cli_generation_seed(gen),
-        .position = 0,
-    };
-
-    while (next.generated < max_tokens) {
-        if (cli_interrupt_requested()) {
-            next.reason = TRANSACTIONAL_FINISH_INTERRUPTED;
-            break;
-        }
-
-        const ds4_generation_block_request request = {
-            .temperature = gen->temperature,
-            .top_k = 0,
-            .top_p = gen->top_p,
-            .min_p = gen->min_p,
-            .rng = rng,
-            .max_output_tokens = max_tokens - next.generated,
-        };
-        ds4_generation_block block = {0};
-        if (ds4_session_generation_block_begin(
-                session, &request, &block, err, errlen) != 0) {
-            ds4_session_invalidate(session);
-            next.reason = TRANSACTIONAL_FINISH_ERROR;
-            *result = next;
-            return 1;
-        }
-        if (block.count == 0) {
-            if (block.cookie != 0) {
-                if (err && errlen) {
-                    snprintf(err, errlen, "empty generation block has a cookie");
-                }
-                ds4_session_invalidate(session);
-                next.reason = TRANSACTIONAL_FINISH_ERROR;
-                *result = next;
-                return 1;
-            }
-            next.reason = TRANSACTIONAL_FINISH_CONTEXT_LIMIT;
-            break;
-        }
-        if (block.cookie == 0 ||
-            block.count > DS4_GENERATION_BLOCK_MAX_TOKENS ||
-            block.count > (uint32_t)request.max_output_tokens) {
-            if (err && errlen) snprintf(err, errlen, "invalid generation block");
-            ds4_session_invalidate(session);
-            next.reason = TRANSACTIONAL_FINISH_ERROR;
-            *result = next;
-            return 1;
-        }
-
-        uint32_t adopted = 0;
-        uint32_t observed = 0;
-        bool terminal = false;
-        bool interrupted = false;
-        bool output_failed = false;
-        for (uint32_t j = 0; j < block.count; j++) {
-            if (next.generated >= max_tokens) break;
-            if (cli_interrupt_requested()) {
-                interrupted = true;
-                break;
-            }
-
-            const int token = block.tokens[j];
-            observed++;
-            if (ds4_token_is_stop_for_think_mode(engine, token, think_mode)) {
-                terminal = true;
-                break;
-            }
-
-            size_t piece_len = 0;
-            char *piece = ds4_token_text(engine, token, &piece_len);
-            const bool delivered = token_printer_write_text(
-                printer, piece, piece_len);
-            free(piece);
-            if (!delivered) {
-                output_failed = true;
-                break;
-            }
-            if (transcript) ds4_tokens_push(transcript, token);
-            adopted++;
-            next.generated++;
-        }
-
-        const ds4_generation_block_commit commit = {
-            .cookie = block.cookie,
-            .adopted_count = adopted,
-            .observed_count = observed,
-            .mode = output_failed ? DS4_GENERATION_COMMIT_INVALIDATE :
-                                    DS4_GENERATION_COMMIT_RETAIN,
-        };
-        if (ds4_session_generation_block_commit(
-                session, &commit, &rng, err, errlen) != 0) {
-            ds4_session_invalidate(session);
-            next.reason = TRANSACTIONAL_FINISH_ERROR;
-            *result = next;
-            return 1;
-        }
-
-        if (output_failed) {
-            next.reason = TRANSACTIONAL_FINISH_ERROR;
-            *result = next;
-            if (err && errlen) {
-                snprintf(err, errlen, "generated output delivery failed");
-            }
-            return 1;
-        }
-        if (terminal) {
-            next.reason = TRANSACTIONAL_FINISH_TERMINAL;
-            break;
-        }
-        if (interrupted) {
-            next.reason = TRANSACTIONAL_FINISH_INTERRUPTED;
-            break;
-        }
-    }
-
-    generation_done(printer);
-    if (printer->failed) {
-        ds4_session_invalidate(session);
-        next.reason = TRANSACTIONAL_FINISH_ERROR;
-        *result = next;
-        if (err && errlen) {
-            snprintf(err, errlen, "generated output delivery failed");
-        }
-        return 1;
-    }
-    *result = next;
-    return 0;
-}
-
-enum {
-    CLI_CHAT_TURN_OK = 0,
-    CLI_CHAT_TURN_RECOVERABLE = 1,
-    CLI_CHAT_TURN_FATAL = 2,
-};
-
-static bool cli_transactional_finish_repl_decode(
-        ds4_session *session,
-        ds4_tokens *transcript,
-        int rollback_len,
-        bool append_synthetic_eos,
-        int eos_token,
-        const transactional_decode_result *decode) {
-    const bool interrupted =
-        decode->reason == TRANSACTIONAL_FINISH_INTERRUPTED;
-    if (interrupted && decode->generated == 0) {
-        transcript->len = rollback_len;
-        ds4_session_invalidate(session);
-    } else if (append_synthetic_eos) {
-        ds4_tokens_push(transcript, eos_token);
-    }
-    return interrupted;
-}
-
-static bool cli_repl_continue_after_turn(int turn_rc, int *repl_rc) {
-    if (turn_rc != CLI_CHAT_TURN_FATAL) return true;
-    *repl_rc = 1;
-    return false;
-}
-
 
 static bool build_prompt(ds4_engine *engine, const cli_generation_options *gen, ds4_tokens *out) {
     if (gen->raw_prompt) {
@@ -630,17 +373,14 @@ static void cli_apply_model_sampling_defaults(
     if (!gen->min_p_set) gen->min_p = 0.0f;
 }
 
-static int run_transactional_generation(
-        ds4_engine *engine,
-        const cli_config *cfg,
-        const ds4_tokens *prompt) {
+static int run_sampled_generation(ds4_engine *engine, const cli_config *cfg, const ds4_tokens *prompt) {
     ds4_session *session = NULL;
     if (ds4_session_create(&session, engine, cfg->gen.ctx_size) != 0) {
-        fprintf(stderr, "ds4: CLI generation requires a session backend\n");
+        fprintf(stderr, "ds4: sampled CLI generation requires a session backend\n");
         return 1;
     }
 
-    char err[160] = {0};
+    char err[160];
     ds4_think_mode think_mode = cli_effective_think_mode(&cfg->gen);
     token_printer printer = {
         .engine = engine,
@@ -678,28 +418,80 @@ static int run_transactional_generation(
     if (room <= 0) max_tokens = 0;
     else if (max_tokens > room) max_tokens = room;
 
-    transactional_decode_result decode = {0};
-    struct sigaction old_int;
-    struct sigaction sa_int;
-    memset(&sa_int, 0, sizeof(sa_int));
-    sigemptyset(&sa_int.sa_mask);
-    sa_int.sa_handler = cli_sigint_handler;
-    const bool sigint_installed =
-        sigaction(SIGINT, &sa_int, &old_int) == 0;
-    cli_interrupt_clear();
+    uint64_t rng = cfg->gen.seed ? cfg->gen.seed :
+        ((uint64_t)time(NULL) ^ ((uint64_t)getpid() << 32) ^ (uint64_t)clock());
+    int generated = 0;
     const double t_decode0 = cli_now_sec();
-    int decode_rc = run_transactional_decode(
-        engine, session, &cfg->gen, think_mode, &printer, NULL,
-        max_tokens, &decode, err, sizeof(err));
-    const double t_decode1 = cli_now_sec();
-    if (sigint_installed) sigaction(SIGINT, &old_int, NULL);
-    if (decode_rc != 0) {
-        fprintf(stderr, "ds4: decode failed: %s\n",
-                err[0] ? err : "unknown generation failure");
+    while (generated < max_tokens && !cli_interrupt_requested()) {
+        int token = ds4_session_sample(session, cfg->gen.temperature, 0,
+                                       cfg->gen.top_p, cfg->gen.min_p, &rng);
+        if (ds4_token_is_stop_for_think_mode(engine, token, think_mode)) break;
+
+        int toks[17];
+        int ntok = 0;
+        const bool final_without_eval =
+            max_tokens - generated <= 1 ||
+            ds4_session_ctx(session) - ds4_session_pos(session) <= 1;
+        if (final_without_eval) {
+            /* Emitting the final visible token does not require advancing the
+             * model frontier.  This matches the canonical greedy loop and
+             * avoids losing one token at an exactly-full context. */
+            toks[0] = token;
+            ntok = 1;
+        } else if (cfg->gen.temperature <= 0.0f && ds4_engine_speculative_draft_tokens(engine) > 1 &&
+            getenv("DS4_MTP_SPEC_DISABLE") == NULL) {
+            ntok = ds4_session_eval_speculative_argmax(session,
+                                                       token,
+                                                       max_tokens - generated,
+                                                       ds4_token_eos(engine),
+                                                       toks,
+                                                       (int)(sizeof(toks) / sizeof(toks[0])),
+                                                       err,
+                                                       sizeof(err));
+            if (ntok < 0) {
+                fprintf(stderr, "ds4: decode failed: %s\n", err);
+                ds4_session_free(session);
+                return 1;
+            }
+        } else {
+            size_t piece_len = 0;
+            char *piece = ds4_token_text(engine, token, &piece_len);
+            token_printer_write_text(&printer, piece, piece_len);
+            fflush(stdout);
+            free(piece);
+            generated++;
+            if (generated >= max_tokens || cli_interrupt_requested()) {
+                continue;
+            }
+
+            int eval_rc = ds4_session_eval(session, token, err, sizeof(err));
+            if (eval_rc != 0) {
+                fprintf(stderr, "ds4: decode failed: %s\n", err);
+                ds4_session_free(session);
+                return 1;
+            }
+            continue;
+        }
+
+        bool stop = false;
+        for (int j = 0; j < ntok; j++) {
+            if (ds4_token_is_stop_for_think_mode(engine, toks[j], think_mode)) {
+                stop = true;
+                break;
+            }
+            size_t piece_len = 0;
+            char *piece = ds4_token_text(engine, toks[j], &piece_len);
+            token_printer_write_text(&printer, piece, piece_len);
+            fflush(stdout);
+            free(piece);
+            generated++;
+            if (generated >= max_tokens) break;
+        }
+        if (stop) break;
     }
-    /* A signal delivered after the helper fixed a terminal/output-limit reason
-     * belongs to the completed generation, not to a later caller phase. */
-    cli_interrupt_clear();
+    const double t_decode1 = cli_now_sec();
+    generation_done(&printer);
+    if (cli_interrupt_requested()) cli_interrupt_clear();
 
     const double prefill_s = t_prefill1 - t_prefill0;
     const double decode_s = t_decode1 - t_decode0;
@@ -707,10 +499,10 @@ static int run_transactional_generation(
             DS4_LOG_TIMING,
             "hebrus: prefill: %.2f t/s, generation: %.2f t/s\n",
             prefill_s > 0.0 ? (double)prompt->len / prefill_s : 0.0,
-            decode_s > 0.0 ? (double)decode.generated / decode_s : 0.0);
+            decode_s > 0.0 ? (double)generated / decode_s : 0.0);
 
     ds4_session_free(session);
-    return decode_rc;
+    return 0;
 }
 
 static bool json_utf8_valid(const char *s, size_t n) {
@@ -1199,7 +991,7 @@ static int run_perplexity_file(ds4_engine *engine, const cli_config *cfg) {
     return 0;
 }
 
-static int run_generation_inner(ds4_engine *engine, const cli_config *cfg) {
+static int run_generation(ds4_engine *engine, const cli_config *cfg) {
     if (cfg->gen.dump_generation_evidence_path &&
         !ds4_engine_is_qwen35(engine)) {
         fprintf(stderr,
@@ -1264,7 +1056,11 @@ static int run_generation_inner(ds4_engine *engine, const cli_config *cfg) {
             fprintf(stderr, "ds4: diagnostic run completed on the native %s path.\n",
                     ds4_backend_name(cfg->engine.backend));
         }
-    } else if (cfg->gen.dump_generation_evidence_path) {
+    } else if (cfg->gen.temperature > 0.0f ||
+               (!ds4_engine_is_qwen35(engine) &&
+                ds4_engine_speculative_draft_tokens(engine) > 1)) {
+        rc = run_sampled_generation(engine, cfg, &prompt);
+    } else {
         token_printer printer = {
             .engine = engine,
             .fp = stdout,
@@ -1278,86 +1074,76 @@ static int run_generation_inner(ds4_engine *engine, const cli_config *cfg) {
             .input_tokens = prompt.len,
             .use_color = ds4_log_is_tty(stderr),
         };
-        const int vocab = ds4_engine_vocab_size(engine);
-        int *token_ids = NULL;
-        float *final_logits = NULL;
-        if (vocab <= 0 || cfg->gen.n_predict < 0 ||
-            (cfg->gen.n_predict > 0 &&
-             (size_t)cfg->gen.n_predict > SIZE_MAX / sizeof(*token_ids)) ||
-            (size_t)vocab > SIZE_MAX / sizeof(*final_logits)) {
-            fprintf(stderr,
-                    "ds4: invalid generation evidence buffer dimensions\n");
-            rc = 1;
-        } else {
-            /* Allocate before entering the engine: neither the prefill nor
-             * decode timing window includes diagnostic memory setup. */
-            if (cfg->gen.n_predict > 0) {
-                token_ids = malloc(
-                    (size_t)cfg->gen.n_predict * sizeof(*token_ids));
-            }
-            final_logits = malloc((size_t)vocab * sizeof(*final_logits));
-            if ((cfg->gen.n_predict > 0 && !token_ids) || !final_logits) {
+        if (cfg->gen.dump_generation_evidence_path) {
+            const int vocab = ds4_engine_vocab_size(engine);
+            int *token_ids = NULL;
+            float *final_logits = NULL;
+            if (vocab <= 0 || cfg->gen.n_predict < 0 ||
+                (cfg->gen.n_predict > 0 &&
+                 (size_t)cfg->gen.n_predict > SIZE_MAX / sizeof(*token_ids)) ||
+                (size_t)vocab > SIZE_MAX / sizeof(*final_logits)) {
                 fprintf(stderr,
-                        "ds4: out of memory allocating generation evidence\n");
+                        "ds4: invalid generation evidence buffer dimensions\n");
                 rc = 1;
             } else {
-                ds4_qwen_generation_evidence evidence = {
-                    .token_ids = token_ids,
-                    .token_capacity = cfg->gen.n_predict,
-                    .final_logits = final_logits,
-                    .final_logits_capacity = vocab,
-                };
-                rc = ds4_engine_generate_argmax_with_evidence(
-                    engine, &prompt, cfg->gen.n_predict,
-                    cfg->gen.ctx_size,
-                    print_generated_token,
-                    generation_done,
-                    &printer,
-                    cli_prefill_progress_cb,
-                    &progress,
-                    &evidence);
-                if (rc == 0 && printer.failed) {
-                    fprintf(stderr,
-                            "ds4: generated output delivery failed\n");
-                    rc = 1;
+                /* Allocate before entering the engine: neither the prefill nor
+                 * decode timing window includes diagnostic memory setup. */
+                if (cfg->gen.n_predict > 0) {
+                    token_ids = malloc(
+                        (size_t)cfg->gen.n_predict * sizeof(*token_ids));
                 }
-                if (rc == 0) {
-                    char evidence_err[256] = {0};
-                    if (ds4_qwen_generation_evidence_write_json_atomic(
-                            cfg->gen.dump_generation_evidence_path,
-                            &evidence,
-                            evidence_err,
-                            sizeof(evidence_err)) != 0) {
-                        fprintf(stderr,
-                                "ds4: failed to write generation evidence: %s\n",
-                                evidence_err[0] ? evidence_err :
-                                    "unknown error");
-                        rc = 1;
+                final_logits = malloc((size_t)vocab * sizeof(*final_logits));
+                if ((cfg->gen.n_predict > 0 && !token_ids) || !final_logits) {
+                    fprintf(stderr,
+                            "ds4: out of memory allocating generation evidence\n");
+                    rc = 1;
+                } else {
+                    ds4_qwen_generation_evidence evidence = {
+                        .token_ids = token_ids,
+                        .token_capacity = cfg->gen.n_predict,
+                        .final_logits = final_logits,
+                        .final_logits_capacity = vocab,
+                    };
+                    rc = ds4_engine_generate_argmax_with_evidence(
+                        engine, &prompt, cfg->gen.n_predict,
+                        cfg->gen.ctx_size,
+                        print_generated_token,
+                        generation_done,
+                        &printer,
+                        cli_prefill_progress_cb,
+                        &progress,
+                        &evidence);
+                    if (rc == 0) {
+                        char evidence_err[256] = {0};
+                        if (ds4_qwen_generation_evidence_write_json_atomic(
+                                cfg->gen.dump_generation_evidence_path,
+                                &evidence,
+                                evidence_err,
+                                sizeof(evidence_err)) != 0) {
+                            fprintf(stderr,
+                                    "ds4: failed to write generation evidence: %s\n",
+                                    evidence_err[0] ? evidence_err :
+                                        "unknown error");
+                            rc = 1;
+                        }
                     }
                 }
             }
+            free(final_logits);
+            free(token_ids);
+        } else {
+            rc = ds4_engine_generate_argmax(engine, &prompt,
+                                            cfg->gen.n_predict,
+                                            cfg->gen.ctx_size,
+                                            print_generated_token,
+                                            generation_done,
+                                            &printer,
+                                            cli_prefill_progress_cb,
+                                            &progress);
         }
-        free(final_logits);
-        free(token_ids);
-    } else {
-        rc = run_transactional_generation(engine, cfg, &prompt);
     }
 
     ds4_tokens_free(&prompt);
-    return rc;
-}
-
-static int run_generation(ds4_engine *engine, const cli_config *cfg) {
-    struct sigaction old_pipe;
-    struct sigaction sa_pipe;
-    memset(&sa_pipe, 0, sizeof(sa_pipe));
-    sigemptyset(&sa_pipe.sa_mask);
-    sa_pipe.sa_handler = SIG_IGN;
-
-    const bool sigpipe_installed =
-        sigaction(SIGPIPE, &sa_pipe, &old_pipe) == 0;
-    const int rc = run_generation_inner(engine, cfg);
-    if (sigpipe_installed) sigaction(SIGPIPE, &old_pipe, NULL);
     return rc;
 }
 
@@ -1558,7 +1344,7 @@ static int run_chat_turn(ds4_engine *engine, cli_config *cfg, repl_chat *chat, c
     const int cached = common == old_pos && chat->transcript.len >= old_pos ? common : 0;
     const int suffix = chat->transcript.len - cached;
 
-    char err[160] = {0};
+    char err[160];
     cli_prefill_progress progress = {
         .base_tokens = cached,
         .input_tokens = suffix,
@@ -1595,39 +1381,98 @@ static int run_chat_turn(ds4_engine *engine, cli_config *cfg, repl_chat *chat, c
     if (room <= 0) max_tokens = 0;
     else if (max_tokens > room) max_tokens = room;
 
-    transactional_decode_result decode = {0};
+    uint64_t rng = cfg->gen.seed ? cfg->gen.seed :
+        ((uint64_t)time(NULL) ^ ((uint64_t)getpid() << 32) ^ (uint64_t)clock());
+    int generated = 0;
     const double t_decode0 = cli_now_sec();
-    const int decode_rc = run_transactional_decode(
-        engine, chat->session, &cfg->gen, think_mode, &printer,
-        &chat->transcript, max_tokens, &decode, err, sizeof(err));
-    const double t_decode1 = cli_now_sec();
+    while (generated < max_tokens && !cli_interrupt_requested()) {
+        int token = ds4_session_sample(chat->session,
+                                       cfg->gen.temperature,
+                                       0,
+                                       cfg->gen.top_p,
+                                       cfg->gen.min_p,
+                                       &rng);
+        if (ds4_token_is_stop_for_think_mode(engine, token, think_mode)) break;
 
-    if (decode_rc != 0) {
-        fprintf(stderr, "ds4: decode failed: %s\n",
-                err[0] ? err : "unknown generation failure");
-        if (cli_interrupt_requested()) cli_interrupt_clear();
-        return CLI_CHAT_TURN_FATAL;
+        int toks[17];
+        int ntok = 0;
+        const bool final_without_eval =
+            max_tokens - generated <= 1 ||
+            ds4_session_ctx(chat->session) -
+                ds4_session_pos(chat->session) <= 1;
+        if (final_without_eval) {
+            toks[0] = token;
+            ntok = 1;
+        } else if (cfg->gen.temperature <= 0.0f && ds4_engine_speculative_draft_tokens(engine) > 1 &&
+            getenv("DS4_MTP_SPEC_DISABLE") == NULL) {
+            ntok = ds4_session_eval_speculative_argmax(chat->session,
+                                                       token,
+                                                       max_tokens - generated,
+                                                       ds4_token_eos(engine),
+                                                       toks,
+                                                       (int)(sizeof(toks) / sizeof(toks[0])),
+                                                       err,
+                                                       sizeof(err));
+            if (ntok < 0) {
+                fprintf(stderr, "ds4: decode failed: %s\n", err);
+                return 1;
+            }
+        } else {
+            size_t piece_len = 0;
+            char *piece = ds4_token_text(engine, token, &piece_len);
+            ds4_tokens_push(&chat->transcript, token);
+            token_printer_write_text(&printer, piece, piece_len);
+            fflush(stdout);
+            free(piece);
+            generated++;
+
+            int eval_rc = ds4_session_eval(chat->session, token, err, sizeof(err));
+            if (eval_rc != 0) {
+                fprintf(stderr, "ds4: decode failed: %s\n", err);
+                ds4_session_invalidate(chat->session);
+                return 1;
+            }
+            if (generated >= max_tokens) break;
+            continue;
+        }
+
+        bool stop = false;
+        for (int j = 0; j < ntok; j++) {
+            if (ds4_token_is_stop_for_think_mode(engine, toks[j], think_mode)) {
+                stop = true;
+                break;
+            }
+            size_t piece_len = 0;
+            char *piece = ds4_token_text(engine, toks[j], &piece_len);
+            ds4_tokens_push(&chat->transcript, toks[j]);
+            token_printer_write_text(&printer, piece, piece_len);
+            fflush(stdout);
+            free(piece);
+            generated++;
+            if (generated >= max_tokens) break;
+        }
+        if (stop) break;
     }
+    const double t_decode1 = cli_now_sec();
+    generation_done(&printer);
 
-    /* Do not carry a late signal from formatter finalization into the next
-     * prompt after the explicit finish reason has already been fixed. */
-    cli_interrupt_clear();
-    (void)cli_transactional_finish_repl_decode(
-        chat->session,
-        &chat->transcript,
-        rollback_len,
-        repl_chat_assistant_turn_uses_eos(engine),
-        ds4_token_eos(engine),
-        &decode);
+    const bool interrupted = cli_interrupt_requested();
+    if (interrupted && generated == 0) {
+        chat->transcript.len = rollback_len;
+        ds4_session_invalidate(chat->session);
+    } else if (repl_chat_assistant_turn_uses_eos(engine)) {
+        ds4_tokens_push(&chat->transcript, ds4_token_eos(engine));
+    }
 
     const double prefill_s = t_prefill1 - t_prefill0;
     const double decode_s = t_decode1 - t_decode0;
+    if (interrupted) cli_interrupt_clear();
     ds4_log(stderr,
             DS4_LOG_TIMING,
             "hebrus: prefill: %.2f t/s, generation: %.2f t/s\n",
             prefill_s > 0.0 ? (double)suffix / prefill_s : 0.0,
-            decode_s > 0.0 ? (double)decode.generated / decode_s : 0.0);
-    return CLI_CHAT_TURN_OK;
+            decode_s > 0.0 ? (double)generated / decode_s : 0.0);
+    return 0;
 }
 
 static int run_repl(ds4_engine *engine, cli_config *cfg) {
@@ -1635,17 +1480,11 @@ static int run_repl(ds4_engine *engine, cli_config *cfg) {
     if (repl_chat_init(engine, &chat, cfg) != 0) return 1;
 
     struct sigaction old_int;
-    struct sigaction old_pipe;
     struct sigaction sa;
-    struct sigaction sa_pipe;
     memset(&sa, 0, sizeof(sa));
-    memset(&sa_pipe, 0, sizeof(sa_pipe));
     sigemptyset(&sa.sa_mask);
-    sigemptyset(&sa_pipe.sa_mask);
     sa.sa_handler = cli_sigint_handler;
-    sa_pipe.sa_handler = SIG_IGN;
     bool sigint_installed = sigaction(SIGINT, &sa, &old_int) == 0;
-    bool sigpipe_installed = sigaction(SIGPIPE, &sa_pipe, &old_pipe) == 0;
     cli_interrupt_clear();
 
     char hist[PATH_MAX];
@@ -1747,13 +1586,8 @@ static int run_repl(ds4_engine *engine, cli_config *cfg) {
         } else {
             rc = run_chat_turn(engine, cfg, &chat, cmd);
         }
-        if (!cli_repl_continue_after_turn(rc, &rc)) {
-            linenoiseFree(line);
-            break;
-        }
         linenoiseFree(line);
     }
-    if (sigpipe_installed) sigaction(SIGPIPE, &old_pipe, NULL);
     if (sigint_installed) sigaction(SIGINT, &old_int, NULL);
     repl_chat_free(&chat);
     return rc;
@@ -1846,8 +1680,6 @@ static cli_config parse_options(int argc, char **argv) {
         }
         if (ds4_help_reject_retired_distributed_option(
                 stderr, DS4_HELP_DS4, arg)) exit(2);
-        if (ds4_help_reject_retired_cli_mtp_option(
-                stderr, DS4_HELP_DS4, arg)) exit(2);
 
         if (!strcmp(arg, "-p") || !strcmp(arg, "--prompt")) {
             if (c.gen.prompt) {
@@ -1868,6 +1700,12 @@ static cli_config parse_options(int argc, char **argv) {
             c.gen.raw_prompt = true;
         } else if (!strcmp(arg, "-m") || !strcmp(arg, "--model")) {
             c.engine.model_path = need_arg(&i, argc, argv, arg);
+        } else if (!strcmp(arg, "--mtp")) {
+            c.engine.mtp_path = need_arg(&i, argc, argv, arg);
+        } else if (!strcmp(arg, "--mtp-draft")) {
+            c.engine.mtp_draft_tokens = parse_int(need_arg(&i, argc, argv, arg), arg);
+        } else if (!strcmp(arg, "--mtp-margin")) {
+            c.engine.mtp_margin = parse_float_range(need_arg(&i, argc, argv, arg), arg, 0.0f, 1000.0f);
         } else if (!strcmp(arg, "-n") || !strcmp(arg, "--tokens")) {
             c.gen.n_predict = parse_int(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "-c") || !strcmp(arg, "--ctx")) {
@@ -2054,7 +1892,6 @@ static cli_config parse_options(int argc, char **argv) {
     return c;
 }
 
-#ifndef DS4_CLI_MODEL_FREE_TEST
 int main(int argc, char **argv) {
     cli_invocation = argv[0];
     hebrus_help_set_invocation(argv[0]);
@@ -2117,4 +1954,3 @@ int main(int argc, char **argv) {
     free(cfg.prompt_owned);
     return rc;
 }
-#endif

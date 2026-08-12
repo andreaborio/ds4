@@ -1,25 +1,26 @@
 {
   "direct_ds4_env_names": {
-    "maximum": 333,
-    "baseline": 324,
-    "reason": "Accepted Qwen Metal benchmark, diagnostic-bisect, profiling, and test-oracle controls; normal release startup remains flag-free and every later direct name still exceeds this ceiling.",
+    "maximum": 342,
+    "baseline": 330,
+    "reason": "The post-Qwen baseline is 331 direct names minus the retired layer-staleness switch. Later additions are classified below as compatibility controls, test-only fault injection, opt-in research, or diagnostics; normal release startup remains flag-free and every later direct name still exceeds this ceiling.",
     "accepted_additions": {
-      "diagnostic_bisect": [
-        "DS4_METAL_DISABLE_F32_NAX_PREFILL",
-        "DS4_METAL_DISABLE_QWEN_GDN_PRENORMALIZE"
+      "runtime_compatibility": [
+        "DS4_DEEPSEEK_PREFILL_CACHE_KEEP_MAX_TOKENS",
+        "DS4_METAL_SOURCE_DIR"
       ],
-      "benchmark_canary": [
-        "DS4_METAL_ENABLE_F32_NAX_PREFILL"
+      "opt_in_research": [
+        "DS4_ENABLE_NGRAM_SPEC",
+        "DS4_METAL_ENABLE_DEEPSEEK_DECODE_GPU_WAIT",
+        "DS4_NGRAM_SPEC_EXACT",
+        "DS4_NGRAM_SPEC_LOG",
+        "DS4_NGRAM_SPEC_NO_PREFIX1",
+        "DS4_NGRAM_SPEC_TIMING",
+        "DS4_NGRAM_SPEC_UNSAFE_STREAMING"
       ],
-      "profiling": [
-        "DS4_QWEN_METAL_PREFILL_DETAIL_PROFILE",
-        "DS4_QWEN_METAL_PREFILL_STAGE_PROFILE"
-      ],
-      "test_selection": [
-        "DS4_TEST_QWEN_EMBEDDING_Q5_ONLY",
-        "DS4_TEST_QWEN_GDN_CONTROLS_ONLY",
-        "DS4_TEST_QWEN_FUSED_SPLIT_Q_NORM_ONLY",
-        "DS4_TEST_FORCE_QWEN_GDN_GENERIC"
+      "profiling_and_benchmarks": [
+        "DS4_METAL_DENSE_MV_BENCH",
+        "DS4_METAL_SYNC_PROFILE",
+        "DS4_VERIFY_PHASE_TIMING"
       ]
     }
   },

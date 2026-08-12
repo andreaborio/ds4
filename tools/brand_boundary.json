@@ -124,7 +124,7 @@
       "location": "content",
       "token": "ds4",
       "classification": "compatibility",
-      "maximum": 6
+      "maximum": 5
     },
     {
       "path": "CHANGELOG.md",
@@ -152,7 +152,7 @@
       "location": "content",
       "token": "DS4",
       "classification": "migration-pending",
-      "maximum": 12
+      "maximum": 10
     },
     {
       "path": "EXPERT_PRUNE.md",
@@ -180,7 +180,7 @@
       "location": "content",
       "token": "DS4",
       "classification": "historical-attribution",
-      "maximum": 2
+      "maximum": 1
     },
     {
       "path": "FORK_NOTES.md",
@@ -236,14 +236,14 @@
       "location": "content",
       "token": "ds4",
       "classification": "compatibility",
-      "maximum": 506
+      "maximum": 507
     },
     {
       "path": "Makefile",
       "location": "content",
       "token": "DS4",
       "classification": "compatibility",
-      "maximum": 50
+      "maximum": 52
     },
     {
       "path": "ONEDGE_IMATRIX.md",
@@ -271,21 +271,21 @@
       "location": "content",
       "token": "DS4",
       "classification": "compatibility",
-      "maximum": 14
+      "maximum": 12
     },
     {
       "path": "README.md",
       "location": "content",
       "token": "ds4",
       "classification": "migration-pending",
-      "maximum": 9
+      "maximum": 6
     },
     {
       "path": "README.md",
       "location": "content",
       "token": "DS4",
       "classification": "migration-pending",
-      "maximum": 6
+      "maximum": 1
     },
     {
       "path": "SSD_STREAMING_VERIFICATION.md",
@@ -341,7 +341,7 @@
       "location": "content",
       "token": "ds4",
       "classification": "migration-pending",
-      "maximum": 43
+      "maximum": 42
     },
     {
       "path": "docs/ENGINE_REFERENCE.md",
@@ -736,6 +736,13 @@
       "maximum": 2
     },
     {
+      "path": "docs/benchmarks/2026-08-05-deepseek-decode-and-kv-findings.md",
+      "location": "content",
+      "token": "DS4",
+      "classification": "compatibility",
+      "maximum": 2
+    },
+    {
       "path": "docs/benchmarks/README.md",
       "location": "content",
       "token": "ds4",
@@ -754,7 +761,7 @@
       "location": "content",
       "token": "DS4",
       "classification": "compatibility",
-      "maximum": 2
+      "maximum": 1
     },
     {
       "path": "docs/contracts/RUNTIME_SUPPORT.md",
@@ -768,14 +775,14 @@
       "location": "content",
       "token": "DS4",
       "classification": "compatibility",
-      "maximum": 7
+      "maximum": 3
     },
     {
       "path": "docs/contracts/qwen-release.json",
       "location": "content",
       "token": "DS4",
       "classification": "serialized/permanent",
-      "maximum": 3
+      "maximum": 1
     },
     {
       "path": "docs/deepseek-expert-major-v2.md",
@@ -803,7 +810,7 @@
       "location": "content",
       "token": "DS4",
       "classification": "migration-pending",
-      "maximum": 3
+      "maximum": 2
     },
     {
       "path": "docs/glm52-expert-major-v2.md",
@@ -845,7 +852,7 @@
       "location": "content",
       "token": "DS4",
       "classification": "migration-pending",
-      "maximum": 10
+      "maximum": 1
     },
     {
       "path": "docs/releases/hebrus-bridge-launch-candidate.md",
@@ -915,7 +922,7 @@
       "location": "content",
       "token": "DS4",
       "classification": "migration-pending",
-      "maximum": 8
+      "maximum": 6
     },
     {
       "path": "ds4.c",
@@ -929,14 +936,14 @@
       "location": "content",
       "token": "ds4",
       "classification": "migration-pending",
-      "maximum": 5216
+      "maximum": 5269
     },
     {
       "path": "ds4.c",
       "location": "content",
       "token": "DS4",
       "classification": "migration-pending",
-      "maximum": 4542
+      "maximum": 4565
     },
     {
       "path": "ds4.h",
@@ -950,7 +957,7 @@
       "location": "content",
       "token": "ds4",
       "classification": "migration-pending",
-      "maximum": 320
+      "maximum": 322
     },
     {
       "path": "ds4.h",
@@ -992,14 +999,14 @@
       "location": "content",
       "token": "ds4",
       "classification": "migration-pending",
-      "maximum": 147
+      "maximum": 159
     },
     {
       "path": "ds4_bench.c",
       "location": "content",
       "token": "DS4",
       "classification": "migration-pending",
-      "maximum": 21
+      "maximum": 22
     },
     {
       "path": "ds4_build.c",
@@ -1034,7 +1041,7 @@
       "location": "content",
       "token": "ds4",
       "classification": "migration-pending",
-      "maximum": 403
+      "maximum": 401
     },
     {
       "path": "ds4_cli.c",
@@ -1118,14 +1125,14 @@
       "location": "content",
       "token": "ds4",
       "classification": "migration-pending",
-      "maximum": 736
+      "maximum": 760
     },
     {
       "path": "ds4_gpu.h",
       "location": "content",
       "token": "DS4",
       "classification": "migration-pending",
-      "maximum": 13
+      "maximum": 15
     },
     {
       "path": "ds4_help.c",
@@ -1223,14 +1230,14 @@
       "location": "content",
       "token": "ds4",
       "classification": "migration-pending",
-      "maximum": 6895
+      "maximum": 7111
     },
     {
       "path": "ds4_metal.m",
       "location": "content",
       "token": "DS4",
       "classification": "migration-pending",
-      "maximum": 1171
+      "maximum": 1194
     },
     {
       "path": "ds4_profile.c",
@@ -1923,7 +1930,7 @@
       "location": "content",
       "token": "ds4",
       "classification": "migration-pending",
-      "maximum": 237
+      "maximum": 239
     },
     {
       "path": "metal/moe.metal",
@@ -2049,14 +2056,14 @@
       "location": "content",
       "token": "ds4",
       "classification": "migration-pending",
-      "maximum": 29
+      "maximum": 31
     },
     {
       "path": "runtime/ds4_deepseek_cache_phase.inc",
       "location": "content",
       "token": "DS4",
       "classification": "migration-pending",
-      "maximum": 5
+      "maximum": 9
     },
     {
       "path": "runtime/ds4_glm_graph.inc",
@@ -2189,14 +2196,14 @@
       "location": "content",
       "token": "ds4",
       "classification": "migration-pending",
-      "maximum": 880
+      "maximum": 887
     },
     {
       "path": "tests/ds4_test.c",
       "location": "content",
       "token": "DS4",
       "classification": "migration-pending",
-      "maximum": 150
+      "maximum": 151
     },
     {
       "path": "tests/gen_qwen_unicode.py",
@@ -2294,7 +2301,7 @@
       "location": "content",
       "token": "DS4",
       "classification": "migration-pending",
-      "maximum": 7
+      "maximum": 1
     },
     {
       "path": "tests/qwen/UNICODE_DATA_PROVENANCE.md",
@@ -2455,14 +2462,14 @@
       "location": "content",
       "token": "ds4",
       "classification": "migration-pending",
-      "maximum": 31
+      "maximum": 38
     },
     {
       "path": "tests/test_brand_boundary_audit.py",
       "location": "content",
       "token": "DS4",
       "classification": "migration-pending",
-      "maximum": 5
+      "maximum": 9
     },
     {
       "path": "tests/test_brand_boundary_audit.py",
@@ -2547,6 +2554,13 @@
       "token": "ds4",
       "classification": "compatibility",
       "maximum": 10
+    },
+    {
+      "path": "tests/test_install.sh",
+      "location": "content",
+      "token": "DS4",
+      "classification": "compatibility",
+      "maximum": 22
     },
     {
       "path": "tests/test_metal_ssd_profile.c",
@@ -2728,7 +2742,7 @@
       "location": "content",
       "token": "ds4",
       "classification": "migration-pending",
-      "maximum": 269
+      "maximum": 275
     },
     {
       "path": "tests/test_ssd_residency.c",
@@ -2798,7 +2812,21 @@
       "location": "content",
       "token": "DS4",
       "classification": "compatibility",
-      "maximum": 9
+      "maximum": 12
+    },
+    {
+      "path": "tools/golden_greedy_gate.sh",
+      "location": "content",
+      "token": "ds4",
+      "classification": "compatibility",
+      "maximum": 1
+    },
+    {
+      "path": "tools/golden_greedy_gate.sh",
+      "location": "content",
+      "token": "DS4",
+      "classification": "compatibility",
+      "maximum": 3
     }
   ]
 }

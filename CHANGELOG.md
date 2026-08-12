@@ -22,9 +22,9 @@ not represent a published release.
 - Added model-free tests for capability-schema determinism, cross-executable
   consistency, command aliases, build-profile isolation, and canonical/legacy
   output parity.
-- Added Proposed ADR 0005 to document the intended Hebrus naming and
-  compatibility boundary without changing durable model, cache, or historical
-  identifiers.
+- Added Proposed ADR 0005 to document the Hebrus naming layer and the proposed
+  long-term compatibility boundary without changing durable model, cache, or
+  historical identifiers.
 - Added the maintainer-supplied Hebrus logo as a hash-frozen, unchanged RGBA
   master shared with Hebrus Studio. Repository tests reject pixel or encoding
   drift; web presentation effects remain CSS-only.
@@ -46,8 +46,9 @@ not represent a published release.
 
 ### Compatibility
 
-- The repository remains at <https://github.com/andreaborio/ds4> until an
-  administrative rename is actually performed.
+- The engine repository was renamed in place and is now canonical at
+  <https://github.com/andreaborio/hebrus>. Historical documents may retain the
+  repository identity that was current when their evidence was recorded.
 - Existing `DS4_*` environment variables and `ds4`-owned serialized identifiers
   remain unchanged. This bridge does not introduce `HEBRUS_*` environment
   aliases or rename source-level C symbols.

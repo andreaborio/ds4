@@ -1,5 +1,0 @@
-# Development-only Apple Silicon cross-check environment.
-# This file is never installed by the Hebrus build or runtime.
-mlx==0.32.0
-mlx-metal==0.32.0
-numpy==2.4.6

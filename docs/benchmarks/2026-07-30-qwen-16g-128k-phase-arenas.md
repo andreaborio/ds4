@@ -2,22 +2,24 @@
 
 Date: 2026-07-30
 
-Status: additive physical-hardware stabilization evidence. The guarded-SSD
-candidate completed a 131,072-token prefill and 128 greedy decode tokens with
-zero swap on the physical 16 GiB floor. This record does not promote a speed
-claim or establish output parity with a matching `main` run. The 128K prompt
-frontier is the selected public ceiling for the 16 GiB profile; the artifact's
-larger metadata window is not a gate for this RAM tier.
+Status: accepted physical capacity and safety qualification for the guarded
+16 GiB SSD path at its 128K ceiling; not a performance promotion. The candidate
+completed a 131,072-token prefill and 128 greedy decode tokens with zero swap
+on the physical 16 GiB floor. This record does not promote a speed claim or
+establish output parity with a matching `main` run. The artifact's larger
+metadata window is not a gate for this RAM tier.
 
-Decision: retain the Qwen-only candidate for the remaining validation matrix.
+Decision: retain the Qwen-only path and cap the public 16 GiB contract at this
+measured capacity frontier. The run qualifies bounded completion and admission
+safety, not comparative throughput. Refreshed lower-frontier timing remains a
+separate performance gate and cannot turn the numbers below into a speed claim.
 On guarded 16/24 GiB tiers, cap one macro-prefill arena at 32K tokens, reserve
 arithmetic room for the minimum cache plus one complete route cycle, and allow
 decode entry to re-sample macOS pressure for at most 30 seconds after transient
 prefill storage is released. The gate still fails closed if pressure does not
 return to normal. The 16 GiB admission ceiling is 131,201 allocated tokens: a
 131,072-token prompt, 128 decode tokens, and one bookkeeping slot. Refreshed
-8K and 32K lanes remain pending before this can replace the published 16 GiB
-runtime path.
+8K and 32K timing lanes remain pending before any performance promotion.
 
 Supersedes: none. This extends the physical 16 GiB evidence in
 [`2026-07-29-qwen-m1-pro-16g-main.md`](2026-07-29-qwen-m1-pro-16g-main.md)
@@ -51,8 +53,9 @@ required for decode.
 
 The main risk is trading throughput for a bounded footprint. More macro
 boundaries repeat setup and make later chunks progressively slower as the
-context grows. A short-context run could also regress even if 128K becomes
-stable, so this record is not sufficient to promote the implementation.
+context grows. A short-context run could also regress even though 128K is
+capacity-qualified, so this record is not sufficient to promote a performance
+claim.
 
 ## Experiment identity
 
@@ -164,8 +167,10 @@ Key evidence hashes:
 | Decode evidence | `0398d83411209621502f25dc28bb352152255e7a29958180a0b5fc9eee675247` |
 
 The result proves that this artifact and candidate can complete 128K plus 128
-decode tokens on this physical 16 GiB host without swap. It does not prove
+decode tokens on this physical 16 GiB host without swap; that bounded capacity
+and safety result is the basis for the public 16 GiB ceiling. It does not prove
 byte-identical output against a matching `main` run because no such run
-completed. Before promotion, run the refreshed 8K and 32K lanes with exact
-output comparison. Context allocations above 131,201 are deliberately outside
-the 16 GiB contract; higher-memory profiles retain their own endpoint gates.
+completed, and it supports no comparative speed claim. Before any performance
+promotion, run the refreshed 8K and 32K lanes with exact output comparison.
+Context allocations above 131,201 are deliberately outside the 16 GiB
+contract; higher-memory profiles retain their own endpoint gates.

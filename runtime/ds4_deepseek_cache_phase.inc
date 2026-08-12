@@ -61,7 +61,7 @@ static int ds4_session_deepseek_prepare_prefill_cache(
     if (!ds4_session_deepseek_phase_cache_enabled(s)) return 0;
     const uint32_t selected_max =
         metal_graph_stream_prefill_batch_selected_addr_auto_max();
-    const uint32_t parent_target =
+    const uint32_t target =
         ds4_ssd_deepseek_prefill_phase_cache_target(
             prefill_tokens,
             resulting_context_tokens,
@@ -70,14 +70,14 @@ static int ds4_session_deepseek_prepare_prefill_cache(
             s->engine->deepseek_long_context_cache_experts,
             s->engine->deepseek_extended_context_cache_experts,
             ds4_session_deepseek_prefill_cache_keep_max());
-    if (parent_target == 0) return 0;
+    if (target == 0) return 0;
     const uint32_t current =
-        ds4_gpu_stream_expert_cache_effective_parent_count();
+        ds4_gpu_stream_expert_cache_configured_count();
     /* Batched native prefill bypasses the decode cache. Keep only its safe
      * floor during that work, then install the long-context hot set once at
      * commit. A tiny suffix that crosses 8K only needs the bounded long tier. */
-    if (current == parent_target) return 0;
-    if (!ds4_gpu_reconfigure_streaming_expert_cache_budget(parent_target)) {
+    if (current == target) return 0;
+    if (!ds4_gpu_reconfigure_streaming_expert_cache_budget(target)) {
         if (errlen) {
             snprintf(err, errlen,
                      "failed to shrink DeepSeek cache for long prefill");
@@ -87,11 +87,9 @@ static int ds4_session_deepseek_prepare_prefill_cache(
     if (changed) *changed = true;
     if (getenv("DS4_METAL_MEMORY_REPORT") != NULL) {
         fprintf(stderr,
-                "ds4: DeepSeek native cache phase switched parent %u -> %u "
-                "experts for %u-token prefill (%u-token "
-                "resulting context)\n",
-                current, parent_target, prefill_tokens,
-                resulting_context_tokens);
+                "ds4: DeepSeek native cache phase switched %u -> %u experts "
+                "for %u-token prefill (%u-token resulting context)\n",
+                current, target, prefill_tokens, resulting_context_tokens);
     }
     return 0;
 }
@@ -104,14 +102,14 @@ static int ds4_session_deepseek_finish_prefill_cache(
         char        *err,
         size_t       errlen) {
     uint32_t current =
-        ds4_gpu_stream_expert_cache_effective_parent_count();
+        ds4_gpu_stream_expert_cache_configured_count();
     const uint32_t cache_before = current;
-    const uint32_t long_parent_target =
+    const uint32_t long_target =
         s->engine->deepseek_long_context_cache_experts;
     uint32_t target =
         ds4_ssd_deepseek_post_prefill_cache_target(
             resulting_context_tokens,
-            long_parent_target,
+            long_target,
             s->engine->deepseek_extended_context_cache_experts,
             s->engine->deepseek_decode_cache_experts);
     ds4_ssd_host_memory memory = {0};
@@ -153,12 +151,12 @@ static int ds4_session_deepseek_finish_prefill_cache(
     }
     if (target != current && getenv("DS4_METAL_MEMORY_REPORT") != NULL) {
         fprintf(stderr,
-                "ds4: DeepSeek native cache phase set parent %u -> %u "
-                "experts for decode at %u-token context%s\n",
+                "ds4: DeepSeek native cache phase set %u -> %u experts "
+                "for decode at %u-token context%s\n",
                 current, target, resulting_context_tokens,
                 changed ? "" : " (short-context recovery)");
     }
-    current = ds4_gpu_stream_expert_cache_effective_parent_count();
+    current = ds4_gpu_stream_expert_cache_configured_count();
     if (ds4_ssd_deepseek_post_prefill_seed_allowed(
             prefill_succeeded, pressure_allows_seed,
             cache_changed, target, current) &&
@@ -189,7 +187,7 @@ static int ds4_session_deepseek_apply_context_cache_tier(
             s->engine->deepseek_extended_context_cache_experts,
             s->engine->deepseek_decode_cache_experts);
     if (target == 0 ||
-        target == ds4_gpu_stream_expert_cache_effective_parent_count()) {
+        target == ds4_gpu_stream_expert_cache_configured_count()) {
         return 0;
     }
     return ds4_session_deepseek_finish_prefill_cache(

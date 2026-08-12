@@ -63,90 +63,6 @@ Run a completed artifact without conversion flags:
 ./hebrus -m /absolute/path/to/MODEL-DS4-ExpertMajor-v2.gguf --ctx 8192
 ```
 
-### DSpark provenance gate
-
-`deepseek4-quantize --dspark-support-only` is the sole generator for the
-standalone composer input. It has a fixed 81-tensor inventory and quantization
-recipe, and authenticates the final checkpoint revision, config, safetensors
-index, and shards 46-48 before writing. It does not accept a template,
-quantization override, imatrix, or provenance override.
-
-The generated GGUF carries the independently pinned source revision plus the
-complete SHA-256 values for config, index, and each source shard. The composer
-checks those values against its own constants; metadata merely copied from a
-support file is not accepted as proof of provenance.
-
-Inspect the exact 5,989,114,912-byte output plan without reading the shards:
-
-```sh
-gguf-tools/deepseek4-quantize \
-  --dspark-support-only \
-  --hf /path/to/DeepSeek-V4-Flash-0731 \
-  --dry-run
-```
-
-Authenticate all three local shards without generating output, then build the
-support input atomically:
-
-```sh
-gguf-tools/deepseek4-quantize \
-  --dspark-support-only \
-  --hf /path/to/DeepSeek-V4-Flash-0731 \
-  --check
-
-gguf-tools/deepseek4-quantize \
-  --dspark-support-only \
-  --hf /path/to/DeepSeek-V4-Flash-0731 \
-  --out /path/to/DeepSeek-V4-Flash-0731-DSpark-support.gguf
-```
-
-The source contract pins revision
-`7872f01b1d1fe23eabc4c98b48bffcef5a386062`, config SHA-256
-`6c8f3d2d3b48707541b88f32f22ef3f0f8a6b57d8523281e2b8d3cdb0ae9a023`,
-index SHA-256
-`98efab455cf08dfbbbaaba6f570e1bf10bf927d2b4c3c453a59c2f6f0e3be92b`,
-and shard SHA-256 values beginning `5db924ca`, `62816173`, and `cc43742b`.
-The resulting GGUF is an authenticated offline input to
-`ds4-expert-major.py`; it is not a production sidecar or runnable artifact.
-Generation reauthenticates every input after conversion and before install.
-The temporary output is exclusively created without following symlinks,
-size/hash checked through its still-open descriptor, and installed directly
-from that descriptor with true no-clobber semantics. Apple builds use
-`fclonefileat`, falling back to an exclusive descriptor-to-descriptor copy
-when the filesystem does not support cloning; non-Apple builds use the same
-copy path. Cleanup removes the temporary pathname only while it
-still identifies the owned inode, and directory installation is followed by
-`fsync`. There is no destructive replacement mode: use a new output name or
-remove an obsolete artifact explicitly before invoking the tool.
-
-`build --dspark-support` and `verify --dspark-support` accept only the reviewed
-final-0731 support artifact whose complete SHA-256 is
-`aa2bd4b5b916e1aa0a01392d69cbdd9798a3f3050c29c22973c8ee4233af0413`.
-It was generated from the pinned official inputs above. An independent
-conversion with `antirez/deepseek-v4-gguf` commit
-`54b36ed9ba42da31b24f2d1a5feb075c2475dbb1` reproduced the descriptors and
-payload bytes of all 81 tensors exactly. The 640-byte whole-file difference is
-authenticated Hebrus provenance metadata, not a weight difference.
-
-The 5,989,114,272-byte support GGUF with SHA-256
-`8b3adf5942bec22ae2ea867cd7079cf13530ba83ffcffaf00f5de48664a1a34e`
-was published before the final 0731 checkpoint and identifies the preview
-`DeepSeek-V4-Flash-DSpark` source. It is admitted only as a structural test
-reference and is rejected for combined-artifact publication. Matching its
-name, metadata, tensor inventory, and geometry does not prove that its weights
-come from the final checkpoint.
-
-No CLI hash override is provided. Runtime support remains gated by the
-architecture in
-[`../docs/adr/0008-deepseek-dspark-embedded-support-store.md`](../docs/adr/0008-deepseek-dspark-embedded-support-store.md).
-
-Successful conversion and exact tensor reproduction do not qualify the
-runtime. DSpark logits and draft decisions must still match the official
-implementation and the MLX oracle. Then run target-only versus combined
-quality and exact-output lanes, followed by the Apple 64 GiB AUTO-to-SSD 8K,
-32K, and admitted-endpoint matrix. The reviewed digest is coded manually;
-generation must never edit or derive the composer production pin.
-
 ## Generate An Imatrix
 
 First regenerate or inspect the calibration dataset:
@@ -186,8 +102,8 @@ shapes.  Tensor bytes are regenerated from the Hugging Face safetensors.  Full
 generation is intentionally offline and heavy: expect roughly 80-90 GB outputs
 for the 2-bit template family and roughly 150-170 GB for the 4-bit routed-expert
 family, plus enough free disk for the temporary output.  Use `--dry-run` and
-`--compare-tensor` before starting a full write. Output creation is exclusive;
-use a new name or explicitly remove an obsolete artifact before generation.
+`--compare-tensor` before starting a full write, and use `--overwrite` only when
+you really mean to replace an existing GGUF.
 
 Q2 routed experts with imatrix:
 

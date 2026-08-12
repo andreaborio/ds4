@@ -6,7 +6,6 @@
 #include <stdint.h>
 
 #define DS4_EXPERT_STORE_V2_TENSOR "ds4.expert_major.v2"
-#define DS4_DSPARK_EXPERT_STORE_V2_TENSOR "ds4.dspark.expert_major.v2"
 
 enum {
     DS4_EXPERT_STORE_V2_VERSION = 2,
@@ -15,25 +14,7 @@ enum {
     DS4_EXPERT_STORE_V2_MAX_LAYERS = 79,
     DS4_EXPERT_STORE_V2_MAX_MODEL_LAYER = 127,
     DS4_EXPERT_STORE_V2_MAX_EXPERTS = 384,
-    DS4_DSPARK_0731_STAGE_COUNT = 3,
-    DS4_DSPARK_0731_EXPERT_COUNT = 256,
-    DS4_DSPARK_0731_EXPERT_USED_COUNT = 6,
-    DS4_DSPARK_0731_STATIC_TENSOR_COUNT = 72,
-    DS4_DSPARK_0731_ROUTED_TENSOR_COUNT = 9,
-    DS4_DSPARK_0731_SOURCE_TENSOR_COUNT =
-        DS4_DSPARK_0731_STATIC_TENSOR_COUNT +
-        DS4_DSPARK_0731_ROUTED_TENSOR_COUNT,
-    DS4_DSPARK_0731_PHYSICAL_TENSOR_COUNT =
-        DS4_DSPARK_0731_STATIC_TENSOR_COUNT + 1,
 };
-
-#define DS4_DSPARK_0731_RECORD_BYTES UINT64_C(7077888)
-#define DS4_DSPARK_0731_DATA_OFFSET UINT64_C(4096)
-#define DS4_DSPARK_0731_STAGE_BYTES UINT64_C(1811939328)
-#define DS4_DSPARK_0731_DATA_BYTES UINT64_C(5435817984)
-#define DS4_DSPARK_0731_STORE_BYTES UINT64_C(5435822080)
-#define DS4_DSPARK_0731_STATIC_PAYLOAD_BYTES UINT64_C(553290668)
-#define DS4_DSPARK_0731_SOURCE_BYTES UINT64_C(5989114912)
 
 typedef enum {
     /* GGML block payloads such as Q2_K, IQ2_XS, IQ3_XXS, and IQ4_XS. */
@@ -122,15 +103,6 @@ const ds4_expert_store_layer *ds4_expert_store_layer_get(
 const ds4_expert_store_layer *ds4_expert_store_layer_at(
         const ds4_expert_store *store,
         uint32_t                index);
-
-/* Applies the exact routed-store contract of the final DeepSeek V4 Flash 0731
- * DSpark support checkpoint. This deliberately sits above the generic v2
- * codec validation: another three-layer DeepSeek store is not interchangeable
- * merely because its header and descriptor digest are well formed. */
-bool ds4_expert_store_validate_dspark_0731(
-        const ds4_expert_store *store,
-        char                   *error,
-        size_t                  error_size);
 
 /* Returns an absolute file offset for one complete component of one expert. */
 bool ds4_expert_store_slice_get(

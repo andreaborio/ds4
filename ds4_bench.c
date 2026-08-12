@@ -10,10 +10,9 @@
  * The benchmark walks one fixed token sequence to configurable context
  * frontiers, measuring only the newest prefill interval at each frontier.  It
  * then snapshots the live session in memory when the payload is small enough,
- * performs a fixed-horizon greedy decode run (EOS is an ordinary token),
- * restores the snapshot or replays the prefix, and continues to the next
- * frontier.  Snapshot save/restore time is intentionally outside both timing
- * windows.
+ * performs a fixed greedy decode run without allowing EOS, restores the
+ * snapshot or replays the prefix, and continues to the next frontier.  Snapshot
+ * save/restore time is intentionally outside both timing windows.
  */
 
 #include <errno.h>
@@ -536,38 +535,10 @@ static int write_decode_evidence_json(
     return 0;
 }
 
-/* Close an opened block through the public ledger before falling back to full
- * session invalidation.  This keeps the observed RNG boundary explicit even
- * when validation or the intended RETAIN commit fails. */
-static void abort_transactional_generation_block(
-        ds4_session             *session,
-        uint64_t                 cookie,
-        uint32_t                 observed_count,
-        const ds4_generation_rng *rng_start) {
-    if (cookie != 0 && rng_start) {
-        const ds4_generation_block_commit abort_commit = {
-            .cookie = cookie,
-            .adopted_count = 0,
-            .observed_count = observed_count,
-            .mode = DS4_GENERATION_COMMIT_INVALIDATE,
-        };
-        ds4_generation_rng abort_rng = *rng_start;
-        char abort_err[128];
-        if (ds4_session_generation_block_commit(
-                session, &abort_commit, &abort_rng,
-                abort_err, sizeof(abort_err)) == 0) {
-            return;
-        }
-    }
-    ds4_session_invalidate(session);
-}
-
 /* Opt-in measurement lane for the exact n-gram speculative round.  It uses
- * the dedicated session entry, not the generation-block transaction: blocks
- * stay depth zero until the ledger work lands.  EOS is not terminal here for
- * the same fixed-horizon reason as the transactional lane, so the round is
- * asked for exactly the remaining budget and eos_token is a value no token
- * can equal. */
+ * the dedicated session entry, not the normal sequential decode loop. EOS is
+ * not terminal here for the same fixed-horizon reason, so the round is asked
+ * for exactly the remaining budget and eos_token is a value no token can equal. */
 static int run_ngram_spec_greedy_decode(
         ds4_session *session,
         int          frontier,
@@ -638,147 +609,6 @@ static int run_ngram_spec_greedy_decode(
             (unsigned long long)drafted_rejects,
             token_count,
             rounds ? (double)token_count / (double)rounds : 0.0);
-    *token_count_out = token_count;
-    return 0;
-}
-
-/* Consume the public generation-block transaction for one fixed-horizon greedy
- * decode.  EOS is deliberately not terminal: benchmark arms compare the same
- * exact number of ordinary argmax tickets, including any EOS token selected by
- * the model.  Greedy sampling must advance only the public ticket position,
- * never the xorshift state.
- *
- * A returned block may contain more than one token once DSpark is enabled.
- * Charge the complete begin/commit wall time evenly to those simultaneously
- * returned tokens.  The last adopted token remains pending, so a zero-output
- * begin materializes it inside the decode timer.  That flush produces no new
- * visible token; amortizing its wall time over the fixed horizon preserves the
- * old benchmark's final-token evaluation cost without inventing a zero-time
- * speculative suffix or one artificial last-token outlier. */
-static int run_transactional_greedy_decode(
-        ds4_session *session,
-        int          frontier,
-        int          gen_tokens,
-        int          vocab,
-        int         *token_ids,
-        double      *token_ms,
-        int         *token_count_out,
-        double      *first_token_ready_sec_out,
-        double       generation_start_sec,
-        char        *err,
-        size_t       errlen) {
-    if (!session || gen_tokens <= 0 || vocab <= 0 || !token_ms ||
-        !token_count_out || !first_token_ready_sec_out) {
-        if (err && errlen) snprintf(err, errlen, "invalid transactional decode request");
-        return 1;
-    }
-
-    const int initial_pos = ds4_session_pos(session);
-    if (initial_pos != frontier || initial_pos > INT_MAX - gen_tokens) {
-        if (err && errlen) snprintf(err, errlen, "invalid transactional decode frontier");
-        return 1;
-    }
-
-    ds4_generation_rng rng = {.state = 0, .position = 0};
-    int token_count = 0;
-    *token_count_out = 0;
-    *first_token_ready_sec_out = 0.0;
-
-    while (token_count < gen_tokens) {
-        const ds4_generation_block_request request = {
-            .temperature = 0.0f,
-            .top_k = 1,
-            .top_p = 1.0f,
-            .min_p = 0.0f,
-            .rng = rng,
-            .max_output_tokens = gen_tokens - token_count,
-        };
-        ds4_generation_block block = {0};
-        const double block_t0 = bench_now_sec();
-        if (ds4_session_generation_block_begin(
-                session, &request, &block, err, errlen) != 0) {
-            ds4_session_invalidate(session);
-            return 1;
-        }
-        const double block_ready = bench_now_sec();
-
-        if (block.cookie == 0 || block.count == 0 ||
-            block.count > DS4_GENERATION_BLOCK_MAX_TOKENS ||
-            block.count > (uint32_t)request.max_output_tokens) {
-            if (err && errlen) snprintf(err, errlen, "invalid transactional decode block");
-            abort_transactional_generation_block(
-                session, block.cookie, 0, &request.rng);
-            return 1;
-        }
-        uint32_t observed_count = 0;
-        for (uint32_t i = 0; i < block.count; i++) {
-            const int token = block.tokens[i];
-            observed_count++;
-            if (token < 0 || token >= vocab) {
-                if (err && errlen) snprintf(err, errlen, "invalid transactional decode token");
-                abort_transactional_generation_block(
-                    session, block.cookie, observed_count, &request.rng);
-                return 1;
-            }
-            if (token_ids) token_ids[token_count + (int)i] = token;
-        }
-        if (token_count == 0) {
-            *first_token_ready_sec_out = block_ready - generation_start_sec;
-        }
-
-        const ds4_generation_block_commit commit = {
-            .cookie = block.cookie,
-            .adopted_count = block.count,
-            .observed_count = block.count,
-            .mode = DS4_GENERATION_COMMIT_RETAIN,
-        };
-        if (ds4_session_generation_block_commit(
-                session, &commit, &rng, err, errlen) != 0) {
-            abort_transactional_generation_block(
-                session, block.cookie, observed_count, &request.rng);
-            return 1;
-        }
-        const int committed_count = token_count + (int)block.count;
-        if (rng.state != 0 || rng.position != (uint64_t)committed_count) {
-            if (err && errlen) snprintf(err, errlen, "greedy generation consumed RNG state");
-            ds4_session_invalidate(session);
-            return 1;
-        }
-
-        const double per_token_ms =
-            (bench_now_sec() - block_t0) * 1000.0 / (double)block.count;
-        for (uint32_t i = 0; i < block.count; i++) {
-            token_ms[token_count + (int)i] = per_token_ms;
-        }
-        token_count = committed_count;
-    }
-
-    const ds4_generation_block_request flush_request = {
-        .temperature = 0.0f,
-        .top_k = 1,
-        .top_p = 1.0f,
-        .min_p = 0.0f,
-        .rng = rng,
-        .max_output_tokens = 0,
-    };
-    ds4_generation_block flush_block = {0};
-    const double flush_t0 = bench_now_sec();
-    if (ds4_session_generation_block_begin(
-            session, &flush_request, &flush_block, err, errlen) != 0) {
-        ds4_session_invalidate(session);
-        return 1;
-    }
-    const double flush_ms = (bench_now_sec() - flush_t0) * 1000.0;
-    if (flush_block.cookie != 0 || flush_block.count != 0 ||
-        rng.state != 0 || rng.position != (uint64_t)token_count ||
-        ds4_session_pos(session) != initial_pos + token_count) {
-        if (err && errlen) snprintf(err, errlen, "transactional decode flush mismatch");
-        ds4_session_invalidate(session);
-        return 1;
-    }
-
-    const double flush_per_token_ms = flush_ms / (double)token_count;
-    for (int i = 0; i < token_count; i++) token_ms[i] += flush_per_token_ms;
     *token_count_out = token_count;
     return 0;
 }
@@ -918,9 +748,10 @@ int main(int argc, char **argv) {
     float *decode_final_logits = NULL;
     double *decode_token_ms = NULL;
     int decode_vocab = 0;
-    const int generation_vocab = ds4_engine_vocab_size(engine);
+    const int generation_vocab =
+        cfg.ngram_spec ? ds4_engine_vocab_size(engine) : 0;
     if (cfg.gen_tokens > 0) {
-        if (generation_vocab <= 0) {
+        if (cfg.ngram_spec && generation_vocab <= 0) {
             fprintf(stderr, "ds4-bench: invalid generation vocabulary\n");
             if (out != stdout) fclose(out);
             ds4_session_free(session);
@@ -948,7 +779,7 @@ int main(int argc, char **argv) {
         }
     }
     if (cfg.dump_decode_evidence_dir) {
-        decode_vocab = generation_vocab;
+        decode_vocab = ds4_engine_vocab_size(engine);
         if (decode_vocab <= 0 ||
             (size_t)decode_vocab > SIZE_MAX / sizeof(decode_final_logits[0]) ||
             (cfg.gen_tokens > 0 &&
@@ -979,6 +810,7 @@ int main(int argc, char **argv) {
         }
     }
 
+    const int eos = ds4_token_eos(engine);
     const bool replay_restore = ds4_engine_is_qwen35(engine);
     ds4_session_snapshot snap = {0};
     char err[256];
@@ -1091,10 +923,8 @@ int main(int argc, char **argv) {
         ds4_gpu_stream_expert_io_measurement_begin();
 #endif
         const double gen_t0 = bench_now_sec();
-        int decode_rc = 0;
-        if (cfg.gen_tokens > 0) {
-            decode_rc = cfg.ngram_spec ?
-                run_ngram_spec_greedy_decode(
+        if (cfg.ngram_spec) {
+            if (run_ngram_spec_greedy_decode(
                     session,
                     frontier,
                     cfg.gen_tokens,
@@ -1105,26 +935,43 @@ int main(int argc, char **argv) {
                     &first_token_ready_sec,
                     gen_t0,
                     err,
-                    sizeof(err)) :
-                run_transactional_greedy_decode(
-                    session,
-                    frontier,
-                    cfg.gen_tokens,
-                    generation_vocab,
-                    decode_token_ids,
-                    decode_token_ms,
-                    &decode_token_count,
-                    &first_token_ready_sec,
-                    gen_t0,
-                    err,
-                    sizeof(err));
-        }
-        if (decode_rc != 0) {
-            fprintf(stderr,
-                    "ds4-bench: transactional decode at frontier %d failed: %s\n",
-                    frontier,
-                    err);
-            rc = 1;
+                    sizeof(err)) != 0) {
+                fprintf(stderr,
+                        "ds4-bench: ngram decode at frontier %d failed: %s\n",
+                        frontier,
+                        err);
+                rc = 1;
+            }
+        } else {
+            for (int i = 0; i < cfg.gen_tokens; i++) {
+                if (ds4_session_pos(session) + 1 >= ds4_session_ctx(session)) {
+                    fprintf(stderr, "ds4-bench: generation would exceed allocated context at frontier %d\n", frontier);
+                    rc = 1;
+                    break;
+                }
+                const double token_t0 = bench_now_sec();
+                const int token = ds4_session_argmax_excluding(session, eos);
+                if (token < 0) {
+                    fprintf(stderr, "ds4-bench: failed to choose non-EOS token at frontier %d\n", frontier);
+                    rc = 1;
+                    break;
+                }
+                if (i == 0) {
+                    /* TTFT stops when the first token is selectable, before its
+                     * eval. Add this small selection interval to the isolated
+                     * prefill timing, excluding snapshot/evidence serialization. */
+                    first_token_ready_sec = bench_now_sec() - gen_t0;
+                }
+                if (decode_token_ids) decode_token_ids[decode_token_count] = token;
+                if (ds4_session_eval(session, token, err, sizeof(err)) != 0) {
+                    fprintf(stderr, "ds4-bench: decode at frontier %d failed: %s\n", frontier, err);
+                    rc = 1;
+                    break;
+                }
+                decode_token_ms[decode_token_count] =
+                    (bench_now_sec() - token_t0) * 1000.0;
+                decode_token_count++;
+            }
         }
         const double gen_t1 = bench_now_sec();
 #ifndef DS4_NO_GPU

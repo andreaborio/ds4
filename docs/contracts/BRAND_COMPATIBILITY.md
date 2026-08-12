@@ -32,9 +32,12 @@ phase.
 | `hebrus-bench` | `ds4-bench` | `hebrus` / `ds4` |
 | `hebrus-eval` | `ds4-eval` | `hebrus` / `ds4` |
 
-The compatibility commands remain supported through at least the complete 1.x
-release line. Removing them would require usage evidence, a new accepted
-decision record, release notes, and a separately tested migration.
+The compatibility commands are implemented and tested in the current bridge.
+Their proposed complete-1.x support horizon remains unaccepted in
+[`ADR 0005`](../adr/0005-hebrus-naming-and-compatibility-boundary.md); it is not
+yet a release-line promise. Removing the current aliases would require usage
+evidence, a new accepted decision record, release notes, and a separately
+tested migration.
 
 Options, defaults, streams, exit codes, model admission, HTTP protocols,
 generated tokens, and runtime plans must remain equivalent across each pair.

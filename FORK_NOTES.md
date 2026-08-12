@@ -26,7 +26,7 @@ snapshot drifts.
 | change | what | upstream status |
 |---|---|---|
 | `gguf-tools/Makefile` quality-score link (`d2101a5`) | historical linkage fix for `ds4_distributed.o ds4_ssd.o` after the streaming refactor | **OBSOLETE IN THIS FORK** — distributed source and its object were retired; `ds4_ssd.o` remains linked. Upstream history: [antirez/ds4#434](https://github.com/antirez/ds4/pull/434). |
-| Live server imatrix (`ee7181f`) | allow `ds4-server --imatrix-out` to aggregate routed-MoE statistics from live traffic without storing prompts | **UPSTREAM PR REQUIRED after final privacy/API review** — default-off and broadly applicable; design and verification in `ONEDGE_IMATRIX.md`. |
+| Live server imatrix (`ee7181f`) | allow `ds4-server --imatrix-out` to aggregate routed-MoE statistics from live traffic without intentionally serializing raw prompt text into the imatrix | **UPSTREAM PR REQUIRED after final privacy/API review** — default-off and broadly applicable; derived statistics still require a workload-specific data-risk review. Design and verification are in `ONEDGE_IMATRIX.md`. |
 | `deepseek4-quantize --reuse` (`ef80754`, `f330c3b`) | incremental re-quantize: copy byte-identical tensors from a prior build and regenerate only changed tensors | **UPSTREAM PR REQUIRED after reuse-key hardening** — quantizer/tooling only. Blind the key with the quantizer implementation/version and lead with the byte-verifier. |
 | Re-calibration reuse (`db96c2b`, `69787f1`, `324cc5a`) | reuse imatrix-independent tensors when only the calibration matrix changes | **UPSTREAM PR REQUIRED after the same key hardening** — keep stacked with, or follow, the base `--reuse` proposal; measured byte checks are already documented. |
 | `score_official.c` SSD streaming | enable `ssd_streaming` + a cache budget so the scorer runs when the model > RAM | **UPSTREAM PR REQUIRED after rework; not mergeable as-is** — the 40 GiB cap is hardcoded for a 64 GB box. Rework it as a default-off CLI flag using `ds4_parse_streaming_cache_experts_arg`. |
@@ -54,7 +54,6 @@ snapshot drifts.
 | work | current status | promotion/upstream rule |
 |---|---|---|
 | Resident-map overcommit guard | Published at `marmyx77/ds4:fix/refuse-oversized-resident-maps` (`06fd005`); tested, not yet on this fork's `main` | Open upstream as a standalone PR; do not claim mainline protection until it lands here or upstream. |
-| DeepSeek V4 Flash 0731 DSpark | Local development slice: pinned deterministic dual-store ExpertMajor packaging, independent NumPy/optional-MLX semantic oracle, and inspection-only fail-closed runtime admission; combined artifacts are still rejected before inference | Upstream antirez DSpark explicitly rejects SSD streaming, while the normal Hebrus 64 GiB AUTO lane resolves to SSD. Do not transplant the upstream runtime, enable execution, publish a combined default, or propose a performance claim until native target/support cache ownership and the 8K/32K/endpoint Apple gates pass. |
 
 ## DO NOT UPSTREAM (without clearing the bar below): per-expert / mixed-precision expert quantization
 

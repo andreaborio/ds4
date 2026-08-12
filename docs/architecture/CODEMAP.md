@@ -26,8 +26,10 @@ The Makefile links one canonical `hebrus*` executable per role from these
 entrypoints and publishes the corresponding `ds4*` name as a symlink to the
 same file. It also owns the `DESTDIR`/`PREFIX`/`BINDIR` install boundary:
 canonical executables are copied, compatibility aliases stay relative, and
-uninstall names every removable path explicitly. There are no alias-specific
-wrappers or object graphs.
+the Metal build's exact runtime source set is installed under the versioned
+resource root derived from `BINDIR`. Uninstall names every removable command
+and resource path explicitly. There are no alias-specific wrappers or object
+graphs.
 
 | Path | Primary responsibility |
 | --- | --- |
@@ -70,7 +72,6 @@ helpers remain in the same translation unit while agents can load one family.
 | `ds4_streaming_hotlist.inc` | DeepSeek streaming hotlist data included by `ds4.c` |
 | `ds4_streaming_hotlist_glm52.inc` | GLM 5.2 streaming hotlist data included by `ds4.c` |
 | `runtime/ds4_deepseek_cache_phase.inc` | DeepSeek adaptive ExpertMajor cache transitions around batched prefill; textually included by `ds4.c` |
-| `runtime/ds4_dspark_graph.inc` | DSpark post-layer HC-mean taps and the non-executing TARGET/SUPPORT cache-floor plan; textually included by `ds4.c` |
 | `runtime/ds4_glm_graph.inc` | GLM Metal graph state, allocation, prefill/decode scheduling, routed MoE/SSD orchestration, and GLM generation; textually included by `ds4.c` |
 | `runtime/ds4_metal_glm.inc` | GLM-specific Metal encoders and tensor wrappers; textually included by `ds4_metal.m` |
 
@@ -107,8 +108,8 @@ prove codegen identity for move-only edits before behavior work continues.
 | Path | Primary responsibility |
 | --- | --- |
 | `ds4_gpu.h` | Shared GPU-facing interface used by core graph scheduling |
-| `ds4_metal.m` | Metal device/runtime state, buffers, generic command encoding, tensor transfers, ExpertMajor resident/SSD paths, non-partitioned model-family wrappers, and one-time Qwen codec dispatch |
-| `metal/*.metal` | Metal compute kernels grouped by operation or model family, including separate Affine4 and routed-IQ weight decoders under the shared Qwen graph |
+| `ds4_metal.m` | Metal device/runtime state, versioned installed/build-tree source discovery, runtime library compilation, buffers, generic command encoding, tensor transfers, ExpertMajor resident/SSD paths, non-partitioned model-family wrappers, and one-time Qwen codec dispatch |
+| `metal/*.metal` | Metal compute kernels grouped by operation or model family, including separate Affine4 and routed-IQ weight decoders under the shared Qwen graph; the required set plus the generated IQ table include is installed as runtime data for Metal builds |
 
 `ds4_metal.m` is the second refactor hotspot. Keep Objective-C runtime calls
 there. Before moving hot functions across translation units, compare generated
@@ -135,18 +136,14 @@ not validated.
 | `tests/` | Model-free, model-backed, kernel, tokenizer, server, and build-isolation regressions |
 | `tests/test_capabilities.py` | Exact schema and cross-executable checks for the model-free build/capability contract |
 | `tests/test_command_aliases.py` | Canonical/legacy symlink layout, binary identity, and CLI-output parity checks |
-| `tests/test_install.sh` | Temporary-root install/uninstall layout, path portability, capability, and explicit-removal checks |
+| `tests/test_install.sh` | Temporary-root install/uninstall layout, path portability, capability, versioned Metal-resource discovery from a clean working directory, model-free library initialization when a device is available, and explicit-removal checks |
 | `tools/brand_boundary.json` + `tools/brand_boundary_audit.py` | Exact canonical, bridged, and permanently preserved identity contract plus explicit per-file legacy `ds4`/`DS4`/`DwarfStar` classification and monotonic count ceilings; `--check` rejects contract drift, new groups, and increases, while `--refresh` requires exact authorizations before widening a ceiling |
 | `tests/test_brand_boundary_audit.py` | Fail-closed fixtures for new files and tokens, increases, reductions, deterministic refresh, and invalid manifests |
 | `docs/contracts/qwen-release.json` + `tools/qwen_release_contract.py` | Canonical Hebrus-named Stable, opt-in Beta, and historical negative-only Qwen artifact identities plus the model-free gate that parses their documentation, downloader, and test surfaces for drift |
 | `tests/test_qwen_release_contract.py` | Fail-closed fixtures for prose, table, downloader, schema, status, and negative-only Qwen release-contract drift |
 | `tests/qwen/` | Qwen fixtures, provenance, reference collectors, and model-specific gates |
-| `tests/dspark/` | Development-only, model-free fixtures and fail-closed tests for the pinned DeepSeek V4 Flash 0731 DSpark metadata, sequential Markov correction, per-position confidence depth, cumulative binary-acceptance prefixing, and exact speculative sampling |
-| `tests/test_dspark_admission.py` | Sparse, exact-geometry combined-GGUF fixtures for DSpark 0731 loader inspection, physical-range validation, logical routed-tensor expansion, and the explicit pre-inference fail-closed gate |
 | `tests/test-vectors/` | Official and local continuation vectors plus provenance |
 | `gguf-tools/` | Quantization, ExpertMajor conversion, imatrix, and quality-scoring tools |
-| `gguf-tools/ds4-expert-major.py` | Deterministic ExpertMajor v2 converter/verifier; its development-only `--dspark-support` path composes target and 0731 support sources into one atomically installed GGUF with byte-verified target and auxiliary stores |
-| `tools/dspark_oracle/` | NumPy semantic oracle, pinned provenance, reproducible fixture generator, and optional direct-MLX primitive cross-check; never linked into production inference |
 | `speed-bench/` | Benchmark prompt, driver helpers, plots, and historical results |
 | [`docs/benchmarks/`](../benchmarks/README.md) | Indexed dated benchmark decisions and measurements |
 
@@ -162,7 +159,6 @@ not be copied into new tests.
 | `QA_BEFORE_RELEASES.md` | Complete release checklist |
 | `docs/contracts/RUNTIME_SUPPORT.md` | Current supported runtime/model matrix |
 | `docs/contracts/BRAND_COMPATIBILITY.md` | Canonical Hebrus names, compatibility aliases, and permanently stable identifiers |
-| `docs/adr/0008-deepseek-dspark-embedded-support-store.md` | Proposed, not yet accepted: single-GGUF target/support ownership and Apple AUTO/SSD promotion gates for DeepSeek DSpark |
 | `docs/adr/` | Accepted architectural decisions and their consequences |
 | `GOLD_METAL_SSD.md` | Metal/SSD planner details and performance gates; support authority remains `RUNTIME_SUPPORT.md` |
 | `FORK_NOTES.md` | Time-stamped fork/upstream boundary ledger |

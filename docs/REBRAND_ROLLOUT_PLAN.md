@@ -1,270 +1,82 @@
-# Hebrus Rebrand Rollout Plan
+# Hebrus rebrand record
 
-- Status: compatibility bridges merged; GitHub and Hugging Face renames completed
-- Last updated: 2026-07-22
-- Scope: Hebrus engine, Hebrus Studio, the Hebrus Studio website, and the
-  qualified Hugging Face model repositories
-- Release posture: public development preview; final notarized macOS release pending
+- Snapshot: 2026-07-22
+- Status: historical record; not a live launch plan
+- Scope: Hebrus engine, Hebrus Studio, the project website, and the qualified
+  Hugging Face model repositories
 
-This is the cross-repository source of truth for completing the Hebrus rebrand
-without breaking runtime compatibility, installed application state, published
-model artifacts, Git history, or upstream attribution. Detailed engine release
-evidence remains in [`QA_BEFORE_RELEASES.md`](../QA_BEFORE_RELEASES.md); the
-stable naming boundary remains in
-[`BRAND_COMPATIBILITY.md`](contracts/BRAND_COMPATIBILITY.md).
+This record preserves the decisions and outcomes of the DS4-to-Hebrus rename.
+It must not be used to infer current repository settings, CI state, counters,
+downloads, redirects, release readiness, or application availability. Recheck
+those external facts when performing a release or administrative operation.
 
-> [!IMPORTANT]
-> Hebrus began as a fork of
-> [`antirez/ds4`](https://github.com/antirez/ds4) and retains substantial code,
-> architecture, utilities, and history from that project. Salvatore
-> Sanfilippo/antirez must remain prominently credited in the engine, Studio,
-> website, release notes, and future repository descriptions. `llama.cpp`,
-> GGML, MLX, and other material references remain credited with links and
-> scope. A repository rename must preserve this lineage rather than presenting
-> Hebrus as a clean-room implementation.
+Current authority is split deliberately:
 
-## Current snapshot
+- [`BRAND_COMPATIBILITY.md`](contracts/BRAND_COMPATIBILITY.md) defines canonical
+  names, compatibility aliases, and identifiers that branding must not change;
+- [`RUNTIME_SUPPORT.md`](contracts/RUNTIME_SUPPORT.md) defines qualified runtime
+  and model support;
+- [`qwen-release.json`](contracts/qwen-release.json) records exact current Qwen
+  artifact identities;
+- [`QA_BEFORE_RELEASES.md`](../QA_BEFORE_RELEASES.md) defines release evidence.
 
-| Surface | Canonical work | State | Immediate constraint |
-| --- | --- | --- | --- |
-| Engine | `andreaborio/hebrus`, merged PR [#6](https://github.com/andreaborio/hebrus/pull/6) at `7686f70` | In-place rename completed; 35 stars, 4 forks, releases, PRs, fork ancestry, old-URL redirect, and clone parity verified | Model-backed release lanes remain required before a final release |
-| Studio | `andreaborio/hebrus-studio`, merged PR [#11](https://github.com/andreaborio/hebrus-studio/pull/11) at `dd13cb5` | In-place rename completed; 5 stars, releases, preview DMG, old-URL redirect, and clone parity verified | Publish and verify a post-merge development candidate before the final signed release |
-| Website | `andreaborio/hebrus-site`, `main` at `086ade3` | Canonical source and DMG links merged; lint, static export, ranged DMG request, and Pages test green | Final logo and final signed download remain pending |
-| Model Hub | Three consolidated `andreaborio/*-Hebrus-GGUF` repositories | In-place moves and Hebrus model-card refreshes completed; exact revisions, files, hashes, counters, Git heads, range downloads, and DS4-ID redirects verified | Retain continuous redirect/download monitoring |
+## Recorded outcome
 
-Release work must use the active engine rebrand branch, the active Studio bridge
-branch, and the GitHub Pages site checkout identified in the table above. A
-separate empty workspace checkout named `ds4` is unrelated and must not be used
-for release work. The uncommitted modal-portal change in an older Studio
-checkout must be reviewed and either ported deliberately to current Studio
-`main` or discarded by its owner; it must not be accidentally included in the
-rebrand integration.
-
-## Non-breaking identity matrix
-
-| May become canonical | Must remain compatible | Must not be renamed for branding |
+| Surface | Recorded identity | Outcome at the snapshot date |
 | --- | --- | --- |
-| `Hebrus`, `hebrus`, and the five `hebrus*` commands | Five `ds4*` command aliases through the complete 1.x line | `ds4.expert_major.v2`, wire values, GGUF metadata, disk-KV ABI, published filenames and hashes |
-| `Hebrus Studio` visible product and Finder name | `com.dsbox.desktop`, `$HOME/.dsbox`, legacy Electron `userData`, browser keys, `DSBOX_*` configuration | Existing user models, conversations, settings, downloads, release artifacts, tags, and historical links |
-| `andreaborio/hebrus` and `andreaborio/hebrus-studio` repository names | Old GitHub URLs through in-place rename redirects; consumers accept old and new engine identities | Git history, authorship, upstream remote, fork ancestry, licenses, acknowledgments, citations |
-| `*-Hebrus-GGUF` as the canonical Hugging Face repository display identity | Historical `*-DS4-GGUF` repository IDs and already-installed repository directory names | GGUF filenames, bytes, immutable revisions, LFS/Xet objects, SHA-256 values, `ds4.expert_major.v2` metadata |
-| Future `HEBRUS_*` aliases through one resolver | Existing `DS4_*` variables; conflicting old/new values fail closed | A textual replacement of environment variables, C symbols, paths, or serialized identifiers |
+| Engine | `andreaborio/hebrus`, merge `7686f70` | Repository renamed in place; canonical `hebrus*` commands and `ds4*` compatibility aliases implemented |
+| Studio | `andreaborio/hebrus-studio`, merge `dd13cb5` | Repository renamed in place; visible Hebrus Studio identity and persisted DSBox compatibility bridge implemented |
+| Website | `andreaborio/hebrus-site`, revision `086ade3` | Canonical source and release links recorded in the site source |
+| Model Hub | Three `andreaborio/*-Hebrus-GGUF` repositories | In-place moves recorded and checked against the pre-move inventory; see the [historical Hub inventory](HF_MODEL_RENAME_INVENTORY.md) |
 
-## Phase 0 — Reconcile the three active repositories
+These revisions identify the rename work only. They are not current release
+pins and do not replace the exact runtime and artifact identities in the live
+contracts above.
 
-Goal: establish one reproducible head per product before changing another
-public name.
+## Durable compatibility boundary
 
-1. Fetch all remotes and record immutable starting SHAs for engine, Studio, and
-   website.
-2. Rebase or reconstruct `codex/hebrus-phase-0` on current engine `main`. Keep
-   the three incoming Qwen Flash/SSD commits intact and resolve conflicts as
-   integration work, not as opportunities for extra kernel changes.
-3. Reconstruct the Studio bridge on current Studio `main`, preserving the two
-   new visual-brand commits and the thirteen bridge/release-hardening commits.
-   Avoid a blind merge if it duplicates the brand-boundary inventory.
-4. Review the older checkout's `createPortal(..., document.body)` modal change
-   against current Studio. Port it in a separate bug-fix commit only if the
-   current modal still has the stacking-context defect.
-5. Mark the empty `Documents/ds4` checkout as non-canonical locally so builds,
-   scripts, and release notes cannot accidentally reference it.
+| Canonical public identity | Compatibility implemented in this snapshot | Preserved data or history |
+| --- | --- | --- |
+| `Hebrus`, `hebrus`, and five `hebrus*` commands | Five `ds4*` command aliases | `ds4.expert_major.v2`, wire values, GGUF metadata, disk-KV ABI, published bytes and hashes |
+| `Hebrus Studio` visible name | Persisted DSBox application identity, data paths, browser keys, and `DSBOX_*` configuration | Existing user models, conversations, settings, downloads, release artifacts, and tags |
+| `andreaborio/hebrus` and `andreaborio/hebrus-studio` | Old repository identities accepted by the recorded bridge | Git history, authorship, upstream fork ancestry, licenses, acknowledgments, and historical links |
+| `*-Hebrus-GGUF` repository display identities | Historical repository IDs and already-installed repository directory names | Model bytes, immutable revisions, LFS/Xet objects, checksums, and embedded identifiers |
+| A possible future `HEBRUS_*` namespace | Existing `DS4_*` variables | No textual rewrite of environment variables, C symbols, paths, or serialized identifiers |
 
-Exit gate: both integration branches are clean, based on current `main`, have
-an explicit upstream tracking branch, and contain no unexplained duplicate or
-dropped commits.
+The aliases present in this snapshot are tested compatibility behavior. The
+proposal to retain them through the complete 1.x line remains unaccepted in
+[`ADR 0005`](adr/0005-hebrus-naming-and-compatibility-boundary.md); this record
+does not turn that proposed horizon into a release promise.
 
-## Phase 1 — Restore green CI before further renaming
+## Completed operations recorded on 2026-07-22
 
-### Studio blockers and resolutions
+- The engine and Studio repositories were renamed in place rather than copied
+  into history-less replacements.
+- Three Hugging Face repositories were moved in place. The recorded comparison
+  covered revisions, sibling inventories, object identities, ranged reads, and
+  redirects; it did not change model bytes or embedded ExpertMajor identifiers.
+- Current product copy moved to Hebrus while upstream DS4 origin, authorship,
+  licenses, and substantial implementation credit remained explicit.
+- The compatibility bridge separated public display names from command,
+  application-state, environment, and serialized-data identities.
 
-1. **Resolved:** the rebased lockfile reports zero vulnerabilities under
-   `npm audit --audit-level=high` from a clean install.
-2. **Resolved locally:** the macOS package verifier false positive that classified the font path
-   `/dist/fonts/hebrus` as an embedded engine executable. The verifier must
-   distinguish executable payloads from font/assets by type and location, not
-   by basename alone.
-3. **Resolved:** the persisted-artifact resume test is deterministic: the previous failure
-   compares `[null, null]` with `[null, undefined]`. Decide and document the
-   boundary representation, then assert that contract consistently rather than
-   weakening the compatibility check.
-4. **Green locally:** typecheck, brand audit, the complete test suite, production build,
-   ad-hoc macOS packaging contract, and legacy upgrade/rollback exercise on the
-   same candidate SHA.
+Redirect and download observations above are dated evidence, not guarantees
+about present external service behavior.
 
-### Engine gates
+## Remaining publication gates
 
-The current brand audit is green with 29,877 legacy occurrences classified in
-370 groups and no unclassified increase. After rebasing, rerun at minimum:
+Before describing a new build as a public release, the maintainer must still:
 
-- context and documentation-link audits;
-- brand-boundary and Qwen release-contract checks;
-- CPU/Linux and macOS arm64 builds;
-- visible identity, capabilities, command-alias, install/uninstall, and server
-  alias parity tests;
-- qualified Apple Silicon model-backed correctness and performance lanes for
-  every supported artifact affected by the incoming Metal changes.
+- satisfy the acceptance conditions in ADR 0005 before promoting its proposed
+  release-line compatibility horizon;
+- obtain green CI and every model-backed lane required for the exact candidate;
+- provide a verified private security-reporting route;
+- verify current repository links, redirects, downloads, artifact hashes, and
+  release assets rather than relying on this snapshot; and
+- claim Developer ID signing, notarization, stapling, or Gatekeeper acceptance
+  only when each property has been checked on the published artifact.
 
-### Website gates
-
-Keep lint, static export tests, dependency audit, GitHub Pages deployment, HTTP
-200 verification, canonical/OG metadata, and the exact GitHub Release download
-URL green. The website must not host the DMG inside the Pages repository.
-
-Exit gate: required checks are green on the exact engine and Studio candidate
-SHAs; the site deploy for its exact content SHA is green.
-
-## Phase 2 — Merge the bridge without renaming repositories
-
-1. Open focused integration PRs for engine and Studio. Keep inference changes,
-   visual polish, dependency fixes, and naming mechanics in reviewable commits.
-2. Merge the engine capability contract and canonical `hebrus*` commands while
-   retaining `ds4*` aliases and invocation-aware identity.
-3. Merge Hebrus Studio's `hebrus-server`-first discovery, `ds4-server`
-   fallback, dual `engine_id` acceptance, visible product identity, and
-   persisted DSBox compatibility identity.
-4. Publish a fresh development candidate from the merged Studio `main`; verify
-   no-data-loss upgrade from an installed DSBox build and rollback to it.
-5. Change ADR 0005 from Proposed to Accepted only after the merged bridge,
-   compatibility evidence, and namespace decision are all recorded.
-
-Exit gate: users can install Hebrus Studio and invoke Hebrus while old DS4
-commands, models, state, paths, and integrations continue to work.
-
-## Phase 3 — Freeze the public launch surface
-
-1. Select the final logo master. The website currently uses a temporary
-   text-based `H`; regenerate the favicon, application icons, and Open Graph
-   card together once the master is accepted.
-2. Freeze the typography, colors, spacing, screenshot count, English copy, and
-   accessibility behavior across Studio documentation and the website.
-3. Capture fresh screenshots from the exact release candidate, with no stale
-   DSBox visible copy except where a migration explanation requires it.
-4. Synchronize README hero copy, repository descriptions, topics, social card,
-   release notes, install guide, support matrix, and changelog.
-5. Verify every public surface carries the upstream DS4 origin and material
-   technical references without implying endorsement.
-
-Exit gate: visual assets and copy are versioned, consistent, accessible, and
-traceable to the same candidate release.
-
-## Phase 4 — Administrative repository renames
-
-Completed on 2026-07-22. The checks below remain the regression contract for
-future repository and release changes.
-
-Perform in-place GitHub renames only; do not create history-less replacement
-repositories and do not reuse the old names.
-
-1. Rename `andreaborio/ds4` to `andreaborio/hebrus`.
-2. Verify clone, fetch, submodule/reference, issue, PR, release, and Actions
-   behavior through both the new canonical URL and GitHub's old-URL redirect.
-3. Update active remotes, badges, repository topics/descriptions, security and
-   issue-template links, package metadata, CI references, Studio engine-source
-   admission, and website source links. Do not rewrite historical documents.
-4. Rename `andreaborio/dsbox` to `andreaborio/hebrus-studio` only after Studio
-   consumes both old and new engine remote identities.
-5. Repeat redirect and automation verification for Studio, then update the
-   website and release download URLs. Keep `hebrus-site` unchanged unless a
-   separate brand decision justifies moving the Pages base path.
-6. Run repository-wide broken-link scans and fresh clone/build/install tests
-   from the new canonical URLs.
-
-Exit gate: new URLs are canonical, old URLs redirect, Actions and Pages are
-green, releases and stars remain attached to the renamed repositories, and no
-published artifact or historical attribution link was rewritten destructively.
-
-## Phase 5 — Rename the qualified Hugging Face repositories
-
-Hugging Face documents an in-place move operation that redirects the old URL
-and preserves download counts and likes. Use that operation rather than copying
-or re-uploading weights. The initial public move set was completed on
-2026-07-22:
-
-| Current repository | Future canonical repository |
-| --- | --- |
-| `andreaborio/DeepSeek-V4-Flash-DS4-GGUF` | `andreaborio/DeepSeek-V4-Flash-Hebrus-GGUF` |
-| `andreaborio/GLM-5.2-DS4-GGUF` | `andreaborio/GLM-5.2-Hebrus-GGUF` |
-| `andreaborio/Qwen3.6-35B-A3B-DS4-GGUF` | `andreaborio/Qwen3.6-35B-A3B-Hebrus-GGUF` |
-
-Retired, experimental, lab, v1, and superseded v2 repositories are historical
-records. Do not bulk-rename or revive them; classify each separately and keep
-them hidden from the Studio catalog.
-
-1. Before any Hub move, update Studio catalog contracts so the new Hebrus ID is
-   canonical and the current DS4 ID is included in `previousRepositories`.
-   Installed paths using either repository name must continue to resolve to the
-   same model.
-2. Update engine download manifests and tooling to accept both repository IDs
-   while pinning the same immutable revision, GGUF filename, byte size, and
-   SHA-256. Repository identity is transport metadata, not a model-format
-   change.
-3. Add tests for API discovery, revision resolution, ranged download/resume,
-   local installed-path recognition, hidden retired repositories, and fallback
-   through the old redirected URL.
-4. Record each source repository, destination repository, visibility, gated
-   status, main revision, refs, file inventory, file sizes, LFS/Xet object
-   identifiers, model-card metadata, downloads, and likes immediately before
-   the move.
-5. Move one repository at a time using the authenticated Hub move operation.
-   Start with the least operationally critical model, validate it completely,
-   and stop the sequence if any invariant changes.
-6. After each move, verify the old web, API, `resolve`, and Git URLs redirect;
-   the new URL resolves the same commit; range requests and Studio downloads
-   work; the exact GGUF hash is unchanged; the model card and attribution are
-   intact; and download counts/likes remain attached.
-7. Update live model cards, Hebrus/Studio READMEs, catalog source labels,
-   website links, release manifests, and support tables to the new canonical
-   IDs. Preserve historical release notes and benchmark links unless they are
-   intended as live download instructions.
-8. Do not rename files inside the repositories. A friendly Hebrus display name
-   may be added to the model card and manifest, but existing published GGUF
-   filenames and their checksums remain immutable.
-
-Exit gate: all three new Hub IDs are canonical, every old URL redirects, Studio
-recognizes both old and new installed paths, exact revisions/files/hashes are
-unchanged, and no model is duplicated or re-uploaded.
-
-## Phase 6 — Release and launch
-
-Two release lanes remain deliberately separate:
-
-- **Community/development preview:** ad-hoc signed, clearly labelled, includes
-  the Control-click installation path, checksums, provenance, SBOM, known
-  limitations, and no notarization claim.
-- **Public macOS release:** Developer ID signed, notarized, stapled, verified on
-  a clean Mac under Gatekeeper, with the final DMG checksum and attestation.
-
-For either lane, cut tags only from the green immutable candidate SHAs, publish
-engine and Studio notes together, update the website download atomically, and
-run a post-publish smoke test covering download, install, first launch, runtime
-discovery, one resident model, one SSD-streamed model, upgrade, and rollback.
-
-The launch announcement should lead with the differentiated product direction:
-an open-source, Apple Metal-first inference engine with adaptive SSD streaming.
-It must also state the DS4 fork origin prominently and link the acknowledgments,
-compatibility guide, source, supported-artifact matrix, and reproducible
-benchmark evidence.
-
-## Stop conditions
-
-Do not rename repositories, remove aliases, move application data, or describe
-a build as a final release when any of the following is true:
-
-- either engine or Studio CI is red;
-- a branch is not reconciled with current `main`;
-- a model-backed Metal/SSD gate required by the diff is missing;
-- upstream attribution, license inventory, checksums, provenance, or rollback
-  evidence is incomplete;
-- the website points to an unavailable or differently qualified artifact;
-- the macOS build is described as notarized without Developer ID, notarization,
-  stapling, and clean-machine Gatekeeper evidence.
-
-## Completion definition
-
-The rebrand is complete when the canonical repositories, commands, application,
-website, release assets, documentation, and community surfaces say Hebrus or
-Hebrus Studio; every intentionally retained DS4/DSBox identifier is classified
-and tested as compatibility, serialized data, or history; old URLs and commands
-still work within their promised window; CI and model-backed evidence are green;
-and a new user can understand the product, its support boundary, its provenance,
-and its installation path from the public landing page alone.
+Do not remove aliases, move application data, rename serialized identifiers, or
+rewrite historical attribution as part of routine brand work. Hebrus remains a
+fork of [`antirez/ds4`](https://github.com/antirez/ds4); this lineage does not
+imply upstream endorsement or partnership.

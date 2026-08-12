@@ -2,6 +2,9 @@
 
 - Status: Proposed
 - Date: 2026-07-21
+- Implementation note: the public repository rename, canonical commands,
+  capability document, and current compatibility aliases are implemented;
+  the release-line commitment below is not Accepted yet.
 
 ## Context
 
@@ -16,17 +19,23 @@ ownership harder to explain.
 A textual rename is unsafe. Existing installations and automation depend on
 `ds4` commands, `DS4_*` environment variables, repository URLs, C names, model
 paths, and application paths. Published GGUFs and disk-KV files also contain
-identifiers whose bytes are part of a durable format. The pre-rename DSBox release
-additionally probes exact source paths, C symbols, and diagnostic strings when
-admitting an ExpertMajor runtime.
+identifiers whose bytes are part of a durable format. The pre-rename DSBox
+release additionally probes exact source paths, C symbols, and diagnostic
+strings when admitting an ExpertMajor runtime.
+
+The repository has since been renamed in place to
+[`andreaborio/hebrus`](https://github.com/andreaborio/hebrus), and the source
+tree now ships the canonical commands and machine-readable capability bridge.
+Those completed mechanics do not by themselves accept every future
+compatibility promise in this record.
 
 ## Decision
 
-After namespace and legal screening is complete, the public engine name will be
-**Hebrus**. The existing GitHub fork will be renamed rather than copied, and the
-README will continue to identify `antirez/ds4` prominently as the origin of the
-fork and of substantial implementation work. Acknowledgments will also name
-ggml, llama.cpp, MLX, and other material sources with precise links and scope.
+The public engine name is **Hebrus**. The existing GitHub fork was renamed in
+place rather than copied, and the README continues to identify `antirez/ds4`
+prominently as the origin of the fork and of substantial implementation work.
+Acknowledgments also name ggml, llama.cpp, MLX, and other material sources with
+precise links and scope.
 
 The migration separates public brand from compatibility identity:
 
@@ -77,8 +86,10 @@ both command brands. Model-format lifecycle remains governed by ADR 0003.
   protocols, deterministic output, resolved runtime plan, and performance.
 - Existing installations, checkouts, models, caches, and application data do
   not need to be copied or rewritten for branding.
-- The GitHub repository rename happens only after the compatibility application
-  recognizes both old and new remote identities.
-- This ADR becomes Accepted only after the Hebrus identity is reserved, the
-  machine-readable capability contract is merged, the Hebrus Studio bridge is proven,
-  and the pre-rebrand release baseline is green.
+- Live documentation and automation use the canonical repository URL. Historic
+  evidence keeps the URL and identity that were true when it was recorded.
+- This ADR becomes Accepted only when the remaining acceptance evidence is
+  cited here: a proven Hebrus Studio bridge for persisted identities and
+  rollback, plus a green immutable release baseline. The repository rename and
+  canonical command surface alone do not accept the proposed complete-1.x
+  compatibility horizon.
