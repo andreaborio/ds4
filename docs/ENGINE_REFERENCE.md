@@ -23,13 +23,24 @@ assumed from parameter count: admission, correctness, context limits, and
 performance remain tied to the exact artifacts and evidence in the current
 support contract.
 
-That said, a few important things about this project:
+The operating constraints are deliberate:
 
-* The local inference landscape contains many excellent projects, but new models are released continuously, and the attention immediately gets captured by the next model to implement. This project takes a deliberately narrow bet: one model at a time, official-vector validation (logits obtained with the official implementation), long-context tests, and enough agent integration to know if it really works. The exact model may change as the landscape evolves, but the constraint remains: credible local Apple Metal inference, with family-specific memory limits. DeepSeek and GLM currently start at 64 GiB; Qwen's SSD-backed policy starts at 16 GiB.
-* This software is developed with **strong assistance from GPT 5.5** and with humans leading the ideas, testing, and debugging. We say this openly because it shaped how the project was built. If you are not happy with AI-developed code, this software is not for you. The acknowledgement below is equally important: this would not exist without `llama.cpp` and GGML, largely written by hand.
-* This implementation is based on the idea that compressed KV caches like the one of DeepSeek v4 and the fast SSD disks of modern MacBooks should change our idea that KV cache belongs to RAM. **The KV cache is actually a first-class disk citizen**. Fast SSD disks also changed the inference game from the point of view of "model needs to fit RAM": while having more RAM than the model size is still preferred, SSD streaming turns the available amount of RAM from a hard cutoff (can I run this model or not?) into a continuous spectrum of speed levels.
-* Our vision is that local inference should be a set of three things working well together, out of the box: A) inference engine with HTTP API + B) GGUF specially crafted to run well under a given engine and given assumptions + C) testing and validation with coding agents implementations. D) Purpose built agents for specific models and execution environments. Hebrus only runs with the GGUF files provided. It gets tested against officially obtained logits at different context sizes. This project exists because we wanted to make one local model feel finished end to end, not just runnable. However this is beta quality code, so probably we are not still there, especially since SSD streaming and the additional model families are recent additions.
-* The production graph path targets **Metal on macOS**. The CPU path is only for correctness checks and model/tokenizer diagnostics. For CPU-only Linux builds, use `make cpu`; it builds canonical `hebrus` commands plus their `ds4*` compatibility aliases without a GPU backend. On macOS, **warning: current macOS versions have a bug in the virtual memory implementation that can crash the kernel** if you try to run very large CPU model inference. Do not use CPU as a production fallback.
+* Support advances one qualified model profile at a time. Official-vector
+  comparisons, long-context completion, memory pressure, swap, and agent/API
+  behavior are recorded separately; passing one gate does not imply the others.
+  DeepSeek and GLM currently start at 64 GiB. Qwen's guarded SSD profile starts
+  at 16 GiB.
+* Development uses strong AI assistance, with maintainers responsible for
+  design, review, physical-host testing, and release decisions. The repository
+  records this because it is relevant provenance, not as a quality claim.
+* SSD streaming is a bounded execution mode. It does not remove RAM
+  requirements: non-routed weights, KV state, graph scratch, activations, and
+  the admitted expert cache still consume unified memory.
+* The runtime, exact GGUF artifact, support contract, and regression evidence
+  form one release unit. A model-family match by itself is not admission.
+* The qualified graph path targets Metal on macOS. `make cpu` provides canonical
+  commands and compatibility aliases for reference and model-free diagnostics;
+  a successful CPU build is not a production-inference claim.
 
 ## Acknowledgements to llama.cpp and GGML
 
@@ -49,8 +60,12 @@ notice in our `LICENSE` file.
 The code and GGUF files are **beta quality**. Inference and model serving are
 complicated, the supported model paths are evolving quickly, and not every
 backend receives the same validation at the same time. We try to keep tested
-paths usable. If you hit an issue, use `--trace` to log the session and include
-the full trace in the report.
+paths usable. If you hit an issue, start with a minimal sanitized reproduction
+and the build/capability output requested by the
+[bug-report form](../.github/ISSUE_TEMPLATE/bug_report.yml). Do not attach an
+unsanitized `--trace`: it can contain prompts, model output, tool results,
+paths, tokens, or secrets. Redact private data, and use the private route in
+[`SECURITY.md`](../SECURITY.md) for vulnerabilities.
 
 The `hebrus-agent` was added later and remains alpha quality.
 
@@ -87,13 +102,11 @@ This implementation only works with the explicitly qualified ExpertMajor v2
 GGUFs published for this project. It is not a general GGUF loader, and
 arbitrary Qwen, DeepSeek, GLM, or community GGUF files will not have the
 validated embedded store, tensor layout, quantization mix, or metadata expected
-by the engine. The 2 bit
-DeepSeek quantizations provided here are not
-a joke: they behave well, work under coding agents, call tools in a reliable way.
-The 2 bit quants use a very asymmetrical quantization: only the routed MoE
-experts are quantized, up/gate at `IQ2_XXS`, down at `Q2_K`. They are the
-majority of all the model space: the other components (shared experts,
-projections, routing) are left untouched to guarantee quality.
+by the engine. The DeepSeek artifact quantizes only routed MoE experts:
+up/gate use `IQ2_XXS` and down uses `Q2_K`; shared experts, projections, and
+routing retain their published higher-precision layouts. Correctness and model
+behavior are scoped to the linked vector and benchmark evidence, not inferred
+from this quantization recipe.
 
 Obtain a qualified ExpertMajor v2 release artifact and verify the exact size and
 complete output SHA-256 in its publication record:
@@ -251,12 +264,11 @@ rejects resident mode. In streaming mode the non-routed model weights stay
 resident, while routed MoE experts are kept in an in-memory cache and loaded
 from the GGUF file on cache misses.
 
-Streaming is not as fast as fitting the full model in RAM. It still needs memory
-for non-routed weights, KV cache, graph scratch, activations, and the routed
-expert cache. It is useful because routed experts dominate model size and modern
-Mac SSDs are fast enough to make cache misses tolerable. Long prefills can still
-be fast; generation is more sensitive to cache misses because every new token
-routes through experts again.
+Streaming still needs memory for non-routed weights, KV cache, graph scratch,
+activations, and the routed-expert cache. Cache misses add SSD I/O, and decode
+is particularly sensitive because every new token routes through experts
+again. Use the measured records for the exact artifact and hardware lane;
+neither artifact size nor SSD bandwidth alone predicts throughput.
 
 Start with AUTO residency and the automatic cache budget:
 
@@ -440,19 +452,17 @@ for example:
 
 ## Native agent
 
-Hebrus features a native coding agent that works in a different way
-than most other systems: the inference is controlled from within the agent
-itself, without socket/API boundaries, so the session is represented
-by the on-disk KV cache itself. Moreover the tools and the system prompt
-are all designed vertically for DeepSeek v4 Flash and PRO. This provides a
-few advantages:
+Hebrus includes an in-process coding agent for the qualified DeepSeek V4 Flash
+path. It calls the engine directly rather than crossing a socket/API boundary,
+uses the model's documented tool format, and owns one live graph/KV checkpoint
+for the active conversation. The current surface provides:
 
-* Low latency experience, bounded mainly by the prefill speed limits. Displaying of generated text, tool calling, start of a new session are always instantaneous.
-* Live progress bar during prefill time.
-* No DSML tool calling conversion, the tools are handled natively in the LLM format.
-* KV cache mismatch are impossible by construction, the current state is always the truth.
-* Everything is tuned for this model.
-* Ability to switch saved sessions with `/list` and `/switch`; full KV sessions resume without a prefill stage.
+* a live progress bar during prefill;
+* model-format tool calls without an intermediate HTTP protocol conversion;
+* one checkpoint owner for the active transcript, with errors reported if a
+  stored session cannot be restored consistently; and
+* `/list` and `/switch` for saved sessions; a complete compatible KV payload
+  can resume without rebuilding it from transcript text.
 
 Agent sessions are stored in `~/.ds4/kvcache`. Use `/save` to persist the
 current session, `/list` to show saved sessions sorted by recent update time,
@@ -472,13 +482,10 @@ Private compaction instructions never enter the visible transcript or execute
 tools. `/compact` requests the same operation manually, and the terminal shows
 `COMPACTING` while the summary and rebuilt prefill are in progress.
 
-Use `--chdir /path/to/engine-checkout` when launching `hebrus-agent` from another directory,
-so relative runtime files such as `metal/*.metal` resolve from the project tree.
-
-However while the system already works, there is a lot of work to do
-in order to make it ready for prime time. When finally the agent will reach
-the wanted shape, we will *likely* split the server and the client creating a stateful
-session-based protocol that can recreate all that in a client-server way.
+Use `--chdir DIR` only when model, cache, trace, or agent-tool paths are
+intentionally relative to a chosen working directory. Installed Metal sources
+are resolved from the versioned resource directory beside the executable and
+do not require a checkout working directory.
 
 ## Benchmarking
 
@@ -632,7 +639,7 @@ The interactive CLI is a real multi-turn chat. It keeps the rendered chat
 transcript and the live graph KV checkpoint, so each turn extends the previous
 conversation. Useful commands are `/help`, `/think`, `/think-max`, `/nothink`,
 `/ctx N`, `/read FILE`, and `/quit`. Ctrl+C interrupts the current generation
-and returns to `ds4>`.
+and returns to `hebrus>` (`ds4>` when invoked through the compatibility alias).
 
 The CLI defaults to thinking mode. Use `/nothink` or `--nothink` for direct
 answers. `--mtp MTP.gguf --mtp-draft 2` enables the optional MTP speculative
@@ -642,7 +649,8 @@ experimental slight-speedup path.
 
 ## Server
 
-Start a local OpenAI/Anthropic-compatible server:
+Start a local server implementing the documented OpenAI and Anthropic endpoint
+subsets listed below:
 
 ```sh
 ./hebrus-server \
@@ -650,8 +658,9 @@ Start a local OpenAI/Anthropic-compatible server:
   --ctx 100000 --kv-disk-dir /tmp/ds4-kv --kv-disk-space-mb 8192
 ```
 
-Use `--chdir /path/to/engine-checkout` when launching `hebrus-server` from another directory,
-so relative runtime files such as `metal/*.metal` resolve from the project tree.
+Use `--chdir DIR` only when model, cache, trace, or other input paths are
+intentionally relative to a chosen working directory. Installed Metal sources
+are executable-relative and do not require a checkout working directory.
 
 The server keeps one mutable backend/KV checkpoint in memory,
 so stateless clients that resend a longer version of the same prompt can reuse
@@ -1158,14 +1167,12 @@ in `QA_BEFORE_RELEASES.md`; a historical build or benchmark is not support.
 
 ## Steering
 
-This project supports steering with single-vector activation directions; see the
-`dir-steering` directory for more information. This follows the core idea of the
-[Refusal in Language Models Is Mediated by a Single Direction](https://arxiv.org/abs/2406.11717)
-paper. You can use it to make the model more or less verbose, less likely to
-answer programming questions if it is a chatbot for your car rental web site,
-and so forth, much faster than fine-tuning.
-This is also useful for cybersecurity researchers who want to reduce a model's
-willingness to provide dual-use or offensive security guidance.
+This project supports steering with single-vector activation directions; see
+`dir-steering` for its controls, evidence, and limits. The implementation follows
+the core idea in
+[Refusal in Language Models Is Mediated by a Single Direction](https://arxiv.org/abs/2406.11717).
+Steering changes activations at inference time without modifying model weights;
+it is not presented as equivalent to fine-tuning or as a safety boundary.
 
 ## Test Vectors
 

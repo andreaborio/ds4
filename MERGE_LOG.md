@@ -2,8 +2,8 @@
 
 Record of syncs of this fork (`andreaborio/hebrus`) with upstream `antirez/ds4`, and how the
 fork's engine additions were preserved across upstream refactors. See
-[`FORK_NOTES.md`](FORK_NOTES.md) for per-change upstreamability and [`README.md`](README.md)
-("This fork") for what each addition does.
+[`FORK_NOTES.md`](FORK_NOTES.md) for per-change upstreamability and
+[`README.md`](README.md) for the current public runtime surface.
 
 ---
 

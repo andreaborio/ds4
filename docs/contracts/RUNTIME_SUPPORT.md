@@ -1,6 +1,6 @@
 # Runtime Support Contract
 
-This document defines what the current fork supports in production. It is an
+This document defines the current qualified inference contract. It is an
 admission and maintenance contract, not a list of code that happens to compile.
 Testing and release evidence remain governed by
 [`CONTRIBUTING.md`](../../CONTRIBUTING.md) and
@@ -14,9 +14,9 @@ and Qwen's lower-memory extension in
 
 | Model family | Minimum unified memory | Qualified Metal modes | Release startup |
 | --- | ---: | --- | --- |
-| DeepSeek V4 Flash | 64 GiB | AUTO resolving to resident or SSD; explicit resident and SSD according to the artifact gate | `./hebrus -m DEEPSEEK-DS4-ExpertMajor-v2.gguf` |
+| DeepSeek V4 Flash | 64 GiB | AUTO resolving to resident or SSD; explicit resident and SSD according to the artifact gate | `./download_model.sh deepseek-v2`, then `./hebrus -m DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix-DS4-ExpertMajor-v2.gguf` |
 | Qwen3.6-35B-A3B | 16 GiB for Stable Affine4; 64 GiB for Q2_K_XL Beta | 16 GiB Affine4 is qualified with guarded SSD through a 128K prompt frontier plus 128 decode tokens. The allocation-time release candidate extends deterministic guarded SSD through 24 GiB; above 24 GiB AUTO may resolve to resident or SSD according to the Qwen admission gates. Q2_K_XL Beta has recorded 64 GiB resident/SSD evidence through 32768 tokens | Stable: `./hebrus -m Qwen3.6-35B-A3B-Hebrus-ExpertMajor-v2-MLX-Affine4-G64.gguf`; Beta: `./hebrus -m Qwen3.6-35B-A3B-Hebrus-ExpertMajor-v2-Q2_K_XL.gguf` |
-| GLM 5.2 | 64 GiB | AUTO resolving to SSD streaming only; resident is rejected | `./hebrus -m GLM-DS4-ExpertMajor-v2.gguf --ctx 8192` |
+| GLM 5.2 | 64 GiB | AUTO resolving to SSD streaming only; resident is rejected | `./download_model.sh glm-v2`, then `./hebrus -m GLM-5.2-DS4-ExpertMajor-v2-Q2_K.gguf --ctx 8192` |
 
 All rows require Apple Metal and a validated embedded `ds4.expert_major.v2`
 store. Explicit residency options are controlled qualification tools; normal
@@ -75,7 +75,7 @@ fixture and real-Metal fault injection prove policy mechanics. A physical
 24 GiB Mac must still pass the versioned five-request gate before release.
 
 The lower-memory extension is Qwen-specific. Hosts below 64 GiB remain outside
-the DeepSeek and GLM production contract. Do not infer support for another
+the DeepSeek and GLM qualified contract. Do not infer support for another
 family from Qwen's successful admission.
 
 Runtime support and public artifact distribution are separate gates. The
@@ -109,7 +109,7 @@ endpoint lane remains mandatory before Stable/full-window promotion.
 
 ## Model Artifact Admission
 
-Production inference accepts the qualified embedded ExpertMajor v2 artifact for
+Qualified inference accepts the embedded ExpertMajor v2 artifact for
 each supported family. It must fail closed for:
 
 - canonical routed-weight GGUFs used as converter inputs;

@@ -236,7 +236,7 @@
       "location": "content",
       "token": "ds4",
       "classification": "compatibility",
-      "maximum": 518
+      "maximum": 507
     },
     {
       "path": "Makefile",
@@ -302,20 +302,6 @@
       "maximum": 11
     },
     {
-      "path": "cli_internal.h",
-      "location": "content",
-      "token": "ds4",
-      "classification": "migration-pending",
-      "maximum": 14
-    },
-    {
-      "path": "cli_internal.h",
-      "location": "content",
-      "token": "DS4",
-      "classification": "compatibility",
-      "maximum": 1
-    },
-    {
       "path": "dir-steering/README.md",
       "location": "content",
       "token": "ds4",
@@ -355,7 +341,7 @@
       "location": "content",
       "token": "ds4",
       "classification": "migration-pending",
-      "maximum": 44
+      "maximum": 42
     },
     {
       "path": "docs/ENGINE_REFERENCE.md",
@@ -407,18 +393,11 @@
       "maximum": 4
     },
     {
-      "path": "docs/adr/0008-deepseek-dspark-embedded-support-store.md",
-      "location": "content",
-      "token": "ds4",
-      "classification": "serialized/permanent",
-      "maximum": 3
-    },
-    {
       "path": "docs/architecture/CODEMAP.md",
       "location": "content",
       "token": "ds4",
       "classification": "migration-pending",
-      "maximum": 51
+      "maximum": 48
     },
     {
       "path": "docs/architecture/CODEMAP.md",
@@ -957,14 +936,14 @@
       "location": "content",
       "token": "ds4",
       "classification": "migration-pending",
-      "maximum": 6141
+      "maximum": 5269
     },
     {
       "path": "ds4.c",
       "location": "content",
       "token": "DS4",
       "classification": "migration-pending",
-      "maximum": 5133
+      "maximum": 4565
     },
     {
       "path": "ds4.h",
@@ -978,14 +957,14 @@
       "location": "content",
       "token": "ds4",
       "classification": "migration-pending",
-      "maximum": 343
+      "maximum": 322
     },
     {
       "path": "ds4.h",
       "location": "content",
       "token": "DS4",
       "classification": "migration-pending",
-      "maximum": 44
+      "maximum": 40
     },
     {
       "path": "ds4_agent.c",
@@ -1020,14 +999,14 @@
       "location": "content",
       "token": "ds4",
       "classification": "migration-pending",
-      "maximum": 172
+      "maximum": 159
     },
     {
       "path": "ds4_bench.c",
       "location": "content",
       "token": "DS4",
       "classification": "migration-pending",
-      "maximum": 25
+      "maximum": 22
     },
     {
       "path": "ds4_build.c",
@@ -1062,14 +1041,14 @@
       "location": "content",
       "token": "ds4",
       "classification": "migration-pending",
-      "maximum": 387
+      "maximum": 401
     },
     {
       "path": "ds4_cli.c",
       "location": "content",
       "token": "DS4",
       "classification": "migration-pending",
-      "maximum": 50
+      "maximum": 45
     },
     {
       "path": "ds4_eval.c",
@@ -1104,14 +1083,14 @@
       "location": "content",
       "token": "ds4",
       "classification": "migration-pending",
-      "maximum": 40
+      "maximum": 34
     },
     {
       "path": "ds4_expert_store.c",
       "location": "content",
       "token": "DS4",
       "classification": "migration-pending",
-      "maximum": 38
+      "maximum": 16
     },
     {
       "path": "ds4_expert_store.h",
@@ -1122,59 +1101,59 @@
     },
     {
       "path": "ds4_expert_store.h",
+      "location": "content",
+      "token": "ds4",
+      "classification": "migration-pending",
+      "maximum": 29
+    },
+    {
+      "path": "ds4_expert_store.h",
+      "location": "content",
+      "token": "DS4",
+      "classification": "migration-pending",
+      "maximum": 21
+    },
+    {
+      "path": "ds4_gpu.h",
+      "location": "path",
+      "token": "ds4",
+      "classification": "migration-pending",
+      "maximum": 1
+    },
+    {
+      "path": "ds4_gpu.h",
+      "location": "content",
+      "token": "ds4",
+      "classification": "migration-pending",
+      "maximum": 760
+    },
+    {
+      "path": "ds4_gpu.h",
+      "location": "content",
+      "token": "DS4",
+      "classification": "migration-pending",
+      "maximum": 15
+    },
+    {
+      "path": "ds4_help.c",
+      "location": "path",
+      "token": "ds4",
+      "classification": "migration-pending",
+      "maximum": 1
+    },
+    {
+      "path": "ds4_help.c",
       "location": "content",
       "token": "ds4",
       "classification": "migration-pending",
       "maximum": 32
     },
     {
-      "path": "ds4_expert_store.h",
-      "location": "content",
-      "token": "DS4",
-      "classification": "migration-pending",
-      "maximum": 39
-    },
-    {
-      "path": "ds4_gpu.h",
-      "location": "path",
-      "token": "ds4",
-      "classification": "migration-pending",
-      "maximum": 1
-    },
-    {
-      "path": "ds4_gpu.h",
-      "location": "content",
-      "token": "ds4",
-      "classification": "migration-pending",
-      "maximum": 872
-    },
-    {
-      "path": "ds4_gpu.h",
-      "location": "content",
-      "token": "DS4",
-      "classification": "migration-pending",
-      "maximum": 18
-    },
-    {
-      "path": "ds4_help.c",
-      "location": "path",
-      "token": "ds4",
-      "classification": "migration-pending",
-      "maximum": 1
-    },
-    {
-      "path": "ds4_help.c",
-      "location": "content",
-      "token": "ds4",
-      "classification": "migration-pending",
-      "maximum": 34
-    },
-    {
       "path": "ds4_help.c",
       "location": "content",
       "token": "DS4",
       "classification": "migration-pending",
-      "maximum": 83
+      "maximum": 81
     },
     {
       "path": "ds4_help.h",
@@ -1188,7 +1167,7 @@
       "location": "content",
       "token": "ds4",
       "classification": "migration-pending",
-      "maximum": 7
+      "maximum": 5
     },
     {
       "path": "ds4_help.h",
@@ -1251,14 +1230,14 @@
       "location": "content",
       "token": "ds4",
       "classification": "migration-pending",
-      "maximum": 9995
+      "maximum": 7111
     },
     {
       "path": "ds4_metal.m",
       "location": "content",
       "token": "DS4",
       "classification": "migration-pending",
-      "maximum": 3290
+      "maximum": 1194
     },
     {
       "path": "ds4_profile.c",
@@ -1615,7 +1594,7 @@
       "location": "content",
       "token": "ds4",
       "classification": "migration-pending",
-      "maximum": 10
+      "maximum": 9
     },
     {
       "path": "gguf-tools/README.md",
@@ -1629,14 +1608,14 @@
       "location": "content",
       "token": "ds4",
       "classification": "migration-pending",
-      "maximum": 59
+      "maximum": 47
     },
     {
       "path": "gguf-tools/deepseek4-quantize.c",
       "location": "content",
       "token": "DS4",
       "classification": "migration-pending",
-      "maximum": 251
+      "maximum": 54
     },
     {
       "path": "gguf-tools/ds4-expert-major.py",
@@ -1650,14 +1629,14 @@
       "location": "content",
       "token": "ds4",
       "classification": "migration-pending",
-      "maximum": 3
+      "maximum": 2
     },
     {
       "path": "gguf-tools/ds4-expert-major.py",
       "location": "content",
       "token": "DS4",
       "classification": "migration-pending",
-      "maximum": 6
+      "maximum": 5
     },
     {
       "path": "gguf-tools/generate_qwen35_iq_metal.py",
@@ -1860,7 +1839,7 @@
       "location": "content",
       "token": "DS4",
       "classification": "migration-pending",
-      "maximum": 3
+      "maximum": 5
     },
     {
       "path": "metal/dsv4_kv.metal",
@@ -1881,19 +1860,26 @@
       "location": "content",
       "token": "ds4",
       "classification": "migration-pending",
-      "maximum": 99
+      "maximum": 79
     },
     {
       "path": "metal/dsv4_misc.metal",
       "location": "content",
       "token": "DS4",
       "classification": "migration-pending",
-      "maximum": 7
+      "maximum": 15
     },
     {
       "path": "metal/dsv4_rope.metal",
       "location": "content",
       "token": "ds4",
+      "classification": "migration-pending",
+      "maximum": 2
+    },
+    {
+      "path": "metal/dsv4_rope.metal",
+      "location": "content",
+      "token": "DS4",
       "classification": "migration-pending",
       "maximum": 2
     },
@@ -1944,14 +1930,14 @@
       "location": "content",
       "token": "ds4",
       "classification": "migration-pending",
-      "maximum": 244
+      "maximum": 239
     },
     {
       "path": "metal/moe.metal",
       "location": "content",
       "token": "DS4",
       "classification": "migration-pending",
-      "maximum": 18
+      "maximum": 17
     },
     {
       "path": "metal/norm.metal",
@@ -2078,27 +2064,6 @@
       "token": "DS4",
       "classification": "migration-pending",
       "maximum": 9
-    },
-    {
-      "path": "runtime/ds4_dspark_graph.inc",
-      "location": "path",
-      "token": "ds4",
-      "classification": "migration-pending",
-      "maximum": 1
-    },
-    {
-      "path": "runtime/ds4_dspark_graph.inc",
-      "location": "content",
-      "token": "ds4",
-      "classification": "migration-pending",
-      "maximum": 864
-    },
-    {
-      "path": "runtime/ds4_dspark_graph.inc",
-      "location": "content",
-      "token": "DS4",
-      "classification": "migration-pending",
-      "maximum": 346
     },
     {
       "path": "runtime/ds4_glm_graph.inc",
@@ -2231,7 +2196,7 @@
       "location": "content",
       "token": "ds4",
       "classification": "migration-pending",
-      "maximum": 902
+      "maximum": 887
     },
     {
       "path": "tests/ds4_test.c",
@@ -2239,41 +2204,6 @@
       "token": "DS4",
       "classification": "migration-pending",
       "maximum": 151
-    },
-    {
-      "path": "tests/dspark/test_bench_transactional.py",
-      "location": "content",
-      "token": "ds4",
-      "classification": "migration-pending",
-      "maximum": 23
-    },
-    {
-      "path": "tests/dspark/test_bench_transactional.py",
-      "location": "content",
-      "token": "DS4",
-      "classification": "migration-pending",
-      "maximum": 5
-    },
-    {
-      "path": "tests/dspark/test_benchmark_cohort.py",
-      "location": "content",
-      "token": "ds4",
-      "classification": "compatibility",
-      "maximum": 12
-    },
-    {
-      "path": "tests/dspark/test_oracle.py",
-      "location": "content",
-      "token": "ds4",
-      "classification": "migration-pending",
-      "maximum": 82
-    },
-    {
-      "path": "tests/dspark/test_oracle.py",
-      "location": "content",
-      "token": "DS4",
-      "classification": "compatibility",
-      "maximum": 21
     },
     {
       "path": "tests/gen_qwen_unicode.py",
@@ -2358,20 +2288,6 @@
       "token": "DS4",
       "classification": "migration-pending",
       "maximum": 4
-    },
-    {
-      "path": "tests/internal/test_cli_transactional_consumer.c",
-      "location": "content",
-      "token": "ds4",
-      "classification": "migration-pending",
-      "maximum": 135
-    },
-    {
-      "path": "tests/internal/test_cli_transactional_consumer.c",
-      "location": "content",
-      "token": "DS4",
-      "classification": "compatibility",
-      "maximum": 11
     },
     {
       "path": "tests/qwen/README.md",
@@ -2577,20 +2493,6 @@
       "maximum": 7
     },
     {
-      "path": "tests/test_cli_transactional_consumer.py",
-      "location": "content",
-      "token": "ds4",
-      "classification": "migration-pending",
-      "maximum": 2
-    },
-    {
-      "path": "tests/test_cli_transactional_consumer.py",
-      "location": "content",
-      "token": "DS4",
-      "classification": "compatibility",
-      "maximum": 1
-    },
-    {
       "path": "tests/test_command_aliases.py",
       "location": "content",
       "token": "ds4",
@@ -2617,34 +2519,6 @@
       "token": "DS4",
       "classification": "migration-pending",
       "maximum": 10
-    },
-    {
-      "path": "tests/test_dspark_admission.py",
-      "location": "content",
-      "token": "ds4",
-      "classification": "serialized/permanent",
-      "maximum": 5
-    },
-    {
-      "path": "tests/test_dspark_admission.py",
-      "location": "content",
-      "token": "DS4",
-      "classification": "serialized/permanent",
-      "maximum": 2
-    },
-    {
-      "path": "tests/test_dspark_support_quantizer.py",
-      "location": "content",
-      "token": "ds4",
-      "classification": "migration-pending",
-      "maximum": 1
-    },
-    {
-      "path": "tests/test_dspark_support_quantizer.py",
-      "location": "content",
-      "token": "DS4",
-      "classification": "compatibility",
-      "maximum": 15
     },
     {
       "path": "tests/test_expert_major.py",
@@ -2665,7 +2539,7 @@
       "location": "content",
       "token": "ds4",
       "classification": "migration-pending",
-      "maximum": 15
+      "maximum": 13
     },
     {
       "path": "tests/test_expert_store.c",
@@ -2777,14 +2651,14 @@
       "location": "content",
       "token": "ds4",
       "classification": "migration-pending",
-      "maximum": 327
+      "maximum": 172
     },
     {
       "path": "tests/test_qwen_session.c",
       "location": "content",
       "token": "DS4",
       "classification": "migration-pending",
-      "maximum": 99
+      "maximum": 77
     },
     {
       "path": "tests/test_qwen_state.c",
@@ -2938,70 +2812,7 @@
       "location": "content",
       "token": "DS4",
       "classification": "compatibility",
-      "maximum": 14
-    },
-    {
-      "path": "tools/dspark_oracle/README.md",
-      "location": "content",
-      "token": "ds4",
-      "classification": "migration-pending",
-      "maximum": 1
-    },
-    {
-      "path": "tools/dspark_oracle/README.md",
-      "location": "content",
-      "token": "DS4",
-      "classification": "compatibility",
-      "maximum": 1
-    },
-    {
-      "path": "tools/dspark_oracle/benchmark_8k_abba.json",
-      "location": "content",
-      "token": "ds4",
-      "classification": "compatibility",
-      "maximum": 6
-    },
-    {
-      "path": "tools/dspark_oracle/benchmark_8k_abba.json",
-      "location": "content",
-      "token": "DS4",
-      "classification": "compatibility",
-      "maximum": 11
-    },
-    {
-      "path": "tools/dspark_oracle/benchmark_cohort.py",
-      "location": "content",
-      "token": "ds4",
-      "classification": "compatibility",
-      "maximum": 13
-    },
-    {
-      "path": "tools/dspark_oracle/benchmark_cohort.py",
-      "location": "content",
-      "token": "DS4",
-      "classification": "compatibility",
-      "maximum": 43
-    },
-    {
-      "path": "tools/dspark_oracle/physical_fixture.py",
-      "location": "content",
-      "token": "ds4",
-      "classification": "migration-pending",
-      "maximum": 1
-    },
-    {
-      "path": "tools/dspark_oracle/provenance.json",
-      "location": "content",
-      "token": "ds4",
-      "classification": "historical-attribution",
-      "maximum": 6
-    },
-    {
-      "path": "tools/dspark_oracle/transaction_rng.py",
-      "location": "content",
-      "token": "ds4",
-      "classification": "migration-pending",
-      "maximum": 1
+      "maximum": 12
     },
     {
       "path": "tools/golden_greedy_gate.sh",

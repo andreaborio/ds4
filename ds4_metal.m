@@ -4508,6 +4508,8 @@ static NSArray<NSString *> *ds4_gpu_source_roots(void) {
     const char *explicit_dir = getenv("DS4_METAL_SOURCE_DIR");
     if (explicit_dir && explicit_dir[0]) {
         [roots addObject:[NSString stringWithUTF8String:explicit_dir]];
+        cached = roots;
+        return cached;
     }
 
     NSString *exe = [[NSBundle mainBundle] executablePath];
@@ -4563,43 +4565,64 @@ static NSString *ds4_gpu_full_source(void) {
         @[@"DS4_METAL_QWEN35_SOURCE",      @"metal/qwen35.metal"],
     ];
 
+    /* Pick one complete automatic root before reading anything.  Selecting a
+     * root independently for every file can silently combine an incomplete
+     * install with checkout or working-directory sources. */
+    NSString *selected_root = nil;
+    for (NSString *root in ds4_gpu_source_roots()) {
+        BOOL complete = YES;
+        for (NSArray<NSString *> *spec in required_sources) {
+            const char *override_path = getenv([spec[0] UTF8String]);
+            if (override_path && override_path[0]) continue;
+
+            NSString *path = [root stringByAppendingPathComponent:spec[1]];
+            BOOL is_directory = NO;
+            if (![fm fileExistsAtPath:path isDirectory:&is_directory] ||
+                is_directory) {
+                complete = NO;
+                break;
+            }
+        }
+        if (complete) {
+            selected_root = root;
+            break;
+        }
+    }
+    if (!selected_root) {
+        fprintf(stderr,
+                "ds4: no complete Metal source set found under any candidate root\n");
+        return nil;
+    }
+
     NSMutableString *source = [NSMutableString stringWithString:base];
     for (NSArray<NSString *> *spec in required_sources) {
         const char *override_path = getenv([spec[0] UTF8String]);
-        NSMutableArray<NSString *> *paths = [NSMutableArray array];
+        NSString *path = nil;
         if (override_path && override_path[0]) {
-            [paths addObject:[NSString stringWithUTF8String:override_path]];
+            path = [NSString stringWithUTF8String:override_path];
             g_metal_source_override_count++;
-        }
-        for (NSString *root in ds4_gpu_source_roots()) {
-            [paths addObject:[root stringByAppendingPathComponent:spec[1]]];
-        }
-
-        NSString *loaded = nil;
-        NSString *loaded_path = nil;
-        for (NSString *path in paths) {
-            if (![fm fileExistsAtPath:path]) continue;
-
-            NSError *error = nil;
-            loaded = [NSString stringWithContentsOfFile:path
-                                               encoding:NSUTF8StringEncoding
-                                                  error:&error];
-            if (!loaded) {
-                fprintf(stderr, "ds4: failed to read Metal source %s: %s\n",
-                        [path UTF8String], [[error localizedDescription] UTF8String]);
-                return nil;
-            }
-            loaded_path = path;
-            break;
+        } else {
+            path = [selected_root stringByAppendingPathComponent:spec[1]];
         }
 
-        if (!loaded) {
+        BOOL is_directory = NO;
+        if (![fm fileExistsAtPath:path isDirectory:&is_directory] || is_directory) {
             fprintf(stderr,
                     "ds4: Metal source %s not found (set %s to override)\n",
                     [spec[1] UTF8String], [spec[0] UTF8String]);
             return nil;
         }
-        [source appendFormat:@"\n// appended %@\n%@\n", loaded_path, loaded];
+
+        NSError *error = nil;
+        NSString *loaded = [NSString stringWithContentsOfFile:path
+                                                     encoding:NSUTF8StringEncoding
+                                                        error:&error];
+        if (!loaded) {
+            fprintf(stderr, "ds4: failed to read Metal source %s: %s\n",
+                    [path UTF8String], [[error localizedDescription] UTF8String]);
+            return nil;
+        }
+        [source appendFormat:@"\n// appended %@\n%@\n", path, loaded];
     }
     return source;
 }

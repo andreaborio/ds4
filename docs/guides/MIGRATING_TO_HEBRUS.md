@@ -213,12 +213,12 @@ still owns the control port, quit Hebrus Studio and stop the upgrade. Do not
 merge two profile directories or launch DSBox to “repair” state while Hebrus
 Studio is running.
 
-## 7. Handle the repository rename only after an announcement
+## 7. Verify the completed repository rename before changing a clone
 
-No repository rename is implied by this guide. Existing clones continue to use
-their current remote. After maintainers announce and verify an administrative
-rename, inspect the redirect and then update `origin` to the exact URL in that
-announcement:
+The in-place GitHub rename to `andreaborio/hebrus` was recorded as completed on
+2026-07-22. Existing clones may continue through GitHub's redirect. Before
+changing a remote, verify the redirect and current canonical URL, then update
+`origin` deliberately:
 
 ```sh
 git remote get-url origin
@@ -242,8 +242,9 @@ The engine compatibility bridge is designed to make rollback mechanical:
 
 Do not roll back by rewriting GGUF metadata, moving `$HOME/.dsbox`, or converting a
 published model. If the new package installed into a private staging root, use
-`make uninstall` with the same `DESTDIR` and `PREFIX`; it removes only the ten
-explicit command paths.
+`make uninstall` with the same `DESTDIR`, `PREFIX`, and any `BINDIR` override;
+it removes the ten explicit command paths plus the named versioned Metal shader
+resources installed by that package.
 
 For an application rollback, keep the old app offline until it is needed, then:
 

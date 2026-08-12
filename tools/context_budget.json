@@ -1,6 +1,6 @@
 {
   "direct_ds4_env_names": {
-    "maximum": 344,
+    "maximum": 342,
     "baseline": 330,
     "reason": "The post-Qwen baseline is 331 direct names minus the retired layer-staleness switch. Later additions are classified below as compatibility controls, test-only fault injection, opt-in research, or diagnostics; normal release startup remains flag-free and every later direct name still exceeds this ceiling.",
     "accepted_additions": {

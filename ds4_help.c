@@ -346,7 +346,7 @@ static void print_server_api(FILE *fp, const help_colors *c) {
     opt(fp, c, "--port N", "Bind port. Default: 8000");
     opt(fp, c, "--cors", "Add Access-Control-Allow-* headers for browser JS clients.");
     opt(fp, c, "--trace FILE", "Write prompts, cache decisions, output, and tool calls.");
-    opt(fp, c, "--imatrix-out FILE", "Write routed-MoE imatrix .dat from live traffic (aggregate stats only; prompts are never stored).");
+    opt(fp, c, "--imatrix-out FILE", "Write routed-MoE imatrix .dat from live traffic (derived activation statistics; no raw prompt text written by this collector).");
     opt(fp, c, "--imatrix-every N", "Snapshot the imatrix every N completed requests (0 = shutdown only). Default: 64.");
     opt(fp, c, "--imatrix-min-requests N", "Require >=N completed requests before any write. Default: 8.");
     para(fp, c, "Endpoints: /v1/chat/completions, /v1/responses, /v1/completions, and /v1/messages.");

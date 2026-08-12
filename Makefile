@@ -39,13 +39,6 @@ INSTALL_MODE ?= 0755
 INSTALL_DATA_MODE ?= 0644
 INSTALL_DEST_BINDIR = $(DESTDIR)$(BINDIR)
 INSTALL_SOURCE_PROGRAMS = $(addprefix $(INSTALL_SOURCE_BINDIR)/,$(HEBRUS_PROGRAMS))
-# Keep runtime resources relative to the installed command directory rather
-# than PREFIX.  This preserves standalone discovery when callers override
-# BINDIR independently (for example, a package staging layout).
-INSTALL_BINDIR_NORMALIZED = $(patsubst %/,%,$(BINDIR))
-INSTALL_BINDIR_PARENT = $(dir $(INSTALL_BINDIR_NORMALIZED))
-METAL_RESOURCE_ROOT = $(INSTALL_BINDIR_PARENT)share/hebrus/v$(METAL_RESOURCE_VERSION)
-INSTALL_DEST_METALDIR = $(DESTDIR)$(METAL_RESOURCE_ROOT)/metal
 SERVER_ALIAS_EXPECTED_BACKEND ?= metal
 SERVER_ALIAS_EXPECTED_BUILD_SHA ?= $(BUILD_GIT_SHA)
 SERVER_ALIAS_PORT ?= 0
@@ -1052,7 +1045,22 @@ install: $(INSTALL_SOURCE_PROGRAMS)
 			/*) ;; \
 			*) echo "install: BINDIR must be absolute: $(BINDIR)" >&2; exit 2 ;; \
 		esac; \
-		dest="$(INSTALL_DEST_BINDIR)"; \
+		bindir="$(BINDIR)"; \
+		case "$$bindir" in \
+			*/../*|*/..) echo "install: BINDIR must not contain '..': $$bindir" >&2; exit 2 ;; \
+		esac; \
+		while test "$$bindir" != /; do \
+			case "$$bindir" in \
+				*/.) bindir=$${bindir%/.} ;; \
+				*/) bindir=$${bindir%/} ;; \
+				*) break ;; \
+			esac; \
+			done; \
+		test -n "$$bindir" || bindir=/; \
+		bindir_parent=$$(dirname -- "$$bindir"); \
+		metal_root="$${bindir_parent%/}/share/hebrus/v$(METAL_RESOURCE_VERSION)"; \
+		metal_dest="$(DESTDIR)$$metal_root/metal"; \
+		dest="$(DESTDIR)$$bindir"; \
 		mkdir -p "$$dest"; \
 		for name in $(PROGRAMS); do \
 			path="$$dest/$$name"; \
@@ -1062,11 +1070,6 @@ install: $(INSTALL_SOURCE_PROGRAMS)
 			fi; \
 		done; \
 		if test -n "$(strip $(INSTALL_RESOURCE_SRCS))"; then \
-			case "$(METAL_RESOURCE_ROOT)" in \
-				/*) ;; \
-				*) echo "install: Metal resource root must be absolute: $(METAL_RESOURCE_ROOT)" >&2; exit 2 ;; \
-			esac; \
-			metal_dest="$(INSTALL_DEST_METALDIR)"; \
 			if { test -e "$$metal_dest" || test -L "$$metal_dest"; } && \
 			   { test ! -d "$$metal_dest" || test -L "$$metal_dest"; }; then \
 				echo "install: refusing non-directory Metal resource path $$metal_dest" >&2; \
@@ -1104,11 +1107,11 @@ install: $(INSTALL_SOURCE_PROGRAMS)
 		done; \
 		for source in $(INSTALL_RESOURCE_SRCS); do \
 			name=$${source#metal/}; \
-			tmp="$(INSTALL_DEST_METALDIR)/.$$name.install.$$$$"; \
+			tmp="$$metal_dest/.$$name.install.$$$$"; \
 			rm -f "$$tmp"; \
 			$(INSTALL) -m "$(INSTALL_DATA_MODE)" "$$source" "$$tmp"; \
-			rm -f "$(INSTALL_DEST_METALDIR)/$$name"; \
-			mv "$$tmp" "$(INSTALL_DEST_METALDIR)/$$name"; \
+			rm -f "$$metal_dest/$$name"; \
+			mv "$$tmp" "$$metal_dest/$$name"; \
 			tmp=; \
 		done
 
@@ -1118,7 +1121,22 @@ uninstall:
 			/*) ;; \
 			*) echo "uninstall: BINDIR must be absolute: $(BINDIR)" >&2; exit 2 ;; \
 		esac; \
-		dest="$(INSTALL_DEST_BINDIR)"; \
+		bindir="$(BINDIR)"; \
+		case "$$bindir" in \
+			*/../*|*/..) echo "uninstall: BINDIR must not contain '..': $$bindir" >&2; exit 2 ;; \
+		esac; \
+		while test "$$bindir" != /; do \
+			case "$$bindir" in \
+				*/.) bindir=$${bindir%/.} ;; \
+				*/) bindir=$${bindir%/} ;; \
+				*) break ;; \
+			esac; \
+			done; \
+		test -n "$$bindir" || bindir=/; \
+		bindir_parent=$$(dirname -- "$$bindir"); \
+		metal_root="$${bindir_parent%/}/share/hebrus/v$(METAL_RESOURCE_VERSION)"; \
+		metal_dest="$(DESTDIR)$$metal_root/metal"; \
+		dest="$(DESTDIR)$$bindir"; \
 		for name in $(PROGRAMS); do \
 			path="$$dest/$$name"; \
 			if [ -d "$$path" ] && [ ! -L "$$path" ]; then \
@@ -1130,7 +1148,11 @@ uninstall:
 			rm -f "$$dest/$$name"; \
 		done; \
 		if test -n "$(strip $(INSTALL_RESOURCE_SRCS))"; then \
-			metal_dest="$(INSTALL_DEST_METALDIR)"; \
+			if { test -e "$$metal_dest" || test -L "$$metal_dest"; } && \
+			   { test ! -d "$$metal_dest" || test -L "$$metal_dest"; }; then \
+				echo "uninstall: refusing non-directory Metal resource path $$metal_dest" >&2; \
+				exit 2; \
+			fi; \
 			for source in $(INSTALL_RESOURCE_SRCS); do \
 				name=$${source#metal/}; \
 				path="$$metal_dest/$$name"; \
@@ -1141,8 +1163,8 @@ uninstall:
 				rm -f "$$path"; \
 			done; \
 			rmdir "$$metal_dest" 2>/dev/null || true; \
-			rmdir "$(DESTDIR)$(METAL_RESOURCE_ROOT)" 2>/dev/null || true; \
-			rmdir "$(DESTDIR)$(INSTALL_BINDIR_PARENT)share/hebrus" 2>/dev/null || true; \
+			rmdir "$(DESTDIR)$$metal_root" 2>/dev/null || true; \
+			rmdir "$(DESTDIR)$${bindir_parent%/}/share/hebrus" 2>/dev/null || true; \
 		fi
 
 install-test: $(INSTALL_SOURCE_PROGRAMS) tests/test_install.sh \

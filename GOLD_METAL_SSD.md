@@ -17,8 +17,9 @@ make                         # publishes ./hebrus* plus legacy ./ds4* aliases
 ./hebrus --build-info
 ```
 
-The `./ds4` and `./ds4-server` names remain byte-identical compatibility
-aliases throughout the bridge and 1.x compatibility window.
+The `./ds4` and `./ds4-server` names are byte-identical compatibility aliases
+in the current bridge. The proposed complete-1.x horizon remains unaccepted in
+ADR 0005 and is not asserted by this runtime record.
 
 DeepSeek V4, GLM 5.2, and Qwen3.6 inference accepts only a validated embedded
 `ds4.expert_major.v2` store on Apple Metal. Canonical GGUFs remain offline

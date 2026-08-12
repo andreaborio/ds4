@@ -32,8 +32,10 @@ identity. Options, protocols, model admission, generated tokens, and runtime
 planning are shared; help text, prompts, build labels, and structured
 `engine_id` reflect the command actually invoked.
 
-`make install` supports `PREFIX`, `BINDIR`, and `DESTDIR`. Its uninstall target
-names only the ten public command paths and leaves unrelated files intact.
+`make install` supports `PREFIX`, `BINDIR`, and `DESTDIR`. A Metal install also
+places its named shader sources in a versioned executable-relative resource
+directory. Uninstall removes the ten public command paths and only those named
+resources, leaving unrelated files intact.
 
 ### Versioned integration contract
 
@@ -148,7 +150,8 @@ The following are not implied by source readiness and must remain described as
 pending until independently verified:
 
 - namespace and legal screening, reservation, and acceptance of the naming ADR;
-- administrative repository rename and publication of the compatibility app;
+- re-verification of the completed repository rename redirects and publication
+  of the compatibility app;
 - final version/tag selection and remote push;
 - GitHub private vulnerability reporting or another verified private intake;
 - Apple Developer ID signing, notarization, stapling, and clean-machine

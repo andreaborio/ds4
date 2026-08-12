@@ -81,8 +81,10 @@ Affine4, while `download_model.sh qwen-q2-beta` opts into Q2_K_XL.
 
 Normal startup needs no experimental guard, explicit Metal selection, sidecar,
 payload hash flag, cache geometry, `--resident`, or `--ssd-streaming`. Through
-24 GiB, the published Affine4 hardware policy selects guarded SSD and rejects
-explicit resident mode. On larger qualified hosts AUTO chooses resident when
+24 GiB, the implemented Affine4 hardware policy selects guarded SSD and rejects
+explicit resident mode. The 24 GiB tier remains a release candidate until its
+physical sustained gate passes; this policy statement is not a qualification
+claim. On larger qualified hosts AUTO chooses resident when
 the complete artifact-specific working set passes both Metal and live-memory
 gates; otherwise it uses the bounded SSD expert cache.
 
