@@ -432,6 +432,53 @@ def check_prose_surface(
     )
 
 
+def check_readme_summary(
+    root: Path, manifest_path: Path, contract: Contract
+) -> None:
+    """Keep the landing page bound to the contract without cloning its data."""
+    relative = "README.md"
+    section = markdown_section(root, relative, "Supported models")
+    require_contract_link(root, relative, section, manifest_path)
+    require_tokens(
+        f"{relative}#Supported models",
+        section,
+        [
+            contract.model_family,
+            contract.download_target,
+            contract.beta_download_target,
+            contract.published.status,
+            contract.beta.status,
+            str(contract.beta.qualified_context_tokens),
+            str(contract.beta.minimum_memory_gib),
+        ],
+    )
+    duplicated_identities = [
+        value
+        for value in (
+            contract.published.sha256,
+            contract.published.revision or "",
+            contract.published.runtime_commit or "",
+            contract.beta.sha256,
+            contract.beta.embedded_payload_sha256 or "",
+            contract.beta.revision or "",
+            contract.beta.runtime_commit or "",
+            contract.negative.sha256,
+        )
+        if value and value in section
+    ]
+    if duplicated_identities:
+        raise ContractError(
+            f"{relative}: summary must link to the canonical contract, not "
+            "duplicate machine identities: " + ", ".join(duplicated_identities)
+        )
+    readme = (root / relative).read_text(encoding="utf-8")
+    require_qwen_filenames(
+        relative,
+        readme,
+        {contract.published.filename},
+    )
+
+
 def require_table_row(
     rows: list[dict[str, str]], key_header: str, key: str, relative: str
 ) -> dict[str, str]:
@@ -738,8 +785,8 @@ def validate(root: Path, manifest_path: Path) -> Contract:
     except ValueError as exc:
         raise ContractError("manifest must be inside the repository root") from exc
     contract = load_contract(manifest_path)
+    check_readme_summary(root, manifest_path, contract)
     for relative, heading in (
-        ("README.md", "Supported models"),
         ("CONTRIBUTING.md", "Artifact publication boundary"),
         ("docs/contracts/RUNTIME_SUPPORT.md", "Supported Matrix"),
     ):

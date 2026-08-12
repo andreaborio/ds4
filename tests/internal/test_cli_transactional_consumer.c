@@ -11,7 +11,7 @@
 #include <unistd.h>
 
 #define DS4_CLI_MODEL_FREE_TEST 1
-#include "../../ds4_cli.c"
+#include "../../cli_internal.h"
 
 enum { FAKE_MAX_BLOCKS = 16 };
 

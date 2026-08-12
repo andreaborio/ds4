@@ -26,8 +26,10 @@ The Makefile links one canonical `hebrus*` executable per role from these
 entrypoints and publishes the corresponding `ds4*` name as a symlink to the
 same file. It also owns the `DESTDIR`/`PREFIX`/`BINDIR` install boundary:
 canonical executables are copied, compatibility aliases stay relative, and
-uninstall names every removable path explicitly. There are no alias-specific
-wrappers or object graphs.
+the Metal build's exact runtime source set is installed under the versioned
+resource root derived from `BINDIR`. Uninstall names every removable command
+and resource path explicitly. There are no alias-specific wrappers or object
+graphs.
 
 | Path | Primary responsibility |
 | --- | --- |
@@ -107,8 +109,8 @@ prove codegen identity for move-only edits before behavior work continues.
 | Path | Primary responsibility |
 | --- | --- |
 | `ds4_gpu.h` | Shared GPU-facing interface used by core graph scheduling |
-| `ds4_metal.m` | Metal device/runtime state, buffers, generic command encoding, tensor transfers, ExpertMajor resident/SSD paths, non-partitioned model-family wrappers, and one-time Qwen codec dispatch |
-| `metal/*.metal` | Metal compute kernels grouped by operation or model family, including separate Affine4 and routed-IQ weight decoders under the shared Qwen graph |
+| `ds4_metal.m` | Metal device/runtime state, versioned installed/build-tree source discovery, runtime library compilation, buffers, generic command encoding, tensor transfers, ExpertMajor resident/SSD paths, non-partitioned model-family wrappers, and one-time Qwen codec dispatch |
+| `metal/*.metal` | Metal compute kernels grouped by operation or model family, including separate Affine4 and routed-IQ weight decoders under the shared Qwen graph; the required set plus the generated IQ table include is installed as runtime data for Metal builds |
 
 `ds4_metal.m` is the second refactor hotspot. Keep Objective-C runtime calls
 there. Before moving hot functions across translation units, compare generated
@@ -135,7 +137,7 @@ not validated.
 | `tests/` | Model-free, model-backed, kernel, tokenizer, server, and build-isolation regressions |
 | `tests/test_capabilities.py` | Exact schema and cross-executable checks for the model-free build/capability contract |
 | `tests/test_command_aliases.py` | Canonical/legacy symlink layout, binary identity, and CLI-output parity checks |
-| `tests/test_install.sh` | Temporary-root install/uninstall layout, path portability, capability, and explicit-removal checks |
+| `tests/test_install.sh` | Temporary-root install/uninstall layout, path portability, capability, versioned Metal-resource discovery from a clean working directory, model-free library initialization when a device is available, and explicit-removal checks |
 | `tools/brand_boundary.json` + `tools/brand_boundary_audit.py` | Exact canonical, bridged, and permanently preserved identity contract plus explicit per-file legacy `ds4`/`DS4`/`DwarfStar` classification and monotonic count ceilings; `--check` rejects contract drift, new groups, and increases, while `--refresh` requires exact authorizations before widening a ceiling |
 | `tests/test_brand_boundary_audit.py` | Fail-closed fixtures for new files and tokens, increases, reductions, deterministic refresh, and invalid manifests |
 | `docs/contracts/qwen-release.json` + `tools/qwen_release_contract.py` | Canonical Hebrus-named Stable, opt-in Beta, and historical negative-only Qwen artifact identities plus the model-free gate that parses their documentation, downloader, and test surfaces for drift |

@@ -12,6 +12,7 @@ import tempfile
 
 ROOT = Path(__file__).resolve().parents[1]
 SOURCE = ROOT / "tests" / "internal" / "test_cli_transactional_consumer.c"
+IMPLEMENTATION = ROOT / "ds4_cli.c"
 
 
 def main() -> int:
@@ -26,14 +27,16 @@ def main() -> int:
                 "-Wall",
                 "-Wextra",
                 "-Werror",
-                # This harness includes the real CLI translation unit so its
-                # static frontend functions are callable. Other executable
-                # modes are intentionally unreachable and dead-stripped.
+                # The production CLI exposes a test-only internal seam; link
+                # that translation unit normally instead of including a .c
+                # implementation from the harness.
+                "-DDS4_CLI_MODEL_FREE_TEST",
                 "-Wno-unused-function",
                 "-ffunction-sections",
                 linker_gc,
                 "-I",
                 str(ROOT),
+                str(IMPLEMENTATION),
                 str(SOURCE),
                 "-o",
                 str(binary),

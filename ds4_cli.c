@@ -2,6 +2,7 @@
 #include "ds4_help.h"
 #include "hebrus_identity.h"
 #include "linenoise.h"
+#include "cli_internal.h"
 
 /* ds4 CLI.
  *
@@ -25,46 +26,13 @@
 #include <time.h>
 #include <unistd.h>
 
-typedef struct {
-    const char *prompt;
-    const char *system;
-    bool raw_prompt;
-    int n_predict;
-    int ctx_size;
-    float temperature;
-    float top_p;
-    float min_p;
-    bool temperature_set;
-    bool top_p_set;
-    bool min_p_set;
-    uint64_t seed;
-    bool dump_tokens;
-    const char *dump_logits_path;
-    const char *dump_generation_evidence_path;
-    const char *dump_logprobs_path;
-    int dump_logprobs_top_k;
-    int decode_consistency_tokens;
-    const char *perplexity_file_path;
-    const char *imatrix_dataset_path;
-    const char *imatrix_output_path;
-    int imatrix_max_prompts;
-    int imatrix_max_tokens;
-    ds4_think_mode think_mode;
-    bool head_test;
-    bool first_token_test;
-    bool metal_graph_test;
-    bool metal_graph_full_test;
-    bool metal_graph_prompt_test;
-} cli_generation_options;
+#ifdef DS4_CLI_MODEL_FREE_TEST
+#define CLI_TEST_VISIBLE
+#else
+#define CLI_TEST_VISIBLE static
+#endif
 
-typedef struct {
-    ds4_engine_options engine;
-    cli_generation_options gen;
-    char *prompt_owned;
-    bool inspect;
-} cli_config;
-
-static volatile sig_atomic_t cli_interrupted;
+CLI_TEST_VISIBLE volatile sig_atomic_t cli_interrupted;
 static const char *cli_invocation = "ds4";
 
 static void cli_sigint_handler(int sig) {
@@ -227,19 +195,6 @@ static void cli_prefill_progress_cb(void *ud, const char *event, int current, in
     fflush(stderr);
 }
 
-typedef struct {
-    ds4_engine *engine;
-    FILE *fp;
-    bool format_thinking;
-    bool in_think;
-    bool color_open;
-    bool use_color;
-    bool last_output_newline;
-    bool failed;
-    char pending[16];
-    size_t pending_len;
-} token_printer;
-
 static char token_printer_input_byte(
         const char *prefix_bytes,
         size_t prefix_len,
@@ -378,7 +333,7 @@ static bool token_printer_finish(token_printer *p) {
     return token_printer_flush(p);
 }
 
-static void generation_done(void *ud) {
+CLI_TEST_VISIBLE void generation_done(void *ud) {
     token_printer *p = ud;
     if (!token_printer_finish(p)) return;
     if (!p->last_output_newline && !token_printer_write_char(p, '\n')) {
@@ -387,7 +342,7 @@ static void generation_done(void *ud) {
     (void)token_printer_flush(p);
 }
 
-static bool token_printer_write_text(
+CLI_TEST_VISIBLE bool token_printer_write_text(
         token_printer *p, const char *text, size_t len) {
     if (p->failed) return false;
     if (p->format_thinking) {
@@ -402,26 +357,13 @@ static bool token_printer_write_text(
     return token_printer_flush(p);
 }
 
-static void print_generated_token(void *ud, int token) {
+CLI_TEST_VISIBLE void print_generated_token(void *ud, int token) {
     token_printer *p = ud;
     size_t len = 0;
     char *text = ds4_token_text(p->engine, token, &len);
     (void)token_printer_write_text(p, text, len);
     free(text);
 }
-
-typedef enum {
-    TRANSACTIONAL_FINISH_OUTPUT_LIMIT = 0,
-    TRANSACTIONAL_FINISH_TERMINAL,
-    TRANSACTIONAL_FINISH_CONTEXT_LIMIT,
-    TRANSACTIONAL_FINISH_INTERRUPTED,
-    TRANSACTIONAL_FINISH_ERROR,
-} transactional_finish_reason;
-
-typedef struct {
-    int generated;
-    transactional_finish_reason reason;
-} transactional_decode_result;
 
 static uint64_t cli_generation_seed(const cli_generation_options *gen) {
     return gen->seed ? gen->seed :
@@ -433,7 +375,7 @@ static uint64_t cli_generation_seed(const cli_generation_options *gen) {
  * formatter's inline pending buffer.  Every valid opened cookie reaches the
  * single commit site; malformed blocks are closed fail-closed by invalidating
  * the session before any returned token is observed. */
-static int run_transactional_decode(
+CLI_TEST_VISIBLE int run_transactional_decode(
         ds4_engine *engine,
         ds4_session *session,
         const cli_generation_options *gen,
@@ -577,13 +519,7 @@ static int run_transactional_decode(
     return 0;
 }
 
-enum {
-    CLI_CHAT_TURN_OK = 0,
-    CLI_CHAT_TURN_RECOVERABLE = 1,
-    CLI_CHAT_TURN_FATAL = 2,
-};
-
-static bool cli_transactional_finish_repl_decode(
+CLI_TEST_VISIBLE bool cli_transactional_finish_repl_decode(
         ds4_session *session,
         ds4_tokens *transcript,
         int rollback_len,
@@ -601,7 +537,7 @@ static bool cli_transactional_finish_repl_decode(
     return interrupted;
 }
 
-static bool cli_repl_continue_after_turn(int turn_rc, int *repl_rc) {
+CLI_TEST_VISIBLE bool cli_repl_continue_after_turn(int turn_rc, int *repl_rc) {
     if (turn_rc != CLI_CHAT_TURN_FATAL) return true;
     *repl_rc = 1;
     return false;
@@ -1396,14 +1332,6 @@ static void history_file_path(char *buf, size_t len) {
     snprintf(buf, len, "%s/.ds4_history", home);
 }
 
-typedef struct {
-    ds4_session *session;
-    ds4_tokens transcript;
-    int ctx_size;
-    int think_prefix_pos;
-    int think_prefix_tokens;
-} repl_chat;
-
 static void tokens_insert(ds4_tokens *dst, int pos, const ds4_tokens *src) {
     if (!src || src->len <= 0) return;
     if (pos < 0) pos = 0;
@@ -1532,7 +1460,11 @@ static bool repl_chat_assistant_turn_uses_eos(ds4_engine *engine) {
  * and assistant markers, then ds4_session_sync() decides whether this is a KV
  * continuation.  If prompt processing fails, the transcript rolls back before
  * returning to the prompt. */
-static int run_chat_turn(ds4_engine *engine, cli_config *cfg, repl_chat *chat, const char *user_text) {
+CLI_TEST_VISIBLE int run_chat_turn(
+        ds4_engine *engine,
+        cli_config *cfg,
+        repl_chat *chat,
+        const char *user_text) {
     if (!chat->session) {
         fprintf(stderr, "ds4: no active interactive KV cache\n");
         return 1;
@@ -1630,7 +1562,7 @@ static int run_chat_turn(ds4_engine *engine, cli_config *cfg, repl_chat *chat, c
     return CLI_CHAT_TURN_OK;
 }
 
-static int run_repl(ds4_engine *engine, cli_config *cfg) {
+CLI_TEST_VISIBLE int run_repl(ds4_engine *engine, cli_config *cfg) {
     repl_chat chat;
     if (repl_chat_init(engine, &chat, cfg) != 0) return 1;
 

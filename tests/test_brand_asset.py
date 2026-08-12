@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Freeze the maintainer-supplied Hebrus typographic identity as a brand asset."""
+"""Freeze the maintainer-supplied Hebrus logo and its README use."""
 
 from __future__ import annotations
 
@@ -9,10 +9,10 @@ import struct
 
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
-ASSET = ROOT / "docs" / "media" / "hebrus-typographic.png"
+ASSET = ROOT / "docs" / "media" / "hebrus-logo.png"
 README = ROOT / "README.md"
-EXPECTED_SHA256 = "e753718d3fe4942ada82a91396b6f1dfec28afbc723bbe9cc9f497abe7a3b772"
-EXPECTED_SIZE = (1732, 908)
+EXPECTED_SHA256 = "4be8949c73bd52e7abef58396dcd57f636165a8bb6cd6d536a600bcbf880594c"
+EXPECTED_SIZE = (1254, 1254)
 
 
 def main() -> None:
@@ -28,13 +28,13 @@ def main() -> None:
     width, height, bit_depth, color_type = struct.unpack(">IIBB", payload[16:26])
     if (width, height) != EXPECTED_SIZE:
         raise AssertionError(f"unexpected logo dimensions: {width}x{height}")
-    if (bit_depth, color_type) != (8, 2):
-        raise AssertionError("Hebrus identity must retain its original 8-bit RGB representation")
+    if (bit_depth, color_type) != (8, 6):
+        raise AssertionError("Hebrus logo must retain its original 8-bit RGBA representation")
 
-    if "docs/media/hebrus-typographic.png" not in README.read_text(encoding="utf-8"):
-        raise AssertionError("README does not use the canonical Hebrus identity")
+    if "docs/media/hebrus-logo.png" not in README.read_text(encoding="utf-8"):
+        raise AssertionError("README does not use the canonical Hebrus logo")
 
-    print(f"brand-asset: PASS ({width}x{height}, RGB, {digest})")
+    print(f"brand-asset: PASS ({width}x{height}, RGBA, {digest})")
 
 
 if __name__ == "__main__":

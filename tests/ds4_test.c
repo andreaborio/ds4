@@ -4007,6 +4007,10 @@ static void test_metal_kernel_group(void) {
     TEST_ASSERT(ds4_gpu_internal_dspark_two_source_attention_test() != 0);
 }
 
+static void test_metal_installed_source_group(void) {
+    TEST_ASSERT(ds4_gpu_internal_installed_source_test() != 0);
+}
+
 static void test_metal_qwen35_expert_pack(void) {
     TEST_ASSERT(ds4_gpu_internal_qwen35_expert_pack_test() != 0);
     TEST_ASSERT(
@@ -5740,6 +5744,7 @@ typedef struct {
 
 static const ds4_test_entry test_entries[] = {
 #ifndef DS4_NO_GPU
+    {"--metal-source-discovery", "metal-source-discovery", "standalone Metal source discovery and model-free library initialization", test_metal_installed_source_group},
     {"--long-context", "long-context", "long-context story fact-recall regression", test_long_story_fact_recall},
     {"--tool-call-quality", "tool-call-quality", "model emits valid DSML tool calls", test_tool_call_quality},
     {"--think-tool-recovery", "think-tool-recovery", "forced </think> recovery when a tool call starts inside thinking", test_think_tool_recovery},

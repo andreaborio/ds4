@@ -2,17 +2,16 @@
 
 ## Reporting A Vulnerability
 
-The project intends to receive vulnerability reports through GitHub's private
-vulnerability reporting flow:
+Use GitHub's private vulnerability reporting flow when it is available for
+this repository:
 
 <https://github.com/andreaborio/hebrus/security/advisories/new>
 
-Private vulnerability reporting is not enabled for this repository yet.
-Enabling it is a required administrative step before public launch; until then,
-the advisory URL above will not accept a report. A reporter may open a minimal
-public issue requesting private security contact, but that issue must contain
-no vulnerability details, reproduction steps, affected versions, logs, or
-attachments.
+If the advisory form is unavailable, the repository does not yet expose a
+verified private security intake. Do not work around that limitation by opening
+an issue, discussion, or pull request. Enabling private vulnerability reporting
+or publishing another verified private contact remains an administrative gate
+before a wider launch.
 
 Never disclose an undisclosed vulnerability in a public issue, discussion, or
 pull request. Public details can expose users before a fix or mitigation is
@@ -28,11 +27,10 @@ A useful private report includes:
 - any known workaround or mitigation; and
 - whether the issue has already been disclosed elsewhere.
 
-Once private reporting is enabled, the maintainers will use the advisory to
-investigate, coordinate a fix, and agree on disclosure details with the
-reporter. This project does not promise a fixed acknowledgement or remediation
-time. Complexity, hardware access, model availability, and impact can all
-affect the investigation.
+Maintainers use private advisories to investigate, coordinate a fix, and agree
+on disclosure details with the reporter. This project does not promise a fixed
+acknowledgement or remediation time. Complexity, hardware access, model
+availability, and impact can all affect the investigation.
 
 ## Supported Versions
 

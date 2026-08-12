@@ -134,6 +134,7 @@ backend, cache, preload, or power environment flag. See
 | CUDA | Frozen; backend source absent from the active tree; no inference claim |
 | ROCm | Frozen; backend source absent from the active tree; no inference claim |
 | Distributed | Retired; implementation source absent; former CLI flags fail closed before model loading |
+| DeepSeek DSpark | Research and embedded-store inspection only; normal execution remains fail-closed and target-only DeepSeek is the qualified path |
 
 The last pre-removal CUDA, ROCm, and distributed source is recoverable from Git
 commit `d8d673858f90834522bbe878951a534d8c6508b4` if work resumes. Do not restore

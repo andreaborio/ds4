@@ -97,7 +97,7 @@ class QwenReleaseContractTests(unittest.TestCase):
         assert isinstance(beta, dict)
         assert isinstance(negative, dict)
         cases = (
-            ("README.md", published["filename"], "Qwen3.6-DRIFT.gguf"),
+            ("README.md", beta["status"], "beta-drift"),
             ("CONTRIBUTING.md", beta["embeddedPayloadSha256"], "a" * 64),
             (
                 "docs/contracts/RUNTIME_SUPPORT.md",
@@ -121,6 +121,41 @@ class QwenReleaseContractTests(unittest.TestCase):
                     self.assertIn(relative, result.stderr)
                 finally:
                     fixture.close()
+
+    def test_readme_summary_must_link_without_duplicating_hashes(self) -> None:
+        contract = self.fixture.contract()
+        published = contract["publishedArtifact"]
+        assert isinstance(published, dict)
+        self.fixture.replace_once(
+            "README.md",
+            "[machine-readable Qwen release contract](docs/contracts/qwen-release.json)",
+            "machine-readable Qwen release contract",
+        )
+        self.assert_fails_with("release section must link to the canonical contract")
+
+        fixture = Fixture()
+        try:
+            path = fixture.path("README.md")
+            text = path.read_text(encoding="utf-8")
+            marker = "## Measured results"
+            text = text.replace(marker, f"{published['sha256']}\n\n{marker}", 1)
+            path.write_text(text, encoding="utf-8")
+            result = fixture.run()
+            self.assertEqual(result.returncode, 1, result.stdout)
+            self.assertIn("not duplicate machine identities", result.stderr)
+        finally:
+            fixture.close()
+
+    def test_readme_commands_track_the_published_filename(self) -> None:
+        contract = self.fixture.contract()
+        published = contract["publishedArtifact"]
+        assert isinstance(published, dict)
+        path = self.fixture.path("README.md")
+        text = path.read_text(encoding="utf-8")
+        old = str(published["filename"])
+        self.assertGreaterEqual(text.count(old), 1)
+        path.write_text(text.replace(old, "Qwen3.6-DRIFT.gguf"), encoding="utf-8")
+        self.assert_fails_with("README.md: Qwen artifact identities differ")
 
     def test_downloader_assignment_drift_fails(self) -> None:
         contract = self.fixture.contract()

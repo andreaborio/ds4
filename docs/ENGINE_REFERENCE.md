@@ -16,10 +16,12 @@
 
 ## Motivations
 
-* Very capable open weight models finally exist. DeepSeek v4 Flash feels quasi-frontier. The PRO is even better. Both resist 2 bit quantization very well.
-* Very capable high-memory Apple Silicon computers now exist.
-* DeepSeek v4 KV cache design makes it practical to run very large contexts. Other vendors are using this approach.
-* These few-hundred-billion-parameter models are strictly better than smaller (even if dense) models, regardless of what benchmarks say.
+Hebrus tests whether a deliberately small set of large MoE models can be made
+useful on Apple Silicon when Metal, compressed KV state, mmap-backed weights,
+and SSD expert streaming are engineered as one system. Model quality is not
+assumed from parameter count: admission, correctness, context limits, and
+performance remain tied to the exact artifacts and evidence in the current
+support contract.
 
 That said, a few important things about this project:
 
@@ -150,7 +152,10 @@ the compatibility namespace during this bridge.
 The Makefile can install that same single-binary-per-role layout locally or
 into a package staging root. `PREFIX` defaults to `/usr/local`, `BINDIR`
 defaults to `$(PREFIX)/bin`, and `DESTDIR` prepends a packaging root without
-being embedded in the executables. For example:
+being embedded in the executables. A Metal install also copies the exact
+runtime shader set to `dirname(BINDIR)/share/hebrus/v1/metal`; the executable
+resolves that versioned directory relative to itself, so startup does not
+depend on the caller's working directory. For example:
 
 ```sh
 make install PREFIX="$HOME/.local"
@@ -159,12 +164,16 @@ make uninstall DESTDIR="$PWD/package-root" PREFIX=/usr/local
 make install-test
 ```
 
-Installation copies only the five canonical executables and creates each
-legacy command as a relative symlink to its canonical peer. Uninstall removes
-only those ten named paths; it does not remove the containing directory or any
-other file. The test uses a temporary `DESTDIR`, validates all capability
-documents and aliases without loading a model, exercises `BINDIR` overriding,
-and proves the explicit uninstall boundary.
+Installation copies the five canonical executables and creates each legacy
+command as a relative symlink to its canonical peer. On Metal it additionally
+copies the named shader sources above; CPU-only installs do not need them.
+Uninstall removes only those ten command paths and the named Metal resources;
+it leaves unrelated files in either location untouched. The test uses a
+temporary `DESTDIR`, validates all capability documents and aliases without
+loading a model, exercises `BINDIR` overriding, and probes the installed Metal
+source set from a clean working directory. When the host exposes a Metal
+device, that probe also compiles the runtime library and initializes the
+backend without a model.
 
 Every canonical and compatibility executable accepts `--capabilities=json`
 without loading a model.
@@ -723,6 +732,10 @@ For browser JavaScript clients served from another origin, start the server with
 headers; it does not expose the server on the LAN. Use `--host 0.0.0.0`
 explicitly when remote machines should be able to connect.
 
+The server has no built-in authentication. Binding beyond `127.0.0.1` exposes
+model access and submitted prompt content to every client that can reach the
+port; add an authenticated network boundary before doing so.
+
 ### Tool call handling and canonicalization
 
 DeepSeek V4 emits tool calls as [DSML text](https://huggingface.co/deepseek-ai/DeepSeek-V4-Pro/blob/main/encoding/README.md). Agent clients do not send that
@@ -778,18 +791,15 @@ higher than the `--ctx` value you started the server with:
   --ctx 100000 --kv-disk-dir /tmp/ds4-kv --kv-disk-space-mb 8192
 ```
 
-You can use larger context and larger cache if you wish. Full context of
-1M tokens is going to use more or less 26GB of memory (compressed indexer
-alone will be like 22GB), so configure a context which makes sense in
-your system. With 128GB of RAM you would run the 2-bit quants, which are
-already 81GB, 26GB are going to be likely too much, so a context window
-of 100~300k tokens is wiser. However users reported being able to run 2bit
-quants with 250k ctx window in a Macs with just 96GB of system memory: make sure
-to kill processes that use too much memory, if you plan doing so ;)
+Do not set a client context limit above the server's `--ctx` allocation or the
+qualified frontier for the loaded artifact and hardware tier. Context memory
+is model- and backend-specific; a metadata maximum or a successful report from
+another Mac is not an admission guarantee. Use the exact limits in the
+[runtime support contract](contracts/RUNTIME_SUPPORT.md), and monitor memory
+pressure and swap during long sessions.
 
-The `384000` output limit below avoids token caps since the model is able
-to generate very long replies otherwise (up to 384k tokens). The server
-still stops when the configured context window is full.
+The client examples below use a high output cap to avoid a client-side limit.
+The server still stops when the configured context window is full.
 
 For **opencode**, add a provider and agent entry to
 `~/.config/opencode/opencode.json`:

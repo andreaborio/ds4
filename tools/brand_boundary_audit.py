@@ -220,18 +220,26 @@ def load_manifest(
 
 def tracked_paths(root: Path) -> list[str]:
     try:
-        result = subprocess.run(
+        tracked = subprocess.run(
             ["git", "ls-files", "-z"],
             cwd=root,
             check=True,
             capture_output=True,
         )
+        untracked = subprocess.run(
+            ["git", "ls-files", "--others", "--exclude-standard", "-z"],
+            cwd=root,
+            check=True,
+            capture_output=True,
+        )
     except (OSError, subprocess.CalledProcessError) as exc:
-        raise AuditError(f"cannot enumerate tracked files under {root}: {exc}") from exc
+        raise AuditError(f"cannot enumerate worktree files under {root}: {exc}") from exc
     return sorted(
-        item.decode("utf-8", "surrogateescape")
-        for item in result.stdout.split(b"\0")
-        if item
+        {
+            item.decode("utf-8", "surrogateescape")
+            for item in tracked.stdout.split(b"\0") + untracked.stdout.split(b"\0")
+            if item
+        }
     )
 
 
@@ -260,11 +268,17 @@ def scan_tree(root: Path, excluded_paths: set[str]) -> dict[Identity, int]:
     for relative in tracked_paths(root):
         if relative in excluded_paths:
             continue
+        path = root / relative
+        # `git ls-files` keeps index entries for worktree deletions until they
+        # are staged. Premerge runs against the proposed worktree diff, so a
+        # file already removed there must not keep contributing path tokens.
+        if not path.exists() and not path.is_symlink():
+            continue
         path_counts = count_tokens(relative.encode("utf-8", "surrogateescape"))
         for token, count in path_counts.items():
             observations[Identity(relative, "path", token)] = count
 
-        content = worktree_bytes(root / relative)
+        content = worktree_bytes(path)
         if content is None:
             continue
         for token, count in count_tokens(content).items():

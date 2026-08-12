@@ -23,6 +23,9 @@ CFLAGS += -DDS4_BUILD_GIT_SHA=\"$(BUILD_GIT_SHA)$(BUILD_GIT_SUFFIX)\"
 
 LDLIBS ?= -lm -pthread
 METAL_SRCS := $(wildcard metal/*.metal)
+METAL_RESOURCE_SRCS := $(sort $(METAL_SRCS) metal/qwen35_iq_tables.metal.inc)
+METAL_RESOURCE_VERSION := 1
+OBJCFLAGS += -DDS4_METAL_RESOURCE_VERSION=$(METAL_RESOURCE_VERSION)
 
 BUILD_ROOT ?= build
 HEBRUS_PROGRAMS := hebrus hebrus-server hebrus-bench hebrus-eval hebrus-agent
@@ -33,8 +36,16 @@ PREFIX ?= /usr/local
 BINDIR ?= $(PREFIX)/bin
 INSTALL ?= install
 INSTALL_MODE ?= 0755
+INSTALL_DATA_MODE ?= 0644
 INSTALL_DEST_BINDIR = $(DESTDIR)$(BINDIR)
 INSTALL_SOURCE_PROGRAMS = $(addprefix $(INSTALL_SOURCE_BINDIR)/,$(HEBRUS_PROGRAMS))
+# Keep runtime resources relative to the installed command directory rather
+# than PREFIX.  This preserves standalone discovery when callers override
+# BINDIR independently (for example, a package staging layout).
+INSTALL_BINDIR_NORMALIZED = $(patsubst %/,%,$(BINDIR))
+INSTALL_BINDIR_PARENT = $(dir $(INSTALL_BINDIR_NORMALIZED))
+METAL_RESOURCE_ROOT = $(INSTALL_BINDIR_PARENT)share/hebrus/v$(METAL_RESOURCE_VERSION)
+INSTALL_DEST_METALDIR = $(DESTDIR)$(METAL_RESOURCE_ROOT)/metal
 SERVER_ALIAS_EXPECTED_BACKEND ?= metal
 SERVER_ALIAS_EXPECTED_BUILD_SHA ?= $(BUILD_GIT_SHA)
 SERVER_ALIAS_PORT ?= 0
@@ -92,7 +103,7 @@ brand-boundary-audit: tools/brand_boundary_audit.py tools/brand_boundary.json
 brand-boundary-test: tools/brand_boundary_audit.py tests/test_brand_boundary_audit.py
 	python3 tests/test_brand_boundary_audit.py
 
-brand-asset-test: tests/test_brand_asset.py docs/media/hebrus-typographic.png README.md
+brand-asset-test: tests/test_brand_asset.py docs/media/hebrus-logo.png README.md
 	python3 tests/test_brand_asset.py
 
 qwen-iq-metal-tables-check: gguf-tools/generate_qwen35_iq_metal.py \
@@ -112,6 +123,8 @@ CPU_OBJDIR := $(BUILD_ROOT)/$(CPU_PROFILE)/obj
 CPU_BINDIR := $(BUILD_ROOT)/$(CPU_PROFILE)/bin
 INSTALL_SOURCE_BINDIR := $(METAL_BINDIR)
 INSTALL_BACKEND := metal
+INSTALL_RESOURCE_SRCS := $(METAL_RESOURCE_SRCS)
+INSTALL_METAL_PROBE := $(METAL_BINDIR)/ds4_test
 
 METAL_LDLIBS := $(LDLIBS) -framework Foundation -framework Metal
 
@@ -155,9 +168,9 @@ help:
 	@echo "                    Run authenticated synthetic DSpark support builds"
 	@echo "  make build-isolation-test"
 	@echo "                    Prove Metal -> CPU -> Metal cannot mix artifacts"
-	@echo "  make install      Install commands under DESTDIR+$(BINDIR)"
-	@echo "  make uninstall    Remove only the ten installed command paths"
-	@echo "  make install-test Verify staged install layout and capabilities"
+	@echo "  make install      Install commands and versioned Metal sources"
+	@echo "  make uninstall    Remove only the installed commands and sources"
+	@echo "  make install-test Verify staged layout and standalone Metal discovery"
 	@echo "  make brand-boundary-audit"
 	@echo "                    Reject unclassified or increased legacy brand tokens"
 	@echo "  make release-contract"
@@ -720,6 +733,8 @@ CPU_CORE_OBJS := ds4_cpu.o ds4_build_cpu.o ds4_ssd.o \
 	ds4_profile.o ds4_expert_store.o ds4_qwen.o ds4_qwen_unicode.o
 INSTALL_SOURCE_BINDIR := .
 INSTALL_BACKEND := cpu
+INSTALL_RESOURCE_SRCS :=
+INSTALL_METAL_PROBE :=
 
 all: cpu
 
@@ -1085,6 +1100,27 @@ install: $(INSTALL_SOURCE_PROGRAMS)
 				exit 2; \
 			fi; \
 		done; \
+		if test -n "$(strip $(INSTALL_RESOURCE_SRCS))"; then \
+			case "$(METAL_RESOURCE_ROOT)" in \
+				/*) ;; \
+				*) echo "install: Metal resource root must be absolute: $(METAL_RESOURCE_ROOT)" >&2; exit 2 ;; \
+			esac; \
+			metal_dest="$(INSTALL_DEST_METALDIR)"; \
+			if { test -e "$$metal_dest" || test -L "$$metal_dest"; } && \
+			   { test ! -d "$$metal_dest" || test -L "$$metal_dest"; }; then \
+				echo "install: refusing non-directory Metal resource path $$metal_dest" >&2; \
+				exit 2; \
+			fi; \
+			mkdir -p "$$metal_dest"; \
+			for source in $(INSTALL_RESOURCE_SRCS); do \
+				name=$${source#metal/}; \
+				path="$$metal_dest/$$name"; \
+				if test -d "$$path" && test ! -L "$$path"; then \
+					echo "install: refusing to replace directory $$path" >&2; \
+					exit 2; \
+				fi; \
+			done; \
+		fi; \
 		tmp=; \
 		trap 'test -z "$$tmp" || rm -f "$$tmp"' 0 1 2 3 15; \
 		for name in $(HEBRUS_PROGRAMS); do \
@@ -1104,6 +1140,15 @@ install: $(INSTALL_SOURCE_PROGRAMS)
 			rm -f "$$dest/$$legacy"; \
 			mv "$$tmp" "$$dest/$$legacy"; \
 			tmp=; \
+		done; \
+		for source in $(INSTALL_RESOURCE_SRCS); do \
+			name=$${source#metal/}; \
+			tmp="$(INSTALL_DEST_METALDIR)/.$$name.install.$$$$"; \
+			rm -f "$$tmp"; \
+			$(INSTALL) -m "$(INSTALL_DATA_MODE)" "$$source" "$$tmp"; \
+			rm -f "$(INSTALL_DEST_METALDIR)/$$name"; \
+			mv "$$tmp" "$(INSTALL_DEST_METALDIR)/$$name"; \
+			tmp=; \
 		done
 
 uninstall:
@@ -1122,11 +1167,31 @@ uninstall:
 		done; \
 		for name in $(PROGRAMS); do \
 			rm -f "$$dest/$$name"; \
-		done
+		done; \
+		if test -n "$(strip $(INSTALL_RESOURCE_SRCS))"; then \
+			metal_dest="$(INSTALL_DEST_METALDIR)"; \
+			for source in $(INSTALL_RESOURCE_SRCS); do \
+				name=$${source#metal/}; \
+				path="$$metal_dest/$$name"; \
+				if test -d "$$path" && test ! -L "$$path"; then \
+					echo "uninstall: refusing to remove directory $$path" >&2; \
+					exit 2; \
+				fi; \
+				rm -f "$$path"; \
+			done; \
+			rmdir "$$metal_dest" 2>/dev/null || true; \
+			rmdir "$(DESTDIR)$(METAL_RESOURCE_ROOT)" 2>/dev/null || true; \
+			rmdir "$(DESTDIR)$(INSTALL_BINDIR_PARENT)share/hebrus" 2>/dev/null || true; \
+		fi
 
 install-test: $(INSTALL_SOURCE_PROGRAMS) tests/test_install.sh \
-		tests/test_capabilities.py tests/test_command_aliases.py
-	HEBRUS_INSTALL_BACKEND="$(INSTALL_BACKEND)" MAKE="$(MAKE)" \
+		tests/test_capabilities.py tests/test_command_aliases.py \
+		$(INSTALL_METAL_PROBE)
+	HEBRUS_INSTALL_BACKEND="$(INSTALL_BACKEND)" \
+	HEBRUS_INSTALL_METAL_PROBE="$(INSTALL_METAL_PROBE)" \
+	HEBRUS_INSTALL_METAL_RESOURCE_NAMES="$(notdir $(INSTALL_RESOURCE_SRCS))" \
+	HEBRUS_INSTALL_METAL_RESOURCE_VERSION="$(METAL_RESOURCE_VERSION)" \
+	MAKE="$(MAKE)" \
 		sh tests/test_install.sh
 
 clean:

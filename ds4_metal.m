@@ -4744,13 +4744,11 @@ static const char *ds4_gpu_source =
 static uint32_t g_metal_source_override_count;
 
 /* Directories to look for the kernel sources in, in order.  The sources live
- * next to the repository under metal/, so a binary run from anywhere has
- * to find them relative to ITSELF, not to the working directory: the build
- * layout puts the executable at build/<arch>/bin/, three levels below the
- * sources.  Walking the executable's ancestors also covers an installed
- * layout that keeps metal/ beside the binary.  The working directory stays
- * first so an in-repo run keeps its existing behaviour, and
- * DS4_METAL_SOURCE_DIR overrides everything. */
+ * next to the repository under metal/, while make install puts the same exact
+ * set under ../share/hebrus/vN/metal relative to BINDIR.  Resolve that
+ * versioned installed location from the executable before walking ancestors
+ * for a build checkout.  The working directory remains a development
+ * fallback, and DS4_METAL_SOURCE_DIR overrides every automatic root. */
 static NSArray<NSString *> *ds4_gpu_source_roots(void) {
     static NSArray<NSString *> *cached;
     if (cached) return cached;
@@ -4760,16 +4758,22 @@ static NSArray<NSString *> *ds4_gpu_source_roots(void) {
     if (explicit_dir && explicit_dir[0]) {
         [roots addObject:[NSString stringWithUTF8String:explicit_dir]];
     }
-    [roots addObject:@"."];
 
     NSString *exe = [[NSBundle mainBundle] executablePath];
     if (exe) {
         NSString *dir = [exe stringByDeletingLastPathComponent];
+#ifndef DS4_METAL_RESOURCE_VERSION
+#define DS4_METAL_RESOURCE_VERSION 1
+#endif
+        NSString *installed = [NSString stringWithFormat:
+            @"../share/hebrus/v%d", DS4_METAL_RESOURCE_VERSION];
+        [roots addObject:[dir stringByAppendingPathComponent:installed]];
         for (int up = 0; up < 6 && [dir length] > 1; up++) {
             [roots addObject:dir];
             dir = [dir stringByDeletingLastPathComponent];
         }
     }
+    [roots addObject:@"."];
     cached = roots;
     return cached;
 }
@@ -4857,6 +4861,29 @@ static void ds4_gpu_sha256_hex(NSData *data, char hex[CC_SHA256_DIGEST_LENGTH * 
     }
     hex[CC_SHA256_DIGEST_LENGTH * 2] = '\0';
 }
+
+#ifdef DS4_TEST_HOOKS
+int ds4_gpu_internal_installed_source_test(void) {
+    @autoreleasepool {
+        NSString *source = ds4_gpu_full_source();
+        if (!source) return 0;
+
+        id<MTLDevice> device = MTLCreateSystemDefaultDevice();
+        if (!device) {
+            fprintf(stderr,
+                    "ds4-test: complete Metal source discovery passed; "
+                    "library compilation skipped because no Metal device is available\n");
+            return 1;
+        }
+        if (!ds4_gpu_init()) return 0;
+        fprintf(stderr,
+                "ds4-test: complete Metal source discovery, library compilation, "
+                "and backend initialization passed without a model\n");
+        ds4_gpu_cleanup();
+        return 1;
+    }
+}
+#endif
 
 typedef struct {
     int32_t  ne00t;

@@ -1941,6 +1941,9 @@ int ds4_gpu_dspark_q_head_norm_bf16_tensor(
         uint32_t          rows,
         float             eps);
 #ifdef DS4_TEST_HOOKS
+/* Resolve every runtime Metal source from the executable's environment, then
+ * compile and initialize the library when the host exposes a Metal device. */
+int ds4_gpu_internal_installed_source_test(void);
 /* Model-free rollback and authenticated lease-error unwind regressions. */
 int ds4_gpu_internal_qwen35_stream_staging_rollback_test(void);
 int ds4_gpu_internal_qwen35_lease_error_unwind_test(void);
