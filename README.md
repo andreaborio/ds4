@@ -261,6 +261,10 @@ evidence when they change a promoted path. The model-free premerge suite checks
 documentation, compatibility contracts, build isolation, installation, and
 the supported command surface.
 
+Share condition-scoped reproductions in
+[Independent hardware results and reproductions](https://github.com/andreaborio/hebrus/discussions/18).
+Use the structured issue forms for actionable bugs and performance reports.
+
 Do not disclose vulnerability details in an issue, discussion, or pull request.
 Use the private reporting flow documented in [SECURITY.md](SECURITY.md).
 
