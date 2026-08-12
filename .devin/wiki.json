@@ -1,0 +1,48 @@
+{
+  "repo_notes": [
+    {
+      "content": "Hebrus is a beta, source-built engine repository, not the Hebrus Studio desktop application. Its public commands are hebrus, hebrus-server, hebrus-agent, hebrus-bench, and hebrus-eval; legacy names remain compatibility aliases."
+    },
+    {
+      "content": "Use README.md and docs/contracts/RUNTIME_SUPPORT.md for the human-readable support boundary, docs/contracts/qwen-release.json for exact Qwen artifact identity, and docs/contracts/BRAND_COMPATIBILITY.md for naming and serialized compatibility."
+    },
+    {
+      "content": "Hebrus deliberately supports a small qualified model set. Do not describe it as a general GGUF runner or generalize measured results beyond their linked artifact, commit, hardware, context, workload, and telemetry."
+    },
+    {
+      "content": "Important implementation surfaces include the core engine, Metal backend and metal/ kernels, SSD streaming, local API subsets, the agent entry point, model-specific Qwen and runtime files, and tests/ plus tools/ for release gates."
+    }
+  ],
+  "pages": [
+    {
+      "title": "Overview and Qualified Support",
+      "purpose": "Explain the project scope, beta status, exact supported model families, hardware floors, qualified AUTO paths, and current limits using README.md and docs/contracts/RUNTIME_SUPPORT.md. Make clear that arbitrary GGUF files are unsupported.",
+      "parent": null
+    },
+    {
+      "title": "Build, Install, and Frontends",
+      "purpose": "Document the source build, model downloader, installed resource layout, canonical executables, compatibility aliases, CLI, local HTTP server, agent, benchmark, and evaluation frontends using README.md, Makefile, and docs/ENGINE_REFERENCE.md.",
+      "parent": null
+    },
+    {
+      "title": "Core Runtime and ExpertMajor Admission",
+      "purpose": "Describe the public engine and session API, mmap-backed GGUF parsing, model-family binding, tokenizer and session flow, and fail-closed validation of the embedded checksummed ExpertMajor v2 store using docs/architecture/CODEMAP.md and the core runtime sources.",
+      "parent": null
+    },
+    {
+      "title": "Metal, AUTO, and SSD Streaming",
+      "purpose": "Explain hardware-aware AUTO planning, Apple Metal execution, resident versus bounded SSD expert paths, memory-pressure guards, and model-family graph partitions. Keep every support statement within docs/contracts/RUNTIME_SUPPORT.md.",
+      "parent": "Core Runtime and ExpertMajor Admission"
+    },
+    {
+      "title": "Local APIs, Sessions, and Security Boundary",
+      "purpose": "Document the implemented local API subsets and their model-specific limits, streaming and tool-calling behavior, disk-backed KV checkpoints, agent sessions, loopback default, and lack of built-in server authentication using README.md and docs/ENGINE_REFERENCE.md.",
+      "parent": "Build, Install, and Frontends"
+    },
+    {
+      "title": "Tests, Evidence, and Release Gates",
+      "purpose": "Explain model-free and model-backed tests, exact-artifact correctness checks, benchmark evidence boundaries, contribution rules, and release qualification using CONTRIBUTING.md, QA_BEFORE_RELEASES.md, tests/, and docs/benchmarks/README.md. Never generalize a benchmark beyond its recorded hardware, artifact, mode, and context.",
+      "parent": null
+    }
+  ]
+}

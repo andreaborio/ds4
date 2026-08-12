@@ -11,6 +11,7 @@
   <img src="https://img.shields.io/badge/status-beta-f0a202" alt="Project status: beta">
   <img src="https://img.shields.io/badge/platform-Apple%20Silicon-111827" alt="Platform: Apple Silicon">
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-0969da" alt="License: MIT"></a>
+  <a href="https://archive.softwareheritage.org/browse/origin/?origin_url=https%3A%2F%2Fgithub.com%2Fandreaborio%2Fhebrus"><img src="https://archive.softwareheritage.org/badge/origin/https://github.com/andreaborio/hebrus/" alt="Archived by Software Heritage"></a>
 </p>
 
 Hebrus runs a deliberately small set of qualified mixture-of-experts models:
