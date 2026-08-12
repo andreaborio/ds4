@@ -113,7 +113,7 @@ assert_resource_files_removed() {
 
 run_installed_metal_probe() {
     bin_dir=$1
-    [ "$BACKEND" = metal ] || return
+    [ "$BACKEND" = metal ] || return 0
     [ -n "$METAL_PROBE" ] || fail "Metal install has no source-discovery probe"
     [ -x "$METAL_PROBE" ] || fail "Metal source-discovery probe is not executable: $METAL_PROBE"
 
