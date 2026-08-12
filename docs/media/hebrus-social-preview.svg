@@ -1,0 +1,43 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1280" height="640" viewBox="0 0 1280 640">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#07111f"/>
+      <stop offset="0.58" stop-color="#0b1727"/>
+      <stop offset="1" stop-color="#111827"/>
+    </linearGradient>
+    <radialGradient id="glow" cx="0.23" cy="0.54" r="0.55">
+      <stop offset="0" stop-color="#126cff" stop-opacity="0.34"/>
+      <stop offset="0.55" stop-color="#126cff" stop-opacity="0.09"/>
+      <stop offset="1" stop-color="#126cff" stop-opacity="0"/>
+    </radialGradient>
+    <filter id="shadow" x="-30%" y="-30%" width="160%" height="160%">
+      <feDropShadow dx="0" dy="18" stdDeviation="22" flood-color="#000" flood-opacity="0.48"/>
+    </filter>
+  </defs>
+
+  <rect width="1280" height="640" fill="url(#bg)"/>
+  <rect width="1280" height="640" fill="url(#glow)"/>
+  <path d="M0 557 C218 508 372 607 602 548 S1018 474 1280 547 V640 H0Z" fill="#126cff" opacity="0.08"/>
+  <path d="M0 584 C228 530 392 630 618 574 S1018 504 1280 570" fill="none" stroke="#2f80ff" stroke-width="2" opacity="0.3"/>
+
+  <image href="hebrus-logo.png" x="62" y="130" width="392" height="392" filter="url(#shadow)"/>
+
+  <g font-family="-apple-system, BlinkMacSystemFont, 'Helvetica Neue', Arial, sans-serif">
+    <rect x="514" y="105" width="91" height="34" rx="17" fill="#126cff" opacity="0.16" stroke="#4091ff" stroke-opacity="0.62"/>
+    <text x="559.5" y="128" fill="#8fc0ff" font-size="15" font-weight="700" text-anchor="middle" letter-spacing="1.5">BETA</text>
+
+    <text x="510" y="224" fill="#ffffff" font-size="86" font-weight="760" letter-spacing="-3">Hebrus</text>
+    <text x="514" y="293" fill="#dce7f6" font-size="35" font-weight="620" letter-spacing="-0.7">Metal-first MoE inference</text>
+    <text x="514" y="339" fill="#dce7f6" font-size="35" font-weight="620" letter-spacing="-0.7">for Apple Silicon.</text>
+
+    <text x="514" y="402" fill="#8ca2bb" font-size="23" font-weight="430">Bounded SSD expert streaming for exact,</text>
+    <text x="514" y="435" fill="#8ca2bb" font-size="23" font-weight="430">qualified model artifacts.</text>
+
+    <line x1="514" y1="487" x2="1154" y2="487" stroke="#30445d" stroke-width="1"/>
+    <text x="514" y="531" fill="#7f96b0" font-size="17" font-weight="600" letter-spacing="0.8">APPLE METAL</text>
+    <circle cx="671" cy="525" r="3" fill="#2f80ff"/>
+    <text x="691" y="531" fill="#7f96b0" font-size="17" font-weight="600" letter-spacing="0.8">EVIDENCE-BOUND SUPPORT</text>
+    <circle cx="948" cy="525" r="3" fill="#2f80ff"/>
+    <text x="968" y="531" fill="#7f96b0" font-size="17" font-weight="600" letter-spacing="0.8">MIT</text>
+  </g>
+</svg>
