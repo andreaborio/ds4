@@ -137,6 +137,8 @@ not validated.
 | `tests/test_capabilities.py` | Exact schema and cross-executable checks for the model-free build/capability contract |
 | `tests/test_command_aliases.py` | Canonical/legacy symlink layout, binary identity, and CLI-output parity checks |
 | `tests/test_install.sh` | Temporary-root install/uninstall layout, path portability, capability, versioned Metal-resource discovery from a clean working directory, model-free library initialization when a device is available, and explicit-removal checks |
+| `tools/release_source.py` + `tests/test_release_source.py` | Fail-closed deterministic source-archive generation and verification: immutable ref/clean-tree provenance, canonical tar/gzip metadata, JSON manifest, SHA-256 set, overwrite refusal, and tamper fixtures |
+| `tests/test_release_source_smoke.sh` + `.github/workflows/release-source.yml` | Double-build reproducibility, extraction outside Git, explicit build provenance, staged install smoke, and read-only retention of the three source-release files; the workflow does not publish a release |
 | `tools/brand_boundary.json` + `tools/brand_boundary_audit.py` | Exact canonical, bridged, and permanently preserved identity contract plus explicit per-file legacy `ds4`/`DS4`/`DwarfStar` classification and monotonic count ceilings; `--check` rejects contract drift, new groups, and increases, while `--refresh` requires exact authorizations before widening a ceiling |
 | `tests/test_brand_boundary_audit.py` | Fail-closed fixtures for new files and tokens, increases, reductions, deterministic refresh, and invalid manifests |
 | `docs/contracts/qwen-release.json` + `tools/qwen_release_contract.py` | Canonical Hebrus-named Stable, opt-in Beta, and historical negative-only Qwen artifact identities plus the model-free gate that parses their documentation, downloader, and test surfaces for drift |
@@ -183,3 +185,6 @@ worded as a current instruction.
   session APIs, protocol tests, and agent session behavior when shared.
 - CLI/configuration: inspect all executable parsers, `ds4_help.*`, environment
   reads in runtime/backend code, README startup commands, and release help checks.
+- Source packaging: inspect `tools/release_source.py`, its unit and extracted
+  install tests, the read-only workflow, the README package contract, and the
+  canonical source-bundle section in `QA_BEFORE_RELEASES.md`.

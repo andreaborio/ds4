@@ -46,6 +46,7 @@ SERVER_ALIAS_PORT ?= 0
 .PHONY: all help clean test model-free-test premerge context-audit doc-links \
 	brand-boundary-audit brand-boundary-test brand-asset-test \
 	release-contract release-contract-test \
+	release-source release-source-test release-source-smoke \
 	imatrix-dataset-check prompt-fixture-check cpu FORCE \
 	metal build-isolation-test q4k-dot-test qwen-metadata-test \
 	qwen-iq-metal-tables-check \
@@ -76,6 +77,25 @@ release-contract: tools/qwen_release_contract.py \
 release-contract-test: release-contract tools/qwen_release_contract.py \
 		tests/test_qwen_release_contract.py
 	python3 tests/test_qwen_release_contract.py
+
+release-source:
+	@set -eu; \
+		: "$${RELEASE_VERSION:?set RELEASE_VERSION to the SemVer without a leading v}"; \
+		: "$${RELEASE_REF:?set RELEASE_REF to the full release commit or exact tag}"; \
+		output=$${RELEASE_OUT:-dist/hebrus-$$RELEASE_VERSION}; \
+		python3 tools/release_source.py build \
+			--version "$$RELEASE_VERSION" --ref "$$RELEASE_REF" \
+			--output-dir "$$output"
+
+release-source-test: tools/release_source.py tests/test_release_source.py
+	python3 tests/test_release_source.py
+
+release-source-smoke: tools/release_source.py tests/test_release_source_smoke.sh \
+		tests/test_install.sh tests/test_capabilities.py tests/test_command_aliases.py
+	@set -eu; \
+		: "$${RELEASE_VERSION:?set RELEASE_VERSION to the SemVer without a leading v}"; \
+		: "$${RELEASE_REF:?set RELEASE_REF to the full release commit or exact tag}"; \
+		sh tests/test_release_source_smoke.sh
 
 qwen-24g-fixture-test: tests/qwen/test_24g_release_fixture.py \
 		tests/qwen/run_24g_release_gate.py \
@@ -162,6 +182,12 @@ help:
 	@echo "                    Reject unclassified or increased legacy brand tokens"
 	@echo "  make release-contract"
 	@echo "                    Reject Qwen release identity drift"
+	@echo "  make release-source-test"
+	@echo "                    Test deterministic source-bundle generation"
+	@echo "  make release-source RELEASE_VERSION=X.Y.Z RELEASE_REF=<commit-or-tag>"
+	@echo "                    Build a source archive, manifest, and SHA256SUMS"
+	@echo "  make release-source-smoke RELEASE_VERSION=X.Y.Z RELEASE_REF=<commit-or-tag>"
+	@echo "                    Rebuild twice and smoke-install outside Git"
 	@echo "  make server-alias-model-test QWEN_V2=/absolute/model.gguf"
 	@echo "                    Run the opt-in model-backed server alias release gate"
 	@echo "  make premerge     Run context/docs, isolation, and model-free gates"
@@ -681,6 +707,7 @@ prompt-fixture-check:
 # only after it completes even when an agent invokes `make -j premerge`.
 premerge: context-audit doc-links brand-boundary-audit brand-boundary-test brand-asset-test \
 	release-contract release-contract-test \
+	release-source-test \
 	imatrix-dataset-check prompt-fixture-check qwen-iq-metal-tables-check \
 	build-isolation-test
 	$(MAKE) model-free-test
@@ -716,6 +743,11 @@ help:
 	@echo "  make brand-boundary-audit"
 	@echo "                           Reject unclassified or increased legacy brand tokens"
 	@echo "  make release-contract    Reject Qwen release identity drift"
+	@echo "  make release-source-test Test deterministic source-bundle generation"
+	@echo "  make release-source RELEASE_VERSION=X.Y.Z RELEASE_REF=<commit-or-tag>"
+	@echo "                           Build a source archive, manifest, and SHA256SUMS"
+	@echo "  make release-source-smoke RELEASE_VERSION=X.Y.Z RELEASE_REF=<commit-or-tag>"
+	@echo "                           Rebuild twice and smoke-install outside Git"
 	@echo "  make server-alias-model-test QWEN_V2=/absolute/model.gguf"
 	@echo "                           Run the opt-in model-backed server alias gate"
 	@echo "  make premerge            Run repository audits and Linux CPU/model-free gates"
@@ -909,6 +941,7 @@ prompt-fixture-check:
 
 premerge: context-audit doc-links brand-boundary-audit brand-boundary-test brand-asset-test \
 	release-contract release-contract-test \
+	release-source-test \
 	imatrix-dataset-check prompt-fixture-check qwen-iq-metal-tables-check \
 	model-free-test
 	$(MAKE) install-test

@@ -1,0 +1,68 @@
+name: Release source bundle
+
+run-name: Source bundle ${{ inputs.version }} at ${{ inputs.ref }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: SemVer without a leading v, for example 1.2.3
+        required: true
+        type: string
+      ref:
+        description: Full 40-character commit or exact tag checked out for release
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-source-${{ github.run_id }}
+  cancel-in-progress: false
+
+jobs:
+  source-bundle:
+    name: Reproducible source archive and smoke install
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    env:
+      RELEASE_VERSION: ${{ inputs.version }}
+      RELEASE_REF: ${{ inputs.ref }}
+      RELEASE_OUT: dist/hebrus-${{ inputs.version }}
+
+    steps:
+      - name: Check out the immutable release ref
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.ref }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+
+      - name: Test the source-bundle generator
+        run: make release-source-test
+
+      - name: Rebuild twice and smoke-install outside Git
+        run: make release-source-smoke
+
+      - name: Build the retained release bundle
+        run: make release-source
+
+      - name: Verify the retained manifest and checksums
+        run: >-
+          python3 tools/release_source.py verify
+          --manifest "$RELEASE_OUT/hebrus-$RELEASE_VERSION-source.json"
+
+      - name: Retain the source archive, manifest, and checksums
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: hebrus-${{ inputs.version }}-source
+          path: ${{ env.RELEASE_OUT }}/*
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 30

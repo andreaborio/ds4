@@ -28,6 +28,9 @@ not represent a published release.
 - Added the maintainer-supplied Hebrus logo as a hash-frozen, unchanged RGBA
   master shared with Hebrus Studio. Repository tests reject pixel or encoding
   drift; web presentation effects remain CSS-only.
+- Added fail-closed source-release tooling that binds a deterministic archive,
+  JSON provenance manifest, and SHA-256 set to one immutable clean commit, then
+  rebuilds and smoke-installs the archive outside Git before publication.
 
 ### Changed
 

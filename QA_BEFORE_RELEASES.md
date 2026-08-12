@@ -63,6 +63,52 @@ Stable/full-window promotion, rerun the complete Qwen gate on both `QWEN_V2`
 and `QWEN_Q2_V2` and complete both near-262K endpoint arms. A local Q2 file with
 the right filename but no complete hash match is not release evidence.
 
+## Source Release Bundle
+
+Prepare source artifacts only after the version, release notes, changelog, and
+all other intentional release metadata are committed. Start release notes from
+[`docs/releases/TEMPLATE.md`](docs/releases/TEMPLATE.md), remove every
+placeholder, and add the same numbered `version` and `date-released` to
+`CITATION.cff`. Historical tags are not authority for the new citation.
+
+Use a fresh output directory and bind the bundle to either the full
+40-character release commit or an exact local tag. The ref must resolve to the
+clean checked-out `HEAD`; mutable branch names, dirty trees, submodule gitlinks,
+and existing destination artifacts are rejected.
+
+```sh
+export RELEASE_VERSION=<X.Y.Z-without-leading-v>
+export RELEASE_REF=<full-40-character-release-commit-or-exact-tag>
+export RELEASE_OUT="$PWD/dist/hebrus-$RELEASE_VERSION"
+
+make release-source-test
+make release-source-smoke
+make release-source
+python3 tools/release_source.py verify \
+  --manifest "$RELEASE_OUT/hebrus-$RELEASE_VERSION-source.json"
+```
+
+`release-source-smoke` builds the archive twice, requires byte-identical
+archive/manifest/checksum outputs, extracts it without `.git`, passes the
+12-character release commit through `BUILD_GIT_SHA`, clears
+`NATIVE_CPU_FLAG`, and runs the staged install contract. On macOS this exercises
+the default Metal package and installed resource discovery; on Linux it
+exercises the CPU reference package. This source/install gate does not replace
+qualified Metal kernels, model-backed evidence, or any manual lane below.
+
+Retain and publish these three files together:
+
+- `hebrus-$RELEASE_VERSION.tar.gz`;
+- `hebrus-$RELEASE_VERSION-source.json`;
+- `SHA256SUMS`.
+
+The read-only manual
+[`release-source.yml`](.github/workflows/release-source.yml) workflow performs
+the same generator tests, double-build smoke, verification, and artifact
+retention for an immutable input ref. It does not create or modify a GitHub
+Release. Downloaded workflow artifacts are staging evidence; re-run the local
+verifier on the exact three files before publication.
+
 ## 1. Repository And Build Sanity
 
 - Start from the exact clean committed release tree. Release notes and every
@@ -92,6 +138,9 @@ the right filename but no complete hash match is not release evidence.
   canonical executables, five relative compatibility aliases, valid capability
   documents, no embedded checkout/staging paths, and an explicit-only,
   idempotent uninstall.
+- Run `make release-source-test`; the full archive double-build and smoke
+  install remain the explicit source-bundle gate above because they require the
+  final version and immutable release ref.
 - Run whitespace checks before committing:
   `git diff --check`.
 - Confirm both names of the CLI, server, and agent render help cleanly, with
