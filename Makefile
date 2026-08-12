@@ -63,7 +63,6 @@ SERVER_ALIAS_PORT ?= 0
 	qwen-reference-test qwen-unicode-test qwen-tokenizer-test \
 	qwen-expert-group-test qwen-24g-fixture-test \
 	expert-store-test metal-ssd-profile-test \
-	dspark-support-quantizer-test \
 	download-model-test capabilities-test command-alias-test \
 	visible-identity-test server-alias-model-unit-test \
 	server-alias-model-test \
@@ -84,10 +83,6 @@ release-contract: tools/qwen_release_contract.py \
 release-contract-test: release-contract tools/qwen_release_contract.py \
 		tests/test_qwen_release_contract.py
 	python3 tests/test_qwen_release_contract.py
-
-dspark-support-quantizer-test: tests/test_dspark_support_quantizer.py \
-		gguf-tools/deepseek4-quantize.c gguf-tools/quants.c gguf-tools/quants.h
-	python3 tests/test_dspark_support_quantizer.py
 
 qwen-24g-fixture-test: tests/qwen/test_24g_release_fixture.py \
 		tests/qwen/run_24g_release_gate.py \
@@ -164,8 +159,6 @@ help:
 	@echo "  make test         Build and run the Metal test suite"
 	@echo "  make model-free-test"
 	@echo "                    Run all Metal gates that do not require a GGUF"
-	@echo "  make dspark-support-quantizer-test"
-	@echo "                    Run authenticated synthetic DSpark support builds"
 	@echo "  make build-isolation-test"
 	@echo "                    Prove Metal -> CPU -> Metal cannot mix artifacts"
 	@echo "  make install      Install commands and versioned Metal sources"
@@ -284,12 +277,10 @@ $(METAL_OBJDIR)/%.o: %.c
 # the dependency explicit as well as in the generated .d file so incremental
 # builds remain correct before dependency metadata exists.
 $(METAL_OBJDIR)/ds4.o: runtime/ds4_glm_graph.inc \
-		runtime/ds4_deepseek_cache_phase.inc \
-		runtime/ds4_dspark_graph.inc
+		runtime/ds4_deepseek_cache_phase.inc
 
 $(CPU_OBJDIR)/ds4.o: runtime/ds4_glm_graph.inc \
-		runtime/ds4_deepseek_cache_phase.inc \
-		runtime/ds4_dspark_graph.inc
+		runtime/ds4_deepseek_cache_phase.inc
 
 $(CPU_OBJDIR)/%.o: %.c
 	@mkdir -p "$(@D)"
@@ -327,8 +318,7 @@ $(CPU_OBJDIR)/ds4_qwen_unicode.o: ds4_qwen_unicode.c ds4_qwen_unicode.h \
 $(METAL_OBJDIR)/ds4_test_core.o: ds4.c ds4.h ds4_ssd.h ds4_profile.h \
 		ds4_gpu.h ds4_qwen.h ds4_expert_store.h \
 		ds4_qwen_unicode.h ds4_streaming_hotlist.inc \
-		tests/internal/ds4_qwen_cpu_test_hooks.h \
-		runtime/ds4_dspark_graph.inc
+		tests/internal/ds4_qwen_cpu_test_hooks.h
 	@mkdir -p "$(@D)"
 	$(CC) $(CFLAGS) $(QWEN_CFLAGS) $(DEPFLAGS) -DDS4_NO_GPU \
 		-DDS4_TEST_HOOKS -Wno-unused-function -Wno-unused-parameter \
@@ -380,16 +370,14 @@ $(METAL_OBJDIR)/test_q4k_top8.o: tests/test_q4k_top8.c \
 $(METAL_OBJDIR)/test_qwen_session.o: tests/test_qwen_session.c ds4.c ds4.h \
 		ds4_ssd.h ds4_profile.h ds4_gpu.h ds4_qwen.h \
 		ds4_qwen_unicode.h runtime/ds4_glm_graph.inc \
-		runtime/ds4_deepseek_cache_phase.inc \
-		runtime/ds4_dspark_graph.inc
+		runtime/ds4_deepseek_cache_phase.inc
 	@mkdir -p "$(@D)"
 	$(CC) $(CFLAGS) $(QWEN_CFLAGS) $(DEPFLAGS) -DDS4_NO_GPU \
 		-Wno-unused-function -Wno-unused-parameter -I. -c -o $@ $<
 
 $(METAL_OBJDIR)/test_qwen_tokenizer.o: tests/test_qwen_tokenizer.c ds4.c \
 		ds4.h ds4_kvstore.h ds4_ssd.h ds4_profile.h ds4_gpu.h ds4_qwen.h \
-		ds4_qwen_unicode.h tests/qwen/qwen36_tokenizer_fixture.inc \
-		runtime/ds4_dspark_graph.inc
+		ds4_qwen_unicode.h tests/qwen/qwen36_tokenizer_fixture.inc
 	@mkdir -p "$(@D)"
 	$(CC) $(CFLAGS) $(QWEN_CFLAGS) $(DEPFLAGS) -DDS4_NO_GPU \
 		-Wno-unused-function -Wno-unused-parameter -I. -c -o $@ $<
@@ -541,15 +529,6 @@ $(METAL_BINDIR)/test_qwen35_iq_metal: \
 	$(CC) $(OBJCFLAGS) -o $@ tests/qwen/test_qwen35_iq_metal.m \
 		$(METAL_LDLIBS)
 
-$(METAL_BINDIR)/test_expert_major_v3_tile_metal: \
-		tests/qwen/test_expert_major_v3_tile_metal.m \
-		gguf-tools/vendor/qwen35-iq-ggml-common.h \
-		metal/qwen35_iq_tables.metal.inc
-	@mkdir -p "$(@D)"
-	$(CC) -O2 -fno-fast-math $(DEBUG_FLAGS) $(NATIVE_CPU_FLAG) \
-		-Wall -Wextra -fobjc-arc -o $@ \
-		tests/qwen/test_expert_major_v3_tile_metal.m $(METAL_LDLIBS)
-
 $(METAL_BINDIR)/test_qwen35_metal: \
 		tests/qwen/test_qwen35_metal.m ds4_qwen.c ds4_qwen.h \
 		metal/qwen35.metal tests/qwen/qwen36_attention_golden.inc \
@@ -651,10 +630,7 @@ model-free-test: metal ds4_test ds4_agent_test $(METAL_BINDIR)/test_q4k_dot \
 		qwen-24g-fixture-test \
 		visible-identity-test \
 		server-alias-model-unit-test \
-		dspark-support-quantizer-test \
-		tests/test_capabilities.py tests/test_command_aliases.py \
-		tests/test_dspark_admission.py tests/dspark/test_oracle.py \
-		tools/dspark_oracle/generate_fixtures.py
+		tests/test_capabilities.py tests/test_command_aliases.py
 	python3 tests/test_capabilities.py --bin-dir $(METAL_BINDIR) --backend metal
 	python3 tests/test_command_aliases.py --bin-dir $(METAL_BINDIR) \
 		--backend metal --layout profile
@@ -683,9 +659,6 @@ model-free-test: metal ds4_test ds4_agent_test $(METAL_BINDIR)/test_q4k_dot \
 		$(METAL_BINDIR)/test_qwen35_metal
 	DS4_EXPERT_STORE_PROBE=$(METAL_BINDIR)/test_expert_store \
 		python3 tests/test_expert_major.py
-	python3 tools/dspark_oracle/generate_fixtures.py --check
-	python3 tests/dspark/test_oracle.py
-	python3 tests/test_dspark_admission.py $(METAL_BINDIR)/ds4
 	$(METAL_BINDIR)/test_metal_ssd_profile
 	python3 tests/qwen/collect_gdn_reference.py --check
 	python3 tests/qwen/collect_attention_reference.py --check
@@ -743,8 +716,6 @@ help:
 	@echo "  make / make cpu          Build ./hebrus* plus ./ds4* aliases"
 	@echo "  make test                Build and run tests"
 	@echo "  make model-free-test     Run all tests that do not require a GGUF"
-	@echo "  make dspark-support-quantizer-test"
-	@echo "                           Run authenticated synthetic DSpark support builds"
 	@echo "  make install             Install commands under DESTDIR+$(BINDIR)"
 	@echo "  make uninstall           Remove only the ten installed command paths"
 	@echo "  make install-test        Verify staged install layout and capabilities"
@@ -845,14 +816,12 @@ linenoise.o: linenoise.c linenoise.h
 	$(CC) $(CFLAGS) -c -o $@ linenoise.c
 
 ds4_cpu.o: ds4.c ds4.h ds4_ssd.h ds4_profile.h ds4_gpu.h ds4_qwen.h \
-		ds4_expert_store.h ds4_qwen_unicode.h ds4_streaming_hotlist.inc \
-		runtime/ds4_dspark_graph.inc
+		ds4_expert_store.h ds4_qwen_unicode.h ds4_streaming_hotlist.inc
 	$(CC) $(CFLAGS) -DDS4_NO_GPU -c -o $@ ds4.c
 
 ds4_test_core.o: ds4.c ds4.h ds4_ssd.h ds4_profile.h \
 		ds4_gpu.h ds4_qwen.h ds4_expert_store.h ds4_qwen_unicode.h \
-		ds4_streaming_hotlist.inc tests/internal/ds4_qwen_cpu_test_hooks.h \
-		runtime/ds4_dspark_graph.inc
+		ds4_streaming_hotlist.inc tests/internal/ds4_qwen_cpu_test_hooks.h
 	$(CC) $(CFLAGS) $(QWEN_CFLAGS) -DDS4_NO_GPU -DDS4_TEST_HOOKS \
 		-Wno-unused-function -Wno-unused-parameter -c -o $@ ds4.c
 
@@ -890,11 +859,8 @@ model-free-test: $(PROGRAMS) ds4_test ds4_agent_test q4k-dot-test \
 		tests/test_ssd_residency download-model-test qwen-24g-fixture-test \
 		visible-identity-test \
 		server-alias-model-unit-test \
-		dspark-support-quantizer-test \
 		tests/test_capabilities.py \
-		tests/test_command_aliases.py \
-		tests/test_dspark_admission.py tests/dspark/test_oracle.py \
-		tools/dspark_oracle/generate_fixtures.py
+		tests/test_command_aliases.py
 	python3 tests/test_capabilities.py --bin-dir . --backend cpu
 	python3 tests/test_command_aliases.py --bin-dir . --backend cpu --layout profile
 	sh tests/test_retired_distributed_flags.sh
@@ -912,9 +878,6 @@ model-free-test: $(PROGRAMS) ds4_test ds4_agent_test q4k-dot-test \
 	./tests/test_qwen_expert_group
 	DS4_EXPERT_STORE_PROBE=./tests/test_expert_store \
 		python3 tests/test_expert_major.py
-	python3 tools/dspark_oracle/generate_fixtures.py --check
-	python3 tests/dspark/test_oracle.py
-	python3 tests/test_dspark_admission.py ./ds4
 	./tests/test_metal_ssd_profile
 	python3 tests/qwen/collect_gdn_reference.py --check
 	python3 tests/qwen/collect_attention_reference.py --check
@@ -977,8 +940,7 @@ tests/test_qwen_session: tests/test_qwen_session.c ds4.c ds4.h ds4_ssd.h ds4_pro
 		ds4_profile.c ds4_qwen.c \
 		ds4_qwen_unicode.c ds4_qwen_unicode_data.inc \
 		ds4_streaming_hotlist.inc runtime/ds4_glm_graph.inc \
-		runtime/ds4_deepseek_cache_phase.inc \
-		runtime/ds4_dspark_graph.inc
+		runtime/ds4_deepseek_cache_phase.inc
 	$(CC) $(CFLAGS) $(QWEN_CFLAGS) -DDS4_NO_GPU \
 		-Wno-unused-function -Wno-unused-parameter -I. -o $@ \
 		$(filter-out ds4.c,$(filter %.c %.o,$^)) $(LDLIBS)
@@ -987,8 +949,7 @@ tests/test_qwen_tokenizer: tests/test_qwen_tokenizer.c ds4.c ds4.h \
 		ds4_kvstore.c ds4_kvstore.h ds4_ssd.h ds4_profile.c ds4_profile.h ds4_gpu.h ds4_qwen.h \
 		ds4_qwen_unicode.h ds4_build.c ds4_expert_store.o ds4_ssd.c \
 		ds4_qwen.c ds4_qwen_unicode.c ds4_qwen_unicode_data.inc \
-		ds4_streaming_hotlist.inc tests/qwen/qwen36_tokenizer_fixture.inc \
-		runtime/ds4_dspark_graph.inc
+		ds4_streaming_hotlist.inc tests/qwen/qwen36_tokenizer_fixture.inc
 	$(CC) $(CFLAGS) $(QWEN_CFLAGS) -DDS4_NO_GPU \
 		-Wno-unused-function -Wno-unused-parameter -I. -o $@ \
 		$(filter-out ds4.c,$(filter %.c %.o,$^)) $(LDLIBS)

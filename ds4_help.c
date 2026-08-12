@@ -151,34 +151,6 @@ bool ds4_help_reject_retired_distributed_option(
     return true;
 }
 
-static const char *retired_cli_mtp_option(const char *arg) {
-    static const char *const options[] = {
-        "--mtp",
-        "--mtp-draft",
-        "--mtp-margin",
-    };
-    if (!arg) return NULL;
-    for (size_t i = 0; i < sizeof(options) / sizeof(options[0]); i++) {
-        const size_t len = strlen(options[i]);
-        if (!strncmp(arg, options[i], len) &&
-            (arg[len] == '\0' || arg[len] == '=')) {
-            return options[i];
-        }
-    }
-    return NULL;
-}
-
-bool ds4_help_reject_retired_cli_mtp_option(
-        FILE *fp, ds4_help_tool tool, const char *arg) {
-    if (tool != DS4_HELP_DS4) return false;
-    const char *option = retired_cli_mtp_option(arg);
-    if (!option) return false;
-    fprintf(fp,
-            "%s: MTP option %s was retired; MTP generation is not supported by the CLI\n",
-            tool_name(tool), option);
-    return true;
-}
-
 static void print_tool_usage(FILE *fp, ds4_help_tool tool) {
     switch (tool) {
     case DS4_HELP_DS4:
@@ -243,10 +215,10 @@ static void print_model_runtime(FILE *fp, const help_colors *c,
     opt(fp, c, "--simulate-used-memory NGB", "Diagnostic: lock N GiB before model load to simulate a smaller-memory machine.");
     opt(fp, c, "--prefill-chunk N", "Metal graph prefill chunk size. Default: auto (PRO long prompts use 8192; others use 4096).");
     if (full) {
-        if (tool != DS4_HELP_DS4 && tool != DS4_HELP_BENCH) {
+        if (tool != DS4_HELP_BENCH) {
             opt(fp, c, "--mtp FILE", "Optional MTP support GGUF used for draft-token probes.");
         }
-        if (tool == DS4_HELP_AGENT || tool == DS4_HELP_SERVER) {
+        if (tool == DS4_HELP_DS4 || tool == DS4_HELP_AGENT || tool == DS4_HELP_SERVER) {
             opt(fp, c, "--mtp-draft N", "Maximum autoregressive MTP draft tokens. Default: 1");
             opt(fp, c, "--mtp-margin F", "Verifier confidence margin for fast MTP acceptance. Default: 3");
         }

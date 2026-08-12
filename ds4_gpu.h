@@ -75,13 +75,6 @@ typedef struct ds4_gpu_expert_store_layer_v2 {
     uint64_t component_offset[3];
     uint64_t component_bytes[3];
 } ds4_gpu_expert_store_layer_v2;
-/* Expert stores are separate identity domains. TARGET remains zero so every
- * zero-initialized legacy table keeps the historical target-only behavior. */
-typedef enum ds4_gpu_expert_store_id {
-    DS4_GPU_EXPERT_STORE_TARGET = 0,
-    DS4_GPU_EXPERT_STORE_SUPPORT = 1,
-    DS4_GPU_EXPERT_STORE_COUNT = 2,
-} ds4_gpu_expert_store_id;
 /* Install a validated expert-major store embedded in the model GGUF. layer is
  * the real model-layer id, so inventories may omit a dense prefix. */
 int ds4_gpu_expert_store_v2_install(
@@ -108,32 +101,6 @@ int ds4_gpu_expert_store_v2_layer_span(
         uint64_t *size);
 int ds4_gpu_expert_store_v2_enable_resident(void);
 void ds4_gpu_expert_store_v2_clear(void);
-/* Store-aware variants form the DSpark seam. The legacy entry points above
- * are exact TARGET wrappers. */
-int ds4_gpu_expert_store_v2_install_for_store(
-        ds4_gpu_expert_store_id                store_id,
-        int                                    fd,
-        uint64_t                               file_size,
-        uint32_t                               n_layer,
-        uint32_t                               n_expert,
-        uint32_t                               storage_format,
-        uint32_t                               group_size,
-        const ds4_gpu_expert_store_layer_v2   *layers);
-int ds4_gpu_expert_store_v2_bind_layer_for_store(
-        ds4_gpu_expert_store_id store_id,
-        uint32_t                layer,
-        uint64_t                model_size,
-        uint64_t                gate_offset,
-        uint64_t                up_offset,
-        uint64_t                down_offset);
-int ds4_gpu_expert_store_v2_layer_span_for_store(
-        ds4_gpu_expert_store_id store_id,
-        uint32_t                layer,
-        uint64_t                model_size,
-        uint64_t               *offset,
-        uint64_t               *size);
-void ds4_gpu_expert_store_v2_clear_for_store(
-        ds4_gpu_expert_store_id store_id);
 int ds4_gpu_set_model_map_range(const void *model_map, uint64_t model_size, uint64_t map_offset, uint64_t map_size, uint64_t max_tensor_bytes);
 int ds4_gpu_set_model_map_spans(const void *model_map, uint64_t model_size, const uint64_t *offsets, const uint64_t *sizes, uint32_t count, uint64_t max_tensor_bytes);
 int ds4_gpu_pro_q4_expert_table_auto_available(void);
@@ -163,11 +130,10 @@ void ds4_gpu_set_streaming_expert_cache_required_floor(uint32_t experts);
 void ds4_gpu_set_streaming_expert_cache_expert_bytes(uint64_t bytes);
 /* Optional model-specific slab-growth target; zero restores the backend
  * default. An explicit DS4_METAL_STREAMING_EXPERT_SLAB_MB wins only outside
- * guarded model tiers whose measured slab geometry is part of admission. */
+ * guarded Qwen tiers, whose measured slab geometry is part of admission. */
 void ds4_gpu_set_streaming_expert_cache_slab_target_bytes(uint64_t bytes);
-/* Guarded streaming tiers admit every additional TARGET slab against a fresh
- * host snapshot. runtime_bytes must include the maximum prefill/decode
- * envelope plus any separately owned cache such as DSpark SUPPORT;
+/* Guarded Qwen tiers admit every additional slab against a fresh host
+ * snapshot. runtime_bytes is the maximum prefill/decode envelope and
  * static_page_bytes is the complete pageable non-routed coverage. */
 void ds4_gpu_set_streaming_expert_cache_growth_guard(
         bool     enabled,
@@ -175,9 +141,6 @@ void ds4_gpu_set_streaming_expert_cache_growth_guard(
         uint64_t static_page_bytes);
 uint64_t ds4_gpu_recommended_working_set_size(void);
 int ds4_gpu_host_memory_snapshot(ds4_ssd_host_memory *out);
-/* Effective combined cache budget after TARGET caps and an optional DSpark
- * SUPPORT split. Equal to configured_count() for target-only models. */
-uint32_t ds4_gpu_stream_expert_cache_effective_parent_count(void);
 uint32_t ds4_gpu_stream_expert_cache_configured_count(void);
 uint32_t ds4_gpu_stream_expert_cache_current_count(void);
 /* Complete gate + up + down payload for one logical routed expert.  This is
@@ -765,10 +728,6 @@ int ds4_gpu_dsv4_fp8_kv_quantize_tensor(
         uint32_t          head_dim,
         uint32_t          n_rot);
 
-/* Round F32 lanes to BF16 with round-to-nearest-even, retaining F32 storage.
- * Infinities remain bit-exact; NaNs retain sign/high payload and are quieted. */
-int ds4_gpu_bf16_round_f32_tensor(ds4_gpu_tensor *x, uint64_t count);
-
 int ds4_gpu_dsv4_indexer_qat_tensor(
         ds4_gpu_tensor *x,
         uint32_t          n_rows,
@@ -1253,185 +1212,6 @@ int ds4_gpu_attention_decode_raw_batch_heads_tensor(
         uint32_t                window,
         uint32_t                n_head,
         uint32_t                head_dim);
-
-/* Final-0731 DSpark attention: five query rows attend non-causally to the
- * committed ring in pinned physical-cache order plus exactly five transient
- * draft rows. q, committed_kv, and transient_draft_kv use F32 storage but
- * must already contain BF16-rounded values reopened as F32; this primitive
- * does not round its inputs. The ring already contains current main_kv. */
-int ds4_gpu_dspark_attention_two_source_f32_tensor(
-        ds4_gpu_tensor       *heads,
-        const void             *model_map,
-        uint64_t                model_size,
-        uint64_t                sinks_offset,
-        const ds4_gpu_tensor *q,
-        const ds4_gpu_tensor *committed_kv,
-        const ds4_gpu_tensor *transient_draft_kv,
-        uint32_t                committed_count,
-        uint32_t                committed_cap,
-        uint32_t                committed_start,
-        uint32_t                n_head,
-        uint32_t                head_dim);
-
-/* Production-private final-0731 stage boundary.  This is intentionally a
- * fixed-geometry descriptor rather than a general model API: the caller must
- * bind one authenticated DSpark stage from the combined GGUF and provide all
- * graph-lifetime scratch up front.  The Metal call owns no session, admission,
- * sampler, proposal, or allocation policy.
- *
- * On success candidate_shadow receives one complete [5,4,4096] HC stage in a
- * publication batch that runs only after all attention, SUPPORT and FFN work
- * has completed and the unpublished candidate is finite. A failed Metal blit
- * may have touched shadow bytes, so callers must publish or consume them only
- * after this function succeeds; graph candidate state remains unpublished on
- * every failure. */
-typedef struct {
-    uint64_t hc_attn_base;
-    uint64_t hc_attn_fn;
-    uint64_t hc_attn_scale;
-    uint64_t attn_sinks;
-    uint64_t attn_q_a;
-    uint64_t attn_q_a_norm;
-    uint64_t attn_q_b;
-    uint64_t attn_kv;
-    uint64_t attn_kv_a_norm;
-    uint64_t attn_output_a;
-    uint64_t attn_output_b;
-    uint64_t attn_norm;
-    uint64_t hc_ffn_base;
-    uint64_t hc_ffn_fn;
-    uint64_t hc_ffn_scale;
-    uint64_t ffn_gate_inp;
-    uint64_t ffn_exp_probs_b;
-    uint64_t ffn_norm;
-    uint64_t ffn_gate_shexp;
-    uint64_t ffn_up_shexp;
-    uint64_t ffn_down_shexp;
-} ds4_gpu_dspark_stage_offsets;
-
-typedef struct {
-    ds4_gpu_tensor *hidden_work;       /* [5,4,4096] */
-    ds4_gpu_tensor *hc_plain_norm;     /* [5,4,4096] */
-    ds4_gpu_tensor *hc_mix;            /* [5,24] */
-    ds4_gpu_tensor *hc_split;          /* [5,24] */
-    ds4_gpu_tensor *hc_pre;            /* [5,4096] */
-    ds4_gpu_tensor *normalized;        /* [5,4096] */
-    ds4_gpu_tensor *q;                 /* [5,64,512] */
-    ds4_gpu_tensor *q_rank;            /* [5,1024] */
-    ds4_gpu_tensor *kv;                /* [5,512] */
-    ds4_gpu_tensor *attention_staging; /* [128+5,512] */
-    ds4_gpu_tensor *attention_out;     /* [5,64,512] */
-    ds4_gpu_tensor *attention_low;     /* [5,8192] */
-    ds4_gpu_tensor *attention_row;     /* [5,4096] */
-    ds4_gpu_tensor *attention_hc;      /* [5,4,4096] */
-    ds4_gpu_tensor *router_logits;     /* [5,256] */
-    ds4_gpu_tensor *router_bias;       /* [256] */
-    ds4_gpu_tensor *router_probs;      /* [5,256] */
-    ds4_gpu_tensor *router_ids;        /* [5,6] int32 */
-    ds4_gpu_tensor *router_weights;    /* [5,6] */
-    ds4_gpu_tensor *sorted_ids;        /* [5,6] int32 */
-    ds4_gpu_tensor *sorted_weights;    /* [5,6] */
-    ds4_gpu_tensor *routed_gate;       /* [5,6,2048] */
-    ds4_gpu_tensor *routed_up;         /* [5,6,2048] */
-    ds4_gpu_tensor *routed_mid;        /* [5,6,2048] */
-    ds4_gpu_tensor *routed_down;       /* [5,6,4096] */
-    ds4_gpu_tensor *routed_sum;        /* [5,4096] */
-    ds4_gpu_tensor *shared_gate;       /* [5,2048] */
-    ds4_gpu_tensor *shared_up;         /* [5,2048] */
-    ds4_gpu_tensor *shared_mid;        /* [5,2048] */
-    ds4_gpu_tensor *shared_down;       /* [5,4096] */
-    ds4_gpu_tensor *moe;               /* [5,4096] */
-    ds4_gpu_tensor *candidate;         /* [5,4,4096], unpublished */
-} ds4_gpu_dspark_stage_scratch;
-
-typedef int (*ds4_gpu_dspark_stage_route_plan_fn)(
-        const int32_t ids[30],
-        const float weights[30],
-        int32_t sorted_ids[30],
-        float sorted_weights[30],
-        void *opaque);
-
-typedef struct {
-    uint32_t stage;                    /* tranche-minimum executor: exactly 0 */
-    const void *model_map;
-    uint64_t model_size;
-    ds4_gpu_dspark_stage_offsets weights;
-    uint32_t position0;
-    uint32_t committed_count;          /* 2..128 */
-    uint32_t committed_start;          /* physical-ring cursor */
-    const ds4_gpu_tensor *committed_kv;/* [128,512], current stage */
-    const ds4_gpu_tensor *hidden_input;/* [5,4,4096] */
-    ds4_gpu_tensor *selected_address_page; /* graph-owned exact 16 KiB */
-    ds4_gpu_tensor *candidate_shadow;  /* stable prior publication */
-    ds4_gpu_dspark_stage_route_plan_fn route_plan;
-    void *route_plan_opaque;
-    ds4_gpu_dspark_stage_scratch scratch;
-} ds4_gpu_dspark_stage_descriptor;
-
-int ds4_gpu_dspark_stage_execute_candidate(
-        const ds4_gpu_dspark_stage_descriptor *stage);
-
-/* DSpark HC head: final-0731 HC collapse, RMSNorm, target output projection,
- * sequential Markov correction and confidence over the published candidate.
- *
- * The collapse is the same operation the qualified target output head uses:
- * one inverse-RMS over the flattened four-lane row, a [hc_dim, n_hc] F16 mix,
- * independent sigmoid gates plus epsilon, and a weighted sum of the RAW lanes.
- * The gates are not a distribution: they neither sum to one nor pass through
- * Sinkhorn.  See output_hc_head_one() and metal_graph_encode_output_head_mtp()
- * for the target-side equivalent, and hc_head() in the frozen oracle. */
-typedef struct {
-    uint64_t norm;             /* F32 [4096] */
-    uint64_t hc_fn;            /* F16 [16384, 4] */
-    uint64_t hc_scale;         /* F32 [1] */
-    uint64_t hc_base;          /* F32 [4] */
-    uint64_t markov_w1;        /* Q8_0 [markov_rank, vocab] */
-    uint64_t markov_w2;        /* Q8_0 [markov_rank, vocab] */
-    uint64_t confidence_proj;  /* Q8_0 [4096+markov_rank, 1] */
-    uint64_t output;           /* Q8_0 target model output projection */
-} ds4_gpu_dspark_head_offsets;
-
-typedef struct {
-    /* y[p+1]: the pending target token seeds the sequential Markov chain.
-     * The five drafted tokens are outputs p+2 .. p+6. */
-    int32_t pending_token_id;
-    /* 1..5 drafted candidate rows.  This is head scoped: it bounds the
-     * sequential Markov chain, the confidence rows and therefore the accepted
-     * prefix.  It does NOT yet shrink stage work.  The stage executor still
-     * routes and evaluates all five rows, so SUPPORT record traffic per
-     * proposal is unchanged by a smaller value.  Restricting the final stage
-     * is a separate, measurement-gated change: only the last stage may be
-     * restricted at all, because DSpark attention is non-causal across the
-     * five candidate rows and earlier stages must publish all of them. */
-    uint32_t active_rows;
-    uint32_t vocab_size;
-    uint32_t markov_rank;
-    float norm_eps;
-    float hc_eps;
-    const void *model_map;
-    uint64_t model_size;
-    ds4_gpu_dspark_head_offsets weights;
-    const ds4_gpu_tensor *candidate;   /* [5, 4, 4096] published shadow */
-    ds4_gpu_tensor *flat_norm;         /* [5, 4 * 4096] */
-    ds4_gpu_tensor *hc_mix;            /* [5, 4] */
-    ds4_gpu_tensor *hc_weights;        /* [5, 4] */
-    ds4_gpu_tensor *head_hidden;       /* [5, 4096], collapse before RMSNorm */
-    ds4_gpu_tensor *head_normalized;   /* [5, 4096] */
-    ds4_gpu_tensor *logits_row;        /* [vocab], one Markov bias row */
-    ds4_gpu_tensor *corrected_logits;  /* [5, vocab], base then corrected */
-    ds4_gpu_tensor *markov_emb;        /* [5, markov_rank] */
-    ds4_gpu_tensor *confidence_feat;   /* [5, 4096+markov_rank] */
-    ds4_gpu_tensor *confidence;        /* [5] */
-    ds4_gpu_tensor *draft_tokens;      /* [5] int32 */
-    /* Exact per-position views owned by the caller's graph.  The head must
-     * not allocate a tensor view on the decode hot path. */
-    ds4_gpu_tensor *corrected_row[5];
-    ds4_gpu_tensor *markov_row[5];
-    ds4_gpu_tensor *draft_row[5];
-} ds4_gpu_dspark_head_descriptor;
-
-int ds4_gpu_dspark_head_execute(
-        const ds4_gpu_dspark_head_descriptor *d);
 
 int ds4_gpu_attention_decode_mixed_batch_heads_tensor(
         ds4_gpu_tensor       *heads,
@@ -1934,12 +1714,7 @@ int hebrus_gpu_internal_stream_expert_cache_scan_limit_test(void);
 int ds4_gpu_internal_qwen35_expert_pack_test(void);
 /* Canonical-vs-embedded GLM Q2 regression for direct and grouped execution. */
 int ds4_gpu_internal_expert_store_v2_kernel_test(void);
-/* Production-private final-0731 Q-B primitive.  The fixed stage executor is
- * its only release caller; tests keep direct coverage of the precision seam. */
-int ds4_gpu_dspark_q_head_norm_bf16_tensor(
-        ds4_gpu_tensor *x,
-        uint32_t          rows,
-        float             eps);
+
 #ifdef DS4_TEST_HOOKS
 /* Resolve every runtime Metal source from the executable's environment, then
  * compile and initialize the library when the host exposes a Metal device. */
@@ -1947,42 +1722,10 @@ int ds4_gpu_internal_installed_source_test(void);
 /* Model-free rollback and authenticated lease-error unwind regressions. */
 int ds4_gpu_internal_qwen35_stream_staging_rollback_test(void);
 int ds4_gpu_internal_qwen35_lease_error_unwind_test(void);
-/* TARGET/SUPPORT descriptor namespace and offset-isolation regression. */
-int ds4_gpu_internal_dspark_dual_store_test(void);
-/* Separate SUPPORT SSD cache quota, namespace, I/O and teardown regression. */
-int ds4_gpu_internal_dspark_support_cache_test(void);
-/* Boundary-correct compact-mid routed MoE through one SUPPORT transaction. */
-int ds4_gpu_internal_dspark_support_routed_moe_test(void);
-/* Production-record first/last-block SUPPORT ownership probe. */
-int ds4_gpu_internal_dspark_support_full_width_test(void);
-/* Device-only post-layer HC mean regression for the DSpark tap. */
-int ds4_gpu_internal_dspark_hc_mean_test(void);
-/* Device ring append/publication regression for DSpark capture history. */
-int ds4_gpu_internal_dspark_history_test(void);
-/* Physical Metal BF16 round/reopen bit-semantics and range regression. */
-int ds4_gpu_internal_bf16_round_f32_test(void);
-/* Final-0731 per-head Q normalization BF16-publication regression. */
-int ds4_gpu_internal_dspark_q_head_norm_bf16_test(void);
-/* Final-0731 DSpark two-source non-causal F32 attention regression. */
-int ds4_gpu_internal_dspark_two_source_attention_test(void);
-/* Payload-first final-0731 stage-zero 32/32/4 physical Metal white box. */
-int ds4_gpu_internal_dspark_stage_zero_physical_test(void);
-/* Disconnected 5x4x32 three-stage topology through final proposal heads. */
-int ds4_gpu_internal_dspark_three_stage_proposal_test(void);
-/* Fixed 5x256/top-6 DSpark router oracle; disconnected from production. */
-int ds4_gpu_internal_dspark_router_f32_test(void);
-/* Direct physical production stage-0 executor fixture. */
-int ds4_gpu_internal_dspark_stage_executor_test(void);
-
-int ds4_gpu_internal_dspark_head_execute_test(void);
-
 int ds4_gpu_internal_shared_event_resume_latency_test(void);
-
 int ds4_gpu_internal_experts_ready_event_test(void);
-
 int ds4_gpu_internal_dense_matvec_bandwidth_test(void);
 int ds4_gpu_internal_routed_moe_bandwidth_test(void);
-
 #endif
 
 /* Sync-profile hook (DS4_METAL_SYNC_PROFILE): the decode loop reports the
@@ -1992,51 +1735,30 @@ int ds4_gpu_internal_routed_moe_bandwidth_test(void);
 void ds4_gpu_sync_profile_note_host_block_ms(double waited_ms);
 void ds4_gpu_sync_profile_note_worker_load_ms(double load_ms);
 
-/* L1 GPU-wait decode primitives (see
- * docs/work/active/l1-decode-overlap-plan-20260804.md).
- *
- * The experts-ready event lets the queue wait for the selected-load worker
- * instead of the host: the encode side reserves a value and encodes a wait
- * before the routed MoE; the worker fills the compact address table and then
- * signals that value from the CPU.  The worker contract is signal-ALWAYS:
- * whoever reserves a value must guarantee it is eventually signaled, on
- * success and on every failure path, or the queue deadlocks until the 60 s
- * command-buffer timeout. */
+/* L1 GPU-wait decode primitives.  The experts-ready event lets the queue
+ * wait for the selected-load worker instead of the host. */
 int ds4_gpu_experts_ready_ensure(void);
 uint64_t ds4_gpu_experts_ready_reserve_value(void);
 void ds4_gpu_experts_ready_signal(uint64_t value);
 int ds4_gpu_encode_wait_experts_ready(uint64_t value);
 
-/* Resolve the cache entries for up to six selected experts of one layer and
- * fill that layer's compact GPU address table.  Requires every id to be
- * resident (the caller runs it after a successful selected load).  Fails
- * without touching the table when any entry is missing or stale. */
+/* Resolve the cache entries for selected experts and fill one layer's compact
+ * GPU address table. */
 int ds4_gpu_stream_compact_addr_prepare_selected(
         const ds4_gpu_stream_expert_table *table,
         const int32_t                     *selected_ids,
         uint32_t                           n_selected);
 
-/* L1 P2 — GPU-wait decode mode.  set_pending marks the layer whose routed
- * MoE is being encoded ahead of its expert load (-1 clears); while set, the
- * Metal encode helpers switch to slab-wide residency and skip id-dependent
- * cache work.  worker_set marks the selected-load worker thread for the
- * duration of a GPU-wait job: slab growth and in-flight command-buffer
- * waits are refused there (both would deadlock or race the encode thread).
- * token_grow is the main-thread, token-boundary complement that keeps the
- * cache ramp alive while intra-token growth is frozen.  supported reports
- * whether the compact address kernels and gpuAddress are available. */
+/* GPU-wait decode state and worker lifecycle. */
 void ds4_gpu_stream_gpu_wait_moe_set_pending(int32_t layer);
 int ds4_gpu_stream_gpu_wait_moe_supported(void);
 void ds4_gpu_stream_gpu_wait_worker_set(int active);
 int ds4_gpu_stream_expert_cache_gpu_wait_token_grow(void);
 int ds4_gpu_stream_expert_cache_gpu_wait_token_trim(void);
 
-/* GPU-wait worker fast path: wait_io completes only the staged preads; the
- * fill publishes the layer's compact table from resident entries plus the
- * parked pending-load buffers, so the experts-ready signal can fire before
- * the cache install bookkeeping runs. */
+/* GPU-wait worker fast path: wait_io completes staged preads; the fill
+ * publishes the compact table before cache-install bookkeeping. */
 int ds4_gpu_stream_expert_pending_load_wait_io(void);
-/* Install the parked pending load into the cache. */
 int ds4_gpu_stream_expert_pending_load_commit(void);
 int ds4_gpu_stream_compact_addr_fill_gpu_wait(
         const ds4_gpu_stream_expert_table *table,
@@ -2068,40 +1790,6 @@ int ds4_gpu_hc_weighted_sum_tensor(
         const ds4_gpu_tensor *weights,
         uint32_t                n_embd,
         uint32_t                n_hc);
-
-/* DSpark capture primitive: average the HC lanes after a selected target
- * decoder layer without host readback or a learned HC-head transform. */
-int ds4_gpu_hc_mean_tensor(
-        ds4_gpu_tensor       *out,
-        const ds4_gpu_tensor *residual_hc,
-        uint32_t                n_embd,
-        uint32_t                n_hc);
-
-/* Encode one selected-stage DSpark history update. Geometry comes from the
- * graph's checked absolute-ring plan. Single-row decode writes directly to
- * current; multi-row prefill uses scratch for the retained HC means. */
-int ds4_gpu_dspark_capture_history_tensor(
-        ds4_gpu_tensor       *current,
-        ds4_gpu_tensor       *history,
-        ds4_gpu_tensor       *scratch,
-        const ds4_gpu_tensor *post_layer_hc,
-        uint32_t              active_tokens,
-        uint32_t              input_skip,
-        uint32_t              retained_rows,
-        uint32_t              first_physical_row,
-        uint32_t              first_rows,
-        uint32_t              second_rows);
-
-/* Publish one selected stage from verifier shadow storage. Only the accepted
- * prefix reaches history and only its final row reaches current. */
-int ds4_gpu_dspark_publish_history_tensor(
-        ds4_gpu_tensor       *current,
-        ds4_gpu_tensor       *history,
-        const ds4_gpu_tensor *candidate,
-        uint32_t              committed_rows,
-        uint32_t              first_physical_row,
-        uint32_t              first_rows,
-        uint32_t              second_rows);
 
 int ds4_gpu_hc_weighted_sum_split_tensor(
         ds4_gpu_tensor       *out,

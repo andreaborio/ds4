@@ -204,8 +204,6 @@ break compatibility.
   model-free isolation; CUDA, ROCm, and distributed inference are not shipped.
 - Only the artifacts in the support contract are admitted. Canonical converter
   inputs, old stores, sidecars, and look-alike community GGUFs are rejected.
-- DSpark support-store and oracle code is research/inspection-only. DSpark
-  execution remains fail-closed and is not part of the qualified DeepSeek path.
 - Large-model inference creates substantial I/O and memory pressure. Use AUTO,
   keep context inside the qualified frontier, and monitor memory pressure.
 - The local server has no built-in authentication and is not a multi-tenant

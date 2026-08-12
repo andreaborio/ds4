@@ -8,10 +8,6 @@
         "DS4_DEEPSEEK_PREFILL_CACHE_KEEP_MAX_TOKENS",
         "DS4_METAL_SOURCE_DIR"
       ],
-      "dspark_test_fault_injection": [
-        "DS4_DSPARK_TEST_FORCE_CLONE_REOPEN_FAILURE",
-        "DS4_DSPARK_TEST_FORCE_FCLONE_UNSUPPORTED"
-      ],
       "opt_in_research": [
         "DS4_ENABLE_NGRAM_SPEC",
         "DS4_METAL_ENABLE_DEEPSEEK_DECODE_GPU_WAIT",

@@ -21,11 +21,6 @@ void hebrus_help_set_invocation(const char *argv0);
  * option. Both the exact spelling and --option=value forms are recognized. */
 bool ds4_help_reject_retired_distributed_option(
         FILE *fp, ds4_help_tool tool, const char *arg);
-
-/* Return true after printing the canonical error for an MTP option retired
- * from the interactive/one-shot CLI. Other executable roles are unchanged. */
-bool ds4_help_reject_retired_cli_mtp_option(
-        FILE *fp, ds4_help_tool tool, const char *arg);
 void ds4_help_print(FILE *fp, ds4_help_tool tool, const char *topic);
 
 #endif

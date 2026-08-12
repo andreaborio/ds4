@@ -43,356 +43,6 @@ struct ds4_metal_args_dsv4_softmax_pool {
     uint64_t nb1;
 };
 
-struct ds4_metal_args_dspark_attention_f32 {
-    uint32_t n_keys;
-};
-
-static inline float ds4_dspark_bf16_rne(float value) {
-    const uint bits = as_type<uint>(value);
-    const uint magnitude = bits & 0x7fffffffu;
-    if (magnitude >= 0x7f800000u) {
-        if (magnitude == 0x7f800000u) return value;
-        return as_type<float>((bits & 0xffff0000u) | 0x00400000u);
-    }
-    const uint retained_lsb = (bits >> 16u) & 1u;
-    return as_type<float>(
-        (bits + 0x00007fffu + retained_lsb) & 0xffff0000u);
-}
-
-struct ds4_metal_args_dspark_q_head_norm_bf16 {
-    float eps;
-};
-
-// Final-0731 DSpark Q-head normalization.  Q-B is published as BF16 before
-// this kernel.  The official expression then returns to BF16 after square,
-// mean, epsilon addition, reciprocal square root, and final multiply.  The
-// tensor remains F32 storage so subsequent Metal primitives can consume it
-// without a format conversion.
-kernel void kernel_dspark_q_head_norm_bf16_f32(
-        constant ds4_metal_args_dspark_q_head_norm_bf16 &args [[buffer(0)]],
-        device float *x [[buffer(1)]],
-        uint tid [[thread_index_in_threadgroup]],
-        uint2 tgpig [[threadgroup_position_in_grid]]) {
-    constexpr uint n_head = 64;
-    constexpr uint head_dim = 512;
-    constexpr uint threads = 256;
-    threadgroup float reduction[threads];
-
-    const ulong base = ((ulong)tgpig.y * n_head + tgpig.x) * head_dim;
-    const float source0 = x[base + tid];
-    const float source1 = x[base + tid + threads];
-    const float square0 = ds4_dspark_bf16_rne(source0 * source0);
-    const float square1 = ds4_dspark_bf16_rne(source1 * source1);
-    reduction[tid] = square0 + square1;
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-
-    for (uint stride = threads / 2u; stride != 0u; stride >>= 1u) {
-        if (tid < stride) {
-            reduction[tid] += reduction[tid + stride];
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-    }
-
-    if (tid == 0u) {
-        const float mean = ds4_dspark_bf16_rne(
-            reduction[0] * (1.0f / (float)head_dim));
-        const float added = ds4_dspark_bf16_rne(mean + args.eps);
-        reduction[0] = ds4_dspark_bf16_rne(rsqrt(added));
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-
-    const float inverse_rms = reduction[0];
-    x[base + tid] = ds4_dspark_bf16_rne(source0 * inverse_rms);
-    x[base + tid + threads] =
-        ds4_dspark_bf16_rne(source1 * inverse_rms);
-}
-
-// Final-0731 DSpark sparse attention.  One 256-thread group owns one
-// (query,head) pair.  Q/KV enter as BF16-rounded values reopened in F32.
-// The online softmax follows the pinned 64-row TileLang schedule: the
-// denominator stays F32, each block's unnormalised exp weights are rounded to
-// BF16 before the V multiply, the sink affects only the denominator, and the
-// output is rounded to BF16 before returning in F32 storage.
-kernel void kernel_dspark_attention_two_source_f32(
-        constant ds4_metal_args_dspark_attention_f32 &args [[buffer(0)]],
-        device const float *q [[buffer(1)]],
-        device const float *kv [[buffer(2)]],
-        device const float *sinks [[buffer(3)]],
-        device float *out [[buffer(4)]],
-        uint tid [[thread_index_in_threadgroup]],
-        uint simd_lane [[thread_index_in_simdgroup]],
-        uint simd_group [[simdgroup_index_in_threadgroup]],
-        uint3 tgpig [[threadgroup_position_in_grid]]) {
-    constexpr uint head_dim = 512;
-    constexpr uint block_rows = 64;
-    constexpr uint max_keys = 133;
-    constexpr uint simdgroups = 8;
-    threadgroup float scores[max_keys];
-    threadgroup float running_max;
-    threadgroup float running_sum;
-    threadgroup float block_scale;
-
-    const uint query_row = tgpig.x;
-    const uint head = tgpig.y;
-    q += ((ulong)query_row * 64u + head) * head_dim;
-    out += ((ulong)query_row * 64u + head) * head_dim;
-
-    for (uint key = simd_group; key < args.n_keys; key += simdgroups) {
-        const device float *kv_row = kv + (ulong)key * head_dim;
-        float dot = 0.0f;
-        for (uint dim = simd_lane; dim < head_dim; dim += 32u) {
-            dot = fma(q[dim], kv_row[dim], dot);
-        }
-        dot += simd_shuffle_down(dot, 16u);
-        dot += simd_shuffle_down(dot, 8u);
-        dot += simd_shuffle_down(dot, 4u);
-        dot += simd_shuffle_down(dot, 2u);
-        dot += simd_shuffle_down(dot, 1u);
-        if (simd_lane == 0u) {
-            scores[key] = dot * 0.04419417382415922f; // 1/sqrt(512)
-        }
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-
-    float acc0 = 0.0f;
-    float acc1 = 0.0f;
-    if (tid == 0u) {
-        running_max = -FLT_MAX;
-        running_sum = 0.0f;
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-
-    for (uint block = 0u; block < args.n_keys; block += block_rows) {
-        const uint end = min(block + block_rows, args.n_keys);
-        if (tid == 0u) {
-            const float previous_max = running_max;
-            float next_max = previous_max;
-            for (uint key = block; key < end; key++) {
-                next_max = max(next_max, scores[key]);
-            }
-            block_scale = isinf(previous_max) ? 0.0f
-                                               : exp(previous_max - next_max);
-            float block_sum = 0.0f;
-            for (uint key = block; key < end; key++) {
-                const float weight = exp(scores[key] - next_max);
-                block_sum += weight;
-                scores[key] = ds4_dspark_bf16_rne(weight);
-            }
-            running_max = next_max;
-            running_sum = running_sum * block_scale + block_sum;
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-
-        acc0 *= block_scale;
-        acc1 *= block_scale;
-        for (uint key = block; key < end; key++) {
-            const float weight = scores[key];
-            const device float *kv_row = kv + (ulong)key * head_dim;
-            acc0 += weight * kv_row[tid];
-            acc1 += weight * kv_row[tid + 256u];
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-    }
-
-    const float denominator = running_sum + exp(sinks[head] - running_max);
-    out[tid] = ds4_dspark_bf16_rne(acc0 / denominator);
-    out[tid + 256u] = ds4_dspark_bf16_rne(acc1 / denominator);
-}
-
-// Production-private final-0731 DSpark router.  Its fixed five-row geometry is
-// owned only by the isolated stage executor; no generic target routing path
-// may select it.
-// Bias changes selection only; the published route weights always come from
-// the unbiased sqrt(softplus(logit)) probabilities.
-static inline float ds4_dspark_router_probability(float value) {
-    float softplus;
-    if (value > 20.0f) {
-        softplus = value;
-    } else if (value < -20.0f) {
-        softplus = exp(value);
-    } else if (value < -10.0f) {
-        // Metal does not expose log1p.  Retain its small-x terms instead of
-        // rounding 1 + exp(value) to one in the negative tail.
-        const float exponential = exp(value);
-        softplus = exponential - 0.5f * exponential * exponential +
-            (exponential * exponential * exponential) / 3.0f;
-    } else if (value > 10.0f) {
-        softplus = value + log(1.0f + exp(-value));
-    } else {
-        softplus = log(1.0f + exp(value));
-    }
-    return sqrt(softplus);
-}
-
-static inline bool ds4_dspark_router_better(
-        threadgroup const float *scores,
-        int32_t                  a,
-        int32_t                  b) {
-    const float sa = scores[(uint)a];
-    const float sb = scores[(uint)b];
-    return sa > sb || (sa == sb && a < b);
-}
-
-kernel void kernel_dspark_router_f32_5x256_top6(
-        device const float *logits [[buffer(0)]],
-        device const float *bias [[buffer(1)]],
-        device float *probabilities [[buffer(2)]],
-        device int32_t *selected [[buffer(3)]],
-        device float *weights [[buffer(4)]],
-        threadgroup uchar *scratch_bytes [[threadgroup(0)]],
-        uint row [[threadgroup_position_in_grid]],
-        uint tid [[thread_position_in_threadgroup]]) {
-    constexpr uint rows = 5;
-    constexpr uint experts = 256;
-    constexpr uint topk = 6;
-    if (row >= rows || tid >= experts) return;
-
-    threadgroup float *scores =
-        (threadgroup float *)scratch_bytes;
-    threadgroup int32_t *indices =
-        (threadgroup int32_t *)(scores + experts);
-    threadgroup uint *row_valid =
-        (threadgroup uint *)(indices + experts);
-
-    device const float *row_logits = logits + (ulong)row * experts;
-    device float *row_probabilities =
-        probabilities + (ulong)row * experts;
-    device int32_t *row_selected = selected + (ulong)row * topk;
-    device float *row_weights = weights + (ulong)row * topk;
-
-    const float raw = row_logits[tid];
-    const float correction = bias[tid];
-    const bool raw_valid = isfinite(raw);
-    const float probability = raw_valid
-        ? ds4_dspark_router_probability(raw) : 0.0f;
-    const bool probability_valid = raw_valid && isfinite(probability);
-    const float score = probability_valid && isfinite(correction)
-        ? probability + correction : 0.0f;
-    const bool lane_valid = probability_valid && isfinite(correction) &&
-        isfinite(score);
-
-    row_probabilities[tid] = lane_valid ? probability : 0.0f;
-    scores[tid] = lane_valid ? score : 0.0f;
-    indices[tid] = lane_valid ? (int32_t)tid : -1;
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-
-    if (tid == 0u) {
-        uint valid = 1u;
-        for (uint expert = 0u; expert < experts; expert++) {
-            if (indices[expert] < 0) {
-                valid = 0u;
-                break;
-            }
-        }
-        row_valid[0] = valid;
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-
-    // Keep every compare total: higher score first, then lower expert id.
-    // Invalid rows still complete the barriers, but never publish an index.
-    for (uint width = 2u; width <= experts; width <<= 1u) {
-        for (uint stride = width >> 1u; stride != 0u; stride >>= 1u) {
-            const uint other = tid ^ stride;
-            if (other > tid) {
-                const int32_t a = indices[tid] < 0
-                    ? (int32_t)tid : indices[tid];
-                const int32_t b = indices[other] < 0
-                    ? (int32_t)other : indices[other];
-                const bool descending = (tid & width) == 0u;
-                const bool swap = descending
-                    ? ds4_dspark_router_better(scores, b, a)
-                    : ds4_dspark_router_better(scores, a, b);
-                if (swap) {
-                    indices[tid] = b;
-                    indices[other] = a;
-                } else {
-                    indices[tid] = a;
-                    indices[other] = b;
-                }
-            }
-            threadgroup_barrier(mem_flags::mem_threadgroup);
-        }
-    }
-
-    if (row_valid[0] != 0u && tid < topk) {
-        row_selected[tid] = indices[tid];
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-
-    if (tid == 0u && row_valid[0] != 0u) {
-        float denominator = 0.0f;
-        for (uint slot = 0u; slot < topk; slot++) {
-            denominator += row_probabilities[(uint)row_selected[slot]];
-        }
-        if (!isfinite(denominator) || !(denominator > 0.0f)) {
-            row_valid[0] = 0u;
-        } else {
-            // Sorting is complete, so its score scratch can publish the one
-            // exact unbiased denominator to all six weight lanes.
-            scores[0] = denominator;
-        }
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-
-    if (row_valid[0] == 0u) {
-        row_probabilities[tid] = 0.0f;
-        if (tid < topk) {
-            row_selected[tid] = -1;
-            row_weights[tid] = 0.0f;
-        }
-    } else if (tid < topk) {
-        // Only tid 0 performed the gather, after complete row validation and
-        // publication of six in-range ids.  No invalid row reaches this read.
-        const float denominator = scores[0];
-        row_weights[tid] =
-            row_probabilities[(uint)row_selected[tid]] /
-            denominator * 1.5f;
-    }
-}
-
-// Stage-private publication guard. The caller initializes flag to one in the
-// unused tail of its reusable 16 KiB address page. Any NaN or infinity clears
-// it before the candidate shadow can be copied. Integer exponent inspection
-// remains fail-closed under fast-math compilation.
-kernel void kernel_dspark_all_finite_f32(
-        device const float *values [[buffer(0)]],
-        device atomic_uint *flag [[buffer(1)]],
-        constant ulong &count [[buffer(2)]],
-        uint gid [[thread_position_in_grid]]) {
-    if ((ulong)gid >= count) return;
-    const uint bits = as_type<uint>(values[gid]);
-    if ((bits & 0x7f800000u) == 0x7f800000u) {
-        atomic_store_explicit(flag, 0u, memory_order_relaxed);
-    }
-}
-
-// Reopens each F32 lane after an exact BF16 round-to-nearest-even step.  Raw
-// integer arithmetic keeps zero signs and NaN payload/sign handling independent
-// of the Metal compiler's floating-point canonicalization choices.
-kernel void kernel_dsv4_bf16_round_f32(
-        device uint *x [[buffer(0)]],
-        constant ulong &count [[buffer(1)]],
-        uint gid [[thread_position_in_grid]]) {
-    if ((ulong)gid >= count) {
-        return;
-    }
-
-    const uint bits = x[gid];
-    const uint magnitude = bits & 0x7fffffffu;
-    if (magnitude >= 0x7f800000u) {
-        if (magnitude == 0x7f800000u) {
-            return; // Preserve both infinities exactly.
-        }
-        // Preserve sign and the retained payload while guaranteeing that a NaN
-        // with payload only in the discarded half cannot collapse to infinity.
-        x[gid] = (bits & 0xffff0000u) | 0x00400000u;
-        return;
-    }
-
-    const uint retained_lsb = (bits >> 16u) & 1u;
-    x[gid] = (bits + 0x00007fffu + retained_lsb) & 0xffff0000u;
-}
-
 struct ds4_metal_args_dsv4_indexed_attention {
     uint32_t n_tokens;
     uint32_t n_head;
@@ -1203,7 +853,11 @@ kernel void kernel_glm_store_indexer_k(
             if (i < rot_dim) {
                 if ((i & 1u) != 0u) continue;
                 const uint rel_i0 = i;
+#ifdef DS4_METAL_ROPE_EXP2_LOG2
+                const float theta = theta_base * exp2(inv_ndims * (float)rel_i0 * log2(args.freq_base));
+#else
                 const float theta = theta_base * pow(args.freq_base, inv_ndims * (float)rel_i0);
+#endif
                 float cos_theta;
                 float sin_theta;
                 glm_rope_yarn(theta,
@@ -1232,7 +886,11 @@ kernel void kernel_glm_store_indexer_k(
             if (i < rot_dim) {
                 if ((i & 1u) != 0u) continue;
                 const uint rel_i0 = i;
+#ifdef DS4_METAL_ROPE_EXP2_LOG2
+                const float theta = theta_base * exp2(inv_ndims * (float)rel_i0 * log2(args.freq_base));
+#else
                 const float theta = theta_base * pow(args.freq_base, inv_ndims * (float)rel_i0);
+#endif
                 float cos_theta;
                 float sin_theta;
                 glm_rope_yarn(theta,
@@ -1336,7 +994,11 @@ kernel void kernel_glm_build_kv_cache(
     const float theta_base = (float)pos;
     const float inv_ndims = -1.0f / (float)args.qk_rope;
     for (uint r = tid * 2u; r < args.qk_rope; r += nth * 2u) {
+#ifdef DS4_METAL_ROPE_EXP2_LOG2
+        const float theta = theta_base * exp2(inv_ndims * (float)r * log2(args.freq_base));
+#else
         const float theta = theta_base * pow(args.freq_base, inv_ndims * (float)r);
+#endif
         float cos_theta;
         float sin_theta;
         glm_rope_yarn(theta,
@@ -1417,7 +1079,11 @@ kernel void kernel_glm_build_kv_cache_decode_group4(
     const float theta_base = (float)pos;
     const float inv_ndims = -1.0f / (float)args.qk_rope;
     for (uint r = tid * 2u; r < args.qk_rope; r += 512u) {
+#ifdef DS4_METAL_ROPE_EXP2_LOG2
+        const float theta = theta_base * exp2(inv_ndims * (float)r * log2(args.freq_base));
+#else
         const float theta = theta_base * pow(args.freq_base, inv_ndims * (float)r);
+#endif
         float cos_theta;
         float sin_theta;
         glm_rope_yarn(theta,
@@ -1496,7 +1162,11 @@ kernel void kernel_glm_build_kv_cache_flash(
     const float theta_base = (float)pos;
     const float inv_ndims = -1.0f / (float)args.qk_rope;
     for (uint r = tid * 2u; r < args.qk_rope; r += nth * 2u) {
+#ifdef DS4_METAL_ROPE_EXP2_LOG2
+        const float theta = theta_base * exp2(inv_ndims * (float)r * log2(args.freq_base));
+#else
         const float theta = theta_base * pow(args.freq_base, inv_ndims * (float)r);
+#endif
         float cos_theta;
         float sin_theta;
         glm_rope_yarn(theta,
@@ -1743,7 +1413,11 @@ kernel void kernel_glm_indexer_rope_tail_f32(
     const float inv_ndims = -1.0f / (float)args.rot_dim;
     for (uint i = tid * 2u; i < args.rot_dim; i += nth * 2u) {
         const uint rel_i0 = i;
+#ifdef DS4_METAL_ROPE_EXP2_LOG2
+        const float theta = theta_base * exp2(inv_ndims * (float)rel_i0 * log2(args.freq_base));
+#else
         const float theta = theta_base * pow(args.freq_base, inv_ndims * (float)rel_i0);
+#endif
         float cos_theta;
         float sin_theta;
         glm_rope_yarn(theta,
@@ -1793,7 +1467,11 @@ static inline float2 glm_cache_load_rotated_rope_pair(
         float              corr1) {
     const float theta_base = (float)row;
     const float inv_ndims = -1.0f / (float)qk_rope;
+#ifdef DS4_METAL_ROPE_EXP2_LOG2
+    const float theta = theta_base * exp2(inv_ndims * (float)r * log2(freq_base));
+#else
     const float theta = theta_base * pow(freq_base, inv_ndims * (float)r);
+#endif
     float corr_dims[2] = {corr0, corr1};
     float cos_theta;
     float sin_theta;
@@ -1825,7 +1503,11 @@ static inline float2 glm_cache_load_rotated_rope_pair_f16_only(
         float              corr1) {
     const float theta_base = (float)row;
     const float inv_ndims = -1.0f / (float)qk_rope;
+#ifdef DS4_METAL_ROPE_EXP2_LOG2
+    const float theta = theta_base * exp2(inv_ndims * (float)r * log2(freq_base));
+#else
     const float theta = theta_base * pow(freq_base, inv_ndims * (float)r);
+#endif
     float corr_dims[2] = {corr0, corr1};
     float cos_theta;
     float sin_theta;

@@ -21,17 +21,6 @@ struct ds4_metal_args_dsv4_hc_weighted_sum {
     uint64_t nb1;
 };
 
-struct ds4_metal_args_dsv4_hc_mean {
-    int64_t  n_embd;
-    int64_t  n_hc;
-    int64_t  n_tokens;
-    uint64_t nb_x0;
-    uint64_t nb_x1;
-    uint64_t nb_x2;
-    uint64_t nb0;
-    uint64_t nb1;
-};
-
 struct ds4_metal_args_dsv4_hc_split_weighted_sum {
     int64_t  n_embd;
     int32_t  n_hc;
@@ -88,32 +77,29 @@ struct ds4_metal_args_dsv4_hc_expand {
     int32_t  has_add;
 };
 
-// Sign-stable logistic for the standalone split/sinkhorn path.  exp(-abs(z))
-// is bounded by one, so neither sign can overflow; selecting e/(1+e) for the
-// negative half and 1/(1+e) for the non-negative half preserves the official
-// logistic expression without the small tanh-identity drift at BF16 ties.
+// Numerically stable sigmoid for the standalone split/sinkhorn path. The naive
+// form 1/(1+exp(-z)) overflows for large negative z (exp(-z) blows up);
+// replacing it with the 0.5*(tanh(z/2)+1) identity keeps the value bounded in
+// [0, 1] across the entire float range. Gated by DS4_METAL_HC_STABLE so we can
+// A/B vs the historical form on M5 Max where the faster ALU is more likely to
+// push HC mixer inputs into the unstable regime.
 //
 // Do not automatically use these helpers in the fused HC decode kernels below:
-// those kernels retain their independently qualified arithmetic.
-static inline float ds4_hc_sigmoid(float z) {
-    const float e = exp(-abs(z));
-    const float denominator = 1.0f + e;
-    return z < 0.0f ? e / denominator : 1.0f / denominator;
-}
-
-static inline float4 ds4_hc_sigmoid(float4 z) {
-    const float4 e = exp(-abs(z));
-    const float4 denominator = 1.0f + e;
-    return select(e / denominator, 1.0f / denominator, z >= 0.0f);
-}
-
-static inline float  ds4_hc_twice_sigmoid(float  z) {
-    return 2.0f * ds4_hc_sigmoid(z);
-}
-
-static inline float4 ds4_hc_twice_sigmoid(float4 z) {
-    return 2.0f * ds4_hc_sigmoid(z);
-}
+// routing the fused vector sites through the tanh form produced non-finite
+// logits on M5 Max, while the historical inline exp form remains finite and is
+// the decode throughput baseline.
+#ifdef DS4_METAL_HC_STABLE
+static inline float  ds4_hc_sigmoid(float  z)  { return 0.5f * tanh(0.5f * z) + 0.5f; }
+static inline float4 ds4_hc_sigmoid(float4 z)  { return 0.5f * tanh(0.5f * z) + 0.5f; }
+// 2 * sigmoid(z) == 1 + tanh(z/2).
+static inline float  ds4_hc_twice_sigmoid(float  z) { return 1.0f + tanh(0.5f * z); }
+static inline float4 ds4_hc_twice_sigmoid(float4 z) { return 1.0f + tanh(0.5f * z); }
+#else
+static inline float  ds4_hc_sigmoid(float  z)  { return 1.0f / (1.0f + exp(-z)); }
+static inline float4 ds4_hc_sigmoid(float4 z)  { return 1.0f / (1.0f + exp(-z)); }
+static inline float  ds4_hc_twice_sigmoid(float  z) { return 2.0f / (1.0f + exp(-z)); }
+static inline float4 ds4_hc_twice_sigmoid(float4 z) { return 2.0f / (1.0f + exp(-z)); }
+#endif
 
 // Splits an HC mixer row into pre weights, post gates, and the HC-to-HC
 // combination matrix. The 4-channel path is specialized because DS4 Flash uses
@@ -896,28 +882,4 @@ kernel void kernel_dsv4_hc_weighted_sum(
     }
 
     *((device float *) (dst + d*args.nb0 + t*args.nb1)) = acc;
-}
-
-// DSpark captures the arithmetic mean of the post-layer HC lanes.  A dedicated
-// kernel avoids a shared weight buffer whose lifetime could otherwise race an
-// unretained command buffer.
-kernel void kernel_dsv4_hc_mean(
-        constant ds4_metal_args_dsv4_hc_mean & args,
-        device  const char * x,
-        device        char * dst,
-        uint gid [[thread_position_in_grid]]) {
-    const int64_t n_elem = args.n_embd * args.n_tokens;
-    if ((int64_t) gid >= n_elem) {
-        return;
-    }
-
-    const int64_t d = ((int64_t) gid) % args.n_embd;
-    const int64_t t = ((int64_t) gid) / args.n_embd;
-    float acc = 0.0f;
-    for (int64_t h = 0; h < args.n_hc; ++h) {
-        acc += *((device const float *)
-            (x + d*args.nb_x0 + h*args.nb_x1 + t*args.nb_x2));
-    }
-    *((device float *) (dst + d*args.nb0 + t*args.nb1)) =
-        acc / (float) args.n_hc;
 }

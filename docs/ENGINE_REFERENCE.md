@@ -635,12 +635,10 @@ conversation. Useful commands are `/help`, `/think`, `/think-max`, `/nothink`,
 and returns to `ds4>`.
 
 The CLI defaults to thinking mode. Use `/nothink` or `--nothink` for direct
-answers. The legacy CLI options `--mtp`, `--mtp-draft`, and `--mtp-margin` are
-retired and fail closed before model loading. Their mutating speculative path
-does not have the caller-visible RNG and generation-block ledger required by
-the transactional CLI. This retirement is limited to `hebrus`/`ds4`; the
-server and agent retain their existing MTP behavior until their generation
-loops are migrated and audited separately.
+answers. `--mtp MTP.gguf --mtp-draft 2` enables the optional MTP speculative
+path; it is useful only for greedy decoding, currently uses a confidence gate
+(`--mtp-margin`) to avoid slow partial accepts, and should be treated as an
+experimental slight-speedup path.
 
 ## Server
 

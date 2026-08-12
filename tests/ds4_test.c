@@ -3983,18 +3983,6 @@ static void test_metal_kernel_group(void) {
     TEST_ASSERT(
         hebrus_gpu_internal_stream_expert_cache_scan_limit_test() != 0);
     TEST_ASSERT(ds4_gpu_internal_qwen35_expert_group_test() != 0);
-    TEST_ASSERT(ds4_gpu_internal_bf16_round_f32_test() != 0);
-    TEST_ASSERT(ds4_gpu_internal_dspark_q_head_norm_bf16_test() != 0);
-    TEST_ASSERT(ds4_gpu_internal_dspark_router_f32_test() != 0);
-    TEST_ASSERT(ds4_gpu_internal_dspark_support_routed_moe_test() != 0);
-    TEST_ASSERT(ds4_gpu_internal_dspark_support_full_width_test() != 0);
-    TEST_ASSERT(ds4_gpu_internal_dspark_three_stage_proposal_test() != 0);
-    /* Prove fixture teardown: the second call must regenerate, authenticate,
-     * remap, execute, drain every no-copy wrapper, and unmap again. */
-    TEST_ASSERT(ds4_gpu_internal_dspark_three_stage_proposal_test() != 0);
-    TEST_ASSERT(ds4_gpu_internal_dspark_stage_zero_physical_test() != 0);
-    TEST_ASSERT(ds4_gpu_internal_dspark_stage_executor_test() != 0);
-    TEST_ASSERT(ds4_gpu_internal_dspark_head_execute_test() != 0);
     TEST_ASSERT(ds4_gpu_internal_shared_event_resume_latency_test() != 0);
     TEST_ASSERT(ds4_gpu_internal_experts_ready_event_test() != 0);
     if (getenv("DS4_METAL_DENSE_MV_BENCH")) {
@@ -4002,9 +3990,6 @@ static void test_metal_kernel_group(void) {
         TEST_ASSERT(ds4_gpu_internal_routed_moe_bandwidth_test() != 0);
     }
     test_metal_selected_slots_runtime_count();
-    /* This test retains one model-map page for its Metal no-copy sink view;
-     * keep it last so later tests do not replace that view. */
-    TEST_ASSERT(ds4_gpu_internal_dspark_two_source_attention_test() != 0);
 }
 
 static void test_metal_installed_source_group(void) {
@@ -4016,10 +4001,6 @@ static void test_metal_qwen35_expert_pack(void) {
     TEST_ASSERT(
         ds4_gpu_internal_qwen35_stream_staging_rollback_test() != 0);
     TEST_ASSERT(ds4_gpu_internal_qwen35_lease_error_unwind_test() != 0);
-    TEST_ASSERT(ds4_gpu_internal_dspark_dual_store_test() != 0);
-    TEST_ASSERT(ds4_gpu_internal_dspark_support_cache_test() != 0);
-    TEST_ASSERT(ds4_gpu_internal_dspark_hc_mean_test() != 0);
-    TEST_ASSERT(ds4_gpu_internal_dspark_history_test() != 0);
     TEST_ASSERT(ds4_gpu_internal_expert_store_v2_kernel_test() != 0);
 }
 
