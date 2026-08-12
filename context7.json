@@ -1,0 +1,26 @@
+{
+  "$schema": "https://context7.com/schema/context7.json",
+  "projectTitle": "Hebrus",
+  "description": "Metal-first MoE inference for Apple Silicon with bounded SSD expert streaming, qualified GGUF artifacts, and documented local API subsets.",
+  "branch": "main",
+  "folders": [
+    "docs"
+  ],
+  "excludeFolders": [
+    "docs/media",
+    "docs/work",
+    "docs/benchmarks/raw"
+  ],
+  "excludeFiles": [
+    "REBRAND_ROLLOUT_PLAN.md",
+    "HF_MODEL_RENAME_INVENTORY.md"
+  ],
+  "rules": [
+    "Treat README.md and docs/contracts/RUNTIME_SUPPORT.md as the human-readable support authority.",
+    "Treat docs/contracts/qwen-release.json as the machine-readable Qwen artifact authority.",
+    "Do not generalize qualified artifacts or hardware profiles to arbitrary GGUF files, model families, or Macs.",
+    "Use the hebrus command names in new examples; legacy names are compatibility aliases.",
+    "Treat benchmark results as condition-scoped evidence, not universal or cross-engine performance claims.",
+    "Describe the local API endpoints as documented subsets rather than full OpenAI or Anthropic compatibility."
+  ]
+}
