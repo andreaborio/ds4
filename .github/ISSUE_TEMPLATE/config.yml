@@ -2,7 +2,7 @@ blank_issues_enabled: false
 contact_links:
   - name: Security policy
     url: https://github.com/andreaborio/hebrus/blob/main/SECURITY.md
-    about: Read the private-reporting status before reporting a vulnerability. Do not disclose vulnerability details in a public issue.
+    about: Report vulnerabilities privately. Do not disclose vulnerability details in a public issue.
   - name: Contribution guide
     url: https://github.com/andreaborio/hebrus/blob/main/CONTRIBUTING.md
     about: Review the contribution, validation, evidence, and compatibility requirements before opening a pull request.

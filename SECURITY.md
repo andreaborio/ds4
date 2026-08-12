@@ -2,16 +2,13 @@
 
 ## Reporting A Vulnerability
 
-Use GitHub's private vulnerability reporting flow when it is available for
-this repository:
+Use GitHub's private vulnerability reporting flow for this repository:
 
 <https://github.com/andreaborio/hebrus/security/advisories/new>
 
-If the advisory form is unavailable, the repository does not yet expose a
-verified private security intake. Do not work around that limitation by opening
-an issue, discussion, or pull request. Enabling private vulnerability reporting
-or publishing another verified private contact remains an administrative gate
-before a wider launch.
+Private vulnerability reporting was enabled and verified on 2026-08-12. If the
+advisory form is temporarily unavailable, do not work around that limitation by
+opening an issue, discussion, or pull request.
 
 Never disclose an undisclosed vulnerability in a public issue, discussion, or
 pull request. Public details can expose users before a fix or mitigation is

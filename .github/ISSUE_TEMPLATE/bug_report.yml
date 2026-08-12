@@ -1,6 +1,7 @@
 name: Bug report
 description: Report a reproducible Hebrus runtime, build, API, model-loading, or compatibility problem.
 title: "[Bug]: "
+labels: ["bug", "needs-reproduction"]
 body:
   - type: markdown
     attributes:

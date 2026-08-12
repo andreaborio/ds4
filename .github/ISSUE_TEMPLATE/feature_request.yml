@@ -1,6 +1,7 @@
 name: Feature request
 description: Propose a focused Hebrus capability or support-contract change.
 title: "[Feature]: "
+labels: ["enhancement"]
 body:
   - type: markdown
     attributes:

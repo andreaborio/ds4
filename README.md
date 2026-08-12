@@ -261,7 +261,7 @@ documentation, compatibility contracts, build isolation, installation, and
 the supported command surface.
 
 Do not disclose vulnerability details in an issue, discussion, or pull request.
-Follow the current private-reporting status in [SECURITY.md](SECURITY.md).
+Use the private reporting flow documented in [SECURITY.md](SECURITY.md).
 
 Hebrus is available under the [MIT License](LICENSE). Model weights and datasets
 are distributed under their own terms; this repository's software license does
