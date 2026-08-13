@@ -74,7 +74,10 @@ placeholder, and add the same numbered `version` and `date-released` to
 Use a fresh output directory and bind the bundle to either the full
 40-character release commit or an exact local tag. The ref must resolve to the
 clean checked-out `HEAD`; mutable branch names, dirty trees, submodule gitlinks,
-and existing destination artifacts are rejected.
+nonempty or linked output directories, and existing destination artifacts are
+rejected. Archive generation uses an isolated view of the commit's Git objects,
+so repository-local attributes, replacement objects, grafts, and user or system
+Git configuration cannot change the committed tree being packaged.
 
 ```sh
 export RELEASE_VERSION=<X.Y.Z-without-leading-v>
@@ -105,9 +108,12 @@ Retain and publish these three files together:
 The read-only manual
 [`release-source.yml`](.github/workflows/release-source.yml) workflow performs
 the same generator tests, double-build smoke, verification, and artifact
-retention for an immutable input ref. It does not create or modify a GitHub
-Release. Downloaded workflow artifacts are staging evidence; re-run the local
-verifier on the exact three files before publication.
+retention after resolving its full-commit or exact-tag input to a recorded full
+commit. It does not create or modify a GitHub Release. Downloaded workflow
+artifacts are staging evidence; re-run the local verifier on the exact three
+files before publication. The checksum set establishes internal consistency;
+publisher authenticity still depends on obtaining its digest or files through
+the trusted release channel.
 
 ## 1. Repository And Build Sanity
 

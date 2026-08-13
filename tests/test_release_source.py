@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import gzip
 import hashlib
+import io
 import json
 import os
 import subprocess
@@ -99,6 +100,76 @@ class ReleaseSourceTest(unittest.TestCase):
         )
         return output / f"hebrus-{VERSION}-source.json"
 
+    def replace_archive(self, manifest_path: Path, archive_bytes: bytes) -> None:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        archive = manifest_path.parent / manifest["archive"]["filename"]
+        archive.write_bytes(archive_bytes)
+        manifest["archive"]["bytes"] = archive.stat().st_size
+        manifest["archive"]["sha256"] = hashlib.sha256(archive_bytes).hexdigest()
+        manifest_path.write_text(
+            json.dumps(manifest, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+        (manifest_path.parent / "SHA256SUMS").write_text(
+            f"{manifest['archive']['sha256']}  {archive.name}\n"
+            f"{hashlib.sha256(manifest_path.read_bytes()).hexdigest()}  "
+            f"{manifest_path.name}\n",
+            encoding="utf-8",
+        )
+
+    def replace_with_tar_members(
+        self,
+        manifest_path: Path,
+        members: list[tuple[str, str, bytes | str, dict[str, str] | None]],
+    ) -> None:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        tar_stream = io.BytesIO()
+        with tarfile.open(
+            fileobj=tar_stream,
+            mode="w",
+            format=tarfile.PAX_FORMAT,
+            pax_headers={"comment": manifest["git_commit"]},
+        ) as archive:
+            for name, kind, value, pax_headers in members:
+                member = tarfile.TarInfo(name)
+                member.uid = 0
+                member.gid = 0
+                member.uname = "root"
+                member.gname = "root"
+                member.mtime = manifest["source_date_epoch"]
+                member.pax_headers = pax_headers or {}
+                if kind == "dir":
+                    member.type = tarfile.DIRTYPE
+                    member.mode = 0o755
+                    archive.addfile(member)
+                elif kind == "link":
+                    member.type = tarfile.SYMTYPE
+                    member.mode = 0o777
+                    member.linkname = str(value)
+                    archive.addfile(member)
+                else:
+                    data = bytes(value)
+                    member.type = tarfile.REGTYPE
+                    member.mode = 0o644
+                    member.size = len(data)
+                    archive.addfile(member, io.BytesIO(data))
+
+        compressed = io.BytesIO()
+        with gzip.GzipFile(
+            filename="",
+            mode="wb",
+            compresslevel=9,
+            fileobj=compressed,
+            mtime=0,
+        ) as stream:
+            stream.write(tar_stream.getvalue())
+        manifest["archive"]["members"] = len(members)
+        manifest_path.write_text(
+            json.dumps(manifest, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+        self.replace_archive(manifest_path, compressed.getvalue())
+
     def test_bundle_is_reproducible_and_self_verifying(self) -> None:
         first = self.base / "first"
         second = self.base / "second"
@@ -133,6 +204,46 @@ class ReleaseSourceTest(unittest.TestCase):
         self.assertEqual(members[f"{root}/verify.sh"].mode & 0o777, 0o755)
         self.assertTrue(members[f"{root}/makefile-link"].issym())
         self.assertEqual(members[f"{root}/makefile-link"].linkname, "Makefile")
+
+    def test_local_archive_attributes_cannot_change_commit_output(self) -> None:
+        first = self.base / "attributes-first"
+        second = self.base / "attributes-second"
+        self.build(first)
+
+        info_attributes = self.repository / ".git" / "info" / "attributes"
+        info_attributes.write_text(
+            "verify.sh export-ignore\nMakefile export-subst\n",
+            encoding="utf-8",
+        )
+        self.assertEqual(self.git("status", "--porcelain").stdout, "")
+        self.build(second)
+
+        for name in (
+            f"hebrus-{VERSION}.tar.gz",
+            f"hebrus-{VERSION}-source.json",
+            "SHA256SUMS",
+        ):
+            self.assertEqual((first / name).read_bytes(), (second / name).read_bytes())
+
+        with tarfile.open(second / f"hebrus-{VERSION}.tar.gz", "r:gz") as archive:
+            self.assertIn(f"hebrus-{VERSION}/verify.sh", archive.getnames())
+
+    def test_replace_objects_cannot_substitute_the_release_commit(self) -> None:
+        (self.repository / "replacement.txt").write_text("replacement\n", encoding="utf-8")
+        self.git("add", "replacement.txt")
+        env = os.environ.copy()
+        env.update({"GIT_AUTHOR_DATE": FIXED_DATE, "GIT_COMMITTER_DATE": FIXED_DATE})
+        self.git("commit", "--quiet", "-m", "replacement", env=env)
+        replacement = self.git("rev-parse", "HEAD").stdout.strip()
+        self.git("reset", "--hard", "--quiet", self.commit)
+        self.git("replace", self.commit, replacement)
+
+        output = self.base / "replaced"
+        manifest = self.build(output)
+        value = json.loads(manifest.read_text(encoding="utf-8"))
+        self.assertEqual(value["git_commit"], self.commit)
+        with tarfile.open(output / f"hebrus-{VERSION}.tar.gz", "r:gz") as archive:
+            self.assertNotIn(f"hebrus-{VERSION}/replacement.txt", archive.getnames())
 
     def test_dirty_tree_mutable_ref_and_invalid_version_fail_closed(self) -> None:
         invalid = self.tool(
@@ -260,6 +371,42 @@ class ReleaseSourceTest(unittest.TestCase):
         )
         self.assertIn("SHA-256 does not match", tampered.stderr)
 
+        nonempty = self.base / "nonempty"
+        nonempty.mkdir()
+        (nonempty / "unrelated.txt").write_text("keep\n", encoding="utf-8")
+        rejected = self.tool(
+            "build",
+            "--repository",
+            str(self.repository),
+            "--version",
+            VERSION,
+            "--ref",
+            self.commit,
+            "--output-dir",
+            str(nonempty),
+            expect_success=False,
+        )
+        self.assertIn("must be empty", rejected.stderr)
+        self.assertEqual((nonempty / "unrelated.txt").read_text(encoding="utf-8"), "keep\n")
+
+        real_output = self.base / "real-output"
+        real_output.mkdir()
+        linked_output = self.base / "linked-output"
+        linked_output.symlink_to(real_output, target_is_directory=True)
+        rejected = self.tool(
+            "build",
+            "--repository",
+            str(self.repository),
+            "--version",
+            VERSION,
+            "--ref",
+            self.commit,
+            "--output-dir",
+            str(linked_output),
+            expect_success=False,
+        )
+        self.assertIn("must not be a symlink", rejected.stderr)
+
     def test_noncanonical_gzip_wrapper_is_rejected(self) -> None:
         output = self.base / "wrapper"
         manifest_path = self.build(output)
@@ -298,6 +445,103 @@ class ReleaseSourceTest(unittest.TestCase):
             expect_success=False,
         )
         self.assertIn("gzip wrapper is not canonical", result.stderr)
+
+    def test_gzip_crc_trailing_data_and_second_member_are_rejected(self) -> None:
+        cases = ("crc", "trailing", "concatenated")
+        for case in cases:
+            with self.subTest(case=case):
+                output = self.base / f"gzip-{case}"
+                manifest = self.build(output)
+                archive = output / f"hebrus-{VERSION}.tar.gz"
+                data = bytearray(archive.read_bytes())
+                if case == "crc":
+                    data[-8] ^= 0x01
+                    expected = "checksum or size is invalid"
+                elif case == "trailing":
+                    data.extend(b"unexpected")
+                    expected = "trailing or concatenated"
+                else:
+                    data.extend(gzip.compress(b"second stream", mtime=0))
+                    expected = "trailing or concatenated"
+                self.replace_archive(manifest, bytes(data))
+                result = self.tool(
+                    "verify", "--manifest", str(manifest), expect_success=False
+                )
+                self.assertIn(expected, result.stderr)
+
+    def test_unsafe_tar_structure_links_and_metadata_are_rejected(self) -> None:
+        root = f"hebrus-{VERSION}"
+        cases = {
+            "path-alias": (
+                [(root, "dir", b"", None), (f"{root}/./file", "file", b"x", None)],
+                "escapes its top-level directory",
+            ),
+            "link-chain": (
+                [
+                    (root, "dir", b"", None),
+                    (f"{root}/a", "link", "b", None),
+                    (f"{root}/b", "link", "../..", None),
+                ],
+                "escapes its top-level directory",
+            ),
+            "missing-parent": (
+                [
+                    (root, "dir", b"", None),
+                    (f"{root}/missing/child", "file", b"x", None),
+                ],
+                "preceding directory parent",
+            ),
+            "file-parent": (
+                [
+                    (root, "dir", b"", None),
+                    (f"{root}/file", "file", b"x", None),
+                    (f"{root}/file/child", "file", b"x", None),
+                ],
+                "preceding directory parent",
+            ),
+            "extended-metadata": (
+                [
+                    (root, "dir", b"", None),
+                    (
+                        f"{root}/file",
+                        "file",
+                        b"x",
+                        {"SCHILY.xattr.user.release-test": "present"},
+                    ),
+                ],
+                "unsupported extended metadata",
+            ),
+        }
+        for name, (members, expected) in cases.items():
+            with self.subTest(case=name):
+                output = self.base / f"tar-{name}"
+                manifest = self.build(output)
+                self.replace_with_tar_members(manifest, members)
+                result = self.tool(
+                    "verify", "--manifest", str(manifest), expect_success=False
+                )
+                self.assertIn(expected, result.stderr)
+
+    def test_duplicate_manifest_fields_are_rejected(self) -> None:
+        output = self.base / "duplicate-json"
+        manifest = self.build(output)
+        text = manifest.read_text(encoding="utf-8")
+        text = text.replace(
+            '  "project": "hebrus",\n',
+            '  "project": "hebrus",\n  "project": "hebrus",\n',
+            1,
+        )
+        manifest.write_text(text, encoding="utf-8")
+        archive = output / f"hebrus-{VERSION}.tar.gz"
+        (output / "SHA256SUMS").write_text(
+            f"{hashlib.sha256(archive.read_bytes()).hexdigest()}  {archive.name}\n"
+            f"{hashlib.sha256(manifest.read_bytes()).hexdigest()}  {manifest.name}\n",
+            encoding="utf-8",
+        )
+        result = self.tool(
+            "verify", "--manifest", str(manifest), expect_success=False
+        )
+        self.assertIn("duplicate field", result.stderr)
 
 
 if __name__ == "__main__":

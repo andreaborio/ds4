@@ -203,7 +203,9 @@ make NATIVE_CPU_FLAG= BUILD_GIT_SHA=<12-character-release-commit>
 ```
 
 The exact reproducibility, verification, and smoke-install procedure is part of
-the [release checklist](QA_BEFORE_RELEASES.md#source-release-bundle).
+the [release checklist](QA_BEFORE_RELEASES.md#source-release-bundle). The
+checksum set detects bundle drift but does not identify its publisher by
+itself; obtain the files or published digest through a trusted release channel.
 
 The canonical commands are `hebrus`, `hebrus-server`, `hebrus-agent`,
 `hebrus-bench`, and `hebrus-eval`. Their `ds4*` compatibility names point to

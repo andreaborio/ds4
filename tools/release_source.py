@@ -12,10 +12,12 @@ import os
 import posixpath
 import re
 import shutil
+import struct
 import subprocess
 import sys
 import tarfile
 import tempfile
+import zlib
 from pathlib import Path, PurePosixPath
 
 
@@ -40,6 +42,7 @@ CANONICAL_MODES = {
     "dir": frozenset({0o755}),
     "link": frozenset({0o777}),
 }
+CANONICAL_GZIP_HEADER = b"\x1f\x8b\x08\x00\x00\x00\x00\x00\x02\xff"
 
 
 class ReleaseSourceError(RuntimeError):
@@ -50,11 +53,29 @@ def fail(message: str) -> None:
     raise ReleaseSourceError(message)
 
 
+def clean_git_environment() -> dict[str, str]:
+    """Return an environment without caller-selected Git repositories/config."""
+    environment = os.environ.copy()
+    for key in tuple(environment):
+        if key.startswith("GIT_"):
+            environment.pop(key)
+    environment.update(
+        {
+            "GIT_ATTR_NOSYSTEM": "1",
+            "GIT_CONFIG_GLOBAL": os.devnull,
+            "GIT_CONFIG_NOSYSTEM": "1",
+            "GIT_NO_REPLACE_OBJECTS": "1",
+        }
+    )
+    return environment
+
+
 def run_git(repository: Path, *args: str, text: bool = True) -> str | bytes:
     try:
         completed = subprocess.run(
-            ["git", *args],
+            ["git", "--no-replace-objects", *args],
             cwd=repository,
+            env=clean_git_environment(),
             check=True,
             capture_output=True,
             text=text,
@@ -125,29 +146,77 @@ def write_json(path: Path, value: object) -> None:
     )
 
 
+def parse_json_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
+    value: dict[str, object] = {}
+    for key, item in pairs:
+        if key in value:
+            fail(f"source manifest contains a duplicate field: {key}")
+        value[key] = item
+    return value
+
+
 def require_plain_regular_file(path: Path, label: str) -> None:
     if path.is_symlink() or not path.is_file():
         fail(f"{label} must be a regular file: {path}")
 
 
 def safe_member_path(name: str, root: str) -> bool:
-    if name == root:
-        return True
-    if not name.startswith(root + "/"):
+    if "\\" in name or "\x00" in name:
         return False
-    path = PurePosixPath(name)
-    return not path.is_absolute() and all(
-        part not in ("", ".", "..") for part in path.parts
+    parts = name.split("/")
+    return (
+        parts[0] == root
+        and all(part not in ("", ".", "..") for part in parts)
+        and (len(parts) > 1 or name == root)
     )
 
 
-def validate_link_target(member: tarfile.TarInfo, root: str) -> None:
+def validate_link_target(member: tarfile.TarInfo) -> None:
     target = member.linkname
-    if not target or target.startswith("/"):
+    if (
+        not target
+        or target.startswith("/")
+        or "\\" in target
+        or "\x00" in target
+        or posixpath.normpath(target) != target
+    ):
         fail(f"archive has unsafe link target: {member.name} -> {target}")
-    resolved = posixpath.normpath(posixpath.join(posixpath.dirname(member.name), target))
-    if not safe_member_path(resolved, root):
-        fail(f"archive link escapes its top-level directory: {member.name} -> {target}")
+
+
+def validate_link_graph(symlinks: dict[str, str], root: str) -> None:
+    """Resolve archive symlinks component-wise so chained links cannot escape."""
+    for link_name, initial_target in symlinks.items():
+        pending = link_name.split("/")[:-1] + initial_target.split("/")
+        resolved: list[str] = []
+        followed: set[str] = set()
+        while pending:
+            part = pending.pop(0)
+            if part == ".":
+                continue
+            if part == "..":
+                if len(resolved) <= 1:
+                    fail(
+                        "archive link escapes its top-level directory: "
+                        f"{link_name} -> {initial_target}"
+                    )
+                resolved.pop()
+                continue
+
+            resolved.append(part)
+            candidate = "/".join(resolved)
+            if candidate not in symlinks:
+                continue
+            if candidate in followed:
+                fail(f"archive contains a symlink cycle involving {candidate}")
+            followed.add(candidate)
+            resolved.pop()
+            pending = symlinks[candidate].split("/") + pending
+
+        if not resolved or resolved[0] != root:
+            fail(
+                "archive link escapes its top-level directory: "
+                f"{link_name} -> {initial_target}"
+            )
 
 
 @contextlib.contextmanager
@@ -157,49 +226,79 @@ def open_canonical_gzip_tar(path: Path):
     except OSError as exc:
         fail(f"cannot open source archive {path}: {exc}")
     try:
-        header = raw.read(10)
-        if len(header) != 10 or header[:3] != b"\x1f\x8b\x08":
-            fail(f"source archive has an invalid gzip header: {path}")
-        flags = header[3]
-        mtime = int.from_bytes(header[4:8], "little")
-        if flags != 0 or mtime != 0:
+        header = raw.read(len(CANONICAL_GZIP_HEADER))
+        if header != CANONICAL_GZIP_HEADER:
             fail(f"source archive gzip wrapper is not canonical: {path}")
-        raw.seek(0)
-        with gzip.GzipFile(fileobj=raw, mode="rb") as compressed:
-            with tarfile.open(fileobj=compressed, mode="r|") as archive:
-                yield archive
-    except (gzip.BadGzipFile, tarfile.TarError, EOFError, OSError) as exc:
+
+        decompressor = zlib.decompressobj(-zlib.MAX_WBITS)
+        crc = 0
+        expanded_size = 0
+        trailer = b""
+        with tempfile.SpooledTemporaryFile(max_size=8 * 1024 * 1024) as expanded:
+            while True:
+                chunk = raw.read(1024 * 1024)
+                if not chunk:
+                    break
+                data = decompressor.decompress(chunk)
+                if data:
+                    expanded.write(data)
+                    crc = zlib.crc32(data, crc)
+                    expanded_size += len(data)
+                if decompressor.eof:
+                    trailer = decompressor.unused_data + raw.read()
+                    break
+
+            if not decompressor.eof:
+                fail(f"source archive has a truncated gzip stream: {path}")
+            flushed = decompressor.flush()
+            if flushed:
+                expanded.write(flushed)
+                crc = zlib.crc32(flushed, crc)
+                expanded_size += len(flushed)
+            if len(trailer) != 8:
+                fail(f"source archive has trailing or concatenated gzip data: {path}")
+            expected_crc, expected_size = struct.unpack("<II", trailer)
+            if expected_crc != crc or expected_size != expanded_size & 0xFFFFFFFF:
+                fail(f"source archive gzip checksum or size is invalid: {path}")
+
+            expanded.seek(0)
+            with tarfile.open(fileobj=expanded, mode="r:") as archive:
+                yield archive, expanded, expanded_size
+    except (gzip.BadGzipFile, tarfile.TarError, EOFError, OSError, zlib.error) as exc:
         fail(f"cannot read source archive {path}: {exc}")
     finally:
         raw.close()
 
 
-def validate_archive(path: Path, *, root: str, source_date_epoch: int) -> int:
+def validate_archive(
+    path: Path,
+    *,
+    root: str,
+    source_date_epoch: int,
+    git_commit: str,
+) -> int:
     require_plain_regular_file(path, "source archive")
 
     count = 0
-    root_entry = False
-    member_names: set[str] = set()
-    symlink_names: set[str] = set()
-    with open_canonical_gzip_tar(path) as archive:
+    member_kinds: dict[str, str] = {}
+    symlinks: dict[str, str] = {}
+    last_data_end = 0
+    with open_canonical_gzip_tar(path) as (archive, expanded, expanded_size):
+        if archive.pax_headers != {"comment": git_commit}:
+            fail("archive global metadata does not match its Git commit")
         for member in archive:
             count += 1
             if not safe_member_path(member.name, root):
                 fail(f"archive member escapes its top-level directory: {member.name}")
-            if member.name in member_names:
+            if member.name in member_kinds:
                 fail(f"archive contains a duplicate member: {member.name}")
-            if any(
-                member.name.startswith(symlink_name + "/")
-                for symlink_name in symlink_names
-            ):
-                fail(f"archive member is nested below a symlink: {member.name}")
-            if member.issym() and any(
-                existing.startswith(member.name + "/") for existing in member_names
-            ):
-                fail(f"archive symlink replaces a populated directory: {member.name}")
-            member_names.add(member.name)
-            if member.name == root:
-                root_entry = member.isdir()
+            if count == 1:
+                if member.name != root or not member.isdir():
+                    fail("archive does not begin with its top-level directory")
+            else:
+                parent = member.name.rsplit("/", 1)[0]
+                if member_kinds.get(parent) != "dir":
+                    fail(f"archive member lacks a preceding directory parent: {member.name}")
             if ".git" in PurePosixPath(member.name).parts:
                 fail(f"archive unexpectedly contains Git metadata: {member.name}")
             if member.mtime != source_date_epoch:
@@ -207,21 +306,65 @@ def validate_archive(path: Path, *, root: str, source_date_epoch: int) -> int:
                     f"archive member has non-canonical mtime: {member.name} "
                     f"({member.mtime} != {source_date_epoch})"
                 )
-            if member.uid != 0 or member.gid != 0:
-                fail(f"archive member has non-zero owner IDs: {member.name}")
-            if not (member.isfile() or member.isdir() or member.issym()):
+            if (
+                member.uid != 0
+                or member.gid != 0
+                or member.uname != "root"
+                or member.gname != "root"
+            ):
+                fail(f"archive member has non-canonical ownership: {member.name}")
+            if member.type not in {tarfile.REGTYPE, tarfile.DIRTYPE, tarfile.SYMTYPE}:
                 fail(f"archive contains unsupported entry type: {member.name}")
             kind = (
                 "file" if member.isfile() else "dir" if member.isdir() else "link"
             )
-            mode = member.mode & 0o7777
+            mode = member.mode
             if mode not in CANONICAL_MODES[kind]:
                 fail(f"archive member has non-canonical mode: {member.name} ({mode:o})")
-            if member.issym():
-                validate_link_target(member, root)
-                symlink_names.add(member.name)
+            if member.devmajor != 0 or member.devminor != 0:
+                fail(f"archive member has non-zero device numbers: {member.name}")
+            if kind != "file" and member.size != 0:
+                fail(f"archive non-file member has data: {member.name}")
+            if not member.issym() and member.linkname:
+                fail(f"archive non-link member has a link target: {member.name}")
 
-    if count == 0 or not root_entry:
+            allowed_pax = {"comment", "path", "linkpath"}
+            if set(member.pax_headers) - allowed_pax:
+                fail(f"archive member has unsupported extended metadata: {member.name}")
+            if member.pax_headers.get("comment") != git_commit:
+                fail(f"archive member metadata does not match its Git commit: {member.name}")
+            if "path" in member.pax_headers and member.pax_headers["path"] != member.name:
+                fail(f"archive member has inconsistent extended path: {member.name}")
+            if "linkpath" in member.pax_headers and (
+                not member.issym() or member.pax_headers["linkpath"] != member.linkname
+            ):
+                fail(f"archive member has inconsistent extended link path: {member.name}")
+
+            member_kinds[member.name] = kind
+            if member.issym():
+                validate_link_target(member)
+                symlinks[member.name] = member.linkname
+
+            last_data_end = member.offset_data + (
+                (member.size + tarfile.BLOCKSIZE - 1) // tarfile.BLOCKSIZE
+            ) * tarfile.BLOCKSIZE
+
+        if count == 0:
+            fail("archive is empty or lacks its top-level directory entry")
+        validate_link_graph(symlinks, root)
+
+        # git archive writes complete 10 KiB records. At least the two tar EOF
+        # blocks must remain after the final member, extending to that boundary.
+        expected_padding = (-last_data_end) % tarfile.RECORDSIZE
+        if expected_padding < 2 * tarfile.BLOCKSIZE:
+            expected_padding += tarfile.RECORDSIZE
+        if expanded_size - last_data_end != expected_padding:
+            fail("archive tar record padding is not canonical")
+        expanded.seek(last_data_end)
+        if any(expanded.read()):
+            fail("archive has non-zero data after its final member")
+
+    if count == 0:
         fail("archive is empty or lacks its top-level directory entry")
     return count
 
@@ -238,10 +381,97 @@ def expected_checksums(archive_path: Path, manifest_path: Path) -> str:
     )
 
 
+def create_isolated_git_archive(
+    repository: Path,
+    commit: str,
+    prefix: str,
+    destination: Path,
+    work: Path,
+) -> None:
+    """Archive a commit through a bare object view with no local attributes."""
+    object_text = str(
+        run_git(repository, "rev-parse", "--path-format=absolute", "--git-path", "objects")
+    ).strip()
+    if not object_text or "\n" in object_text or "\r" in object_text:
+        fail("repository has an invalid Git object directory")
+    object_directory = Path(object_text)
+    if not object_directory.is_dir():
+        fail(f"repository Git object directory is unavailable: {object_directory}")
+
+    git_directory = work / "repository.git"
+    (git_directory / "objects" / "info").mkdir(parents=True)
+    (git_directory / "refs").mkdir()
+    (git_directory / "config").write_text(
+        "[core]\n\trepositoryformatversion = 0\n\tbare = true\n",
+        encoding="utf-8",
+        newline="\n",
+    )
+    (git_directory / "HEAD").write_text(
+        "ref: refs/heads/unborn\n", encoding="utf-8", newline="\n"
+    )
+    (git_directory / "objects" / "info" / "alternates").write_text(
+        str(object_directory.resolve()) + "\n",
+        encoding="utf-8",
+        newline="\n",
+    )
+
+    try:
+        subprocess.run(
+            [
+                "git",
+                "--no-replace-objects",
+                f"--git-dir={git_directory}",
+                "-c",
+                "tar.umask=0022",
+                "archive",
+                "--format=tar",
+                f"--prefix={prefix}/",
+                f"--output={destination}",
+                commit,
+            ],
+            cwd=repository,
+            env=clean_git_environment(),
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+    except subprocess.CalledProcessError as exc:
+        detail = exc.stderr.strip()
+        fail(f"git archive failed{': ' + detail if detail else ''}")
+
+
+def publish_artifacts(sources: tuple[Path, ...], destinations: list[Path]) -> None:
+    """Publish without ever replacing a destination created by another writer."""
+    published: list[tuple[Path, Path]] = []
+    try:
+        for source, destination in zip(sources, destinations, strict=True):
+            try:
+                os.link(source, destination, follow_symlinks=False)
+            except FileExistsError:
+                fail(f"refusing to overwrite release artifact: {destination}")
+            published.append((source, destination))
+    except (OSError, ReleaseSourceError):
+        for source, destination in reversed(published):
+            try:
+                source_stat = source.stat(follow_symlinks=False)
+                destination_stat = destination.stat(follow_symlinks=False)
+                if (
+                    source_stat.st_dev == destination_stat.st_dev
+                    and source_stat.st_ino == destination_stat.st_ino
+                ):
+                    destination.unlink()
+            except (FileNotFoundError, OSError):
+                pass
+        raise
+
+
 def verify_bundle(manifest_path: Path) -> dict[str, object]:
     require_plain_regular_file(manifest_path, "source manifest")
     try:
-        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        manifest = json.loads(
+            manifest_path.read_text(encoding="utf-8"),
+            object_pairs_hook=parse_json_object,
+        )
     except (OSError, UnicodeError, json.JSONDecodeError) as exc:
         fail(f"cannot read source manifest {manifest_path}: {exc}")
     if not isinstance(manifest, dict):
@@ -306,7 +536,12 @@ def verify_bundle(manifest_path: Path) -> dict[str, object]:
         fail("source archive byte count does not match its manifest")
     if sha256_file(archive_path) != archive["sha256"]:
         fail("source archive SHA-256 does not match its manifest")
-    members = validate_archive(archive_path, root=stem, source_date_epoch=epoch)
+    members = validate_archive(
+        archive_path,
+        root=stem,
+        source_date_epoch=epoch,
+        git_commit=commit,
+    )
     if members != archive["members"]:
         fail("source archive member count does not match its manifest")
 
@@ -324,6 +559,8 @@ def verify_bundle(manifest_path: Path) -> dict[str, object]:
 
 def build_bundle(repository: Path, version: str, ref: str, output_dir: Path) -> Path:
     repository = repository.resolve()
+    if output_dir.is_symlink():
+        fail(f"output directory must not be a symlink: {output_dir}")
     output_dir = output_dir.resolve()
     validate_version(version)
     commit = resolve_immutable_ref(repository, ref)
@@ -342,6 +579,8 @@ def build_bundle(repository: Path, version: str, ref: str, output_dir: Path) -> 
         fail(f"commit has invalid timestamp: {epoch_text}")
 
     output_dir.mkdir(parents=True, exist_ok=True)
+    if any(output_dir.iterdir()):
+        fail(f"release output directory must be empty: {output_dir}")
     with tempfile.TemporaryDirectory(prefix=".hebrus-release-", dir=output_dir) as temporary:
         work = Path(temporary)
         tar_path = work / f"{stem}.tar"
@@ -349,23 +588,7 @@ def build_bundle(repository: Path, version: str, ref: str, output_dir: Path) -> 
         manifest_path = work / manifest_name
         checksum_path = work / checksum_name
 
-        try:
-            subprocess.run(
-                [
-                    "git",
-                    "-c",
-                    "tar.umask=0022",
-                    "archive",
-                    "--format=tar",
-                    f"--prefix={stem}/",
-                    f"--output={tar_path}",
-                    commit,
-                ],
-                cwd=repository,
-                check=True,
-            )
-        except subprocess.CalledProcessError:
-            fail("git archive failed")
+        create_isolated_git_archive(repository, commit, stem, tar_path, work)
 
         with tar_path.open("rb") as source, archive_path.open("wb") as destination:
             with gzip.GzipFile(
@@ -381,6 +604,7 @@ def build_bundle(repository: Path, version: str, ref: str, output_dir: Path) -> 
             archive_path,
             root=stem,
             source_date_epoch=source_date_epoch,
+            git_commit=commit,
         )
         manifest = {
             "schema_version": SCHEMA_VERSION,
@@ -405,10 +629,11 @@ def build_bundle(repository: Path, version: str, ref: str, output_dir: Path) -> 
             newline="\n",
         )
 
-        for source, destination in zip(
-            (archive_path, manifest_path, checksum_path), destinations, strict=True
-        ):
-            os.replace(source, destination)
+        verify_bundle(manifest_path)
+        publish_artifacts(
+            (archive_path, manifest_path, checksum_path),
+            destinations,
+        )
 
     final_manifest = output_dir / manifest_name
     verify_bundle(final_manifest)
@@ -451,7 +676,7 @@ def main() -> int:
             )
             print(f"release-source: manifest {manifest}")
         else:
-            value = verify_bundle(args.manifest.resolve())
+            value = verify_bundle(args.manifest.absolute())
             print(
                 f"release-source: verified {value['archive']['filename']} "
                 f"({value['archive']['sha256']})"
