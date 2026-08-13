@@ -78,9 +78,11 @@ release-contract-test: release-contract tools/qwen_release_contract.py \
 		tests/test_qwen_release_contract.py
 	python3 tests/test_qwen_release_contract.py
 
-release-metadata-test: tests/test_release_metadata.py CITATION.cff CHANGELOG.md \
+release-metadata-test: tests/test_release_metadata.py \
+		tests/test_release_metadata_unit.py CITATION.cff CHANGELOG.md \
 		docs/releases/TEMPLATE.md docs/releases/v0.3.0.md
 	python3 tests/test_release_metadata.py
+	python3 tests/test_release_metadata_unit.py
 
 release-source: release-metadata-test
 	@set -eu; \

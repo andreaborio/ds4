@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import os
 import re
 from pathlib import Path
 
@@ -23,12 +24,25 @@ def cff_scalar(text: str, name: str) -> str:
     return match.group(1)
 
 
+def require_expected_version(version: str, expected: str | None) -> None:
+    if expected is None or expected == "":
+        return
+    if SEMVER_RE.fullmatch(expected) is None:
+        fail(f"invalid RELEASE_VERSION: {expected}")
+    if version != expected:
+        fail(
+            f"RELEASE_VERSION {expected} does not match "
+            f"CITATION.cff version {version}"
+        )
+
+
 def main() -> int:
     citation = (ROOT / "CITATION.cff").read_text(encoding="utf-8")
     version = cff_scalar(citation, "version")
     release_date = cff_scalar(citation, "date-released")
     if SEMVER_RE.fullmatch(version) is None:
         fail(f"invalid citation version: {version}")
+    require_expected_version(version, os.environ.get("RELEASE_VERSION"))
     if DATE_RE.fullmatch(release_date) is None:
         fail(f"invalid citation date-released: {release_date}")
 
