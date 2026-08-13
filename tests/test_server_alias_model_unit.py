@@ -272,7 +272,7 @@ class ServerAliasModelUnitTests(unittest.TestCase):
         with tempfile.TemporaryDirectory(prefix="alias-contract-") as directory:
             path = pathlib.Path(directory) / "contract.json"
             document = {
-                "schemaVersion": 1,
+                "schemaVersion": 2,
                 "publishedArtifact": {
                     "status": "published",
                     "filename": "qualified.gguf",
@@ -287,10 +287,21 @@ class ServerAliasModelUnitTests(unittest.TestCase):
             self.assertEqual(artifact.filename, "qualified.gguf")
             self.assertEqual(artifact.size, 3)
 
+            document["schemaVersion"] = 1
+            path.write_text(json.dumps(document), encoding="utf-8")
+            with self.assertRaisesRegex(AssertionError, "schemaVersion 2"):
+                SERVER_ALIAS.load_published_artifact(path)
+
+            document["schemaVersion"] = 2
             document["publishedArtifact"]["sha256"] = "not-a-digest"
             path.write_text(json.dumps(document), encoding="utf-8")
             with self.assertRaisesRegex(AssertionError, "SHA-256"):
                 SERVER_ALIAS.load_published_artifact(path)
+
+    def test_checked_in_contract_is_accepted_by_alias_gate_loader(self) -> None:
+        artifact = SERVER_ALIAS.load_published_artifact()
+        self.assertGreater(artifact.size, 0)
+        self.assertEqual(len(artifact.sha256), 64)
 
     def test_model_verification_requires_manifest_filename_and_hash(self) -> None:
         with tempfile.TemporaryDirectory(prefix="alias-model-") as directory:

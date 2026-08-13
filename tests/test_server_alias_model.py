@@ -83,9 +83,9 @@ def load_published_artifact(path: pathlib.Path = MODEL_CONTRACT) -> PublishedArt
     if (
         not isinstance(document, dict)
         or type(document.get("schemaVersion")) is not int
-        or document.get("schemaVersion") != 1
+        or document.get("schemaVersion") != 2
     ):
-        raise AssertionError("Qwen release contract must use schemaVersion 1")
+        raise AssertionError("Qwen release contract must use schemaVersion 2")
     published = document.get("publishedArtifact")
     if not isinstance(published, dict) or published.get("status") != "published":
         raise AssertionError("Qwen release contract has no published artifact")
