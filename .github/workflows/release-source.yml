@@ -10,7 +10,7 @@ on:
         required: true
         type: string
       ref:
-        description: Full 40-character commit or exact tag checked out for release
+        description: Full staging commit or matching v<version> tag for final assets
         required: true
         type: string
 
@@ -18,7 +18,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: release-source-${{ github.run_id }}
+  group: release-source-${{ inputs.version }}-${{ inputs.ref }}
   cancel-in-progress: false
 
 jobs:

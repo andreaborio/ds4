@@ -69,7 +69,11 @@ Prepare source artifacts only after the version, release notes, changelog, and
 all other intentional release metadata are committed. Start release notes from
 [`docs/releases/TEMPLATE.md`](docs/releases/TEMPLATE.md), remove every
 placeholder, and add the same numbered `version` and `date-released` to
-`CITATION.cff`. Historical tags are not authority for the new citation.
+`CITATION.cff`. Historical tags are not authority for the new citation. The
+versioned note records only facts knowable before the tag: version, date,
+expected tag and asset names, scope, support boundary, and limitations. Do not
+embed its own future commit, archive hash, workflow link, or post-commit
+evidence in the source tree.
 
 Use a fresh output directory and bind the bundle to either the full
 40-character release commit or an exact local tag. The ref must resolve to the
@@ -78,6 +82,9 @@ nonempty or linked output directories, and existing destination artifacts are
 rejected. Archive generation uses an isolated view of the commit's Git objects,
 so repository-local attributes, replacement objects, grafts, and user or system
 Git configuration cannot change the committed tree being packaged.
+Full commit refs are accepted for staging. Final published assets must be
+regenerated from the exact `v$RELEASE_VERSION` tag; a tag whose SemVer does not
+match the requested version is rejected.
 
 ```sh
 export RELEASE_VERSION=<X.Y.Z-without-leading-v>
@@ -104,6 +111,18 @@ Retain and publish these three files together:
 - `hebrus-$RELEASE_VERSION.tar.gz`;
 - `hebrus-$RELEASE_VERSION-source.json`;
 - `SHA256SUMS`.
+
+After the final commit and exact tag exist, the GitHub Release body is the
+post-commit evidence record. It must name the tag's peeled 40-character commit
+target, reproduce the two entries from `SHA256SUMS`, link the hosted
+Linux/macOS jobs and source workflow for that exact commit or tag, link the
+qualified model-backed and manual evidence, and state every skipped or
+non-applicable lane with its reason. This separation avoids a circular attempt
+to commit the hash of an archive or commit that contains the note itself.
+
+If the calendar date changes before publication, update the versioned note and
+`CITATION.cff`, create a new final candidate commit, and rerun every exact-commit
+gate. Do not publish a tag whose recorded release date is stale.
 
 The read-only manual
 [`release-source.yml`](.github/workflows/release-source.yml) workflow performs
@@ -294,7 +313,10 @@ the normal flag-free `AUTO` path selects SSD. Forced SSD on hardware where
 non-regression control only; it cannot justify SSD optimization there.
 
 - Flash q2/q2-q4 streaming:
-  `./ds4 -m "$DEEPSEEK_V2" --ssd-streaming --ssd-streaming-cache-experts 32GB -p "..."`
+  `./hebrus -m "$DEEPSEEK_V2" --ssd-streaming -p "..."`
+  DeepSeek ExpertMajor v2 must use automatic cache sizing; an explicit
+  `--ssd-streaming-cache-experts` budget is rejected because it bypasses the
+  phase cache schedule.
 - Mixed-quant Flash SSD streaming is currently non-applicable because no
   qualified mixed-quant ExpertMajor v2 artifact identity or model-backed
   baseline is recorded. Do not substitute a canonical, v1, sidecar, or

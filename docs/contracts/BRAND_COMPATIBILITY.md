@@ -1,6 +1,6 @@
 # Hebrus Brand Compatibility Contract
 
-Status: bridge contract for the unreleased Hebrus naming transition.
+Status: bridge contract introduced with the Hebrus 0.3.0 source release.
 
 This document defines which public names are canonical, which historical names
 remain accepted, and which identifiers must never be rewritten merely for

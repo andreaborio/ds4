@@ -1,11 +1,11 @@
 cff-version: 1.2.0
-# Version and date are intentionally omitted until a numbered Hebrus release
-# is cut. Add both to the release commit; do not infer them from historical tags.
 message: >-
   If you use this software, please cite it using the metadata in this file and
   preserve the upstream acknowledgements in the repository documentation.
 title: Hebrus
 type: software
+version: 0.3.0
+date-released: 2026-08-13
 authors:
   - name: The ds4.c authors
 abstract: >-

@@ -2,17 +2,21 @@
 
 <!--
 Copy this file to docs/releases/v<version>.md. Replace every angle-bracket
-placeholder, delete these comments, and keep claims limited to evidence from
-the exact release commit. The canonical release gate is QA_BEFORE_RELEASES.md;
-do not copy that checklist into these notes.
+placeholder, delete these comments, and keep claims limited to behavior present
+in the candidate tree. The canonical release gate is
+QA_BEFORE_RELEASES.md; do not copy that checklist into these notes. Commit
+hashes, final asset hashes, and exact-commit job links do not exist until after
+this file is committed; publish those in the source manifest and GitHub Release
+body instead of creating a self-reference here.
 -->
 
 | Release field | Value |
 | --- | --- |
 | Release date | <YYYY-MM-DD> |
-| Source commit | `<full-40-character-commit>` |
+| Release tag | `v<version>` |
+| Distribution | <Source-only, or the exact additional artifacts included> |
 | Source archive | `hebrus-<version>.tar.gz` |
-| Source SHA-256 | `<64-lowercase-hex-digest>` |
+| Provenance | `hebrus-<version>-source.json` and `SHA256SUMS` |
 
 ## Summary
 
@@ -40,8 +44,7 @@ support.>
 
 The exact model artifacts, hardware floors, qualified modes, and context
 frontiers for this release are recorded in the
-[runtime support contract](../contracts/RUNTIME_SUPPORT.md) at the source
-commit above.
+[runtime support contract](../contracts/RUNTIME_SUPPORT.md) at the release tag.
 
 <Call out only support changes introduced by this release. Do not reproduce the
 whole matrix or infer support from compilation.>
@@ -82,19 +85,12 @@ command-name transition and rollback boundary.
 
 ## Validation
 
-The release was evaluated with the canonical
-[release checklist](../../QA_BEFORE_RELEASES.md) on the exact source commit
-above.
-
-| Evidence | Result or link |
-| --- | --- |
-| Hosted Linux and macOS jobs | <permanent run links> |
-| Source archive reproducibility and install smoke | <result or evidence link> |
-| Qualified model-backed lanes | <dated evidence links> |
-| Manual server, cache, and agent lanes | <dated evidence links> |
-
-<Record every skipped or non-applicable lane with its reason. Do not replace a
-missing physical-hardware result with hosted compilation or a simulated lane.>
+The release must be evaluated with the canonical
+[release checklist](../../QA_BEFORE_RELEASES.md) on the exact tag target. The
+GitHub Release body records the full commit, final asset hashes, exact job
+links, model-backed and manual evidence, and every skipped or non-applicable
+lane with its reason. Hosted compilation or a simulated lane cannot replace a
+missing physical-hardware result.
 
 ## Known limitations
 

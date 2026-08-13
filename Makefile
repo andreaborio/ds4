@@ -45,7 +45,7 @@ SERVER_ALIAS_PORT ?= 0
 
 .PHONY: all help clean test model-free-test premerge context-audit doc-links \
 	brand-boundary-audit brand-boundary-test brand-asset-test \
-	release-contract release-contract-test \
+	release-contract release-contract-test release-metadata-test \
 	release-source release-source-test release-source-smoke \
 	imatrix-dataset-check prompt-fixture-check cpu FORCE \
 	metal build-isolation-test q4k-dot-test qwen-metadata-test \
@@ -78,10 +78,14 @@ release-contract-test: release-contract tools/qwen_release_contract.py \
 		tests/test_qwen_release_contract.py
 	python3 tests/test_qwen_release_contract.py
 
-release-source:
+release-metadata-test: tests/test_release_metadata.py CITATION.cff CHANGELOG.md \
+		docs/releases/TEMPLATE.md docs/releases/v0.3.0.md
+	python3 tests/test_release_metadata.py
+
+release-source: release-metadata-test
 	@set -eu; \
 		: "$${RELEASE_VERSION:?set RELEASE_VERSION to the SemVer without a leading v}"; \
-		: "$${RELEASE_REF:?set RELEASE_REF to the full release commit or exact tag}"; \
+		: "$${RELEASE_REF:?set RELEASE_REF to the full release commit or matching v<version> tag}"; \
 		output=$${RELEASE_OUT:-dist/hebrus-$$RELEASE_VERSION}; \
 		python3 tools/release_source.py build \
 			--version "$$RELEASE_VERSION" --ref "$$RELEASE_REF" \
@@ -90,11 +94,11 @@ release-source:
 release-source-test: tools/release_source.py tests/test_release_source.py
 	python3 tests/test_release_source.py
 
-release-source-smoke: tools/release_source.py tests/test_release_source_smoke.sh \
+release-source-smoke: release-metadata-test tools/release_source.py tests/test_release_source_smoke.sh \
 		tests/test_install.sh tests/test_capabilities.py tests/test_command_aliases.py
 	@set -eu; \
 		: "$${RELEASE_VERSION:?set RELEASE_VERSION to the SemVer without a leading v}"; \
-		: "$${RELEASE_REF:?set RELEASE_REF to the full release commit or exact tag}"; \
+		: "$${RELEASE_REF:?set RELEASE_REF to the full release commit or matching v<version> tag}"; \
 		sh tests/test_release_source_smoke.sh
 
 qwen-24g-fixture-test: tests/qwen/test_24g_release_fixture.py \
@@ -706,7 +710,7 @@ prompt-fixture-check:
 # Build isolation removes and rebuilds BUILD_ROOT, so model-free-test must start
 # only after it completes even when an agent invokes `make -j premerge`.
 premerge: context-audit doc-links brand-boundary-audit brand-boundary-test brand-asset-test \
-	release-contract release-contract-test \
+	release-contract release-contract-test release-metadata-test \
 	release-source-test \
 	imatrix-dataset-check prompt-fixture-check qwen-iq-metal-tables-check \
 	build-isolation-test
@@ -940,7 +944,7 @@ prompt-fixture-check:
 	python3 speed-bench/build_long_context_prompt.py --check
 
 premerge: context-audit doc-links brand-boundary-audit brand-boundary-test brand-asset-test \
-	release-contract release-contract-test \
+	release-contract release-contract-test release-metadata-test \
 	release-source-test \
 	imatrix-dataset-check prompt-fixture-check qwen-iq-metal-tables-check \
 	model-free-test

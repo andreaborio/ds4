@@ -112,6 +112,16 @@ def resolve_immutable_ref(repository: Path, ref: str) -> str:
         .strip().lower()
 
 
+def require_tag_matches_version(ref: str, version: str) -> None:
+    """Bind a tag-based final bundle to the same SemVer as its asset names."""
+    if COMMIT_RE.fullmatch(ref.lower()):
+        return
+    expected = f"v{version}"
+    normalized = ref.removeprefix("refs/tags/")
+    if normalized != expected:
+        fail(f"release tag must be {expected} for version {version}")
+
+
 def require_release_checkout(repository: Path, commit: str) -> None:
     head = str(run_git(repository, "rev-parse", "--verify", "HEAD^{commit}")) \
         .strip().lower()
@@ -564,6 +574,7 @@ def build_bundle(repository: Path, version: str, ref: str, output_dir: Path) -> 
     output_dir = output_dir.resolve()
     validate_version(version)
     commit = resolve_immutable_ref(repository, ref)
+    require_tag_matches_version(ref, version)
     require_release_checkout(repository, commit)
 
     stem, archive_name, manifest_name, checksum_name = artifact_names(version)

@@ -304,7 +304,7 @@ class ReleaseSourceTest(unittest.TestCase):
         self.assertIn("clean working tree", dirty.stderr)
 
     def test_exact_tag_is_accepted_and_non_head_commit_is_rejected(self) -> None:
-        self.git("tag", "v1.2.3-test", self.commit)
+        self.git("tag", "v1.2.3", self.commit)
         tagged = self.base / "tagged"
         self.tool(
             "build",
@@ -313,7 +313,7 @@ class ReleaseSourceTest(unittest.TestCase):
             "--version",
             "1.2.3",
             "--ref",
-            "v1.2.3-test",
+            "v1.2.3",
             "--output-dir",
             str(tagged),
         )
@@ -321,6 +321,21 @@ class ReleaseSourceTest(unittest.TestCase):
             (tagged / "hebrus-1.2.3-source.json").read_text(encoding="utf-8")
         )
         self.assertEqual(manifest["git_commit"], self.commit)
+
+        self.git("tag", "v9.9.9", self.commit)
+        mismatched = self.tool(
+            "build",
+            "--repository",
+            str(self.repository),
+            "--version",
+            "1.2.3",
+            "--ref",
+            "v9.9.9",
+            "--output-dir",
+            str(self.base / "mismatched-tag"),
+            expect_success=False,
+        )
+        self.assertIn("release tag must be v1.2.3", mismatched.stderr)
 
         (self.repository / "second.txt").write_text("second\n", encoding="utf-8")
         self.git("add", "second.txt")
