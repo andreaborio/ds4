@@ -8,7 +8,7 @@ into current support claims here.
 
 No user-visible changes recorded yet.
 
-## 0.3.0 - 2026-08-13
+## 0.3.0 - 2026-08-14
 
 Hebrus 0.3.0 is the first Hebrus-named source release. It ships source and
 provenance files only; it does not include prebuilt engine binaries or a
@@ -58,6 +58,12 @@ Hebrus Studio application bundle.
 
 ### Fixed
 
+- Fixed Qwen resident routed-MoE prefills from 2 through 31 tokens by restoring
+  the expert reduction omitted by the dual-codec integration. The shared fix
+  applies to Stable Affine4 and Beta Q2_K_XL; the complete synthetic Affine4
+  regression now covers the 1/2/25/31/32-token boundary, and the model-backed
+  Stable server gate requires the exact response twice in an explicitly
+  resident process. Q2_K_XL retains its separate Beta qualification gate.
 - Corrected the host-side hyper-connection combination strides and added a
   three-prompt DeepSeek generated-text regression check.
 - Made installed Metal commands discover their complete shader source set

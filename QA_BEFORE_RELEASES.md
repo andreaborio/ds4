@@ -171,8 +171,8 @@ the trusted release channel.
 - Confirm both names of the CLI, server, and agent render help cleanly, with
   readable section colors and no broken wrapping.
 - On a qualified Qwen host, run the two server names sequentially against the
-  exact published artifact and compare model discovery, one seeded greedy chat
-  completion, graceful shutdown, and exit status. Set
+  exact published artifact and compare model discovery, two seeded greedy chat
+  completions per persistent process, graceful shutdown, and exit status. Set
   `RELEASE_EVIDENCE_ROOT` explicitly to a persistent, release-owned absolute
   directory outside the checkout, then run:
   `QWEN_V2="$QWEN_V2" SERVER_ALIAS_EVIDENCE_DIR="$RELEASE_EVIDENCE_ROOT/hebrus-server-alias-$(git rev-parse --short=12 HEAD)" make server-alias-model-test`.
@@ -361,15 +361,31 @@ canonical, v1, sidecar, and community GGUFs are not equivalent inputs.
 - Run `make model-free-test` and `./ds4_test --metal-kernels`. The latter must
   retain resident/SSD top-8 output equivalence, zero resident cache/`pread`
   accounting, malformed-route fail-closed behavior, and slab-growth checks.
-  The model-free lane must include a synthetic 21 GiB host snapshot; the Metal
-  lane must inject a denial after one slab and prove slot reuse with no new
-  buffer, then inject denial before the first slab and prove fail-closed before
-  SSD I/O. These simulations validate mechanics, not physical memory behavior.
+  `--metal-expert-pack` must exercise the complete synthetic resident Affine4
+  routed-MoE path at 1, 2, 25, 31 and 32 rows and compare its reduced output
+  against the numeric oracle. The model-free lane must include a synthetic
+  21 GiB host snapshot; the Metal lane must inject a denial after one slab and
+  prove slot reuse with no new buffer, then inject denial before the first slab
+  and prove fail-closed before SSD I/O. These simulations validate mechanics,
+  not physical memory behavior or a complete model graph.
+  The restored reduction is shared with the Q2_K_XL routed path, but this
+  Affine4 fixture does not replace the separate exact-artifact Q2 Beta gate.
   `make qwen-24g-fixture-test` must also validate the prompt hashes, fixed
   sampler/seed, request order, and >1,719-token companion threshold in
   `tests/qwen/fixtures/qwen-24g-release-v1.json`.
 - Run `./ds4 -m "$QWEN_V2" --ctx 8192` for the normal flag-free
   AUTO smoke.
+- On a host that admits resident mode, run the exact published Affine4 server
+  marker gate without inherited runtime-tuning variables. Assert the log says
+  `residency requested=resident resolved=resident`,
+  `Qwen Metal resident runtime: mapped`, and the 25-token resident layer-major
+  prefill marker; an AUTO run counts only when its log
+  likewise proves that it resolved to resident. Send the deterministic
+  `HEBRUS ALIAS PARITY OK` completion twice to each persistent server process
+  and require the generated content to match exactly both times. Both responses
+  must report exactly 25 prompt tokens and valid cache accounting. A process that
+  emits a control token, passes only one request, resolves to SSD, or relies on
+  an inherited batch-disable setting does not satisfy this resident gate.
 - Run AUTO with the normal flag-free startup command; record both admission plans,
   their point-in-time inputs, resolved mode, cache tier, configured target slab
   size (up to 321 experts), cache `buffer_allocs`, task physical footprint, and

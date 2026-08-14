@@ -3998,6 +3998,7 @@ static void test_metal_installed_source_group(void) {
 
 static void test_metal_qwen35_expert_pack(void) {
     TEST_ASSERT(ds4_gpu_internal_qwen35_expert_pack_test() != 0);
+    TEST_ASSERT(ds4_gpu_internal_qwen35_affine_resident_short_test() != 0);
     TEST_ASSERT(
         ds4_gpu_internal_qwen35_stream_staging_rollback_test() != 0);
     TEST_ASSERT(ds4_gpu_internal_qwen35_lease_error_unwind_test() != 0);

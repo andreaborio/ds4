@@ -105,12 +105,22 @@ python3 tests/qwen/test_compare_logits.py -v
 
 `make model-free-test` runs these checks as part of the wider repository gate.
 The scalar fixtures prove numeric and tokenizer invariants; they do not qualify
-a model artifact or a production inference mode. Metal Qwen cases in
-`test_qwen35_metal.m` additionally cover resident/SSD top-8 equivalence,
-malformed-route fail-closed behavior, cache accounting, and slab growth. The
-focused Q5_K lane compares both one-row and batched embedding gathers against a
-CPU oracle. `test_qwen35_iq_metal.m` independently compares resident and
-six-slot SSD matvecs for IQ2_XS, IQ3_XXS, and IQ4_XS against decoded CPU values.
+a model artifact or a production inference mode. The `--metal-expert-pack`
+group additionally executes the synthetic resident Affine4 routed-MoE path at
+1, 2, 25, 31 and 32 rows. It checks the final expert reduction against a
+numeric oracle across the MV-ID/MM-ID boundary after the former short-prefill
+regression was removed. The corrected reduction predicate is shared with the
+Q2_K_XL route, but this complete-path fixture is Affine4-specific and does not
+replace the exact-artifact Q2 Beta qualification.
+
+Metal Qwen cases in `test_qwen35_metal.m` additionally cover resident/SSD top-8
+equivalence, malformed-route fail-closed behavior, cache accounting, and slab
+growth. Those focused cases do not execute the complete production Affine4
+layer-major prefill graph and cannot qualify it. The focused Q5_K lane compares
+both one-row and batched embedding gathers against a CPU oracle.
+`test_qwen35_iq_metal.m` independently compares resident and six-slot SSD
+matvecs for IQ2_XS, IQ3_XXS, and IQ4_XS against decoded CPU values; its Affine4
+case is also a primitive fixture, not an end-to-end server gate.
 The incremental-growth case admits one slab, denies the next, and proves reuse
 without a new buffer; a second case denies the first slab and proves no expert
 I/O or allocation fallback. `test_ssd_residency` includes the synthetic 21 GiB
@@ -190,7 +200,10 @@ Record the admission inputs, resolved residency, cache tier, physical footprint,
 and system swap before, during, and after the run. Through 24 GiB, AUTO must
 choose guarded SSD and an explicit resident request must fail. On larger hosts,
 AUTO may choose resident or SSD according to the current memory and pressure
-gates.
+gates. A run that resolves to SSD does not exercise the resident-prefill
+regression. On a qualified host that admits resident mode, the persistent
+server gate must assert the resident log markers and return the exact expected
+completion twice in the same process.
 
 The policy suite covers named 16/24/32/36/48/64/96/128 GiB profiles. Model-backed
 release evidence must additionally identify the real Metal device and its
