@@ -273,8 +273,13 @@ neither artifact size nor SSD bandwidth alone predicts throughput.
 Start with AUTO residency and the automatic cache budget:
 
 ```sh
-./hebrus -m /absolute/path/to/QUALIFIED-DEEPSEEK-OR-QWEN-DS4-ExpertMajor-v2.gguf
+./download_model.sh qwen-v2
+./hebrus -m Qwen3.6-35B-A3B-Hebrus-ExpertMajor-v2-MLX-Affine4-G64.gguf
 ```
+
+Use `./download_model.sh deepseek-v2` or `./download_model.sh glm-v2` for the
+other qualified families; their exact startup commands are in the runtime
+support contract.
 
 For DeepSeek, and for Qwen above 24 GiB, qualification may use
 `--ssd-streaming` to force streaming or `--resident` to request the full-model
@@ -326,12 +331,12 @@ mode; there is no CPU/GPU split of neural layers or routed experts.  Resident
 mode disables DS4's expert-cache `pread`, but Metal's residency request remains
 a budget hint rather than proof that every mapped page stayed physically in RAM.
 
-If startup reports that the expert cache is too large, or if you want to reserve
-more memory for context, set the routed expert cache explicitly:
+For qualified Qwen artifacts, a routed expert cache may be set explicitly for
+diagnostic or qualification work:
 
 ```sh
 ./hebrus \
-  -m /absolute/path/to/QUALIFIED-DEEPSEEK-OR-QWEN-DS4-ExpertMajor-v2.gguf \
+  -m /absolute/path/to/QUALIFIED-QWEN-Hebrus-ExpertMajor-v2.gguf \
   --ssd-streaming --ssd-streaming-cache-experts 32GB
 ```
 
@@ -345,16 +350,21 @@ remainder for routed experts. Leave the hot expert preload enabled for
 normal use; use `--ssd-streaming-cold` and `--ssd-streaming-preload-experts N`
 only for measurements.
 
+DeepSeek ExpertMajor v2 must omit the explicit expert-cache budget and use
+automatic sizing. Hebrus rejects `--ssd-streaming-cache-experts` for that
+family because the explicit path does not establish the required phase cache
+schedule. GLM's explicit SSD and cache controls remain diagnostic rather than
+an additional qualified startup contract.
+
 ### Practical SSD streaming examples
 
 On a qualified 64 GB host, run the published DeepSeek Flash ExpertMajor v2
-artifact with its recorded complete output SHA-256 and a moderate expert cache:
+artifact with its recorded complete output SHA-256 and automatic cache sizing:
 
 ```sh
 ./hebrus \
   -m /absolute/path/to/QUALIFIED-DEEPSEEK-FLASH-DS4-ExpertMajor-v2.gguf \
   --ssd-streaming \
-  --ssd-streaming-cache-experts 32GB \
   --ctx 32768 \
   --nothink
 ```

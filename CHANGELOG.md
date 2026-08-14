@@ -6,51 +6,84 @@ into current support claims here.
 
 ## Unreleased
 
-The entries below describe the local Hebrus compatibility bridge after the
-current published history. They have no release version or release date and do
-not represent a published release.
+No user-visible changes recorded yet.
+
+## 0.3.0 - 2026-08-14
+
+Hebrus 0.3.0 is the first Hebrus-named source release. It ships source and
+provenance files only; it does not include prebuilt engine binaries or a
+Hebrus Studio application bundle.
 
 ### Added
 
-- Added deterministic, model-free `--capabilities=json` output to the CLI,
-  server, agent, benchmark, and evaluation executables. The versioned document
-  reports build identity, backend, executable role, supported model-family IDs,
-  and the immutable ExpertMajor v2 storage contract.
-- Added canonical `hebrus`, `hebrus-server`, `hebrus-agent`, `hebrus-bench`, and
-  `hebrus-eval` commands. Existing `ds4*` command names remain symlink aliases
-  to the same binaries for command-surface parity.
+- Added canonical `hebrus`, `hebrus-server`, `hebrus-agent`, `hebrus-bench`,
+  and `hebrus-eval` commands. The corresponding `ds4*` names remain
+  compatibility symlinks to the same binaries in this release.
+- Added deterministic, model-free schema-1 `--capabilities=json` output to all
+  five executable roles and both command identities. The document reports
+  build identity, backend, executable role, supported model-family IDs, and
+  the immutable ExpertMajor v2 storage contract.
+- Added staged `make install` and `make uninstall` support with `PREFIX`,
+  `BINDIR`, and `DESTDIR`, including versioned Metal resources and an
+  install-layout test.
+- Added the exact Qwen3.6 Q2_K_XL profile as an opt-in `published-beta`
+  artifact. It has a 64 GiB floor and a 32,768-token qualified boundary; it is
+  neither recommended nor full-window qualified.
 - Added model-free tests for capability-schema determinism, cross-executable
-  consistency, command aliases, build-profile isolation, and canonical/legacy
-  output parity.
-- Added Proposed ADR 0005 to document the Hebrus naming layer and the proposed
-  long-term compatibility boundary without changing durable model, cache, or
-  historical identifiers.
-- Added the maintainer-supplied Hebrus logo as a hash-frozen, unchanged RGBA
-  master shared with Hebrus Studio. Repository tests reject pixel or encoding
-  drift; web presentation effects remain CSS-only.
+  consistency, command aliases, build-profile isolation, installed resources,
+  and canonical/compatibility output parity.
+- Added fail-closed source-release tooling that binds a deterministic archive,
+  JSON provenance manifest, and SHA-256 set to one immutable clean commit, then
+  rebuilds and smoke-installs the archive outside Git before publication.
 
 ### Changed
 
-- Help headings, usage lines, examples, and retired-option diagnostics now use
-  the executable name that was invoked. Canonical `hebrus*` commands present
-  the Hebrus name, while the `ds4*` compatibility aliases preserve their
-  legacy command identity and the same options, defaults, streams, and exit
-  codes.
-- Canonical commands report `engine_id: "hebrus"` and `hebrus build`; legacy
-  aliases retain `engine_id: "ds4"` and `ds4 build`. Both identities use the
-  same schema-1 capability fields and immutable ExpertMajor wire contract.
-- Current contributor, release, and engine-reference documentation now presents
-  Hebrus commands first and links an explicit brand compatibility contract.
-  Canonical CLI/agent/evaluation prompts and new benchmark evidence use the
-  invoked Hebrus identity; legacy aliases preserve their existing labels.
+- Renamed the existing GitHub fork in place to `andreaborio/hebrus` while
+  preserving its history and upstream attribution.
+- Replaced the retired Qwen Q4_K_S release path with the exact Stable and
+  recommended MLX Affine4/group-64 artifact. The retired Q4_K_S artifact is
+  rejection-only, not a fallback.
+- Qualified the Stable Qwen Affine4 guarded-SSD 16 GiB capacity and safety lane
+  through a 131,072-token prompt plus 128 greedy decode tokens, without making
+  a speed claim. The separate 24 GiB policy remains a publication candidate,
+  not a qualified hardware claim.
+- Changed short DeepSeek conversational prefills to retain the warm expert
+  cache by default through 4,096 tokens.
+- Updated current commands, documentation, Qwen artifact names, Qwen download
+  metadata and immutable repository paths, and release-contract tests to use
+  the Hebrus identity while retaining compatibility-owned serialized
+  identifiers.
+- Added Proposed ADR 0005 to document the naming layer and a possible future
+  compatibility horizon. This release does not accept or promise that horizon.
+
+### Fixed
+
+- Fixed Qwen resident routed-MoE prefills from 2 through 31 tokens by restoring
+  the expert reduction omitted by the dual-codec integration. The shared fix
+  applies to Stable Affine4 and Beta Q2_K_XL; the complete synthetic Affine4
+  regression now covers the 1/2/25/31/32-token boundary, and the model-backed
+  Stable server gate requires the exact response twice in an explicitly
+  resident process. Q2_K_XL retains its separate Beta qualification gate.
+- Corrected the host-side hyper-connection combination strides and added a
+  three-prompt DeepSeek generated-text regression check.
+- Made installed Metal commands discover their complete shader source set
+  relative to the executable instead of depending on the current working
+  directory.
+- Hardened Qwen guarded-SSD allocation so live memory and working-set limits
+  are checked before cache growth; denied growth reuses the bounded cache or
+  fails closed.
+- Restored the qualified Qwen Affine4 SSD execution path after the dual-profile
+  integration while keeping Qwen-specific cache behavior isolated from
+  DeepSeek and GLM.
+- Made an unsafe explicit DeepSeek expert-cache budget fail closed instead of
+  allowing unconfigured routed experts to read as zero.
 
 ### Compatibility
 
-- The engine repository was renamed in place and is now canonical at
-  <https://github.com/andreaborio/hebrus>. Historical documents may retain the
-  repository identity that was current when their evidence was recorded.
-- Existing `DS4_*` environment variables and `ds4`-owned serialized identifiers
-  remain unchanged. This bridge does not introduce `HEBRUS_*` environment
-  aliases or rename source-level C symbols.
-- ExpertMajor tensor names, wire values, model artifact identities, disk-KV
-  formats, Git history, and historical links are unchanged.
+- This release preserves the five `ds4*` command aliases, the `DS4_*`
+  namespace for documented runtime settings, `ds4.expert_major.v2`, disk-KV
+  magic, version and payload ABI, model bytes, and historical identifiers.
+- It does not promise an alias horizon for later release lines: ADR 0005
+  remains Proposed.
+- Old model containers and the retired Qwen Q4_K_S payload remain unsupported;
+  see the runtime support and brand compatibility contracts.

@@ -29,7 +29,9 @@ DEFAULT_LOCK_FILE = "/tmp/ds4.lock"
 CANONICAL_SERVER_NAME = "hebrus-server"
 LEGACY_SERVER_NAME = "ds4-server"
 EXPECTED_COMPLETION_MARKER = "HEBRUS ALIAS PARITY OK"
+EXPECTED_PROMPT_TOKENS = 25
 EVIDENCE_MANIFEST_NAME = "server-alias-evidence-manifest.json"
+GATE_LOG_ENVIRONMENT = {"DS4_METAL_MEMORY_REPORT": "1"}
 VOLATILE_COMPLETION_KEYS = frozenset({"id", "created"})
 LOCAL_HTTP_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 
@@ -83,9 +85,9 @@ def load_published_artifact(path: pathlib.Path = MODEL_CONTRACT) -> PublishedArt
     if (
         not isinstance(document, dict)
         or type(document.get("schemaVersion")) is not int
-        or document.get("schemaVersion") != 1
+        or document.get("schemaVersion") != 2
     ):
-        raise AssertionError("Qwen release contract must use schemaVersion 1")
+        raise AssertionError("Qwen release contract must use schemaVersion 2")
     published = document.get("publishedArtifact")
     if not isinstance(published, dict) or published.get("status") != "published":
         raise AssertionError("Qwen release contract has no published artifact")
@@ -173,6 +175,49 @@ def validate_completion_content(
             f"{EXPECTED_COMPLETION_MARKER!r}"
         )
     return normalized
+
+
+def validate_completion_usage(
+    document: dict[str, Any], binary_name: str
+) -> dict[str, int]:
+    usage = document.get("usage")
+    if not isinstance(usage, dict):
+        raise AssertionError(f"{binary_name}: completion has no usage object")
+    prompt_tokens = usage.get("prompt_tokens")
+    completion_tokens = usage.get("completion_tokens")
+    total_tokens = usage.get("total_tokens")
+    details = usage.get("prompt_tokens_details")
+    if (
+        type(prompt_tokens) is not int
+        or prompt_tokens != EXPECTED_PROMPT_TOKENS
+        or type(completion_tokens) is not int
+        or completion_tokens <= 0
+        or total_tokens != prompt_tokens + completion_tokens
+        or not isinstance(details, dict)
+    ):
+        raise AssertionError(
+            f"{binary_name}: completion did not exercise the exact "
+            f"{EXPECTED_PROMPT_TOKENS}-token prompt lane"
+        )
+    cached_tokens = details.get("cached_tokens")
+    cache_write_tokens = details.get("cache_write_tokens")
+    if (
+        type(cached_tokens) is not int
+        or type(cache_write_tokens) is not int
+        or cached_tokens < 0
+        or cache_write_tokens < 0
+        or cached_tokens + cache_write_tokens > prompt_tokens
+    ):
+        raise AssertionError(
+            f"{binary_name}: invalid prompt-cache accounting "
+            f"cached={cached_tokens!r} written={cache_write_tokens!r}"
+        )
+    return {
+        "prompt_tokens": prompt_tokens,
+        "completion_tokens": completion_tokens,
+        "cached_tokens": cached_tokens,
+        "cache_write_tokens": cache_write_tokens,
+    }
 
 
 def command_output(argv: Sequence[str]) -> str | None:
@@ -296,6 +341,7 @@ def build_environment(source: Mapping[str, str]) -> tuple[dict[str, str], list[s
             environment[key] = value
     if not environment.get("DS4_LOCK_FILE"):
         environment["DS4_LOCK_FILE"] = DEFAULT_LOCK_FILE
+    environment.update(GATE_LOG_ENVIRONMENT)
     return environment, sorted(removed)
 
 
@@ -632,6 +678,21 @@ def terminate_process(
     return process.returncode
 
 
+def server_command(
+    binary: pathlib.Path, model: pathlib.Path, port: int
+) -> list[str]:
+    return [
+        str(binary),
+        "-m", str(model),
+        "--resident",
+        "--ctx", "8192",
+        "--tokens", "32",
+        "--threads", "8",
+        "--host", "127.0.0.1",
+        "--port", str(port),
+    ]
+
+
 def run_server(
     binary: pathlib.Path,
     model: pathlib.Path,
@@ -644,15 +705,7 @@ def run_server(
 ) -> dict[str, Any]:
     assert_port_available(port)
     log_path = evidence_dir / f"{binary.name}.log"
-    command = [
-        str(binary),
-        "-m", str(model),
-        "--ctx", "8192",
-        "--tokens", "32",
-        "--threads", "8",
-        "--host", "127.0.0.1",
-        "--port", str(port),
-    ]
+    command = server_command(binary, model, port)
     with log_path.open("wb") as log:
         process = subprocess.Popen(
             command,
@@ -680,27 +733,51 @@ def run_server(
                 f"{base_url}/v1/models/{urllib.parse.quote(model_id, safe='')}",
                 timeout=request_timeout,
             )
+            completion_request = {
+                "model": model_id,
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": "Reply with exactly: HEBRUS ALIAS PARITY OK",
+                    }
+                ],
+                "max_tokens": 16,
+                "temperature": 0,
+                "seed": 20260721,
+                "thinking": False,
+                "stream": False,
+            }
             completion = http_json(
                 f"{base_url}/v1/chat/completions",
-                {
-                    "model": model_id,
-                    "messages": [
-                        {
-                            "role": "user",
-                            "content": "Reply with exactly: HEBRUS ALIAS PARITY OK",
-                        }
-                    ],
-                    "max_tokens": 16,
-                    "temperature": 0,
-                    "seed": 20260721,
-                    "thinking": False,
-                    "stream": False,
-                },
+                completion_request,
                 timeout=request_timeout,
+            )
+            write_report(
+                evidence_dir / f"{binary.name}-completion-1.json", completion
             )
             completion_content = validate_completion_content(
                 completion, binary.name
             )
+            completion_usage = validate_completion_usage(completion, binary.name)
+            repeat_completion = http_json(
+                f"{base_url}/v1/chat/completions",
+                completion_request,
+                timeout=request_timeout,
+            )
+            write_report(
+                evidence_dir / f"{binary.name}-completion-2.json",
+                repeat_completion,
+            )
+            repeat_completion_content = validate_completion_content(
+                repeat_completion, binary.name
+            )
+            repeat_completion_usage = validate_completion_usage(
+                repeat_completion, binary.name
+            )
+            if completion_content != repeat_completion_content:
+                raise AssertionError(
+                    f"{binary.name}: repeated completion content changed in one process"
+                )
         finally:
             exit_code = terminate_process(process, binary.name, shutdown_timeout)
     wait_for_port_closed(port)
@@ -712,6 +789,9 @@ def run_server(
     log_text = log_path.read_text(encoding="utf-8", errors="replace")
     for marker in (
         f"listening on http://127.0.0.1:{port}",
+        "residency requested=resident resolved=resident",
+        "Qwen Metal resident runtime: mapped",
+        f"Qwen resident layer-major prefill encoded {EXPECTED_PROMPT_TOKENS} tokens",
         "shutdown requested, draining requests",
     ):
         if marker not in log_text:
@@ -722,6 +802,10 @@ def run_server(
         "model": model_document,
         "completion": normalize_completion(completion),
         "completion_content": completion_content,
+        "completion_usage": completion_usage,
+        "repeat_completion": normalize_completion(repeat_completion),
+        "repeat_completion_content": repeat_completion_content,
+        "repeat_completion_usage": repeat_completion_usage,
         "log": str(log_path),
         "exit_code": exit_code,
     }
@@ -757,7 +841,7 @@ def main() -> int:
     evidence_dir = prepare_evidence_dir(args.evidence_dir)
     report_path = evidence_dir / "server-alias-parity.json"
     report: dict[str, Any] = {
-        "schema_version": 3,
+        "schema_version": 4,
         "status": "RUNNING",
         "evidence_manifest": EVIDENCE_MANIFEST_NAME,
         "results": {},
@@ -805,6 +889,7 @@ def main() -> int:
                 },
                 "environment": {
                     "preserved_names": ["DS4_LOCK_FILE"],
+                    "injected_names": sorted(GATE_LOG_ENVIRONMENT),
                     "removed_names": removed_environment,
                 },
                 "log_paths": {
@@ -870,6 +955,10 @@ def main() -> int:
             "model",
             "completion",
             "completion_content",
+            "completion_usage",
+            "repeat_completion",
+            "repeat_completion_content",
+            "repeat_completion_usage",
             "exit_code",
         ):
             if results[canonical.name][field] != results[legacy.name][field]:

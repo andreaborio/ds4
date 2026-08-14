@@ -38515,6 +38515,352 @@ cleanup:
 }
 
 typedef struct {
+    uint8_t qs[32];
+    uint16_t scale_bf16;
+    uint16_t bias_bf16;
+} ds4_gpu_internal_mlx_affine4_block;
+
+static void ds4_gpu_internal_mlx_affine4_fill_row(
+        uint8_t *row,
+        uint8_t  value) {
+    const uint8_t packed = (uint8_t)(value | (uint8_t)(value << 4u));
+    for (uint32_t group = 0; group < 4u; group++) {
+        ds4_gpu_internal_mlx_affine4_block *block =
+            (ds4_gpu_internal_mlx_affine4_block *)(
+                row + (uint64_t)group *
+                    sizeof(ds4_gpu_internal_mlx_affine4_block));
+        memset(block->qs, packed, sizeof(block->qs));
+        block->scale_bf16 = 0x3f80u;
+        block->bias_bf16 = 0u;
+    }
+}
+
+static int ds4_gpu_internal_qwen35_affine_resident_case(
+        const void *model_map,
+        uint64_t    model_size,
+        uint64_t    gate_offset,
+        uint64_t    up_offset,
+        uint64_t    down_offset,
+        uint64_t    gate_expert_bytes,
+        uint64_t    down_expert_bytes,
+        uint32_t    n_tokens,
+        bool        expected_mid_f16) {
+    enum {
+        N_EXPERT = 256,
+        N_ROUTE = 8,
+        IN_DIM = 256,
+        MID_DIM = 256,
+        OUT_DIM = 4,
+        GGML_TYPE_Q4_K = 12,
+    };
+    const uint64_t row_bytes =
+        4u * sizeof(ds4_gpu_internal_mlx_affine4_block);
+    const uint64_t pair_rows = (uint64_t)n_tokens * N_ROUTE;
+    const uint64_t mid_values = pair_rows * MID_DIM;
+    const uint64_t out_values = (uint64_t)n_tokens * OUT_DIM;
+    const uint64_t input_values_count = (uint64_t)n_tokens * IN_DIM;
+    const uint64_t route_values = (uint64_t)n_tokens * N_ROUTE;
+    ds4_gpu_tensor *out = NULL;
+    ds4_gpu_tensor *gate = NULL;
+    ds4_gpu_tensor *up = NULL;
+    ds4_gpu_tensor *mid = NULL;
+    ds4_gpu_tensor *experts = NULL;
+    ds4_gpu_tensor *selected = NULL;
+    ds4_gpu_tensor *weights = NULL;
+    ds4_gpu_tensor *x = NULL;
+    float *out_host = NULL;
+    float *gate_host = NULL;
+    float *up_host = NULL;
+    float *input_host = NULL;
+    int32_t *selected_host = NULL;
+    float *weights_host = NULL;
+    int ok = 0;
+    const char *failure = "allocation";
+
+    if (n_tokens == 0) return 0;
+    out = ds4_gpu_tensor_alloc(out_values * sizeof(float));
+    gate = ds4_gpu_tensor_alloc(mid_values * sizeof(float));
+    up = ds4_gpu_tensor_alloc(mid_values * sizeof(float));
+    mid = ds4_gpu_tensor_alloc(mid_values * sizeof(float));
+    experts = ds4_gpu_tensor_alloc(
+        pair_rows * OUT_DIM * sizeof(float));
+    selected = ds4_gpu_tensor_alloc(route_values * sizeof(int32_t));
+    weights = ds4_gpu_tensor_alloc(route_values * sizeof(float));
+    x = ds4_gpu_tensor_alloc(input_values_count * sizeof(float));
+    out_host = malloc((size_t)out_values * sizeof(float));
+    gate_host = malloc((size_t)mid_values * sizeof(float));
+    up_host = malloc((size_t)mid_values * sizeof(float));
+    input_host = malloc((size_t)input_values_count * sizeof(float));
+    selected_host = malloc((size_t)route_values * sizeof(int32_t));
+    weights_host = malloc((size_t)route_values * sizeof(float));
+    if (!out || !gate || !up || !mid || !experts || !selected || !weights ||
+        !x || !out_host || !gate_host || !up_host || !input_host ||
+        !selected_host || !weights_host) {
+        goto cleanup;
+    }
+
+    for (uint64_t index = 0; index < input_values_count; index++) {
+        input_host[index] = 1.0f / (float)IN_DIM;
+    }
+    for (uint32_t token = 0; token < n_tokens; token++) {
+        for (uint32_t route = 0; route < N_ROUTE; route++) {
+            const uint64_t index = (uint64_t)token * N_ROUTE + route;
+            selected_host[index] = (int32_t)((token + route) % 15u);
+            weights_host[index] = 1.0f / (float)N_ROUTE;
+        }
+    }
+    failure = "upload";
+    if (!ds4_gpu_tensor_write(x, 0, input_host,
+                              input_values_count * sizeof(float)) ||
+        !ds4_gpu_tensor_write(selected, 0, selected_host,
+                              route_values * sizeof(int32_t)) ||
+        !ds4_gpu_tensor_write(weights, 0, weights_host,
+                              route_values * sizeof(float))) {
+        goto cleanup;
+    }
+
+    bool mid_is_f16 = !expected_mid_f16;
+    int expert_group_used = -1;
+    failure = "execution";
+    if (!ds4_gpu_qwen35_routed_moe_batch_select_tensor(
+            out, gate, up, mid, experts,
+            model_map, model_size,
+            gate_offset, up_offset, down_offset,
+            GGML_TYPE_Q4_K, GGML_TYPE_Q4_K,
+            gate_expert_bytes, row_bytes,
+            down_expert_bytes, row_bytes,
+            IN_DIM, MID_DIM, OUT_DIM,
+            selected, weights, N_EXPERT, N_ROUTE, 0.0f, x, 0,
+            n_tokens, &mid_is_f16, 0, &expert_group_used)) {
+        goto cleanup;
+    }
+    if (mid_is_f16 != expected_mid_f16) {
+        failure = "mid precision";
+        goto cleanup;
+    }
+    if (expert_group_used != 0) {
+        failure = "unexpected expert schedule";
+        goto cleanup;
+    }
+    /* The batch-32 fused pair+SwiGLU kernel does not materialize gate/up.
+     * Below that threshold, checking both projections proves the MV path
+     * decoded the affine payload instead of treating its bytes as Q4_K. */
+    const bool inspect_projections = n_tokens < 32u;
+    failure = "readback";
+    if (!ds4_gpu_tensor_read(out, 0, out_host,
+                             out_values * sizeof(float)) ||
+        (inspect_projections &&
+         (!ds4_gpu_tensor_read(gate, 0, gate_host,
+                               mid_values * sizeof(float)) ||
+          !ds4_gpu_tensor_read(up, 0, up_host,
+                               mid_values * sizeof(float))))) {
+        goto cleanup;
+    }
+
+    const float silu_one = 1.0f / (1.0f + expf(-1.0f));
+    const float projection_tolerance = 1.0e-4f;
+    for (uint32_t token = 0; token < n_tokens; token++) {
+        float expected_out = 0.0f;
+        for (uint32_t route = 0; route < N_ROUTE; route++) {
+            const uint64_t pair = (uint64_t)token * N_ROUTE + route;
+            const float value = (float)(selected_host[pair] + 1);
+            expected_out += weights_host[pair] * value * value;
+            for (uint32_t column = 0;
+                 inspect_projections && column < MID_DIM;
+                 column++) {
+                const uint64_t index = pair * MID_DIM + column;
+                if (!isfinite(gate_host[index]) ||
+                    !isfinite(up_host[index]) ||
+                    fabsf(gate_host[index] - 1.0f) > projection_tolerance ||
+                    fabsf(up_host[index] - value) > projection_tolerance) {
+                    fprintf(stderr,
+                            "ds4: resident MLX-affine batch %u projection "
+                            "mismatch token=%u route=%u column=%u "
+                            "gate=%.9g up=%.9g expected_up=%.9g\n",
+                            n_tokens, token, route, column,
+                            gate_host[index], up_host[index], value);
+                    failure = "affine projection";
+                    goto cleanup;
+                }
+            }
+        }
+        expected_out *= (float)MID_DIM * silu_one;
+        const float output_tolerance =
+            fmaxf(0.5f, fabsf(expected_out) * 0.0025f);
+        for (uint32_t row = 0; row < OUT_DIM; row++) {
+            const float actual = out_host[(uint64_t)token * OUT_DIM + row];
+            if (!isfinite(actual) ||
+                fabsf(actual - expected_out) > output_tolerance) {
+                fprintf(stderr,
+                        "ds4: resident MLX-affine batch %u output mismatch "
+                        "token=%u row=%u actual=%.9g expected=%.9g "
+                        "tolerance=%.9g\n",
+                        n_tokens, token, row, actual, expected_out,
+                        output_tolerance);
+                failure = "output";
+                goto cleanup;
+            }
+        }
+    }
+    ok = 1;
+
+cleanup:
+    ds4_gpu_tensor_free(out);
+    ds4_gpu_tensor_free(gate);
+    ds4_gpu_tensor_free(up);
+    ds4_gpu_tensor_free(mid);
+    ds4_gpu_tensor_free(experts);
+    ds4_gpu_tensor_free(selected);
+    ds4_gpu_tensor_free(weights);
+    ds4_gpu_tensor_free(x);
+    free(out_host);
+    free(gate_host);
+    free(up_host);
+    free(input_host);
+    free(selected_host);
+    free(weights_host);
+    if (!ok) {
+        fprintf(stderr,
+                "ds4: resident MLX-affine synthetic batch %u failed at %s\n",
+                n_tokens, failure);
+    }
+    return ok;
+}
+
+int ds4_gpu_internal_qwen35_affine_resident_short_test(void) {
+    enum {
+        N_EXPERT = 256,
+        MID_DIM = 256,
+        OUT_DIM = 4,
+    };
+    const uint64_t row_bytes =
+        4u * sizeof(ds4_gpu_internal_mlx_affine4_block);
+    const uint64_t gate_expert_bytes = (uint64_t)MID_DIM * row_bytes;
+    const uint64_t down_expert_bytes = (uint64_t)OUT_DIM * row_bytes;
+    const uint64_t record_bytes =
+        gate_expert_bytes * 2u + down_expert_bytes;
+    const uint64_t component_gate_bytes =
+        (uint64_t)N_EXPERT * gate_expert_bytes;
+    const uint64_t component_down_bytes =
+        (uint64_t)N_EXPERT * down_expert_bytes;
+    const uint64_t payload_bytes = (uint64_t)N_EXPERT * record_bytes;
+    const uint64_t gate_offset = 0;
+    const uint64_t up_offset = component_gate_bytes;
+    const uint64_t down_offset = component_gate_bytes * 2u;
+    const uint64_t model_size = down_offset + component_down_bytes;
+    char path[] = "/tmp/ds4-affine-resident-short.XXXXXX";
+    int fd = -1;
+    void *model_map = MAP_FAILED;
+    int installed = 0;
+    int ok = 0;
+
+    if (sizeof(ds4_gpu_internal_mlx_affine4_block) != 36u ||
+        row_bytes != 144u || payload_bytes != model_size ||
+        (!g_initialized && !ds4_gpu_init()) ||
+        g_qwen35_expert_pack.active) {
+        return 0;
+    }
+    ds4_gpu_set_glm_model(false);
+    ds4_gpu_set_quality(false);
+    ds4_gpu_set_ssd_streaming(false);
+    ds4_gpu_set_model_fd(-1);
+
+    fd = mkstemp(path);
+    if (fd < 0) goto cleanup;
+    (void)unlink(path);
+    if (ftruncate(fd, (off_t)model_size) != 0) goto cleanup;
+    model_map = mmap(NULL, (size_t)model_size,
+                     PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    if (model_map == MAP_FAILED) goto cleanup;
+
+    uint8_t *payload = model_map;
+    for (uint32_t expert = 0; expert < N_EXPERT; expert++) {
+        const uint8_t value = (uint8_t)(expert % 15u + 1u);
+        uint8_t *record = payload + (uint64_t)expert * record_bytes;
+        uint8_t *gate = record;
+        uint8_t *up = gate + gate_expert_bytes;
+        uint8_t *down = up + gate_expert_bytes;
+        for (uint32_t row = 0; row < MID_DIM; row++) {
+            ds4_gpu_internal_mlx_affine4_fill_row(
+                gate + (uint64_t)row * row_bytes, 1u);
+            ds4_gpu_internal_mlx_affine4_fill_row(
+                up + (uint64_t)row * row_bytes, value);
+        }
+        for (uint32_t row = 0; row < OUT_DIM; row++) {
+            ds4_gpu_internal_mlx_affine4_fill_row(
+                down + (uint64_t)row * row_bytes, value);
+        }
+    }
+    if (msync(model_map, (size_t)model_size, MS_SYNC) != 0) goto cleanup;
+
+    const ds4_gpu_expert_store_layer_v2 layer = {
+        .layer = 0,
+        .data_offset = 0,
+        .data_size = payload_bytes,
+        .record_bytes = record_bytes,
+        .component_offset = {
+            0,
+            gate_expert_bytes,
+            gate_expert_bytes * 2u,
+        },
+        .component_bytes = {
+            gate_expert_bytes,
+            gate_expert_bytes,
+            down_expert_bytes,
+        },
+    };
+    if (!ds4_gpu_expert_store_v2_install(
+            fd, model_size, 1, N_EXPERT,
+            DS4_EXPERT_STORE_STORAGE_MLX_AFFINE4, 64, &layer)) {
+        goto cleanup;
+    }
+    installed = 1;
+    if (!ds4_gpu_expert_store_v2_bind_layer(
+            0, model_size, gate_offset, up_offset, down_offset) ||
+        !ds4_gpu_expert_store_v2_enable_resident() ||
+        !ds4_gpu_internal_qwen35_affine_resident_case(
+            model_map, model_size,
+            gate_offset, up_offset, down_offset,
+            gate_expert_bytes, down_expert_bytes,
+            1, false) ||
+        !ds4_gpu_internal_qwen35_affine_resident_case(
+            model_map, model_size,
+            gate_offset, up_offset, down_offset,
+            gate_expert_bytes, down_expert_bytes,
+            2, false) ||
+        !ds4_gpu_internal_qwen35_affine_resident_case(
+            model_map, model_size,
+            gate_offset, up_offset, down_offset,
+            gate_expert_bytes, down_expert_bytes,
+            25, false) ||
+        !ds4_gpu_internal_qwen35_affine_resident_case(
+            model_map, model_size,
+            gate_offset, up_offset, down_offset,
+            gate_expert_bytes, down_expert_bytes,
+            31, false) ||
+        !ds4_gpu_internal_qwen35_affine_resident_case(
+            model_map, model_size,
+            gate_offset, up_offset, down_offset,
+            gate_expert_bytes, down_expert_bytes,
+            32, true)) {
+        goto cleanup;
+    }
+    ok = 1;
+
+cleanup:
+    if (installed) ds4_gpu_expert_store_v2_clear();
+    if (model_map != MAP_FAILED) {
+        (void)munmap(model_map, (size_t)model_size);
+    }
+    if (fd >= 0) close(fd);
+    if (!ok) {
+        fprintf(stderr,
+                "ds4: resident MLX-affine short-prompt regression failed\n");
+    }
+    return ok;
+}
+
+typedef struct {
     uint8_t scales[16];
     uint8_t qs[64];
     uint16_t d;
@@ -41144,13 +41490,14 @@ int ds4_gpu_qwen35_routed_moe_batch_select_tensor(
             }
         }
         DS4_METAL_PROFILE_MOE_STAGE("down");
+        /* Generic non-stream down kernels leave one row per routed expert in
+         * scratch. Selected-address MV kernels already reduce into out; their
+         * MM-ID counterpart still needs this explicit reduction. */
         if (ok &&
             n_expert > 1 &&
             !direct_down_sum &&
             !use_q4_batch_expert_table &&
-            ((!use_stream_batch_selected_addr &&
-              use_mm_id) ||
-             (use_stream_batch_selected_addr && use_stream_mm_id))) {
+            (!use_stream_batch_selected_addr || use_stream_mm_id)) {
             ok = ds4_gpu_encode_moe_sum_experts(cb,
                                                        down_dst,
                                                        down_dst_off,

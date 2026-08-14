@@ -46,6 +46,28 @@ def completion(content: object) -> dict[str, object]:
     }
 
 
+def completion_with_usage(
+    content: object, *, cached: int = 0, written: int = 25
+) -> dict[str, object]:
+    document = completion(content)
+    document.update(
+        {
+            "object": "chat.completion",
+            "model": "qualified",
+            "usage": {
+                "prompt_tokens": SERVER_ALIAS.EXPECTED_PROMPT_TOKENS,
+                "completion_tokens": 8,
+                "total_tokens": SERVER_ALIAS.EXPECTED_PROMPT_TOKENS + 8,
+                "prompt_tokens_details": {
+                    "cached_tokens": cached,
+                    "cache_write_tokens": written,
+                },
+            },
+        }
+    )
+    return document
+
+
 class FakeProcess:
     returncode = None
 
@@ -99,6 +121,45 @@ class ServerAliasModelUnitTests(unittest.TestCase):
                         document, "hebrus-server"
                     )
 
+    def test_completion_usage_proves_short_lane_and_valid_cache_accounting(self) -> None:
+        def response(cached: int, written: int) -> dict[str, object]:
+            return {
+                "usage": {
+                    "prompt_tokens": SERVER_ALIAS.EXPECTED_PROMPT_TOKENS,
+                    "completion_tokens": 8,
+                    "total_tokens": SERVER_ALIAS.EXPECTED_PROMPT_TOKENS + 8,
+                    "prompt_tokens_details": {
+                        "cached_tokens": cached,
+                        "cache_write_tokens": written,
+                    },
+                }
+            }
+
+        cold = SERVER_ALIAS.validate_completion_usage(
+            response(0, SERVER_ALIAS.EXPECTED_PROMPT_TOKENS),
+            "hebrus-server",
+        )
+        cached = SERVER_ALIAS.validate_completion_usage(
+            response(SERVER_ALIAS.EXPECTED_PROMPT_TOKENS, 0),
+            "hebrus-server",
+        )
+        self.assertEqual(cold["prompt_tokens"], 25)
+        self.assertEqual(cached["cached_tokens"], 25)
+
+        with self.assertRaisesRegex(AssertionError, "exact 25-token"):
+            wrong = response(0, 31)
+            usage = wrong["usage"]
+            assert isinstance(usage, dict)
+            usage["prompt_tokens"] = 31
+            SERVER_ALIAS.validate_completion_usage(
+                wrong, "hebrus-server"
+            )
+        with self.assertRaisesRegex(AssertionError, "cache accounting"):
+            SERVER_ALIAS.validate_completion_usage(
+                response(1, SERVER_ALIAS.EXPECTED_PROMPT_TOKENS),
+                "hebrus-server",
+            )
+
     def test_environment_preserves_lock_and_reports_only_removed_names(self) -> None:
         environment, removed = SERVER_ALIAS.build_environment(
             {
@@ -109,6 +170,9 @@ class ServerAliasModelUnitTests(unittest.TestCase):
             }
         )
         self.assertEqual(environment["DS4_LOCK_FILE"], "/tmp/qualified.lock")
+        self.assertEqual(
+            environment["DS4_METAL_MEMORY_REPORT"], "1"
+        )
         self.assertNotIn("DS4_TOKEN_TIMING", environment)
         self.assertNotIn("HEBRUS_EXPERIMENT", environment)
         self.assertEqual(removed, ["DS4_TOKEN_TIMING", "HEBRUS_EXPERIMENT"])
@@ -116,6 +180,7 @@ class ServerAliasModelUnitTests(unittest.TestCase):
     def test_environment_sets_explicit_default_lock(self) -> None:
         environment, removed = SERVER_ALIAS.build_environment({"PATH": "/usr/bin"})
         self.assertEqual(environment["DS4_LOCK_FILE"], SERVER_ALIAS.DEFAULT_LOCK_FILE)
+        self.assertEqual(environment["DS4_METAL_MEMORY_REPORT"], "1")
         self.assertEqual(removed, [])
 
     def test_host_power_parsers_select_the_active_source(self) -> None:
@@ -272,7 +337,7 @@ class ServerAliasModelUnitTests(unittest.TestCase):
         with tempfile.TemporaryDirectory(prefix="alias-contract-") as directory:
             path = pathlib.Path(directory) / "contract.json"
             document = {
-                "schemaVersion": 1,
+                "schemaVersion": 2,
                 "publishedArtifact": {
                     "status": "published",
                     "filename": "qualified.gguf",
@@ -287,10 +352,21 @@ class ServerAliasModelUnitTests(unittest.TestCase):
             self.assertEqual(artifact.filename, "qualified.gguf")
             self.assertEqual(artifact.size, 3)
 
+            document["schemaVersion"] = 1
+            path.write_text(json.dumps(document), encoding="utf-8")
+            with self.assertRaisesRegex(AssertionError, "schemaVersion 2"):
+                SERVER_ALIAS.load_published_artifact(path)
+
+            document["schemaVersion"] = 2
             document["publishedArtifact"]["sha256"] = "not-a-digest"
             path.write_text(json.dumps(document), encoding="utf-8")
             with self.assertRaisesRegex(AssertionError, "SHA-256"):
                 SERVER_ALIAS.load_published_artifact(path)
+
+    def test_checked_in_contract_is_accepted_by_alias_gate_loader(self) -> None:
+        artifact = SERVER_ALIAS.load_published_artifact()
+        self.assertGreater(artifact.size, 0)
+        self.assertEqual(len(artifact.sha256), 64)
 
     def test_model_verification_requires_manifest_filename_and_hash(self) -> None:
         with tempfile.TemporaryDirectory(prefix="alias-model-") as directory:
@@ -374,6 +450,16 @@ class ServerAliasModelUnitTests(unittest.TestCase):
             with self.assertRaisesRegex(AssertionError, "already in use"):
                 SERVER_ALIAS.assert_port_available(occupied)
 
+    def test_server_command_forces_the_resident_regression_lane(self) -> None:
+        command = SERVER_ALIAS.server_command(
+            pathlib.Path("/candidate/hebrus-server"),
+            pathlib.Path("/models/qualified.gguf"),
+            18081,
+        )
+        self.assertIn("--resident", command)
+        self.assertNotIn("--ssd-streaming", command)
+        self.assertEqual(command[-2:], ["--port", "18081"])
+
     def test_startup_http_probe_is_bounded_by_remaining_deadline(self) -> None:
         with tempfile.TemporaryDirectory(prefix="alias-listener-") as directory:
             log_path = pathlib.Path(directory) / "server.log"
@@ -416,6 +502,75 @@ class ServerAliasModelUnitTests(unittest.TestCase):
         self.assertEqual(SERVER_ALIAS.terminate_process(process, "server", 1.0), 0)
         process.send_signal.assert_called_once_with(SERVER_ALIAS.signal.SIGTERM)
         process.kill.assert_not_called()
+
+    def test_run_server_success_proves_lane_and_retains_raw_completions(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="alias-success-") as directory:
+            evidence = pathlib.Path(directory)
+            process = mock.Mock()
+
+            def launch(_command: object, **kwargs: object) -> mock.Mock:
+                log = kwargs["stdout"]
+                assert hasattr(log, "write")
+                log.write(
+                    b"ds4-server: listening on http://127.0.0.1:18081\n"
+                    b"ds4: residency requested=resident resolved=resident\n"
+                    b"ds4: Qwen Metal resident runtime: mapped 20.00 GiB\n"
+                    b"ds4: Qwen resident layer-major prefill encoded 25 tokens "
+                    b"in 1 chunk(s), cap=8192\n"
+                    b"ds4-server: shutdown requested, draining requests\n"
+                )
+                log.flush()
+                return process
+
+            first = completion_with_usage(
+                SERVER_ALIAS.EXPECTED_COMPLETION_MARKER
+            )
+            repeated = completion_with_usage(
+                SERVER_ALIAS.EXPECTED_COMPLETION_MARKER
+            )
+            with (
+                mock.patch.object(SERVER_ALIAS, "assert_port_available"),
+                mock.patch.object(SERVER_ALIAS.subprocess, "Popen", side_effect=launch),
+                mock.patch.object(
+                    SERVER_ALIAS,
+                    "wait_for_models",
+                    return_value={"data": [{"id": "qualified"}]},
+                ),
+                mock.patch.object(
+                    SERVER_ALIAS,
+                    "http_json",
+                    side_effect=[{"id": "qualified"}, first, repeated],
+                ),
+                mock.patch.object(SERVER_ALIAS, "terminate_process", return_value=0),
+                mock.patch.object(SERVER_ALIAS, "wait_for_port_closed"),
+            ):
+                result = SERVER_ALIAS.run_server(
+                    pathlib.Path("/candidate/hebrus-server"),
+                    pathlib.Path("/models/qualified.gguf"),
+                    18081,
+                    1.0,
+                    1.0,
+                    1.0,
+                    evidence,
+                    SERVER_ALIAS.GATE_LOG_ENVIRONMENT,
+                )
+
+            self.assertEqual(
+                result["completion_content"],
+                SERVER_ALIAS.EXPECTED_COMPLETION_MARKER,
+            )
+            self.assertEqual(result["completion_usage"]["prompt_tokens"], 25)
+            self.assertEqual(
+                json.loads(
+                    (evidence / "hebrus-server-completion-1.json").read_text(
+                        encoding="utf-8"
+                    )
+                ),
+                first,
+            )
+            self.assertTrue(
+                (evidence / "hebrus-server-completion-2.json").is_file()
+            )
 
     def test_cleanup_kills_after_graceful_timeout(self) -> None:
         process = mock.Mock()
@@ -503,7 +658,7 @@ class ServerAliasModelUnitTests(unittest.TestCase):
             report = json.loads(
                 (evidence / "server-alias-parity.json").read_text(encoding="utf-8")
             )
-            self.assertEqual(report["schema_version"], 3)
+            self.assertEqual(report["schema_version"], 4)
             self.assertEqual(report["status"], "FAIL")
             self.assertEqual(report["error"], "KeyboardInterrupt: interrupted")
             self.assertEqual(report["host"], host)

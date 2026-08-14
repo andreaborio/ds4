@@ -193,6 +193,20 @@ make install-test
 make uninstall DESTDIR="$PWD/package-root" PREFIX=/usr/local
 ```
 
+Numbered source bundles contain a `.tar.gz`, a machine-readable source
+manifest, and `SHA256SUMS`. The archive intentionally has no `.git` directory;
+redistributable package builds should clear host-specific tuning and pass the
+12-character commit recorded by the manifest:
+
+```sh
+make NATIVE_CPU_FLAG= BUILD_GIT_SHA=<12-character-release-commit>
+```
+
+The exact reproducibility, verification, and smoke-install procedure is part of
+the [release checklist](QA_BEFORE_RELEASES.md#source-release-bundle). The
+checksum set detects bundle drift but does not identify its publisher by
+itself; obtain the files or published digest through a trusted release channel.
+
 The canonical commands are `hebrus`, `hebrus-server`, `hebrus-agent`,
 `hebrus-bench`, and `hebrus-eval`. Their `ds4*` compatibility names point to
 the same binaries. Durable environment variables, serialized identifiers, and

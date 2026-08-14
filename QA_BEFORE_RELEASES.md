@@ -63,6 +63,77 @@ Stable/full-window promotion, rerun the complete Qwen gate on both `QWEN_V2`
 and `QWEN_Q2_V2` and complete both near-262K endpoint arms. A local Q2 file with
 the right filename but no complete hash match is not release evidence.
 
+## Source Release Bundle
+
+Prepare source artifacts only after the version, release notes, changelog, and
+all other intentional release metadata are committed. Start release notes from
+[`docs/releases/TEMPLATE.md`](docs/releases/TEMPLATE.md), remove every
+placeholder, and add the same numbered `version` and `date-released` to
+`CITATION.cff`. Historical tags are not authority for the new citation. The
+versioned note records only facts knowable before the tag: version, date,
+expected tag and asset names, scope, support boundary, and limitations. Do not
+embed its own future commit, archive hash, workflow link, or post-commit
+evidence in the source tree.
+
+Use a fresh output directory and bind the bundle to either the full
+40-character release commit or an exact local tag. The ref must resolve to the
+clean checked-out `HEAD`; mutable branch names, dirty trees, submodule gitlinks,
+nonempty or linked output directories, and existing destination artifacts are
+rejected. Archive generation uses an isolated view of the commit's Git objects,
+so repository-local attributes, replacement objects, grafts, and user or system
+Git configuration cannot change the committed tree being packaged.
+Full commit refs are accepted for staging. Final published assets must be
+regenerated from the exact `v$RELEASE_VERSION` tag; a tag whose SemVer does not
+match the requested version is rejected.
+
+```sh
+export RELEASE_VERSION=<X.Y.Z-without-leading-v>
+export RELEASE_REF=<full-40-character-release-commit-or-exact-tag>
+export RELEASE_OUT="$PWD/dist/hebrus-$RELEASE_VERSION"
+
+make release-source-test
+make release-source-smoke
+make release-source
+python3 tools/release_source.py verify \
+  --manifest "$RELEASE_OUT/hebrus-$RELEASE_VERSION-source.json"
+```
+
+`release-source-smoke` builds the archive twice, requires byte-identical
+archive/manifest/checksum outputs, extracts it without `.git`, passes the
+12-character release commit through `BUILD_GIT_SHA`, clears
+`NATIVE_CPU_FLAG`, and runs the staged install contract. On macOS this exercises
+the default Metal package and installed resource discovery; on Linux it
+exercises the CPU reference package. This source/install gate does not replace
+qualified Metal kernels, model-backed evidence, or any manual lane below.
+
+Retain and publish these three files together:
+
+- `hebrus-$RELEASE_VERSION.tar.gz`;
+- `hebrus-$RELEASE_VERSION-source.json`;
+- `SHA256SUMS`.
+
+After the final commit and exact tag exist, the GitHub Release body is the
+post-commit evidence record. It must name the tag's peeled 40-character commit
+target, reproduce the two entries from `SHA256SUMS`, link the hosted
+Linux/macOS jobs and source workflow for that exact commit or tag, link the
+qualified model-backed and manual evidence, and state every skipped or
+non-applicable lane with its reason. This separation avoids a circular attempt
+to commit the hash of an archive or commit that contains the note itself.
+
+If the calendar date changes before publication, update the versioned note and
+`CITATION.cff`, create a new final candidate commit, and rerun every exact-commit
+gate. Do not publish a tag whose recorded release date is stale.
+
+The read-only manual
+[`release-source.yml`](.github/workflows/release-source.yml) workflow performs
+the same generator tests, double-build smoke, verification, and artifact
+retention after resolving its full-commit or exact-tag input to a recorded full
+commit. It does not create or modify a GitHub Release. Downloaded workflow
+artifacts are staging evidence; re-run the local verifier on the exact three
+files before publication. The checksum set establishes internal consistency;
+publisher authenticity still depends on obtaining its digest or files through
+the trusted release channel.
+
 ## 1. Repository And Build Sanity
 
 - Start from the exact clean committed release tree. Release notes and every
@@ -92,13 +163,16 @@ the right filename but no complete hash match is not release evidence.
   canonical executables, five relative compatibility aliases, valid capability
   documents, no embedded checkout/staging paths, and an explicit-only,
   idempotent uninstall.
+- Run `make release-source-test`; the full archive double-build and smoke
+  install remain the explicit source-bundle gate above because they require the
+  final version and immutable release ref.
 - Run whitespace checks before committing:
   `git diff --check`.
 - Confirm both names of the CLI, server, and agent render help cleanly, with
   readable section colors and no broken wrapping.
 - On a qualified Qwen host, run the two server names sequentially against the
-  exact published artifact and compare model discovery, one seeded greedy chat
-  completion, graceful shutdown, and exit status. Set
+  exact published artifact and compare model discovery, two seeded greedy chat
+  completions per persistent process, graceful shutdown, and exit status. Set
   `RELEASE_EVIDENCE_ROOT` explicitly to a persistent, release-owned absolute
   directory outside the checkout, then run:
   `QWEN_V2="$QWEN_V2" SERVER_ALIAS_EVIDENCE_DIR="$RELEASE_EVIDENCE_ROOT/hebrus-server-alias-$(git rev-parse --short=12 HEAD)" make server-alias-model-test`.
@@ -239,7 +313,10 @@ the normal flag-free `AUTO` path selects SSD. Forced SSD on hardware where
 non-regression control only; it cannot justify SSD optimization there.
 
 - Flash q2/q2-q4 streaming:
-  `./ds4 -m "$DEEPSEEK_V2" --ssd-streaming --ssd-streaming-cache-experts 32GB -p "..."`
+  `./hebrus -m "$DEEPSEEK_V2" --ssd-streaming -p "..."`
+  DeepSeek ExpertMajor v2 must use automatic cache sizing; an explicit
+  `--ssd-streaming-cache-experts` budget is rejected because it bypasses the
+  phase cache schedule.
 - Mixed-quant Flash SSD streaming is currently non-applicable because no
   qualified mixed-quant ExpertMajor v2 artifact identity or model-backed
   baseline is recorded. Do not substitute a canonical, v1, sidecar, or
@@ -284,15 +361,31 @@ canonical, v1, sidecar, and community GGUFs are not equivalent inputs.
 - Run `make model-free-test` and `./ds4_test --metal-kernels`. The latter must
   retain resident/SSD top-8 output equivalence, zero resident cache/`pread`
   accounting, malformed-route fail-closed behavior, and slab-growth checks.
-  The model-free lane must include a synthetic 21 GiB host snapshot; the Metal
-  lane must inject a denial after one slab and prove slot reuse with no new
-  buffer, then inject denial before the first slab and prove fail-closed before
-  SSD I/O. These simulations validate mechanics, not physical memory behavior.
+  `--metal-expert-pack` must exercise the complete synthetic resident Affine4
+  routed-MoE path at 1, 2, 25, 31 and 32 rows and compare its reduced output
+  against the numeric oracle. The model-free lane must include a synthetic
+  21 GiB host snapshot; the Metal lane must inject a denial after one slab and
+  prove slot reuse with no new buffer, then inject denial before the first slab
+  and prove fail-closed before SSD I/O. These simulations validate mechanics,
+  not physical memory behavior or a complete model graph.
+  The restored reduction is shared with the Q2_K_XL routed path, but this
+  Affine4 fixture does not replace the separate exact-artifact Q2 Beta gate.
   `make qwen-24g-fixture-test` must also validate the prompt hashes, fixed
   sampler/seed, request order, and >1,719-token companion threshold in
   `tests/qwen/fixtures/qwen-24g-release-v1.json`.
 - Run `./ds4 -m "$QWEN_V2" --ctx 8192` for the normal flag-free
   AUTO smoke.
+- On a host that admits resident mode, run the exact published Affine4 server
+  marker gate without inherited runtime-tuning variables. Assert the log says
+  `residency requested=resident resolved=resident`,
+  `Qwen Metal resident runtime: mapped`, and the 25-token resident layer-major
+  prefill marker; an AUTO run counts only when its log
+  likewise proves that it resolved to resident. Send the deterministic
+  `HEBRUS ALIAS PARITY OK` completion twice to each persistent server process
+  and require the generated content to match exactly both times. Both responses
+  must report exactly 25 prompt tokens and valid cache accounting. A process that
+  emits a control token, passes only one request, resolves to SSD, or relies on
+  an inherited batch-disable setting does not satisfy this resident gate.
 - Run AUTO with the normal flag-free startup command; record both admission plans,
   their point-in-time inputs, resolved mode, cache tier, configured target slab
   size (up to 321 experts), cache `buffer_allocs`, task physical footprint, and

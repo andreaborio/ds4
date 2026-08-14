@@ -16,6 +16,7 @@
 /tests/test_q4k_dot
 /tests/test_ssd_residency
 /build/
+/dist/
 /ds4flash.gguf
 *.experts.pack
 /TODO.md

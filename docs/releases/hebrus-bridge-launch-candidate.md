@@ -3,12 +3,18 @@
 - Status: local launch candidate; not published
 - Version: to be assigned at release cut
 - Release date: to be assigned at release cut
-- Candidate commit: to be recorded after all release gates pass
+- Candidate commit and evidence: to be recorded in the external release record
+  after the final commit exists
 
 These notes separate behavior already implemented in source from external
 release operations that still require an explicit decision, credentials, or a
 published artifact. They are not a release announcement and do not promise a
 repository URL, signed package, or availability date.
+
+This combined engine-and-Studio launch candidate is not the source-only Hebrus
+0.3.0 release. The numbered engine release is documented separately in
+[`v0.3.0.md`](v0.3.0.md); Studio packaging, signing, and notarization remain
+outside that release.
 
 > [!IMPORTANT]
 > Hebrus began as a fork of
@@ -117,14 +123,15 @@ This bridge intentionally does not rename:
 - source-level C identifiers, Git history, authorship, tags, or historical
   benchmark and release links.
 
-Compatibility aliases remain supported through at least the complete 1.x
-release line. Any future removal requires usage evidence, a new accepted
-decision record, release notes, and its own migration tests.
+Compatibility aliases are retained in the current release. The proposed
+complete-1.x horizon remains unaccepted in ADR 0005 and is not a release-line
+promise. Any future removal requires usage evidence, a new accepted decision
+record, release notes, and its own migration tests.
 
 ## Evidence required on the final candidate commit
 
-Before replacing the placeholders at the top of this document, the release
-owner must attach evidence for the exact commit being published:
+Before publishing the combined release, the release owner must attach evidence
+for the exact commit in an external release record:
 
 - clean context, documentation-link, brand-boundary, model-free, build
   isolation, command-alias, staged-install, and download-manifest gates;
@@ -176,10 +183,11 @@ does not rewrite models or user data.
 
 ## Release-owner cut procedure
 
-1. Choose and record the immutable candidate commit.
+1. Choose the immutable candidate commit.
 2. Run the complete checklist and archive exact raw evidence.
 3. Verify the release version appears consistently in packages and notes.
-4. Replace only the version, date, and commit placeholders above.
+4. Record the final commit, checksums, exact job links, and evidence in the
+   external release record after the commit exists.
 5. Confirm every pending item is either completed with evidence or explicitly
    disclosed as unavailable; do not silently omit a gate.
 6. Publish only after the engine, Hebrus Studio bridge, migration guide,

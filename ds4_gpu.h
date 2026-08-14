@@ -1712,6 +1712,8 @@ int hebrus_gpu_internal_stream_expert_cache_scan_limit_test(void);
 /* Model-free source-translation/fail-closed regression used by
  * --metal-expert-pack. */
 int ds4_gpu_internal_qwen35_expert_pack_test(void);
+/* Model-free resident MLX-affine regression across the routed-MM threshold. */
+int ds4_gpu_internal_qwen35_affine_resident_short_test(void);
 /* Canonical-vs-embedded GLM Q2 regression for direct and grouped execution. */
 int ds4_gpu_internal_expert_store_v2_kernel_test(void);
 

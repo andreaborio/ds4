@@ -41313,46 +41313,6 @@ static bool ds4_session_qwen35_metal_forward_commit(
     return true;
 }
 
-static bool ds4_session_qwen35_metal_forward_queued_commit(
-        ds4_session *s,
-        int          token,
-        float       *logits,
-        bool         commands_preopened,
-        bool         finish_commands) {
-    if (!ds4_session_is_qwen35_metal(s) ||
-        !ds4_session_qwen35_timeline_valid(s)) {
-        return false;
-    }
-
-    const uint32_t position = (uint32_t)s->checkpoint.len;
-    const bool io_overlap =
-        (s->engine->qwen35_features.enabled &
-         QWEN35_FEATURE_IO_OVERLAP) != 0;
-    const bool gqa_reuse =
-        ds4_session_qwen35_decode_gqa_reuse_enabled(s);
-    if (!qwen35_gpu_forward_token_commands(
-            logits,
-            &s->engine->model,
-            &s->engine->qwen35_weights,
-            &s->qwen35_gpu_graph,
-            token,
-            position,
-            commands_preopened,
-            finish_commands,
-            gqa_reuse,
-            io_overlap,
-            ds4_session_qwen35_metal_activity,
-            s) ||
-        s->qwen35_gpu_graph.n_tokens != position + 1u) {
-        return false;
-    }
-
-    token_vec_push(&s->checkpoint, token);
-    s->checkpoint_valid = true;
-    s->mtp_draft_valid = false;
-    return true;
-}
-
 static bool ds4_session_qwen35_metal_prefill_chunk_commit(
         ds4_session *s,
         const int   *tokens,
@@ -42297,11 +42257,8 @@ static int ds4_session_sync_qwen35_metal(
         }
         return finish;
     }
-    const bool batch_ssd_prefill = s->engine->ssd_streaming;
     const bool batch_layer_major_prefill =
-        (!s->engine->ssd_streaming || batch_ssd_prefill) &&
         prompt->len - start > 1 &&
-        getenv("DS4_QWEN_DISABLE_RESIDENT_BATCH_PREFILL") == NULL &&
         getenv("DS4_MOE_RECORD_SELECTED_IDS") == NULL &&
         getenv("DS4_MOE_REPLAY_SELECTED_IDS") == NULL &&
         getenv("DS4_MOE_RECORD_SELECTED_HOTLIST") == NULL;
@@ -42366,7 +42323,7 @@ static int ds4_session_sync_qwen35_metal(
             fprintf(stderr,
                     "ds4: Qwen %s layer-major prefill encoded %u "
                     "tokens in %u chunk(s), cap=%u\n",
-                    batch_ssd_prefill ? "SSD" : "resident",
+                    s->engine->ssd_streaming ? "SSD" : "resident",
                     batched_tokens,
                     chunks,
                     s->qwen35_gpu_graph.prefill.capacity);
@@ -42387,18 +42344,6 @@ static int ds4_session_sync_qwen35_metal(
         return finish;
     }
 
-    const bool queue_resident_prefill =
-        !s->engine->ssd_streaming &&
-        prompt->len - start > 1 &&
-        getenv("DS4_QWEN_DISABLE_RESIDENT_PREFILL_QUEUE") == NULL &&
-        getenv("DS4_MOE_RECORD_SELECTED_IDS") == NULL &&
-        getenv("DS4_MOE_REPLAY_SELECTED_IDS") == NULL &&
-        getenv("DS4_MOE_RECORD_SELECTED_HOTLIST") == NULL;
-    bool commands_preopened = false;
-    uint32_t queued_command_buffers = 0;
-    uint32_t pending_command_buffers = 0;
-    uint32_t intermediate_fences = 0;
-    const uint32_t max_pending_command_buffers = 8;
     for (int i = start; i < prompt->len; i++) {
         if (ds4_session_cancelled(s)) {
             const bool reset = ds4_session_qwen35_reset_timeline(s);
@@ -42412,18 +42357,10 @@ static int ds4_session_sync_qwen35_metal(
             return DS4_SESSION_SYNC_INTERRUPTED;
         }
         float *token_logits = i + 1 == prompt->len ? s->logits : NULL;
-        const bool finish_commands = i + 1 == prompt->len;
-        const bool committed = queue_resident_prefill ?
-            ds4_session_qwen35_metal_forward_queued_commit(
-                s,
-                prompt->v[i],
-                token_logits,
-                commands_preopened,
-                finish_commands) :
-            ds4_session_qwen35_metal_forward_commit(
-                s,
-                prompt->v[i],
-                token_logits);
+        const bool committed = ds4_session_qwen35_metal_forward_commit(
+            s,
+            prompt->v[i],
+            token_logits);
         if (!committed) {
             const bool reset = ds4_session_qwen35_reset_timeline(s);
             if (errlen) {
@@ -42437,57 +42374,9 @@ static int ds4_session_sync_qwen35_metal(
                 phase_feature_enabled, err, errlen);
             return 1;
         }
-        if (queue_resident_prefill && !finish_commands) {
-            commands_preopened = true;
-            if (ds4_gpu_flush_commands() == 0) {
-                const bool reset = ds4_session_qwen35_reset_timeline(s);
-                if (errlen) {
-                    snprintf(err, errlen,
-                             "Qwen Metal prefill queue flush failed at "
-                             "position %d%s",
-                             i,
-                             reset ? "" : "; reset failed");
-                }
-                qwen35_metal_unwind_prefill_phase(
-                    s, &prefill_resources, phase_budget,
-                    phase_feature_enabled, err, errlen);
-                return 1;
-            }
-            queued_command_buffers++;
-            pending_command_buffers++;
-            if (pending_command_buffers == max_pending_command_buffers) {
-                if (ds4_gpu_synchronize() == 0) {
-                    const bool reset =
-                        ds4_session_qwen35_reset_timeline(s);
-                    if (errlen) {
-                        snprintf(err, errlen,
-                                 "Qwen Metal prefill queue fence failed at "
-                                 "position %d%s",
-                                 i,
-                                 reset ? "" : "; reset failed");
-                    }
-                    qwen35_metal_unwind_prefill_phase(
-                        s, &prefill_resources, phase_budget,
-                        phase_feature_enabled, err, errlen);
-                    return 1;
-                }
-                commands_preopened = false;
-                pending_command_buffers = 0;
-                intermediate_fences++;
-            }
-        }
         if (s->progress) {
             s->progress(s->progress_ud, "prefill_chunk", i + 1, prompt->len);
         }
-    }
-    if (queue_resident_prefill &&
-        getenv("DS4_METAL_MEMORY_REPORT") != NULL) {
-        fprintf(stderr,
-                "ds4: Qwen resident prefill queued %u command buffers with "
-                "%u bounded intermediate fences (max in-flight=%u)\n",
-                queued_command_buffers,
-                intermediate_fences,
-                max_pending_command_buffers);
     }
     const int finish =
         qwen35_metal_finish_prefill_phase(

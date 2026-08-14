@@ -124,7 +124,7 @@
       "location": "content",
       "token": "ds4",
       "classification": "compatibility",
-      "maximum": 5
+      "maximum": 3
     },
     {
       "path": "CHANGELOG.md",
@@ -250,7 +250,7 @@
       "location": "content",
       "token": "ds4",
       "classification": "migration-pending",
-      "maximum": 9
+      "maximum": 5
     },
     {
       "path": "ONEDGE_IMATRIX.md",
@@ -264,7 +264,7 @@
       "location": "content",
       "token": "ds4",
       "classification": "compatibility",
-      "maximum": 26
+      "maximum": 25
     },
     {
       "path": "QA_BEFORE_RELEASES.md",
@@ -348,28 +348,28 @@
       "location": "content",
       "token": "DS4",
       "classification": "migration-pending",
-      "maximum": 39
+      "maximum": 37
     },
     {
       "path": "docs/HF_MODEL_RENAME_INVENTORY.md",
       "location": "content",
       "token": "DS4",
       "classification": "serialized/permanent",
-      "maximum": 9
+      "maximum": 7
     },
     {
       "path": "docs/REBRAND_ROLLOUT_PLAN.md",
       "location": "content",
       "token": "ds4",
       "classification": "compatibility",
-      "maximum": 10
+      "maximum": 5
     },
     {
       "path": "docs/REBRAND_ROLLOUT_PLAN.md",
       "location": "content",
       "token": "DS4",
       "classification": "compatibility",
-      "maximum": 11
+      "maximum": 3
     },
     {
       "path": "docs/adr/0001-expert-major-v2-only.md",
@@ -911,6 +911,20 @@
       "maximum": 1
     },
     {
+      "path": "docs/releases/v0.3.0.md",
+      "location": "content",
+      "token": "ds4",
+      "classification": "compatibility",
+      "maximum": 3
+    },
+    {
+      "path": "docs/releases/v0.3.0.md",
+      "location": "content",
+      "token": "DS4",
+      "classification": "compatibility",
+      "maximum": 1
+    },
+    {
       "path": "download_model.sh",
       "location": "content",
       "token": "ds4",
@@ -936,14 +950,14 @@
       "location": "content",
       "token": "ds4",
       "classification": "migration-pending",
-      "maximum": 5269
+      "maximum": 5257
     },
     {
       "path": "ds4.c",
       "location": "content",
       "token": "DS4",
       "classification": "migration-pending",
-      "maximum": 4565
+      "maximum": 4559
     },
     {
       "path": "ds4.h",
@@ -1125,7 +1139,7 @@
       "location": "content",
       "token": "ds4",
       "classification": "migration-pending",
-      "maximum": 760
+      "maximum": 761
     },
     {
       "path": "ds4_gpu.h",
@@ -1230,14 +1244,14 @@
       "location": "content",
       "token": "ds4",
       "classification": "migration-pending",
-      "maximum": 7111
+      "maximum": 7175
     },
     {
       "path": "ds4_metal.m",
       "location": "content",
       "token": "DS4",
       "classification": "migration-pending",
-      "maximum": 1194
+      "maximum": 1195
     },
     {
       "path": "ds4_profile.c",
@@ -2196,7 +2210,7 @@
       "location": "content",
       "token": "ds4",
       "classification": "migration-pending",
-      "maximum": 887
+      "maximum": 888
     },
     {
       "path": "tests/ds4_test.c",
@@ -2721,21 +2735,21 @@
       "location": "content",
       "token": "DS4",
       "classification": "compatibility",
-      "maximum": 6
+      "maximum": 7
     },
     {
       "path": "tests/test_server_alias_model_unit.py",
       "location": "content",
       "token": "ds4",
       "classification": "compatibility",
-      "maximum": 4
+      "maximum": 9
     },
     {
       "path": "tests/test_server_alias_model_unit.py",
       "location": "content",
       "token": "DS4",
       "classification": "compatibility",
-      "maximum": 6
+      "maximum": 8
     },
     {
       "path": "tests/test_ssd_residency.c",
