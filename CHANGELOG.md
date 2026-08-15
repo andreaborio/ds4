@@ -8,7 +8,7 @@ into current support claims here.
 
 No user-visible changes recorded yet.
 
-## 0.3.0 - 2026-08-14
+## 0.3.0 - 2026-08-15
 
 Hebrus 0.3.0 is the first Hebrus-named source release. It ships source and
 provenance files only; it does not include prebuilt engine binaries or a
