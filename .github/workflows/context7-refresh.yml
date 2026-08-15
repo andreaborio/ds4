@@ -23,8 +23,28 @@ jobs:
       - name: Trigger Context7 refresh
         if: env.CONTEXT7_API_KEY != ''
         run: |
-          curl --fail-with-body --silent --show-error \
+          response_file="$(mktemp)"
+          trap 'rm -f "$response_file"' EXIT
+          http_status="$(curl --silent --show-error \
             --request POST https://context7.com/api/v1/refresh \
             --header "Content-Type: application/json" \
             --header "Authorization: Bearer ${CONTEXT7_API_KEY}" \
-            --data '{"libraryName":"/${{ github.repository }}"}'
+            --data '{"libraryName":"/${{ github.repository }}"}' \
+            --output "$response_file" \
+            --write-out '%{http_code}')"
+
+          if [[ "$http_status" =~ ^2[0-9][0-9]$ ]]; then
+            cat "$response_file"
+            exit 0
+          fi
+
+          if [[ "$http_status" == "400" ]] && \
+             grep -Eq '"error"[[:space:]]*:[[:space:]]*"too-early"' "$response_file"; then
+            cat "$response_file"
+            echo "Context7 refresh skipped: the index is inside its cooldown window."
+            exit 0
+          fi
+
+          cat "$response_file" >&2
+          echo "Context7 refresh failed with HTTP $http_status" >&2
+          exit 1
