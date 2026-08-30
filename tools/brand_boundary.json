@@ -393,6 +393,20 @@
       "maximum": 4
     },
     {
+      "path": "docs/adr/0008-qwen38flash-next-text-only-family.md",
+      "location": "content",
+      "token": "ds4",
+      "classification": "migration-pending",
+      "maximum": 2
+    },
+    {
+      "path": "docs/adr/0008-qwen38flash-next-text-only-family.md",
+      "location": "content",
+      "token": "DS4",
+      "classification": "migration-pending",
+      "maximum": 3
+    },
+    {
       "path": "docs/architecture/CODEMAP.md",
       "location": "content",
       "token": "ds4",
@@ -783,6 +797,20 @@
       "token": "DS4",
       "classification": "serialized/permanent",
       "maximum": 1
+    },
+    {
+      "path": "docs/contracts/qwen4exp-profile.json",
+      "location": "content",
+      "token": "ds4",
+      "classification": "serialized/permanent",
+      "maximum": 3
+    },
+    {
+      "path": "docs/contracts/qwen4exp-profile.json",
+      "location": "content",
+      "token": "DS4",
+      "classification": "serialized/permanent",
+      "maximum": 2
     },
     {
       "path": "docs/deepseek-expert-major-v2.md",
@@ -2059,6 +2087,83 @@
       "maximum": 4
     },
     {
+      "path": "plan-qwen38flash/02-hebrus-integration-map.md",
+      "location": "content",
+      "token": "ds4",
+      "classification": "migration-pending",
+      "maximum": 38
+    },
+    {
+      "path": "plan-qwen38flash/02-hebrus-integration-map.md",
+      "location": "content",
+      "token": "DS4",
+      "classification": "migration-pending",
+      "maximum": 4
+    },
+    {
+      "path": "plan-qwen38flash/03-artifact-converter-and-admission.md",
+      "location": "content",
+      "token": "ds4",
+      "classification": "migration-pending",
+      "maximum": 14
+    },
+    {
+      "path": "plan-qwen38flash/03-artifact-converter-and-admission.md",
+      "location": "content",
+      "token": "DS4",
+      "classification": "migration-pending",
+      "maximum": 1
+    },
+    {
+      "path": "plan-qwen38flash/05-ssd-streaming-and-memory-policy.md",
+      "location": "content",
+      "token": "ds4",
+      "classification": "migration-pending",
+      "maximum": 7
+    },
+    {
+      "path": "plan-qwen38flash/06-implementation-phases.md",
+      "location": "content",
+      "token": "ds4",
+      "classification": "migration-pending",
+      "maximum": 8
+    },
+    {
+      "path": "plan-qwen38flash/07-test-oracles-and-qualification.md",
+      "location": "content",
+      "token": "ds4",
+      "classification": "migration-pending",
+      "maximum": 1
+    },
+    {
+      "path": "plan-qwen38flash/10-agent-playbook.md",
+      "location": "content",
+      "token": "ds4",
+      "classification": "migration-pending",
+      "maximum": 5
+    },
+    {
+      "path": "plan-qwen38flash/10-agent-playbook.md",
+      "location": "content",
+      "token": "DS4",
+      "classification": "migration-pending",
+      "maximum": 1
+    },
+    {
+      "path": "plan-qwen38flash/README.md",
+      "location": "content",
+      "token": "ds4",
+      "classification": "migration-pending",
+      "maximum": 2
+    },
+    {
+      "path": "plan-qwen38flash/START_IMPLEMENTATION_PROMPT.md",
+      "location": "content",
+      "token": "ds4",
+      "classification": "migration-pending",
+      "maximum": 17
+    },
+    {
       "path": "runtime/ds4_deepseek_cache_phase.inc",
       "location": "path",
       "token": "ds4",
@@ -2379,6 +2484,20 @@
       "token": "DS4",
       "classification": "migration-pending",
       "maximum": 5
+    },
+    {
+      "path": "tests/qwen4exp/test_source_inventory.py",
+      "location": "content",
+      "token": "ds4",
+      "classification": "migration-pending",
+      "maximum": 3
+    },
+    {
+      "path": "tests/qwen4exp/test_source_inventory.py",
+      "location": "content",
+      "token": "DS4",
+      "classification": "migration-pending",
+      "maximum": 1
     },
     {
       "path": "tests/test-vectors/README.md",
