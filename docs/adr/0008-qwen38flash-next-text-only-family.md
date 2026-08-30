@@ -149,6 +149,29 @@ claim follows from this decision; support requires the gates below.
     quantized weights may be used only as non-distributed private research
     evidence, with no public artifact or downloader entry.
 
+## Phase 3 structural-admission milestone
+
+Phase 3 adds a closed loader and ownership proof without adding an execution
+profile. Normal builds deliberately register no Qwen4Exp physical profile and
+therefore reject at `physical_profile`, before tokenizer loading, residency
+planning, host-memory probes, weight binding or GPU initialization. A separate
+`DS4_TEST_HOOKS` plus `DS4_NO_GPU` binary registers exactly one sparse BF16
+structural fixture profile, `qwen4exp-phase3-fixture-bf16-v1`; it can succeed
+only with `--inspect` and still reports `runtimeSupported=false` and
+`payloadVerified=false`. Attempted generation is rejected after structural
+admission and before runtime setup.
+
+The fixture contains 1,069 physical tensors: 1,067 exact dense/runtime-control
+identities, one ExpertMajor owner and one PLE owner. Dense tensors use the
+default 32-byte GGUF packing. The two opaque owners follow in that order at
+minimal 4,096-byte boundaries, finish on 4,096-byte boundaries, and the PLE
+extent reaches EOF. Admission checks the closed 108-entry metadata table,
+three explicitly absent keys, exact tensor names/types/shapes, both structural
+manifests, non-overlap, dense page isolation and whole-file ownership. Startup
+does not verify or fault either sparse payload. Production physical types,
+ExpertMajor codec qualification, PLE codec/page geometry and tokenizer-content
+canonicalization remain later decisions.
+
 ## Consequences
 
 - `qwen4exp` is a permanent second Qwen family. Qwen3.6 keeps its existing

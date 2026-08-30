@@ -41,8 +41,10 @@
 
 #include "ds4.h"
 #include "ds4_expert_store.h"
+#include "ds4_ple_store.h"
 #include "ds4_profile.h"
 #include "ds4_qwen.h"
+#include "ds4_qwen4exp.h"
 #include "ds4_qwen_unicode.h"
 
 #ifdef DS4_TEST_HOOKS
@@ -142,6 +144,7 @@ typedef enum {
     DS4_MODEL_FAMILY_DEEPSEEK4,
     DS4_MODEL_FAMILY_GLM_DSA,
     DS4_MODEL_FAMILY_QWEN35_MOE,
+    DS4_MODEL_FAMILY_QWEN4EXP,
 } ds4_model_family;
 
 typedef enum {
@@ -1635,9 +1638,22 @@ static bool cursor_string(ds4_cursor *c, ds4_str *s) {
     return true;
 }
 
+static bool checked_align_up_u64(
+        uint64_t value, uint64_t alignment, uint64_t *out) {
+    if (!out || alignment == 0) return false;
+    const uint64_t rem = value % alignment;
+    const uint64_t add = rem == 0 ? 0 : alignment - rem;
+    if (value > UINT64_MAX - add) return false;
+    *out = value + add;
+    return true;
+}
+
 static uint64_t align_up(uint64_t value, uint64_t alignment) {
-    uint64_t rem = value % alignment;
-    return rem == 0 ? value : value + alignment - rem;
+    uint64_t aligned = 0;
+    if (!checked_align_up_u64(value, alignment, &aligned)) {
+        ds4_die("alignment arithmetic overflow");
+    }
+    return aligned;
 }
 
 /* =========================================================================
@@ -1840,8 +1856,9 @@ static const char *tensor_type_name(uint32_t type) {
 
 static bool tensor_nbytes(uint32_t type, uint64_t elements, uint64_t *bytes) {
     const gguf_type_info *info = tensor_type(type);
-    if (!info || info->block_elems == 0) return false;
-    uint64_t blocks = (elements + info->block_elems - 1) / info->block_elems;
+    if (!info || info->block_elems == 0 || !bytes) return false;
+    const uint64_t blocks = elements / info->block_elems +
+        (elements % info->block_elems != 0 ? 1u : 0u);
     if (blocks > UINT64_MAX / info->block_bytes) return false;
     *bytes = blocks * info->block_bytes;
     return true;
@@ -1879,6 +1896,9 @@ static ds4_model_family model_family_from_metadata(const ds4_model *m) {
     if (ds4_streq(arch, "deepseek4")) return DS4_MODEL_FAMILY_DEEPSEEK4;
     if (ds4_streq(arch, "glm-dsa")) return DS4_MODEL_FAMILY_GLM_DSA;
     if (ds4_streq(arch, "qwen35moe")) return DS4_MODEL_FAMILY_QWEN35_MOE;
+    if (ds4_streq(arch, DS4_QWEN4EXP_GGUF_ARCHITECTURE)) {
+        return DS4_MODEL_FAMILY_QWEN4EXP;
+    }
     return DS4_MODEL_FAMILY_UNKNOWN;
 }
 
@@ -1978,6 +1998,17 @@ static bool model_get_bool(const ds4_model *m, const char *key, bool *out) {
     return true;
 }
 
+/* Route malformed near-matches through the closed Qwen4Exp identity gate so a
+ * single architecture mutation still receives the deterministic admission
+ * report instead of falling into the generic unsupported-family path. */
+static bool model_is_qwen4exp_candidate(const ds4_model *m) {
+    ds4_str profile = {0};
+    return m &&
+        (m->family == DS4_MODEL_FAMILY_QWEN4EXP ||
+         (model_get_string(m, "ds4.model.profile_id", &profile) &&
+          ds4_streq(profile, DS4_QWEN4EXP_PROFILE_ID)));
+}
+
 typedef struct {
     uint32_t type;
     uint64_t len;
@@ -2032,17 +2063,32 @@ static void model_prefetch_cpu_mapping(const ds4_model *m) {
 
 /* Read the GGUF metadata table.  Values stay in the mmap; we store offsets so
  * later validation can decode only the keys it needs. */
-static void parse_metadata(ds4_model *m, ds4_cursor *c) {
+static void model_parse_die(const char *path, const char *message) {
+    fprintf(stderr, "ds4: model '%s': %s\n", path, message);
+    exit(1);
+}
+
+static void parse_metadata(
+        ds4_model *m, ds4_cursor *c, const char *path) {
+    const uint64_t minimum_entry_bytes = 8u + 4u + 1u;
+    if (m->n_kv == 0 ||
+        m->n_kv > SIZE_MAX / sizeof(m->kv[0]) ||
+        m->n_kv > m->size / minimum_entry_bytes) {
+        model_parse_die(path,
+            "GGUF metadata count is not plausible for the file size");
+    }
     m->kv = calloc((size_t)m->n_kv, sizeof(m->kv[0]));
-    if (!m->kv) ds4_die("out of memory while allocating metadata table");
+    if (!m->kv) {
+        model_parse_die(path, "out of memory while allocating metadata table");
+    }
 
     m->alignment = 32;
 
     for (uint64_t i = 0; i < m->n_kv; i++) {
         ds4_kv *kv = &m->kv[i];
 
-        if (!cursor_string(c, &kv->key)) ds4_die(c->error);
-        if (!cursor_u32(c, &kv->type)) ds4_die(c->error);
+        if (!cursor_string(c, &kv->key)) model_parse_die(path, c->error);
+        if (!cursor_u32(c, &kv->type)) model_parse_die(path, c->error);
 
         kv->value_pos = c->pos;
 
@@ -2056,57 +2102,78 @@ static void parse_metadata(ds4_model *m, ds4_cursor *c) {
             }
         }
 
-        if (!skip_value(c, kv->type, 0)) ds4_die(c->error);
+        if (!skip_value(c, kv->type, 0)) model_parse_die(path, c->error);
     }
 }
 
 /* Read the tensor directory and convert relative GGUF offsets to absolute
  * mmap offsets.  Tensor bytes are still never copied here. */
-static void parse_tensors(ds4_model *m, ds4_cursor *c) {
+static void parse_tensors(
+        ds4_model *m, ds4_cursor *c, const char *path) {
+    const uint64_t minimum_entry_bytes = 8u + 4u + 8u + 4u + 8u;
+    if (m->n_tensors == 0 ||
+        m->n_tensors > SIZE_MAX / sizeof(m->tensors[0]) ||
+        m->n_tensors > m->size / minimum_entry_bytes) {
+        model_parse_die(path,
+            "GGUF tensor count is not plausible for the file size");
+    }
     m->tensors = calloc((size_t)m->n_tensors, sizeof(m->tensors[0]));
-    if (!m->tensors) ds4_die("out of memory while allocating tensor table");
+    if (!m->tensors) {
+        model_parse_die(path, "out of memory while allocating tensor table");
+    }
 
     for (uint64_t i = 0; i < m->n_tensors; i++) {
         ds4_tensor *t = &m->tensors[i];
 
-        if (!cursor_string(c, &t->name)) ds4_die(c->error);
-        if (!cursor_u32(c, &t->ndim)) ds4_die(c->error);
+        if (!cursor_string(c, &t->name)) model_parse_die(path, c->error);
+        if (!cursor_u32(c, &t->ndim)) model_parse_die(path, c->error);
         if (t->ndim == 0 || t->ndim > DS4_MAX_DIMS) {
-            ds4_die("tensor has an unsupported number of dimensions");
+            model_parse_die(path,
+                "tensor has an unsupported number of dimensions");
         }
 
         t->elements = 1;
         for (uint32_t d = 0; d < t->ndim; d++) {
-            if (!cursor_u64(c, &t->dim[d])) ds4_die(c->error);
-            if (t->dim[d] != 0 && t->elements > UINT64_MAX / t->dim[d]) {
-                ds4_die("tensor element count overflow");
+            if (!cursor_u64(c, &t->dim[d])) model_parse_die(path, c->error);
+            if (t->dim[d] == 0) {
+                model_parse_die(path, "tensor has a zero dimension");
+            }
+            if (t->elements > UINT64_MAX / t->dim[d]) {
+                model_parse_die(path, "tensor element count overflow");
             }
             t->elements *= t->dim[d];
         }
 
-        if (!cursor_u32(c, &t->type)) ds4_die(c->error);
-        if (!cursor_u64(c, &t->rel_offset)) ds4_die(c->error);
+        if (!cursor_u32(c, &t->type)) model_parse_die(path, c->error);
+        if (!cursor_u64(c, &t->rel_offset)) model_parse_die(path, c->error);
 
-        if (!tensor_nbytes(t->type, t->elements, &t->bytes)) {
-            ds4_log(stderr,
-                DS4_LOG_WARNING,
-                "ds4: warning: tensor %.*s has unsupported GGUF type %u\n",
-                (int)t->name.len, t->name.ptr, t->type);
+        if (!tensor_nbytes(t->type, t->elements, &t->bytes) ||
+            t->bytes == 0) {
+            fprintf(stderr,
+                "ds4: model '%s': tensor %.*s has unsupported or overflowing "
+                "GGUF type %u\n",
+                path, (int)t->name.len, t->name.ptr, t->type);
+            exit(1);
         }
     }
 
-    m->tensor_data_pos = align_up(c->pos, m->alignment);
+    if (!checked_align_up_u64(c->pos, m->alignment,
+                              &m->tensor_data_pos)) {
+        model_parse_die(path, "GGUF tensor data alignment overflow");
+    }
+    if (m->tensor_data_pos > m->size) {
+        model_parse_die(path, "GGUF tensor data offset exceeds the file");
+    }
 
     for (uint64_t i = 0; i < m->n_tensors; i++) {
         ds4_tensor *t = &m->tensors[i];
         if (t->rel_offset > UINT64_MAX - m->tensor_data_pos) {
-            ds4_die("tensor offset overflow");
+            model_parse_die(path, "tensor offset overflow");
         }
         t->abs_offset = m->tensor_data_pos + t->rel_offset;
-        if (t->bytes != 0 &&
-            (t->abs_offset > m->size || t->bytes > m->size - t->abs_offset))
+        if (t->abs_offset > m->size || t->bytes > m->size - t->abs_offset)
         {
-            ds4_die("tensor points outside GGUF file");
+            model_parse_die(path, "tensor points outside GGUF file");
         }
         if (t->bytes > m->max_tensor_bytes) {
             m->max_tensor_bytes = t->bytes;
@@ -2718,7 +2785,11 @@ static void model_open(ds4_model *m, const char *path, bool metal_mapping,
 
     struct stat st;
     if (fstat(fd, &st) == -1) ds4_die_errno("cannot stat model", path);
-    if (st.st_size < 32) ds4_die("model file is too small to be GGUF");
+    if (!S_ISREG(st.st_mode)) model_parse_die(path, "model must be a regular file");
+    if (st.st_size < 32) model_parse_die(path, "model file is too small to be GGUF");
+    if ((uintmax_t)st.st_size > (uintmax_t)SIZE_MAX) {
+        model_parse_die(path, "model file is too large for this address space");
+    }
 
     /*
      * Metal wraps slices of this mapping as no-copy MTLBuffers, so the Metal
@@ -2742,18 +2813,18 @@ static void model_open(ds4_model *m, const char *path, bool metal_mapping,
 
     ds4_cursor c = cursor_at(m, 0);
     uint32_t magic;
-    if (!cursor_u32(&c, &magic)) ds4_die(c.error);
-    if (magic != DS4_GGUF_MAGIC) ds4_die("model is not a GGUF file");
-    if (!cursor_u32(&c, &m->version)) ds4_die(c.error);
-    if (!cursor_u64(&c, &m->n_tensors)) ds4_die(c.error);
+    if (!cursor_u32(&c, &magic)) model_parse_die(path, c.error);
+    if (magic != DS4_GGUF_MAGIC) model_parse_die(path, "model is not a GGUF file");
+    if (!cursor_u32(&c, &m->version)) model_parse_die(path, c.error);
+    if (!cursor_u64(&c, &m->n_tensors)) model_parse_die(path, c.error);
     m->gguf_n_tensors = m->n_tensors;
-    if (!cursor_u64(&c, &m->n_kv)) ds4_die(c.error);
+    if (!cursor_u64(&c, &m->n_kv)) model_parse_die(path, c.error);
 
-    if (m->version != 3) ds4_die("only GGUF v3 is supported");
+    if (m->version != 3) model_parse_die(path, "only GGUF v3 is supported");
 
-    parse_metadata(m, &c);
+    parse_metadata(m, &c, path);
     m->family = model_family_from_metadata(m);
-    parse_tensors(m, &c);
+    parse_tensors(m, &c, path);
     model_expand_glm_native_expert_store(m);
     model_expand_deepseek4_native_expert_store(m);
     model_expand_qwen35_expert_store_v2(m);
@@ -2890,6 +2961,11 @@ static ds4_tensor *model_find_tensor(const ds4_model *m, const char *name) {
     }
     return NULL;
 }
+
+/* The Qwen4Exp loader is intentionally a textual partition of this translation
+ * unit: it needs the private GGUF model/tensor helpers above, but exposes no
+ * public runtime API while the artifact codecs remain unqualified. */
+#include "runtime/ds4_qwen4exp_loader.inc"
 
 
 /* Return the in-place tensor payload inside the mapped GGUF. */
@@ -5732,6 +5808,9 @@ static void config_validate_model(const ds4_model *m) {
         return;
     case DS4_MODEL_FAMILY_QWEN35_MOE:
         config_validate_qwen35moe_model(m);
+        return;
+    case DS4_MODEL_FAMILY_QWEN4EXP:
+        ds4_die("Qwen4Exp execution is not qualified");
         return;
     case DS4_MODEL_FAMILY_UNKNOWN:
         break;
@@ -29990,6 +30069,7 @@ struct ds4_vocab {
 struct ds4_engine {
     ds4_model model;
     ds4_model mtp_model;
+    ds4_qwen4exp_loader qwen4exp_loader;
     ds4_vocab vocab;
     ds4_weights weights;
     ds4_qwen35_weights qwen35_weights;
@@ -40026,6 +40106,35 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
     if (opt->n_threads > 0) g_requested_threads = (uint32_t)opt->n_threads;
     ds4_acquire_instance_lock();
 
+    const bool graph_backend = ds4_backend_uses_graph(opt->backend);
+    if (graph_backend) ds4_linux_graph_backend_set_oom_score(opt->backend);
+    model_open(&e->model, opt->model_path, graph_backend, false);
+    if (model_is_qwen4exp_candidate(&e->model)) {
+        ds4_qwen4exp_rejection rejection = {0};
+        if (!qwen4exp_loader_admit(&e->model, &e->qwen4exp_loader,
+                                   &rejection)) {
+            fprintf(stderr,
+                    "ds4: Qwen4Exp admission rejected model %s\n",
+                    opt->model_path);
+            qwen4exp_loader_print_json(stderr, &e->qwen4exp_loader,
+                                       &rejection);
+            ds4_engine_close(e);
+            return 1;
+        }
+        if (!opt->inspect_only) {
+            fprintf(stderr,
+                    "ds4: Qwen4Exp execution rejected model %s: execution "
+                    "is not qualified; this profile is structural "
+                    "admission-only\n",
+                    opt->model_path);
+            qwen4exp_loader_print_json(stderr, &e->qwen4exp_loader, NULL);
+            ds4_engine_close(e);
+            return 1;
+        }
+        *out = e;
+        return 0;
+    }
+
     if (opt->simulate_used_memory_bytes != 0 &&
         !ds4_ssd_memory_lock_acquire(&e->simulated_memory,
                                      opt->simulate_used_memory_bytes)) {
@@ -40033,10 +40142,6 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
         *out = NULL;
         return 1;
     }
-
-    const bool graph_backend = ds4_backend_uses_graph(opt->backend);
-    if (graph_backend) ds4_linux_graph_backend_set_oom_score(opt->backend);
-    model_open(&e->model, opt->model_path, graph_backend, false);
     const bool qwen_family =
         e->model.family == DS4_MODEL_FAMILY_QWEN35_MOE;
     const bool deepseek_family =
@@ -40658,6 +40763,11 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
 }
 
 void ds4_engine_summary(ds4_engine *e) {
+    if (e && e->model.family == DS4_MODEL_FAMILY_QWEN4EXP) {
+        qwen4exp_loader_print_summary(stdout, &e->qwen4exp_loader);
+        qwen4exp_loader_print_json(stdout, &e->qwen4exp_loader, NULL);
+        return;
+    }
     model_summary(&e->model);
 }
 
@@ -40773,6 +40883,7 @@ bool ds4_engine_context_memory_estimate_with_prefill(
 
 void ds4_engine_close(ds4_engine *e) {
     if (!e) return;
+    qwen4exp_loader_close(&e->qwen4exp_loader);
     qwen35_telemetry_close(e);
     ds4_expert_profile_close();
     weights_free(&e->weights);

@@ -57,6 +57,7 @@ CHECK_NAMES = (
     "norm-roles",
     "graph-facts",
     "config-rules",
+    "admission",
     "license",
 )
 
@@ -256,6 +257,146 @@ def truthy_list(errors: list[str], tag: str, values: list[str], label: str) -> N
     for value in values:
         if not isinstance(value, str) or not value.strip():
             errors.append(f"{tag}: {label}: empty rule string")
+
+
+def canonical_json_sha256(value: object) -> str:
+    blob = json.dumps(value, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return hashlib.sha256(blob).hexdigest()
+
+
+def align_up(value: int, alignment: int) -> int:
+    if alignment <= 0 or alignment & (alignment - 1):
+        raise ValueError("alignment must be a positive power of two")
+    return (value + alignment - 1) // alignment * alignment
+
+
+def metadata_scalar_type(value: object) -> str:
+    if type(value) is bool:
+        return "BOOL"
+    if type(value) is int:
+        return "UINT32"
+    if type(value) is float:
+        return "FLOAT32"
+    if type(value) is str:
+        return "STRING"
+    raise TypeError(f"not a scalar GGUF metadata value: {value!r}")
+
+
+def expected_admission_metadata(contract: dict) -> dict[str, dict]:
+    """Build the exact Phase-3 metadata table from independent pinned fields."""
+
+    pins = contract["sourcePins"]
+    ident = contract["identity"]
+    cfg = contract["pinnedConfig"]
+    ple_hash = contract["pleHash"]
+    ple_extent = contract["pleExtent"]
+    entries: dict[str, dict] = {}
+
+    def add(key: str, type_name: str, value: object) -> None:
+        entries[key] = {"type": type_name, "value": value}
+
+    add("general.architecture", "STRING", ident["ggufArchSpelling"])
+    add("ds4.model.profile_id", "STRING", ident["artifactProfileId"])
+    add("ds4.model.physical_profile_id", "STRING", "qwen4exp-phase3-fixture-bf16-v1")
+    add("ds4.model.source_architecture", "STRING", ident["architecture"])
+    add("ds4.model.source_revision", "STRING", ident["hfRevision"])
+    add("ds4.model.transformers_revision", "STRING", pins["transformersCommit"])
+    add("ds4.model.tensor_inventory_digest", "STRING", pins["inventorySha256"])
+    add("ds4.model.source_tensor_count", "UINT32", pins["tensorCount"])
+    add("ds4.model.source_bytes", "UINT64", pins["sourceBytes"])
+    add("ds4.tokenizer.digest", "STRING", pins["fileSha256"]["tokenizer.json"])
+    add("ds4.tokenizer_config.digest", "STRING", pins["fileSha256"]["tokenizer_config.json"])
+    add("ds4.chat_template.digest", "STRING", pins["fileSha256"]["chat_template.jinja"])
+    add("ds4.text_only", "BOOL", True)
+    add("ds4.mtp.present", "BOOL", False)
+    add("ds4.mtp.executed", "BOOL", False)
+    add("ds4.expert_store.family", "UINT32", 4)
+    add("ds4.expert_store.profile", "STRING", ident["artifactProfileId"])
+    add("ds4.expert_store.codec", "STRING", "mlx-affine4")
+    add("ds4.expert_store.codec_descriptor_digest", "STRING",
+        "74ff9e25a49c2ca8f8620f5360308876b163257f12dff146cc56749222583f4b")
+    add("ds4.ple_store.family", "UINT32", 4)
+    add("ds4.ple_store.profile", "STRING", ident["artifactProfileId"])
+    add("ds4.ple_store.codec", "STRING", "q4exp-fixture-bf16-v1")
+    add("ds4.ple_store.codec_descriptor_digest", "STRING",
+        "810f4424febbd36b6659465e555cd781b1cc8ef3a5b3e25126df7cabc8ca8a31")
+
+    for key, value in cfg["topLevel"].items():
+        if key != "architectures":
+            add(f"qwen4exp.top.{key}", metadata_scalar_type(value), value)
+    for key, value in cfg["text"].items():
+        if not isinstance(value, (list, dict)):
+            add(f"qwen4exp.text.{key}", metadata_scalar_type(value), value)
+    for key, value in cfg["text"]["rope_parameters"].items():
+        if not isinstance(value, list):
+            add(f"qwen4exp.text.rope.{key}", metadata_scalar_type(value), value)
+    for key, value in cfg["mtp"].items():
+        if value is not None and not isinstance(value, list):
+            add(f"qwen4exp.mtp.{key}", metadata_scalar_type(value), value)
+    add("qwen4exp.default.seed", "UINT32", cfg["defaultsUsed"]["seed"])
+    add("qwen4exp.text.norm_topk_prob", "BOOL", cfg["norm_topk_prob"])
+    layer_encoding = {"linear_attention": 0, "full_attention": 1}
+    add("qwen4exp.text.layer_pattern", "UINT32[48]",
+        [layer_encoding[value] for value in cfg["text"]["layer_types"]])
+    add("qwen4exp.text.ple_layer_ids", "UINT32[1]", cfg["text"]["ple_layer_ids"])
+    add("qwen4exp.text.rope.mrope_section", "UINT32[3]",
+        cfg["text"]["rope_parameters"]["mrope_section"])
+    add("qwen4exp.ple.layer_multipliers", "UINT64[3]", ple_hash["layerMultipliers"])
+    add("qwen4exp.ple.head_primes", "UINT64[16]", ple_hash["headPrimes"])
+    add("qwen4exp.ple.head_offsets", "UINT64[16]", ple_hash["headOffsets"])
+    add("qwen4exp.ple.hash_id", "STRING", ple_extent["hashId"])
+    add("qwen4exp.ple.hash_seed", "UINT32", ple_hash["seed"])
+    add("qwen4exp.ple.head_rows", "UINT64", ple_extent["headRows"])
+    add("qwen4exp.ple.rows", "UINT64", ple_extent["rows"])
+    tokenizer_ids = {
+        "end_of_text_token_id": 248044,
+        "pad_token_id": 248044,
+        "im_start_token_id": 248045,
+        "im_end_token_id": 248046,
+        "eos_token_id": 248046,
+        "vision_start_token_id": 248053,
+        "vision_end_token_id": 248054,
+        "vision_pad_token_id": 248055,
+        "image_pad_token_id": 248056,
+        "video_pad_token_id": 248057,
+    }
+    for key, value in tokenizer_ids.items():
+        add(f"qwen4exp.tokenizer.{key}", "UINT32", value)
+    return entries
+
+
+def validate_metadata_value(errors: list[str], key: str, entry: dict) -> None:
+    eq(errors, f"[admission.metadata.shape.{key}]", "metadata entry fields",
+       set(entry), {"type", "value"})
+    type_name = entry["type"]
+    value = entry["value"]
+    array_match = re.fullmatch(r"(UINT32|UINT64)\[(\d+)\]", type_name)
+    if array_match:
+        width = 32 if array_match.group(1) == "UINT32" else 64
+        length = int(array_match.group(2))
+        eq(errors, f"[admission.metadata.array.{key}]", "fixed array length",
+           len(value), length)
+        for index, item in enumerate(value):
+            if type(item) is not int or not 0 <= item < (1 << width):
+                errors.append(
+                    f"[admission.metadata.array.{key}.{index}]: value {item!r} is not UINT{width}"
+                )
+        return
+    if type_name == "STRING":
+        ok = isinstance(value, str) and bool(value)
+    elif type_name == "BOOL":
+        ok = type(value) is bool
+    elif type_name == "UINT32":
+        ok = type(value) is int and 0 <= value < (1 << 32)
+    elif type_name == "UINT64":
+        ok = type(value) is int and 0 <= value < (1 << 64)
+    elif type_name == "FLOAT32":
+        ok = type(value) in (int, float) and math.isfinite(value)
+    else:
+        errors.append(f"[admission.metadata.type.{key}]: unknown closed type {type_name!r}")
+        return
+    if not ok:
+        errors.append(f"[admission.metadata.value.{key}]: {value!r} is not a valid {type_name}")
 
 
 # ---------------------------------------------------------------------------
@@ -1143,6 +1284,423 @@ def check_config_rules(contract: dict, fixture: dict, errors: list[str]) -> int:
     return len(errors) - before
 
 
+def check_admission(contract: dict, fixture: dict, errors: list[str]) -> int:
+    """Close the Phase-3 metadata and model-free physical fixture."""
+
+    before = len(errors)
+    admission = contract["admission"]
+    expected_admission_keys = {
+        "status", "supportClaim", "productionProfile", "productionDecision",
+        "fixtureBuildGuard", "fixtureMayRunInProduction", "sourceHashControls",
+        "metadataSchema", "physicalFixture", "reportSchema", "tokenizer",
+    }
+    eq(errors, "[admission.keys]", "closed admission document fields",
+       set(admission), expected_admission_keys)
+    eq(errors, "[admission.status]", "Phase-3 fixture status",
+       admission["status"], "phase3-structural-test-only")
+    eq(errors, "[admission.noSupport]", "structural fixture is not a support claim",
+       admission["supportClaim"], False)
+    eq(errors, "[admission.productionNull]", "production physical profile remains absent",
+       admission["productionProfile"], None)
+    eq(errors, "[admission.productionPending]", "production decision remains pending",
+       admission["productionDecision"], "pending")
+    eq(errors, "[admission.testGuard]", "fixture is compiled only under the test hook",
+       admission["fixtureBuildGuard"], "DS4_TEST_HOOKS")
+    eq(errors, "[admission.neverProduction]", "fixture cannot run in production",
+       admission["fixtureMayRunInProduction"], False)
+    eq(errors, "[admission.sourceHashesMetadataOnly]", "source hashes are provenance controls only",
+       admission["sourceHashControls"],
+       "metadata-only; source hashes bind provenance and never stand in for payload verification")
+    eq(errors, "[admission.contractUnsupported]", "admission does not change support status",
+       contract["status"], "pinned-not-supported")
+
+    schema = admission["metadataSchema"]
+    eq(errors, "[admission.metadata.keys]", "closed metadata schema fields",
+       set(schema), {"closed", "layerTypeEncoding", "absentKeys", "entries"})
+    eq(errors, "[admission.metadata.closed]", "metadata rejects missing and unknown fields",
+       schema["closed"], True)
+    eq(errors, "[admission.metadata.layerEncoding]", "layer type numeric encoding",
+       schema["layerTypeEncoding"], {"linear_attention": 0, "full_attention": 1})
+    eq(errors, "[admission.metadata.absent]", "source-null and tokenizer BOS remain absent",
+       schema["absentKeys"], [
+           "general.alignment",
+           "qwen4exp.mtp.mtp_use_hidden_state_from_layer",
+           "qwen4exp.tokenizer.bos_token_id",
+       ])
+    expected_metadata = expected_admission_metadata(contract)
+    entries = schema["entries"]
+    eq(errors, "[admission.metadata.keySet]", "exact GGUF metadata key set",
+       set(entries), set(expected_metadata))
+    for key, expected in expected_metadata.items():
+        if key not in entries:
+            continue
+        validate_metadata_value(errors, key, entries[key])
+        eq(errors, f"[admission.metadata.{key}]", "closed metadata type and value",
+           entries[key], expected)
+
+    physical = admission["physicalFixture"]
+    eq(errors, "[admission.physical.keys]", "closed structural fixture fields",
+       set(physical), {
+           "scope", "production", "payloadMaterialized", "physicalProfileId",
+           "physicalTensorCount", "owners", "sourcePartition", "rules", "dense",
+           "expertMajor", "ple",
+       })
+    eq(errors, "[admission.physical.scope]", "physical fixture test scope",
+       physical["scope"], admission["fixtureBuildGuard"])
+    eq(errors, "[admission.physical.production]", "physical fixture is never production",
+       physical["production"], False)
+    eq(errors, "[admission.physical.payload]", "structural fixture emits no payload",
+       physical["payloadMaterialized"], False)
+    eq(errors, "[admission.physical.profile]", "test-only physical profile identity",
+       physical["physicalProfileId"], "qwen4exp-phase3-fixture-bf16-v1")
+    owners = physical["owners"]
+    eq(errors, "[admission.physical.owners]", "one owner per physical tensor class",
+       owners, {"dense": 1067, "expertMajor": 1, "ple": 1})
+    eq(errors, "[admission.physical.total]", "physical tensor total",
+       physical["physicalTensorCount"], sum(owners.values()))
+    eq(errors, "[admission.physical.totalExact]", "closed physical tensor total",
+       physical["physicalTensorCount"], 1069)
+
+    base_rows = sorted(
+        (row for row in fixture["tensors"] if classify(fixture, row["name"]) == "base"),
+        key=lambda row: row["name"],
+    )
+    routed_rows = [row for row in base_rows if ".mlp.experts." in row["name"]]
+    hash_suffixes = (
+        ".ple.ple_embedding.layer_multipliers",
+        ".ple.ple_embedding.ngram_heads_offsets",
+        ".ple.ple_embedding.ngram_heads_vocab_sizes",
+    )
+    ple_store_rows = [
+        row for row in base_rows
+        if ".ple.ple_embedding.ngram_embedding.shard_" in row["name"]
+        or row["name"].endswith(hash_suffixes)
+    ]
+    dense_rows = [
+        row for row in base_rows
+        if row not in routed_rows and row not in ple_store_rows
+    ]
+    ple_compute = [
+        row for row in dense_rows
+        if row["name"].startswith(contract["tensorRoles"]["pleLayerPattern"])
+    ]
+    partition = physical["sourcePartition"]
+    expected_partition = {
+        "base": len(base_rows),
+        "dense": len(dense_rows),
+        "routedIntoExpertMajor": len(routed_rows),
+        "pleIntoStore": len(ple_store_rows),
+        "pleComputeRetainedDense": len(ple_compute),
+    }
+    eq(errors, "[admission.physical.partition]", "source identities partition exactly once",
+       partition, expected_partition)
+    eq(errors, "[admission.physical.partitionSum]", "base partition closes",
+       partition["dense"] + partition["routedIntoExpertMajor"] + partition["pleIntoStore"],
+       partition["base"])
+    eq(errors, "[admission.physical.pleCompute]", "six PLE compute tensors remain dense",
+       partition["pleComputeRetainedDense"], 6)
+    expected_layout_rules = [
+        "general.alignment is intentionally absent; GGUF default alignment is 32 bytes",
+        "dense tensors are sorted by source identity and packed at the minimal 32-byte GGUF alignment",
+        "physical owner order is dense tensors, then ds4.expert_major.v2, then ds4.ple_rows.v1",
+        "each opaque owner starts and ends at a 4096-byte boundary; only the minimal align_up gap is permitted and counted as padding",
+        "ds4.ple_rows.v1 ends at the file extent with no extra tail bytes",
+        "4096-byte host-page-rounded dense spans are disjoint from both opaque owner extents",
+    ]
+    eq(errors, "[admission.physical.layoutRules]", "closed packing and ownership rules",
+       physical["rules"], expected_layout_rules)
+    eq(errors, "[admission.physical.noAlignmentMetadata]", "GGUF uses the absent-key default",
+       "general.alignment" in entries, False)
+    truthy_list(errors, "[admission.physical.layoutRulesNonempty]",
+                physical["rules"], "layout rules")
+    eq(errors, "[admission.physical.denseDtype]", "every dense source is BF16",
+       {row["dtype"] for row in dense_rows}, {"BF16"})
+    descriptors = [
+        {
+            "sourceIdentity": row["name"],
+            "ggufDimensions": list(reversed(row["shape"])),
+            "ggufType": "BF16",
+        }
+        for row in dense_rows
+    ]
+    dense_doc = physical["dense"]
+    expected_dense = {
+        "sourceIdentity": "unchanged",
+        "sourceSelection": "base minus routed experts minus 128 PLE shards minus three PLE hash buffers",
+        "sourceDtype": "BF16",
+        "ggufType": "BF16",
+        "ggufDimensions": "reverse(source.shape)",
+        "descriptorCanonicalization":
+            "RFC8259 JSON array sorted by sourceIdentity; object keys sorted; separators ',' and ':'; UTF-8",
+        "descriptorSha256": canonical_json_sha256(descriptors),
+    }
+    eq(errors, "[admission.physical.dense]", "dense identity/type/reversed-dimension fixture",
+       dense_doc, expected_dense)
+    eq(errors, "[admission.physical.denseCount]", "dense descriptor count",
+       len(descriptors), owners["dense"])
+
+    # Reconstruct the structural data-region layout.  The metadata deliberately
+    # omits general.alignment, so GGUF's 32-byte default is authoritative.  The
+    # v2 expert store and v1 PLE store are both whole 4096-byte owner extents.
+    gguf_alignment = 32
+    host_page = 4096
+    cursor = 0
+    padding_bytes = 0
+    dense_spans: list[tuple[int, int]] = []
+    for row in dense_rows:
+        start = align_up(cursor, gguf_alignment)
+        padding_bytes += start - cursor
+        end = start + row["end"] - row["begin"]
+        dense_spans.append((start, end))
+        cursor = end
+    dense_end = cursor
+    expert_start = align_up(dense_end, host_page)
+    padding_bytes += expert_start - dense_end
+    cfg = text_config(contract)
+    candidate = contract["expertStore"]["structuralCandidate"]
+    gate_or_up_bytes = (
+        cfg["hidden_size"] // candidate["groupSize"]
+        * candidate["blockBytes"] * cfg["moe_intermediate_size"]
+    )
+    down_bytes = (
+        cfg["moe_intermediate_size"] // candidate["groupSize"]
+        * candidate["blockBytes"] * cfg["hidden_size"]
+    )
+    expert_record_bytes = 2 * gate_or_up_bytes + down_bytes
+    expert_data_offset = align_up(512 + cfg["num_hidden_layers"] * 256, host_page)
+    expert_bytes = (
+        expert_data_offset
+        + expert_record_bytes * cfg["num_experts"] * cfg["num_hidden_layers"]
+    )
+    expert_end = expert_start + expert_bytes
+    ple_start = align_up(expert_end, host_page)
+    padding_bytes += ple_start - expert_end
+    ple_bytes = host_page + physical["ple"]["pageStride"]
+    ple_end = ple_start + ple_bytes
+    file_end = ple_end
+    eq(errors, "[admission.physical.densePacking]", "dense starts use minimal 32-byte alignment",
+       all(start % gguf_alignment == 0 for start, _ in dense_spans), True)
+    eq(errors, "[admission.physical.ownerOrder]", "dense then ExpertMajor then PLE",
+       dense_end <= expert_start <= expert_end <= ple_start <= ple_end, True)
+    eq(errors, "[admission.physical.expertBoundaries]", "ExpertMajor starts and ends on host pages",
+       (expert_start % host_page, expert_end % host_page), (0, 0))
+    eq(errors, "[admission.physical.pleBoundaries]", "PLE starts and ends on host pages",
+       (ple_start % host_page, ple_end % host_page), (0, 0))
+    eq(errors, "[admission.physical.minimalExpertGap]", "ExpertMajor uses the minimal align_up gap",
+       expert_start, align_up(dense_end, host_page))
+    eq(errors, "[admission.physical.minimalPleGap]", "PLE uses the minimal align_up gap",
+       ple_start, align_up(expert_end, host_page))
+    eq(errors, "[admission.physical.paddingCounted]", "only alignment gaps count as outer padding",
+       padding_bytes >= 0, True)
+    eq(errors, "[admission.physical.noTail]", "PLE is the final owner with no tail",
+       file_end, ple_end)
+    dense_page_end = max(align_up(end, host_page) for _, end in dense_spans)
+    eq(errors, "[admission.physical.densePageIsolation]",
+       "page-rounded dense spans stop before the opaque owners",
+       dense_page_end <= expert_start and dense_page_end <= ple_start, True)
+
+    expert_codec = {
+        "storage": candidate["storage"],
+        "logicalGgmlType": candidate["logicalGgmlType"],
+        "groupSize": candidate["groupSize"],
+        "blockBytes": candidate["blockBytes"],
+        "status": candidate["status"],
+    }
+    expected_expert = {
+        "tensorIdentity": contract["expertStore"]["tensor"],
+        "family": contract["identity"]["expertStoreFamily"],
+        "profileId": contract["identity"]["artifactProfileId"],
+        "storage": candidate["storage"],
+        "logicalGgmlType": candidate["logicalGgmlType"],
+        "groupSize": candidate["groupSize"],
+        "blockBytes": candidate["blockBytes"],
+        "codecStatus": candidate["status"],
+        "codecDescriptorSha256": canonical_json_sha256(expert_codec),
+        "sourceProvenance": {
+            "semantics": "complete-pinned-source-inventory",
+            "tensorCount": contract["sourcePins"]["tensorCount"],
+            "sourceBytes": contract["sourcePins"]["sourceBytes"],
+            "inventorySha256": contract["sourcePins"]["inventorySha256"],
+        },
+    }
+    eq(errors, "[admission.physical.expert]", "family-4 affine-G64 structural store",
+       physical["expertMajor"], expected_expert)
+    eq(errors, "[admission.physical.expertNotQualified]", "expert codec is structural only",
+       physical["expertMajor"]["codecStatus"], "phase2-structural-not-release-qualified")
+
+    ple_codec = {
+        "codecId": "q4exp-fixture-bf16-v1",
+        "codecVersion": 1,
+        "groupSize": 1,
+        "encodedRowBytes": 320,
+        "rowsPerPage": 320001536,
+        "pageAlignment": 4096,
+    }
+    page_body = 64 + ple_codec["rowsPerPage"] * ple_codec["encodedRowBytes"]
+    page_stride = align_up(page_body, ple_codec["pageAlignment"])
+    expected_geometry = {
+        "rows": contract["pleExtent"]["rows"],
+        "rowWidth": contract["pleExtent"]["rowWidth"],
+        "rowAlignment": contract["pleExtent"]["rowAlignment"],
+        "headRows": contract["pleExtent"]["headRows"],
+        "paddingRows": contract["pleExtent"]["paddingRows"],
+        "headCount": len(contract["pleHash"]["headPrimes"]),
+        "hashId": contract["pleExtent"]["hashId"],
+        "layerMultipliers": contract["pleHash"]["layerMultipliers"],
+        "headPrimes": contract["pleHash"]["headPrimes"],
+        "headOffsets": contract["pleHash"]["headOffsets"],
+    }
+    expected_ple = {
+        "tensorIdentity": contract["pleExtent"]["magic"],
+        "family": contract["identity"]["expertStoreFamily"],
+        "profileId": contract["identity"]["artifactProfileId"],
+        **ple_codec,
+        "pageCount": 1,
+        "pageHeaderBytes": 64,
+        "pageStride": page_stride,
+        "codecDescriptorSha256": canonical_json_sha256(ple_codec),
+        "logicalGeometry": expected_geometry,
+        "payloadVerification": "offline-publication-only",
+        "startupPayloadVerification": False,
+        "payloadPresent": False,
+    }
+    eq(errors, "[admission.physical.ple]", "exact model-free PLE structural fixture",
+       physical["ple"], expected_ple)
+    eq(errors, "[admission.physical.pleOnePage]", "structural fixture has one affine page",
+       math.ceil(expected_geometry["rows"] / ple_codec["rowsPerPage"]), 1)
+    eq(errors, "[admission.physical.pleNoStartupPayload]", "startup never verifies absent payload",
+       physical["ple"]["startupPayloadVerification"], False)
+
+    report = admission["reportSchema"]
+    stage_enum = [
+        "none", "identity", "physical_profile", "metadata", "tokenizer",
+        "inventory", "expert_store", "ple_store", "policy", "ownership",
+        "accepted",
+    ]
+    report_fields = [
+        "schemaVersion", "family", "profileId", "physicalProfileId", "stage",
+        "admitted", "runtimeSupported", "payloadVerified", "textOnly",
+        "mtpPresent", "visionPresent", "physicalTensors", "denseTensors",
+        "expertStores", "pleStores", "fileBytes", "headerBytes", "denseBytes",
+        "expertBytes", "pleBytes", "paddingBytes", "ownedBytes",
+        "densePageBytes", "expertManifestVerified", "pleManifestVerified",
+        "sourceTensorCount", "sourceBytes", "sourceInventorySha256",
+        "tokenizerContentVerified", "rejection",
+    ]
+    eq(errors, "[admission.report.keys]", "closed report schema fields",
+       set(report), {"schemaVersion", "closed", "stageEnum", "fields", "rules"})
+    eq(errors, "[admission.report.version]", "report schema version",
+       report["schemaVersion"], 1)
+    eq(errors, "[admission.report.closed]", "report rejects unknown fields",
+       report["closed"], True)
+    eq(errors, "[admission.report.stages]", "first-failure stage enumeration",
+       report["stageEnum"], stage_enum)
+    eq(errors, "[admission.report.flatFields]", "exact flat report field order",
+       list(report["fields"]), report_fields)
+    constant_report_fields = {
+        "schemaVersion": {"type": "UINT32", "acceptedValue": 1},
+        "family": {"type": "STRING", "acceptedValue": "qwen4exp"},
+        "profileId": {"type": "STRING", "acceptedValue": "qwen4exp-base-v1"},
+        "physicalProfileId": {
+            "type": "STRING", "acceptedValue": "qwen4exp-phase3-fixture-bf16-v1"
+        },
+        "stage": {"type": "STRING", "acceptedValue": "accepted"},
+        "admitted": {"type": "BOOL", "acceptedValue": True},
+        "runtimeSupported": {"type": "BOOL", "acceptedValue": False},
+        "payloadVerified": {"type": "BOOL", "acceptedValue": False},
+        "textOnly": {"type": "BOOL", "acceptedValue": True},
+        "mtpPresent": {"type": "BOOL", "acceptedValue": False},
+        "visionPresent": {"type": "BOOL", "acceptedValue": False},
+        "physicalTensors": {"type": "UINT64", "acceptedValue": 1069},
+        "denseTensors": {"type": "UINT64", "acceptedValue": 1067},
+        "expertStores": {"type": "UINT64", "acceptedValue": 1},
+        "pleStores": {"type": "UINT64", "acceptedValue": 1},
+        "expertManifestVerified": {"type": "BOOL", "acceptedValue": True},
+        "pleManifestVerified": {"type": "BOOL", "acceptedValue": True},
+        "sourceTensorCount": {"type": "UINT64", "acceptedValue": 1658},
+        "sourceBytes": {"type": "UINT64", "acceptedValue": 359999963128},
+        "sourceInventorySha256": {
+            "type": "STRING",
+            "acceptedValue": "a639efc7a5147b04200e870d7e320335527f4361a8327b137feca2683b1dc434",
+        },
+        "tokenizerContentVerified": {"type": "BOOL", "acceptedValue": False},
+        "rejection": {
+            "type": "NULL_OR_OBJECT{field:STRING,expected:STRING,observed:STRING}",
+            "acceptedValue": None,
+        },
+    }
+    dynamic_report_fields = {
+        "fileBytes": "validated file extent",
+        "headerBytes": "aligned GGUF data offset",
+        "denseBytes": "sum of exact dense tensor byte spans",
+        "expertBytes": "validated ExpertMajor owner extent",
+        "pleBytes": "validated PLE owner extent",
+        "paddingBytes": "named GGUF owner-alignment gaps",
+        "ownedBytes": "denseBytes + expertBytes + pleBytes",
+        "densePageBytes": "union of page-rounded dense owner spans",
+    }
+    for key, value in constant_report_fields.items():
+        eq(errors, f"[admission.report.{key}]", "closed accepted report field",
+           report["fields"][key], value)
+    for key, source in dynamic_report_fields.items():
+        eq(errors, f"[admission.report.{key}]", "runtime-derived exact byte field",
+           report["fields"][key], {"type": "UINT64", "acceptedValueSource": source})
+    expected_report_rules = [
+        "the report is flat and has exactly the listed top-level fields",
+        "rejection is null on acceptance and otherwise has exactly field, expected and observed",
+        "startup verifies both structural manifests but not either sparse payload",
+        "runtimeSupported remains false for the DS4_TEST_HOOKS structural fixture",
+    ]
+    eq(errors, "[admission.report.rules]", "flat report and structural-only rules",
+       report["rules"], expected_report_rules)
+
+    tokenizer = admission["tokenizer"]
+    source_files = contract["sourcePins"]["fileSha256"]
+    expected_tokenizer = {
+        "verification": "declared-provenance-and-special-ids-only",
+        "tokenizerContentVerified": False,
+        "fullSpecialMappingVerified": False,
+        "phase": 4,
+        "status": "pending",
+        "declaredProvenance": {
+            "tokenizerSha256": source_files["tokenizer.json"],
+            "tokenizerConfigSha256": source_files["tokenizer_config.json"],
+            "chatTemplateSha256": source_files["chat_template.jinja"],
+        },
+        "declaredModelConfigIds": {
+            "bos": 248044,
+            "pad": 248044,
+            "eos": 248044,
+            "image": 248056,
+            "video": 248057,
+            "visionStart": 248053,
+            "visionEnd": 248054,
+        },
+        "declaredTokenizerIds": {
+            "bos": None,
+            "endOfText": 248044,
+            "imStart": 248045,
+            "imEnd": 248046,
+            "eos": 248046,
+            "pad": 248044,
+            "visionStart": 248053,
+            "visionEnd": 248054,
+            "visionPad": 248055,
+            "imagePad": 248056,
+            "videoPad": 248057,
+        },
+    }
+    eq(errors, "[admission.tokenizer]", "declared-only Phase-4 tokenizer evidence",
+       tokenizer, expected_tokenizer)
+    eq(errors, "[admission.tokenizerNotVerified]", "tokenizer content remains unverified",
+       tokenizer["tokenizerContentVerified"], False)
+    eq(errors, "[admission.tokenizerBosAbsent]", "tokenizer config declares no BOS token",
+       tokenizer["declaredTokenizerIds"]["bos"], None)
+    eq(errors, "[admission.tokenizerEosDistinct]", "tokenizer EOS differs from model-config EOS",
+       tokenizer["declaredTokenizerIds"]["eos"] != tokenizer["declaredModelConfigIds"]["eos"], True)
+    return len(errors) - before
+
+
 def check_license(contract: dict, fixture: dict, errors: list[str]) -> int:
     before = len(errors)
     license_doc = contract["license"]
@@ -1171,6 +1729,7 @@ CHECKS = {
     "norm-roles": check_norm_roles,
     "graph-facts": check_graph_facts,
     "config-rules": check_config_rules,
+    "admission": check_admission,
     "license": check_license,
 }
 
@@ -1390,6 +1949,135 @@ MUTATIONS: list[tuple[str, str, object]] = [
         d, ("license", "assumedApache2"), True)),
     ("license.reviewed", "claim the license review is done", lambda d: set_path(
         d, ("license", "reviewStatus"), "approved")),
+    ("admission.supportClaim", "turn a structural fixture into a support claim", lambda d: set_path(
+        d, ("admission", "supportClaim"), True)),
+    ("admission.productionProfile", "select an unqualified production profile", lambda d: set_path(
+        d, ("admission", "productionProfile"), "qwen4exp-phase3-fixture-bf16-v1")),
+    ("admission.testGuard", "remove the compile-time test guard", lambda d: set_path(
+        d, ("admission", "fixtureBuildGuard"), "always")),
+    ("admission.sourceHashPolicy", "treat source hashes as payload verification", lambda d: set_path(
+        d, ("admission", "sourceHashControls"), "payload-verified")),
+    ("admission.metadataExtra", "admit an unknown metadata key", lambda d: set_path(
+        d, ("admission", "metadataSchema", "entries", "qwen4exp.unclosed"),
+        {"type": "UINT32", "value": 1})),
+    ("admission.metadataAlignment", "override the intentional GGUF alignment default", lambda d: set_path(
+        d, ("admission", "metadataSchema", "entries", "general.alignment"),
+        {"type": "UINT32", "value": 4096})),
+    ("admission.metadataAlignmentAbsent", "stop freezing general.alignment as absent", lambda d: set_path(
+        d, ("admission", "metadataSchema", "absentKeys"), [
+            "qwen4exp.mtp.mtp_use_hidden_state_from_layer",
+            "qwen4exp.tokenizer.bos_token_id",
+        ])),
+    ("admission.metadataPhysicalProfile", "change the physical selector", lambda d: set_path(
+        d, ("admission", "metadataSchema", "entries", "ds4.model.physical_profile_id", "value"),
+        "qwen4exp-production-v1")),
+    ("admission.metadataSourceBytesType", "narrow source bytes to UINT32", lambda d: set_path(
+        d, ("admission", "metadataSchema", "entries", "ds4.model.source_bytes", "type"), "UINT32")),
+    ("admission.metadataLayerType", "change the 48-layer array type", lambda d: set_path(
+        d, ("admission", "metadataSchema", "entries", "qwen4exp.text.layer_pattern", "type"),
+        "UINT32[47]")),
+    ("admission.metadataLayerValue", "change the 48-layer array", lambda d: set_path(
+        d, ("admission", "metadataSchema", "entries", "qwen4exp.text.layer_pattern", "value", 3), 0)),
+    ("admission.metadataMropeType", "change the M-RoPE array type", lambda d: set_path(
+        d, ("admission", "metadataSchema", "entries", "qwen4exp.text.rope.mrope_section", "type"),
+        "UINT64[3]")),
+    ("admission.metadataMultiplier", "change one UINT64 multiplier", lambda d: set_path(
+        d, ("admission", "metadataSchema", "entries", "qwen4exp.ple.layer_multipliers", "value", 0),
+        23703573157768)),
+    ("admission.metadataPrime", "change one UINT64 head prime", lambda d: set_path(
+        d, ("admission", "metadataSchema", "entries", "qwen4exp.ple.head_primes", "value", 15),
+        20000169)),
+    ("admission.metadataOffset", "change one UINT64 head offset", lambda d: set_path(
+        d, ("admission", "metadataSchema", "entries", "qwen4exp.ple.head_offsets", "value", 1), 1)),
+    ("admission.metadataTokenizerEos", "conflate tokenizer and model EOS", lambda d: set_path(
+        d, ("admission", "metadataSchema", "entries", "qwen4exp.tokenizer.eos_token_id", "value"),
+        248044)),
+    ("admission.metadataBosPresent", "invent a tokenizer BOS metadata key", lambda d: set_path(
+        d, ("admission", "metadataSchema", "entries", "qwen4exp.tokenizer.bos_token_id"),
+        {"type": "UINT32", "value": 248044})),
+    ("admission.physicalProfile", "change the fixture physical profile", lambda d: set_path(
+        d, ("admission", "physicalFixture", "physicalProfileId"), "qwen4exp-base-v1")),
+    ("admission.physicalTotal", "drop one physical tensor", lambda d: set_path(
+        d, ("admission", "physicalFixture", "physicalTensorCount"), 1068)),
+    ("admission.physicalDenseCount", "change the dense physical owner count", lambda d: set_path(
+        d, ("admission", "physicalFixture", "owners", "dense"), 1066)),
+    ("admission.sourcePartition", "misclassify one PLE compute tensor", lambda d: set_path(
+        d, ("admission", "physicalFixture", "sourcePartition", "pleComputeRetainedDense"), 5)),
+    ("admission.layoutDefault", "change the absent-key GGUF default", lambda d: set_path(
+        d, ("admission", "physicalFixture", "rules", 0),
+        "general.alignment is intentionally absent; GGUF default alignment is 64 bytes")),
+    ("admission.layoutDense", "over-align dense tensors", lambda d: set_path(
+        d, ("admission", "physicalFixture", "rules", 1),
+        "dense tensors are sorted by source identity and packed at 4096-byte alignment")),
+    ("admission.layoutOrder", "swap the opaque physical owners", lambda d: set_path(
+        d, ("admission", "physicalFixture", "rules", 2),
+        "physical owner order is dense tensors, then ds4.ple_rows.v1, then ds4.expert_major.v2")),
+    ("admission.layoutPadding", "permit arbitrary owner padding", lambda d: set_path(
+        d, ("admission", "physicalFixture", "rules", 3),
+        "opaque owners are 4096-byte aligned with arbitrary padding")),
+    ("admission.layoutTail", "permit bytes after PLE", lambda d: set_path(
+        d, ("admission", "physicalFixture", "rules", 4),
+        "ds4.ple_rows.v1 may be followed by tail padding")),
+    ("admission.layoutIsolation", "allow dense host pages to overlap a store", lambda d: set_path(
+        d, ("admission", "physicalFixture", "rules", 5),
+        "host-page-rounded dense spans may overlap opaque owners")),
+    ("admission.denseDtype", "change the dense source dtype", lambda d: set_path(
+        d, ("admission", "physicalFixture", "dense", "sourceDtype"), "F16")),
+    ("admission.denseDimensions", "stop reversing dense dimensions", lambda d: set_path(
+        d, ("admission", "physicalFixture", "dense", "ggufDimensions"), "source.shape")),
+    ("admission.denseDigest", "change the dense descriptor digest", lambda d: set_path(
+        d, ("admission", "physicalFixture", "dense", "descriptorSha256"), "0" * 64)),
+    ("admission.expertFamily", "change the structural ExpertMajor family", lambda d: set_path(
+        d, ("admission", "physicalFixture", "expertMajor", "family"), 3)),
+    ("admission.expertGroup", "change the affine expert group", lambda d: set_path(
+        d, ("admission", "physicalFixture", "expertMajor", "groupSize"), 128)),
+    ("admission.expertQualified", "claim the expert fixture codec is qualified", lambda d: set_path(
+        d, ("admission", "physicalFixture", "expertMajor", "codecStatus"), "release-qualified")),
+    ("admission.expertSourceCount", "change complete source provenance count", lambda d: set_path(
+        d, ("admission", "physicalFixture", "expertMajor", "sourceProvenance", "tensorCount"), 1657)),
+    ("admission.expertSourceDigest", "change complete source provenance digest", lambda d: set_path(
+        d, ("admission", "physicalFixture", "expertMajor", "sourceProvenance", "inventorySha256"),
+        "0" * 64)),
+    ("admission.pleCodec", "select a non-fixture PLE codec", lambda d: set_path(
+        d, ("admission", "physicalFixture", "ple", "codecId"), "q4exp-production-v1")),
+    ("admission.pleGroup", "change the fixture PLE group size", lambda d: set_path(
+        d, ("admission", "physicalFixture", "ple", "groupSize"), 2)),
+    ("admission.pleRowBytes", "change the fixture encoded row bytes", lambda d: set_path(
+        d, ("admission", "physicalFixture", "ple", "encodedRowBytes"), 160)),
+    ("admission.pleRowsPerPage", "change the structural rows per page", lambda d: set_path(
+        d, ("admission", "physicalFixture", "ple", "rowsPerPage"), 64)),
+    ("admission.pleAlignment", "change the structural page alignment", lambda d: set_path(
+        d, ("admission", "physicalFixture", "ple", "pageAlignment"), 2048)),
+    ("admission.pleStride", "change the checked physical page stride", lambda d: set_path(
+        d, ("admission", "physicalFixture", "ple", "pageStride"), 102400491520)),
+    ("admission.pleGeometry", "change exact PLE padding", lambda d: set_path(
+        d, ("admission", "physicalFixture", "ple", "logicalGeometry", "paddingRows"), 89)),
+    ("admission.pleStartupPayload", "verify absent PLE payload during startup", lambda d: set_path(
+        d, ("admission", "physicalFixture", "ple", "startupPayloadVerification"), True)),
+    ("admission.plePayloadPresent", "claim the structural fixture has a PLE payload", lambda d: set_path(
+        d, ("admission", "physicalFixture", "ple", "payloadPresent"), True)),
+    ("admission.reportStage", "remove the physical-profile failure stage", lambda d: set_path(
+        d, ("admission", "reportSchema", "stageEnum", 2), "profile")),
+    ("admission.reportRuntime", "claim the accepted fixture is runtime-supported", lambda d: set_path(
+        d, ("admission", "reportSchema", "fields", "runtimeSupported", "acceptedValue"), True)),
+    ("admission.reportPayload", "claim startup verified sparse payload", lambda d: set_path(
+        d, ("admission", "reportSchema", "fields", "payloadVerified", "acceptedValue"), True)),
+    ("admission.reportDenseCount", "change the report dense tensor count", lambda d: set_path(
+        d, ("admission", "reportSchema", "fields", "denseTensors", "acceptedValue"), 1066)),
+    ("admission.reportBytesType", "narrow report file bytes", lambda d: set_path(
+        d, ("admission", "reportSchema", "fields", "fileBytes", "type"), "UINT32")),
+    ("admission.reportRejection", "weaken structured rejection fields", lambda d: set_path(
+        d, ("admission", "reportSchema", "fields", "rejection", "type"), "STRING")),
+    ("admission.tokenizerContent", "claim tokenizer content was verified in Phase 3", lambda d: set_path(
+        d, ("admission", "tokenizer", "tokenizerContentVerified"), True)),
+    ("admission.tokenizerPhase", "move tokenizer verification into Phase 3", lambda d: set_path(
+        d, ("admission", "tokenizer", "phase"), 3)),
+    ("admission.tokenizerDigest", "change declared tokenizer provenance", lambda d: set_path(
+        d, ("admission", "tokenizer", "declaredProvenance", "tokenizerSha256"), "0" * 64)),
+    ("admission.tokenizerBos", "invent an official tokenizer BOS", lambda d: set_path(
+        d, ("admission", "tokenizer", "declaredTokenizerIds", "bos"), 248044)),
+    ("admission.tokenizerEos", "conflate official tokenizer and model EOS", lambda d: set_path(
+        d, ("admission", "tokenizer", "declaredTokenizerIds", "eos"), 248044)),
     ("fixturePaddingProbe", "break the padding probe", lambda d, f: set_path(
         f, ("paddingRowFacts", "embedZero"), True)),
     ("fixtureClassification", "break the fixture classification", lambda d, f: set_path(

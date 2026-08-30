@@ -76,6 +76,7 @@ helpers remain in the same translation unit while agents can load one family.
 | `ds4_streaming_hotlist_glm52.inc` | GLM 5.2 streaming hotlist data included by `ds4.c` |
 | `runtime/ds4_deepseek_cache_phase.inc` | DeepSeek adaptive ExpertMajor cache transitions around batched prefill; textually included by `ds4.c` |
 | `runtime/ds4_glm_graph.inc` | GLM Metal graph state, allocation, prefill/decode scheduling, routed MoE/SSD orchestration, and GLM generation; textually included by `ds4.c` |
+| `runtime/ds4_qwen4exp_loader.inc` | Closed Qwen4Exp metadata, tokenizer-provenance, physical inventory, ExpertMajor/PLE manifest and whole-file ownership admission; production has no registered physical profile and the only positive is a CPU-only structural test hook |
 | `runtime/ds4_metal_glm.inc` | GLM-specific Metal encoders and tensor wrappers; textually included by `ds4_metal.m` |
 
 Qwen keeps one Metal graph and scheduler across its two accepted weight codecs.
@@ -147,7 +148,7 @@ not validated.
 | `docs/contracts/qwen-release.json` + `tools/qwen_release_contract.py` | Canonical Hebrus-named Stable, opt-in Beta, and historical negative-only Qwen artifact identities plus the model-free gate that parses their documentation, downloader, and test surfaces for drift |
 | `tests/test_qwen_release_contract.py` | Fail-closed fixtures for prose, table, downloader, schema, status, and negative-only Qwen release-contract drift |
 | `tests/qwen/` | Qwen fixtures, provenance, reference collectors, and model-specific gates |
-| `tests/qwen4exp/` | Pinned Qwen4Exp source inventory, upstream-backed scalar captures, independent controls, per-array provenance, and fail-closed regeneration checks |
+| `tests/qwen4exp/` | Pinned Qwen4Exp source inventory, upstream-backed scalar captures, independent controls, per-array provenance, sparse Phase 3 GGUF admission builder, black-box negative battery, and fail-closed regeneration checks |
 | `gguf-tools/qwen4exp-profile.py` | Header/index-only Qwen4Exp conversion dry run that maps and byte-accounts every pinned source identity without loading checkpoint tensors |
 | `tests/test-vectors/` | Official and local continuation vectors plus provenance |
 | `gguf-tools/` | Quantization, ExpertMajor conversion, imatrix, and quality-scoring tools |

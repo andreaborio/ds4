@@ -119,9 +119,35 @@ make qwen4exp-converter-test qwen4exp-ple-store-test \
   expert-store-test qwen4exp-sanitizer-test
 ```
 
+## Phase 3 structural admission
+
+`qwen4exp_gguf_fixture.py` independently builds a sparse, structural-only GGUF
+with the full production shapes and owner extents. Its 180,243,750,912 logical
+bytes occupy roughly 150 KiB because dense, ExpertMajor and PLE payloads are
+holes; only the GGUF directory and authenticated structural manifests are
+materialized. The exact layout is 1,067 dense/runtime-control tensors followed
+by one ExpertMajor owner and one PLE owner. Dense packing uses the default GGUF
+32-byte alignment, while opaque stores use minimal 4,096-byte boundaries and
+the PLE owner ends at EOF.
+
+The fixture is admitted only by the dedicated `DS4_NO_GPU` and
+`DS4_TEST_HOOKS` binary. Normal builds have no Qwen4Exp physical profile. The
+black-box runner checks the public `--inspect -m` boundary, the exact flat JSON
+report, a table-driven positive/negative mutation matrix, rejection before
+GPU/runtime work, and absence of unresolved `ds4_gpu_*` symbols. It never reads
+the sparse
+payload, downloads a checkpoint or claims that either structural codec is
+release-qualified.
+
+Run it with:
+
+```sh
+make qwen4exp-admission-test
+```
+
 ## Limitations
 
-These vectors exercise semantic primitives at tiny dimensions. They do not
+These vectors and the structural admission fixture do not
 contain checkpoint weights, full-layer intermediates, tokenizer/template
 vectors, BF16 rounding, quantization, Metal, SSD I/O, or long-running state.
 Their outputs come from the pinned upstream primitives and are independently

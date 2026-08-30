@@ -58,7 +58,8 @@ SERVER_ALIAS_PORT ?= 0
 	qwen-reference-test qwen-unicode-test qwen-tokenizer-test \
 	qwen4exp-profile-test qwen4exp-reference-test \
 	qwen4exp-fixture-check qwen4exp-converter-test \
-	qwen4exp-ple-store-test qwen4exp-sanitizer-test \
+	qwen4exp-ple-store-test qwen4exp-admission-test \
+	qwen4exp-sanitizer-test \
 	qwen-expert-group-test qwen-24g-fixture-test \
 	expert-store-test metal-ssd-profile-test \
 	download-model-test capabilities-test command-alias-test \
@@ -81,8 +82,13 @@ qwen4exp-converter-test: gguf-tools/qwen4exp-profile.py \
 qwen4exp-sanitizer-test: ds4_qwen4exp.c ds4_qwen4exp.h \
 		ds4_qwen4exp_ref.c ds4_qwen4exp_ref.h \
 		ds4_ple_store.c ds4_ple_store.h \
+		ds4.c ds4_cli.c ds4_help.c linenoise.c ds4_build.c ds4_ssd.c \
+		ds4_profile.c ds4_expert_store.c ds4_qwen.c ds4_qwen_unicode.c \
+		runtime/ds4_qwen4exp_loader.inc \
 		tests/test_qwen4exp_profile.c tests/test_qwen4exp_ref.c \
 		tests/test_ple_store.c \
+		tests/qwen4exp/qwen4exp_gguf_fixture.py \
+		tests/qwen4exp/test_qwen4exp_admission.py \
 		tests/qwen4exp/qwen4exp_scalar_golden.inc
 	@mkdir -p "$(BUILD_ROOT)/qwen4exp-sanitizer"
 	$(CC) -O1 -g -Wall -Wextra -Wpedantic -Werror -std=c99 \
@@ -106,6 +112,19 @@ qwen4exp-sanitizer-test: ds4_qwen4exp.c ds4_qwen4exp.h \
 		ds4_ple_store.c tests/test_ple_store.c -lm
 	ASAN_OPTIONS=halt_on_error=1 UBSAN_OPTIONS=halt_on_error=1 \
 		"$(BUILD_ROOT)/qwen4exp-sanitizer/test_ple_store"
+	$(CC) -O1 -g -Wall -Wextra -Werror -std=c99 \
+		-fno-finite-math-only \
+		-fsanitize=address,undefined -fno-sanitize-recover=all \
+		-fno-omit-frame-pointer -DDS4_NO_GPU -DDS4_TEST_HOOKS \
+		-Wno-unused-function -Wno-unused-parameter -I. -o \
+		"$(BUILD_ROOT)/qwen4exp-sanitizer/hebrus-admission" \
+		ds4_cli.c ds4_help.c linenoise.c ds4.c ds4_build.c ds4_ssd.c \
+		ds4_profile.c ds4_expert_store.c ds4_ple_store.c ds4_qwen.c \
+		ds4_qwen4exp.c ds4_qwen_unicode.c -lm -pthread
+	ASAN_OPTIONS=halt_on_error=1 UBSAN_OPTIONS=halt_on_error=1 \
+		PYTHONDONTWRITEBYTECODE=1 python3 \
+		tests/qwen4exp/test_qwen4exp_admission.py --binary \
+		"$(BUILD_ROOT)/qwen4exp-sanitizer/hebrus-admission"
 
 download-model-test: tests/test_download_model.sh download_model.sh \
 		docs/contracts/qwen-release.json
@@ -187,10 +206,10 @@ INSTALL_METAL_PROBE := $(METAL_BINDIR)/ds4_test
 
 METAL_LDLIBS := $(LDLIBS) -framework Foundation -framework Metal
 
-METAL_CORE_OBJS := $(addprefix $(METAL_OBJDIR)/,ds4.o ds4_build.o ds4_ssd.o ds4_profile.o ds4_expert_store.o ds4_qwen.o ds4_qwen_unicode.o ds4_qwen_expert_group.o ds4_metal.o)
+METAL_CORE_OBJS := $(addprefix $(METAL_OBJDIR)/,ds4.o ds4_build.o ds4_ssd.o ds4_profile.o ds4_expert_store.o ds4_ple_store.o ds4_qwen.o ds4_qwen4exp.o ds4_qwen_unicode.o ds4_qwen_expert_group.o ds4_metal.o)
 METAL_TEST_CORE_OBJS := $(filter-out $(METAL_OBJDIR)/ds4_metal.o,$(METAL_CORE_OBJS)) \
 	$(METAL_OBJDIR)/ds4_metal_test.o
-CPU_CORE_OBJS := $(addprefix $(CPU_OBJDIR)/,ds4.o ds4_build.o ds4_ssd.o ds4_profile.o ds4_expert_store.o ds4_qwen.o ds4_qwen_unicode.o)
+CPU_CORE_OBJS := $(addprefix $(CPU_OBJDIR)/,ds4.o ds4_build.o ds4_ssd.o ds4_profile.o ds4_expert_store.o ds4_ple_store.o ds4_qwen.o ds4_qwen4exp.o ds4_qwen_unicode.o)
 
 METAL_BINS := $(addprefix $(METAL_BINDIR)/,$(PROGRAMS))
 CPU_BINS := $(addprefix $(CPU_BINDIR)/,$(PROGRAMS))
@@ -350,10 +369,12 @@ $(METAL_OBJDIR)/%.o: %.c
 # the dependency explicit as well as in the generated .d file so incremental
 # builds remain correct before dependency metadata exists.
 $(METAL_OBJDIR)/ds4.o: runtime/ds4_glm_graph.inc \
-		runtime/ds4_deepseek_cache_phase.inc
+		runtime/ds4_deepseek_cache_phase.inc \
+		runtime/ds4_qwen4exp_loader.inc ds4_qwen4exp.h ds4_ple_store.h
 
 $(CPU_OBJDIR)/ds4.o: runtime/ds4_glm_graph.inc \
-		runtime/ds4_deepseek_cache_phase.inc
+		runtime/ds4_deepseek_cache_phase.inc \
+		runtime/ds4_qwen4exp_loader.inc ds4_qwen4exp.h ds4_ple_store.h
 
 $(CPU_OBJDIR)/%.o: %.c
 	@mkdir -p "$(@D)"
@@ -378,6 +399,14 @@ $(CPU_OBJDIR)/ds4_qwen.o: ds4_qwen.c ds4_qwen.h
 	@mkdir -p "$(@D)"
 	$(CC) $(CFLAGS) $(QWEN_CFLAGS) -DDS4_NO_GPU $(DEPFLAGS) -c -o $@ $<
 
+$(CPU_OBJDIR)/ds4_qwen4exp.o: ds4_qwen4exp.c ds4_qwen4exp.h
+	@mkdir -p "$(@D)"
+	$(CC) $(QWEN4EXP_REF_CFLAGS) -DDS4_NO_GPU $(DEPFLAGS) -I. -c -o $@ $<
+
+$(CPU_OBJDIR)/ds4_ple_store.o: ds4_ple_store.c ds4_ple_store.h
+	@mkdir -p "$(@D)"
+	$(CC) $(QWEN4EXP_REF_CFLAGS) -DDS4_NO_GPU $(DEPFLAGS) -I. -c -o $@ $<
+
 $(METAL_OBJDIR)/ds4_qwen_unicode.o: ds4_qwen_unicode.c ds4_qwen_unicode.h \
 		ds4_qwen_unicode_data.inc
 	@mkdir -p "$(@D)"
@@ -389,13 +418,31 @@ $(CPU_OBJDIR)/ds4_qwen_unicode.o: ds4_qwen_unicode.c ds4_qwen_unicode.h \
 	$(CC) $(CFLAGS) -DDS4_NO_GPU $(DEPFLAGS) -c -o $@ $<
 
 $(METAL_OBJDIR)/ds4_test_core.o: ds4.c ds4.h ds4_ssd.h ds4_profile.h \
-		ds4_gpu.h ds4_qwen.h ds4_expert_store.h \
+		ds4_gpu.h ds4_qwen.h ds4_qwen4exp.h ds4_expert_store.h \
+		ds4_ple_store.h runtime/ds4_qwen4exp_loader.inc \
 		ds4_qwen_unicode.h ds4_streaming_hotlist.inc \
 		tests/internal/ds4_qwen_cpu_test_hooks.h
 	@mkdir -p "$(@D)"
 	$(CC) $(CFLAGS) $(QWEN_CFLAGS) $(DEPFLAGS) -DDS4_NO_GPU \
 		-DDS4_TEST_HOOKS -Wno-unused-function -Wno-unused-parameter \
 		-c -o $@ $<
+
+$(CPU_OBJDIR)/ds4_qwen4exp_test_core.o: ds4.c ds4.h ds4_ssd.h \
+		ds4_profile.h ds4_gpu.h ds4_qwen.h ds4_qwen4exp.h \
+		ds4_expert_store.h ds4_ple_store.h ds4_qwen_unicode.h \
+		runtime/ds4_qwen4exp_loader.inc ds4_streaming_hotlist.inc \
+		tests/internal/ds4_qwen_cpu_test_hooks.h
+	@mkdir -p "$(@D)"
+	$(CC) $(CFLAGS) $(QWEN_CFLAGS) $(DEPFLAGS) -DDS4_NO_GPU \
+		-DDS4_TEST_HOOKS -Wno-unused-function -Wno-unused-parameter \
+		-c -o $@ $<
+
+$(CPU_BINDIR)/hebrus-qwen4exp-admission-test: \
+		$(CPU_OBJDIR)/ds4_cli.o $(CPU_OBJDIR)/ds4_help.o \
+		$(CPU_OBJDIR)/linenoise.o $(CPU_OBJDIR)/ds4_qwen4exp_test_core.o \
+		$(filter-out $(CPU_OBJDIR)/ds4.o,$(CPU_CORE_OBJS))
+	@mkdir -p "$(@D)"
+	$(CC) $(CFLAGS) -o $@ $^ $(LDLIBS)
 
 $(METAL_OBJDIR)/ds4_metal.o: ds4_metal.m ds4_gpu.h \
 		ds4_qwen_expert_group.h runtime/ds4_metal_glm.inc \
@@ -550,8 +597,9 @@ $(METAL_BINDIR)/test_q4k_top8: \
 		$(METAL_OBJDIR)/ds4_build.o \
 		$(METAL_OBJDIR)/ds4_ssd.o \
 		$(METAL_OBJDIR)/ds4_profile.o \
-		$(METAL_OBJDIR)/ds4_expert_store.o \
-		$(METAL_OBJDIR)/ds4_qwen.o $(METAL_OBJDIR)/ds4_qwen_unicode.o
+		$(METAL_OBJDIR)/ds4_expert_store.o $(METAL_OBJDIR)/ds4_ple_store.o \
+		$(METAL_OBJDIR)/ds4_qwen.o $(METAL_OBJDIR)/ds4_qwen4exp.o \
+		$(METAL_OBJDIR)/ds4_qwen_unicode.o
 	@mkdir -p "$(@D)"
 	$(CC) $(CFLAGS) -o $@ $^ $(LDLIBS)
 
@@ -559,8 +607,9 @@ $(METAL_BINDIR)/test_qwen_session: \
 		$(METAL_OBJDIR)/test_qwen_session.o $(METAL_OBJDIR)/ds4_build.o \
 		$(METAL_OBJDIR)/ds4_ssd.o \
 		$(METAL_OBJDIR)/ds4_profile.o \
-		$(METAL_OBJDIR)/ds4_expert_store.o \
-		$(METAL_OBJDIR)/ds4_qwen.o $(METAL_OBJDIR)/ds4_qwen_unicode.o
+		$(METAL_OBJDIR)/ds4_expert_store.o $(METAL_OBJDIR)/ds4_ple_store.o \
+		$(METAL_OBJDIR)/ds4_qwen.o $(METAL_OBJDIR)/ds4_qwen4exp.o \
+		$(METAL_OBJDIR)/ds4_qwen_unicode.o
 	@mkdir -p "$(@D)"
 	$(CC) $(CFLAGS) -o $@ $^ $(LDLIBS)
 
@@ -569,8 +618,9 @@ $(METAL_BINDIR)/test_qwen_tokenizer: \
 		$(METAL_OBJDIR)/ds4_build.o \
 		$(METAL_OBJDIR)/ds4_ssd.o \
 		$(METAL_OBJDIR)/ds4_profile.o \
-		$(METAL_OBJDIR)/ds4_expert_store.o \
-		$(METAL_OBJDIR)/ds4_qwen.o $(METAL_OBJDIR)/ds4_qwen_unicode.o
+		$(METAL_OBJDIR)/ds4_expert_store.o $(METAL_OBJDIR)/ds4_ple_store.o \
+		$(METAL_OBJDIR)/ds4_qwen.o $(METAL_OBJDIR)/ds4_qwen4exp.o \
+		$(METAL_OBJDIR)/ds4_qwen_unicode.o
 	@mkdir -p "$(@D)"
 	$(CC) $(CFLAGS) -o $@ $^ $(LDLIBS)
 
@@ -729,6 +779,18 @@ qwen4exp-reference-test: qwen4exp-fixture-check \
 qwen4exp-ple-store-test: $(METAL_BINDIR)/test_ple_store
 	$<
 
+qwen4exp-admission-test: \
+		$(CPU_BINDIR)/hebrus-qwen4exp-admission-test \
+		$(METAL_BINDIR)/hebrus \
+		$(CPU_BINDIR)/hebrus \
+		tests/qwen4exp/qwen4exp_gguf_fixture.py \
+		tests/qwen4exp/test_qwen4exp_admission.py \
+		docs/contracts/qwen4exp-profile.json
+	PYTHONDONTWRITEBYTECODE=1 python3 tests/qwen4exp/test_qwen4exp_admission.py \
+		--binary $(CPU_BINDIR)/hebrus-qwen4exp-admission-test \
+		--production-binary $(METAL_BINDIR)/hebrus \
+		--production-binary $(CPU_BINDIR)/hebrus
+
 qwen-unicode-test: $(METAL_BINDIR)/test_qwen_unicode
 	python3 tests/gen_qwen_unicode.py --check
 	$(METAL_BINDIR)/test_qwen_unicode
@@ -751,6 +813,7 @@ model-free-test: metal ds4_test ds4_agent_test $(METAL_BINDIR)/test_q4k_dot \
 		$(METAL_BINDIR)/test_qwen_state \
 		qwen4exp-profile-test qwen4exp-reference-test \
 		qwen4exp-converter-test qwen4exp-ple-store-test \
+		qwen4exp-admission-test \
 		$(METAL_BINDIR)/test_qwen_unicode \
 		$(METAL_BINDIR)/test_qwen_tokenizer \
 		$(METAL_BINDIR)/test_qwen_expert_group \
@@ -836,7 +899,8 @@ else
 
 CFLAGS += -D_GNU_SOURCE -fno-finite-math-only
 CPU_CORE_OBJS := ds4_cpu.o ds4_build_cpu.o ds4_ssd.o \
-	ds4_profile.o ds4_expert_store.o ds4_qwen.o ds4_qwen_unicode.o
+	ds4_profile.o ds4_expert_store.o ds4_ple_store.o ds4_qwen.o \
+	ds4_qwen4exp.o ds4_qwen_unicode.o
 INSTALL_SOURCE_BINDIR := .
 INSTALL_BACKEND := cpu
 INSTALL_RESOURCE_SRCS :=
@@ -904,6 +968,12 @@ ds4_profile.o: ds4_profile.c ds4_profile.h
 ds4_qwen.o: ds4_qwen.c ds4_qwen.h
 	$(CC) $(CFLAGS) $(QWEN_CFLAGS) -c -o $@ ds4_qwen.c
 
+ds4_qwen4exp.o: ds4_qwen4exp.c ds4_qwen4exp.h
+	$(CC) $(QWEN4EXP_REF_CFLAGS) -DDS4_NO_GPU -I. -c -o $@ ds4_qwen4exp.c
+
+ds4_ple_store.o: ds4_ple_store.c ds4_ple_store.h
+	$(CC) $(QWEN4EXP_REF_CFLAGS) -DDS4_NO_GPU -I. -c -o $@ ds4_ple_store.c
+
 ds4_qwen_unicode.o: ds4_qwen_unicode.c ds4_qwen_unicode.h \
 		ds4_qwen_unicode_data.inc
 	$(CC) $(CFLAGS) -c -o $@ ds4_qwen_unicode.c
@@ -954,14 +1024,28 @@ linenoise.o: linenoise.c linenoise.h
 	$(CC) $(CFLAGS) -c -o $@ linenoise.c
 
 ds4_cpu.o: ds4.c ds4.h ds4_ssd.h ds4_profile.h ds4_gpu.h ds4_qwen.h \
-		ds4_expert_store.h ds4_qwen_unicode.h ds4_streaming_hotlist.inc
+		ds4_qwen4exp.h ds4_expert_store.h ds4_ple_store.h \
+		ds4_qwen_unicode.h ds4_streaming_hotlist.inc \
+		runtime/ds4_qwen4exp_loader.inc
 	$(CC) $(CFLAGS) -DDS4_NO_GPU -c -o $@ ds4.c
 
 ds4_test_core.o: ds4.c ds4.h ds4_ssd.h ds4_profile.h \
-		ds4_gpu.h ds4_qwen.h ds4_expert_store.h ds4_qwen_unicode.h \
+		ds4_gpu.h ds4_qwen.h ds4_qwen4exp.h ds4_expert_store.h \
+		ds4_ple_store.h ds4_qwen_unicode.h runtime/ds4_qwen4exp_loader.inc \
 		ds4_streaming_hotlist.inc tests/internal/ds4_qwen_cpu_test_hooks.h
 	$(CC) $(CFLAGS) $(QWEN_CFLAGS) -DDS4_NO_GPU -DDS4_TEST_HOOKS \
 		-Wno-unused-function -Wno-unused-parameter -c -o $@ ds4.c
+
+ds4_qwen4exp_test_core.o: ds4.c ds4.h ds4_ssd.h ds4_profile.h \
+		ds4_gpu.h ds4_qwen.h ds4_qwen4exp.h ds4_expert_store.h \
+		ds4_ple_store.h ds4_qwen_unicode.h runtime/ds4_qwen4exp_loader.inc \
+		ds4_streaming_hotlist.inc tests/internal/ds4_qwen_cpu_test_hooks.h
+	$(CC) $(CFLAGS) $(QWEN_CFLAGS) -DDS4_NO_GPU -DDS4_TEST_HOOKS \
+		-Wno-unused-function -Wno-unused-parameter -c -o $@ ds4.c
+
+hebrus-qwen4exp-admission-test: ds4_cli_cpu.o ds4_help.o linenoise.o \
+		ds4_qwen4exp_test_core.o $(filter-out ds4_cpu.o,$(CPU_CORE_OBJS))
+	$(CC) $(CFLAGS) -o $@ $^ $(LDLIBS)
 
 ds4_cli_cpu.o: ds4_cli.c ds4.h ds4_ssd.h ds4_help.h hebrus_identity.h linenoise.h
 	$(CC) $(CFLAGS) -DDS4_NO_GPU -c -o $@ ds4_cli.c
@@ -993,6 +1077,7 @@ model-free-test: $(PROGRAMS) ds4_test ds4_agent_test q4k-dot-test \
 		tests/test_qwen_state tests/test_qwen_unicode \
 		qwen4exp-profile-test qwen4exp-reference-test \
 		qwen4exp-converter-test qwen4exp-ple-store-test \
+		qwen4exp-admission-test \
 		tests/test_qwen_expert_group \
 		tests/test_expert_store \
 		tests/test_metal_ssd_profile \
@@ -1071,26 +1156,28 @@ test_q4k_top8.o: tests/test_q4k_top8.c \
 		-I. -c -o $@ $<
 
 tests/test_q4k_top8: test_q4k_top8.o ds4_test_core.o ds4_build_cpu.o \
-		ds4_ssd.o ds4_profile.o ds4_expert_store.o \
-		ds4_qwen.o ds4_qwen_unicode.o
+		ds4_ssd.o ds4_profile.o ds4_expert_store.o ds4_ple_store.o \
+		ds4_qwen.o ds4_qwen4exp.o ds4_qwen_unicode.o
 	$(CC) $(CFLAGS) -o $@ $^ $(LDLIBS)
 
 tests/test_qwen_session: tests/test_qwen_session.c ds4.c ds4.h ds4_ssd.h ds4_profile.h \
 		ds4_gpu.h ds4_qwen.h ds4_qwen_unicode.h \
-		ds4_build.c ds4_expert_store.o ds4_ssd.c \
+		ds4_build.c ds4_expert_store.o ds4_ple_store.o ds4_qwen4exp.o ds4_ssd.c \
 		ds4_profile.c ds4_qwen.c \
 		ds4_qwen_unicode.c ds4_qwen_unicode_data.inc \
 		ds4_streaming_hotlist.inc runtime/ds4_glm_graph.inc \
-		runtime/ds4_deepseek_cache_phase.inc
+		runtime/ds4_deepseek_cache_phase.inc runtime/ds4_qwen4exp_loader.inc
 	$(CC) $(CFLAGS) $(QWEN_CFLAGS) -DDS4_NO_GPU \
 		-Wno-unused-function -Wno-unused-parameter -I. -o $@ \
 		$(filter-out ds4.c,$(filter %.c %.o,$^)) $(LDLIBS)
 
 tests/test_qwen_tokenizer: tests/test_qwen_tokenizer.c ds4.c ds4.h \
 		ds4_kvstore.c ds4_kvstore.h ds4_ssd.h ds4_profile.c ds4_profile.h ds4_gpu.h ds4_qwen.h \
-		ds4_qwen_unicode.h ds4_build.c ds4_expert_store.o ds4_ssd.c \
+		ds4_qwen_unicode.h ds4_build.c ds4_expert_store.o ds4_ple_store.o \
+		ds4_qwen4exp.o ds4_ssd.c \
 		ds4_qwen.c ds4_qwen_unicode.c ds4_qwen_unicode_data.inc \
-		ds4_streaming_hotlist.inc tests/qwen/qwen36_tokenizer_fixture.inc
+		ds4_streaming_hotlist.inc runtime/ds4_qwen4exp_loader.inc \
+		tests/qwen/qwen36_tokenizer_fixture.inc
 	$(CC) $(CFLAGS) $(QWEN_CFLAGS) -DDS4_NO_GPU \
 		-Wno-unused-function -Wno-unused-parameter -I. -o $@ \
 		$(filter-out ds4.c,$(filter %.c %.o,$^)) $(LDLIBS)
@@ -1137,6 +1224,15 @@ qwen4exp-reference-test: qwen4exp-fixture-check tests/test_qwen4exp_ref
 
 qwen4exp-ple-store-test: tests/test_ple_store
 	./tests/test_ple_store
+
+qwen4exp-admission-test: hebrus-qwen4exp-admission-test \
+		hebrus \
+		tests/qwen4exp/qwen4exp_gguf_fixture.py \
+		tests/qwen4exp/test_qwen4exp_admission.py \
+		docs/contracts/qwen4exp-profile.json
+	PYTHONDONTWRITEBYTECODE=1 python3 tests/qwen4exp/test_qwen4exp_admission.py \
+		--binary ./hebrus-qwen4exp-admission-test \
+		--production-binary ./hebrus
 
 tests/test_qwen_unicode: tests/test_qwen_unicode.c ds4_qwen_unicode.c \
 		ds4_qwen_unicode.h ds4_qwen_unicode_data.inc
@@ -1354,7 +1450,8 @@ clean:
 	rm -rf "$(BUILD_ROOT)"
 	rm -f hebrus hebrus-server hebrus-bench hebrus-eval hebrus-agent \
 		ds4 ds4-server ds4-bench ds4-eval ds4-agent ds4_cpu ds4_native \
-		ds4_server_test ds4_test ds4_agent_test tests/test_q4k_dot \
+		ds4_server_test ds4_test ds4_agent_test \
+		hebrus-qwen4exp-admission-test tests/test_q4k_dot \
 		tests/test_q4k_top8 \
 		tests/test_qwen_session \
 		tests/test_qwen_tokenizer \

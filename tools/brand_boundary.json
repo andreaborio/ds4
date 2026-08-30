@@ -236,14 +236,14 @@
       "location": "content",
       "token": "ds4",
       "classification": "compatibility",
-      "maximum": 547
+      "maximum": 654
     },
     {
       "path": "Makefile",
       "location": "content",
       "token": "DS4",
       "classification": "compatibility",
-      "maximum": 52
+      "maximum": 62
     },
     {
       "path": "ONEDGE_IMATRIX.md",
@@ -404,7 +404,7 @@
       "location": "content",
       "token": "DS4",
       "classification": "migration-pending",
-      "maximum": 3
+      "maximum": 5
     },
     {
       "path": "docs/adr/0009-qwen4exp-ple-store-v1-structure.md",
@@ -414,11 +414,18 @@
       "maximum": 2
     },
     {
+      "path": "docs/adr/0009-qwen4exp-ple-store-v1-structure.md",
+      "location": "content",
+      "token": "DS4",
+      "classification": "migration-pending",
+      "maximum": 1
+    },
+    {
       "path": "docs/architecture/CODEMAP.md",
       "location": "content",
       "token": "ds4",
       "classification": "migration-pending",
-      "maximum": 52
+      "maximum": 53
     },
     {
       "path": "docs/architecture/CODEMAP.md",
@@ -810,14 +817,14 @@
       "location": "content",
       "token": "ds4",
       "classification": "serialized/permanent",
-      "maximum": 3
+      "maximum": 30
     },
     {
       "path": "docs/contracts/qwen4exp-profile.json",
       "location": "content",
       "token": "DS4",
       "classification": "serialized/permanent",
-      "maximum": 2
+      "maximum": 5
     },
     {
       "path": "docs/deepseek-expert-major-v2.md",
@@ -985,14 +992,14 @@
       "location": "content",
       "token": "ds4",
       "classification": "migration-pending",
-      "maximum": 5257
+      "maximum": 5252
     },
     {
       "path": "ds4.c",
       "location": "content",
       "token": "DS4",
       "classification": "migration-pending",
-      "maximum": 4559
+      "maximum": 4565
     },
     {
       "path": "ds4.h",
@@ -2367,6 +2374,27 @@
       "maximum": 58
     },
     {
+      "path": "runtime/ds4_qwen4exp_loader.inc",
+      "location": "path",
+      "token": "ds4",
+      "classification": "migration-pending",
+      "maximum": 1
+    },
+    {
+      "path": "runtime/ds4_qwen4exp_loader.inc",
+      "location": "content",
+      "token": "ds4",
+      "classification": "migration-pending",
+      "maximum": 189
+    },
+    {
+      "path": "runtime/ds4_qwen4exp_loader.inc",
+      "location": "content",
+      "token": "DS4",
+      "classification": "migration-pending",
+      "maximum": 173
+    },
+    {
       "path": "runtime/ds4_qwen_memory_policy.inc",
       "location": "path",
       "token": "ds4",
@@ -2630,21 +2658,56 @@
       "location": "content",
       "token": "ds4",
       "classification": "migration-pending",
+      "maximum": 3
+    },
+    {
+      "path": "tests/qwen4exp/README.md",
+      "location": "content",
+      "token": "DS4",
+      "classification": "migration-pending",
       "maximum": 2
     },
     {
-      "path": "tests/qwen4exp/test_source_inventory.py",
+      "path": "tests/qwen4exp/qwen4exp_gguf_fixture.py",
       "location": "content",
       "token": "ds4",
+      "classification": "migration-pending",
+      "maximum": 9
+    },
+    {
+      "path": "tests/qwen4exp/qwen4exp_gguf_fixture.py",
+      "location": "content",
+      "token": "DS4",
+      "classification": "migration-pending",
+      "maximum": 3
+    },
+    {
+      "path": "tests/qwen4exp/test_qwen4exp_admission.py",
+      "location": "content",
+      "token": "ds4",
+      "classification": "migration-pending",
+      "maximum": 20
+    },
+    {
+      "path": "tests/qwen4exp/test_qwen4exp_admission.py",
+      "location": "content",
+      "token": "DS4",
       "classification": "migration-pending",
       "maximum": 3
     },
     {
       "path": "tests/qwen4exp/test_source_inventory.py",
       "location": "content",
+      "token": "ds4",
+      "classification": "migration-pending",
+      "maximum": 33
+    },
+    {
+      "path": "tests/qwen4exp/test_source_inventory.py",
+      "location": "content",
       "token": "DS4",
       "classification": "migration-pending",
-      "maximum": 2
+      "maximum": 4
     },
     {
       "path": "tests/test-vectors/README.md",

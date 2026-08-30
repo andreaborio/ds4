@@ -2,8 +2,9 @@
 
 - Status: Accepted
 - Date: 2026-08-30
-- Support state: Structural converter contract only (`pinned-not-supported`).
-  No PLE codec, artifact, runtime path, downloader or release is admitted.
+- Support state: Structural converter and test-only loader contract
+  (`pinned-not-supported`). No production PLE codec, artifact, execution path,
+  downloader or release is admitted.
 
 ## Context
 
@@ -72,5 +73,7 @@ test codec or the current ExpertMajor affine candidate is release-qualified.
   Changing wire offsets, digest coverage or page-header meaning requires a new
   format version; selecting a production codec requires a reviewed artifact
   profile and quality/performance evidence.
-- No production loader registers, warms or presents this extent to Metal in
-  Phase 2. Runtime ownership and admission remain Phase 3 work.
+- Phase 3 proves embedded ownership through a sparse `DS4_TEST_HOOKS` fixture.
+  Normal builds register no Qwen4Exp physical profile, and even the fixture
+  admits only inspection with `runtimeSupported=false` and without reading the
+  payload. No production loader warms or presents this extent to Metal.
