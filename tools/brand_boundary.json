@@ -1359,6 +1359,48 @@
       "maximum": 2
     },
     {
+      "path": "ds4_qwen4exp.h",
+      "location": "path",
+      "token": "ds4",
+      "classification": "migration-pending",
+      "maximum": 1
+    },
+    {
+      "path": "ds4_qwen4exp.h",
+      "location": "content",
+      "token": "ds4",
+      "classification": "migration-pending",
+      "maximum": 19
+    },
+    {
+      "path": "ds4_qwen4exp.h",
+      "location": "content",
+      "token": "DS4",
+      "classification": "migration-pending",
+      "maximum": 50
+    },
+    {
+      "path": "ds4_qwen4exp_ref.h",
+      "location": "path",
+      "token": "ds4",
+      "classification": "migration-pending",
+      "maximum": 1
+    },
+    {
+      "path": "ds4_qwen4exp_ref.h",
+      "location": "content",
+      "token": "ds4",
+      "classification": "migration-pending",
+      "maximum": 25
+    },
+    {
+      "path": "ds4_qwen4exp_ref.h",
+      "location": "content",
+      "token": "DS4",
+      "classification": "migration-pending",
+      "maximum": 3
+    },
+    {
       "path": "ds4_qwen_expert_group.c",
       "location": "path",
       "token": "ds4",
