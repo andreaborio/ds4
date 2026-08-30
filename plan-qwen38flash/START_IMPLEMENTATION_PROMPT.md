@@ -19,10 +19,10 @@ performance gates have passed.
 
 ## 1. Repository and Git state
 
-The repository is:
+The repository is the checked-out Hebrus tree:
 
 ```text
-/Users/chinaski/Documents/ds4
+<repository-root>
 ```
 
 Expected starting state when this prompt was written:

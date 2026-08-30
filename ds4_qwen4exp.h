@@ -5,7 +5,8 @@
 #include <stdint.h>
 
 #define DS4_QWEN4EXP_PROFILE_ID "qwen4exp-base-v1"
-#define DS4_QWEN4EXP_ARCHITECTURE "qwen4exp"
+#define DS4_QWEN4EXP_SOURCE_ARCHITECTURE "Qwen4ExpForConditionalGeneration"
+#define DS4_QWEN4EXP_GGUF_ARCHITECTURE "qwen4exp"
 
 enum {
     DS4_QWEN4EXP_N_LAYER = 48,
@@ -39,9 +40,15 @@ enum {
     DS4_QWEN4EXP_EXPERTS = 512,
     DS4_QWEN4EXP_EXPERTS_USED = 10,
     DS4_QWEN4EXP_EXPERT_DIM = 640,
+    DS4_QWEN4EXP_SHARED_EXPERT_DIM = 640,
 
+    DS4_QWEN4EXP_PLE_SOURCE_LAYER_ID = 2,
     DS4_QWEN4EXP_PLE_RUNTIME_LAYER = 1,
     DS4_QWEN4EXP_PLE_LAYER_ORDINAL = 0,
+    DS4_QWEN4EXP_PLE_SEED = 1234,
+    DS4_QWEN4EXP_PLE_VOCAB_BASE = 20000000,
+    DS4_QWEN4EXP_PLE_SPLIT_PARTS = 128,
+    DS4_QWEN4EXP_PLE_ROW_ALIGNMENT = 128,
     DS4_QWEN4EXP_PLE_NGRAM_SIZE = 3,
     DS4_QWEN4EXP_PLE_HEADS_PER_NGRAM = 8,
     DS4_QWEN4EXP_PLE_HEADS = 16,
@@ -52,6 +59,7 @@ enum {
     DS4_QWEN4EXP_PLE_CONV_STATE = 9,
     DS4_QWEN4EXP_PLE_HASH_MULTIPLIERS = 3,
     DS4_QWEN4EXP_PLE_PAD_TOKEN = 248044,
+    DS4_QWEN4EXP_SOURCE_MTP_LAYERS = 1,
 };
 
 typedef enum {
@@ -59,13 +67,26 @@ typedef enum {
     DS4_QWEN4EXP_LAYER_QSA = 1,
 } ds4_qwen4exp_layer_type;
 
+typedef enum {
+    DS4_QWEN4EXP_GATE_SIGMOID = 1,
+} ds4_qwen4exp_gate_activation;
+
+typedef enum {
+    DS4_QWEN4EXP_ROUTER_TIE_ASCENDING_EXPERT_ID = 1,
+} ds4_qwen4exp_router_tie_policy;
+
 /* Immutable semantic descriptor for the one pinned base-text profile.  It is
  * model metadata, not a support or artifact-codec claim. */
 typedef struct {
     const char *profile_id;
-    const char *architecture;
+    const char *source_architecture;
+    const char *gguf_architecture;
     const char *hf_revision;
     const char *transformers_commit;
+
+    bool text_only;
+    uint32_t source_mtp_layers;
+    bool base_profile_includes_mtp;
 
     uint32_t n_layer;
     uint32_t hidden_size;
@@ -83,18 +104,32 @@ typedef struct {
     uint32_t qsa_index_head_dim;
     uint32_t qsa_compression;
     uint32_t qsa_token_budget;
+    bool qsa_mrope_interleaved;
+    ds4_qwen4exp_gate_activation qsa_output_gate;
 
     uint32_t gdn_key_heads;
     uint32_t gdn_value_heads;
     uint32_t gdn_head_dim;
     uint32_t gdn_conv_kernel;
+    uint32_t gdn_recurrent_element_bytes;
+    ds4_qwen4exp_gate_activation gdn_output_gate;
 
     uint32_t experts;
     uint32_t experts_used;
     uint32_t expert_dim;
+    uint32_t shared_expert_dim;
+    uint32_t router_softmax_element_bytes;
+    bool router_full_softmax;
+    bool router_normalize_selected;
+    ds4_qwen4exp_router_tie_policy router_tie_policy;
 
+    uint32_t ple_source_layer_id;
     uint32_t ple_runtime_layer;
     uint32_t ple_layer_ordinal;
+    uint32_t ple_seed;
+    uint32_t ple_vocab_base;
+    uint32_t ple_split_parts;
+    uint32_t ple_row_alignment;
     uint32_t ple_ngram_size;
     uint32_t ple_heads_per_ngram;
     uint32_t ple_head_dim;
@@ -112,13 +147,16 @@ typedef struct {
     uint32_t ple_head_offset[DS4_QWEN4EXP_PLE_HEADS];
 } ds4_qwen4exp_profile;
 
-/* Per-sequence logical state.  Byte sizes are explicit so later physical
- * codecs can be planned without silently assuming BF16 or F32. */
+/* Raw per-sequence logical tensor payload.  This deliberately excludes scalar
+ * position/validity/generation/cache-control metadata, allocator alignment and
+ * physical codec overhead.  PLE history counts only its two token IDs; the
+ * host-side valid-count field is control metadata.  Byte sizes are explicit so
+ * later physical codecs cannot silently change the FP32 GDN state contract. */
 typedef struct {
     uint32_t context;
     uint32_t qsa_kv_element_bytes;
     uint32_t qsa_index_element_bytes;
-    uint32_t gdn_element_bytes;
+    uint32_t gdn_state_element_bytes;
     uint32_t ple_element_bytes;
 
     uint64_t gdn_conv_values_per_layer;
@@ -129,11 +167,11 @@ typedef struct {
     uint64_t qsa_kv_bytes;
     uint64_t qsa_raw_index_bytes_per_token;
     uint64_t qsa_raw_index_bytes;
-    uint64_t ple_history_bytes;
+    uint64_t ple_history_token_bytes;
     uint64_t ple_conv_bytes;
-    uint64_t fixed_bytes;
-    uint64_t context_bytes;
-    uint64_t total_bytes;
+    uint64_t fixed_tensor_bytes;
+    uint64_t context_tensor_bytes;
+    uint64_t tensor_payload_bytes;
 } ds4_qwen4exp_state_plan;
 
 const ds4_qwen4exp_profile *ds4_qwen4exp_profile_get(void);
@@ -152,7 +190,7 @@ bool ds4_qwen4exp_state_plan_make(
         uint32_t                     context,
         uint32_t                     qsa_kv_element_bytes,
         uint32_t                     qsa_index_element_bytes,
-        uint32_t                     gdn_element_bytes,
+        uint32_t                     gdn_state_element_bytes,
         uint32_t                     ple_element_bytes,
         ds4_qwen4exp_state_plan     *plan);
 

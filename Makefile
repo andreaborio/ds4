@@ -15,6 +15,7 @@ OBJCFLAGS ?= -O3 -ffast-math $(DEBUG_FLAGS) $(NATIVE_CPU_FLAG) -Wall -Wextra -fo
 # Qwen's stable softmax rejects non-finite logits; retain that branch while
 # keeping the remaining fast-math optimizations used by the scalar CPU path.
 QWEN_CFLAGS ?= -fno-finite-math-only
+QWEN4EXP_REF_CFLAGS ?= -O2 -g -Wall -Wextra -Wpedantic -Werror -std=c99
 DEPFLAGS ?= -MMD -MP
 
 BUILD_GIT_SHA ?= $(shell git rev-parse --short=12 HEAD 2>/dev/null || echo unknown)
@@ -55,6 +56,8 @@ SERVER_ALIAS_PORT ?= 0
 	qwen-gdn-controls-metal-kernel-test \
 	qwen-fused-split-q-norm-metal-kernel-test \
 	qwen-reference-test qwen-unicode-test qwen-tokenizer-test \
+	qwen4exp-profile-test qwen4exp-reference-test \
+	qwen4exp-fixture-check qwen4exp-sanitizer-test \
 	qwen-expert-group-test qwen-24g-fixture-test \
 	expert-store-test metal-ssd-profile-test \
 	download-model-test capabilities-test command-alias-test \
@@ -62,6 +65,31 @@ SERVER_ALIAS_PORT ?= 0
 	server-alias-model-test \
 	install uninstall install-test $(PROGRAMS) \
 	ds4_test ds4_agent_test
+
+qwen4exp-fixture-check: tests/qwen4exp/collect_scalar_reference.py \
+		tests/qwen4exp/qwen4exp_scalar_golden.inc \
+		tests/qwen4exp/qwen4exp_scalar_provenance.json
+	python3 tests/qwen4exp/collect_scalar_reference.py --check
+
+qwen4exp-sanitizer-test: ds4_qwen4exp.c ds4_qwen4exp.h \
+		ds4_qwen4exp_ref.c ds4_qwen4exp_ref.h \
+		tests/test_qwen4exp_profile.c tests/test_qwen4exp_ref.c \
+		tests/qwen4exp/qwen4exp_scalar_golden.inc
+	@mkdir -p "$(BUILD_ROOT)/qwen4exp-sanitizer"
+	$(CC) -O1 -g -Wall -Wextra -Wpedantic -Werror -std=c99 \
+		-fsanitize=address,undefined -fno-sanitize-recover=all \
+		-fno-omit-frame-pointer -I. -o \
+		"$(BUILD_ROOT)/qwen4exp-sanitizer/test_profile" \
+		ds4_qwen4exp.c tests/test_qwen4exp_profile.c -lm
+	ASAN_OPTIONS=halt_on_error=1 UBSAN_OPTIONS=halt_on_error=1 \
+		"$(BUILD_ROOT)/qwen4exp-sanitizer/test_profile"
+	$(CC) -O1 -g -Wall -Wextra -Wpedantic -Werror -std=c99 \
+		-fsanitize=address,undefined -fno-sanitize-recover=all \
+		-fno-omit-frame-pointer -I. -o \
+		"$(BUILD_ROOT)/qwen4exp-sanitizer/test_ref" \
+		ds4_qwen4exp.c ds4_qwen4exp_ref.c tests/test_qwen4exp_ref.c -lm
+	ASAN_OPTIONS=halt_on_error=1 UBSAN_OPTIONS=halt_on_error=1 \
+		"$(BUILD_ROOT)/qwen4exp-sanitizer/test_ref"
 
 download-model-test: tests/test_download_model.sh download_model.sh \
 		docs/contracts/qwen-release.json
@@ -160,6 +188,8 @@ METAL_TEST_BINS := \
 	$(METAL_BINDIR)/test_qwen_gdn_ref \
 	$(METAL_BINDIR)/test_qwen_attention_ref \
 	$(METAL_BINDIR)/test_qwen_state \
+	$(METAL_BINDIR)/test_qwen4exp_profile \
+	$(METAL_BINDIR)/test_qwen4exp_ref \
 	$(METAL_BINDIR)/test_qwen_unicode \
 	$(METAL_BINDIR)/test_qwen_tokenizer \
 	$(METAL_BINDIR)/test_qwen_expert_group \
@@ -451,6 +481,26 @@ $(METAL_OBJDIR)/ds4_qwen_ref.o: ds4_qwen_ref.c ds4_qwen_ref.h
 	@mkdir -p "$(@D)"
 	$(CC) -O2 -Wall -Wextra -std=c99 $(DEPFLAGS) -c -o $@ $<
 
+$(METAL_OBJDIR)/ds4_qwen4exp.o: ds4_qwen4exp.c ds4_qwen4exp.h
+	@mkdir -p "$(@D)"
+	$(CC) $(QWEN4EXP_REF_CFLAGS) $(DEPFLAGS) -I. -c -o $@ $<
+
+$(METAL_OBJDIR)/ds4_qwen4exp_ref.o: ds4_qwen4exp_ref.c \
+		ds4_qwen4exp_ref.h ds4_qwen4exp.h
+	@mkdir -p "$(@D)"
+	$(CC) $(QWEN4EXP_REF_CFLAGS) $(DEPFLAGS) -I. -c -o $@ $<
+
+$(METAL_OBJDIR)/test_qwen4exp_profile.o: tests/test_qwen4exp_profile.c \
+		ds4_qwen4exp.h
+	@mkdir -p "$(@D)"
+	$(CC) $(QWEN4EXP_REF_CFLAGS) $(DEPFLAGS) -I. -c -o $@ $<
+
+$(METAL_OBJDIR)/test_qwen4exp_ref.o: tests/test_qwen4exp_ref.c \
+		ds4_qwen4exp_ref.h ds4_qwen4exp.h \
+		tests/qwen4exp/qwen4exp_scalar_golden.inc
+	@mkdir -p "$(@D)"
+	$(CC) $(QWEN4EXP_REF_CFLAGS) $(DEPFLAGS) -I. -c -o $@ $<
+
 $(METAL_BINDIR)/ds4_test: \
 	$(METAL_OBJDIR)/ds4_test.o $(METAL_OBJDIR)/ds4_help.o \
 	$(METAL_OBJDIR)/ds4_kvstore.o $(METAL_OBJDIR)/rax.o \
@@ -535,6 +585,19 @@ $(METAL_BINDIR)/test_qwen_state: \
 	$(METAL_OBJDIR)/test_qwen_state.o $(METAL_OBJDIR)/ds4_qwen.o
 	@mkdir -p "$(@D)"
 	$(CC) -O2 -o $@ $^ -lm
+
+$(METAL_BINDIR)/test_qwen4exp_profile: \
+		$(METAL_OBJDIR)/test_qwen4exp_profile.o \
+		$(METAL_OBJDIR)/ds4_qwen4exp.o
+	@mkdir -p "$(@D)"
+	$(CC) $(QWEN4EXP_REF_CFLAGS) -o $@ $^ -lm
+
+$(METAL_BINDIR)/test_qwen4exp_ref: \
+		$(METAL_OBJDIR)/test_qwen4exp_ref.o \
+		$(METAL_OBJDIR)/ds4_qwen4exp_ref.o \
+		$(METAL_OBJDIR)/ds4_qwen4exp.o
+	@mkdir -p "$(@D)"
+	$(CC) $(QWEN4EXP_REF_CFLAGS) -o $@ $^ -lm
 
 $(METAL_BINDIR)/test_qwen_unicode: \
 	$(METAL_OBJDIR)/test_qwen_unicode.o $(METAL_OBJDIR)/ds4_qwen_unicode.o
@@ -625,6 +688,13 @@ qwen-reference-test: $(METAL_BINDIR)/test_qwen_gdn_ref \
 	$(METAL_BINDIR)/test_qwen_attention_ref
 	$(METAL_BINDIR)/test_qwen_unicode
 
+qwen4exp-profile-test: $(METAL_BINDIR)/test_qwen4exp_profile
+	$<
+
+qwen4exp-reference-test: qwen4exp-fixture-check \
+		$(METAL_BINDIR)/test_qwen4exp_ref
+	$(METAL_BINDIR)/test_qwen4exp_ref
+
 qwen-unicode-test: $(METAL_BINDIR)/test_qwen_unicode
 	python3 tests/gen_qwen_unicode.py --check
 	$(METAL_BINDIR)/test_qwen_unicode
@@ -645,6 +715,7 @@ model-free-test: metal ds4_test ds4_agent_test $(METAL_BINDIR)/test_q4k_dot \
 		$(METAL_BINDIR)/test_qwen_gdn_ref \
 		$(METAL_BINDIR)/test_qwen_attention_ref \
 		$(METAL_BINDIR)/test_qwen_state \
+		qwen4exp-profile-test qwen4exp-reference-test \
 		$(METAL_BINDIR)/test_qwen_unicode \
 		$(METAL_BINDIR)/test_qwen_tokenizer \
 		$(METAL_BINDIR)/test_qwen_expert_group \
@@ -885,6 +956,7 @@ model-free-test: $(PROGRAMS) ds4_test ds4_agent_test q4k-dot-test \
 		tests/test_qwen_tokenizer \
 		tests/test_qwen_gdn_ref tests/test_qwen_attention_ref \
 		tests/test_qwen_state tests/test_qwen_unicode \
+		qwen4exp-profile-test qwen4exp-reference-test \
 		tests/test_qwen_expert_group \
 		tests/test_expert_store \
 		tests/test_metal_ssd_profile \
@@ -1004,6 +1076,24 @@ tests/test_qwen_attention_ref: tests/test_qwen_attention_ref.c ds4_qwen_ref.c \
 tests/test_qwen_state: tests/test_qwen_state.c ds4_qwen.c ds4_qwen.h
 	$(CC) -O2 -Wall -Wextra -std=c99 -I. -o $@ \
 		tests/test_qwen_state.c ds4_qwen.c -lm
+
+tests/test_qwen4exp_profile: tests/test_qwen4exp_profile.c \
+		ds4_qwen4exp.c ds4_qwen4exp.h
+	$(CC) $(QWEN4EXP_REF_CFLAGS) -I. -o $@ \
+		tests/test_qwen4exp_profile.c ds4_qwen4exp.c -lm
+
+tests/test_qwen4exp_ref: tests/test_qwen4exp_ref.c \
+		ds4_qwen4exp_ref.c ds4_qwen4exp_ref.h \
+		ds4_qwen4exp.c ds4_qwen4exp.h \
+		tests/qwen4exp/qwen4exp_scalar_golden.inc
+	$(CC) $(QWEN4EXP_REF_CFLAGS) -I. -o $@ \
+		tests/test_qwen4exp_ref.c ds4_qwen4exp_ref.c ds4_qwen4exp.c -lm
+
+qwen4exp-profile-test: tests/test_qwen4exp_profile
+	./tests/test_qwen4exp_profile
+
+qwen4exp-reference-test: qwen4exp-fixture-check tests/test_qwen4exp_ref
+	./tests/test_qwen4exp_ref
 
 tests/test_qwen_unicode: tests/test_qwen_unicode.c ds4_qwen_unicode.c \
 		ds4_qwen_unicode.h ds4_qwen_unicode_data.inc
@@ -1227,6 +1317,7 @@ clean:
 		tests/test_qwen_tokenizer \
 		tests/test_qwen_gdn_ref tests/test_qwen_attention_ref \
 		tests/test_qwen_state tests/test_qwen_unicode \
+		tests/test_qwen4exp_profile tests/test_qwen4exp_ref \
 		tests/test_qwen_expert_group \
 		tests/test_expert_store \
 		tests/test_metal_ssd_profile \

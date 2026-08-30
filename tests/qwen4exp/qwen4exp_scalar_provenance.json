@@ -1,0 +1,1405 @@
+{
+  "arrays": [
+    {
+      "authority": "deterministic-input",
+      "cType": "float",
+      "dtype": "float32",
+      "elements": 8,
+      "name": "q4e_norm_input",
+      "numpyCrossCheck": {
+        "mode": "exact"
+      },
+      "origin": "PCG64/fixed input for q4e_norm_input",
+      "sha256": "cda94980c6c5cae10d2a4ef5548f01ea7e1ec5dd25511d1feba93f162adf898e",
+      "shape": [
+        2,
+        4
+      ]
+    },
+    {
+      "authority": "deterministic-input",
+      "cType": "float",
+      "dtype": "float32",
+      "elements": 4,
+      "name": "q4e_norm_zero_weight",
+      "numpyCrossCheck": {
+        "mode": "exact"
+      },
+      "origin": "PCG64/fixed input for q4e_norm_zero_weight",
+      "sha256": "374708fff7719dd5979ec875d56cd2286f6d3cf7ec317a3b25632aab28ec37bb",
+      "shape": [
+        4
+      ]
+    },
+    {
+      "authority": "upstream-transformers",
+      "cType": "float",
+      "dtype": "float32",
+      "elements": 8,
+      "name": "q4e_norm_zero_output",
+      "numpyCrossCheck": {
+        "atol": 2e-05,
+        "mode": "allclose",
+        "rtol": 2e-05
+      },
+      "origin": "transformers:Qwen4ExpTextRMSNorm.forward",
+      "sha256": "c3af136e2b1090946fb4a482d653be5fbe6c3e2b12c2cc5a8ac24fb7a8d311ef",
+      "shape": [
+        2,
+        4
+      ]
+    },
+    {
+      "authority": "deterministic-input",
+      "cType": "float",
+      "dtype": "float32",
+      "elements": 4,
+      "name": "q4e_norm_weight",
+      "numpyCrossCheck": {
+        "mode": "exact"
+      },
+      "origin": "PCG64/fixed input for q4e_norm_weight",
+      "sha256": "c8cc738a65145d6fbf2de2f3d2fc34c697495979fc20f282f01ecec647b8c836",
+      "shape": [
+        4
+      ]
+    },
+    {
+      "authority": "upstream-transformers",
+      "cType": "float",
+      "dtype": "float32",
+      "elements": 8,
+      "name": "q4e_norm_output",
+      "numpyCrossCheck": {
+        "atol": 2e-05,
+        "mode": "allclose",
+        "rtol": 2e-05
+      },
+      "origin": "transformers:Qwen4ExpTextRMSNorm.forward",
+      "sha256": "aefd4af5d65b544cbc483175793480afab97c2f944dc25d27f68ff412113f380",
+      "shape": [
+        2,
+        4
+      ]
+    },
+    {
+      "authority": "deterministic-input",
+      "cType": "float",
+      "dtype": "float32",
+      "elements": 8,
+      "name": "q4e_gated_norm_input",
+      "numpyCrossCheck": {
+        "mode": "exact"
+      },
+      "origin": "PCG64/fixed input for q4e_gated_norm_input",
+      "sha256": "ca1f396343432d44a83f8592b2d5619bd5453b4a8f4409a83dfe46f0e5530813",
+      "shape": [
+        2,
+        4
+      ]
+    },
+    {
+      "authority": "deterministic-input",
+      "cType": "float",
+      "dtype": "float32",
+      "elements": 8,
+      "name": "q4e_gated_norm_gate",
+      "numpyCrossCheck": {
+        "mode": "exact"
+      },
+      "origin": "PCG64/fixed input for q4e_gated_norm_gate",
+      "sha256": "90abd2da4b11c066891b79e736ac0b98735900c2801e923cadadd2a23fc08fb7",
+      "shape": [
+        2,
+        4
+      ]
+    },
+    {
+      "authority": "deterministic-input",
+      "cType": "float",
+      "dtype": "float32",
+      "elements": 4,
+      "name": "q4e_gated_norm_weight",
+      "numpyCrossCheck": {
+        "mode": "exact"
+      },
+      "origin": "PCG64/fixed input for q4e_gated_norm_weight",
+      "sha256": "05df9e27674f8faa5e32ff4730ede59798759471c1ffb983c91cc0fecccfd8f4",
+      "shape": [
+        4
+      ]
+    },
+    {
+      "authority": "upstream-transformers",
+      "cType": "float",
+      "dtype": "float32",
+      "elements": 8,
+      "name": "q4e_gated_norm_output",
+      "numpyCrossCheck": {
+        "atol": 2e-05,
+        "mode": "allclose",
+        "rtol": 2e-05
+      },
+      "origin": "transformers:Qwen4ExpTextRMSNormGated.forward(sigmoid)",
+      "sha256": "bbbd86f0d961f82949de0c894a7d9945516e459f51c81e3ab94d541646b5de95",
+      "shape": [
+        2,
+        4
+      ]
+    },
+    {
+      "authority": "deterministic-input",
+      "cType": "float",
+      "dtype": "float32",
+      "elements": 12,
+      "name": "q4e_gr_residual",
+      "numpyCrossCheck": {
+        "mode": "exact"
+      },
+      "origin": "PCG64/fixed input for q4e_gr_residual",
+      "sha256": "f6db1688020376b86376061228b9f4a9cc906084e63551529d876c06887d5fcb",
+      "shape": [
+        4,
+        3
+      ]
+    },
+    {
+      "authority": "deterministic-input",
+      "cType": "float",
+      "dtype": "float32",
+      "elements": 12,
+      "name": "q4e_gr_norm_weight",
+      "numpyCrossCheck": {
+        "mode": "exact"
+      },
+      "origin": "PCG64/fixed input for q4e_gr_norm_weight",
+      "sha256": "f0e558c5d08df5364ce2cee631aecd73666e5208c1d18be99f33ec83eb2e231c",
+      "shape": [
+        4,
+        3
+      ]
+    },
+    {
+      "authority": "deterministic-input",
+      "cType": "float",
+      "dtype": "float32",
+      "elements": 24,
+      "name": "q4e_gr_down",
+      "numpyCrossCheck": {
+        "mode": "exact"
+      },
+      "origin": "PCG64/fixed input for q4e_gr_down",
+      "sha256": "27134992d985904b0f730d10ec270768d0315ea2df41fa16b0ef78a619982151",
+      "shape": [
+        2,
+        12
+      ]
+    },
+    {
+      "authority": "deterministic-input",
+      "cType": "float",
+      "dtype": "float32",
+      "elements": 24,
+      "name": "q4e_gr_up",
+      "numpyCrossCheck": {
+        "mode": "exact"
+      },
+      "origin": "PCG64/fixed input for q4e_gr_up",
+      "sha256": "676d048674d23d301dbf017bb0267be9e0fbe3aa7c6ca53b0e71098af617c1dc",
+      "shape": [
+        12,
+        2
+      ]
+    },
+    {
+      "authority": "deterministic-input",
+      "cType": "float",
+      "dtype": "float32",
+      "elements": 48,
+      "name": "q4e_gr_inject",
+      "numpyCrossCheck": {
+        "mode": "exact"
+      },
+      "origin": "PCG64/fixed input for q4e_gr_inject",
+      "sha256": "dc5641ddca2dacd17f2afacdaf4ad03347ecf593bb03a42efaef43d080d293e0",
+      "shape": [
+        4,
+        12
+      ]
+    },
+    {
+      "authority": "deterministic-input",
+      "cType": "float",
+      "dtype": "float32",
+      "elements": 3,
+      "name": "q4e_gr_block_output",
+      "numpyCrossCheck": {
+        "mode": "exact"
+      },
+      "origin": "PCG64/fixed input for q4e_gr_block_output",
+      "sha256": "685f884130838f990bf586ebb67e564f2fa7a578826065bf43f083548bc33571",
+      "shape": [
+        3
+      ]
+    },
+    {
+      "authority": "upstream-transformers",
+      "cType": "float",
+      "dtype": "float32",
+      "elements": 3,
+      "name": "q4e_gr_mixed",
+      "numpyCrossCheck": {
+        "atol": 2e-05,
+        "mode": "allclose",
+        "rtol": 2e-05
+      },
+      "origin": "transformers:Qwen4ExpTextGatedResidual.forward",
+      "sha256": "856acf2991865fc3f4da1012af60cbbf53f57eeac7a796818ca26c458364dc9b",
+      "shape": [
+        3
+      ]
+    },
+    {
+      "authority": "upstream-transformers",
+      "cType": "float",
+      "dtype": "float32",
+      "elements": 4,
+      "name": "q4e_gr_injection",
+      "numpyCrossCheck": {
+        "atol": 2e-05,
+        "mode": "allclose",
+        "rtol": 2e-05
+      },
+      "origin": "transformers:Qwen4ExpTextGatedResidual.forward",
+      "sha256": "88c9d7cbdb0efb803dd93eeb96d6adba10fd05e66ea46a22d296b0aa3886f034",
+      "shape": [
+        4
+      ]
+    },
+    {
+      "authority": "upstream-transformers",
+      "cType": "float",
+      "dtype": "float32",
+      "elements": 12,
+      "name": "q4e_gr_applied",
+      "numpyCrossCheck": {
+        "atol": 2e-05,
+        "mode": "allclose",
+        "rtol": 2e-05
+      },
+      "origin": "transformers:Qwen4ExpTextDecoderLayer injection update",
+      "sha256": "8cbb8b1058823cc1d2247dc8a79ab46910e0c1aacb986cbf89a02546010723d8",
+      "shape": [
+        4,
+        3
+      ]
+    },
+    {
+      "authority": "upstream-transformers",
+      "cType": "float",
+      "dtype": "float32",
+      "elements": 3,
+      "name": "q4e_gr_final",
+      "numpyCrossCheck": {
+        "atol": 2e-05,
+        "mode": "allclose",
+        "rtol": 2e-05
+      },
+      "origin": "transformers:Qwen4ExpTextGatedResidual.forward(use_combine=False)",
+      "sha256": "8c790f6f9f10001d5002c7592e449bb9261e780acc29104781673237a26c82d8",
+      "shape": [
+        3
+      ]
+    },
+    {
+      "authority": "deterministic-input",
+      "cType": "float",
+      "dtype": "float32",
+      "elements": 20,
+      "name": "q4e_gdn_conv_input",
+      "numpyCrossCheck": {
+        "mode": "exact"
+      },
+      "origin": "PCG64/fixed input for q4e_gdn_conv_input",
+      "sha256": "1f988ef39aa623a9cfc134844cdbb4cc4c04e9194140fab8b96f9a28ee9070a9",
+      "shape": [
+        5,
+        4
+      ]
+    },
+    {
+      "authority": "deterministic-input",
+      "cType": "float",
+      "dtype": "float32",
+      "elements": 16,
+      "name": "q4e_gdn_conv_weight",
+      "numpyCrossCheck": {
+        "mode": "exact"
+      },
+      "origin": "PCG64/fixed input for q4e_gdn_conv_weight",
+      "sha256": "8ec7781887028d89487bcc543dfec0e1dfa28eb09cb9fd001bd4f09700e428d5",
+      "shape": [
+        4,
+        4
+      ]
+    },
+    {
+      "authority": "deterministic-input",
+      "cType": "float",
+      "dtype": "float32",
+      "elements": 12,
+      "name": "q4e_gdn_conv_state_initial",
+      "numpyCrossCheck": {
+        "mode": "exact"
+      },
+      "origin": "PCG64/fixed input for q4e_gdn_conv_state_initial",
+      "sha256": "ac9d59521537826464990f39267235ddd3b6ceb06c2e44591fd881a0ec63c7bb",
+      "shape": [
+        4,
+        3
+      ]
+    },
+    {
+      "authority": "upstream-transformers",
+      "cType": "float",
+      "dtype": "float32",
+      "elements": 20,
+      "name": "q4e_gdn_conv_output",
+      "numpyCrossCheck": {
+        "atol": 2e-05,
+        "mode": "allclose",
+        "rtol": 2e-05
+      },
+      "origin": "transformers:causal_conv1d_update",
+      "sha256": "df59bf36ae60ce77ea90f082a7dbc426be6fb749f80bb10197c997da0585a5be",
+      "shape": [
+        5,
+        4
+      ]
+    },
+    {
+      "authority": "upstream-transformers",
+      "cType": "float",
+      "dtype": "float32",
+      "elements": 12,
+      "name": "q4e_gdn_conv_state_final",
+      "numpyCrossCheck": {
+        "atol": 2e-05,
+        "mode": "allclose",
+        "rtol": 2e-05
+      },
+      "origin": "transformers:causal_conv1d_update",
+      "sha256": "dd8db52427cfc0fc47e1f032683c89b12aa41a93b3d502a4d89389240076794d",
+      "shape": [
+        4,
+        3
+      ]
+    },
+    {
+      "authority": "deterministic-input",
+      "cType": "float",
+      "dtype": "float32",
+      "elements": 8,
+      "name": "q4e_gdn_query",
+      "numpyCrossCheck": {
+        "mode": "exact"
+      },
+      "origin": "PCG64/fixed input for q4e_gdn_query",
+      "sha256": "d1be999f1ad63ccdbd7e0473c495f2f6e916e8f2901b5177959d2d4260e65a0a",
+      "shape": [
+        2,
+        2,
+        2
+      ]
+    },
+    {
+      "authority": "deterministic-input",
+      "cType": "float",
+      "dtype": "float32",
+      "elements": 8,
+      "name": "q4e_gdn_key",
+      "numpyCrossCheck": {
+        "mode": "exact"
+      },
+      "origin": "PCG64/fixed input for q4e_gdn_key",
+      "sha256": "72ad49517d2ce36a0cd426491dde71be059fb124323ba4ced9fbcdfaae248a5b",
+      "shape": [
+        2,
+        2,
+        2
+      ]
+    },
+    {
+      "authority": "deterministic-input",
+      "cType": "float",
+      "dtype": "float32",
+      "elements": 24,
+      "name": "q4e_gdn_value",
+      "numpyCrossCheck": {
+        "mode": "exact"
+      },
+      "origin": "PCG64/fixed input for q4e_gdn_value",
+      "sha256": "0712211fece0be439f6db7626aaf07e59f0dfa0358d22303e93769dbcf3730ea",
+      "shape": [
+        2,
+        6,
+        2
+      ]
+    },
+    {
+      "authority": "deterministic-input",
+      "cType": "float",
+      "dtype": "float32",
+      "elements": 12,
+      "name": "q4e_gdn_alpha_logit",
+      "numpyCrossCheck": {
+        "mode": "exact"
+      },
+      "origin": "PCG64/fixed input for q4e_gdn_alpha_logit",
+      "sha256": "832a66065efaacfd1c47c1a231ce8aa1cda5a50dbda6b50dc919abe1960aaabc",
+      "shape": [
+        2,
+        6
+      ]
+    },
+    {
+      "authority": "deterministic-input",
+      "cType": "float",
+      "dtype": "float32",
+      "elements": 12,
+      "name": "q4e_gdn_beta_logit",
+      "numpyCrossCheck": {
+        "mode": "exact"
+      },
+      "origin": "PCG64/fixed input for q4e_gdn_beta_logit",
+      "sha256": "bb84ce4538c5415cfb3d522ca3e71eeeddf76580e9b8b40f3944638ef902ea58",
+      "shape": [
+        2,
+        6
+      ]
+    },
+    {
+      "authority": "deterministic-input",
+      "cType": "float",
+      "dtype": "float32",
+      "elements": 6,
+      "name": "q4e_gdn_a_log",
+      "numpyCrossCheck": {
+        "mode": "exact"
+      },
+      "origin": "PCG64/fixed input for q4e_gdn_a_log",
+      "sha256": "b75a6102c94fec4604cc58d0df7f827aa6c9013bfeb02d6476b822c8792cef03",
+      "shape": [
+        6
+      ]
+    },
+    {
+      "authority": "deterministic-input",
+      "cType": "float",
+      "dtype": "float32",
+      "elements": 6,
+      "name": "q4e_gdn_dt_bias",
+      "numpyCrossCheck": {
+        "mode": "exact"
+      },
+      "origin": "PCG64/fixed input for q4e_gdn_dt_bias",
+      "sha256": "873cc7a7474d2935eee99574be2ae6809bfb33d05443e1cb86c6a90fdb617bf6",
+      "shape": [
+        6
+      ]
+    },
+    {
+      "authority": "upstream-transformers",
+      "cType": "float",
+      "dtype": "float32",
+      "elements": 12,
+      "name": "q4e_gdn_log_decay",
+      "numpyCrossCheck": {
+        "atol": 2e-05,
+        "mode": "allclose",
+        "rtol": 2e-05
+      },
+      "origin": "transformers:Qwen4ExpTextGatedDeltaNet controls",
+      "sha256": "2ffd933f6740993def527db4ae5b516dd2f1e2af56c0e5b9e8013990f912863d",
+      "shape": [
+        2,
+        6
+      ]
+    },
+    {
+      "authority": "upstream-transformers",
+      "cType": "float",
+      "dtype": "float32",
+      "elements": 12,
+      "name": "q4e_gdn_beta",
+      "numpyCrossCheck": {
+        "atol": 2e-05,
+        "mode": "allclose",
+        "rtol": 2e-05
+      },
+      "origin": "transformers:Qwen4ExpTextGatedDeltaNet controls",
+      "sha256": "a7135c3b587c0dec30d05851f4a1c4713102318678040f667af07ae6f39abd06",
+      "shape": [
+        2,
+        6
+      ]
+    },
+    {
+      "authority": "contract-control",
+      "cType": "uint32_t",
+      "dtype": "uint32",
+      "elements": 6,
+      "name": "q4e_gdn_head_map",
+      "numpyCrossCheck": {
+        "mode": "exact"
+      },
+      "origin": "contract-control:exact 16-to-48 repeat-interleave analogue",
+      "sha256": "c972bad6492c0500bad5ab473471161c84a4f7268527085fc09c50df08e556c6",
+      "shape": [
+        6
+      ]
+    },
+    {
+      "authority": "deterministic-input",
+      "cType": "float",
+      "dtype": "float32",
+      "elements": 24,
+      "name": "q4e_gdn_state_initial",
+      "numpyCrossCheck": {
+        "mode": "exact"
+      },
+      "origin": "PCG64/fixed input for q4e_gdn_state_initial",
+      "sha256": "e15b3a46f75b4cbe27e145425c31ff4440caed0f43e092ee1dd3affb5ee3cc17",
+      "shape": [
+        6,
+        2,
+        2
+      ]
+    },
+    {
+      "authority": "upstream-transformers",
+      "cType": "float",
+      "dtype": "float32",
+      "elements": 24,
+      "name": "q4e_gdn_output",
+      "numpyCrossCheck": {
+        "atol": 2e-05,
+        "mode": "allclose",
+        "rtol": 2e-05
+      },
+      "origin": "transformers:torch_recurrent_gated_delta_rule",
+      "sha256": "d00cefb4ff07e5307a170089beb6d4ad883c263d9750d87e66ef0958c745944d",
+      "shape": [
+        2,
+        6,
+        2
+      ]
+    },
+    {
+      "authority": "upstream-transformers",
+      "cType": "float",
+      "dtype": "float32",
+      "elements": 24,
+      "name": "q4e_gdn_state_final",
+      "numpyCrossCheck": {
+        "atol": 2e-05,
+        "mode": "allclose",
+        "rtol": 2e-05
+      },
+      "origin": "transformers:torch_recurrent_gated_delta_rule",
+      "sha256": "fe0091894a16adca6df45158bcd65fc1aaa50c8c4d5becb3fd2e73115b6c9ce8",
+      "shape": [
+        6,
+        2,
+        2
+      ]
+    },
+    {
+      "authority": "contract-control",
+      "cType": "float",
+      "dtype": "float32",
+      "elements": 512,
+      "name": "q4e_router_equal_logits",
+      "numpyCrossCheck": {
+        "mode": "exact"
+      },
+      "origin": "contract-control:all-equal 512-expert logits",
+      "sha256": "e5a00aa9991ac8a5ee3109844d84a55583bd20572ad3ffcd42792f3c36b183ad",
+      "shape": [
+        512
+      ]
+    },
+    {
+      "authority": "contract-control",
+      "cType": "uint32_t",
+      "dtype": "uint32",
+      "elements": 10,
+      "name": "q4e_router_equal_id",
+      "numpyCrossCheck": {
+        "mode": "exact"
+      },
+      "origin": "contract-control:descending score then ascending expert ID",
+      "sha256": "10b4796eac59c7d81c33711f219ba227247a4e338adad078159ba01e87590841",
+      "shape": [
+        10
+      ]
+    },
+    {
+      "authority": "contract-control",
+      "cType": "float",
+      "dtype": "float32",
+      "elements": 10,
+      "name": "q4e_router_equal_weight",
+      "numpyCrossCheck": {
+        "mode": "exact"
+      },
+      "origin": "contract-control:renormalized equal top-10",
+      "sha256": "c2a1076280164fce11c1e91f4b35f8fb4699216a1398c779b9d0a233425f0ad6",
+      "shape": [
+        10
+      ]
+    },
+    {
+      "authority": "deterministic-input",
+      "cType": "float",
+      "dtype": "float32",
+      "elements": 1024,
+      "name": "q4e_router_upstream_logits",
+      "numpyCrossCheck": {
+        "mode": "exact"
+      },
+      "origin": "PCG64/fixed input for q4e_router_upstream_logits",
+      "sha256": "c1ca43c3368653bdb2032708c430b0cdd998706cf8b48a5902e087e807857b2c",
+      "shape": [
+        2,
+        512
+      ]
+    },
+    {
+      "authority": "upstream-transformers",
+      "cType": "uint32_t",
+      "dtype": "uint32",
+      "elements": 20,
+      "name": "q4e_router_upstream_id",
+      "numpyCrossCheck": {
+        "mode": "exact"
+      },
+      "origin": "transformers:Qwen4ExpTextTopKRouter.forward",
+      "sha256": "9a0cc2d7a75407b0560553f00bd61dfc785425dcb4b9ebf23b9498d55eff0fd9",
+      "shape": [
+        2,
+        10
+      ]
+    },
+    {
+      "authority": "upstream-transformers",
+      "cType": "float",
+      "dtype": "float32",
+      "elements": 20,
+      "name": "q4e_router_upstream_weight",
+      "numpyCrossCheck": {
+        "atol": 2e-05,
+        "mode": "allclose",
+        "rtol": 2e-05
+      },
+      "origin": "transformers:Qwen4ExpTextTopKRouter.forward",
+      "sha256": "614fd904e985060fb253a9046be179157ffbea8896ea997dac7d36b1854b0354",
+      "shape": [
+        2,
+        10
+      ]
+    },
+    {
+      "authority": "deterministic-input",
+      "cType": "float",
+      "dtype": "float32",
+      "elements": 96,
+      "name": "q4e_qsa_raw_key",
+      "numpyCrossCheck": {
+        "mode": "exact"
+      },
+      "origin": "PCG64/fixed input for q4e_qsa_raw_key",
+      "sha256": "642778fd211069395ab8ea1d906d1f405e0e527531cd04caaf802630ef3ddf78",
+      "shape": [
+        12,
+        8
+      ]
+    },
+    {
+      "authority": "deterministic-input",
+      "cType": "float",
+      "dtype": "float32",
+      "elements": 8,
+      "name": "q4e_qsa_norm_weight",
+      "numpyCrossCheck": {
+        "mode": "exact"
+      },
+      "origin": "PCG64/fixed input for q4e_qsa_norm_weight",
+      "sha256": "9d86476b8d082f6e2fe71fcbefa8bba318ae773f629d63c01723b1e0683452fb",
+      "shape": [
+        8
+      ]
+    },
+    {
+      "authority": "deterministic-input",
+      "cType": "uint32_t",
+      "dtype": "uint32",
+      "elements": 3,
+      "name": "q4e_qsa_group_position",
+      "numpyCrossCheck": {
+        "mode": "exact"
+      },
+      "origin": "PCG64/fixed input for q4e_qsa_group_position",
+      "sha256": "a793829a02facc184584d96f9b5ab078907a0894a4588be70485afd1741001f1",
+      "shape": [
+        3
+      ]
+    },
+    {
+      "authority": "upstream-transformers",
+      "cType": "float",
+      "dtype": "float32",
+      "elements": 24,
+      "name": "q4e_qsa_group_key",
+      "numpyCrossCheck": {
+        "atol": 2e-05,
+        "mode": "allclose",
+        "rtol": 2e-05
+      },
+      "origin": "transformers:Qwen4ExpTextQSAIndexer pooled-key path",
+      "sha256": "cc7be1702d03b0804861fd8484fd9c9bcda430fe5610af96bf4f6a3a2d1cef0e",
+      "shape": [
+        3,
+        8
+      ]
+    },
+    {
+      "authority": "deterministic-input",
+      "cType": "float",
+      "dtype": "float32",
+      "elements": 32,
+      "name": "q4e_qsa_query",
+      "numpyCrossCheck": {
+        "mode": "exact"
+      },
+      "origin": "PCG64/fixed input for q4e_qsa_query",
+      "sha256": "c8a6c5c526231eaac44be666a4f574a1e7785eb45e1d00bbc0ed9ddc2aee7b8c",
+      "shape": [
+        4,
+        8
+      ]
+    },
+    {
+      "authority": "upstream-transformers",
+      "cType": "float",
+      "dtype": "float32",
+      "elements": 12,
+      "name": "q4e_qsa_head_dot",
+      "numpyCrossCheck": {
+        "atol": 2e-05,
+        "mode": "allclose",
+        "rtol": 2e-05
+      },
+      "origin": "transformers:Qwen4ExpTextQSAIndexer score matmul",
+      "sha256": "2f6a7b46b7f419a2dc21bb1dd063c10293b0b3f9d4ab02576935a8e08b0277fe",
+      "shape": [
+        3,
+        4
+      ]
+    },
+    {
+      "authority": "upstream-transformers",
+      "cType": "float",
+      "dtype": "float32",
+      "elements": 3,
+      "name": "q4e_qsa_score",
+      "numpyCrossCheck": {
+        "atol": 2e-05,
+        "mode": "allclose",
+        "rtol": 2e-05
+      },
+      "origin": "transformers:Qwen4ExpTextQSAIndexer per-head ReLU score",
+      "sha256": "61d3da6bd297159d3547729d0878b2d947e36799f11992e98da85306e5bec46a",
+      "shape": [
+        3
+      ]
+    },
+    {
+      "authority": "contract-control",
+      "cType": "float",
+      "dtype": "float32",
+      "elements": 3,
+      "name": "q4e_qsa_wrong_relu_after_sum",
+      "numpyCrossCheck": {
+        "mode": "exact"
+      },
+      "origin": "contract-control:negative ReLU-after-sum comparator",
+      "sha256": "da160f3c51eab54cd73eafa2352234b9635aca7d3bd8a74bd0b559c357349041",
+      "shape": [
+        3
+      ]
+    },
+    {
+      "authority": "upstream-transformers",
+      "cType": "uint32_t",
+      "dtype": "uint32",
+      "elements": 10,
+      "name": "q4e_qsa_selected",
+      "numpyCrossCheck": {
+        "mode": "exact"
+      },
+      "origin": "transformers:Qwen4ExpTextQSAIndexer topk/expand/tail",
+      "sha256": "7637540c25771dfc9a9135ca5d1b9860974be9d728de49dbc07b0ad56ab32709",
+      "shape": [
+        10
+      ]
+    },
+    {
+      "authority": "contract-control",
+      "cType": "uint32_t",
+      "dtype": "uint32",
+      "elements": 2,
+      "name": "q4e_qsa_tail_before",
+      "numpyCrossCheck": {
+        "mode": "exact"
+      },
+      "origin": "contract-control:incomplete causal tail identity",
+      "sha256": "b9252ced93d1432063b20490ede4312faea6845d0bddf266f8def20b42a01d2f",
+      "shape": [
+        2
+      ]
+    },
+    {
+      "authority": "upstream-transformers",
+      "cType": "uint32_t",
+      "dtype": "uint32",
+      "elements": 2,
+      "name": "q4e_qsa_tail_after",
+      "numpyCrossCheck": {
+        "mode": "exact"
+      },
+      "origin": "transformers:Qwen4ExpTextQSAIndexer tail append",
+      "sha256": "b9252ced93d1432063b20490ede4312faea6845d0bddf266f8def20b42a01d2f",
+      "shape": [
+        2
+      ]
+    },
+    {
+      "authority": "contract-control",
+      "cType": "float",
+      "dtype": "float32",
+      "elements": 3,
+      "name": "q4e_qsa_tie_score",
+      "numpyCrossCheck": {
+        "mode": "exact"
+      },
+      "origin": "contract-control:equal QSA block scores",
+      "sha256": "0e5a36a82c5f4a1ae0bf4885ecb4587d69d2a83c24fae086fcd29351d7cbdcfb",
+      "shape": [
+        3
+      ]
+    },
+    {
+      "authority": "contract-control",
+      "cType": "uint32_t",
+      "dtype": "uint32",
+      "elements": 10,
+      "name": "q4e_qsa_tie_selected",
+      "numpyCrossCheck": {
+        "mode": "exact"
+      },
+      "origin": "contract-control:descending score then ascending group ID",
+      "sha256": "a96aaa294f1be5f0c11a39715e77f2ea92475a2d88c8f6e1c6b8c178c5e83dd6",
+      "shape": [
+        10
+      ]
+    },
+    {
+      "authority": "upstream-transformers",
+      "cType": "uint64_t",
+      "dtype": "uint64",
+      "elements": 3,
+      "name": "q4e_ple_multiplier",
+      "numpyCrossCheck": {
+        "mode": "exact"
+      },
+      "origin": "transformers:_build_layer_multipliers",
+      "sha256": "37349930c3c77bf4927b2afb6b50f30c404f42f00f5790bda96e7d9589c26477",
+      "shape": [
+        3
+      ]
+    },
+    {
+      "authority": "upstream-transformers",
+      "cType": "uint32_t",
+      "dtype": "uint32",
+      "elements": 16,
+      "name": "q4e_ple_head_prime",
+      "numpyCrossCheck": {
+        "mode": "exact"
+      },
+      "origin": "transformers:_find_nth_prime_after",
+      "sha256": "a945b1d6a51bed3889d778ce55b4758922a89d07faa02ddaa9f9a3eadead0848",
+      "shape": [
+        16
+      ]
+    },
+    {
+      "authority": "upstream-transformers",
+      "cType": "uint32_t",
+      "dtype": "uint32",
+      "elements": 16,
+      "name": "q4e_ple_head_offset",
+      "numpyCrossCheck": {
+        "mode": "exact"
+      },
+      "origin": "transformers:Qwen4ExpTextNGramEmbedding offsets",
+      "sha256": "ac9a0e522b6e17ee9f198677dedefcab07644c4eb77ac3d085997fee956db805",
+      "shape": [
+        16
+      ]
+    },
+    {
+      "authority": "deterministic-input",
+      "cType": "uint32_t",
+      "dtype": "uint32",
+      "elements": 5,
+      "name": "q4e_ple_token",
+      "numpyCrossCheck": {
+        "mode": "exact"
+      },
+      "origin": "PCG64/fixed input for q4e_ple_token",
+      "sha256": "42c1be497afa40757eeaaa130258f7c8722a0b7b2d0180e9f066080e054de3a2",
+      "shape": [
+        5
+      ]
+    },
+    {
+      "authority": "contract-control",
+      "cType": "uint32_t",
+      "dtype": "uint32",
+      "elements": 10,
+      "name": "q4e_ple_history_before",
+      "numpyCrossCheck": {
+        "mode": "exact"
+      },
+      "origin": "contract-control:transactional previous1/previous2 state",
+      "sha256": "e017b5ab65617f75690965bad388e9f25aa444683eea2d2b5dff10cea7bdbc7a",
+      "shape": [
+        5,
+        2
+      ]
+    },
+    {
+      "authority": "contract-control",
+      "cType": "uint32_t",
+      "dtype": "uint32",
+      "elements": 5,
+      "name": "q4e_ple_history_count_before",
+      "numpyCrossCheck": {
+        "mode": "exact"
+      },
+      "origin": "contract-control:transactional PLE history count",
+      "sha256": "62a4997e810f471d4912b661774ed0f9c37653aaa743b0368a23b2ebac48c9ff",
+      "shape": [
+        5
+      ]
+    },
+    {
+      "authority": "upstream-transformers",
+      "cType": "uint32_t",
+      "dtype": "uint32",
+      "elements": 80,
+      "name": "q4e_ple_row",
+      "numpyCrossCheck": {
+        "mode": "exact"
+      },
+      "origin": "transformers:Qwen4ExpTextNGramEmbedding hash/remainder path",
+      "sha256": "c5d1ac2143d5ec66a0c488f9b994ac70f0000f7221cd9b60d18abcbd8cb5040c",
+      "shape": [
+        5,
+        16
+      ]
+    },
+    {
+      "authority": "contract-control",
+      "cType": "uint32_t",
+      "dtype": "uint32",
+      "elements": 10,
+      "name": "q4e_ple_history_after",
+      "numpyCrossCheck": {
+        "mode": "exact"
+      },
+      "origin": "contract-control:current EOS resets successor history",
+      "sha256": "50c4a22cdb48a97ba01a14f760307b3f0cfdc7bc3d831bd88562efd3fdd77f0f",
+      "shape": [
+        5,
+        2
+      ]
+    },
+    {
+      "authority": "contract-control",
+      "cType": "uint32_t",
+      "dtype": "uint32",
+      "elements": 5,
+      "name": "q4e_ple_history_count_after",
+      "numpyCrossCheck": {
+        "mode": "exact"
+      },
+      "origin": "contract-control:current EOS resets successor count",
+      "sha256": "98a911f0d45503d156ecd033b384ca4148c6ea5eadf8bd4c57a46596da52ac6f",
+      "shape": [
+        5
+      ]
+    },
+    {
+      "authority": "contract-control",
+      "cType": "uint64_t",
+      "dtype": "uint64",
+      "elements": 3,
+      "name": "q4e_ple_overflow_token",
+      "numpyCrossCheck": {
+        "mode": "exact"
+      },
+      "origin": "contract-control:out-of-profile uint64 wrap operands",
+      "sha256": "11a0c1d9f78dc0144438d95b12855b813478635b4392f8422a4bb144181c61f9",
+      "shape": [
+        3
+      ]
+    },
+    {
+      "authority": "contract-control",
+      "cType": "uint64_t",
+      "dtype": "uint64",
+      "elements": 3,
+      "name": "q4e_ple_overflow_product",
+      "numpyCrossCheck": {
+        "mode": "exact"
+      },
+      "origin": "contract-control:uint64 modular multiplication",
+      "sha256": "2a15007797413a07693e1080caa75f0c827946a7f367fe9c0ad6eff20728f632",
+      "shape": [
+        3
+      ]
+    },
+    {
+      "authority": "contract-control",
+      "cType": "uint64_t",
+      "dtype": "uint64",
+      "elements": 2,
+      "name": "q4e_ple_overflow_fold",
+      "numpyCrossCheck": {
+        "mode": "exact"
+      },
+      "origin": "contract-control:uint64 XOR fold after wrap",
+      "sha256": "3f7cf84b7a91731b5e235c86c0d4e450b36d285183ed90451acf66f7213b2119",
+      "shape": [
+        2
+      ]
+    },
+    {
+      "authority": "deterministic-input",
+      "cType": "float",
+      "dtype": "float32",
+      "elements": 12,
+      "name": "q4e_ple_gate_query",
+      "numpyCrossCheck": {
+        "mode": "exact"
+      },
+      "origin": "PCG64/fixed input for q4e_ple_gate_query",
+      "sha256": "2fc6dc65e310cb6730bab1505ef0ec660ea9d815a07ac86b2ec15f91c25708fe",
+      "shape": [
+        4,
+        3
+      ]
+    },
+    {
+      "authority": "deterministic-input",
+      "cType": "float",
+      "dtype": "float32",
+      "elements": 12,
+      "name": "q4e_ple_gate_key",
+      "numpyCrossCheck": {
+        "mode": "exact"
+      },
+      "origin": "PCG64/fixed input for q4e_ple_gate_key",
+      "sha256": "27031e32f82546f84b3b905b9890a297774c371ccf758c727816cc70520f32f2",
+      "shape": [
+        4,
+        3
+      ]
+    },
+    {
+      "authority": "deterministic-input",
+      "cType": "float",
+      "dtype": "float32",
+      "elements": 3,
+      "name": "q4e_ple_gate_value",
+      "numpyCrossCheck": {
+        "mode": "exact"
+      },
+      "origin": "PCG64/fixed input for q4e_ple_gate_value",
+      "sha256": "4b8703550a82228a0d67eb75edd8df7237e25b114e4d5d488110a13e40ee5450",
+      "shape": [
+        3
+      ]
+    },
+    {
+      "authority": "upstream-transformers",
+      "cType": "float",
+      "dtype": "float32",
+      "elements": 4,
+      "name": "q4e_ple_gate_signed_root",
+      "numpyCrossCheck": {
+        "atol": 2e-05,
+        "mode": "allclose",
+        "rtol": 2e-05
+      },
+      "origin": "transformers:Qwen4ExpTextPLELayer signed-root gate",
+      "sha256": "92078654c76d33f0baf0410d6d324197ece89cbdbd0aef8f08af11fe380d9c8c",
+      "shape": [
+        4
+      ]
+    },
+    {
+      "authority": "upstream-transformers",
+      "cType": "float",
+      "dtype": "float32",
+      "elements": 4,
+      "name": "q4e_ple_gate_sigmoid",
+      "numpyCrossCheck": {
+        "atol": 2e-05,
+        "mode": "allclose",
+        "rtol": 2e-05
+      },
+      "origin": "transformers:Qwen4ExpTextPLELayer sigmoid gate",
+      "sha256": "4dc66e9abeff8cbe4f03c30e107dddf49462f807a000239da457bc4fb7e69b83",
+      "shape": [
+        4
+      ]
+    },
+    {
+      "authority": "upstream-transformers",
+      "cType": "float",
+      "dtype": "float32",
+      "elements": 12,
+      "name": "q4e_ple_gate_output",
+      "numpyCrossCheck": {
+        "atol": 2e-05,
+        "mode": "allclose",
+        "rtol": 2e-05
+      },
+      "origin": "transformers:Qwen4ExpTextPLELayer gated value",
+      "sha256": "5b61afdc2c08bf33662b8e4e282f23c65ac58c0c8a863d0507b5e98461392fb3",
+      "shape": [
+        4,
+        3
+      ]
+    },
+    {
+      "authority": "deterministic-input",
+      "cType": "float",
+      "dtype": "float32",
+      "elements": 10,
+      "name": "q4e_ple_conv_input",
+      "numpyCrossCheck": {
+        "mode": "exact"
+      },
+      "origin": "PCG64/fixed input for q4e_ple_conv_input",
+      "sha256": "2a4e3c1f9d75094ab76330e3b7ade75bf928906fdbcb5e28ce5502fd393561ac",
+      "shape": [
+        5,
+        2
+      ]
+    },
+    {
+      "authority": "deterministic-input",
+      "cType": "float",
+      "dtype": "float32",
+      "elements": 8,
+      "name": "q4e_ple_conv_weight",
+      "numpyCrossCheck": {
+        "mode": "exact"
+      },
+      "origin": "PCG64/fixed input for q4e_ple_conv_weight",
+      "sha256": "d0cd59f8c48df0490e44fc1f3d7ec587f3fdb90e84f4563b43438f2f6e0d3b4b",
+      "shape": [
+        2,
+        4
+      ]
+    },
+    {
+      "authority": "deterministic-input",
+      "cType": "float",
+      "dtype": "float32",
+      "elements": 18,
+      "name": "q4e_ple_conv_state_initial",
+      "numpyCrossCheck": {
+        "mode": "exact"
+      },
+      "origin": "PCG64/fixed input for q4e_ple_conv_state_initial",
+      "sha256": "f20e0d02c1b211615187aa4693f78dbd33acb39d7f6ab9c6134862b2307f67e8",
+      "shape": [
+        2,
+        9
+      ]
+    },
+    {
+      "authority": "upstream-transformers",
+      "cType": "float",
+      "dtype": "float32",
+      "elements": 10,
+      "name": "q4e_ple_conv_preact",
+      "numpyCrossCheck": {
+        "atol": 2e-05,
+        "mode": "allclose",
+        "rtol": 2e-05
+      },
+      "origin": "transformers:Qwen4ExpTextPLELayer dilated depthwise conv",
+      "sha256": "856aa90dc8254d5789f38c381f57973d8da12aad7ce8a91934dbf306f3a6e0ab",
+      "shape": [
+        5,
+        2
+      ]
+    },
+    {
+      "authority": "upstream-transformers",
+      "cType": "float",
+      "dtype": "float32",
+      "elements": 10,
+      "name": "q4e_ple_conv_output",
+      "numpyCrossCheck": {
+        "atol": 2e-05,
+        "mode": "allclose",
+        "rtol": 2e-05
+      },
+      "origin": "transformers:Qwen4ExpTextPLELayer dilated depthwise conv+SiLU",
+      "sha256": "b089d23a3a222b317cf48182f3fcf7921ab64b0b5caea776f5c74afe43d9ba9c",
+      "shape": [
+        5,
+        2
+      ]
+    },
+    {
+      "authority": "upstream-transformers",
+      "cType": "float",
+      "dtype": "float32",
+      "elements": 18,
+      "name": "q4e_ple_conv_state_final",
+      "numpyCrossCheck": {
+        "atol": 2e-05,
+        "mode": "allclose",
+        "rtol": 2e-05
+      },
+      "origin": "transformers:Qwen4Exp PLE cache-state semantics",
+      "sha256": "de069430cfc1b4c8a3c30459bc4193afd3dfd37cf1c1ad2b941389e40a187476",
+      "shape": [
+        2,
+        9
+      ]
+    },
+    {
+      "authority": "contract-control",
+      "cType": "float",
+      "dtype": "float32",
+      "elements": 6,
+      "name": "q4e_state_control_initial",
+      "numpyCrossCheck": {
+        "mode": "exact"
+      },
+      "origin": "contract-control:tiny transactional state seed",
+      "sha256": "9c020b5740762a9325b350e29bf1fd9746141bb6a7725332ee594a3a47d8cb75",
+      "shape": [
+        6
+      ]
+    },
+    {
+      "authority": "contract-control",
+      "cType": "float",
+      "dtype": "float32",
+      "elements": 6,
+      "name": "q4e_state_control_copied",
+      "numpyCrossCheck": {
+        "mode": "exact"
+      },
+      "origin": "contract-control:state copy",
+      "sha256": "9c020b5740762a9325b350e29bf1fd9746141bb6a7725332ee594a3a47d8cb75",
+      "shape": [
+        6
+      ]
+    },
+    {
+      "authority": "contract-control",
+      "cType": "float",
+      "dtype": "float32",
+      "elements": 6,
+      "name": "q4e_state_control_advanced",
+      "numpyCrossCheck": {
+        "mode": "exact"
+      },
+      "origin": "contract-control:state advance after copy",
+      "sha256": "2059026f2a000a12bee6172bf6dd5acc2d8a7e7dbf11fd88dd06e0f30e1240c1",
+      "shape": [
+        6
+      ]
+    },
+    {
+      "authority": "contract-control",
+      "cType": "float",
+      "dtype": "float32",
+      "elements": 6,
+      "name": "q4e_state_control_rewound",
+      "numpyCrossCheck": {
+        "mode": "exact"
+      },
+      "origin": "contract-control:state rewind to copy",
+      "sha256": "9c020b5740762a9325b350e29bf1fd9746141bb6a7725332ee594a3a47d8cb75",
+      "shape": [
+        6
+      ]
+    },
+    {
+      "authority": "contract-control",
+      "cType": "float",
+      "dtype": "float32",
+      "elements": 6,
+      "name": "q4e_state_control_reset",
+      "numpyCrossCheck": {
+        "mode": "exact"
+      },
+      "origin": "contract-control:state reset",
+      "sha256": "9d908ecfb6b256def8b49a7c504e6c889c4b0e41fe6ce3e01863dd7b61a20aa0",
+      "shape": [
+        6
+      ]
+    }
+  ],
+  "capture": {
+    "device": "cpu",
+    "dtype": "float32",
+    "numpy": "2.4.6",
+    "python": "3.13.13",
+    "seedDecimal": 1313167444,
+    "seedHex": "0x4e455854",
+    "torch": "2.9.1",
+    "torchDeterministicAlgorithms": true,
+    "torchThreads": 1,
+    "transformers": "5.16.0.dev0"
+  },
+  "fixtureArraySha256": "9564a15b4fff26cc1db7c2e9872c0b033bbd4e8a9d1e644c50e649bd00122406",
+  "generatedBy": "tests/qwen4exp/collect_scalar_reference.py",
+  "kind": "qwen4exp-scalar-provenance",
+  "schemaVersion": 1,
+  "source": {
+    "chatTemplateSha256": "c3cf9e34abf4f9e36c2d72165aa9c132d3e2a725b6c2586aaa3a8af9d7a81041",
+    "configSha256": "889658f2508e8c61d409b02e70e0d78d8d4452ec65aaafbe129805d213d2e74b",
+    "hfRepository": "Qwen/Qwen3.8-Flash-Next",
+    "hfRevision": "de4b8e4d43b917e7706784d8bb445c9af86a3540",
+    "inventorySha256": "a639efc7a5147b04200e870d7e320335527f4361a8327b137feca2683b1dc434",
+    "tokenizerConfigSha256": "b11349aafa7cdc6a320767cf7ceb29ed82f7eda5d65e8e0819e76f0ce947bf27",
+    "tokenizerSha256": "0997f410c57a1f4e53b09e4be8f4a172d90edd9564368fb0847030937229b9f3",
+    "transformersCommit": "42ca97014c85d71a88ad60d55f08cb9fb4d26e2c",
+    "transformersModelingSha256": "91e9b1e9c74efe373cd989fe1974a8fa305f4aad43628dbcbd03dac20437814f"
+  },
+  "status": "model-free-not-support"
+}

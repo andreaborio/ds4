@@ -152,7 +152,22 @@ bool ds4_qwen4exp_ref_qsa_select_positions(
         size_t       compression,
         size_t       group_budget);
 
+/* Tiny logical-state helpers used to prove checkpoint, fork and rewind
+ * semantics independently of any runtime allocator.  Copy/rewind reject
+ * overlapping non-identical ranges and preserve the destination on failure. */
+bool ds4_qwen4exp_ref_state_reset_f32(float *state, size_t n_value);
+bool ds4_qwen4exp_ref_state_copy_f32(
+        float       *destination,
+        const float *source,
+        size_t       n_value);
+bool ds4_qwen4exp_ref_state_rewind_f32(
+        float       *state,
+        const float *checkpoint,
+        size_t       n_value);
+
 typedef struct {
+    /* token[0] is the most recent predecessor; token[1] is the second-most
+     * recent.  count is 0..2 and is host control metadata, not a token ID. */
     uint32_t token[2];
     uint32_t count;
 } ds4_qwen4exp_ple_history;
