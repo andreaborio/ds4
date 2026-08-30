@@ -6,6 +6,7 @@
 #include <stdint.h>
 #include <stdio.h>
 
+#include "ds4_qwen4exp_chat.h"
 #include "ds4_ssd.h"
 
 /* Public engine boundary.
@@ -95,6 +96,16 @@ typedef struct {
     int len;
     int cap;
 } ds4_tokens;
+
+/* Pinned Qwen4Exp text vocabulary.  The output tensors retain their physical
+ * 248320-row shape, while only the tokenizer-backed prefix is semantic. */
+enum {
+    DS4_QWEN4EXP_PHYSICAL_VOCAB_SIZE = 248320,
+    DS4_QWEN4EXP_TOKENIZER_ID_COUNT = 248077,
+    DS4_QWEN4EXP_END_OF_TEXT_ID = 248044,
+    DS4_QWEN4EXP_IM_START_ID = 248045,
+    DS4_QWEN4EXP_IM_END_ID = 248046,
+};
 
 typedef struct {
     int id;
@@ -317,15 +328,28 @@ void ds4_tokens_free(ds4_tokens *tv);
 void ds4_tokens_copy(ds4_tokens *dst, const ds4_tokens *src);
 bool ds4_tokens_starts_with(const ds4_tokens *tokens, const ds4_tokens *prefix);
 
-/* Checked tokenization APIs are transactional: false leaves the destination
- * token vector exactly unchanged.  The void forms remain compatibility
- * wrappers and report failures to stderr. */
+/* Checked tokenization APIs are transactional: malformed UTF-8 or any other
+ * failure leaves the destination exactly unchanged.  Text APIs treat every
+ * client byte as data; only the rendered-chat APIs recognize registered
+ * control-token literals.  The _n forms also support embedded NUL bytes.  The
+ * void forms remain compatibility wrappers and report failures to stderr. */
 bool ds4_tokenize_text_checked(
         ds4_engine *e, const char *text, ds4_tokens *out);
+bool ds4_tokenize_text_n_checked(
+        ds4_engine *e, const char *text, size_t text_len, ds4_tokens *out);
 void ds4_tokenize_text(ds4_engine *e, const char *text, ds4_tokens *out);
 bool ds4_tokenize_rendered_chat_checked(
         ds4_engine *e, const char *text, ds4_tokens *out);
+bool ds4_tokenize_rendered_chat_n_checked(
+        ds4_engine *e, const char *text, size_t text_len, ds4_tokens *out);
 void ds4_tokenize_rendered_chat(ds4_engine *e, const char *text, ds4_tokens *out);
+/* Tokenize a Qwen4Exp renderer result without flattening its trust boundary:
+ * DATA segments always use ordinary BPE, while only template-authored
+ * TRUSTED_CONTROL segments may resolve registered control-token IDs. */
+bool ds4_tokenize_qwen4exp_chat_checked(
+        ds4_engine *e,
+        const ds4_qwen4exp_chat_output *rendered,
+        ds4_tokens *out);
 void ds4_chat_begin(ds4_engine *e, ds4_tokens *tokens);
 bool ds4_encode_chat_prompt_checked(
         ds4_engine *e,

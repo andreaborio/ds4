@@ -69,6 +69,7 @@ helpers remain in the same translation unit while agents can load one family.
 | `ds4_qwen_ref.[ch]` | Qwen numeric reference implementations used by tests |
 | `ds4_qwen4exp.[ch]` | Immutable, model-free descriptor and checked logical tensor-payload formulas for the pinned text-only Qwen3.8-Flash-Next/Qwen4Exp profile; this is not runtime support admission |
 | `ds4_qwen4exp_ref.[ch]` | Allocation-free scalar C oracle for Qwen4Exp norms, gated residuals, GDN, routing, sparse-index selection, PLE hashing/gating/convolution, and tiny state checkpoint semantics |
+| `ds4_qwen4exp_chat.[ch]` | Standalone exact Qwen4Exp chat-template renderer with transactional output and contiguous client-data versus trusted-control provenance segments; normal runtime/server support remains disabled |
 | `ds4_ple_store.[ch]` | Structural parser, verifier and atomic writer for the embedded fixed-page `ds4.ple_rows.v1` extent; codec admission remains caller/profile-explicit |
 | `ds4_qwen_unicode.[ch]` | Qwen Unicode/tokenizer data access |
 | `ds4_qwen_unicode_data.inc` | Generated Unicode data; provenance lives under `tests/qwen/` |
@@ -148,7 +149,7 @@ not validated.
 | `docs/contracts/qwen-release.json` + `tools/qwen_release_contract.py` | Canonical Hebrus-named Stable, opt-in Beta, and historical negative-only Qwen artifact identities plus the model-free gate that parses their documentation, downloader, and test surfaces for drift |
 | `tests/test_qwen_release_contract.py` | Fail-closed fixtures for prose, table, downloader, schema, status, and negative-only Qwen release-contract drift |
 | `tests/qwen/` | Qwen fixtures, provenance, reference collectors, and model-specific gates |
-| `tests/qwen4exp/` | Pinned Qwen4Exp source inventory, upstream-backed scalar captures, independent controls, per-array provenance, sparse Phase 3 GGUF admission builder, black-box negative battery, and fail-closed regeneration checks |
+| `tests/qwen4exp/` | Pinned Qwen4Exp source inventory, upstream-backed scalar/tokenizer/chat captures, independent controls, per-case provenance, sparse Phase 3 GGUF admission builder, black-box negative battery, and fail-closed regeneration checks |
 | `gguf-tools/qwen4exp-profile.py` | Header/index-only Qwen4Exp conversion dry run that maps and byte-accounts every pinned source identity without loading checkpoint tensors |
 | `tests/test-vectors/` | Official and local continuation vectors plus provenance |
 | `gguf-tools/` | Quantization, ExpertMajor conversion, imatrix, and quality-scoring tools |

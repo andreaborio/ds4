@@ -31375,12 +31375,13 @@ static bool qwen35_emit_chars(
 static bool qwen35_bpe_tokenize_text(
         const ds4_vocab *vocab,
         const char      *text,
+        size_t           text_len,
         token_vec       *out) {
     const size_t original_len = out->len;
     char *normalized = NULL;
     size_t normalized_len = 0;
     if (!ds4_qwen_nfc_normalize(
-            text, strlen(text), &normalized, &normalized_len)) {
+            text, text_len, &normalized, &normalized_len)) {
         return false;
     }
     if (normalized_len > SIZE_MAX / sizeof(qwen35_char) - 1u) {
@@ -31527,8 +31528,9 @@ static bool bpe_tokenize_text(
         const ds4_vocab *vocab,
         const char      *text,
         token_vec       *out) {
-    if (vocab->family == DS4_MODEL_FAMILY_QWEN35_MOE) {
-        return qwen35_bpe_tokenize_text(vocab, text, out);
+    if (vocab->family == DS4_MODEL_FAMILY_QWEN35_MOE ||
+        vocab->family == DS4_MODEL_FAMILY_QWEN4EXP) {
+        return qwen35_bpe_tokenize_text(vocab, text, strlen(text), out);
     }
     if (vocab->family == DS4_MODEL_FAMILY_DEEPSEEK4) {
         joyai_bpe_tokenize_text(vocab, text, out);
@@ -31744,6 +31746,82 @@ static void vocab_configure_qwen35(ds4_vocab *vocab) {
     vocab->add_bos = false;
 }
 
+typedef struct {
+    const char *text;
+    int id;
+} qwen4exp_special_contract;
+
+/* This table deliberately belongs to the pinned Qwen4Exp profile.  Its IDs
+ * currently coincide with Qwen3.6, but neither family inherits the other's
+ * artifact/tokenizer identity. */
+static const qwen4exp_special_contract qwen4exp_special_tokens[] = {
+    {"<|endoftext|>", 248044},
+    {"<|im_start|>", 248045},
+    {"<|im_end|>", 248046},
+    {"<|object_ref_start|>", 248047},
+    {"<|object_ref_end|>", 248048},
+    {"<|box_start|>", 248049},
+    {"<|box_end|>", 248050},
+    {"<|quad_start|>", 248051},
+    {"<|quad_end|>", 248052},
+    {"<|vision_start|>", 248053},
+    {"<|vision_end|>", 248054},
+    {"<|vision_pad|>", 248055},
+    {"<|image_pad|>", 248056},
+    {"<|video_pad|>", 248057},
+    {"<tool_call>", 248058},
+    {"</tool_call>", 248059},
+    {"<|fim_prefix|>", 248060},
+    {"<|fim_middle|>", 248061},
+    {"<|fim_suffix|>", 248062},
+    {"<|fim_pad|>", 248063},
+    {"<|repo_name|>", 248064},
+    {"<|file_sep|>", 248065},
+    {"<tool_response>", 248066},
+    {"</tool_response>", 248067},
+    {"<think>", 248068},
+    {"</think>", 248069},
+    {"<|audio_start|>", 248070},
+    {"<|audio_end|>", 248071},
+    {"<tts_pad>", 248072},
+    {"<tts_text_bos>", 248073},
+    {"<tts_text_eod>", 248074},
+    {"<tts_text_bos_single>", 248075},
+    {"<|audio_pad|>", 248076},
+};
+
+static void vocab_configure_qwen4exp(ds4_vocab *vocab) {
+    if (vocab->n_vocab != DS4_QWEN4EXP_TOKENIZER_ID_COUNT) {
+        fprintf(stderr,
+                "ds4: expected Qwen4Exp tokenizer size %u, got %d\n",
+                (unsigned)DS4_QWEN4EXP_TOKENIZER_ID_COUNT,
+                vocab->n_vocab);
+        exit(1);
+    }
+    if (sizeof(qwen4exp_special_tokens) /
+            sizeof(qwen4exp_special_tokens[0]) != 33u) {
+        ds4_die("internal Qwen4Exp special-token contract is incomplete");
+    }
+    for (size_t i = 0;
+         i < sizeof(qwen4exp_special_tokens) /
+             sizeof(qwen4exp_special_tokens[0]);
+         i++) {
+        const qwen4exp_special_contract *special =
+            &qwen4exp_special_tokens[i];
+        vocab_expect_token_id(vocab, special->text, special->id);
+        vocab_add_special(vocab, special->text, special->id);
+    }
+
+    vocab->bos_id = DS4_QWEN4EXP_END_OF_TEXT_ID;
+    vocab->eos_id = DS4_QWEN4EXP_IM_END_ID;
+    vocab->pad_id = DS4_QWEN4EXP_END_OF_TEXT_ID;
+    vocab->im_start_id = DS4_QWEN4EXP_IM_START_ID;
+    vocab->im_end_id = DS4_QWEN4EXP_IM_END_ID;
+    vocab->think_start_id = 248068;
+    vocab->think_end_id = 248069;
+    vocab->add_bos = false;
+}
+
 /* Load token strings, special token ids, and merge ranks from GGUF metadata. */
 static void vocab_load(ds4_vocab *vocab, const ds4_model *model) {
     memset(vocab, 0, sizeof(*vocab));
@@ -31810,6 +31888,8 @@ static void vocab_load(ds4_vocab *vocab, const ds4_model *model) {
          * consistent with that already-validated GGUF value here. */
         vocab->pad_id =
             (int)required_u32(model, "tokenizer.ggml.padding_token_id");
+    } else if (vocab->family == DS4_MODEL_FAMILY_QWEN4EXP) {
+        vocab_configure_qwen4exp(vocab);
     } else if (vocab->family == DS4_MODEL_FAMILY_GLM_DSA) {
         vocab_configure_glm(vocab, model);
     } else if (vocab->family == DS4_MODEL_FAMILY_DEEPSEEK4) {
@@ -31826,12 +31906,126 @@ static void vocab_free(ds4_vocab *vocab) {
     memset(vocab, 0, sizeof(*vocab));
 }
 
+#ifdef DS4_TEST_HOOKS
+bool ds4_test_qwen4exp_tokenizer_engine_create(
+        ds4_engine **engine_out,
+        const ds4_test_qwen4exp_tokenizer_token *tokens,
+        size_t token_count,
+        const ds4_test_qwen4exp_tokenizer_merge *merges,
+        size_t merge_count,
+        int omitted_token_id) {
+    if (!engine_out || (token_count && !tokens) || (merge_count && !merges)) {
+        return false;
+    }
+    *engine_out = NULL;
+    ds4_engine *engine = xcalloc(1u, sizeof(*engine));
+    engine->model.fd = -1;
+    engine->mtp_model.fd = -1;
+    engine->model.family = DS4_MODEL_FAMILY_QWEN4EXP;
+
+    ds4_vocab *vocab = &engine->vocab;
+    vocab->family = DS4_MODEL_FAMILY_QWEN4EXP;
+    vocab->n_vocab = DS4_QWEN4EXP_TOKENIZER_ID_COUNT;
+    vocab->bos_id = -1;
+    vocab->eos_id = -1;
+    vocab->pad_id = -1;
+    vocab->im_start_id = -1;
+    vocab->im_end_id = -1;
+    vocab->think_start_id = -1;
+    vocab->think_end_id = -1;
+    vocab->token = xcalloc(
+        (size_t)vocab->n_vocab, sizeof(vocab->token[0]));
+
+    table_init(&vocab->token_to_id, token_count);
+    for (size_t index = 0; index < token_count; index++) {
+        const ds4_test_qwen4exp_tokenizer_token *token = &tokens[index];
+        if (!token->text || token->len != strlen(token->text) ||
+            token->id < 0 || token->id >= vocab->n_vocab ||
+            vocab->token[token->id].ptr) {
+            goto fail;
+        }
+        vocab->token[token->id] = (ds4_str){token->text, token->len};
+        if (token->id != omitted_token_id) {
+            table_put(&vocab->token_to_id, vocab->token[token->id], token->id);
+        }
+    }
+
+    table_init(&vocab->merge_rank, merge_count);
+    for (size_t index = 0; index < merge_count; index++) {
+        const ds4_test_qwen4exp_tokenizer_merge *merge = &merges[index];
+        if (!merge->text || merge->len != strlen(merge->text) ||
+            merge->rank < 0) {
+            goto fail;
+        }
+        table_put(
+            &vocab->merge_rank,
+            (ds4_str){merge->text, merge->len},
+            merge->rank);
+        if (merge->len > vocab->max_merge_len) {
+            vocab->max_merge_len = merge->len;
+        }
+    }
+    vocab_configure_qwen4exp(vocab);
+    *engine_out = engine;
+    return true;
+
+fail:
+    vocab_free(vocab);
+    free(engine);
+    return false;
+}
+
+void ds4_test_qwen4exp_tokenizer_engine_destroy(ds4_engine *engine) {
+    if (!engine) return;
+    vocab_free(&engine->vocab);
+    free(engine);
+}
+
+bool ds4_test_qwen4exp_tokenizer_contract_get(
+        const ds4_engine *engine,
+        ds4_test_qwen4exp_tokenizer_contract *contract_out) {
+    if (!engine || !contract_out ||
+        engine->vocab.family != DS4_MODEL_FAMILY_QWEN4EXP ||
+        engine->vocab.n_special > 33u) {
+        return false;
+    }
+    memset(contract_out, 0, sizeof(*contract_out));
+    contract_out->special_count = engine->vocab.n_special;
+    for (size_t index = 0; index < engine->vocab.n_special; index++) {
+        contract_out->special_ids[index] = engine->vocab.special[index].id;
+    }
+    contract_out->bos_id = engine->vocab.bos_id;
+    contract_out->eos_id = engine->vocab.eos_id;
+    contract_out->pad_id = engine->vocab.pad_id;
+    contract_out->im_start_id = engine->vocab.im_start_id;
+    contract_out->im_end_id = engine->vocab.im_end_id;
+    contract_out->add_bos = engine->vocab.add_bos;
+    return true;
+}
+
+bool ds4_test_qwen4exp_tokenizer_set_family(
+        ds4_engine *engine,
+        int family) {
+    if (!engine || family < DS4_MODEL_FAMILY_UNKNOWN ||
+        family > DS4_MODEL_FAMILY_QWEN4EXP) {
+        return false;
+    }
+    engine->vocab.family = (ds4_model_family)family;
+    return true;
+}
+#endif
+
 static bool tokenize_span(
         const ds4_vocab *vocab,
         const char      *p,
         size_t           n,
         token_vec       *out) {
     if (!n) return true;
+    if (vocab->family == DS4_MODEL_FAMILY_QWEN35_MOE ||
+        vocab->family == DS4_MODEL_FAMILY_QWEN4EXP) {
+        return qwen35_bpe_tokenize_text(vocab, p, n, out);
+    }
+    if (memchr(p, '\0', n) != NULL) return false;
     char *tmp = xmalloc(n + 1);
     memcpy(tmp, p, n);
     tmp[n] = '\0';
@@ -32010,10 +32204,21 @@ fail:
 
 bool ds4_tokenize_text_checked(
         ds4_engine *e, const char *text, ds4_tokens *out) {
-    if (!e || !out || e->vocab.n_vocab == 0) return false;
+    const char *input = text ? text : "";
+    return ds4_tokenize_text_n_checked(e, input, strlen(input), out);
+}
+
+bool ds4_tokenize_text_n_checked(
+        ds4_engine *e,
+        const char *text,
+        size_t      text_len,
+        ds4_tokens *out) {
+    if ((!text && text_len != 0u) || !e || !out || e->vocab.n_vocab == 0) {
+        return false;
+    }
     token_vec staged = {0};
     const int staged_prefix = token_vec_stage_tail(out, &staged);
-    if (!bpe_tokenize_text(&e->vocab, text ? text : "", &staged)) {
+    if (!tokenize_span(&e->vocab, text ? text : "", text_len, &staged)) {
         token_vec_free(&staged);
         return false;
     }
@@ -32046,14 +32251,15 @@ static bool special_token_at(
     return false;
 }
 
-static bool tokenize_rendered_chat_vocab(
+static bool tokenize_rendered_chat_vocab_n(
         const ds4_vocab *vocab,
         const char      *text,
+        size_t           text_len,
         token_vec       *out) {
+    if (!text && text_len != 0u) return false;
     if (!text) text = "";
 
     const int original_len = out->len;
-    const size_t text_len = strlen(text);
     const char *span = text;
     const char *p = text;
     const char *end = text + text_len;
@@ -32080,17 +32286,82 @@ fail:
     return false;
 }
 
+static bool tokenize_rendered_chat_vocab(
+        const ds4_vocab *vocab,
+        const char      *text,
+        token_vec       *out) {
+    const char *input = text ? text : "";
+    return tokenize_rendered_chat_vocab_n(
+        vocab, input, strlen(input), out);
+}
+
 bool ds4_tokenize_rendered_chat_checked(
         ds4_engine *e, const char *text, ds4_tokens *out) {
-    if (!e || !out || e->vocab.n_vocab == 0) return false;
+    const char *input = text ? text : "";
+    return ds4_tokenize_rendered_chat_n_checked(
+        e, input, strlen(input), out);
+}
+
+bool ds4_tokenize_rendered_chat_n_checked(
+        ds4_engine *e,
+        const char *text,
+        size_t      text_len,
+        ds4_tokens *out) {
+    if ((!text && text_len != 0u) || !e || !out || e->vocab.n_vocab == 0) {
+        return false;
+    }
     token_vec staged = {0};
     const int staged_prefix = token_vec_stage_tail(out, &staged);
-    if (!tokenize_rendered_chat_vocab(&e->vocab, text, &staged)) {
+    if (!tokenize_rendered_chat_vocab_n(
+            &e->vocab, text ? text : "", text_len, &staged)) {
         token_vec_free(&staged);
         return false;
     }
     token_vec_commit_suffix(out, &staged, staged_prefix);
     return true;
+}
+
+bool ds4_tokenize_qwen4exp_chat_checked(
+        ds4_engine *e,
+        const ds4_qwen4exp_chat_output *rendered,
+        ds4_tokens *out) {
+    if (!e || !rendered || !out || e->vocab.n_vocab == 0 ||
+        e->vocab.family != DS4_MODEL_FAMILY_QWEN4EXP ||
+        !rendered->rendered || !rendered->segments ||
+        rendered->segment_count == 0) {
+        return false;
+    }
+
+    token_vec staged = {0};
+    const int staged_prefix = token_vec_stage_tail(out, &staged);
+    size_t cursor = 0;
+    for (size_t i = 0; i < rendered->segment_count; i++) {
+        const ds4_qwen4exp_chat_segment *segment = &rendered->segments[i];
+        if (segment->offset != cursor || segment->length == 0 ||
+            segment->length > rendered->rendered_length - cursor) {
+            goto fail;
+        }
+        const char *bytes = rendered->rendered + cursor;
+        bool ok = false;
+        if (segment->kind == DS4_QWEN4EXP_CHAT_SEGMENT_DATA) {
+            ok = tokenize_span(
+                &e->vocab, bytes, segment->length, &staged);
+        } else if (segment->kind ==
+                   DS4_QWEN4EXP_CHAT_SEGMENT_TRUSTED_CONTROL) {
+            ok = tokenize_rendered_chat_vocab_n(
+                &e->vocab, bytes, segment->length, &staged);
+        }
+        if (!ok) goto fail;
+        cursor += segment->length;
+    }
+    if (cursor != rendered->rendered_length) goto fail;
+
+    token_vec_commit_suffix(out, &staged, staged_prefix);
+    return true;
+
+fail:
+    token_vec_free(&staged);
+    return false;
 }
 
 void ds4_tokenize_rendered_chat(ds4_engine *e, const char *text, ds4_tokens *out) {
@@ -33005,7 +33276,9 @@ char *ds4_token_text(ds4_engine *e, int token, size_t *len) {
         out[0] = '\0';
         return out;
     }
-    if (token < 0 || token >= vocab->n_vocab) {
+    if (token < 0 || token >= vocab->n_vocab ||
+        (vocab->family == DS4_MODEL_FAMILY_QWEN4EXP &&
+         token >= DS4_QWEN4EXP_TOKENIZER_ID_COUNT)) {
         if (len) *len = 0;
         char *out = xmalloc(1);
         out[0] = '\0';
@@ -33036,6 +33309,10 @@ char *ds4_token_text(ds4_engine *e, int token, size_t *len) {
 static bool vocab_token_is_generation_stop(const ds4_vocab *vocab, int token) {
     if (!vocab || token < 0) return false;
     if (token == vocab->eos_id) return true;
+    if (vocab->family == DS4_MODEL_FAMILY_QWEN4EXP &&
+        token == DS4_QWEN4EXP_END_OF_TEXT_ID) {
+        return true;
+    }
     if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_GLM_DSA) {
         return (vocab->system_id >= 0 && token == vocab->system_id) ||
                (vocab->user_id >= 0 && token == vocab->user_id) ||
@@ -40775,12 +41052,18 @@ int ds4_engine_vocab_size(ds4_engine *e) {
     if (e && e->model.family == DS4_MODEL_FAMILY_QWEN35_MOE) {
         return QWEN35_N_VOCAB;
     }
+    if (e && e->model.family == DS4_MODEL_FAMILY_QWEN4EXP) {
+        return DS4_QWEN4EXP_PHYSICAL_VOCAB_SIZE;
+    }
     return e ? e->vocab.n_vocab : 0;
 }
 
 int ds4_engine_effective_vocab_size(ds4_engine *e) {
     if (e && e->model.family == DS4_MODEL_FAMILY_QWEN35_MOE) {
         return QWEN35_N_VALID_TOKEN;
+    }
+    if (e && e->model.family == DS4_MODEL_FAMILY_QWEN4EXP) {
+        return DS4_QWEN4EXP_TOKENIZER_ID_COUNT;
     }
     return e ? e->vocab.n_vocab : 0;
 }
@@ -43437,6 +43720,38 @@ int ds4_session_sample(ds4_session *s, float temperature, int top_k, float top_p
                               ds4_session_selectable_vocab_size(s),
                               temperature, top_k, top_p, min_p, rng);
 }
+
+#ifdef DS4_TEST_HOOKS
+bool ds4_test_qwen4exp_sampling_boundary(
+        ds4_engine *engine,
+        int *argmax_out,
+        int *sample_out) {
+    if (!engine || !argmax_out || !sample_out ||
+        engine->model.family != DS4_MODEL_FAMILY_QWEN4EXP) {
+        return false;
+    }
+    ds4_session session = {0};
+    session.engine = engine;
+    session.logits = xmalloc(
+        (size_t)DS4_QWEN4EXP_PHYSICAL_VOCAB_SIZE *
+        sizeof(session.logits[0]));
+    for (int id = 0; id < DS4_QWEN4EXP_PHYSICAL_VOCAB_SIZE; id++) {
+        session.logits[id] = -10.0f;
+    }
+    session.logits[DS4_QWEN4EXP_TOKENIZER_ID_COUNT - 1] = 1.0f;
+    for (int id = DS4_QWEN4EXP_TOKENIZER_ID_COUNT;
+         id < DS4_QWEN4EXP_PHYSICAL_VOCAB_SIZE;
+         id++) {
+        session.logits[id] = 100.0f;
+    }
+    uint64_t rng = 1u;
+    *argmax_out = ds4_session_argmax(&session);
+    *sample_out = ds4_session_sample(
+        &session, 1.0f, 1, 1.0f, 0.0f, &rng);
+    free(session.logits);
+    return true;
+}
+#endif
 
 int ds4_session_top_logprobs(ds4_session *s, ds4_token_score *out, int k) {
     if (!s || !out || k <= 0) return 0;

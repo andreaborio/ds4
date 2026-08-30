@@ -145,12 +145,53 @@ Run it with:
 make qwen4exp-admission-test
 ```
 
+## Phase 4 tokenizer and chat oracles
+
+`collect_tokenizer_reference.py` treats the pinned `tokenizer.json` backend as
+authoritative. This matters because the pinned Qwen2 `AutoTokenizer`
+reconstruction uses an older expression without `\p{M}` and disagrees on
+Devanagari combining forms. The generated tokenizer fixture covers 59 text
+cases and six decode-boundary controls, all 33 added tokens, NFC, Unicode and
+invalid-UTF-8 replacement behavior, embedded NUL handling, raw-versus-trusted
+literal controls, and the 248,077 effective-token/248,320 physical-logit split.
+IDs 248,077 through 248,319 are decode-silent and must be masked before
+sampling; the exact stop set is 248,044 and 248,046.
+
+`collect_chat_reference.py` captures 34 pinned Transformers cases and five
+Hebrus text-only rejections. Its 39-case C fixture freezes reasoning effort,
+thinking preservation, tools and grouped tool results, role errors, structured
+media rejection, insertion-ordered UTF-8 serialization, and Python/Jinja
+Unicode trimming. `ds4_qwen4exp_chat.[ch]` preserves rendered bytes as
+contiguous `DATA` and `TRUSTED_CONTROL` segments. The tokenizer consumes those
+segments separately, so client text that spells `<|im_start|>` never becomes
+a template-authored control token.
+
+Refresh is intentionally pinned and networked:
+
+```sh
+PYTHONDONTWRITEBYTECODE=1 uv run --python 3.13.13 \
+  --with 'tokenizers==0.23.1' --with 'huggingface-hub==1.29.0' \
+  --with 'transformers @ git+https://github.com/huggingface/transformers.git@42ca97014c85d71a88ad60d55f08cb9fb4d26e2c' \
+  python tests/qwen4exp/collect_tokenizer_reference.py --write
+
+PYTHONDONTWRITEBYTECODE=1 uv run --python 3.13.13 \
+  --with 'Jinja2==3.1.6' --with 'tokenizers==0.23.1' \
+  --with 'huggingface-hub==1.29.0' \
+  --with 'transformers @ git+https://github.com/huggingface/transformers.git@42ca97014c85d71a88ad60d55f08cb9fb4d26e2c' \
+  python tests/qwen4exp/collect_chat_reference.py --write
+```
+
+The normal gate is fully offline:
+
+```sh
+make qwen4exp-chat-test qwen4exp-tokenizer-test
+```
+
 ## Limitations
 
-These vectors and the structural admission fixture do not
-contain checkpoint weights, full-layer intermediates, tokenizer/template
-vectors, BF16 rounding, quantization, Metal, SSD I/O, or long-running state.
-Their outputs come from the pinned upstream primitives and are independently
-checked with NumPy, but they are not a substitute for later checkpoint-backed
-layer/logit captures, full-model parity, sanitizer, physical-Metal, memory, and
-performance gates.
+These vectors and the structural admission fixture do not contain checkpoint
+weights, full-layer intermediates, BF16 rounding, quantization, Metal, SSD I/O,
+or long-running state. Their outputs come from pinned upstream primitives,
+tokenizer and template implementations and are independently checked, but they
+are not a substitute for later checkpoint-backed layer/logit captures,
+full-model parity, sanitizer, physical-Metal, memory, and performance gates.

@@ -1,0 +1,1395 @@
+{
+  "decodeControls": [
+    {
+      "decoded": "ありますか",
+      "ids": [
+        248043
+      ],
+      "name": "base_vocabulary_last",
+      "skipSpecialDecoded": "ありますか"
+    },
+    {
+      "decoded": "<|endoftext|>",
+      "ids": [
+        248044
+      ],
+      "name": "added_vocabulary_first",
+      "skipSpecialDecoded": ""
+    },
+    {
+      "decoded": "<|audio_pad|>",
+      "ids": [
+        248076
+      ],
+      "name": "added_vocabulary_last",
+      "skipSpecialDecoded": ""
+    },
+    {
+      "decoded": "",
+      "ids": [
+        248077
+      ],
+      "name": "first_unassigned_physical_logit",
+      "skipSpecialDecoded": ""
+    },
+    {
+      "decoded": "",
+      "ids": [
+        248319
+      ],
+      "name": "last_unassigned_physical_logit",
+      "skipSpecialDecoded": ""
+    },
+    {
+      "decoded": "<|audio_pad|><|endoftext|>",
+      "ids": [
+        248076,
+        248077,
+        248319,
+        248044
+      ],
+      "name": "unassigned_ids_are_decode_silent",
+      "skipSpecialDecoded": ""
+    }
+  ],
+  "fixturePayloadSha256": "7798f292df893fb9928b138988c9b41068b212925308833de155c1674e32b382",
+  "identity": {
+    "hfRepository": "Qwen/Qwen3.8-Flash-Next",
+    "hfRevision": "de4b8e4d43b917e7706784d8bb445c9af86a3540",
+    "transformersCommit": "42ca97014c85d71a88ad60d55f08cb9fb4d26e2c"
+  },
+  "kind": "qwen4exp-tokenizer-golden",
+  "schemaVersion": 1,
+  "textCases": [
+    {
+      "category": "ascii",
+      "decoded": "The quick brown fox jumps over 13 lazy dogs.",
+      "decodedUtf8Hex": "54686520717569636b2062726f776e20666f78206a756d7073206f766572203133206c617a7920646f67732e",
+      "ids": [
+        760,
+        3841,
+        13477,
+        37550,
+        33075,
+        888,
+        220,
+        16,
+        18,
+        15217,
+        12228,
+        13
+      ],
+      "inputPolicy": "unicode-literal",
+      "inputText": "The quick brown fox jumps over 13 lazy dogs.",
+      "inputUtf8Hex": "54686520717569636b2062726f776e20666f78206a756d7073206f766572203133206c617a7920646f67732e",
+      "name": "ascii_basic",
+      "normalizedText": "The quick brown fox jumps over 13 lazy dogs.",
+      "skipSpecialDecoded": "The quick brown fox jumps over 13 lazy dogs."
+    },
+    {
+      "category": "ascii",
+      "decoded": "I'm sure we'll test Qwen's tokenizer; won't we?",
+      "decodedUtf8Hex": "49276d2073757265207765276c6c2074657374205177656e277320746f6b656e697a65723b20776f6e27742077653f",
+      "ids": [
+        40,
+        2688,
+        2617,
+        567,
+        3172,
+        1228,
+        1167,
+        16451,
+        579,
+        44424,
+        26,
+        2677,
+        914,
+        567,
+        30
+      ],
+      "inputPolicy": "unicode-literal",
+      "inputText": "I'm sure we'll test Qwen's tokenizer; won't we?",
+      "inputUtf8Hex": "49276d2073757265207765276c6c2074657374205177656e277320746f6b656e697a65723b20776f6e27742077653f",
+      "name": "ascii_contractions",
+      "normalizedText": "I'm sure we'll test Qwen's tokenizer; won't we?",
+      "skipSpecialDecoded": "I'm sure we'll test Qwen's tokenizer; won't we?"
+    },
+    {
+      "category": "nfc",
+      "decoded": "Café déjà vu — naïve façade.",
+      "decodedUtf8Hex": "436166c3a92064c3a96ac3a020767520e28094206e61c3af7665206661c3a76164652e",
+      "ids": [
+        34,
+        2492,
+        933,
+        44311,
+        31441,
+        1892,
+        91603,
+        571,
+        218894,
+        13
+      ],
+      "inputPolicy": "unicode-literal",
+      "inputText": "Café déjà vu — naïve façade.",
+      "inputUtf8Hex": "436166c3a92064c3a96ac3a020767520e28094206e61c3af7665206661c3a76164652e",
+      "name": "accent_nfc",
+      "normalizedText": "Café déjà vu — naïve façade.",
+      "skipSpecialDecoded": "Café déjà vu — naïve façade."
+    },
+    {
+      "category": "nfd",
+      "decoded": "Café déjà vu — naïve façade.",
+      "decodedUtf8Hex": "436166c3a92064c3a96ac3a020767520e28094206e61c3af7665206661c3a76164652e",
+      "ids": [
+        34,
+        2492,
+        933,
+        44311,
+        31441,
+        1892,
+        91603,
+        571,
+        218894,
+        13
+      ],
+      "inputPolicy": "unicode-literal",
+      "inputText": "Café déjà vu — naïve façade.",
+      "inputUtf8Hex": "43616665cc81206465cc816a61cc8020767520e28094206e6169cc88766520666163cca76164652e",
+      "name": "accent_nfd",
+      "normalizedText": "Café déjà vu — naïve façade.",
+      "skipSpecialDecoded": "Café déjà vu — naïve façade."
+    },
+    {
+      "category": "cjk",
+      "decoded": "你好，世界。漢字かな交じり文。",
+      "decodedUtf8Hex": "e4bda0e5a5bdefbc8ce4b896e7958ce38082e6bca2e5ad97e3818be381aae4baa4e38198e3828ae69687e38082",
+      "ids": [
+        109266,
+        3709,
+        96748,
+        1710,
+        101306,
+        96356,
+        149667,
+        96044,
+        95674,
+        29342,
+        95905,
+        1710
+      ],
+      "inputPolicy": "unicode-literal",
+      "inputText": "你好，世界。漢字かな交じり文。",
+      "inputUtf8Hex": "e4bda0e5a5bdefbc8ce4b896e7958ce38082e6bca2e5ad97e3818be381aae4baa4e38198e3828ae69687e38082",
+      "name": "cjk_mixed",
+      "normalizedText": "你好，世界。漢字かな交じり文。",
+      "skipSpecialDecoded": "你好，世界。漢字かな交じり文。"
+    },
+    {
+      "category": "arabic",
+      "decoded": "مَرْحَبًا بالعالم! العربية ١٢٣",
+      "decodedUtf8Hex": "d985d98ed8b1d992d8add98ed8a8d98bd8a720d8a8d8a7d984d8b9d8a7d984d9852120d8a7d984d8b9d8b1d8a8d98ad8a920d9a1d9a2d9a3",
+      "ids": [
+        9873,
+        164865,
+        28850,
+        150765,
+        150021,
+        182946,
+        149650,
+        0,
+        171405,
+        220,
+        149,
+        94,
+        149,
+        95,
+        149,
+        96
+      ],
+      "inputPolicy": "unicode-literal",
+      "inputText": "مَرْحَبًا بالعالم! العربية ١٢٣",
+      "inputUtf8Hex": "d985d98ed8b1d992d8add98ed8a8d98bd8a720d8a8d8a7d984d8b9d8a7d984d9852120d8a7d984d8b9d8b1d8a8d98ad8a920d9a1d9a2d9a3",
+      "name": "arabic_marks_digits",
+      "normalizedText": "مَرْحَبًا بالعالم! العربية ١٢٣",
+      "skipSpecialDecoded": "مَرْحَبًا بالعالم! العربية ١٢٣"
+    },
+    {
+      "category": "emoji_astral",
+      "decoded": "🙂 🚀 👩🏽‍💻 🧑‍🚀 🏳️‍🌈 𝄞 𠜎",
+      "decodedUtf8Hex": "f09f998220f09f9a8020f09f91a9f09f8fbde2808df09f92bb20f09fa791e2808df09f9a8020f09f8fb3efb88fe2808df09f8c8820f09d849e20f0a09c8e",
+      "ids": [
+        169171,
+        10838,
+        248,
+        222,
+        59720,
+        102,
+        9008,
+        237,
+        121,
+        373,
+        235,
+        88995,
+        119,
+        10838,
+        100,
+        239,
+        373,
+        235,
+        9008,
+        248,
+        222,
+        10838,
+        237,
+        111,
+        29545,
+        373,
+        235,
+        9008,
+        234,
+        230,
+        78449,
+        226,
+        252,
+        220,
+        172,
+        254,
+        250,
+        236
+      ],
+      "inputPolicy": "unicode-literal",
+      "inputText": "🙂 🚀 👩🏽‍💻 🧑‍🚀 🏳️‍🌈 𝄞 𠜎",
+      "inputUtf8Hex": "f09f998220f09f9a8020f09f91a9f09f8fbde2808df09f92bb20f09fa791e2808df09f9a8020f09f8fb3efb88fe2808df09f8c8820f09d849e20f0a09c8e",
+      "name": "emoji_astral",
+      "normalizedText": "🙂 🚀 👩🏽‍💻 🧑‍🚀 🏳️‍🌈 𝄞 𠜎",
+      "skipSpecialDecoded": "🙂 🚀 👩🏽‍💻 🧑‍🚀 🏳️‍🌈 𝄞 𠜎"
+    },
+    {
+      "category": "combining",
+      "decoded": "á̧ Z͑ e⃝ ́leading",
+      "decodedUtf8Hex": "c3a1cca7205acd912065e2839d20cc816c656164696e67",
+      "ids": [
+        1886,
+        136,
+        100,
+        1799,
+        137,
+        239,
+        378,
+        158,
+        28429,
+        220,
+        52033,
+        20028
+      ],
+      "inputPolicy": "unicode-literal",
+      "inputText": "á̧ Z͑ e⃝ ́leading",
+      "inputUtf8Hex": "61cc81cca7205acd912065e2839d20cc816c656164696e67",
+      "name": "combining_edge",
+      "normalizedText": "á̧ Z͑ e⃝ ́leading",
+      "skipSpecialDecoded": "á̧ Z͑ e⃝ ́leading"
+    },
+    {
+      "category": "combining",
+      "decoded": "क् क्ष हिन्दी",
+      "decodedUtf8Hex": "e0a495e0a58d20e0a495e0a58de0a4b720e0a4b9e0a4bfe0a4a8e0a58de0a4a6e0a580",
+      "ids": [
+        149567,
+        165216,
+        190488,
+        150127,
+        177453
+      ],
+      "inputPolicy": "unicode-literal",
+      "inputText": "क् क्ष हिन्दी",
+      "inputUtf8Hex": "e0a495e0a58d20e0a495e0a58de0a4b720e0a4b9e0a4bfe0a4a8e0a58de0a4a6e0a580",
+      "name": "devanagari_combining",
+      "normalizedText": "क् क्ष हिन्दी",
+      "skipSpecialDecoded": "क् क्ष हिन्दी"
+    },
+    {
+      "category": "whitespace",
+      "decoded": " \talpha  beta\n\n  gamma\r\ndelta \t \n",
+      "decodedUtf8Hex": "2009616c7068612020626574610a0a202067616d6d610d0a64656c74612009200a",
+      "ids": [
+        220,
+        70579,
+        220,
+        13053,
+        271,
+        220,
+        20956,
+        317,
+        19639,
+        6800,
+        695
+      ],
+      "inputPolicy": "unicode-literal",
+      "inputText": " \talpha  beta\n\n  gamma\r\ndelta \t \n",
+      "inputUtf8Hex": "2009616c7068612020626574610a0a202067616d6d610d0a64656c74612009200a",
+      "name": "whitespace_runs",
+      "normalizedText": " \talpha  beta\n\n  gamma\r\ndelta \t \n",
+      "skipSpecialDecoded": " \talpha  beta\n\n  gamma\r\ndelta \t \n"
+    },
+    {
+      "category": "whitespace",
+      "decoded": " \t\n\r\n  ",
+      "decodedUtf8Hex": "20090a0d0a2020",
+      "ids": [
+        16957,
+        317,
+        256
+      ],
+      "inputPolicy": "unicode-literal",
+      "inputText": " \t\n\r\n  ",
+      "inputUtf8Hex": "20090a0d0a2020",
+      "name": "whitespace_only",
+      "normalizedText": " \t\n\r\n  ",
+      "skipSpecialDecoded": " \t\n\r\n  "
+    },
+    {
+      "category": "code",
+      "decoded": "def f(x: int) -> str:\n\treturn f\"value={x!r}\\n\"  # café\n",
+      "decodedUtf8Hex": "646566206628783a20696e7429202d3e207374723a0a0972657475726e20662276616c75653d7b7821727d5c6e2220202320636166c3a90a",
+      "ids": [
+        727,
+        281,
+        2007,
+        25,
+        514,
+        8,
+        1411,
+        592,
+        25,
+        198,
+        827,
+        281,
+        61171,
+        1126,
+        87,
+        0,
+        81,
+        10713,
+        77,
+        1,
+        220,
+        653,
+        50203,
+        198
+      ],
+      "inputPolicy": "unicode-literal",
+      "inputText": "def f(x: int) -> str:\n\treturn f\"value={x!r}\\n\"  # café\n",
+      "inputUtf8Hex": "646566206628783a20696e7429202d3e207374723a0a0972657475726e20662276616c75653d7b7821727d5c6e2220202320636166c3a90a",
+      "name": "code_python",
+      "normalizedText": "def f(x: int) -> str:\n\treturn f\"value={x!r}\\n\"  # café\n",
+      "skipSpecialDecoded": "def f(x: int) -> str:\n\treturn f\"value={x!r}\\n\"  # café\n"
+    },
+    {
+      "category": "json",
+      "decoded": "{\"message\":\"café🙂\",\"n\":-12.5,\"ok\":true}",
+      "decodedUtf8Hex": "7b226d657373616765223a22636166c3a9f09f9982222c226e223a2d31322e352c226f6b223a747275657d",
+      "ids": [
+        4754,
+        1927,
+        3147,
+        895,
+        56868,
+        169171,
+        2129,
+        77,
+        50303,
+        16,
+        17,
+        13,
+        20,
+        1288,
+        547,
+        763,
+        1802,
+        92
+      ],
+      "inputPolicy": "unicode-literal",
+      "inputText": "{\"message\":\"café🙂\",\"n\":-12.5,\"ok\":true}",
+      "inputUtf8Hex": "7b226d657373616765223a22636166c3a9f09f9982222c226e223a2d31322e352c226f6b223a747275657d",
+      "name": "json_text",
+      "normalizedText": "{\"message\":\"café🙂\",\"n\":-12.5,\"ok\":true}",
+      "skipSpecialDecoded": "{\"message\":\"café🙂\",\"n\":-12.5,\"ok\":true}"
+    },
+    {
+      "category": "xml",
+      "decoded": "<root a=\"1\">&lt;你好&gt;<x/></root>",
+      "decodedUtf8Hex": "3c726f6f7420613d2231223e266c743be4bda0e5a5bd2667743b3c782f3e3c2f726f6f743e",
+      "ids": [
+        27,
+        2794,
+        264,
+        420,
+        16,
+        12979,
+        4677,
+        26,
+        109266,
+        14915,
+        33898,
+        87,
+        64101,
+        2794,
+        29
+      ],
+      "inputPolicy": "unicode-literal",
+      "inputText": "<root a=\"1\">&lt;你好&gt;<x/></root>",
+      "inputUtf8Hex": "3c726f6f7420613d2231223e266c743be4bda0e5a5bd2667743b3c782f3e3c2f726f6f743e",
+      "name": "xml_text",
+      "normalizedText": "<root a=\"1\">&lt;你好&gt;<x/></root>",
+      "skipSpecialDecoded": "<root a=\"1\">&lt;你好&gt;<x/></root>"
+    },
+    {
+      "category": "replacement",
+      "decoded": "literal � replacement",
+      "decodedUtf8Hex": "6c69746572616c20efbfbd207265706c6163656d656e74",
+      "ids": [
+        34600,
+        28373,
+        13329
+      ],
+      "inputPolicy": "unicode-literal",
+      "inputText": "literal � replacement",
+      "inputUtf8Hex": "6c69746572616c20efbfbd207265706c6163656d656e74",
+      "name": "replacement_literal",
+      "normalizedText": "literal � replacement",
+      "skipSpecialDecoded": "literal � replacement"
+    },
+    {
+      "category": "control_chars",
+      "decoded": "a\u0000b\u0001c\u001fd",
+      "decodedUtf8Hex": "61006201631f64",
+      "ids": [
+        64,
+        188,
+        65,
+        189,
+        66,
+        219,
+        67
+      ],
+      "inputPolicy": "unicode-literal",
+      "inputText": "a\u0000b\u0001c\u001fd",
+      "inputUtf8Hex": "61006201631f64",
+      "name": "nul_and_controls",
+      "normalizedText": "a\u0000b\u0001c\u001fd",
+      "skipSpecialDecoded": "a\u0000b\u0001c\u001fd"
+    },
+    {
+      "category": "empty",
+      "decoded": "",
+      "decodedUtf8Hex": "",
+      "ids": [],
+      "inputPolicy": "unicode-literal",
+      "inputText": "",
+      "inputUtf8Hex": "",
+      "name": "empty",
+      "normalizedText": "",
+      "skipSpecialDecoded": ""
+    },
+    {
+      "category": "invalid_utf8_replacement",
+      "decoded": "A�B",
+      "decodedUtf8Hex": "41efbfbd42",
+      "ids": [
+        32,
+        5513,
+        33
+      ],
+      "inputBytesHex": "41ff42",
+      "inputPolicy": "bytes.decode('utf-8', errors='replace')",
+      "inputText": "A�B",
+      "inputUtf8Hex": "41efbfbd42",
+      "name": "invalid_utf8_single",
+      "normalizedText": "A�B",
+      "skipSpecialDecoded": "A�B"
+    },
+    {
+      "category": "invalid_utf8_replacement",
+      "decoded": "�(�(\u0000�",
+      "decodedUtf8Hex": "efbfbd28efbfbd2800efbfbd",
+      "ids": [
+        5513,
+        7,
+        5513,
+        7,
+        188,
+        5513
+      ],
+      "inputBytesHex": "f0288c2800c3",
+      "inputPolicy": "bytes.decode('utf-8', errors='replace')",
+      "inputText": "�(�(\u0000�",
+      "inputUtf8Hex": "efbfbd28efbfbd2800efbfbd",
+      "name": "invalid_utf8_sequence",
+      "normalizedText": "�(�(\u0000�",
+      "skipSpecialDecoded": "�(�(\u0000�"
+    },
+    {
+      "category": "added_token_literal",
+      "decoded": "<|endoftext|>",
+      "decodedUtf8Hex": "3c7c656e646f66746578747c3e",
+      "ids": [
+        248044
+      ],
+      "inputPolicy": "unicode-literal",
+      "inputText": "<|endoftext|>",
+      "inputUtf8Hex": "3c7c656e646f66746578747c3e",
+      "name": "added_token_248044",
+      "normalizedText": "<|endoftext|>",
+      "skipSpecialDecoded": ""
+    },
+    {
+      "category": "added_token_literal",
+      "decoded": "<|im_start|>",
+      "decodedUtf8Hex": "3c7c696d5f73746172747c3e",
+      "ids": [
+        248045
+      ],
+      "inputPolicy": "unicode-literal",
+      "inputText": "<|im_start|>",
+      "inputUtf8Hex": "3c7c696d5f73746172747c3e",
+      "name": "added_token_248045",
+      "normalizedText": "<|im_start|>",
+      "skipSpecialDecoded": ""
+    },
+    {
+      "category": "added_token_literal",
+      "decoded": "<|im_end|>",
+      "decodedUtf8Hex": "3c7c696d5f656e647c3e",
+      "ids": [
+        248046
+      ],
+      "inputPolicy": "unicode-literal",
+      "inputText": "<|im_end|>",
+      "inputUtf8Hex": "3c7c696d5f656e647c3e",
+      "name": "added_token_248046",
+      "normalizedText": "<|im_end|>",
+      "skipSpecialDecoded": ""
+    },
+    {
+      "category": "added_token_literal",
+      "decoded": "<|object_ref_start|>",
+      "decodedUtf8Hex": "3c7c6f626a6563745f7265665f73746172747c3e",
+      "ids": [
+        248047
+      ],
+      "inputPolicy": "unicode-literal",
+      "inputText": "<|object_ref_start|>",
+      "inputUtf8Hex": "3c7c6f626a6563745f7265665f73746172747c3e",
+      "name": "added_token_248047",
+      "normalizedText": "<|object_ref_start|>",
+      "skipSpecialDecoded": ""
+    },
+    {
+      "category": "added_token_literal",
+      "decoded": "<|object_ref_end|>",
+      "decodedUtf8Hex": "3c7c6f626a6563745f7265665f656e647c3e",
+      "ids": [
+        248048
+      ],
+      "inputPolicy": "unicode-literal",
+      "inputText": "<|object_ref_end|>",
+      "inputUtf8Hex": "3c7c6f626a6563745f7265665f656e647c3e",
+      "name": "added_token_248048",
+      "normalizedText": "<|object_ref_end|>",
+      "skipSpecialDecoded": ""
+    },
+    {
+      "category": "added_token_literal",
+      "decoded": "<|box_start|>",
+      "decodedUtf8Hex": "3c7c626f785f73746172747c3e",
+      "ids": [
+        248049
+      ],
+      "inputPolicy": "unicode-literal",
+      "inputText": "<|box_start|>",
+      "inputUtf8Hex": "3c7c626f785f73746172747c3e",
+      "name": "added_token_248049",
+      "normalizedText": "<|box_start|>",
+      "skipSpecialDecoded": ""
+    },
+    {
+      "category": "added_token_literal",
+      "decoded": "<|box_end|>",
+      "decodedUtf8Hex": "3c7c626f785f656e647c3e",
+      "ids": [
+        248050
+      ],
+      "inputPolicy": "unicode-literal",
+      "inputText": "<|box_end|>",
+      "inputUtf8Hex": "3c7c626f785f656e647c3e",
+      "name": "added_token_248050",
+      "normalizedText": "<|box_end|>",
+      "skipSpecialDecoded": ""
+    },
+    {
+      "category": "added_token_literal",
+      "decoded": "<|quad_start|>",
+      "decodedUtf8Hex": "3c7c717561645f73746172747c3e",
+      "ids": [
+        248051
+      ],
+      "inputPolicy": "unicode-literal",
+      "inputText": "<|quad_start|>",
+      "inputUtf8Hex": "3c7c717561645f73746172747c3e",
+      "name": "added_token_248051",
+      "normalizedText": "<|quad_start|>",
+      "skipSpecialDecoded": ""
+    },
+    {
+      "category": "added_token_literal",
+      "decoded": "<|quad_end|>",
+      "decodedUtf8Hex": "3c7c717561645f656e647c3e",
+      "ids": [
+        248052
+      ],
+      "inputPolicy": "unicode-literal",
+      "inputText": "<|quad_end|>",
+      "inputUtf8Hex": "3c7c717561645f656e647c3e",
+      "name": "added_token_248052",
+      "normalizedText": "<|quad_end|>",
+      "skipSpecialDecoded": ""
+    },
+    {
+      "category": "added_token_literal",
+      "decoded": "<|vision_start|>",
+      "decodedUtf8Hex": "3c7c766973696f6e5f73746172747c3e",
+      "ids": [
+        248053
+      ],
+      "inputPolicy": "unicode-literal",
+      "inputText": "<|vision_start|>",
+      "inputUtf8Hex": "3c7c766973696f6e5f73746172747c3e",
+      "name": "added_token_248053",
+      "normalizedText": "<|vision_start|>",
+      "skipSpecialDecoded": ""
+    },
+    {
+      "category": "added_token_literal",
+      "decoded": "<|vision_end|>",
+      "decodedUtf8Hex": "3c7c766973696f6e5f656e647c3e",
+      "ids": [
+        248054
+      ],
+      "inputPolicy": "unicode-literal",
+      "inputText": "<|vision_end|>",
+      "inputUtf8Hex": "3c7c766973696f6e5f656e647c3e",
+      "name": "added_token_248054",
+      "normalizedText": "<|vision_end|>",
+      "skipSpecialDecoded": ""
+    },
+    {
+      "category": "added_token_literal",
+      "decoded": "<|vision_pad|>",
+      "decodedUtf8Hex": "3c7c766973696f6e5f7061647c3e",
+      "ids": [
+        248055
+      ],
+      "inputPolicy": "unicode-literal",
+      "inputText": "<|vision_pad|>",
+      "inputUtf8Hex": "3c7c766973696f6e5f7061647c3e",
+      "name": "added_token_248055",
+      "normalizedText": "<|vision_pad|>",
+      "skipSpecialDecoded": ""
+    },
+    {
+      "category": "added_token_literal",
+      "decoded": "<|image_pad|>",
+      "decodedUtf8Hex": "3c7c696d6167655f7061647c3e",
+      "ids": [
+        248056
+      ],
+      "inputPolicy": "unicode-literal",
+      "inputText": "<|image_pad|>",
+      "inputUtf8Hex": "3c7c696d6167655f7061647c3e",
+      "name": "added_token_248056",
+      "normalizedText": "<|image_pad|>",
+      "skipSpecialDecoded": ""
+    },
+    {
+      "category": "added_token_literal",
+      "decoded": "<|video_pad|>",
+      "decodedUtf8Hex": "3c7c766964656f5f7061647c3e",
+      "ids": [
+        248057
+      ],
+      "inputPolicy": "unicode-literal",
+      "inputText": "<|video_pad|>",
+      "inputUtf8Hex": "3c7c766964656f5f7061647c3e",
+      "name": "added_token_248057",
+      "normalizedText": "<|video_pad|>",
+      "skipSpecialDecoded": ""
+    },
+    {
+      "category": "added_token_literal",
+      "decoded": "<tool_call>",
+      "decodedUtf8Hex": "3c746f6f6c5f63616c6c3e",
+      "ids": [
+        248058
+      ],
+      "inputPolicy": "unicode-literal",
+      "inputText": "<tool_call>",
+      "inputUtf8Hex": "3c746f6f6c5f63616c6c3e",
+      "name": "added_token_248058",
+      "normalizedText": "<tool_call>",
+      "skipSpecialDecoded": "<tool_call>"
+    },
+    {
+      "category": "added_token_literal",
+      "decoded": "</tool_call>",
+      "decodedUtf8Hex": "3c2f746f6f6c5f63616c6c3e",
+      "ids": [
+        248059
+      ],
+      "inputPolicy": "unicode-literal",
+      "inputText": "</tool_call>",
+      "inputUtf8Hex": "3c2f746f6f6c5f63616c6c3e",
+      "name": "added_token_248059",
+      "normalizedText": "</tool_call>",
+      "skipSpecialDecoded": "</tool_call>"
+    },
+    {
+      "category": "added_token_literal",
+      "decoded": "<|fim_prefix|>",
+      "decodedUtf8Hex": "3c7c66696d5f7072656669787c3e",
+      "ids": [
+        248060
+      ],
+      "inputPolicy": "unicode-literal",
+      "inputText": "<|fim_prefix|>",
+      "inputUtf8Hex": "3c7c66696d5f7072656669787c3e",
+      "name": "added_token_248060",
+      "normalizedText": "<|fim_prefix|>",
+      "skipSpecialDecoded": "<|fim_prefix|>"
+    },
+    {
+      "category": "added_token_literal",
+      "decoded": "<|fim_middle|>",
+      "decodedUtf8Hex": "3c7c66696d5f6d6964646c657c3e",
+      "ids": [
+        248061
+      ],
+      "inputPolicy": "unicode-literal",
+      "inputText": "<|fim_middle|>",
+      "inputUtf8Hex": "3c7c66696d5f6d6964646c657c3e",
+      "name": "added_token_248061",
+      "normalizedText": "<|fim_middle|>",
+      "skipSpecialDecoded": "<|fim_middle|>"
+    },
+    {
+      "category": "added_token_literal",
+      "decoded": "<|fim_suffix|>",
+      "decodedUtf8Hex": "3c7c66696d5f7375666669787c3e",
+      "ids": [
+        248062
+      ],
+      "inputPolicy": "unicode-literal",
+      "inputText": "<|fim_suffix|>",
+      "inputUtf8Hex": "3c7c66696d5f7375666669787c3e",
+      "name": "added_token_248062",
+      "normalizedText": "<|fim_suffix|>",
+      "skipSpecialDecoded": "<|fim_suffix|>"
+    },
+    {
+      "category": "added_token_literal",
+      "decoded": "<|fim_pad|>",
+      "decodedUtf8Hex": "3c7c66696d5f7061647c3e",
+      "ids": [
+        248063
+      ],
+      "inputPolicy": "unicode-literal",
+      "inputText": "<|fim_pad|>",
+      "inputUtf8Hex": "3c7c66696d5f7061647c3e",
+      "name": "added_token_248063",
+      "normalizedText": "<|fim_pad|>",
+      "skipSpecialDecoded": "<|fim_pad|>"
+    },
+    {
+      "category": "added_token_literal",
+      "decoded": "<|repo_name|>",
+      "decodedUtf8Hex": "3c7c7265706f5f6e616d657c3e",
+      "ids": [
+        248064
+      ],
+      "inputPolicy": "unicode-literal",
+      "inputText": "<|repo_name|>",
+      "inputUtf8Hex": "3c7c7265706f5f6e616d657c3e",
+      "name": "added_token_248064",
+      "normalizedText": "<|repo_name|>",
+      "skipSpecialDecoded": "<|repo_name|>"
+    },
+    {
+      "category": "added_token_literal",
+      "decoded": "<|file_sep|>",
+      "decodedUtf8Hex": "3c7c66696c655f7365707c3e",
+      "ids": [
+        248065
+      ],
+      "inputPolicy": "unicode-literal",
+      "inputText": "<|file_sep|>",
+      "inputUtf8Hex": "3c7c66696c655f7365707c3e",
+      "name": "added_token_248065",
+      "normalizedText": "<|file_sep|>",
+      "skipSpecialDecoded": "<|file_sep|>"
+    },
+    {
+      "category": "added_token_literal",
+      "decoded": "<tool_response>",
+      "decodedUtf8Hex": "3c746f6f6c5f726573706f6e73653e",
+      "ids": [
+        248066
+      ],
+      "inputPolicy": "unicode-literal",
+      "inputText": "<tool_response>",
+      "inputUtf8Hex": "3c746f6f6c5f726573706f6e73653e",
+      "name": "added_token_248066",
+      "normalizedText": "<tool_response>",
+      "skipSpecialDecoded": "<tool_response>"
+    },
+    {
+      "category": "added_token_literal",
+      "decoded": "</tool_response>",
+      "decodedUtf8Hex": "3c2f746f6f6c5f726573706f6e73653e",
+      "ids": [
+        248067
+      ],
+      "inputPolicy": "unicode-literal",
+      "inputText": "</tool_response>",
+      "inputUtf8Hex": "3c2f746f6f6c5f726573706f6e73653e",
+      "name": "added_token_248067",
+      "normalizedText": "</tool_response>",
+      "skipSpecialDecoded": "</tool_response>"
+    },
+    {
+      "category": "added_token_literal",
+      "decoded": "<think>",
+      "decodedUtf8Hex": "3c7468696e6b3e",
+      "ids": [
+        248068
+      ],
+      "inputPolicy": "unicode-literal",
+      "inputText": "<think>",
+      "inputUtf8Hex": "3c7468696e6b3e",
+      "name": "added_token_248068",
+      "normalizedText": "<think>",
+      "skipSpecialDecoded": "<think>"
+    },
+    {
+      "category": "added_token_literal",
+      "decoded": "</think>",
+      "decodedUtf8Hex": "3c2f7468696e6b3e",
+      "ids": [
+        248069
+      ],
+      "inputPolicy": "unicode-literal",
+      "inputText": "</think>",
+      "inputUtf8Hex": "3c2f7468696e6b3e",
+      "name": "added_token_248069",
+      "normalizedText": "</think>",
+      "skipSpecialDecoded": "</think>"
+    },
+    {
+      "category": "added_token_literal",
+      "decoded": "<|audio_start|>",
+      "decodedUtf8Hex": "3c7c617564696f5f73746172747c3e",
+      "ids": [
+        248070
+      ],
+      "inputPolicy": "unicode-literal",
+      "inputText": "<|audio_start|>",
+      "inputUtf8Hex": "3c7c617564696f5f73746172747c3e",
+      "name": "added_token_248070",
+      "normalizedText": "<|audio_start|>",
+      "skipSpecialDecoded": ""
+    },
+    {
+      "category": "added_token_literal",
+      "decoded": "<|audio_end|>",
+      "decodedUtf8Hex": "3c7c617564696f5f656e647c3e",
+      "ids": [
+        248071
+      ],
+      "inputPolicy": "unicode-literal",
+      "inputText": "<|audio_end|>",
+      "inputUtf8Hex": "3c7c617564696f5f656e647c3e",
+      "name": "added_token_248071",
+      "normalizedText": "<|audio_end|>",
+      "skipSpecialDecoded": ""
+    },
+    {
+      "category": "added_token_literal",
+      "decoded": "<tts_pad>",
+      "decodedUtf8Hex": "3c7474735f7061643e",
+      "ids": [
+        248072
+      ],
+      "inputPolicy": "unicode-literal",
+      "inputText": "<tts_pad>",
+      "inputUtf8Hex": "3c7474735f7061643e",
+      "name": "added_token_248072",
+      "normalizedText": "<tts_pad>",
+      "skipSpecialDecoded": ""
+    },
+    {
+      "category": "added_token_literal",
+      "decoded": "<tts_text_bos>",
+      "decodedUtf8Hex": "3c7474735f746578745f626f733e",
+      "ids": [
+        248073
+      ],
+      "inputPolicy": "unicode-literal",
+      "inputText": "<tts_text_bos>",
+      "inputUtf8Hex": "3c7474735f746578745f626f733e",
+      "name": "added_token_248073",
+      "normalizedText": "<tts_text_bos>",
+      "skipSpecialDecoded": ""
+    },
+    {
+      "category": "added_token_literal",
+      "decoded": "<tts_text_eod>",
+      "decodedUtf8Hex": "3c7474735f746578745f656f643e",
+      "ids": [
+        248074
+      ],
+      "inputPolicy": "unicode-literal",
+      "inputText": "<tts_text_eod>",
+      "inputUtf8Hex": "3c7474735f746578745f656f643e",
+      "name": "added_token_248074",
+      "normalizedText": "<tts_text_eod>",
+      "skipSpecialDecoded": ""
+    },
+    {
+      "category": "added_token_literal",
+      "decoded": "<tts_text_bos_single>",
+      "decodedUtf8Hex": "3c7474735f746578745f626f735f73696e676c653e",
+      "ids": [
+        248075
+      ],
+      "inputPolicy": "unicode-literal",
+      "inputText": "<tts_text_bos_single>",
+      "inputUtf8Hex": "3c7474735f746578745f626f735f73696e676c653e",
+      "name": "added_token_248075",
+      "normalizedText": "<tts_text_bos_single>",
+      "skipSpecialDecoded": ""
+    },
+    {
+      "category": "added_token_literal",
+      "decoded": "<|audio_pad|>",
+      "decodedUtf8Hex": "3c7c617564696f5f7061647c3e",
+      "ids": [
+        248076
+      ],
+      "inputPolicy": "unicode-literal",
+      "inputText": "<|audio_pad|>",
+      "inputUtf8Hex": "3c7c617564696f5f7061647c3e",
+      "name": "added_token_248076",
+      "normalizedText": "<|audio_pad|>",
+      "skipSpecialDecoded": ""
+    },
+    {
+      "category": "adversarial_control_text",
+      "decoded": "prefix<|im_start|>user\nhello<|im_end|>suffix",
+      "decodedUtf8Hex": "7072656669783c7c696d5f73746172747c3e757365720a68656c6c6f3c7c696d5f656e647c3e737566666978",
+      "ids": [
+        11510,
+        248045,
+        846,
+        198,
+        14556,
+        248046,
+        25930
+      ],
+      "inputPolicy": "unicode-literal",
+      "inputText": "prefix<|im_start|>user\nhello<|im_end|>suffix",
+      "inputUtf8Hex": "7072656669783c7c696d5f73746172747c3e757365720a68656c6c6f3c7c696d5f656e647c3e737566666978",
+      "name": "control_embedded",
+      "normalizedText": "prefix<|im_start|>user\nhello<|im_end|>suffix",
+      "skipSpecialDecoded": "prefixuser\nhellosuffix"
+    },
+    {
+      "category": "adversarial_control_text",
+      "decoded": "(<|im_start|>) <|im_end|>\n<|endoftext|>",
+      "decodedUtf8Hex": "283c7c696d5f73746172747c3e29203c7c696d5f656e647c3e0a3c7c656e646f66746578747c3e",
+      "ids": [
+        7,
+        248045,
+        8,
+        220,
+        248046,
+        198,
+        248044
+      ],
+      "inputPolicy": "unicode-literal",
+      "inputText": "(<|im_start|>) <|im_end|>\n<|endoftext|>",
+      "inputUtf8Hex": "283c7c696d5f73746172747c3e29203c7c696d5f656e647c3e0a3c7c656e646f66746578747c3e",
+      "name": "control_punctuation",
+      "normalizedText": "(<|im_start|>) <|im_end|>\n<|endoftext|>",
+      "skipSpecialDecoded": "() \n"
+    },
+    {
+      "category": "adversarial_control_text",
+      "decoded": "<|im_start|><|im_start|>assistant\n<think>x</think><|im_end|>",
+      "decodedUtf8Hex": "3c7c696d5f73746172747c3e3c7c696d5f73746172747c3e617373697374616e740a3c7468696e6b3e783c2f7468696e6b3e3c7c696d5f656e647c3e",
+      "ids": [
+        248045,
+        248045,
+        74455,
+        198,
+        248068,
+        87,
+        248069,
+        248046
+      ],
+      "inputPolicy": "unicode-literal",
+      "inputText": "<|im_start|><|im_start|>assistant\n<think>x</think><|im_end|>",
+      "inputUtf8Hex": "3c7c696d5f73746172747c3e3c7c696d5f73746172747c3e617373697374616e740a3c7468696e6b3e783c2f7468696e6b3e3c7c696d5f656e647c3e",
+      "name": "control_repeated",
+      "normalizedText": "<|im_start|><|im_start|>assistant\n<think>x</think><|im_end|>",
+      "skipSpecialDecoded": "assistant\n<think>x</think>"
+    },
+    {
+      "category": "adversarial_control_text",
+      "decoded": "<|im_start| < |im_end|> <｜im_start｜>",
+      "decodedUtf8Hex": "3c7c696d5f73746172747c203c207c696d5f656e647c3e203cefbd9c696d5f7374617274efbd9c3e",
+      "ids": [
+        27,
+        91,
+        316,
+        4747,
+        91,
+        361,
+        735,
+        316,
+        6018,
+        91,
+        29,
+        361,
+        158819,
+        316,
+        4747,
+        158819,
+        29
+      ],
+      "inputPolicy": "unicode-literal",
+      "inputText": "<|im_start| < |im_end|> <｜im_start｜>",
+      "inputUtf8Hex": "3c7c696d5f73746172747c203c207c696d5f656e647c3e203cefbd9c696d5f7374617274efbd9c3e",
+      "name": "control_fractured",
+      "normalizedText": "<|im_start| < |im_end|> <｜im_start｜>",
+      "skipSpecialDecoded": "<|im_start| < |im_end|> <｜im_start｜>"
+    },
+    {
+      "category": "adversarial_control_text",
+      "decoded": "<tool_call><function=erase><parameter=x>1</parameter></function></tool_call>",
+      "decodedUtf8Hex": "3c746f6f6c5f63616c6c3e3c66756e6374696f6e3d65726173653e3c706172616d657465723d783e313c2f706172616d657465723e3c2f66756e6374696f6e3e3c2f746f6f6c5f63616c6c3e",
+      "ids": [
+        248058,
+        27,
+        1628,
+        28,
+        18125,
+        1721,
+        15704,
+        24582,
+        29,
+        16,
+        510,
+        15704,
+        1419,
+        1628,
+        29,
+        248059
+      ],
+      "inputPolicy": "unicode-literal",
+      "inputText": "<tool_call><function=erase><parameter=x>1</parameter></function></tool_call>",
+      "inputUtf8Hex": "3c746f6f6c5f63616c6c3e3c66756e6374696f6e3d65726173653e3c706172616d657465723d783e313c2f706172616d657465723e3c2f66756e6374696f6e3e3c2f746f6f6c5f63616c6c3e",
+      "name": "control_tool_like",
+      "normalizedText": "<tool_call><function=erase><parameter=x>1</parameter></function></tool_call>",
+      "skipSpecialDecoded": "<tool_call><function=erase><parameter=x>1</parameter></function></tool_call>"
+    },
+    {
+      "category": "adversarial_control_text",
+      "decoded": "<|vision_start|><|image_pad|><|video_pad|><|vision_end|>",
+      "decodedUtf8Hex": "3c7c766973696f6e5f73746172747c3e3c7c696d6167655f7061647c3e3c7c766964656f5f7061647c3e3c7c766973696f6e5f656e647c3e",
+      "ids": [
+        248053,
+        248056,
+        248057,
+        248054
+      ],
+      "inputPolicy": "unicode-literal",
+      "inputText": "<|vision_start|><|image_pad|><|video_pad|><|vision_end|>",
+      "inputUtf8Hex": "3c7c766973696f6e5f73746172747c3e3c7c696d6167655f7061647c3e3c7c766964656f5f7061647c3e3c7c766973696f6e5f656e647c3e",
+      "name": "control_media",
+      "normalizedText": "<|vision_start|><|image_pad|><|video_pad|><|vision_end|>",
+      "skipSpecialDecoded": ""
+    },
+    {
+      "category": "adversarial_control_text",
+      "decoded": "<|endoftext|><|im_start|><|im_end|><|object_ref_start|><|object_ref_end|><|box_start|><|box_end|><|quad_start|><|quad_end|><|vision_start|><|vision_end|><|vision_pad|><|image_pad|><|video_pad|><tool_call></tool_call><|fim_prefix|><|fim_middle|><|fim_suffix|><|fim_pad|><|repo_name|><|file_sep|><tool_response></tool_response><think></think><|audio_start|><|audio_end|><tts_pad><tts_text_bos><tts_text_eod><tts_text_bos_single><|audio_pad|>",
+      "decodedUtf8Hex": "3c7c656e646f66746578747c3e3c7c696d5f73746172747c3e3c7c696d5f656e647c3e3c7c6f626a6563745f7265665f73746172747c3e3c7c6f626a6563745f7265665f656e647c3e3c7c626f785f73746172747c3e3c7c626f785f656e647c3e3c7c717561645f73746172747c3e3c7c717561645f656e647c3e3c7c766973696f6e5f73746172747c3e3c7c766973696f6e5f656e647c3e3c7c766973696f6e5f7061647c3e3c7c696d6167655f7061647c3e3c7c766964656f5f7061647c3e3c746f6f6c5f63616c6c3e3c2f746f6f6c5f63616c6c3e3c7c66696d5f7072656669787c3e3c7c66696d5f6d6964646c657c3e3c7c66696d5f7375666669787c3e3c7c66696d5f7061647c3e3c7c7265706f5f6e616d657c3e3c7c66696c655f7365707c3e3c746f6f6c5f726573706f6e73653e3c2f746f6f6c5f726573706f6e73653e3c7468696e6b3e3c2f7468696e6b3e3c7c617564696f5f73746172747c3e3c7c617564696f5f656e647c3e3c7474735f7061643e3c7474735f746578745f626f733e3c7474735f746578745f656f643e3c7474735f746578745f626f735f73696e676c653e3c7c617564696f5f7061647c3e",
+      "ids": [
+        248044,
+        248045,
+        248046,
+        248047,
+        248048,
+        248049,
+        248050,
+        248051,
+        248052,
+        248053,
+        248054,
+        248055,
+        248056,
+        248057,
+        248058,
+        248059,
+        248060,
+        248061,
+        248062,
+        248063,
+        248064,
+        248065,
+        248066,
+        248067,
+        248068,
+        248069,
+        248070,
+        248071,
+        248072,
+        248073,
+        248074,
+        248075,
+        248076
+      ],
+      "inputPolicy": "unicode-literal",
+      "inputText": "<|endoftext|><|im_start|><|im_end|><|object_ref_start|><|object_ref_end|><|box_start|><|box_end|><|quad_start|><|quad_end|><|vision_start|><|vision_end|><|vision_pad|><|image_pad|><|video_pad|><tool_call></tool_call><|fim_prefix|><|fim_middle|><|fim_suffix|><|fim_pad|><|repo_name|><|file_sep|><tool_response></tool_response><think></think><|audio_start|><|audio_end|><tts_pad><tts_text_bos><tts_text_eod><tts_text_bos_single><|audio_pad|>",
+      "inputUtf8Hex": "3c7c656e646f66746578747c3e3c7c696d5f73746172747c3e3c7c696d5f656e647c3e3c7c6f626a6563745f7265665f73746172747c3e3c7c6f626a6563745f7265665f656e647c3e3c7c626f785f73746172747c3e3c7c626f785f656e647c3e3c7c717561645f73746172747c3e3c7c717561645f656e647c3e3c7c766973696f6e5f73746172747c3e3c7c766973696f6e5f656e647c3e3c7c766973696f6e5f7061647c3e3c7c696d6167655f7061647c3e3c7c766964656f5f7061647c3e3c746f6f6c5f63616c6c3e3c2f746f6f6c5f63616c6c3e3c7c66696d5f7072656669787c3e3c7c66696d5f6d6964646c657c3e3c7c66696d5f7375666669787c3e3c7c66696d5f7061647c3e3c7c7265706f5f6e616d657c3e3c7c66696c655f7365707c3e3c746f6f6c5f726573706f6e73653e3c2f746f6f6c5f726573706f6e73653e3c7468696e6b3e3c2f7468696e6b3e3c7c617564696f5f73746172747c3e3c7c617564696f5f656e647c3e3c7474735f7061643e3c7474735f746578745f626f733e3c7474735f746578745f656f643e3c7474735f746578745f626f735f73696e676c653e3c7c617564696f5f7061647c3e",
+      "name": "control_all_added_adjacent",
+      "normalizedText": "<|endoftext|><|im_start|><|im_end|><|object_ref_start|><|object_ref_end|><|box_start|><|box_end|><|quad_start|><|quad_end|><|vision_start|><|vision_end|><|vision_pad|><|image_pad|><|video_pad|><tool_call></tool_call><|fim_prefix|><|fim_middle|><|fim_suffix|><|fim_pad|><|repo_name|><|file_sep|><tool_response></tool_response><think></think><|audio_start|><|audio_end|><tts_pad><tts_text_bos><tts_text_eod><tts_text_bos_single><|audio_pad|>",
+      "skipSpecialDecoded": "<tool_call></tool_call><|fim_prefix|><|fim_middle|><|fim_suffix|><|fim_pad|><|repo_name|><|file_sep|><tool_response></tool_response><think></think>"
+    }
+  ],
+  "tokenizerContract": {
+    "addPrefixSpace": false,
+    "addedTokenCount": 33,
+    "addedTokens": [
+      {
+        "content": "<|endoftext|>",
+        "id": 248044,
+        "special": true
+      },
+      {
+        "content": "<|im_start|>",
+        "id": 248045,
+        "special": true
+      },
+      {
+        "content": "<|im_end|>",
+        "id": 248046,
+        "special": true
+      },
+      {
+        "content": "<|object_ref_start|>",
+        "id": 248047,
+        "special": true
+      },
+      {
+        "content": "<|object_ref_end|>",
+        "id": 248048,
+        "special": true
+      },
+      {
+        "content": "<|box_start|>",
+        "id": 248049,
+        "special": true
+      },
+      {
+        "content": "<|box_end|>",
+        "id": 248050,
+        "special": true
+      },
+      {
+        "content": "<|quad_start|>",
+        "id": 248051,
+        "special": true
+      },
+      {
+        "content": "<|quad_end|>",
+        "id": 248052,
+        "special": true
+      },
+      {
+        "content": "<|vision_start|>",
+        "id": 248053,
+        "special": true
+      },
+      {
+        "content": "<|vision_end|>",
+        "id": 248054,
+        "special": true
+      },
+      {
+        "content": "<|vision_pad|>",
+        "id": 248055,
+        "special": true
+      },
+      {
+        "content": "<|image_pad|>",
+        "id": 248056,
+        "special": true
+      },
+      {
+        "content": "<|video_pad|>",
+        "id": 248057,
+        "special": true
+      },
+      {
+        "content": "<tool_call>",
+        "id": 248058,
+        "special": false
+      },
+      {
+        "content": "</tool_call>",
+        "id": 248059,
+        "special": false
+      },
+      {
+        "content": "<|fim_prefix|>",
+        "id": 248060,
+        "special": false
+      },
+      {
+        "content": "<|fim_middle|>",
+        "id": 248061,
+        "special": false
+      },
+      {
+        "content": "<|fim_suffix|>",
+        "id": 248062,
+        "special": false
+      },
+      {
+        "content": "<|fim_pad|>",
+        "id": 248063,
+        "special": false
+      },
+      {
+        "content": "<|repo_name|>",
+        "id": 248064,
+        "special": false
+      },
+      {
+        "content": "<|file_sep|>",
+        "id": 248065,
+        "special": false
+      },
+      {
+        "content": "<tool_response>",
+        "id": 248066,
+        "special": false
+      },
+      {
+        "content": "</tool_response>",
+        "id": 248067,
+        "special": false
+      },
+      {
+        "content": "<think>",
+        "id": 248068,
+        "special": false
+      },
+      {
+        "content": "</think>",
+        "id": 248069,
+        "special": false
+      },
+      {
+        "content": "<|audio_start|>",
+        "id": 248070,
+        "special": true
+      },
+      {
+        "content": "<|audio_end|>",
+        "id": 248071,
+        "special": true
+      },
+      {
+        "content": "<tts_pad>",
+        "id": 248072,
+        "special": true
+      },
+      {
+        "content": "<tts_text_bos>",
+        "id": 248073,
+        "special": true
+      },
+      {
+        "content": "<tts_text_eod>",
+        "id": 248074,
+        "special": true
+      },
+      {
+        "content": "<tts_text_bos_single>",
+        "id": 248075,
+        "special": true
+      },
+      {
+        "content": "<|audio_pad|>",
+        "id": 248076,
+        "special": true
+      }
+    ],
+    "backendSpecialTokenIds": [
+      248044,
+      248045,
+      248046,
+      248047,
+      248048,
+      248049,
+      248050,
+      248051,
+      248052,
+      248053,
+      248054,
+      248055,
+      248056,
+      248057,
+      248070,
+      248071,
+      248072,
+      248073,
+      248074,
+      248075,
+      248076
+    ],
+    "baseVocabularySize": 248044,
+    "effectiveValidVocabularySize": 248077,
+    "maximumValidTokenId": 248076,
+    "modelMaxLength": 262144,
+    "normalizer": "NFC",
+    "physicalLogitsWidth": 248320,
+    "pretokenizeRegex": "(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\\r\\n\\p{L}\\p{N}]?[\\p{L}\\p{M}]+|\\p{N}| ?[^\\s\\p{L}\\p{M}\\p{N}]+[\\r\\n]*|\\s*[\\r\\n]+|\\s+(?!\\S)|\\s+",
+    "transformersNamedSpecialTokenIds": [
+      248046,
+      248044,
+      248070,
+      248071,
+      248076,
+      248056,
+      248057,
+      248053,
+      248054
+    ],
+    "unassignedPhysicalIdCount": 243,
+    "unassignedPhysicalIdRangeHalfOpen": [
+      248077,
+      248320
+    ]
+  }
+}

@@ -169,8 +169,39 @@ extent reaches EOF. Admission checks the closed 108-entry metadata table,
 three explicitly absent keys, exact tensor names/types/shapes, both structural
 manifests, non-overlap, dense page isolation and whole-file ownership. Startup
 does not verify or fault either sparse payload. Production physical types,
-ExpertMajor codec qualification, PLE codec/page geometry and tokenizer-content
-canonicalization remain later decisions.
+ExpertMajor codec qualification and PLE codec/page geometry remain later
+decisions.
+
+## Phase 4 tokenizer and chat milestone
+
+Phase 4 closes the model-free text pipeline without enabling Qwen4Exp
+execution or a server route. The authoritative tokenizer is the pinned
+`tokenizer.json` loaded through Transformers' `TokenizersBackend`, not the
+Qwen2 `AutoTokenizer` reconstruction: the latter drops `\p{M}` from the
+pre-tokenizer expression and demonstrably splits Devanagari combining forms
+differently. The runtime therefore uses NFC plus the exact tokenizer.json
+expression, all 33 added-token identities, an effective token domain
+`[0, 248077)`, and a separate 248,320-row physical logits domain. Sampling
+masks the 243 unassigned rows `[248077, 248320)`, while decode treats them as
+silent and the stop set is exactly `{248044, 248046}`.
+
+The tokenizer oracle contains 59 pinned encode/decode cases and six explicit
+decode-boundary controls. The chat oracle contains 39 cases: 34 pinned
+Transformers render/error captures and five text-only contract rejections. It
+freezes default `xhigh`, `medium`, `low`, disabled-thinking and
+reasoning-preservation behavior, tools and grouped results, exact system-role
+cardinality, insertion-ordered UTF-8 tool JSON, Python/Jinja Unicode trimming,
+and structured-media rejection before rendering. The C renderer returns one
+ordered byte stream plus contiguous `DATA` and `TRUSTED_CONTROL` segments;
+tokenization processes each segment independently so a literal control-token
+spelling supplied by a client remains ordinary data. Flattening the rendered
+bytes and retokenizing them as trusted is forbidden.
+
+These are model-free semantic and security gates only. The Phase 3 structural
+report still records `tokenizerContentVerified=false` because its sparse GGUF
+does not contain or inspect tokenizer payload bytes. Normal builds still have
+no production physical profile, runtime graph, server route, downloader entry,
+or support claim for Qwen4Exp.
 
 ## Consequences
 

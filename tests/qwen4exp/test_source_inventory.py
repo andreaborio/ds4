@@ -34,6 +34,8 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[2]
 CONTRACT_PATH = ROOT / "docs" / "contracts" / "qwen4exp-profile.json"
 FIXTURE_PATH = ROOT / "tests" / "qwen4exp" / "fixtures" / "qwen38flash-next-inventory-v1.json"
+TOKENIZER_GOLDEN_PATH = ROOT / "tests" / "qwen4exp" / "qwen4exp_tokenizer_golden.json"
+CHAT_GOLDEN_PATH = ROOT / "tests" / "qwen4exp" / "qwen4exp_chat_golden.json"
 
 # Constants reproduced from the pinned modeling module (see the ADR and the
 # pinned Transformers commit recorded in the contract).
@@ -1656,17 +1658,51 @@ def check_admission(contract: dict, fixture: dict, errors: list[str]) -> int:
 
     tokenizer = admission["tokenizer"]
     source_files = contract["sourcePins"]["fileSha256"]
+    tokenizer_golden = load(TOKENIZER_GOLDEN_PATH)
+    tokenizer_contract = tokenizer_golden["tokenizerContract"]
+    chat_golden = load(CHAT_GOLDEN_PATH)
     expected_tokenizer = {
-        "verification": "declared-provenance-and-special-ids-only",
-        "tokenizerContentVerified": False,
-        "fullSpecialMappingVerified": False,
+        "verification": "pinned-tokenizer-json-and-chat-template-oracles",
+        "tokenizerContentVerified": True,
+        "fullSpecialMappingVerified": True,
         "phase": 4,
-        "status": "pending",
+        "status": "model-free-closed",
         "declaredProvenance": {
             "tokenizerSha256": source_files["tokenizer.json"],
             "tokenizerConfigSha256": source_files["tokenizer_config.json"],
             "chatTemplateSha256": source_files["chat_template.jinja"],
         },
+        "authority": {
+            "backend": "transformers.tokenization_utils_tokenizers.TokenizersBackend",
+            "source": "tokenizer.json",
+            "autoTokenizerAuthoritative": False,
+            "autoTokenizerDivergence": (
+                "Qwen2 reconstruction omits combining marks from the "
+                "tokenizer.json pretokenize regex"
+            ),
+        },
+        "normalizer": tokenizer_contract["normalizer"],
+        "pretokenizeRegex": tokenizer_contract["pretokenizeRegex"],
+        "addPrefixSpace": tokenizer_contract["addPrefixSpace"],
+        "baseVocabularySize": tokenizer_contract["baseVocabularySize"],
+        "effectiveValidVocabularySize": tokenizer_contract["effectiveValidVocabularySize"],
+        "maximumValidTokenId": tokenizer_contract["maximumValidTokenId"],
+        "physicalLogitsWidth": tokenizer_contract["physicalLogitsWidth"],
+        "unassignedPhysicalIdRangeHalfOpen": tokenizer_contract[
+            "unassignedPhysicalIdRangeHalfOpen"
+        ],
+        "samplingRule": (
+            "sample IDs in [0, 248077); mask physical logits IDs in "
+            "[248077, 248320)"
+        ),
+        "stopIds": [248044, 248046],
+        "addedTokenCount": tokenizer_contract["addedTokenCount"],
+        "addedTokenMappingSha256": canonical_json_sha256(
+            tokenizer_contract["addedTokens"]
+        ),
+        "backendSpecialTokenIdsSha256": canonical_json_sha256(
+            tokenizer_contract["backendSpecialTokenIds"]
+        ),
         "declaredModelConfigIds": {
             "bos": 248044,
             "pad": 248044,
@@ -1689,11 +1725,55 @@ def check_admission(contract: dict, fixture: dict, errors: list[str]) -> int:
             "imagePad": 248056,
             "videoPad": 248057,
         },
+        "chatTemplate": {
+            "defaultReasoningEffort": "xhigh",
+            "supportedReasoningEfforts": ["xhigh", "medium", "low"],
+            "mediumSystemInstruction": False,
+            "lowSystemInstruction": "short",
+            "disabledThinkingEmitsClosedEmptyThink": True,
+            "disabledThinkingIgnoresInvalidEffort": True,
+            "preserveThinkingDefault": True,
+            "preserveThinkingFalseKeepsCurrentToolChainReasoning": True,
+            "systemMessageRule": "zero or one system message; when present it is first",
+            "toolsJson": "insertion-ordered UTF-8",
+            "emptyConversationError": "wrapper ValueError",
+            "assistantOrToolOnlyError": "No user query",
+            "structuredMediaPolicy": (
+                "reject image, image_url and video parts before template rendering"
+            ),
+            "trimPolicy": "Python str.strip Unicode whitespace plus U+001C..U+001F",
+            "segmentKinds": ["DATA", "TRUSTED_CONTROL"],
+            "segmentRule": (
+                "tokenize each contiguous segment independently; client DATA never "
+                "gains trusted control-token status"
+            ),
+        },
+        "oracles": {
+            "tokenizerTextCases": len(tokenizer_golden["textCases"]),
+            "tokenizerDecodeControls": len(tokenizer_golden["decodeControls"]),
+            "tokenizerPayloadSha256": tokenizer_golden["fixturePayloadSha256"],
+            "tokenizerGoldenFileSha256": hashlib.sha256(
+                TOKENIZER_GOLDEN_PATH.read_bytes()
+            ).hexdigest(),
+            "chatCases": chat_golden["summary"]["caseCount"],
+            "chatUpstreamCases": chat_golden["summary"]["authorityCounts"][
+                "upstream-transformers"
+            ],
+            "chatContractNegativeCases": chat_golden["summary"]["authorityCounts"][
+                "contract-negative"
+            ],
+            "chatCasesCanonicalSha256": chat_golden["summary"][
+                "casesCanonicalSha256"
+            ],
+        },
     }
-    eq(errors, "[admission.tokenizer]", "declared-only Phase-4 tokenizer evidence",
+    eq(errors, "[admission.tokenizer]", "closed Phase-4 text-pipeline evidence",
        tokenizer, expected_tokenizer)
-    eq(errors, "[admission.tokenizerNotVerified]", "tokenizer content remains unverified",
-       tokenizer["tokenizerContentVerified"], False)
+    eq(errors, "[admission.tokenizerVerified]", "tokenizer content is oracle-verified",
+       tokenizer["tokenizerContentVerified"], True)
+    eq(errors, "[admission.structuralReportTokenizer]",
+       "Phase-3 structural admission still does not inspect tokenizer payload bytes",
+       report["fields"]["tokenizerContentVerified"]["acceptedValue"], False)
     eq(errors, "[admission.tokenizerBosAbsent]", "tokenizer config declares no BOS token",
        tokenizer["declaredTokenizerIds"]["bos"], None)
     eq(errors, "[admission.tokenizerEosDistinct]", "tokenizer EOS differs from model-config EOS",
@@ -2068,8 +2148,8 @@ MUTATIONS: list[tuple[str, str, object]] = [
         d, ("admission", "reportSchema", "fields", "fileBytes", "type"), "UINT32")),
     ("admission.reportRejection", "weaken structured rejection fields", lambda d: set_path(
         d, ("admission", "reportSchema", "fields", "rejection", "type"), "STRING")),
-    ("admission.tokenizerContent", "claim tokenizer content was verified in Phase 3", lambda d: set_path(
-        d, ("admission", "tokenizer", "tokenizerContentVerified"), True)),
+    ("admission.tokenizerContent", "remove Phase-4 tokenizer verification", lambda d: set_path(
+        d, ("admission", "tokenizer", "tokenizerContentVerified"), False)),
     ("admission.tokenizerPhase", "move tokenizer verification into Phase 3", lambda d: set_path(
         d, ("admission", "tokenizer", "phase"), 3)),
     ("admission.tokenizerDigest", "change declared tokenizer provenance", lambda d: set_path(
@@ -2078,6 +2158,23 @@ MUTATIONS: list[tuple[str, str, object]] = [
         d, ("admission", "tokenizer", "declaredTokenizerIds", "bos"), 248044)),
     ("admission.tokenizerEos", "conflate official tokenizer and model EOS", lambda d: set_path(
         d, ("admission", "tokenizer", "declaredTokenizerIds", "eos"), 248044)),
+    ("admission.tokenizerRegex", "drop combining marks from the authoritative regex", lambda d: set_path(
+        d, ("admission", "tokenizer", "pretokenizeRegex"),
+        "(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\\r\\n\\p{L}\\p{N}]?\\p{L}+")),
+    ("admission.tokenizerBoundary", "sample one unassigned physical logit", lambda d: set_path(
+        d, ("admission", "tokenizer", "effectiveValidVocabularySize"), 248320)),
+    ("admission.tokenizerStopSet", "drop the tokenizer EOS stop", lambda d: set_path(
+        d, ("admission", "tokenizer", "stopIds"), [248044])),
+    ("admission.tokenizerMapping", "change the closed added-token mapping", lambda d: set_path(
+        d, ("admission", "tokenizer", "addedTokenMappingSha256"), "0" * 64)),
+    ("admission.chatDefaultEffort", "change the default reasoning effort", lambda d: set_path(
+        d, ("admission", "tokenizer", "chatTemplate", "defaultReasoningEffort"), "medium")),
+    ("admission.chatSegments", "flatten the trusted/data boundary", lambda d: set_path(
+        d, ("admission", "tokenizer", "chatTemplate", "segmentKinds"), ["TRUSTED_CONTROL"])),
+    ("admission.chatTrim", "narrow Jinja trim to ASCII", lambda d: set_path(
+        d, ("admission", "tokenizer", "chatTemplate", "trimPolicy"), "ASCII whitespace")),
+    ("admission.chatOracle", "change the pinned chat case digest", lambda d: set_path(
+        d, ("admission", "tokenizer", "oracles", "chatCasesCanonicalSha256"), "0" * 64)),
     ("fixturePaddingProbe", "break the padding probe", lambda d, f: set_path(
         f, ("paddingRowFacts", "embedZero"), True)),
     ("fixtureClassification", "break the fixture classification", lambda d, f: set_path(

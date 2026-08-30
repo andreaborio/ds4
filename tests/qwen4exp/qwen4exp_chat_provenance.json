@@ -1,0 +1,509 @@
+{
+  "schemaVersion": 1,
+  "kind": "qwen4exp-chat-provenance",
+  "status": "model-free-not-runtime-support",
+  "generatedBy": "tests/qwen4exp/collect_chat_reference.py",
+  "source": {
+    "hfRepository": "Qwen/Qwen3.8-Flash-Next",
+    "hfRevision": "de4b8e4d43b917e7706784d8bb445c9af86a3540",
+    "transformersCommit": "42ca97014c85d71a88ad60d55f08cb9fb4d26e2c",
+    "files": {
+      "chat_template.jinja": {
+        "bytes": 8952,
+        "sha256": "c3cf9e34abf4f9e36c2d72165aa9c132d3e2a725b6c2586aaa3a8af9d7a81041"
+      },
+      "tokenizer.json": {
+        "bytes": 12809320,
+        "sha256": "0997f410c57a1f4e53b09e4be8f4a172d90edd9564368fb0847030937229b9f3"
+      },
+      "tokenizer_config.json": {
+        "bytes": 17928,
+        "sha256": "b11349aafa7cdc6a320767cf7ceb29ed82f7eda5d65e8e0819e76f0ce947bf27"
+      }
+    },
+    "transformersSourceFiles": {
+      "models/qwen2/tokenization_qwen2.py": {
+        "bytes": 3323,
+        "sha256": "fac4e6576bfe2369731be147a4e530f262bdf32f2ac50436f96f0d8bdd2fc628"
+      },
+      "tokenization_utils_base.py": {
+        "bytes": 182554,
+        "sha256": "520a914d0dcc873f8c8788e60ad3007f7db032c82c0b2b2c44ee7f44f2cdad8e"
+      },
+      "tokenization_utils_tokenizers.py": {
+        "bytes": 69842,
+        "sha256": "bf921a160f483c7a32973952ed82a08c7d8982f769726bd220933aae2df98de8"
+      },
+      "utils/chat_template_utils.py": {
+        "bytes": 26143,
+        "sha256": "3125114cf05646e7bc526ec30a6838da15bc9aa4591e42527e1012eaca3d276d"
+      }
+    }
+  },
+  "capture": {
+    "python": "3.13.13",
+    "packages": {
+      "Jinja2": "3.1.6",
+      "huggingface-hub": "1.29.0",
+      "tokenizers": "0.23.1",
+      "transformers": "5.16.0.dev0"
+    },
+    "tokenizerClass": "Qwen2Tokenizer",
+    "networkedWriteMode": true,
+    "checkpointWeightsLoaded": false
+  },
+  "tokenizer": {
+    "baseBpeVocabSize": 248044,
+    "effectiveTokenizerSize": 248077,
+    "modelVocabSize": 248320,
+    "modelMaxLength": 262144,
+    "bosTokenId": null,
+    "eosTokenId": 248046,
+    "padTokenId": 248044,
+    "addedTokenMapping": [
+      {
+        "id": 248044,
+        "content": "<|endoftext|>",
+        "special": true
+      },
+      {
+        "id": 248045,
+        "content": "<|im_start|>",
+        "special": true
+      },
+      {
+        "id": 248046,
+        "content": "<|im_end|>",
+        "special": true
+      },
+      {
+        "id": 248047,
+        "content": "<|object_ref_start|>",
+        "special": true
+      },
+      {
+        "id": 248048,
+        "content": "<|object_ref_end|>",
+        "special": true
+      },
+      {
+        "id": 248049,
+        "content": "<|box_start|>",
+        "special": true
+      },
+      {
+        "id": 248050,
+        "content": "<|box_end|>",
+        "special": true
+      },
+      {
+        "id": 248051,
+        "content": "<|quad_start|>",
+        "special": true
+      },
+      {
+        "id": 248052,
+        "content": "<|quad_end|>",
+        "special": true
+      },
+      {
+        "id": 248053,
+        "content": "<|vision_start|>",
+        "special": true
+      },
+      {
+        "id": 248054,
+        "content": "<|vision_end|>",
+        "special": true
+      },
+      {
+        "id": 248055,
+        "content": "<|vision_pad|>",
+        "special": true
+      },
+      {
+        "id": 248056,
+        "content": "<|image_pad|>",
+        "special": true
+      },
+      {
+        "id": 248057,
+        "content": "<|video_pad|>",
+        "special": true
+      },
+      {
+        "id": 248058,
+        "content": "<tool_call>",
+        "special": false
+      },
+      {
+        "id": 248059,
+        "content": "</tool_call>",
+        "special": false
+      },
+      {
+        "id": 248060,
+        "content": "<|fim_prefix|>",
+        "special": false
+      },
+      {
+        "id": 248061,
+        "content": "<|fim_middle|>",
+        "special": false
+      },
+      {
+        "id": 248062,
+        "content": "<|fim_suffix|>",
+        "special": false
+      },
+      {
+        "id": 248063,
+        "content": "<|fim_pad|>",
+        "special": false
+      },
+      {
+        "id": 248064,
+        "content": "<|repo_name|>",
+        "special": false
+      },
+      {
+        "id": 248065,
+        "content": "<|file_sep|>",
+        "special": false
+      },
+      {
+        "id": 248066,
+        "content": "<tool_response>",
+        "special": false
+      },
+      {
+        "id": 248067,
+        "content": "</tool_response>",
+        "special": false
+      },
+      {
+        "id": 248068,
+        "content": "<think>",
+        "special": false
+      },
+      {
+        "id": 248069,
+        "content": "</think>",
+        "special": false
+      },
+      {
+        "id": 248070,
+        "content": "<|audio_start|>",
+        "special": true
+      },
+      {
+        "id": 248071,
+        "content": "<|audio_end|>",
+        "special": true
+      },
+      {
+        "id": 248072,
+        "content": "<tts_pad>",
+        "special": true
+      },
+      {
+        "id": 248073,
+        "content": "<tts_text_bos>",
+        "special": true
+      },
+      {
+        "id": 248074,
+        "content": "<tts_text_eod>",
+        "special": true
+      },
+      {
+        "id": 248075,
+        "content": "<tts_text_bos_single>",
+        "special": true
+      },
+      {
+        "id": 248076,
+        "content": "<|audio_pad|>",
+        "special": true
+      }
+    ]
+  },
+  "oracle": {
+    "writeMode": "pinned Transformers render/error capture cross-checked byte-for-byte against an independent direct transcription",
+    "checkMode": "offline standard-library regeneration from independent transcription; no network, Transformers, tokenizers, Jinja, or weights",
+    "contractNegativeMeaning": "Hebrus text-only policy rejection before template rendering; an exact pinned-upstream contrast is retained but is not the accepted outcome",
+    "literalControlMeaning": "rendered-text reference only; literal client spellings remain bytes, and trusted-control token provenance must be preserved by the structured renderer",
+    "caseCount": 39,
+    "casesCanonicalSha256": "43021f64edd2b91e09dd6d209798f652c8f04e1588d77de4de574f9eafe85ead",
+    "cases": [
+      {
+        "name": "empty_messages",
+        "authority": "upstream-transformers",
+        "expectedOutcome": "error"
+      },
+      {
+        "name": "empty_user_content",
+        "authority": "upstream-transformers",
+        "expectedOutcome": "rendered",
+        "renderedBytes": 295,
+        "renderedSha256": "be1c0c1fd7297ff893e9ed19963727cf9cdb3766b2d4e784b5db25afdc3b94d5"
+      },
+      {
+        "name": "empty_system_content",
+        "authority": "upstream-transformers",
+        "expectedOutcome": "rendered",
+        "renderedBytes": 304,
+        "renderedSha256": "423c62a5e287bc3d6f3aea269e6aad13da58dac161b77805683366f8c27b1c54"
+      },
+      {
+        "name": "empty_assistant_content",
+        "authority": "upstream-transformers",
+        "expectedOutcome": "rendered",
+        "renderedBytes": 329,
+        "renderedSha256": "9bcc3dcab3f397538a9e0241859ef805dc15ecb13ac4361dbe6c019fa4792edb"
+      },
+      {
+        "name": "empty_tool_content",
+        "authority": "upstream-transformers",
+        "expectedOutcome": "rendered",
+        "renderedBytes": 1987,
+        "renderedSha256": "49ecba08ce17df8e9ecc81210f24840cf3e6a15a992cfbb56d83d57de5c7fe51"
+      },
+      {
+        "name": "unicode_and_information_separator_trim",
+        "authority": "upstream-transformers",
+        "expectedOutcome": "rendered",
+        "renderedBytes": 272,
+        "renderedSha256": "111ba4104dabcbd00e539b7e57c04c5de39ff01a80e3270039db4a51a728f6b9"
+      },
+      {
+        "name": "system_user_legal",
+        "authority": "upstream-transformers",
+        "expectedOutcome": "rendered",
+        "renderedBytes": 314,
+        "renderedSha256": "6f61c69b79986653c7127de7c03ec0472ed93edc3cb26129c9767e6ca8177009"
+      },
+      {
+        "name": "assistant_with_reasoning",
+        "authority": "upstream-transformers",
+        "expectedOutcome": "rendered",
+        "renderedBytes": 341,
+        "renderedSha256": "696d3590141fb6774a57fe89938b17776308bc1bf07175a63915da4926c32052"
+      },
+      {
+        "name": "initial_system_multiturn_legal",
+        "authority": "upstream-transformers",
+        "expectedOutcome": "rendered",
+        "renderedBytes": 402,
+        "renderedSha256": "dcd131b72c0a5f5cebaf1e3b33291be1c1596e97f07ccc9859d7d664990c5d68"
+      },
+      {
+        "name": "multiple_leading_system_turns_illegal",
+        "authority": "upstream-transformers",
+        "expectedOutcome": "error"
+      },
+      {
+        "name": "late_system_turn_illegal",
+        "authority": "upstream-transformers",
+        "expectedOutcome": "error"
+      },
+      {
+        "name": "unknown_role_illegal",
+        "authority": "upstream-transformers",
+        "expectedOutcome": "error"
+      },
+      {
+        "name": "assistant_only_illegal",
+        "authority": "upstream-transformers",
+        "expectedOutcome": "error"
+      },
+      {
+        "name": "tool_only_illegal",
+        "authority": "upstream-transformers",
+        "expectedOutcome": "error"
+      },
+      {
+        "name": "tool_definitions",
+        "authority": "upstream-transformers",
+        "expectedOutcome": "rendered",
+        "renderedBytes": 1739,
+        "renderedSha256": "47993aae4f0eb60b5cee486874fc90c7b7ed079f3cad1caeeef9db72df11ecb8"
+      },
+      {
+        "name": "single_tool_call",
+        "authority": "upstream-transformers",
+        "expectedOutcome": "rendered",
+        "renderedBytes": 1905,
+        "renderedSha256": "b393dddb41a1fc45589ec39ae7c225803cb775b891cf04d14e610d69e4ffeb36"
+      },
+      {
+        "name": "typed_multiple_tool_calls",
+        "authority": "upstream-transformers",
+        "expectedOutcome": "rendered",
+        "renderedBytes": 2135,
+        "renderedSha256": "f9292b22ea2c596753cd057a7578c5c55a724c6c9704785d085acc572ee1ae9e"
+      },
+      {
+        "name": "grouped_tool_results",
+        "authority": "upstream-transformers",
+        "expectedOutcome": "rendered",
+        "renderedBytes": 2124,
+        "renderedSha256": "833826d70fd60726dd8f37bedf391346bc6a8770a83d4e7b014b2883e636cfc3"
+      },
+      {
+        "name": "reasoning_effort_default_xhigh",
+        "authority": "upstream-transformers",
+        "expectedOutcome": "rendered",
+        "renderedBytes": 301,
+        "renderedSha256": "255ffc84aa487b6883ec9b60b154c20634097068de3fcbcf9c5f2128d1b21d4a"
+      },
+      {
+        "name": "reasoning_effort_explicit_xhigh",
+        "authority": "upstream-transformers",
+        "expectedOutcome": "rendered",
+        "renderedBytes": 301,
+        "renderedSha256": "255ffc84aa487b6883ec9b60b154c20634097068de3fcbcf9c5f2128d1b21d4a"
+      },
+      {
+        "name": "reasoning_effort_medium",
+        "authority": "upstream-transformers",
+        "expectedOutcome": "rendered",
+        "renderedBytes": 64,
+        "renderedSha256": "b1885aa3a5d1e5c587ed97b5f46f7f3c300aec33a3b01ed357d48c5b7c049240"
+      },
+      {
+        "name": "reasoning_effort_low",
+        "authority": "upstream-transformers",
+        "expectedOutcome": "rendered",
+        "renderedBytes": 230,
+        "renderedSha256": "1233ffd1871fdc612057f255aa6e06d05e74cbdfd6b9e1d09fa8c6afd1cbfdf6"
+      },
+      {
+        "name": "thinking_disabled",
+        "authority": "upstream-transformers",
+        "expectedOutcome": "rendered",
+        "renderedBytes": 85,
+        "renderedSha256": "a3ef944b2702d2bba07c75d45f7d26c4cc22d981bf74007f242e3137650b51fd"
+      },
+      {
+        "name": "thinking_disabled_ignores_invalid_effort",
+        "authority": "upstream-transformers",
+        "expectedOutcome": "rendered",
+        "renderedBytes": 85,
+        "renderedSha256": "a3ef944b2702d2bba07c75d45f7d26c4cc22d981bf74007f242e3137650b51fd"
+      },
+      {
+        "name": "reasoning_effort_invalid",
+        "authority": "upstream-transformers",
+        "expectedOutcome": "error"
+      },
+      {
+        "name": "prior_reasoning_preserved_by_default",
+        "authority": "upstream-transformers",
+        "expectedOutcome": "rendered",
+        "renderedBytes": 448,
+        "renderedSha256": "f616a15d6cb3800ecd799483ebea3e7d5fd6f4fb05547a3be6ffdbeb9f4e425e"
+      },
+      {
+        "name": "prior_reasoning_preserved_explicitly",
+        "authority": "upstream-transformers",
+        "expectedOutcome": "rendered",
+        "renderedBytes": 448,
+        "renderedSha256": "f616a15d6cb3800ecd799483ebea3e7d5fd6f4fb05547a3be6ffdbeb9f4e425e"
+      },
+      {
+        "name": "prior_reasoning_removed",
+        "authority": "upstream-transformers",
+        "expectedOutcome": "rendered",
+        "renderedBytes": 400,
+        "renderedSha256": "a0ffcc842fab898b4cac8640d0fd9c4a4c19b5b2080d44d940b66b643359c8f9"
+      },
+      {
+        "name": "current_tool_reasoning_survives_prior_removal",
+        "authority": "upstream-transformers",
+        "expectedOutcome": "rendered",
+        "renderedBytes": 2010,
+        "renderedSha256": "ffb64604f73fdae7399a38d2cab2a4969acc312e150cbca56f6764bdc416f844"
+      },
+      {
+        "name": "thinking_disabled_does_not_remove_recorded_reasoning",
+        "authority": "upstream-transformers",
+        "expectedOutcome": "rendered",
+        "renderedBytes": 222,
+        "renderedSha256": "49c06efcdbf13491a5951774a3a7ae0089fea8fc0d7e3bb2ec6db97426c78aad"
+      },
+      {
+        "name": "literal_controls_in_user_content",
+        "authority": "upstream-transformers",
+        "expectedOutcome": "rendered",
+        "renderedBytes": 244,
+        "renderedSha256": "348b2ec35b11bab817016df1f6a03bdc11b1e16c29369ffcdd94ebf3e87906aa"
+      },
+      {
+        "name": "literal_controls_in_system_content",
+        "authority": "upstream-transformers",
+        "expectedOutcome": "rendered",
+        "renderedBytes": 137,
+        "renderedSha256": "7506f8fd63725e402c1d57f478ec506971f205443d10daaab474f72f9d2aee1e"
+      },
+      {
+        "name": "literal_controls_in_tool_result",
+        "authority": "upstream-transformers",
+        "expectedOutcome": "rendered",
+        "renderedBytes": 1821,
+        "renderedSha256": "58669518ff57c0dca4638c01b56827c323f16c0b01d206aa49296788b0a8ee44"
+      },
+      {
+        "name": "structured_text_literal_media_token",
+        "authority": "upstream-transformers",
+        "expectedOutcome": "rendered",
+        "renderedBytes": 96,
+        "renderedSha256": "5741d92047e5c72bafb7cf96b36c6017158fe180869cfe334db52524604a4acd"
+      },
+      {
+        "name": "text_profile_user_image_rejected",
+        "authority": "contract-negative",
+        "expectedOutcome": "contract-reject",
+        "upstreamContrastOutcome": "rendered",
+        "upstreamContrastSha256": "2771a1c7c12ba1aa09cbfca97f3674eebbdc5ca9beb6d3e55475581342c4b556"
+      },
+      {
+        "name": "text_profile_user_image_url_rejected",
+        "authority": "contract-negative",
+        "expectedOutcome": "contract-reject",
+        "upstreamContrastOutcome": "rendered",
+        "upstreamContrastSha256": "1e3de8d91ed0b7f9f9f452b168df00b1de4cd796cd6e9d89d7725402e9234e00"
+      },
+      {
+        "name": "text_profile_user_video_rejected",
+        "authority": "contract-negative",
+        "expectedOutcome": "contract-reject",
+        "upstreamContrastOutcome": "rendered",
+        "upstreamContrastSha256": "c59e161e0ca73973cf2ed8d0de6bbf41613f3ad5be99910fb142454aaee08649"
+      },
+      {
+        "name": "text_profile_assistant_image_rejected",
+        "authority": "contract-negative",
+        "expectedOutcome": "contract-reject",
+        "upstreamContrastOutcome": "rendered",
+        "upstreamContrastSha256": "69b679ada247c714463ba3375e3c0951fec2f0592bf23da58bbdc5455e844ff9"
+      },
+      {
+        "name": "text_profile_system_image_rejected",
+        "authority": "contract-negative",
+        "expectedOutcome": "contract-reject",
+        "upstreamContrastOutcome": "error"
+      }
+    ]
+  },
+  "golden": {
+    "path": "tests/qwen4exp/qwen4exp_chat_golden.json",
+    "bytes": 103792,
+    "sha256": "377aecbc67bdd7bc02390e8973a442e9abd9ca00a75a892b5aac277812bfb9d9"
+  },
+  "cFixture": {
+    "path": "tests/qwen4exp/qwen4exp_chat_golden.inc",
+    "bytes": 102372,
+    "sha256": "6ad6375da6703f9d7aa967bf3bdd498c87f14946756a1f092fdc8b45016739a6"
+  }
+}

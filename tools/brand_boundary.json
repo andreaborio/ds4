@@ -236,14 +236,14 @@
       "location": "content",
       "token": "ds4",
       "classification": "compatibility",
-      "maximum": 654
+      "maximum": 742
     },
     {
       "path": "Makefile",
       "location": "content",
       "token": "DS4",
       "classification": "compatibility",
-      "maximum": 62
+      "maximum": 70
     },
     {
       "path": "ONEDGE_IMATRIX.md",
@@ -425,7 +425,7 @@
       "location": "content",
       "token": "ds4",
       "classification": "migration-pending",
-      "maximum": 53
+      "maximum": 54
     },
     {
       "path": "docs/architecture/CODEMAP.md",
@@ -992,14 +992,14 @@
       "location": "content",
       "token": "ds4",
       "classification": "migration-pending",
-      "maximum": 5252
+      "maximum": 5292
     },
     {
       "path": "ds4.c",
       "location": "content",
       "token": "DS4",
       "classification": "migration-pending",
-      "maximum": 4565
+      "maximum": 4601
     },
     {
       "path": "ds4.h",
@@ -1013,14 +1013,14 @@
       "location": "content",
       "token": "ds4",
       "classification": "migration-pending",
-      "maximum": 322
+      "maximum": 333
     },
     {
       "path": "ds4.h",
       "location": "content",
       "token": "DS4",
       "classification": "migration-pending",
-      "maximum": 40
+      "maximum": 45
     },
     {
       "path": "ds4_agent.c",
@@ -1455,6 +1455,48 @@
       "token": "DS4",
       "classification": "migration-pending",
       "maximum": 60
+    },
+    {
+      "path": "ds4_qwen4exp_chat.c",
+      "location": "path",
+      "token": "ds4",
+      "classification": "migration-pending",
+      "maximum": 1
+    },
+    {
+      "path": "ds4_qwen4exp_chat.c",
+      "location": "content",
+      "token": "ds4",
+      "classification": "migration-pending",
+      "maximum": 38
+    },
+    {
+      "path": "ds4_qwen4exp_chat.c",
+      "location": "content",
+      "token": "DS4",
+      "classification": "migration-pending",
+      "maximum": 48
+    },
+    {
+      "path": "ds4_qwen4exp_chat.h",
+      "location": "path",
+      "token": "ds4",
+      "classification": "migration-pending",
+      "maximum": 1
+    },
+    {
+      "path": "ds4_qwen4exp_chat.h",
+      "location": "content",
+      "token": "ds4",
+      "classification": "migration-pending",
+      "maximum": 41
+    },
+    {
+      "path": "ds4_qwen4exp_chat.h",
+      "location": "content",
+      "token": "DS4",
+      "classification": "migration-pending",
+      "maximum": 31
     },
     {
       "path": "ds4_qwen4exp_ref.c",
@@ -2567,7 +2609,7 @@
       "location": "content",
       "token": "ds4",
       "classification": "migration-pending",
-      "maximum": 7
+      "maximum": 24
     },
     {
       "path": "tests/internal/ds4_qwen_cpu_test_hooks.h",
@@ -2658,7 +2700,7 @@
       "location": "content",
       "token": "ds4",
       "classification": "migration-pending",
-      "maximum": 3
+      "maximum": 4
     },
     {
       "path": "tests/qwen4exp/README.md",
@@ -2666,6 +2708,34 @@
       "token": "DS4",
       "classification": "migration-pending",
       "maximum": 2
+    },
+    {
+      "path": "tests/qwen4exp/collect_chat_reference.py",
+      "location": "content",
+      "token": "ds4",
+      "classification": "migration-pending",
+      "maximum": 8
+    },
+    {
+      "path": "tests/qwen4exp/collect_chat_reference.py",
+      "location": "content",
+      "token": "DS4",
+      "classification": "migration-pending",
+      "maximum": 25
+    },
+    {
+      "path": "tests/qwen4exp/qwen4exp_chat_golden.inc",
+      "location": "content",
+      "token": "ds4",
+      "classification": "migration-pending",
+      "maximum": 63
+    },
+    {
+      "path": "tests/qwen4exp/qwen4exp_chat_golden.inc",
+      "location": "content",
+      "token": "DS4",
+      "classification": "migration-pending",
+      "maximum": 267
     },
     {
       "path": "tests/qwen4exp/qwen4exp_gguf_fixture.py",
@@ -2962,6 +3032,20 @@
       "maximum": 8
     },
     {
+      "path": "tests/test_qwen4exp_chat.c",
+      "location": "content",
+      "token": "ds4",
+      "classification": "migration-pending",
+      "maximum": 41
+    },
+    {
+      "path": "tests/test_qwen4exp_chat.c",
+      "location": "content",
+      "token": "DS4",
+      "classification": "migration-pending",
+      "maximum": 16
+    },
+    {
       "path": "tests/test_qwen4exp_profile.c",
       "location": "content",
       "token": "ds4",
@@ -2988,6 +3072,20 @@
       "token": "DS4",
       "classification": "migration-pending",
       "maximum": 19
+    },
+    {
+      "path": "tests/test_qwen4exp_tokenizer.c",
+      "location": "content",
+      "token": "ds4",
+      "classification": "migration-pending",
+      "maximum": 62
+    },
+    {
+      "path": "tests/test_qwen4exp_tokenizer.c",
+      "location": "content",
+      "token": "DS4",
+      "classification": "migration-pending",
+      "maximum": 21
     },
     {
       "path": "tests/test_qwen_attention_ref.c",

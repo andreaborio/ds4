@@ -776,16 +776,35 @@
       ]
     },
     "tokenizer": {
-      "verification": "declared-provenance-and-special-ids-only",
-      "tokenizerContentVerified": false,
-      "fullSpecialMappingVerified": false,
+      "verification": "pinned-tokenizer-json-and-chat-template-oracles",
+      "tokenizerContentVerified": true,
+      "fullSpecialMappingVerified": true,
       "phase": 4,
-      "status": "pending",
+      "status": "model-free-closed",
       "declaredProvenance": {
         "tokenizerSha256": "0997f410c57a1f4e53b09e4be8f4a172d90edd9564368fb0847030937229b9f3",
         "tokenizerConfigSha256": "b11349aafa7cdc6a320767cf7ceb29ed82f7eda5d65e8e0819e76f0ce947bf27",
         "chatTemplateSha256": "c3cf9e34abf4f9e36c2d72165aa9c132d3e2a725b6c2586aaa3a8af9d7a81041"
       },
+      "authority": {
+        "backend": "transformers.tokenization_utils_tokenizers.TokenizersBackend",
+        "source": "tokenizer.json",
+        "autoTokenizerAuthoritative": false,
+        "autoTokenizerDivergence": "Qwen2 reconstruction omits combining marks from the tokenizer.json pretokenize regex"
+      },
+      "normalizer": "NFC",
+      "pretokenizeRegex": "(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\\r\\n\\p{L}\\p{N}]?[\\p{L}\\p{M}]+|\\p{N}| ?[^\\s\\p{L}\\p{M}\\p{N}]+[\\r\\n]*|\\s*[\\r\\n]+|\\s+(?!\\S)|\\s+",
+      "addPrefixSpace": false,
+      "baseVocabularySize": 248044,
+      "effectiveValidVocabularySize": 248077,
+      "maximumValidTokenId": 248076,
+      "physicalLogitsWidth": 248320,
+      "unassignedPhysicalIdRangeHalfOpen": [248077, 248320],
+      "samplingRule": "sample IDs in [0, 248077); mask physical logits IDs in [248077, 248320)",
+      "stopIds": [248044, 248046],
+      "addedTokenCount": 33,
+      "addedTokenMappingSha256": "ab0588e18b35566af8b63ba38e0dd775e4b1bb9e7ac3194003e3fc1d3904b2b1",
+      "backendSpecialTokenIdsSha256": "905687865be3305fa6f3274b04785e2eec9420ddf9e176786a76ba37e66b18da",
       "declaredModelConfigIds": {
         "bos": 248044,
         "pad": 248044,
@@ -807,6 +826,34 @@
         "visionPad": 248055,
         "imagePad": 248056,
         "videoPad": 248057
+      },
+      "chatTemplate": {
+        "defaultReasoningEffort": "xhigh",
+        "supportedReasoningEfforts": ["xhigh", "medium", "low"],
+        "mediumSystemInstruction": false,
+        "lowSystemInstruction": "short",
+        "disabledThinkingEmitsClosedEmptyThink": true,
+        "disabledThinkingIgnoresInvalidEffort": true,
+        "preserveThinkingDefault": true,
+        "preserveThinkingFalseKeepsCurrentToolChainReasoning": true,
+        "systemMessageRule": "zero or one system message; when present it is first",
+        "toolsJson": "insertion-ordered UTF-8",
+        "emptyConversationError": "wrapper ValueError",
+        "assistantOrToolOnlyError": "No user query",
+        "structuredMediaPolicy": "reject image, image_url and video parts before template rendering",
+        "trimPolicy": "Python str.strip Unicode whitespace plus U+001C..U+001F",
+        "segmentKinds": ["DATA", "TRUSTED_CONTROL"],
+        "segmentRule": "tokenize each contiguous segment independently; client DATA never gains trusted control-token status"
+      },
+      "oracles": {
+        "tokenizerTextCases": 59,
+        "tokenizerDecodeControls": 6,
+        "tokenizerPayloadSha256": "7798f292df893fb9928b138988c9b41068b212925308833de155c1674e32b382",
+        "tokenizerGoldenFileSha256": "062112e2f3a7a5988184be0059b99f5483f588d9ba7ee1a3a2b4bfc1f062dd29",
+        "chatCases": 39,
+        "chatUpstreamCases": 34,
+        "chatContractNegativeCases": 5,
+        "chatCasesCanonicalSha256": "43021f64edd2b91e09dd6d209798f652c8f04e1588d77de4de574f9eafe85ead"
       }
     }
   },
