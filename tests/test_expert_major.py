@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import dataclasses
+import hashlib
 import importlib.util
 import os
 import shutil
@@ -80,6 +82,19 @@ def write_fixture(path: Path, architecture: str, *,
         )
         routed_layers = (0, 1)
         types = ((17, 17, 18), (18, 18, 23))
+    elif architecture == "qwen4exp":
+        metadata_items = (
+            metadata_string("general.architecture", reported_architecture),
+            metadata_u32("general.alignment", 32),
+            metadata_u32("qwen4exp.block_count", 48),
+            metadata_u32("qwen4exp.expert_count", 512),
+            metadata_u32("qwen4exp.expert_used_count", 10),
+        )
+        # The Phase-2 source stub intentionally has no routed payload. The
+        # converter must reject it before inventory traversal because no
+        # Qwen4Exp release codec has been selected.
+        routed_layers = ()
+        types = ()
     else:
         raise AssertionError(f"unsupported fixture architecture: {architecture}")
     metadata_items = tuple(
@@ -134,6 +149,89 @@ def write_fixture(path: Path, architecture: str, *,
             cursor = offset + len(payload)
 
 
+def sha256(path: Path) -> str:
+    with path.open("rb") as file:
+        return hashlib.file_digest(file, "sha256").hexdigest()
+
+
+def write_affine_descriptor_fixture(
+        path: Path, tool, *, family: int, block_elements: int,
+        bad_qwen4_geometry: bool = False) -> tuple[object, object]:
+    """Write header+descriptors only; the multi-GiB payload stays virtual."""
+
+    if family == tool.STORE_FAMILY_QWEN4EXP:
+        layer_count, expert_count, expert_used = 48, 512, 10
+        gate_dims = (2496, 640, 512) if bad_qwen4_geometry else \
+            (2560, 640, 512)
+        down_dims = (640, gate_dims[0], 512)
+    elif family == tool.STORE_FAMILY_QWEN35_MOE:
+        layer_count, expert_count, expert_used = 2, 3, 2
+        gate_dims = (256, 256, 3)
+        down_dims = gate_dims
+    else:
+        raise AssertionError(family)
+
+    data_offset = tool.align_up(
+        tool.STORE_HEADER_BYTES + layer_count * tool.STORE_LAYER_BYTES,
+        tool.STORE_ALIGNMENT,
+    )
+    cursor = data_offset
+    layers = []
+    for layer_index in range(layer_count):
+        components = []
+        record_offset = 0
+        for role, dims in enumerate((gate_dims, gate_dims, down_dims)):
+            elements = dims[0] * dims[1]
+            if family == tool.STORE_FAMILY_QWEN4EXP:
+                expert_bytes = elements // 64 * 36
+            else:
+                expert_bytes = tool.tensor_nbytes(12, (dims[0], dims[1], 1))
+            tensor = tool.Tensor(
+                f"blk.{layer_index}.ffn_{tool.ROLE_NAME[role]}_exps.weight",
+                dims, 12, 0, expert_bytes * expert_count,
+            )
+            components.append(tool.Component(
+                role, tensor, expert_bytes, record_offset, block_elements,
+            ))
+            record_offset += expert_bytes
+        cursor = tool.align_up(cursor, tool.STORE_ALIGNMENT)
+        layer_size = record_offset * expert_count
+        layers.append(tool.Layer(
+            layer_index, expert_count, record_offset, cursor, layer_size,
+            tuple(components),
+        ))
+        cursor += layer_size
+
+    source = tool.GGUF(
+        path, 4096, 3, 0, 32, b"", {}, [], 0,
+    )
+    descriptors = b"".join(tool.pack_layer(layer) for layer in layers)
+    plan = tool.StorePlan(
+        source, family, tool.STORE_STORAGE_MLX_AFFINE4, 64,
+        layer_count, expert_count, expert_used, 1658,
+        descriptors, data_offset, cursor - data_offset, cursor, layers,
+    )
+    provisional = tool.make_header(plan, bytes(32), bytes(32))
+    header = tool.make_header(
+        plan, bytes(32), bytes(32),
+        tool.manifest_digest(provisional, descriptors),
+    )
+    path.write_bytes(header + descriptors)
+    # The descriptor declares the exact production geometry. Extending the
+    # file sparsely lets the same bounded fixture pass the C extent checks
+    # without allocating or writing the roughly 67 GiB routed payload.
+    with path.open("r+b") as file:
+        file.truncate(plan.store_size)
+    tensor = tool.Tensor(
+        tool.STORE_TENSOR, (plan.store_size,), 24, 0, plan.store_size,
+        abs_offset=0,
+    )
+    native = tool.GGUF(
+        path, path.stat().st_size, 3, 0, 32, b"", {}, [tensor], 0,
+    )
+    return native, tensor
+
+
 def run(*args: str, ok: bool = True) -> subprocess.CompletedProcess[str]:
     result = subprocess.run(
         [sys.executable, str(TOOL), *args], text=True,
@@ -148,6 +246,24 @@ def run(*args: str, ok: bool = True) -> subprocess.CompletedProcess[str]:
 
 def main() -> int:
     tool = load_tool()
+    descriptors = tool.EXPERT_FAMILY_DESCRIPTORS
+    assert isinstance(descriptors, tuple)
+    assert [descriptor.family for descriptor in descriptors] == [1, 2, 3, 4]
+    qwen4_descriptor = tool.family_descriptor(architecture="qwen4exp")
+    assert (qwen4_descriptor.exact_layers,
+            qwen4_descriptor.exact_experts,
+            qwen4_descriptor.exact_experts_used) == (48, 512, 10)
+    assert qwen4_descriptor.admitted_storage_formats == (
+        tool.STORE_STORAGE_MLX_AFFINE4,
+    )
+    try:
+        qwen4_descriptor.exact_experts = 384
+    except dataclasses.FrozenInstanceError:
+        pass
+    else:
+        raise AssertionError("ExpertMajor family descriptor is mutable")
+    assert tool.STORE_MAX_EXPERTS == 512
+
     probe = os.environ.get("DS4_EXPERT_STORE_PROBE")
     with tempfile.TemporaryDirectory(prefix="ds4-expert-major-test-") as tmp:
         tmp_path = Path(tmp)
@@ -168,6 +284,32 @@ def main() -> int:
         built = run("build", "--reserve-bytes", "0", str(source), str(native))
         assert "installed atomically" in built.stdout
         run("verify", str(source), str(native))
+        assert sha256(source) == \
+            "d059e0a1572cc1ebdab0c01e7efc720d8660d294d9836180c5393c5880b1ccc3"
+        assert sha256(native) == \
+            "89f8818ca36e6cf8db88eb1ba54cfd310e60acec58e67aba23468fe0d056f33e"
+
+        atomic_target = tmp_path / "atomic-native.gguf"
+        atomic_target.write_bytes(b"existing destination")
+        original_verify = tool.verify
+        try:
+            def fail_verify(_source, _native):
+                raise tool.FormatError("injected post-write verify failure")
+
+            tool.verify = fail_verify
+            try:
+                tool.build(source, atomic_target, 0, True)
+            except tool.FormatError as exc:
+                assert "injected post-write verify failure" in str(exc)
+            else:
+                raise AssertionError("injected converter failure vanished")
+        finally:
+            tool.verify = original_verify
+        assert atomic_target.read_bytes() == b"existing destination"
+        assert not list(tmp_path.glob(".atomic-native.gguf.tmp.*"))
+        tool.build(source, atomic_target, 0, True)
+        assert sha256(atomic_target) == sha256(native)
+        assert not list(tmp_path.glob(".atomic-native.gguf.tmp.*"))
 
         native_gguf = tool.load_gguf(native)
         store = next(t for t in native_gguf.tensors if t.name == tool.STORE_TENSOR)
@@ -230,6 +372,10 @@ def main() -> int:
         run("build", "--reserve-bytes", "0", str(glm_source),
             str(glm_native))
         run("verify", str(glm_source), str(glm_native))
+        assert sha256(glm_source) == \
+            "cff321ec7a3131836896c4a33148ac1255da002b58067e684d41dd940e8d1478"
+        assert sha256(glm_native) == \
+            "58aabe8367516b78a0b1e92e3a91cde011fc16375c8ae3edcfcca145590bd1d2"
         glm_gguf = tool.load_gguf(glm_native)
         glm_store = next(
             tensor for tensor in glm_gguf.tensors
@@ -260,6 +406,10 @@ def main() -> int:
         run("build", "--reserve-bytes", "0", str(qwen_source),
             str(qwen_native))
         run("verify", str(qwen_source), str(qwen_native))
+        assert sha256(qwen_source) == \
+            "645d00e4774324c1ee37129690094c9e7fac1c391c661aadb1d131914eaf9be8"
+        assert sha256(qwen_native) == \
+            "ba1ebc3860538b0f088848f5e76e680c4d4aa05084399487c1e36691269c0ce8"
         qwen_gguf = tool.load_gguf(qwen_native)
         qwen_store = next(
             tensor for tensor in qwen_gguf.tensors
@@ -317,7 +467,7 @@ def main() -> int:
         architecture_result = run(
             "inspect", str(qwen_bad_architecture), ok=False
         )
-        assert "accepts deepseek4, glm-dsa, and qwen35moe" in \
+        assert "accepts deepseek4, glm-dsa, qwen35moe, qwen4exp" in \
             architecture_result.stderr
 
         qwen_bad_payload = tmp_path / "qwen-bad-payload.gguf"
@@ -336,6 +486,103 @@ def main() -> int:
                  str(qwen_store.size), str(tool.STORE_FAMILY_QWEN35_MOE)],
                 check=True,
             )
+
+        qwen4_source = tmp_path / "qwen4exp-source-stub.gguf"
+        write_fixture(qwen4_source, "qwen4exp")
+        qwen4_result = run("inspect", str(qwen4_source), ok=False)
+        assert "no release-qualified routed codec" in qwen4_result.stderr
+
+        # Family 4 uses exact logical 48x512 geometry and the G64 affine
+        # descriptor (64 elements / 36 bytes). The descriptor-only fixture
+        # keeps the roughly 67 GiB logical payload sparse and allocates only
+        # the manifest filesystem blocks.
+        qwen4_manifest_path = tmp_path / "qwen4exp-affine-descriptor.bin"
+        qwen4_native, qwen4_tensor = write_affine_descriptor_fixture(
+            qwen4_manifest_path, tool,
+            family=tool.STORE_FAMILY_QWEN4EXP,
+            block_elements=64,
+        )
+        qwen4_manifest, qwen4_layers = tool.parse_store(
+            qwen4_native, qwen4_tensor,
+        )
+        assert qwen4_manifest["family"] == tool.STORE_FAMILY_QWEN4EXP
+        assert qwen4_manifest["storage_format"] == \
+            tool.STORE_STORAGE_MLX_AFFINE4
+        assert qwen4_manifest["group_size"] == 64
+        assert (qwen4_manifest["layer_count"],
+                qwen4_manifest["expert_count"],
+                qwen4_manifest["expert_used"]) == (48, 512, 10)
+        assert len(qwen4_layers) == 48
+        assert all(
+            component.block_elements == 64
+            for layer in qwen4_layers for component in layer.components
+        )
+        qwen4_stat = qwen4_manifest_path.stat()
+        assert qwen4_stat.st_size == qwen4_manifest["store_size"]
+        assert qwen4_stat.st_blocks * 512 < 1 << 20
+        if probe:
+            subprocess.run(
+                [probe, str(qwen4_manifest_path), "0",
+                 str(qwen4_tensor.size), str(tool.STORE_FAMILY_QWEN4EXP),
+                 str(tool.STORE_STORAGE_MLX_AFFINE4), "64"],
+                check=True,
+            )
+
+        qwen4_bad_block = tmp_path / "qwen4exp-bad-block.bin"
+        bad_native, bad_tensor = write_affine_descriptor_fixture(
+            qwen4_bad_block, tool,
+            family=tool.STORE_FAMILY_QWEN4EXP,
+            block_elements=256,
+        )
+        try:
+            tool.parse_store(bad_native, bad_tensor)
+        except tool.FormatError as exc:
+            assert "physical codec descriptor" in str(exc)
+        else:
+            raise AssertionError("family4 accepted legacy block_elements=256")
+
+        qwen4_bad_geometry = tmp_path / "qwen4exp-bad-geometry.bin"
+        bad_native, bad_tensor = write_affine_descriptor_fixture(
+            qwen4_bad_geometry, tool,
+            family=tool.STORE_FAMILY_QWEN4EXP,
+            block_elements=64,
+            bad_qwen4_geometry=True,
+        )
+        try:
+            tool.parse_store(bad_native, bad_tensor)
+        except tool.FormatError as exc:
+            assert "Qwen4Exp affine descriptor" in str(exc)
+        else:
+            raise AssertionError("family4 accepted wrong affine geometry")
+
+        # Family 3 remains byte-/descriptor-compatible with its existing
+        # same-size Q4_K manifest convention: block_elements stays 256.
+        legacy_path = tmp_path / "qwen35-affine-descriptor.bin"
+        legacy_native, legacy_tensor = write_affine_descriptor_fixture(
+            legacy_path, tool,
+            family=tool.STORE_FAMILY_QWEN35_MOE,
+            block_elements=256,
+        )
+        legacy_manifest, legacy_layers = tool.parse_store(
+            legacy_native, legacy_tensor,
+        )
+        assert legacy_manifest["family"] == tool.STORE_FAMILY_QWEN35_MOE
+        assert all(
+            component.block_elements == 256
+            for layer in legacy_layers for component in layer.components
+        )
+        legacy_bad_path = tmp_path / "qwen35-affine-bad-block.bin"
+        bad_native, bad_tensor = write_affine_descriptor_fixture(
+            legacy_bad_path, tool,
+            family=tool.STORE_FAMILY_QWEN35_MOE,
+            block_elements=64,
+        )
+        try:
+            tool.parse_store(bad_native, bad_tensor)
+        except tool.FormatError as exc:
+            assert "physical codec descriptor" in str(exc)
+        else:
+            raise AssertionError("family3 accepted family4 block_elements=64")
 
     print("expert-major v2 converter and verifier: OK")
     return 0

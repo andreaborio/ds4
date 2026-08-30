@@ -57,7 +57,8 @@ SERVER_ALIAS_PORT ?= 0
 	qwen-fused-split-q-norm-metal-kernel-test \
 	qwen-reference-test qwen-unicode-test qwen-tokenizer-test \
 	qwen4exp-profile-test qwen4exp-reference-test \
-	qwen4exp-fixture-check qwen4exp-sanitizer-test \
+	qwen4exp-fixture-check qwen4exp-converter-test \
+	qwen4exp-ple-store-test qwen4exp-sanitizer-test \
 	qwen-expert-group-test qwen-24g-fixture-test \
 	expert-store-test metal-ssd-profile-test \
 	download-model-test capabilities-test command-alias-test \
@@ -71,9 +72,17 @@ qwen4exp-fixture-check: tests/qwen4exp/collect_scalar_reference.py \
 		tests/qwen4exp/qwen4exp_scalar_provenance.json
 	python3 tests/qwen4exp/collect_scalar_reference.py --check
 
+qwen4exp-converter-test: gguf-tools/qwen4exp-profile.py \
+		tests/qwen4exp/test_qwen4exp_profile.py \
+		docs/contracts/qwen4exp-profile.json \
+		tests/qwen4exp/fixtures/qwen38flash-next-inventory-v1.json
+	PYTHONDONTWRITEBYTECODE=1 python3 tests/qwen4exp/test_qwen4exp_profile.py
+
 qwen4exp-sanitizer-test: ds4_qwen4exp.c ds4_qwen4exp.h \
 		ds4_qwen4exp_ref.c ds4_qwen4exp_ref.h \
+		ds4_ple_store.c ds4_ple_store.h \
 		tests/test_qwen4exp_profile.c tests/test_qwen4exp_ref.c \
+		tests/test_ple_store.c \
 		tests/qwen4exp/qwen4exp_scalar_golden.inc
 	@mkdir -p "$(BUILD_ROOT)/qwen4exp-sanitizer"
 	$(CC) -O1 -g -Wall -Wextra -Wpedantic -Werror -std=c99 \
@@ -90,6 +99,13 @@ qwen4exp-sanitizer-test: ds4_qwen4exp.c ds4_qwen4exp.h \
 		ds4_qwen4exp.c ds4_qwen4exp_ref.c tests/test_qwen4exp_ref.c -lm
 	ASAN_OPTIONS=halt_on_error=1 UBSAN_OPTIONS=halt_on_error=1 \
 		"$(BUILD_ROOT)/qwen4exp-sanitizer/test_ref"
+	$(CC) -O1 -g -Wall -Wextra -Wpedantic -Werror -std=c99 \
+		-fsanitize=address,undefined -fno-sanitize-recover=all \
+		-fno-omit-frame-pointer -I. -o \
+		"$(BUILD_ROOT)/qwen4exp-sanitizer/test_ple_store" \
+		ds4_ple_store.c tests/test_ple_store.c -lm
+	ASAN_OPTIONS=halt_on_error=1 UBSAN_OPTIONS=halt_on_error=1 \
+		"$(BUILD_ROOT)/qwen4exp-sanitizer/test_ple_store"
 
 download-model-test: tests/test_download_model.sh download_model.sh \
 		docs/contracts/qwen-release.json
@@ -190,6 +206,7 @@ METAL_TEST_BINS := \
 	$(METAL_BINDIR)/test_qwen_state \
 	$(METAL_BINDIR)/test_qwen4exp_profile \
 	$(METAL_BINDIR)/test_qwen4exp_ref \
+	$(METAL_BINDIR)/test_ple_store \
 	$(METAL_BINDIR)/test_qwen_unicode \
 	$(METAL_BINDIR)/test_qwen_tokenizer \
 	$(METAL_BINDIR)/test_qwen_expert_group \
@@ -501,6 +518,14 @@ $(METAL_OBJDIR)/test_qwen4exp_ref.o: tests/test_qwen4exp_ref.c \
 	@mkdir -p "$(@D)"
 	$(CC) $(QWEN4EXP_REF_CFLAGS) $(DEPFLAGS) -I. -c -o $@ $<
 
+$(METAL_OBJDIR)/ds4_ple_store.o: ds4_ple_store.c ds4_ple_store.h
+	@mkdir -p "$(@D)"
+	$(CC) $(QWEN4EXP_REF_CFLAGS) $(DEPFLAGS) -I. -c -o $@ $<
+
+$(METAL_OBJDIR)/test_ple_store.o: tests/test_ple_store.c ds4_ple_store.h
+	@mkdir -p "$(@D)"
+	$(CC) $(QWEN4EXP_REF_CFLAGS) $(DEPFLAGS) -I. -c -o $@ $<
+
 $(METAL_BINDIR)/ds4_test: \
 	$(METAL_OBJDIR)/ds4_test.o $(METAL_OBJDIR)/ds4_help.o \
 	$(METAL_OBJDIR)/ds4_kvstore.o $(METAL_OBJDIR)/rax.o \
@@ -596,6 +621,12 @@ $(METAL_BINDIR)/test_qwen4exp_ref: \
 		$(METAL_OBJDIR)/test_qwen4exp_ref.o \
 		$(METAL_OBJDIR)/ds4_qwen4exp_ref.o \
 		$(METAL_OBJDIR)/ds4_qwen4exp.o
+	@mkdir -p "$(@D)"
+	$(CC) $(QWEN4EXP_REF_CFLAGS) -o $@ $^ -lm
+
+$(METAL_BINDIR)/test_ple_store: \
+		$(METAL_OBJDIR)/test_ple_store.o \
+		$(METAL_OBJDIR)/ds4_ple_store.o
 	@mkdir -p "$(@D)"
 	$(CC) $(QWEN4EXP_REF_CFLAGS) -o $@ $^ -lm
 
@@ -695,6 +726,9 @@ qwen4exp-reference-test: qwen4exp-fixture-check \
 		$(METAL_BINDIR)/test_qwen4exp_ref
 	$(METAL_BINDIR)/test_qwen4exp_ref
 
+qwen4exp-ple-store-test: $(METAL_BINDIR)/test_ple_store
+	$<
+
 qwen-unicode-test: $(METAL_BINDIR)/test_qwen_unicode
 	python3 tests/gen_qwen_unicode.py --check
 	$(METAL_BINDIR)/test_qwen_unicode
@@ -716,6 +750,7 @@ model-free-test: metal ds4_test ds4_agent_test $(METAL_BINDIR)/test_q4k_dot \
 		$(METAL_BINDIR)/test_qwen_attention_ref \
 		$(METAL_BINDIR)/test_qwen_state \
 		qwen4exp-profile-test qwen4exp-reference-test \
+		qwen4exp-converter-test qwen4exp-ple-store-test \
 		$(METAL_BINDIR)/test_qwen_unicode \
 		$(METAL_BINDIR)/test_qwen_tokenizer \
 		$(METAL_BINDIR)/test_qwen_expert_group \
@@ -957,6 +992,7 @@ model-free-test: $(PROGRAMS) ds4_test ds4_agent_test q4k-dot-test \
 		tests/test_qwen_gdn_ref tests/test_qwen_attention_ref \
 		tests/test_qwen_state tests/test_qwen_unicode \
 		qwen4exp-profile-test qwen4exp-reference-test \
+		qwen4exp-converter-test qwen4exp-ple-store-test \
 		tests/test_qwen_expert_group \
 		tests/test_expert_store \
 		tests/test_metal_ssd_profile \
@@ -1089,11 +1125,18 @@ tests/test_qwen4exp_ref: tests/test_qwen4exp_ref.c \
 	$(CC) $(QWEN4EXP_REF_CFLAGS) -I. -o $@ \
 		tests/test_qwen4exp_ref.c ds4_qwen4exp_ref.c ds4_qwen4exp.c -lm
 
+tests/test_ple_store: tests/test_ple_store.c ds4_ple_store.c ds4_ple_store.h
+	$(CC) $(QWEN4EXP_REF_CFLAGS) -I. -o $@ \
+		tests/test_ple_store.c ds4_ple_store.c -lm
+
 qwen4exp-profile-test: tests/test_qwen4exp_profile
 	./tests/test_qwen4exp_profile
 
 qwen4exp-reference-test: qwen4exp-fixture-check tests/test_qwen4exp_ref
 	./tests/test_qwen4exp_ref
+
+qwen4exp-ple-store-test: tests/test_ple_store
+	./tests/test_ple_store
 
 tests/test_qwen_unicode: tests/test_qwen_unicode.c ds4_qwen_unicode.c \
 		ds4_qwen_unicode.h ds4_qwen_unicode_data.inc
@@ -1318,6 +1361,7 @@ clean:
 		tests/test_qwen_gdn_ref tests/test_qwen_attention_ref \
 		tests/test_qwen_state tests/test_qwen_unicode \
 		tests/test_qwen4exp_profile tests/test_qwen4exp_ref \
+		tests/test_ple_store \
 		tests/test_qwen_expert_group \
 		tests/test_expert_store \
 		tests/test_metal_ssd_profile \

@@ -785,10 +785,39 @@ def check_ple_extent(contract: dict, fixture: dict, errors: list[str]) -> int:
     roles = contract["tensorRoles"]
     derived = derived_rules(contract, fixture)
     ple_prefix = roles["pleLayerPattern"]
+    cfg = text_config(contract)
+    hash_doc = contract["pleHash"]
+    row_alignment = extent["rowAlignment"]
+    head_rows = extent["headRows"]
+    padded_rows = (head_rows + row_alignment - 1) // row_alignment * row_alignment
+    wire = extent["wireFormat"]
     eq(errors, "[pleExtent.rows]", "extent rows vs recomputed padded rows",
-       extent["rows"], derived and contract["pleHash"]["paddedRows"])
+       extent["rows"], derived and hash_doc["paddedRows"])
     eq(errors, "[pleExtent.rowWidth]", "extent row width vs PLE head width",
        extent["rowWidth"], derived["ple_head_dim"])
+    eq(errors, "[pleExtent.version]", "PLE wire version", extent["version"], 1)
+    eq(errors, "[pleExtent.family]", "PLE family vs Qwen4Exp identity",
+       extent["family"], contract["identity"]["expertStoreFamily"])
+    eq(errors, "[pleExtent.profile]", "PLE profile vs artifact identity",
+       extent["profileId"], contract["identity"]["artifactProfileId"])
+    eq(errors, "[pleExtent.hashId]", "closed PLE hash identity",
+       extent["hashId"], "SplitMix64-Qwen4Exp-v1")
+    eq(errors, "[pleExtent.headRows]", "logical head rows vs PLE hash",
+       head_rows, hash_doc["totalHeadRows"])
+    eq(errors, "[pleExtent.rowAlignment]", "row alignment vs pinned divisor",
+       row_alignment, cfg["make_ngram_vocab_size_divisible_by"])
+    eq(errors, "[pleExtent.rowAlignmentExact]", "closed row alignment",
+       row_alignment, 128)
+    eq(errors, "[pleExtent.alignedRows]", "rows are align_up(head rows, 128)",
+       extent["rows"], padded_rows)
+    eq(errors, "[pleExtent.paddingRows]", "padding rows vs aligned head rows",
+       extent["paddingRows"], extent["rows"] - head_rows)
+    eq(errors, "[pleExtent.paddingRowsExact]", "closed padding row count",
+       extent["paddingRows"], 90)
+    eq(errors, "[pleExtent.rowsAligned]", "padded rows are row-aligned",
+       extent["rows"] % row_alignment, 0)
+    eq(errors, "[pleExtent.paddingBound]", "padding is below one alignment unit",
+       0 <= extent["paddingRows"] < row_alignment, True)
     eq(errors, "[pleExtent.shards]", "extent shard count vs split_ngram_parts",
        extent["embeddingShardCount"], text_config(contract)["split_ngram_parts"])
     eq(errors, "[pleExtent.shardRows]", "shard rows times shard count covers the extent",
@@ -817,9 +846,39 @@ def check_ple_extent(contract: dict, fixture: dict, errors: list[str]) -> int:
        extent["rows"] * extent["rowWidth"] * 2, ple_bytes)
     eq(errors, "[pleExtent.magic]", "extent magic matches the closed identity",
        extent["magic"], contract["identity"]["pleExtentMagic"])
+    expected_wire = {
+        "endianness": "little",
+        "headerBytes": 512,
+        "pageHeaderBytes": 64,
+        "minimumPageAlignment": 4096,
+        "pageDigestAlgorithm": "SHA-256",
+        "pageDigestBytes": 32,
+        "pageDigestTable": "one digest per fixed page; no per-row index",
+        "manifestDigest": "SHA-256(header with manifest digest zeroed || page-digest table || alignment padding)",
+        "payloadDigest": "SHA-256 over every complete fixed-stride physical page in order",
+        "codecBinding": "caller supplies one exact codec id/version/group-size/encoded-row-bytes descriptor",
+    }
+    eq(errors, "[pleExtent.wire.closed]", "closed PLE v1 wire format",
+       wire, expected_wire)
+    eq(errors, "[pleExtent.wire.digestBytes]", "SHA-256 digest width",
+       wire["pageDigestBytes"], hashlib.sha256().digest_size)
+    eq(errors, "[pleExtent.wire.headerPageRatio]", "page header divides manifest header",
+       wire["headerBytes"] % wire["pageHeaderBytes"], 0)
+    eq(errors, "[pleExtent.wire.pageAlignment]", "closed minimum page alignment",
+       wire["minimumPageAlignment"], 4096)
+    eq(errors, "[pleExtent.wire.alignmentPowerOfTwo]", "page alignment is a power of two",
+       wire["minimumPageAlignment"] & (wire["minimumPageAlignment"] - 1), 0)
+    expected_pending = [
+        "the production codec id, group size and encoded row bytes require quality and Metal qualification",
+        "production rows_per_page, page alignment and derived page_stride are frozen by the codec-specific artifact profile",
+    ]
+    eq(errors, "[pleExtent.pendingClosed]", "codec/page decisions remain explicitly pending",
+       extent["pendingDecisions"], expected_pending)
     truthy_list(errors, "[pleExtent.rules]", extent["rules"], "extent rules")
     truthy_list(errors, "[pleExtent.pending]", extent["pendingDecisions"], "pending decisions")
     return len(errors) - before
+
+
 def check_expert_store(contract: dict, fixture: dict, errors: list[str]) -> int:
     before = len(errors)
     store = contract["expertStore"]
@@ -838,9 +897,36 @@ def check_expert_store(contract: dict, fixture: dict, errors: list[str]) -> int:
     eq(errors, "[expert.routeRecords]", "minimum route records per token",
        store["minimumRouteRecordsPerToken"], cfg["num_hidden_layers"] * cfg["num_experts_per_tok"])
     raise_doc = store["raiseMaxExperts"]
+    eq(errors, "[expert.max512]", "Qwen4Exp closes the structural maximum at 512",
+       store["expertsPerLayer"], 512)
+    eq(errors, "[expert.raise.field]", "shared C admission field",
+       raise_doc["field"], "DS4_EXPERT_STORE_V2_MAX_EXPERTS")
+    eq(errors, "[expert.raise.from]", "prior shared expert cap", raise_doc["from"], 384)
     eq(errors, "[expert.raise.to]", "raised expert cap equals num_experts", raise_doc["to"], cfg["num_experts"])
+    eq(errors, "[expert.raise.phase]", "expert-cap raise is owned by Phase 2",
+       raise_doc["phase"], 2)
+    if not isinstance(raise_doc["note"], str) or not raise_doc["note"].strip():
+        errors.append("[expert.raise.note]: admission-only note must be non-empty")
     if raise_doc["from"] >= raise_doc["to"]:
         errors.append("[expert.raise.from]: the current cap must be below the new cap")
+    candidate = store["structuralCandidate"]
+    eq(errors, "[expert.candidate.keys]", "closed structural candidate fields",
+       set(candidate), {"storage", "logicalGgmlType", "groupSize",
+                        "blockBytes", "status", "reason"})
+    eq(errors, "[expert.candidate.storage]", "structural storage",
+       candidate["storage"], "mlx-affine4")
+    eq(errors, "[expert.candidate.logicalType]", "logical GGML descriptor type",
+       candidate["logicalGgmlType"], "Q4_K")
+    eq(errors, "[expert.candidate.group]", "affine group size",
+       candidate["groupSize"], 64)
+    eq(errors, "[expert.candidate.blockBytes]", "affine physical block bytes",
+       candidate["blockBytes"], 36)
+    eq(errors, "[expert.candidate.blockFormula]", "4-bit group plus BF16 scale and bias",
+       candidate["blockBytes"], candidate["groupSize"] // 2 + 4)
+    eq(errors, "[expert.candidate.status]", "candidate remains non-release-qualified",
+       candidate["status"], "phase2-structural-not-release-qualified")
+    if not isinstance(candidate["reason"], str) or "640" not in candidate["reason"]:
+        errors.append("[expert.candidate.reason]: reason must name the 640-wide down row")
     routed = sum(
         span(fixture, n) for n in base_names(fixture)
         if ".mlp.experts." in n and not n.startswith(contract["tensorRoles"]["pleLayerPattern"])
@@ -1218,12 +1304,72 @@ MUTATIONS: list[tuple[str, str, object]] = [
         d, ("pleExtent", "embeddingShardRows"), 2500011)),
     ("pleExtent.rowWidth", "wrong extent row width", lambda d: set_path(
         d, ("pleExtent", "rowWidth"), 128)),
+    ("pleExtent.version", "wrong PLE wire version", lambda d: set_path(
+        d, ("pleExtent", "version"), 2)),
+    ("pleExtent.family", "wrong PLE family", lambda d: set_path(
+        d, ("pleExtent", "family"), 3)),
+    ("pleExtent.profileId", "wrong PLE artifact profile", lambda d: set_path(
+        d, ("pleExtent", "profileId"), "qwen35moe-base-v1")),
+    ("pleExtent.hashId", "wrong PLE hash identity", lambda d: set_path(
+        d, ("pleExtent", "hashId"), "SplitMix64-Qwen4Exp-v2")),
+    ("pleExtent.rowAlignment", "wrong PLE row alignment", lambda d: set_path(
+        d, ("pleExtent", "rowAlignment"), 64)),
+    ("pleExtent.headRows", "wrong logical PLE head row count", lambda d: set_path(
+        d, ("pleExtent", "headRows"), 320001445)),
+    ("pleExtent.paddingRows", "wrong explicit PLE padding", lambda d: set_path(
+        d, ("pleExtent", "paddingRows"), 89)),
+    ("pleExtent.wireEndianness", "wrong PLE wire endianness", lambda d: set_path(
+        d, ("pleExtent", "wireFormat", "endianness"), "big")),
+    ("pleExtent.wireHeader", "wrong PLE manifest header size", lambda d: set_path(
+        d, ("pleExtent", "wireFormat", "headerBytes"), 256)),
+    ("pleExtent.wirePageHeader", "wrong PLE page header size", lambda d: set_path(
+        d, ("pleExtent", "wireFormat", "pageHeaderBytes"), 32)),
+    ("pleExtent.wireAlignment", "wrong PLE minimum page alignment", lambda d: set_path(
+        d, ("pleExtent", "wireFormat", "minimumPageAlignment"), 2048)),
+    ("pleExtent.wireDigestAlgorithm", "wrong page digest algorithm", lambda d: set_path(
+        d, ("pleExtent", "wireFormat", "pageDigestAlgorithm"), "BLAKE3")),
+    ("pleExtent.wireDigestBytes", "wrong page digest width", lambda d: set_path(
+        d, ("pleExtent", "wireFormat", "pageDigestBytes"), 64)),
+    ("pleExtent.wireDigestTable", "invent a per-row digest index", lambda d: set_path(
+        d, ("pleExtent", "wireFormat", "pageDigestTable"), "one digest per row")),
+    ("pleExtent.wireManifestDigest", "change manifest digest coverage", lambda d: set_path(
+        d, ("pleExtent", "wireFormat", "manifestDigest"), "SHA-256(header only)")),
+    ("pleExtent.wirePayloadDigest", "change payload digest coverage", lambda d: set_path(
+        d, ("pleExtent", "wireFormat", "payloadDigest"), "SHA-256(encoded rows)")),
+    ("pleExtent.wireCodecBinding", "remove caller-supplied codec binding", lambda d: set_path(
+        d, ("pleExtent", "wireFormat", "codecBinding"), "")),
+    ("pleExtent.pendingCodec", "pretend the production codec is frozen", lambda d: set_path(
+        d, ("pleExtent", "pendingDecisions", 0), "production codec is frozen")),
+    ("pleExtent.pendingPage", "pretend production page geometry is frozen", lambda d: set_path(
+        d, ("pleExtent", "pendingDecisions", 1), "production page geometry is frozen")),
     ("expertStore.perLayer", "wrong experts per layer", lambda d: set_path(
         d, ("expertStore", "expertsPerLayer"), 384)),
     ("expertStore.routeRecords", "wrong route records per token", lambda d: set_path(
         d, ("expertStore", "minimumRouteRecordsPerToken"), 481)),
     ("expertStore.raiseTo", "raise the cap to the wrong value", lambda d: set_path(
         d, ("expertStore", "raiseMaxExperts", "to"), 384)),
+    ("expertStore.family", "wrong Qwen4Exp store family", lambda d: set_path(
+        d, ("expertStore", "family"), 3)),
+    ("expertStore.raiseField", "wrong shared expert-cap field", lambda d: set_path(
+        d, ("expertStore", "raiseMaxExperts", "field"), "MAX_EXPERTS")),
+    ("expertStore.raiseFrom", "wrong prior shared expert cap", lambda d: set_path(
+        d, ("expertStore", "raiseMaxExperts", "from"), 383)),
+    ("expertStore.raisePhase", "move the cap raise out of Phase 2", lambda d: set_path(
+        d, ("expertStore", "raiseMaxExperts", "phase"), 3)),
+    ("expertStore.raiseNote", "remove the admission-only cap note", lambda d: set_path(
+        d, ("expertStore", "raiseMaxExperts", "note"), "")),
+    ("expertStore.candidateStorage", "select the wrong structural storage", lambda d: set_path(
+        d, ("expertStore", "structuralCandidate", "storage"), "ggml-k-quant")),
+    ("expertStore.candidateLogicalType", "change the logical descriptor type", lambda d: set_path(
+        d, ("expertStore", "structuralCandidate", "logicalGgmlType"), "IQ2_XS")),
+    ("expertStore.candidateGroup", "change the affine group size", lambda d: set_path(
+        d, ("expertStore", "structuralCandidate", "groupSize"), 128)),
+    ("expertStore.candidateBlock", "change the affine physical block bytes", lambda d: set_path(
+        d, ("expertStore", "structuralCandidate", "blockBytes"), 32)),
+    ("expertStore.candidateStatus", "claim structural candidate is release-qualified", lambda d: set_path(
+        d, ("expertStore", "structuralCandidate", "status"), "release-qualified")),
+    ("expertStore.candidateReason", "drop the 640-wide-row reason", lambda d: set_path(
+        d, ("expertStore", "structuralCandidate", "reason"), "structural candidate")),
     ("norms.dropGated", "unclassify the GDN norm", lambda d: set_path(
         d, ("normConventions", "conventional"), [])),
     ("norms.addUnknown", "classify an unknown role", lambda d: set_path(

@@ -96,6 +96,29 @@ per-array provenance hash, repeats the independent NumPy checks, and reproduces
 the complete fixture and provenance text. Generated files must not be edited
 by hand.
 
+## Phase 2 artifact dry run
+
+`gguf-tools/qwen4exp-profile.py --dry-run` reads only this directory's pinned
+inventory and the closed profile contract. It maps and byte-accounts all 1,658
+source identities exactly once: 96 routed tensors become 144 ExpertMajor
+gate/up/down destinations; 1,061 remain dense; 137 belong to PLE; 333 vision
+and 31 MTP tensors are explicitly excluded by the base-text policy. It does
+not open weight shards, select a release codec, or emit weight payloads.
+
+`ds4.ple_rows.v1` is exercised separately with a 100-row non-production byte
+fixture. The test freezes the 512-byte manifest, 64-byte fixed page header,
+per-page and whole SHA-256 rules, checked affine lookup, transactional row
+read, and atomic writer protocol. Production codec, rows per page and page
+stride remain fail-closed profile decisions; see
+[`ADR 0009`](../../docs/adr/0009-qwen4exp-ple-store-v1-structure.md).
+
+Run the Phase 2 model-free gates with:
+
+```sh
+make qwen4exp-converter-test qwen4exp-ple-store-test \
+  expert-store-test qwen4exp-sanitizer-test
+```
+
 ## Limitations
 
 These vectors exercise semantic primitives at tiny dimensions. They do not

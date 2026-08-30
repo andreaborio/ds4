@@ -215,12 +215,23 @@ static bool all_zero(const uint8_t *data, size_t size) {
 static bool family_is_supported(uint32_t family) {
     return family == DS4_EXPERT_STORE_FAMILY_DEEPSEEK4 ||
            family == DS4_EXPERT_STORE_FAMILY_GLM_DSA ||
-           family == DS4_EXPERT_STORE_FAMILY_QWEN35_MOE;
+           family == DS4_EXPERT_STORE_FAMILY_QWEN35_MOE ||
+           family == DS4_EXPERT_STORE_FAMILY_QWEN4EXP;
 }
 
 static bool family_has_dense_routed_prefix(uint32_t family) {
     return family == DS4_EXPERT_STORE_FAMILY_DEEPSEEK4 ||
-           family == DS4_EXPERT_STORE_FAMILY_QWEN35_MOE;
+           family == DS4_EXPERT_STORE_FAMILY_QWEN35_MOE ||
+           family == DS4_EXPERT_STORE_FAMILY_QWEN4EXP;
+}
+
+static bool family_header_geometry_is_valid(
+        uint32_t family,
+        uint32_t layer_count,
+        uint32_t expert_count,
+        uint32_t expert_used) {
+    if (family != DS4_EXPERT_STORE_FAMILY_QWEN4EXP) return true;
+    return layer_count == 48u && expert_count == 512u && expert_used == 10u;
 }
 
 bool ds4_expert_store_open_embedded(
@@ -268,10 +279,12 @@ bool ds4_expert_store_open_embedded(
     const uint32_t group_size = load_u32_le(header + 164);
     const bool storage_valid =
         (storage_format == DS4_EXPERT_STORE_STORAGE_GGML &&
-         group_size == 0u) ||
+         group_size == 0u &&
+         family != DS4_EXPERT_STORE_FAMILY_QWEN4EXP) ||
         (storage_format == DS4_EXPERT_STORE_STORAGE_MLX_AFFINE4 &&
          group_size == 64u &&
-         family == DS4_EXPERT_STORE_FAMILY_QWEN35_MOE);
+         (family == DS4_EXPERT_STORE_FAMILY_QWEN35_MOE ||
+          family == DS4_EXPERT_STORE_FAMILY_QWEN4EXP));
 
     uint64_t want_descriptor_bytes = 0;
     uint64_t descriptors_end = 0;
@@ -283,6 +296,8 @@ bool ds4_expert_store_open_embedded(
         layer_count == 0 || layer_count > DS4_EXPERT_STORE_V2_MAX_LAYERS ||
         expert_count == 0 || expert_count > DS4_EXPERT_STORE_V2_MAX_EXPERTS ||
         expert_used == 0 || expert_used > expert_count ||
+        !family_header_geometry_is_valid(
+            family, layer_count, expert_count, expert_used) ||
         descriptor_count != layer_count ||
         !mul_u64(descriptor_count, STORE_LAYER_BYTES,
                  &want_descriptor_bytes) ||
@@ -363,9 +378,21 @@ bool ds4_expert_store_open_embedded(
 
             uint32_t block_elements = 0, block_bytes = 0;
             uint64_t row_blocks = 0, row_bytes = 0;
+            /* Descriptor-only structural candidate; this does not make the
+             * Qwen4Exp model or any artifact codec runtime-supported. */
+            const bool qwen4exp_affine =
+                family == DS4_EXPERT_STORE_FAMILY_QWEN4EXP &&
+                storage_format == DS4_EXPERT_STORE_STORAGE_MLX_AFFINE4;
+            const bool layout_valid = qwen4exp_affine
+                ? out_component->ggml_type == 12u
+                : quant_layout(out_component->ggml_type,
+                               &block_elements, &block_bytes);
+            if (qwen4exp_affine) {
+                block_elements = 64u;
+                block_bytes = 36u;
+            }
             if (out_component->role != role || ndim != 3 ||
-                !quant_layout(out_component->ggml_type,
-                              &block_elements, &block_bytes) ||
+                !layout_valid ||
                 (storage_format == DS4_EXPERT_STORE_STORAGE_MLX_AFFINE4 &&
                  out_component->ggml_type != 12u) ||
                 out_component->block_elements != block_elements ||
@@ -405,6 +432,20 @@ bool ds4_expert_store_open_embedded(
             free(layers);
             set_error(error, error_size,
                       "expert manifest component relationships are invalid at layer %u",
+                      il);
+            return false;
+        }
+        if (family == DS4_EXPERT_STORE_FAMILY_QWEN4EXP &&
+            (gate->dim[0] != 2560u || gate->dim[1] != 640u ||
+             gate->dim[2] != 512u ||
+             up->dim[0] != 2560u || up->dim[1] != 640u ||
+             up->dim[2] != 512u ||
+             down->dim[0] != 640u || down->dim[1] != 2560u ||
+             down->dim[2] != 512u)) {
+            free(raw);
+            free(layers);
+            set_error(error, error_size,
+                      "Qwen4Exp expert component geometry is invalid at layer %u",
                       il);
             return false;
         }

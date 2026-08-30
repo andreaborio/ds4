@@ -236,7 +236,7 @@
       "location": "content",
       "token": "ds4",
       "classification": "compatibility",
-      "maximum": 536
+      "maximum": 547
     },
     {
       "path": "Makefile",
@@ -407,11 +407,18 @@
       "maximum": 3
     },
     {
+      "path": "docs/adr/0009-qwen4exp-ple-store-v1-structure.md",
+      "location": "content",
+      "token": "ds4",
+      "classification": "migration-pending",
+      "maximum": 2
+    },
+    {
       "path": "docs/architecture/CODEMAP.md",
       "location": "content",
       "token": "ds4",
       "classification": "migration-pending",
-      "maximum": 50
+      "maximum": 52
     },
     {
       "path": "docs/architecture/CODEMAP.md",
@@ -1132,7 +1139,7 @@
       "location": "content",
       "token": "DS4",
       "classification": "migration-pending",
-      "maximum": 16
+      "maximum": 24
     },
     {
       "path": "ds4_expert_store.h",
@@ -1153,7 +1160,7 @@
       "location": "content",
       "token": "DS4",
       "classification": "migration-pending",
-      "maximum": 21
+      "maximum": 22
     },
     {
       "path": "ds4_gpu.h",
@@ -1280,6 +1287,48 @@
       "token": "DS4",
       "classification": "migration-pending",
       "maximum": 1195
+    },
+    {
+      "path": "ds4_ple_store.c",
+      "location": "path",
+      "token": "ds4",
+      "classification": "migration-pending",
+      "maximum": 1
+    },
+    {
+      "path": "ds4_ple_store.c",
+      "location": "content",
+      "token": "ds4",
+      "classification": "migration-pending",
+      "maximum": 65
+    },
+    {
+      "path": "ds4_ple_store.c",
+      "location": "content",
+      "token": "DS4",
+      "classification": "migration-pending",
+      "maximum": 77
+    },
+    {
+      "path": "ds4_ple_store.h",
+      "location": "path",
+      "token": "ds4",
+      "classification": "migration-pending",
+      "maximum": 1
+    },
+    {
+      "path": "ds4_ple_store.h",
+      "location": "content",
+      "token": "ds4",
+      "classification": "migration-pending",
+      "maximum": 46
+    },
+    {
+      "path": "ds4_ple_store.h",
+      "location": "content",
+      "token": "DS4",
+      "classification": "migration-pending",
+      "maximum": 25
     },
     {
       "path": "ds4_profile.c",
@@ -1863,6 +1912,13 @@
       "maximum": 40
     },
     {
+      "path": "gguf-tools/qwen4exp-profile.py",
+      "location": "content",
+      "token": "ds4",
+      "classification": "migration-pending",
+      "maximum": 1
+    },
+    {
       "path": "hebrus_identity.h",
       "location": "content",
       "token": "ds4",
@@ -2245,7 +2301,7 @@
       "location": "content",
       "token": "ds4",
       "classification": "migration-pending",
-      "maximum": 17
+      "maximum": 16
     },
     {
       "path": "runtime/ds4_deepseek_cache_phase.inc",
@@ -2574,7 +2630,7 @@
       "location": "content",
       "token": "ds4",
       "classification": "migration-pending",
-      "maximum": 1
+      "maximum": 2
     },
     {
       "path": "tests/qwen4exp/test_source_inventory.py",
@@ -2588,7 +2644,7 @@
       "location": "content",
       "token": "DS4",
       "classification": "migration-pending",
-      "maximum": 1
+      "maximum": 2
     },
     {
       "path": "tests/test-vectors/README.md",
@@ -2763,14 +2819,14 @@
       "location": "content",
       "token": "ds4",
       "classification": "migration-pending",
-      "maximum": 13
+      "maximum": 55
     },
     {
       "path": "tests/test_expert_store.c",
       "location": "content",
       "token": "DS4",
       "classification": "migration-pending",
-      "maximum": 9
+      "maximum": 44
     },
     {
       "path": "tests/test_install.sh",
@@ -2806,6 +2862,20 @@
       "token": "ds4",
       "classification": "migration-pending",
       "maximum": 2
+    },
+    {
+      "path": "tests/test_ple_store.c",
+      "location": "content",
+      "token": "ds4",
+      "classification": "migration-pending",
+      "maximum": 75
+    },
+    {
+      "path": "tests/test_ple_store.c",
+      "location": "content",
+      "token": "DS4",
+      "classification": "migration-pending",
+      "maximum": 29
     },
     {
       "path": "tests/test_q4k_dot.c",

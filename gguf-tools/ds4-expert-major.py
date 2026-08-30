@@ -30,15 +30,18 @@ STORE_VERSION = 2
 STORE_FAMILY_DEEPSEEK4 = 1
 STORE_FAMILY_GLM_DSA = 2
 STORE_FAMILY_QWEN35_MOE = 3
+STORE_FAMILY_QWEN4EXP = 4
 STORE_STORAGE_GGML = 0
 STORE_STORAGE_MLX_AFFINE4 = 1
 STORE_FAMILIES = {
     STORE_FAMILY_DEEPSEEK4,
     STORE_FAMILY_GLM_DSA,
     STORE_FAMILY_QWEN35_MOE,
+    STORE_FAMILY_QWEN4EXP,
 }
 STORE_MAX_ROUTED_LAYERS = 79
 STORE_MAX_MODEL_LAYER = 127
+STORE_MAX_EXPERTS = 512
 STORE_HEADER_BYTES = 256
 STORE_LAYER_BYTES = 224
 STORE_COMPONENT_BYTES = 56
@@ -83,6 +86,69 @@ TYPE_NAME = {
 }
 ROLE_NAME = ("gate", "up", "down")
 ROUTED_RE = re.compile(r"^blk\.(\d+)\.ffn_(gate|up|down)_exps\.weight$")
+
+
+@dataclasses.dataclass(frozen=True)
+class ExpertFamilyDescriptor:
+    """Closed metadata and routed-layer policy for one ExpertMajor family."""
+
+    architecture: str
+    family: int
+    display_name: str
+    block_count_key: str
+    expert_count_key: str
+    expert_used_count_key: str
+    routed_layer_policy: str = "all"
+    leading_dense_key: str | None = None
+    nextn_key: str | None = None
+    exact_layers: int | None = None
+    exact_experts: int | None = None
+    exact_experts_used: int | None = None
+    admitted_storage_formats: tuple[int, ...] = (STORE_STORAGE_GGML,)
+
+
+EXPERT_FAMILY_DESCRIPTORS = (
+    ExpertFamilyDescriptor(
+        "deepseek4", STORE_FAMILY_DEEPSEEK4, "DeepSeek",
+        "deepseek4.block_count", "deepseek4.expert_count",
+        "deepseek4.expert_used_count",
+    ),
+    ExpertFamilyDescriptor(
+        "glm-dsa", STORE_FAMILY_GLM_DSA, "GLM",
+        "glm-dsa.block_count", "glm-dsa.expert_count",
+        "glm-dsa.expert_used_count", "after-leading-dense",
+        "glm-dsa.leading_dense_block_count", "glm-dsa.nextn_predict_layers",
+    ),
+    ExpertFamilyDescriptor(
+        "qwen35moe", STORE_FAMILY_QWEN35_MOE, "Qwen",
+        "qwen35moe.block_count", "qwen35moe.expert_count",
+        "qwen35moe.expert_used_count",
+        admitted_storage_formats=(STORE_STORAGE_GGML,
+                                  STORE_STORAGE_MLX_AFFINE4),
+    ),
+    ExpertFamilyDescriptor(
+        "qwen4exp", STORE_FAMILY_QWEN4EXP, "Qwen4Exp",
+        "qwen4exp.block_count", "qwen4exp.expert_count",
+        "qwen4exp.expert_used_count",
+        exact_layers=48, exact_experts=512, exact_experts_used=10,
+        # No release codec is selected. Affine4/G64 is retained only as a
+        # descriptor/reader structural candidate; build() stays fail-closed.
+        admitted_storage_formats=(STORE_STORAGE_MLX_AFFINE4,),
+    ),
+)
+
+
+def family_descriptor(*, architecture: str | None = None,
+                      family: int | None = None) -> ExpertFamilyDescriptor:
+    matches = tuple(
+        descriptor for descriptor in EXPERT_FAMILY_DESCRIPTORS
+        if (architecture is None or descriptor.architecture == architecture)
+        and (family is None or descriptor.family == family)
+    )
+    if len(matches) != 1:
+        identity = architecture if architecture is not None else family
+        raise FormatError(f"unknown ExpertMajor family descriptor: {identity}")
+    return matches[0]
 
 
 class FormatError(RuntimeError):
@@ -347,17 +413,17 @@ def load_gguf(path: Path) -> GGUF:
         kv_start = file.tell()
         metadata: dict[str, object] = {}
         alignment = 32
-        wanted = {
-            "general.architecture", "general.alignment",
-            "deepseek4.block_count", "deepseek4.expert_count",
-            "deepseek4.expert_used_count",
-            "glm-dsa.block_count", "glm-dsa.expert_count",
-            "glm-dsa.expert_used_count",
-            "glm-dsa.leading_dense_block_count",
-            "glm-dsa.nextn_predict_layers",
-            "qwen35moe.block_count", "qwen35moe.expert_count",
-            "qwen35moe.expert_used_count",
-        }
+        wanted = {"general.architecture", "general.alignment"}
+        for descriptor in EXPERT_FAMILY_DESCRIPTORS:
+            wanted.update((
+                descriptor.block_count_key,
+                descriptor.expert_count_key,
+                descriptor.expert_used_count_key,
+            ))
+            if descriptor.leading_dense_key:
+                wanted.add(descriptor.leading_dense_key)
+            if descriptor.nextn_key:
+                wanted.add(descriptor.nextn_key)
         for _ in range(n_kv):
             key = gguf_string(file)
             value_type = u32(file)
@@ -412,55 +478,63 @@ def routed_inventory(gguf: GGUF) -> dict[int, dict[int, Tensor]]:
 def make_store_plan(source: GGUF) -> StorePlan:
     architecture = source.metadata.get("general.architecture")
     try:
-        if architecture == "deepseek4":
-            family = STORE_FAMILY_DEEPSEEK4
-            model_layer_count = int(source.metadata["deepseek4.block_count"])
-            expert_count = int(source.metadata["deepseek4.expert_count"])
-            expert_used_count = int(source.metadata["deepseek4.expert_used_count"])
+        descriptor = family_descriptor(architecture=str(architecture))
+        model_layer_count = int(source.metadata[descriptor.block_count_key])
+        expert_count = int(source.metadata[descriptor.expert_count_key])
+        expert_used_count = int(source.metadata[descriptor.expert_used_count_key])
+        if descriptor.routed_layer_policy == "all":
             expected_layers = set(range(model_layer_count))
-            family_name = "DeepSeek"
-        elif architecture == "glm-dsa":
-            family = STORE_FAMILY_GLM_DSA
-            model_layer_count = int(source.metadata["glm-dsa.block_count"])
-            expert_count = int(source.metadata["glm-dsa.expert_count"])
-            expert_used_count = int(source.metadata["glm-dsa.expert_used_count"])
-            leading_dense = int(
-                source.metadata["glm-dsa.leading_dense_block_count"]
-            )
-            nextn_layers = int(source.metadata["glm-dsa.nextn_predict_layers"])
+        elif descriptor.routed_layer_policy == "after-leading-dense":
+            assert descriptor.leading_dense_key and descriptor.nextn_key
+            leading_dense = int(source.metadata[descriptor.leading_dense_key])
+            nextn_layers = int(source.metadata[descriptor.nextn_key])
             if not (0 <= leading_dense < model_layer_count and
                     0 <= nextn_layers < model_layer_count):
                 raise FormatError("GLM dense/NextN layer metadata is invalid")
             # Keep the GGUF self-contained. The NextN tail remains in the
             # store even when the current decode graph stops before it.
             expected_layers = set(range(leading_dense, model_layer_count))
-            family_name = "GLM"
-        elif architecture == "qwen35moe":
-            family = STORE_FAMILY_QWEN35_MOE
-            model_layer_count = int(source.metadata["qwen35moe.block_count"])
-            expert_count = int(source.metadata["qwen35moe.expert_count"])
-            expert_used_count = int(
-                source.metadata["qwen35moe.expert_used_count"]
-            )
-            expected_layers = set(range(model_layer_count))
-            family_name = "Qwen"
         else:
-            raise FormatError(
-                "expert-major v2 accepts deepseek4, glm-dsa, and "
-                "qwen35moe GGUFs only"
-            )
+            raise AssertionError(descriptor.routed_layer_policy)
+        exact = (
+            (descriptor.exact_layers, model_layer_count, "layers"),
+            (descriptor.exact_experts, expert_count, "experts"),
+            (descriptor.exact_experts_used, expert_used_count,
+             "experts used"),
+        )
+        for expected, observed, label in exact:
+            if expected is not None and observed != expected:
+                raise FormatError(
+                    f"{descriptor.display_name} requires exactly {expected} "
+                    f"{label}, got {observed}"
+                )
     except (KeyError, TypeError, ValueError) as exc:
         raise FormatError(
             f"{architecture or 'unknown'} layer/expert metadata is incomplete"
         ) from exc
+    except FormatError as exc:
+        if str(exc).startswith("unknown ExpertMajor family descriptor"):
+            accepted = ", ".join(
+                item.architecture for item in EXPERT_FAMILY_DESCRIPTORS
+            )
+            raise FormatError(
+                f"expert-major v2 accepts {accepted} GGUFs only"
+            ) from exc
+        raise
 
     layer_count = len(expected_layers)
     if not (1 <= model_layer_count <= STORE_MAX_ROUTED_LAYERS and
             1 <= layer_count <= STORE_MAX_ROUTED_LAYERS and
-            1 <= expert_count <= 384 and
+            1 <= expert_count <= STORE_MAX_EXPERTS and
             1 <= expert_used_count <= expert_count):
         raise FormatError(
-            f"{family_name} layer or expert counts are outside v2 limits"
+            f"{descriptor.display_name} layer or expert counts are outside v2 limits"
+        )
+
+    if STORE_STORAGE_GGML not in descriptor.admitted_storage_formats:
+        raise FormatError(
+            f"{descriptor.display_name} has no release-qualified routed "
+            "codec; GGML/K-quant build is rejected"
         )
 
     inventory = routed_inventory(source)
@@ -505,7 +579,7 @@ def make_store_plan(source: GGUF) -> StorePlan:
     descriptor_bytes = b"".join(pack_layer(layer) for layer in layers)
     return StorePlan(
         source=source,
-        family=family,
+        family=descriptor.family,
         storage_format=STORE_STORAGE_GGML,
         group_size=0,
         layer_count=layer_count,
@@ -788,15 +862,29 @@ def parse_store(native: GGUF, tensor: Tensor) -> tuple[dict[str, object], list[L
          descriptor_offset, data_offset, data_size, store_size) = values
         source_size = struct.unpack_from("<Q", header, 88)[0]
         storage_format, group_size = struct.unpack_from("<II", header, 160)
+        descriptor = family_descriptor(family=family) \
+            if family in STORE_FAMILIES else None
         storage_valid = (
-            (storage_format == STORE_STORAGE_GGML and group_size == 0) or
+            (storage_format == STORE_STORAGE_GGML and group_size == 0 and
+             descriptor is not None and
+             STORE_STORAGE_GGML in descriptor.admitted_storage_formats) or
             (storage_format == STORE_STORAGE_MLX_AFFINE4 and
-             group_size == 64 and family == STORE_FAMILY_QWEN35_MOE)
+             group_size == 64 and descriptor is not None and
+             STORE_STORAGE_MLX_AFFINE4 in
+             descriptor.admitted_storage_formats)
         )
+        exact_profile = descriptor is None or all((
+            descriptor.exact_layers is None or
+            layer_count == descriptor.exact_layers,
+            descriptor.exact_experts is None or
+            expert_count == descriptor.exact_experts,
+            descriptor.exact_experts_used is None or
+            expert_used == descriptor.exact_experts_used,
+        ))
         if (version != STORE_VERSION or header_bytes != STORE_HEADER_BYTES or
                 family not in STORE_FAMILIES or
                 not 1 <= layer_count <= STORE_MAX_ROUTED_LAYERS or
-                not 1 <= expert_count <= 384 or
+                not 1 <= expert_count <= STORE_MAX_EXPERTS or
                 not 1 <= expert_used <= expert_count or
                 source_tensors <= layer_count * 3 or source_size == 0 or
                 descriptor_count != layer_count or
@@ -804,7 +892,7 @@ def parse_store(native: GGUF, tensor: Tensor) -> tuple[dict[str, object], list[L
                 descriptor_offset != STORE_HEADER_BYTES or
                 data_offset % STORE_ALIGNMENT or data_offset + data_size != store_size or
                 store_size != tensor.size or not storage_valid or
-                any(header[200:])):
+                not exact_profile or any(header[200:])):
             raise FormatError("invalid expert-store header")
         descriptors = pread_exact(file.fileno(), descriptor_bytes,
                                   tensor.abs_offset + descriptor_offset)
@@ -836,11 +924,21 @@ def parse_store(native: GGUF, tensor: Tensor) -> tuple[dict[str, object], list[L
                 )
                 expected = tensor_nbytes(ggml_type, (d0, d1, 1))
             elif storage_format == STORE_STORAGE_MLX_AFFINE4:
-                descriptor_valid = (
-                    ggml_type == 12 and
-                    TYPE_LAYOUT[ggml_type][0] == block_elements
-                )
-                expected = tensor_nbytes(ggml_type, (d0, d1, 1))
+                if family == STORE_FAMILY_QWEN4EXP:
+                    descriptor_valid = (
+                        ggml_type == 12 and block_elements == 64 and
+                        d0 > 0 and d0 % 64 == 0 and d1 > 0
+                    )
+                    expected = d0 // 64 * 36 * d1
+                else:
+                    # Preserve the admitted Qwen3.6 manifest semantics: its
+                    # affine payload is same-sized with the source Q4_K
+                    # descriptor and therefore records block_elements=256.
+                    descriptor_valid = (
+                        ggml_type == 12 and
+                        TYPE_LAYOUT[ggml_type][0] == block_elements
+                    )
+                    expected = tensor_nbytes(ggml_type, (d0, d1, 1))
             else:
                 raise FormatError("unsupported expert-store storage format")
             if not descriptor_valid:
@@ -864,10 +962,21 @@ def parse_store(native: GGUF, tensor: Tensor) -> tuple[dict[str, object], list[L
                 gate.dims[1] != down.dims[0] or
                 down.dims[2] != expert_count):
             raise FormatError(f"component geometry mismatch at layer {il}")
+        if family == STORE_FAMILY_QWEN4EXP and (
+                storage_format != STORE_STORAGE_MLX_AFFINE4 or
+                any(component.tensor.ggml_type != 12
+                    for component in components) or
+                gate.dims != (2560, 640, 512) or
+                up.dims != (2560, 640, 512) or
+                down.dims != (640, 2560, 512)):
+            raise FormatError(
+                f"invalid Qwen4Exp affine descriptor at layer {il}"
+            )
         if (layer_index <= previous_layer_index or
                 layer_index > STORE_MAX_MODEL_LAYER or
                 (family in (STORE_FAMILY_DEEPSEEK4,
-                            STORE_FAMILY_QWEN35_MOE) and layer_index != il) or
+                            STORE_FAMILY_QWEN35_MOE,
+                            STORE_FAMILY_QWEN4EXP) and layer_index != il) or
                 entry_experts != expert_count or
                 record_bytes != record_cursor or layer_size != record_bytes * expert_count or
                 layer_offset < previous_end or layer_offset % STORE_ALIGNMENT or

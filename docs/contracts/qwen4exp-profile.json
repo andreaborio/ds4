@@ -447,19 +447,46 @@
       "from": 384,
       "to": 512,
       "phase": 2,
-      "note": "admission validation only; the v2 container layout is unchanged"
+      "note": "implemented as an admission-only limit raise; the v2 container layout is unchanged"
+    },
+    "structuralCandidate": {
+      "storage": "mlx-affine4",
+      "logicalGgmlType": "Q4_K",
+      "groupSize": 64,
+      "blockBytes": 36,
+      "status": "phase2-structural-not-release-qualified",
+      "reason": "the 640-wide down row cannot use the admitted 256-element K-quant blocks; this candidate proves v2 geometry only"
     }
   },
   "pleExtent": {
     "magic": "ds4.ple_rows.v1",
+    "version": 1,
+    "family": 4,
+    "profileId": "qwen4exp-base-v1",
+    "hashId": "SplitMix64-Qwen4Exp-v1",
     "rows": 320001536,
     "rowWidth": 160,
+    "rowAlignment": 128,
+    "headRows": 320001446,
+    "paddingRows": 90,
     "embeddingShardCount": 128,
     "embeddingShardRows": 2500012,
     "embeddingShardRowsFormula": "paddedRows / split_ngram_parts",
+    "wireFormat": {
+      "endianness": "little",
+      "headerBytes": 512,
+      "pageHeaderBytes": 64,
+      "minimumPageAlignment": 4096,
+      "pageDigestAlgorithm": "SHA-256",
+      "pageDigestBytes": 32,
+      "pageDigestTable": "one digest per fixed page; no per-row index",
+      "manifestDigest": "SHA-256(header with manifest digest zeroed || page-digest table || alignment padding)",
+      "payloadDigest": "SHA-256 over every complete fixed-stride physical page in order",
+      "codecBinding": "caller supplies one exact codec id/version/group-size/encoded-row-bytes descriptor"
+    },
     "pendingDecisions": [
-      "rows_per_page and page_stride are fixed by the Phase 3 converter ADR gate",
-      "page checksum and generation rules are fixed with the extent writer"
+      "the production codec id, group size and encoded row bytes require quality and Metal qualification",
+      "production rows_per_page, page alignment and derived page_stride are frozen by the codec-specific artifact profile"
     ],
     "rules": [
       "no 320-million-entry offset table exists",
