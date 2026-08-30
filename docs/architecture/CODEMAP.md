@@ -78,7 +78,10 @@ helpers remain in the same translation unit while agents can load one family.
 | `runtime/ds4_deepseek_cache_phase.inc` | DeepSeek adaptive ExpertMajor cache transitions around batched prefill; textually included by `ds4.c` |
 | `runtime/ds4_glm_graph.inc` | GLM Metal graph state, allocation, prefill/decode scheduling, routed MoE/SSD orchestration, and GLM generation; textually included by `ds4.c` |
 | `runtime/ds4_qwen4exp_loader.inc` | Closed Qwen4Exp metadata, tokenizer-provenance, physical inventory, ExpertMajor/PLE manifest and whole-file ownership admission; production has no registered physical profile and the only positive is a CPU-only structural test hook |
+| `runtime/ds4_qwen4exp_graph.[h,inc]` | Phase-5 test-hook resident graph coordinator: frozen llama.cpp-compatible stage order, two-bank whole-chunk state transaction, byte ownership report, dense-QSA ceiling and model-free backend callback; it is linked but not selected by production |
 | `runtime/ds4_metal_glm.inc` | GLM-specific Metal encoders and tensor wrappers; textually included by `ds4_metal.m` |
+| `runtime/ds4_metal_qwen4exp.inc` | Inert Phase-5 Qwen4Exp Metal ABI, bounded encoder and private-state publication transaction; no family dispatch or support selector |
+| `metal/qwen4exp.metal` | Model-free F32 Qwen4Exp correctness kernels for the resident graph stages, qualified against CPU/Transformers oracles before physical codecs are selected |
 
 Qwen keeps one Metal graph and scheduler across its two accepted weight codecs.
 The graph separates session-lifetime core/KV/logits from the SSD prefill arena
@@ -149,7 +152,7 @@ not validated.
 | `docs/contracts/qwen-release.json` + `tools/qwen_release_contract.py` | Canonical Hebrus-named Stable, opt-in Beta, and historical negative-only Qwen artifact identities plus the model-free gate that parses their documentation, downloader, and test surfaces for drift |
 | `tests/test_qwen_release_contract.py` | Fail-closed fixtures for prose, table, downloader, schema, status, and negative-only Qwen release-contract drift |
 | `tests/qwen/` | Qwen fixtures, provenance, reference collectors, and model-specific gates |
-| `tests/qwen4exp/` | Pinned Qwen4Exp source inventory, upstream-backed scalar/tokenizer/chat captures, independent controls, per-case provenance, sparse Phase 3 GGUF admission builder, black-box negative battery, and fail-closed regeneration checks |
+| `tests/qwen4exp/` | Pinned Qwen4Exp source inventory, upstream-backed scalar/tokenizer/chat/graph captures, independent controls, per-case provenance, sparse Phase 3 GGUF admission builder, Phase-5 CPU/Metal state-transition fixtures, black-box negative batteries, and fail-closed regeneration checks |
 | `gguf-tools/qwen4exp-profile.py` | Header/index-only Qwen4Exp conversion dry run that maps and byte-accounts every pinned source identity without loading checkpoint tensors |
 | `tests/test-vectors/` | Official and local continuation vectors plus provenance |
 | `gguf-tools/` | Quantization, ExpertMajor conversion, imatrix, and quality-scoring tools |

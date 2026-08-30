@@ -203,6 +203,35 @@ does not contain or inspect tokenizer payload bytes. Normal builds still have
 no production physical profile, runtime graph, server route, downloader entry,
 or support claim for Qwen4Exp.
 
+## Phase 5 resident graph milestone
+
+Phase 5 ports the resident execution order and state transitions from the
+reviewed Qwen4Exp llama.cpp series (`6c84c7d`, `ff24f38`, `c88c916`,
+`ad4fa3f`, `c89e67b`, `ddf0980`) into the frozen Hebrus transaction seams. It
+does not design a second algorithm: PLE is applied before its layer read,
+attention and MoE each use prepare/block/apply gated residual stages, the final
+gated mixer feeds the unnormalised head, raw QSA index keys share the attention
+slot/position lifecycle, and GDN plus PLE convolution reuse one private
+recurrent-row snapshot.
+
+The positive graph is deliberately tiny and model-free. Its public arrays are
+captured by actually executing the pinned Transformers implementation at
+`42ca97014c85d71a88ad60d55f08cb9fb4d26e2c`, then independently checked by
+NumPy/scalar C. One complete chunk is a transaction: all persistent GDN, QSA,
+PLE, routing, wide-state and logits owners live in a private bank until every
+stage succeeds. A single bank-index flip is the only publication point. The
+Metal path mirrors that rule and publishes only after a completed command and
+clean status words.
+
+The mandatory upstream regressions are explicit: token/chunk/multi-turn
+equivalence, PLE convolution across ubatches and independent sequences, the
+current-EOS history rule, the exact GDN channel formula, one shared recurrent
+snapshot, QSA cache slot/position holes, the inclusive 2051 dense boundary,
+2052 and 262143/262144/262145 rejection before sparse QSA exists, allocation
+failure and command/status rollback. This milestone still registers no
+production physical profile, codec, execution route, server route, downloader
+entry or support claim.
+
 ## Consequences
 
 - `qwen4exp` is a permanent second Qwen family. Qwen3.6 keeps its existing

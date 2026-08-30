@@ -28,6 +28,10 @@
 #include "ds4_qwen.h"
 #include "ds4_qwen_expert_group.h"
 
+/* Model-free Qwen4Exp Phase-5 Metal ABI/transaction partition.  It remains
+ * inert in production until a physical artifact profile is qualified. */
+#include "runtime/ds4_metal_qwen4exp.inc"
+
 /*
  * Objective-C Metal glue for the C engine.
  *

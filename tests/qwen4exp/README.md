@@ -187,6 +187,44 @@ The normal gate is fully offline:
 make qwen4exp-chat-test qwen4exp-tokenizer-test
 ```
 
+## Phase 5 resident graph and Metal oracles
+
+`collect_graph_reference.py` executes the pinned Transformers Qwen4Exp
+modules/functions with deterministic F32 weights, cross-checks them with an
+independent scalar-loop NumPy implementation, and emits a compact graph fixture
+plus per-array provenance. Arrays that upstream does not expose—tokens, hashed
+PLE rows and persistent cache images—are explicitly labelled
+`contract-control`; they are never represented as upstream captures. The
+normal `--check` path is stdlib-only and pins the complete JSON, C include and
+aggregate array payload digests.
+
+The host graph follows the reviewed llama.cpp stage order while retaining
+Hebrus' whole-chunk two-bank transaction. Its tests cover single-token, chunked
+and interleaved multi-turn execution, all-stage failure injection, non-finite
+rollback, PLE convolution across ubatches, EOS/history behavior, dense QSA
+2051/2052 and 262K fail-closed boundaries. The Metal fixture runs the same
+primitive semantics on a real device, including slot/position holes, all
+16→48 GDN head repeats and allocation/command/status rollback.
+
+Pinned capture is opt-in and networked:
+
+```sh
+PYTHONDONTWRITEBYTECODE=1 uv run --python 3.13 \
+  --with 'numpy==2.4.6' --with 'torch==2.9.1' \
+  --with 'transformers @ git+https://github.com/huggingface/transformers.git@42ca97014c85d71a88ad60d55f08cb9fb4d26e2c' \
+  python tests/qwen4exp/collect_graph_reference.py --write --verify-source
+```
+
+The ordinary gates remain offline apart from compiling/running Metal locally:
+
+```sh
+make qwen4exp-graph-test qwen4exp-metal-test
+make qwen4exp-metal-sanitizer-test
+```
+
+These are resident correctness fixtures, not artifact admission or product
+support. Physical dense, ExpertMajor and PLE codecs remain unqualified.
+
 ## Limitations
 
 These vectors and the structural admission fixture do not contain checkpoint
