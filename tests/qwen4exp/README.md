@@ -225,6 +225,47 @@ make qwen4exp-metal-sanitizer-test
 These are resident correctness fixtures, not artifact admission or product
 support. Physical dense, ExpertMajor and PLE codecs remain unqualified.
 
+## Phase 6 sparse QSA
+
+`collect_qsa_reference.py` runs the pinned Transformers Qwen4Exp QSA indexer
+and eager attention function over a deterministic F32 capture, then rejects
+any disagreement with an independent NumPy transcription. The fixture freezes
+complete-group pool/norm/RoPE output, exact full-raw and incremental selected
+positions, compact attention output and the invariant that no dense Q-by-K
+mask is allocated. The aggregate canonical-array payload digest is:
+
+```text
+d20e1d711a2ae519fd7f2f2ad2ad9a4555b6d56fee994056365f5f81348eb4be
+```
+
+Regeneration is intentionally pinned and networked:
+
+```sh
+PYTHONDONTWRITEBYTECODE=1 uv run --python 3.13.13 \
+  --with 'numpy==2.4.6' --with 'torch==2.9.1' \
+  --with 'transformers @ git+https://github.com/huggingface/transformers.git@42ca97014c85d71a88ad60d55f08cb9fb4d26e2c' \
+  python tests/qwen4exp/collect_qsa_reference.py --write --verify-source
+```
+
+The normal fixture check is stdlib-only and offline. Host tests additionally
+cover full-raw/incremental equivalence, cache lifecycle and rollback, holes,
+slot reuse, multi-sequence isolation, compact attention parity, non-finite and
+overflow rejection, and the 262,144-token contract. Actual-device Metal tests
+exercise sparse selection across 65,537, 100,000 and 262,144 visible tokens,
+invalid 262,145 input, compact gather/online attention, and private allocation,
+non-completion and clean-completion publication gates:
+
+```sh
+make qwen4exp-qsa-fixture-check \
+  qwen4exp-qsa-test qwen4exp-qsa-sanitizer-test
+make qwen4exp-metal-test qwen4exp-metal-sanitizer-test
+```
+
+The Phase-5 dense trio remains the small-context correctness reference. Phase
+6 is linked as a model-free implementation partition, but no production
+profile, family dispatch, artifact codec or runtime-support admission selects
+it.
+
 ## Limitations
 
 These vectors and the structural admission fixture do not contain checkpoint

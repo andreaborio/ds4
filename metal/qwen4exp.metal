@@ -1,9 +1,10 @@
-// Qwen4Exp Phase-5 resident correctness primitives.
+// Qwen4Exp Phase-5/6 resident correctness primitives.
 //
 // These kernels deliberately prefer bounded, serial reductions to throughput.
 // All activations, controls, reductions, and persistent state are F32.  The
 // layouts are contiguous and named at each entry point; production codec,
-// sparse-QSA, SSD, and M5-specialized paths are intentionally absent.
+// SSD, and M5-specialized paths are intentionally absent. Phase 6 adds compact
+// sparse QSA without changing the Phase-5 kernel ABIs below.
 
 #include <metal_stdlib>
 using namespace metal;
@@ -107,6 +108,39 @@ struct ds4_metal_args_qwen4exp_qsa_attention {
     uint reserved1;
 };
 
+struct ds4_metal_args_qwen4exp_qsa_sparse_select {
+    uint n_query;
+    uint n_query_head;
+    uint head_dim;
+    uint compression;
+    uint group_budget;
+    uint max_selected;
+    uint max_group;
+    uint reserved;
+};
+
+struct ds4_metal_args_qwen4exp_qsa_sparse_gather {
+    uint n_query;
+    uint n_kv_head;
+    uint head_dim;
+    uint n_slot;
+    uint max_selected;
+    uint storage_bytes;
+    uint reserved0;
+    uint reserved1;
+};
+
+struct ds4_metal_args_qwen4exp_qsa_sparse_attention {
+    uint n_query;
+    uint n_query_head;
+    uint n_kv_head;
+    uint head_dim;
+    uint max_selected;
+    uint reserved0;
+    uint reserved1;
+    uint reserved2;
+};
+
 struct ds4_metal_args_qwen4exp_ple_gather {
     uint n_token;
     uint n_head;
@@ -148,6 +182,12 @@ static_assert(sizeof(ds4_metal_args_qwen4exp_qsa_select) == 32,
               "qwen4exp QSA-select ABI drift");
 static_assert(sizeof(ds4_metal_args_qwen4exp_qsa_attention) == 32,
               "qwen4exp QSA-attention ABI drift");
+static_assert(sizeof(ds4_metal_args_qwen4exp_qsa_sparse_select) == 32,
+              "qwen4exp sparse QSA-select ABI drift");
+static_assert(sizeof(ds4_metal_args_qwen4exp_qsa_sparse_gather) == 32,
+              "qwen4exp sparse QSA-gather ABI drift");
+static_assert(sizeof(ds4_metal_args_qwen4exp_qsa_sparse_attention) == 32,
+              "qwen4exp sparse QSA-attention ABI drift");
 static_assert(sizeof(ds4_metal_args_qwen4exp_ple_gather) == 16,
               "qwen4exp PLE-gather ABI drift");
 static_assert(sizeof(ds4_metal_args_qwen4exp_ple_gate) == 16,
@@ -1183,6 +1223,307 @@ kernel void kernel_qwen4exp_qsa_attention_f32(
             sum += probability * v;
         }
         output[query_base + i] = sum;
+    }
+    status[lane] = DS4_Q4E_METAL_OK;
+}
+
+
+// ---------------------------------------------------------------------------
+// Phase 6: compact sparse QSA.
+//
+// The Phase-5 trio above is the dense correctness reference and stays exactly
+// as it is.  The three kernels below are the native sparse backend: they never
+// build a Q-by-K structure, they rank the groups with a bounded insertion of
+// at most group_budget entries instead of a budget-times-groups exclusion
+// scan, and they emit the selected row in ascending logical order so a context
+// that fits the budget is byte-identical to the dense row.
+//
+// The host module runtime/ds4_qwen4exp_qsa.{h,inc} is the oracle for all three.
+// Two deliberate consequences of that: the selection score is the unscaled
+// sum(ReLU(dot_h)) - a positive scale cannot change the ranking but can round
+// two distinct scores onto each other and move a tie - and the attention runs
+// the same single-pass online softmax in the same operation order, so the
+// results agree bit for bit rather than merely within a tolerance.
+//
+// Logical indices, not physical slots, travel between the kernels: a query's
+// visible range is one contiguous run of n_visible logical positions, group g
+// owns g*compression .. g*compression+compression-1, and the tail is whatever
+// follows the last complete group.  Only the gather resolves logical to
+// physical through the slot map it shares with the main KV cache.
+
+// query [query][index_head][head_dim], group_key [group][head_dim] in
+// ascending group order, n_visible [query].  Writes selected [query]
+// [max_selected] ascending logical ids and n_selected [query].
+kernel void kernel_qwen4exp_qsa_sparse_select_f32(
+        constant ds4_metal_args_qwen4exp_qsa_sparse_select &a [[buffer(0)]],
+        device const float *query       [[buffer(1)]],
+        device const float *group_key   [[buffer(2)]],
+        device const uint  *n_visible   [[buffer(3)]],
+        device       uint  *selected    [[buffer(4)]],
+        device       uint  *n_selected  [[buffer(5)]],
+        device       uint  *status      [[buffer(6)]],
+        uint query_index [[thread_position_in_grid]]) {
+    if (query_index >= a.n_query) return;
+    const uint visible = n_visible[query_index];
+    if (a.n_query_head == 0u || a.n_query_head > 256u ||
+        a.head_dim == 0u || a.head_dim > 256u ||
+        a.compression != 4u || a.group_budget == 0u ||
+        a.group_budget > 512u || a.max_selected == 0u ||
+        a.max_selected > 2051u || a.max_group > 65536u ||
+        visible == 0u || visible > 262144u ||
+        visible > a.max_group * a.compression + a.compression - 1u) {
+        status[query_index] = DS4_Q4E_METAL_BAD_ARGUMENT;
+        return;
+    }
+    const uint n_group = visible / a.compression;
+    const uint tail = visible - n_group * a.compression;
+    const uint select_group = min(n_group, a.group_budget);
+    const uint width = select_group * a.compression + tail;
+    if (n_group > a.max_group || width > a.max_selected) {
+        status[query_index] = DS4_Q4E_METAL_BAD_ARGUMENT;
+        return;
+    }
+
+    // Only the retained top-k scores live on chip. Candidate scores are
+    // consumed immediately, so memory is O(budget) at 262K rather than
+    // O(context) and never Q-by-K.
+    uint chosen[512];
+    float chosen_score[512];
+    uint kept = 0u;
+    for (uint group = 0u; group < n_group; group++) {
+        float total = 0.0f;
+        for (uint head = 0u; head < a.n_query_head; head++) {
+            float dot = 0.0f;
+            for (uint i = 0u; i < a.head_dim; i++) {
+                const float q = query[
+                    ((ulong)query_index * a.n_query_head + head) *
+                    a.head_dim + i];
+                const float k = group_key[(ulong)group * a.head_dim + i];
+                if (!isfinite(q) || !isfinite(k)) {
+                    status[query_index] = DS4_Q4E_METAL_NONFINITE;
+                    return;
+                }
+                dot += q * k;
+            }
+            if (!isfinite(dot)) {
+                status[query_index] = DS4_Q4E_METAL_NONFINITE;
+                return;
+            }
+            // per-head rectification: sum(ReLU(dot)), never ReLU(sum(dot))
+            if (dot > 0.0f) total += dot;
+        }
+        if (!isfinite(total)) {
+            status[query_index] = DS4_Q4E_METAL_NONFINITE;
+            return;
+        }
+        // Bounded sorted insertion: at most group_budget entries are ever
+        // held. Ties keep the earlier group, because the walk-back stops at
+        // the first entry whose score is not strictly smaller.
+        uint insert;
+        uint shift_from;
+        if (kept == a.group_budget) {
+            if (!(total > chosen_score[a.group_budget - 1u])) continue;
+            insert = a.group_budget - 1u;
+            shift_from = a.group_budget - 1u;
+        } else {
+            insert = kept;
+            shift_from = kept;
+        }
+        while (insert > 0u && chosen_score[insert - 1u] < total)
+            insert--;
+        for (uint i = shift_from; i > insert; i--) {
+            chosen[i] = chosen[i - 1u];
+            chosen_score[i] = chosen_score[i - 1u];
+        }
+        chosen[insert] = group;
+        chosen_score[insert] = total;
+        if (kept < a.group_budget) kept++;
+    }
+    if (kept != select_group) {
+        status[query_index] = DS4_Q4E_METAL_BAD_ARGUMENT;
+        return;
+    }
+
+    // The rank decided the set; the row is emitted in ascending group order.
+    for (uint i = 1u; i < select_group; i++) {
+        const uint value = chosen[i];
+        uint j = i;
+        while (j > 0u && chosen[j - 1u] > value) {
+            chosen[j] = chosen[j - 1u];
+            j--;
+        }
+        chosen[j] = value;
+    }
+
+    ulong write = (ulong)query_index * a.max_selected;
+    for (uint slot = 0u; slot < select_group; slot++) {
+        for (uint offset = 0u; offset < a.compression; offset++)
+            selected[write++] = chosen[slot] * a.compression + offset;
+    }
+    const uint tail_start = n_group * a.compression;
+    for (uint offset = 0u; offset < tail; offset++)
+        selected[write++] = tail_start + offset;
+    n_selected[query_index] = width;
+    status[query_index] = DS4_Q4E_METAL_OK;
+}
+
+// Compacts only the selected rows.  logical_slot [logical] is the shared KV
+// slot map; key/value are [slot][kv_head][head_dim]; the gathered pair is
+// [query][max_selected][kv_head][head_dim].  One thread per (query, slot):
+// unused slots of a short row are left untouched and report OK, so the row's
+// tail never has to be zeroed.
+kernel void kernel_qwen4exp_qsa_sparse_gather_f32(
+        constant ds4_metal_args_qwen4exp_qsa_sparse_gather &a [[buffer(0)]],
+        device const uint  *selected      [[buffer(1)]],
+        device const uint  *n_selected    [[buffer(2)]],
+        device const uint  *logical_slot  [[buffer(3)]],
+        device const float *key           [[buffer(4)]],
+        device const float *value         [[buffer(5)]],
+        device       float *gathered_key  [[buffer(6)]],
+        device       float *gathered_value[[buffer(7)]],
+        device       uint  *status        [[buffer(8)]],
+        uint lane [[thread_position_in_grid]]) {
+    const uint count = a.n_query * a.max_selected;
+    if (lane >= count) return;
+    const uint query_index = lane / a.max_selected;
+    const uint entry = lane % a.max_selected;
+    const ulong row = (ulong)a.n_kv_head * a.head_dim;
+    if (a.n_kv_head == 0u || a.n_kv_head > 256u || a.head_dim == 0u ||
+        a.head_dim > 256u || a.n_slot == 0u || a.max_selected == 0u ||
+        a.max_selected > 2051u ||
+        (ulong)count * row * 4ul > (ulong)a.storage_bytes) {
+        status[lane] = DS4_Q4E_METAL_BAD_ARGUMENT;
+        return;
+    }
+    const uint n = n_selected[query_index];
+    if (n == 0u || n > a.max_selected) {
+        status[lane] = DS4_Q4E_METAL_BAD_ARGUMENT;
+        return;
+    }
+    if (entry >= n) {
+        status[lane] = DS4_Q4E_METAL_OK;
+        return;
+    }
+    const uint slot = logical_slot[selected[(ulong)query_index *
+                                            a.max_selected + entry]];
+    if (slot >= a.n_slot) {
+        status[lane] = DS4_Q4E_METAL_BAD_INDEX;
+        return;
+    }
+    const ulong source = (ulong)slot * row;
+    const ulong destination = (ulong)lane * row;
+    for (ulong i = 0ul; i < row; i++) {
+        const float k = key[source + i];
+        const float v = value[source + i];
+        if (!isfinite(k) || !isfinite(v)) {
+            status[lane] = DS4_Q4E_METAL_NONFINITE;
+            return;
+        }
+        gathered_key[destination + i] = k;
+        gathered_value[destination + i] = v;
+    }
+    status[lane] = DS4_Q4E_METAL_OK;
+}
+
+// Single-pass online softmax over one query's compacted rows.  query and
+// output are [query][query_head][head_dim]; the gathered pair is
+// [query][max_selected][kv_head][head_dim].  One thread per (query, head): the
+// running maximum, denominator and accumulator are rescaled in exactly the
+// host oracle's order, so no dense score row is ever materialized.
+kernel void kernel_qwen4exp_qsa_sparse_attention_f32(
+        constant ds4_metal_args_qwen4exp_qsa_sparse_attention &a [[buffer(0)]],
+        device const float *query          [[buffer(1)]],
+        device const float *gathered_key   [[buffer(2)]],
+        device const float *gathered_value [[buffer(3)]],
+        device const uint  *n_selected     [[buffer(4)]],
+        device       float *output         [[buffer(5)]],
+        device       uint  *status         [[buffer(6)]],
+        uint lane [[thread_position_in_grid]]) {
+    const uint count = a.n_query * a.n_query_head;
+    if (lane >= count) return;
+    const uint query_index = lane / a.n_query_head;
+    const uint query_head = lane % a.n_query_head;
+    if (a.n_query_head == 0u || a.n_kv_head == 0u ||
+        a.n_query_head < a.n_kv_head ||
+        a.n_query_head % a.n_kv_head != 0u ||
+        a.head_dim == 0u || a.head_dim > 256u ||
+        a.max_selected == 0u || a.max_selected > 2051u) {
+        status[lane] = DS4_Q4E_METAL_BAD_ARGUMENT;
+        return;
+    }
+    const uint n = n_selected[query_index];
+    if (n == 0u || n > a.max_selected) {
+        status[lane] = DS4_Q4E_METAL_BAD_ARGUMENT;
+        return;
+    }
+    const uint kv_head = query_head / (a.n_query_head / a.n_kv_head);
+    const ulong query_base =
+        ((ulong)query_index * a.n_query_head + query_head) * a.head_dim;
+    const float scale = 1.0f / sqrt((float)a.head_dim);
+    float accumulator[256];
+    for (uint i = 0u; i < a.head_dim; i++) accumulator[i] = 0.0f;
+    float maximum = -INFINITY;
+    float denominator = 0.0f;
+    for (uint entry = 0u; entry < n; entry++) {
+        const ulong gathered_base =
+            (((ulong)query_index * a.max_selected + entry) * a.n_kv_head +
+             kv_head) * a.head_dim;
+        float dot = 0.0f;
+        for (uint i = 0u; i < a.head_dim; i++) {
+            const float q = query[query_base + i];
+            const float k = gathered_key[gathered_base + i];
+            if (!isfinite(q) || !isfinite(k)) {
+                status[lane] = DS4_Q4E_METAL_NONFINITE;
+                return;
+            }
+            dot += q * k;
+        }
+        const float s = dot * scale;
+        if (!isfinite(s)) {
+            status[lane] = DS4_Q4E_METAL_NONFINITE;
+            return;
+        }
+        if (s > maximum) {
+            const float rescale = exp(maximum - s);
+            if (!isfinite(rescale)) {
+                status[lane] = DS4_Q4E_METAL_NONFINITE;
+                return;
+            }
+            denominator *= rescale;
+            for (uint i = 0u; i < a.head_dim; i++) accumulator[i] *= rescale;
+            maximum = s;
+        }
+        const float weight = exp(s - maximum);
+        if (!isfinite(weight)) {
+            status[lane] = DS4_Q4E_METAL_NONFINITE;
+            return;
+        }
+        denominator += weight;
+        for (uint i = 0u; i < a.head_dim; i++) {
+            const float v = gathered_value[gathered_base + i];
+            if (!isfinite(v)) {
+                status[lane] = DS4_Q4E_METAL_NONFINITE;
+                return;
+            }
+            accumulator[i] += weight * v;
+        }
+        if (!isfinite(denominator)) {
+            status[lane] = DS4_Q4E_METAL_NONFINITE;
+            return;
+        }
+    }
+    if (!(denominator > 0.0f) || !isfinite(denominator)) {
+        status[lane] = DS4_Q4E_METAL_NONFINITE;
+        return;
+    }
+    // Publish only after the whole row is proven finite.
+    for (uint i = 0u; i < a.head_dim; i++) {
+        const float result = accumulator[i] / denominator;
+        if (!isfinite(result)) {
+            status[lane] = DS4_Q4E_METAL_NONFINITE;
+            return;
+        }
+        output[query_base + i] = result;
     }
     status[lane] = DS4_Q4E_METAL_OK;
 }

@@ -1,4 +1,4 @@
-/* Qwen4Exp Phase-5 Metal correctness partition.
+/* Qwen4Exp Phase-5/6 Metal correctness partition.
  *
  * This file is a textual implementation partition for ds4_metal.m.  It is
  * intentionally inert until the including translation unit calls the
@@ -109,6 +109,41 @@ typedef struct {
     uint32_t reserved1;
 } ds4_metal_qwen4exp_qsa_attention_args;
 
+/* Phase-6 compact sparse QSA.  Mirrors ds4_metal_args_qwen4exp_qsa_sparse_*
+ * in metal/qwen4exp.metal; the static asserts below pin both sides. */
+typedef struct {
+    uint32_t n_query;
+    uint32_t n_query_head;
+    uint32_t head_dim;
+    uint32_t compression;
+    uint32_t group_budget;
+    uint32_t max_selected;
+    uint32_t max_group;
+    uint32_t reserved;
+} ds4_metal_qwen4exp_qsa_sparse_select_args;
+
+typedef struct {
+    uint32_t n_query;
+    uint32_t n_kv_head;
+    uint32_t head_dim;
+    uint32_t n_slot;
+    uint32_t max_selected;
+    uint32_t storage_bytes;
+    uint32_t reserved0;
+    uint32_t reserved1;
+} ds4_metal_qwen4exp_qsa_sparse_gather_args;
+
+typedef struct {
+    uint32_t n_query;
+    uint32_t n_query_head;
+    uint32_t n_kv_head;
+    uint32_t head_dim;
+    uint32_t max_selected;
+    uint32_t reserved0;
+    uint32_t reserved1;
+    uint32_t reserved2;
+} ds4_metal_qwen4exp_qsa_sparse_attention_args;
+
 typedef struct {
     uint32_t n_token;
     uint32_t n_head;
@@ -150,6 +185,12 @@ _Static_assert(sizeof(ds4_metal_qwen4exp_qsa_select_args) == 32,
                "Qwen4Exp QSA-select Metal ABI drift");
 _Static_assert(sizeof(ds4_metal_qwen4exp_qsa_attention_args) == 32,
                "Qwen4Exp QSA-attention Metal ABI drift");
+_Static_assert(sizeof(ds4_metal_qwen4exp_qsa_sparse_select_args) == 32,
+               "Qwen4Exp sparse QSA-select Metal ABI drift");
+_Static_assert(sizeof(ds4_metal_qwen4exp_qsa_sparse_gather_args) == 32,
+               "Qwen4Exp sparse QSA-gather Metal ABI drift");
+_Static_assert(sizeof(ds4_metal_qwen4exp_qsa_sparse_attention_args) == 32,
+               "Qwen4Exp sparse QSA-attention Metal ABI drift");
 _Static_assert(sizeof(ds4_metal_qwen4exp_ple_gather_args) == 16,
                "Qwen4Exp PLE-gather Metal ABI drift");
 _Static_assert(sizeof(ds4_metal_qwen4exp_ple_gate_args) == 16,
@@ -170,6 +211,9 @@ typedef NS_ENUM(uint32_t, ds4_metal_qwen4exp_kernel) {
     DS4_METAL_QWEN4EXP_QSA_GROUP,
     DS4_METAL_QWEN4EXP_QSA_SELECT,
     DS4_METAL_QWEN4EXP_QSA_ATTENTION,
+    DS4_METAL_QWEN4EXP_QSA_SPARSE_SELECT,
+    DS4_METAL_QWEN4EXP_QSA_SPARSE_GATHER,
+    DS4_METAL_QWEN4EXP_QSA_SPARSE_ATTENTION,
     DS4_METAL_QWEN4EXP_PLE_GATHER,
     DS4_METAL_QWEN4EXP_PLE_GATE,
     DS4_METAL_QWEN4EXP_HEAD,
@@ -221,6 +265,12 @@ static inline NSString *ds4_metal_qwen4exp_kernel_name(
             return @"kernel_qwen4exp_qsa_select_positions_f32";
         case DS4_METAL_QWEN4EXP_QSA_ATTENTION:
             return @"kernel_qwen4exp_qsa_attention_f32";
+        case DS4_METAL_QWEN4EXP_QSA_SPARSE_SELECT:
+            return @"kernel_qwen4exp_qsa_sparse_select_f32";
+        case DS4_METAL_QWEN4EXP_QSA_SPARSE_GATHER:
+            return @"kernel_qwen4exp_qsa_sparse_gather_f32";
+        case DS4_METAL_QWEN4EXP_QSA_SPARSE_ATTENTION:
+            return @"kernel_qwen4exp_qsa_sparse_attention_f32";
         case DS4_METAL_QWEN4EXP_PLE_GATHER:
             return @"kernel_qwen4exp_ple_gather_f32";
         case DS4_METAL_QWEN4EXP_PLE_GATE:
@@ -258,6 +308,12 @@ static inline NSUInteger ds4_metal_qwen4exp_argument_size(
             return sizeof(ds4_metal_qwen4exp_qsa_select_args);
         case DS4_METAL_QWEN4EXP_QSA_ATTENTION:
             return sizeof(ds4_metal_qwen4exp_qsa_attention_args);
+        case DS4_METAL_QWEN4EXP_QSA_SPARSE_SELECT:
+            return sizeof(ds4_metal_qwen4exp_qsa_sparse_select_args);
+        case DS4_METAL_QWEN4EXP_QSA_SPARSE_GATHER:
+            return sizeof(ds4_metal_qwen4exp_qsa_sparse_gather_args);
+        case DS4_METAL_QWEN4EXP_QSA_SPARSE_ATTENTION:
+            return sizeof(ds4_metal_qwen4exp_qsa_sparse_attention_args);
         case DS4_METAL_QWEN4EXP_PLE_GATHER:
             return sizeof(ds4_metal_qwen4exp_ple_gather_args);
         case DS4_METAL_QWEN4EXP_PLE_GATE:
@@ -285,6 +341,9 @@ static inline NSUInteger ds4_metal_qwen4exp_binding_count(
         case DS4_METAL_QWEN4EXP_QSA_GROUP: return 6u;
         case DS4_METAL_QWEN4EXP_QSA_SELECT: return 6u;
         case DS4_METAL_QWEN4EXP_QSA_ATTENTION: return 7u;
+        case DS4_METAL_QWEN4EXP_QSA_SPARSE_SELECT: return 6u;
+        case DS4_METAL_QWEN4EXP_QSA_SPARSE_GATHER: return 8u;
+        case DS4_METAL_QWEN4EXP_QSA_SPARSE_ATTENTION: return 6u;
         case DS4_METAL_QWEN4EXP_PLE_GATHER: return 4u;
         case DS4_METAL_QWEN4EXP_PLE_GATE: return 5u;
         case DS4_METAL_QWEN4EXP_HEAD: return 4u;
@@ -432,7 +491,7 @@ static inline bool ds4_metal_qwen4exp_finite_f32(
     return true;
 }
 
-/* Phase-5 state is shared/managed F32 memory so a fresh private transaction
+/* Phase-5/6 state is shared/managed F32 memory so a fresh private transaction
  * can be seeded byte-for-byte. allocation_ceiling is normally the device or
  * graph budget and is injectable in the standalone OOM rollback test. */
 static inline bool ds4_metal_qwen4exp_prepare_state_transaction(

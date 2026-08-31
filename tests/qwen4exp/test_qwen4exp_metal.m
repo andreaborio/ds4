@@ -11,8 +11,11 @@
 
 #include "../../ds4_qwen4exp_ref.h"
 #include "../../runtime/ds4_metal_qwen4exp.inc"
+#include "../../runtime/ds4_qwen4exp_qsa.h"
+#include "../../runtime/ds4_qwen4exp_qsa.inc"
+#include "qwen4exp_qsa_golden.inc"
 
-/* Standalone Phase-5 CPU-oracle versus actual-device Metal qualification.
+/* Standalone Phase-5/6 CPU-oracle versus actual-device Metal qualification.
  *
  * clang -std=c11 -fobjc-arc -Wall -Wextra -Werror -Wpedantic \
  *   -framework Foundation -framework Metal \
@@ -1293,6 +1296,643 @@ static bool test_qsa(
     return true;
 }
 
+/* ---------------- Phase 6: compact sparse QSA ---------------- */
+
+/* The generated case is pinned to Transformers plus an independent NumPy
+ * transcription.  The other cases use the host module as their oracle: the
+ * same cache owns the group keys, slot map and reference sparse attention. */
+
+typedef struct {
+    ds4_qwen4exp_qsa_cache *cache;
+    uint32_t anchor;      /* first live position of the sequence */
+    uint32_t visible;     /* live positions anchor..anchor+visible-1 */
+    uint32_t n_group;     /* complete groups in that range */
+} q4e_sparse_fixture;
+
+static void q4e_sparse_payload(uint32_t position, uint32_t salt,
+                               size_t index_dim, size_t kv_dim, float *raw,
+                               float *key, float *value) {
+    uint32_t state = position * 2654435761u ^ salt;
+    for (size_t i = 0u; i < index_dim; i++) {
+        state = state * 1664525u + 1013904223u;
+        raw[i] = ((float)(state % 1000u) - 500.0f) / 250.0f;
+    }
+    for (size_t i = 0u; i < kv_dim; i++) {
+        state = state * 1664525u + 1013904223u;
+        key[i] = ((float)(state % 1000u) - 500.0f) / 250.0f;
+        state = state * 1664525u + 1013904223u;
+        value[i] = ((float)(state % 1000u) - 500.0f) / 250.0f;
+    }
+}
+
+static float q4e_sparse_gamma[4] = {0.1f, -0.2f, 0.05f, 0.3f};
+
+static void q4e_sparse_config(ds4_qwen4exp_qsa_config *config, size_t budget,
+                              bool pinned) {
+    memset(config, 0, sizeof(*config));
+    config->index_dim = pinned ? Q4E_QSA6_INDEX_DIM : 4u;
+    config->index_heads = pinned ? Q4E_QSA6_INDEX_HEADS : 2u;
+    config->attn_heads = 4u;
+    config->kv_heads = 2u;   /* GQA ratio 2 */
+    config->kv_head_dim = 4u;
+    config->block_budget = budget;
+    config->context = DS4_Q4E_QSA_MAX_CONTEXT;
+    config->line_capacity = 256u;
+    config->n_slot = 256u;
+    config->max_sequences = 2u;
+    config->n_rot = pinned ? Q4E_QSA6_N_ROT : 4u;
+    config->theta = pinned ? Q4E_QSA6_THETA : 10000.0f;
+    config->epsilon = 1.0e-6f;
+    config->norm_weight = pinned ? q4e_qsa6_key_norm_weight
+                                 : q4e_sparse_gamma;
+}
+
+static bool q4e_sparse_fill(ds4_qwen4exp_qsa_cache *cache, uint32_t anchor,
+                            uint32_t count, uint32_t salt, bool pinned) {
+    for (uint32_t i = 0u; i < count; i++) {
+        ds4_qwen4exp_qsa_reservation reservation;
+        float raw[8];
+        float key[8];
+        float value[8];
+        if (pinned) {
+            memcpy(raw, q4e_qsa6_raw_key + (size_t)i * Q4E_QSA6_INDEX_DIM,
+                   sizeof(float) * Q4E_QSA6_INDEX_DIM);
+            memcpy(key, q4e_qsa6_key + (size_t)i * 8u,
+                   sizeof(key));
+            memcpy(value, q4e_qsa6_value + (size_t)i * 8u,
+                   sizeof(value));
+        } else {
+            q4e_sparse_payload(anchor + i, salt, 4u, 8u, raw, key, value);
+        }
+        if (!ds4_qwen4exp_qsa_append_reserve(cache, 0u, anchor + i,
+                                             &reservation)) {
+            return false;
+        }
+        if (!ds4_qwen4exp_qsa_append_commit(cache, &reservation, key, value,
+                                            raw)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+/* One (length, budget) case end to end: select, gather, attention. */
+static bool q4e_sparse_case(id<MTLDevice> device, id<MTLCommandQueue> queue,
+                            const ds4_metal_qwen4exp_cache *cache,
+                            uint32_t anchor, uint32_t length, size_t budget,
+                            bool expect_dense, bool pinned) {
+    ds4_qwen4exp_qsa_config config;
+    ds4_qwen4exp_qsa_cache *host = NULL;
+    ds4_qwen4exp_qsa_selection expected;
+    const uint32_t index_dim = pinned ? Q4E_QSA6_INDEX_DIM : 4u;
+    const uint32_t index_heads = pinned ? Q4E_QSA6_INDEX_HEADS : 2u;
+    const uint32_t attn_heads = 4u;
+    const uint32_t kv_heads = 2u;
+    const uint32_t kv_head_dim = 4u;
+    const uint32_t max_selected = DS4_Q4E_QSA_MAX_WIDTH;
+    const uint32_t n_group = length / 4u;
+    float index_query[32];  /* [index_heads][index_dim], maximum fixture */
+    float attn_query[16];   /* [attn_heads][kv_head_dim] */
+    float reference_out[16];
+
+    if (pinned) {
+        REQUIRE(anchor == Q4E_QSA6_ANCHOR && length == Q4E_QSA6_VISIBLE &&
+                    budget == Q4E_QSA6_GROUP_BUDGET,
+                "pinned sparse geometry");
+    }
+    q4e_sparse_config(&config, budget, pinned);
+    REQUIRE(ds4_qwen4exp_qsa_cache_create(&host, &config), "host cache");
+    if (!q4e_sparse_fill(host, anchor, length, 11u, pinned)) {
+        ds4_qwen4exp_qsa_cache_destroy(host);
+        REQUIRE(false, "host fill");
+    }
+    if (pinned) {
+        memcpy(index_query, q4e_qsa6_index_query,
+               sizeof(float) * index_heads * index_dim);
+        memcpy(attn_query, q4e_qsa6_attention_query, sizeof(attn_query));
+    } else {
+        for (uint32_t i = 0u; i < index_heads * index_dim; i++)
+            index_query[i] =
+                0.35f - 0.11f * (float)i + 0.03f * (float)(i * i % 7u);
+        for (uint32_t i = 0u; i < attn_heads * kv_head_dim; i++)
+            attn_query[i] =
+                0.2f + 0.07f * (float)i - 0.05f * (float)(i % 5u);
+    }
+
+    bool ok = ds4_qwen4exp_qsa_plan(host, DS4_Q4E_QSA_PLAN_FULL_RAW, 0u,
+                                    anchor + length - 1u, index_query,
+                                    &expected);
+    if (ok) {
+        ok = ds4_qwen4exp_qsa_attention(host, 0u, attn_query, &expected,
+                                        reference_out);
+    }
+    if (!ok) {
+        ds4_qwen4exp_qsa_cache_destroy(host);
+        REQUIRE(false, "host oracle");
+    }
+    if (expect_dense && expected.width != length) {
+        ds4_qwen4exp_qsa_cache_destroy(host);
+        REQUIRE(false, "oracle not dense at length %u: width %zu", length,
+                expected.width);
+    }
+    if (pinned) {
+        bool golden_ok = expected.width == Q4E_QSA6_SELECTED &&
+            q4e_check_f32("pinned pooled keys", host->pooled,
+                          q4e_qsa6_group_key,
+                          (length / 4u) * index_dim) &&
+            q4e_check_f32("pinned attention host", reference_out,
+                          q4e_qsa6_attention_output,
+                          attn_heads * kv_head_dim);
+        for (uint32_t i = 0u; golden_ok && i < expected.width; i++) {
+            golden_ok = expected.entry[i].position ==
+                q4e_qsa6_selected_position[i];
+        }
+        if (!golden_ok) {
+            ds4_qwen4exp_qsa_cache_destroy(host);
+            REQUIRE(false, "pinned Transformers/NumPy QSA fixture");
+        }
+    }
+
+    /* --- select --------------------------------------------------------- */
+    ds4_metal_qwen4exp_qsa_sparse_select_args select_args = {
+        .n_query = 1u,
+        .n_query_head = index_heads,
+        .head_dim = index_dim,
+        .compression = 4u,
+        .group_budget = (uint32_t)budget,
+        .max_selected = max_selected,
+        .max_group = n_group,
+        .reserved = 0u,
+    };
+    const uint32_t visible = length;
+    id<MTLBuffer> query_buffer = q4e_buffer(
+        device, index_query, (NSUInteger)index_heads * index_dim * sizeof(float));
+    id<MTLBuffer> group_buffer =
+        q4e_buffer(device, host->pooled,
+                   (NSUInteger)n_group * index_dim * sizeof(float));
+    id<MTLBuffer> visible_buffer = q4e_buffer(device, &visible,
+                                              sizeof(visible));
+    id<MTLBuffer> selected_buffer =
+        q4e_buffer(device, NULL, (NSUInteger)max_selected * sizeof(uint32_t));
+    id<MTLBuffer> count_buffer = q4e_buffer(device, NULL, sizeof(uint32_t));
+    id<MTLBuffer> select_status = q4e_buffer(device, NULL, sizeof(uint32_t));
+    if (!query_buffer || !group_buffer || !visible_buffer ||
+        !selected_buffer || !count_buffer || !select_status) {
+        ds4_qwen4exp_qsa_cache_destroy(host);
+        REQUIRE(false, "select buffers");
+    }
+    if (!q4e_dispatch(queue, cache, DS4_METAL_QWEN4EXP_QSA_SPARSE_SELECT,
+                      &select_args, sizeof(select_args),
+                      @[query_buffer, group_buffer, visible_buffer,
+                        selected_buffer, count_buffer, select_status],
+                      @[], 1u)) {
+        ds4_qwen4exp_qsa_cache_destroy(host);
+        REQUIRE(false, "select dispatch");
+    }
+    const uint32_t *selected = (const uint32_t *)selected_buffer.contents;
+    const uint32_t width = *(const uint32_t *)count_buffer.contents;
+    bool selection_ok =
+        q4e_status_ok((const uint32_t *)select_status.contents, 1u) &&
+        width == (uint32_t)expected.width;
+    for (uint32_t i = 0u; selection_ok && i < width; i++) {
+        /* the kernel speaks logical indices inside the visible run */
+        selection_ok = selected[i] == expected.entry[i].position - anchor;
+    }
+    if (!selection_ok) {
+        fprintf(stderr, "select mismatch: width %u (oracle %zu)\n", width,
+                expected.width);
+        for (uint32_t i = 0u; i < width && i < 12u; i++)
+            fprintf(stderr, "  [%u] got %u expected %u\n", i, selected[i],
+                    expected.entry[i].position - anchor);
+        ds4_qwen4exp_qsa_cache_destroy(host);
+        REQUIRE(false, "sparse selection");
+    }
+
+    /* --- gather --------------------------------------------------------- */
+    uint32_t *slot_map = (uint32_t *)calloc(visible, sizeof(uint32_t));
+    if (!slot_map) {
+        ds4_qwen4exp_qsa_cache_destroy(host);
+        REQUIRE(false, "slot map");
+    }
+    for (uint32_t i = 0u; i < visible; i++) {
+        uint32_t slot = 0u;
+        if (!ds4_qwen4exp_qsa_resolve(host, 0u, anchor + i, &slot)) {
+            free(slot_map);
+            ds4_qwen4exp_qsa_cache_destroy(host);
+            REQUIRE(false, "resolve logical %u", i);
+        }
+        slot_map[i] = slot;
+    }
+    const NSUInteger gathered_bytes =
+        (NSUInteger)max_selected * kv_heads * kv_head_dim * sizeof(float);
+    ds4_metal_qwen4exp_qsa_sparse_gather_args gather_args = {
+        .n_query = 1u,
+        .n_kv_head = kv_heads,
+        .head_dim = kv_head_dim,
+        .n_slot = (uint32_t)config.n_slot,
+        .max_selected = max_selected,
+        .storage_bytes = (uint32_t)gathered_bytes,
+        .reserved0 = 0u,
+        .reserved1 = 0u,
+    };
+    id<MTLBuffer> slot_buffer =
+        q4e_buffer(device, slot_map, (NSUInteger)visible * sizeof(uint32_t));
+    id<MTLBuffer> key_buffer =
+        q4e_buffer(device, host->key,
+                   (NSUInteger)config.n_slot * kv_heads * kv_head_dim *
+                   sizeof(float));
+    id<MTLBuffer> value_buffer =
+        q4e_buffer(device, host->value,
+                   (NSUInteger)config.n_slot * kv_heads * kv_head_dim *
+                   sizeof(float));
+    id<MTLBuffer> gathered_key = q4e_buffer(device, NULL, gathered_bytes);
+    id<MTLBuffer> gathered_value = q4e_buffer(device, NULL, gathered_bytes);
+    id<MTLBuffer> gather_status =
+        q4e_buffer(device, NULL, (NSUInteger)max_selected * sizeof(uint32_t));
+    free(slot_map);
+    if (!slot_buffer || !key_buffer || !value_buffer || !gathered_key ||
+        !gathered_value || !gather_status) {
+        ds4_qwen4exp_qsa_cache_destroy(host);
+        REQUIRE(false, "gather buffers");
+    }
+    if (!q4e_dispatch(queue, cache, DS4_METAL_QWEN4EXP_QSA_SPARSE_GATHER,
+                      &gather_args, sizeof(gather_args),
+                      @[selected_buffer, count_buffer, slot_buffer,
+                        key_buffer, value_buffer, gathered_key,
+                        gathered_value, gather_status],
+                      @[], max_selected)) {
+        ds4_qwen4exp_qsa_cache_destroy(host);
+        REQUIRE(false, "gather dispatch");
+    }
+    bool gather_ok =
+        q4e_status_ok((const uint32_t *)gather_status.contents, max_selected);
+    const float *got_key = (const float *)gathered_key.contents;
+    const float *got_value = (const float *)gathered_value.contents;
+    for (uint32_t i = 0u; gather_ok && i < width; i++) {
+        uint32_t slot = 0u;
+        gather_ok = ds4_qwen4exp_qsa_resolve(host, 0u,
+                                             expected.entry[i].position,
+                                             &slot);
+        for (uint32_t j = 0u; gather_ok && j < kv_heads * kv_head_dim; j++) {
+            const size_t source = (size_t)slot * kv_heads * kv_head_dim + j;
+            const size_t destination = (size_t)i * kv_heads * kv_head_dim + j;
+            /* a gather may not perturb a single bit */
+            gather_ok = got_key[destination] == host->key[source] &&
+                        got_value[destination] == host->value[source];
+        }
+    }
+    if (!gather_ok) {
+        ds4_qwen4exp_qsa_cache_destroy(host);
+        REQUIRE(false, "sparse gather");
+    }
+
+    /* --- attention ------------------------------------------------------ */
+    ds4_metal_qwen4exp_qsa_sparse_attention_args attention_args = {
+        .n_query = 1u,
+        .n_query_head = attn_heads,
+        .n_kv_head = kv_heads,
+        .head_dim = kv_head_dim,
+        .max_selected = max_selected,
+        .reserved0 = 0u, .reserved1 = 0u, .reserved2 = 0u,
+    };
+    id<MTLBuffer> attention_query = q4e_buffer(device, attn_query,
+                                               sizeof(attn_query));
+    id<MTLBuffer> attention_out =
+        q4e_buffer(device, NULL, sizeof(reference_out));
+    id<MTLBuffer> attention_status =
+        q4e_buffer(device, NULL, (NSUInteger)attn_heads * sizeof(uint32_t));
+    if (!attention_query || !attention_out || !attention_status) {
+        ds4_qwen4exp_qsa_cache_destroy(host);
+        REQUIRE(false, "attention buffers");
+    }
+    if (!q4e_dispatch(queue, cache, DS4_METAL_QWEN4EXP_QSA_SPARSE_ATTENTION,
+                      &attention_args, sizeof(attention_args),
+                      @[attention_query, gathered_key, gathered_value,
+                        count_buffer, attention_out, attention_status],
+                      @[], attn_heads)) {
+        ds4_qwen4exp_qsa_cache_destroy(host);
+        REQUIRE(false, "attention dispatch");
+    }
+    const bool attention_ok =
+        q4e_status_ok((const uint32_t *)attention_status.contents,
+                      attn_heads) &&
+        q4e_check_f32("sparse attention",
+                      (const float *)attention_out.contents, reference_out,
+                      attn_heads * kv_head_dim);
+    ds4_qwen4exp_qsa_cache_destroy(host);
+    REQUIRE(attention_ok, "sparse attention parity");
+    return true;
+}
+
+/* The select kernel must scan the full context while retaining only 512
+ * scores/IDs.  Each case keeps group 0..510 plus a high-scoring final group,
+ * proving that the scan reached the end before ascending emission. */
+static bool q4e_sparse_long_boundaries(
+        id<MTLDevice> device,
+        id<MTLCommandQueue> queue,
+        const ds4_metal_qwen4exp_cache *cache) {
+    static const uint32_t lengths[] = {65537u, 100000u, 262144u};
+    const uint32_t max_selected = DS4_Q4E_QSA_MAX_WIDTH;
+    const float query = 1.0f;
+    for (size_t lane = 0u; lane < sizeof(lengths) / sizeof(lengths[0]); lane++) {
+        const uint32_t visible = lengths[lane];
+        const uint32_t n_group = visible / 4u;
+        const uint32_t tail = visible % 4u;
+        const uint32_t expected_width = 2048u + tail;
+        float *group_key = (float *)calloc(n_group, sizeof(float));
+        REQUIRE(group_key != NULL, "long QSA group allocation");
+        for (uint32_t group = 0u; group < 512u; group++)
+            group_key[group] = 1000.0f - (float)group;
+        group_key[n_group - 1u] = 999.5f;
+
+        id<MTLBuffer> query_buffer = q4e_buffer(device, &query, sizeof(query));
+        id<MTLBuffer> group_buffer = q4e_buffer(
+            device, group_key, (NSUInteger)n_group * sizeof(float));
+        id<MTLBuffer> visible_buffer = q4e_buffer(
+            device, &visible, sizeof(visible));
+        id<MTLBuffer> selected_buffer = q4e_buffer(
+            device, NULL, (NSUInteger)max_selected * sizeof(uint32_t));
+        id<MTLBuffer> count_buffer = q4e_buffer(device, NULL, sizeof(uint32_t));
+        id<MTLBuffer> status_buffer = q4e_buffer(device, NULL, sizeof(uint32_t));
+        free(group_key);
+        REQUIRE(query_buffer && group_buffer && visible_buffer &&
+                    selected_buffer && count_buffer && status_buffer,
+                "long QSA Metal buffers");
+        ds4_metal_qwen4exp_qsa_sparse_select_args args = {
+            .n_query = 1u,
+            .n_query_head = 1u,
+            .head_dim = 1u,
+            .compression = 4u,
+            .group_budget = 512u,
+            .max_selected = max_selected,
+            .max_group = n_group,
+            .reserved = 0u,
+        };
+        REQUIRE(q4e_dispatch(
+                    queue, cache, DS4_METAL_QWEN4EXP_QSA_SPARSE_SELECT,
+                    &args, sizeof(args),
+                    @[query_buffer, group_buffer, visible_buffer,
+                      selected_buffer, count_buffer, status_buffer], @[], 1u),
+                "long QSA select dispatch %u", visible);
+        REQUIRE(q4e_status_ok(status_buffer.contents, 1u),
+                "long QSA select status %u", visible);
+        REQUIRE(*(const uint32_t *)count_buffer.contents == expected_width,
+                "long QSA width %u", visible);
+        const uint32_t *selected = (const uint32_t *)selected_buffer.contents;
+        size_t write = 0u;
+        for (uint32_t group = 0u; group <= 510u; group++) {
+            for (uint32_t offset = 0u; offset < 4u; offset++)
+                REQUIRE(selected[write++] == group * 4u + offset,
+                        "long QSA prefix %u at %zu", visible, write - 1u);
+        }
+        for (uint32_t offset = 0u; offset < 4u; offset++)
+            REQUIRE(selected[write++] == (n_group - 1u) * 4u + offset,
+                    "long QSA final group %u", visible);
+        for (uint32_t offset = 0u; offset < tail; offset++)
+            REQUIRE(selected[write++] == n_group * 4u + offset,
+                    "long QSA tail %u", visible);
+        REQUIRE(write == expected_width, "long QSA emitted width %u", visible);
+
+        if (visible == 262144u) {
+            const uint32_t overflow = 262145u;
+            const uint32_t sentinel = UINT32_C(0xa5a5a5a5);
+            memcpy(visible_buffer.contents, &overflow, sizeof(overflow));
+            memcpy(selected_buffer.contents, &sentinel, sizeof(sentinel));
+            memcpy(count_buffer.contents, &sentinel, sizeof(sentinel));
+            memset(status_buffer.contents, 0, sizeof(uint32_t));
+            REQUIRE(q4e_dispatch(
+                        queue, cache, DS4_METAL_QWEN4EXP_QSA_SPARSE_SELECT,
+                        &args, sizeof(args),
+                        @[query_buffer, group_buffer, visible_buffer,
+                          selected_buffer, count_buffer, status_buffer], @[], 1u),
+                    "262145 rejection dispatch");
+            REQUIRE(*(const uint32_t *)status_buffer.contents == 2u,
+                    "262145 was not rejected");
+            REQUIRE(*(const uint32_t *)selected_buffer.contents == sentinel &&
+                        *(const uint32_t *)count_buffer.contents == sentinel,
+                    "262145 rejection published output");
+        }
+    }
+    return true;
+}
+
+/* Selection outputs are staged in a private two-bank transaction.  An
+ * allocation denial or a command that has not completed cannot change the
+ * public bytes; a completed command with clean status is the only swap. */
+static bool q4e_sparse_transaction_gates(
+        id<MTLDevice> device,
+        id<MTLCommandQueue> queue,
+        const ds4_metal_qwen4exp_cache *cache) {
+    enum { MAX_SELECTED = 5, SELECTED_BYTES = MAX_SELECTED * sizeof(uint32_t),
+           TOTAL_BYTES = SELECTED_BYTES + sizeof(uint32_t) };
+    uint8_t public_seed[TOTAL_BYTES];
+    memset(public_seed, 0xa5, sizeof(public_seed));
+    id<MTLBuffer> public_output = q4e_buffer(
+        device, public_seed, sizeof(public_seed));
+    REQUIRE(public_output != nil, "QSA public transaction buffer");
+
+    NSError *error = nil;
+    ds4_metal_qwen4exp_state_transaction denied = {
+        .public_state = public_output,
+    };
+    REQUIRE(!ds4_metal_qwen4exp_prepare_state_transaction(
+                device, public_output, TOTAL_BYTES, TOTAL_BYTES - 1u,
+                &denied, &error),
+            "forced QSA output OOM accepted");
+    REQUIRE(error != nil && denied.public_state == public_output &&
+                denied.private_state == nil &&
+                memcmp(public_output.contents, public_seed, TOTAL_BYTES) == 0,
+            "forced QSA output OOM changed public ownership");
+
+    ds4_metal_qwen4exp_state_transaction transaction = {0};
+    error = nil;
+    REQUIRE(ds4_metal_qwen4exp_prepare_state_transaction(
+                device, public_output, TOTAL_BYTES, TOTAL_BYTES,
+                &transaction, &error),
+            "QSA private output preparation: %s",
+            error.localizedDescription.UTF8String);
+    const float query = 1.0f;
+    const float groups[2] = {1.0f, 2.0f};
+    const uint32_t visible = 8u;
+    id<MTLBuffer> query_buffer = q4e_buffer(device, &query, sizeof(query));
+    id<MTLBuffer> group_buffer = q4e_buffer(device, groups, sizeof(groups));
+    id<MTLBuffer> visible_buffer = q4e_buffer(device, &visible, sizeof(visible));
+    id<MTLBuffer> status_buffer = q4e_buffer(device, NULL, sizeof(uint32_t));
+    REQUIRE(query_buffer && group_buffer && visible_buffer && status_buffer,
+            "QSA transaction inputs");
+    ds4_metal_qwen4exp_qsa_sparse_select_args args = {
+        .n_query = 1u, .n_query_head = 1u, .head_dim = 1u,
+        .compression = 4u, .group_budget = 1u,
+        .max_selected = MAX_SELECTED, .max_group = 2u, .reserved = 0u,
+    };
+    ds4_metal_qwen4exp_binding bindings[] = {
+        { query_buffer, 0u, query_buffer.length },
+        { group_buffer, 0u, group_buffer.length },
+        { visible_buffer, 0u, visible_buffer.length },
+        { transaction.private_state, 0u, SELECTED_BYTES },
+        { transaction.private_state, SELECTED_BYTES, sizeof(uint32_t) },
+        { status_buffer, 0u, status_buffer.length },
+    };
+    id<MTLCommandBuffer> command = [queue commandBuffer];
+    error = nil;
+    REQUIRE(ds4_metal_qwen4exp_encode(
+                cache, DS4_METAL_QWEN4EXP_QSA_SPARSE_SELECT, command,
+                &args, sizeof(args), bindings,
+                sizeof(bindings) / sizeof(bindings[0]),
+                MTLSizeMake(1u, 1u, 1u), MTLSizeMake(1u, 1u, 1u), &error),
+            "QSA transactional encode: %s", error.localizedDescription.UTF8String);
+    [command commit];
+    [command waitUntilCompleted];
+    REQUIRE(command.status == MTLCommandBufferStatusCompleted &&
+                command.error == nil &&
+                q4e_status_ok(status_buffer.contents, 1u),
+            "QSA transactional command");
+    const uint32_t *private_selected =
+        (const uint32_t *)transaction.private_state.contents;
+    REQUIRE(private_selected[0] == 4u && private_selected[1] == 5u &&
+                private_selected[2] == 6u && private_selected[3] == 7u &&
+                *(const uint32_t *)((const uint8_t *)transaction.private_state.contents +
+                                    SELECTED_BYTES) == 4u,
+            "QSA private transaction result");
+    REQUIRE(memcmp(public_output.contents, public_seed, TOTAL_BYTES) == 0,
+            "QSA kernel changed public output before publish");
+
+    id<MTLCommandBuffer> not_completed = [queue commandBuffer];
+    REQUIRE(!ds4_metal_qwen4exp_publish_state_after_command(
+                &transaction, not_completed, status_buffer.contents, 1u),
+            "non-completed QSA command published output");
+    REQUIRE(transaction.public_state == public_output &&
+                memcmp(public_output.contents, public_seed, TOTAL_BYTES) == 0,
+            "non-completed QSA command changed public output");
+    REQUIRE(ds4_metal_qwen4exp_publish_state_after_command(
+                &transaction, command, status_buffer.contents, 1u),
+            "completed QSA command did not publish output");
+    REQUIRE(transaction.public_state != public_output &&
+                ((const uint32_t *)transaction.public_state.contents)[0] == 4u,
+            "completed QSA publication did not swap private output");
+    return true;
+}
+
+static bool test_qsa_sparse(
+        id<MTLDevice> device,
+        id<MTLCommandQueue> queue,
+        const ds4_metal_qwen4exp_cache *cache) {
+    REQUIRE(q4e_sparse_long_boundaries(device, queue, cache),
+            "sparse long-context boundaries");
+    REQUIRE(q4e_sparse_transaction_gates(device, queue, cache),
+            "sparse output transaction gates");
+    REQUIRE(q4e_sparse_case(device, queue, cache, Q4E_QSA6_ANCHOR,
+                            Q4E_QSA6_VISIBLE, Q4E_QSA6_GROUP_BUDGET,
+                            false, true),
+            "pinned Transformers/NumPy sparse case");
+    /* dense: every complete group fits the budget, so the row is the whole
+     * visible range in logical order */
+    REQUIRE(q4e_sparse_case(device, queue, cache, 0u, 14u, 8u, true, false),
+            "dense sparse case");
+    /* above budget: 6 groups, budget 3, plus a two-token tail */
+    REQUIRE(q4e_sparse_case(device, queue, cache, 0u, 26u, 3u, false, false),
+            "cut sparse case");
+    /* left padding: the run is anchored away from zero, so logical and
+     * absolute positions differ everywhere */
+    REQUIRE(q4e_sparse_case(device, queue, cache, 37u, 26u, 3u, false, false),
+            "left-padded sparse case");
+    /* exactly at the budget edge */
+    REQUIRE(q4e_sparse_case(device, queue, cache, 5u, 20u, 5u, true, false),
+            "budget-edge sparse case");
+
+    /* negative gates: each fails closed on its own field and publishes
+     * nothing */
+    ds4_metal_qwen4exp_qsa_sparse_select_args args = {
+        .n_query = 1u, .n_query_head = 2u, .head_dim = 4u, .compression = 4u,
+        .group_budget = 2u, .max_selected = 2051u, .max_group = 2u,
+        .reserved = 0u,
+    };
+    float query[8] = {0.1f, 0.2f, 0.3f, 0.4f, 0.5f, 0.6f, 0.7f, 0.8f};
+    float keys[8] = {0.1f, 0.2f, 0.3f, 0.4f, 0.5f, 0.6f, 0.7f, 0.8f};
+    uint32_t visible = 0u;
+    id<MTLBuffer> query_buffer = q4e_buffer(device, query, sizeof(query));
+    id<MTLBuffer> group_buffer = q4e_buffer(device, keys, sizeof(keys));
+    id<MTLBuffer> visible_buffer = q4e_buffer(device, &visible,
+                                              sizeof(visible));
+    id<MTLBuffer> selected_buffer =
+        q4e_buffer(device, NULL, 2051u * sizeof(uint32_t));
+    id<MTLBuffer> count_buffer = q4e_buffer(device, NULL, sizeof(uint32_t));
+    id<MTLBuffer> status = q4e_buffer(device, NULL, sizeof(uint32_t));
+    REQUIRE(query_buffer && group_buffer && visible_buffer &&
+            selected_buffer && count_buffer && status, "negative buffers");
+    NSArray<id<MTLBuffer>> *select_bindings =
+        @[query_buffer, group_buffer, visible_buffer, selected_buffer,
+          count_buffer, status];
+
+    /* an empty visible range has no row to build */
+    REQUIRE(q4e_dispatch(queue, cache, DS4_METAL_QWEN4EXP_QSA_SPARSE_SELECT,
+                         &args, sizeof(args), select_bindings, @[], 1u),
+            "empty-visible dispatch");
+    REQUIRE(((const uint32_t *)status.contents)[0] == 2u,
+            "empty visible not rejected");
+    REQUIRE(((const uint32_t *)count_buffer.contents)[0] == 0u,
+            "rejected select published a width");
+
+    /* more visible tokens than max_group can describe: 12 needs 3 complete
+     * groups but the group-key buffer only holds 2, so the kernel must reject
+     * before it reads a single key */
+    visible = 12u;
+    memcpy(visible_buffer.contents, &visible, sizeof(visible));
+    REQUIRE(q4e_dispatch(queue, cache, DS4_METAL_QWEN4EXP_QSA_SPARSE_SELECT,
+                         &args, sizeof(args), select_bindings, @[], 1u),
+            "overflow dispatch");
+    REQUIRE(((const uint32_t *)status.contents)[0] == 2u,
+            "group overflow not rejected");
+
+    /* a nonfinite query poisons the score and must be caught, not written */
+    visible = 8u;
+    memcpy(visible_buffer.contents, &visible, sizeof(visible));
+    query[3] = INFINITY;
+    memcpy(query_buffer.contents, query, sizeof(query));
+    REQUIRE(q4e_dispatch(queue, cache, DS4_METAL_QWEN4EXP_QSA_SPARSE_SELECT,
+                         &args, sizeof(args), select_bindings, @[], 1u),
+            "nonfinite dispatch");
+    REQUIRE(((const uint32_t *)status.contents)[0] == 1u,
+            "nonfinite query not rejected");
+    REQUIRE(((const uint32_t *)count_buffer.contents)[0] == 0u,
+            "rejected select published a width");
+
+    /* a slot outside the pool is a bad index, never a wild read */
+    uint32_t selected_ids[4] = {0u, 1u, 2u, 3u};
+    uint32_t selected_count = 4u;
+    uint32_t bad_slots[4] = {0u, 1u, 2u, 99u};
+    float kv[16];
+    for (uint32_t i = 0u; i < 16u; i++) kv[i] = 0.25f * (float)i;
+    ds4_metal_qwen4exp_qsa_sparse_gather_args gather_args = {
+        .n_query = 1u, .n_kv_head = 1u, .head_dim = 2u, .n_slot = 4u,
+        .max_selected = 4u, .storage_bytes = 4u * 1u * 2u * sizeof(float),
+        .reserved0 = 0u, .reserved1 = 0u,
+    };
+    id<MTLBuffer> ids = q4e_buffer(device, selected_ids, sizeof(selected_ids));
+    id<MTLBuffer> count = q4e_buffer(device, &selected_count,
+                                     sizeof(selected_count));
+    id<MTLBuffer> slots = q4e_buffer(device, bad_slots, sizeof(bad_slots));
+    id<MTLBuffer> keys_buffer = q4e_buffer(device, kv, sizeof(kv));
+    id<MTLBuffer> values_buffer = q4e_buffer(device, kv, sizeof(kv));
+    id<MTLBuffer> out_key = q4e_buffer(device, NULL, 4u * 2u * sizeof(float));
+    id<MTLBuffer> out_value = q4e_buffer(device, NULL, 4u * 2u * sizeof(float));
+    id<MTLBuffer> gather_status = q4e_buffer(device, NULL,
+                                             4u * sizeof(uint32_t));
+    REQUIRE(ids && count && slots && keys_buffer && values_buffer &&
+            out_key && out_value && gather_status, "gather negative buffers");
+    REQUIRE(q4e_dispatch(queue, cache, DS4_METAL_QWEN4EXP_QSA_SPARSE_GATHER,
+                         &gather_args, sizeof(gather_args),
+                         @[ids, count, slots, keys_buffer, values_buffer,
+                           out_key, out_value, gather_status], @[], 4u),
+            "bad-slot dispatch");
+    const uint32_t *gather_codes = (const uint32_t *)gather_status.contents;
+    REQUIRE(gather_codes[3] == 3u, "out-of-pool slot not rejected");
+    REQUIRE(((const float *)out_key.contents)[6] == 0.0f &&
+            ((const float *)out_key.contents)[7] == 0.0f,
+            "rejected gather wrote a row");
+    return true;
+}
+
 static bool test_ple_head(
         id<MTLDevice> device,
         id<MTLCommandQueue> queue,
@@ -1516,7 +2156,7 @@ int main(int argc, const char *argv[]) {
             fprintf(stderr, "create Metal command queue\n");
             return 2;
         }
-        printf("Qwen4Exp Phase-5 Metal fixture on %s\n",
+        printf("Qwen4Exp Phase-5/6 Metal fixture on %s\n",
                device.name.UTF8String);
         const bool ok =
             test_layout_and_bounds(device, queue, &cache) &&
@@ -1525,9 +2165,10 @@ int main(int argc, const char *argv[]) {
             test_shared_conv_row(device, queue, &cache) &&
             test_router_moe(device, queue, &cache) &&
             test_qsa(device, queue, &cache) &&
+            test_qsa_sparse(device, queue, &cache) &&
             test_ple_head(device, queue, &cache);
         if (!ok) return 1;
-        puts("all Qwen4Exp Phase-5 Metal correctness fixtures passed");
+        puts("all Qwen4Exp Phase-5/6 Metal correctness fixtures passed");
         return 0;
     }
 }

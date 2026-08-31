@@ -46,6 +46,7 @@
 #include "ds4_qwen.h"
 #include "ds4_qwen4exp.h"
 #include "runtime/ds4_qwen4exp_graph.h"
+#include "runtime/ds4_qwen4exp_qsa.h"
 #include "ds4_qwen_unicode.h"
 
 #ifdef DS4_TEST_HOOKS
@@ -2968,10 +2969,11 @@ static ds4_tensor *model_find_tensor(const ds4_model *m, const char *name) {
  * public runtime API while the artifact codecs remain unqualified. */
 #include "runtime/ds4_qwen4exp_loader.inc"
 
-/* Phase-5 resident correctness graph.  The implementation is linked into the
- * engine for later backend binding, but no production physical profile or
- * dispatch selects it while Qwen4Exp remains pinned-not-supported. */
+/* Phase-5 resident correctness graph and Phase-6 sparse QSA state/planner.
+ * They are linked for later backend binding, but no production physical
+ * profile or dispatch selects them while Qwen4Exp remains unsupported. */
 #include "runtime/ds4_qwen4exp_graph.inc"
+#include "runtime/ds4_qwen4exp_qsa.inc"
 
 
 /* Return the in-place tensor payload inside the mapped GGUF. */

@@ -59,8 +59,10 @@ SERVER_ALIAS_PORT ?= 0
 	qwen4exp-profile-test qwen4exp-reference-test \
 	qwen4exp-fixture-check qwen4exp-chat-fixture-check \
 	qwen4exp-tokenizer-fixture-check qwen4exp-graph-fixture-check \
+	qwen4exp-qsa-fixture-check \
 	qwen4exp-converter-test qwen4exp-graph-test \
 	qwen4exp-graph-sanitizer-test \
+	qwen4exp-qsa-test qwen4exp-qsa-sanitizer-test \
 	qwen4exp-chat-test qwen4exp-tokenizer-test \
 	qwen4exp-metal-test qwen4exp-metal-sanitizer-test \
 	qwen4exp-ple-store-test qwen4exp-admission-test \
@@ -100,6 +102,13 @@ qwen4exp-graph-fixture-check: tests/qwen4exp/collect_graph_reference.py \
 	PYTHONDONTWRITEBYTECODE=1 python3 \
 		tests/qwen4exp/collect_graph_reference.py --check
 
+qwen4exp-qsa-fixture-check: tests/qwen4exp/collect_qsa_reference.py \
+		tests/qwen4exp/qwen4exp_qsa_golden.json \
+		tests/qwen4exp/qwen4exp_qsa_golden.inc \
+		tests/qwen4exp/qwen4exp_qsa_provenance.json
+	PYTHONDONTWRITEBYTECODE=1 python3 \
+		tests/qwen4exp/collect_qsa_reference.py --check
+
 qwen4exp-graph-sanitizer-test: qwen4exp-graph-fixture-check \
 		tests/test_qwen4exp_graph.c ds4_qwen4exp.c ds4_qwen4exp.h \
 		ds4_qwen4exp_ref.c ds4_qwen4exp_ref.h \
@@ -114,6 +123,21 @@ qwen4exp-graph-sanitizer-test: qwen4exp-graph-fixture-check \
 	ASAN_OPTIONS=halt_on_error=1:detect_leaks=0 UBSAN_OPTIONS=halt_on_error=1 \
 		"$(BUILD_ROOT)/qwen4exp-sanitizer/test_graph"
 
+# Phase-6 host lane.  The QSA module is a single self-contained translation
+# unit: the test includes the .inc directly, so it needs no other object.
+qwen4exp-qsa-sanitizer-test: qwen4exp-qsa-fixture-check \
+		tests/test_qwen4exp_qsa.c tests/qwen4exp/qwen4exp_qsa_golden.inc \
+		runtime/ds4_qwen4exp_qsa.h runtime/ds4_qwen4exp_qsa.inc
+	@mkdir -p "$(BUILD_ROOT)/qwen4exp-sanitizer"
+	$(CC) -O1 -g -Wall -Wextra -Wpedantic -Werror -std=c99 \
+		-fsanitize=address,undefined -fno-sanitize-recover=all \
+		-fno-omit-frame-pointer -I. -o \
+		"$(BUILD_ROOT)/qwen4exp-sanitizer/test_qsa" \
+		tests/test_qwen4exp_qsa.c -lm
+	ASAN_OPTIONS=halt_on_error=1:detect_leaks=0 \
+		UBSAN_OPTIONS=halt_on_error=1 \
+		"$(BUILD_ROOT)/qwen4exp-sanitizer/test_qsa"
+
 qwen4exp-converter-test: gguf-tools/qwen4exp-profile.py \
 		tests/qwen4exp/test_qwen4exp_profile.py \
 		docs/contracts/qwen4exp-profile.json \
@@ -123,6 +147,7 @@ qwen4exp-converter-test: gguf-tools/qwen4exp-profile.py \
 qwen4exp-sanitizer-test: qwen4exp-chat-fixture-check \
 		qwen4exp-tokenizer-fixture-check \
 		qwen4exp-graph-sanitizer-test \
+		qwen4exp-qsa-sanitizer-test \
 		ds4_qwen4exp.c ds4_qwen4exp.h \
 		ds4_qwen4exp_ref.c ds4_qwen4exp_ref.h \
 		ds4_qwen4exp_chat.c ds4_qwen4exp_chat.h \
@@ -293,6 +318,7 @@ METAL_TEST_BINS := \
 	$(METAL_BINDIR)/test_qwen4exp_chat \
 	$(METAL_BINDIR)/test_qwen4exp_tokenizer \
 	$(METAL_BINDIR)/test_qwen4exp_graph \
+	$(METAL_BINDIR)/test_qwen4exp_qsa \
 	$(METAL_BINDIR)/test_qwen4exp_metal \
 	$(METAL_BINDIR)/test_ple_store \
 	$(METAL_BINDIR)/test_qwen_unicode \
@@ -440,7 +466,8 @@ $(METAL_OBJDIR)/%.o: %.c
 $(METAL_OBJDIR)/ds4.o: runtime/ds4_glm_graph.inc \
 		runtime/ds4_deepseek_cache_phase.inc \
 		runtime/ds4_qwen4exp_loader.inc runtime/ds4_qwen4exp_graph.inc \
-		runtime/ds4_qwen4exp_graph.h ds4_qwen4exp.h \
+		runtime/ds4_qwen4exp_graph.h runtime/ds4_qwen4exp_qsa.h \
+		runtime/ds4_qwen4exp_qsa.inc ds4_qwen4exp.h \
 		ds4_qwen4exp_chat.h ds4_ple_store.h
 
 $(METAL_OBJDIR)/ds4.o: CFLAGS += $(QWEN_CFLAGS)
@@ -448,7 +475,8 @@ $(METAL_OBJDIR)/ds4.o: CFLAGS += $(QWEN_CFLAGS)
 $(CPU_OBJDIR)/ds4.o: runtime/ds4_glm_graph.inc \
 		runtime/ds4_deepseek_cache_phase.inc \
 		runtime/ds4_qwen4exp_loader.inc runtime/ds4_qwen4exp_graph.inc \
-		runtime/ds4_qwen4exp_graph.h ds4_qwen4exp.h \
+		runtime/ds4_qwen4exp_graph.h runtime/ds4_qwen4exp_qsa.h \
+		runtime/ds4_qwen4exp_qsa.inc ds4_qwen4exp.h \
 		ds4_qwen4exp_chat.h ds4_ple_store.h
 
 $(CPU_OBJDIR)/ds4.o: CFLAGS += $(QWEN_CFLAGS)
@@ -508,6 +536,7 @@ $(METAL_OBJDIR)/ds4_test_core.o: ds4.c ds4.h ds4_ssd.h ds4_profile.h \
 		ds4_gpu.h ds4_qwen.h ds4_qwen4exp.h ds4_expert_store.h \
 		ds4_ple_store.h ds4_qwen4exp_chat.h runtime/ds4_qwen4exp_loader.inc \
 		runtime/ds4_qwen4exp_graph.h runtime/ds4_qwen4exp_graph.inc \
+		runtime/ds4_qwen4exp_qsa.h runtime/ds4_qwen4exp_qsa.inc \
 		ds4_qwen_unicode.h ds4_streaming_hotlist.inc \
 		tests/internal/ds4_qwen_cpu_test_hooks.h
 	@mkdir -p "$(@D)"
@@ -519,6 +548,7 @@ $(CPU_OBJDIR)/ds4_qwen4exp_test_core.o: ds4.c ds4.h ds4_ssd.h \
 		ds4_profile.h ds4_gpu.h ds4_qwen.h ds4_qwen4exp.h \
 		ds4_expert_store.h ds4_ple_store.h ds4_qwen4exp_chat.h ds4_qwen_unicode.h \
 		runtime/ds4_qwen4exp_loader.inc ds4_streaming_hotlist.inc \
+		runtime/ds4_qwen4exp_qsa.h runtime/ds4_qwen4exp_qsa.inc \
 		tests/internal/ds4_qwen_cpu_test_hooks.h
 	@mkdir -p "$(@D)"
 	$(CC) $(CFLAGS) $(QWEN_CFLAGS) $(DEPFLAGS) -DDS4_NO_GPU \
@@ -581,7 +611,8 @@ $(METAL_OBJDIR)/test_qwen_session.o: tests/test_qwen_session.c ds4.c ds4.h \
 		ds4_ssd.h ds4_profile.h ds4_gpu.h ds4_qwen.h \
 		ds4_qwen4exp_chat.h ds4_qwen_unicode.h runtime/ds4_glm_graph.inc \
 		runtime/ds4_deepseek_cache_phase.inc runtime/ds4_qwen4exp_loader.inc \
-		runtime/ds4_qwen4exp_graph.h runtime/ds4_qwen4exp_graph.inc
+		runtime/ds4_qwen4exp_graph.h runtime/ds4_qwen4exp_graph.inc \
+		runtime/ds4_qwen4exp_qsa.h runtime/ds4_qwen4exp_qsa.inc
 	@mkdir -p "$(@D)"
 	$(CC) $(CFLAGS) $(QWEN_CFLAGS) $(DEPFLAGS) -DDS4_NO_GPU \
 		-Wno-unused-function -Wno-unused-parameter -I. -c -o $@ $<
@@ -590,7 +621,8 @@ $(METAL_OBJDIR)/test_qwen_tokenizer.o: tests/test_qwen_tokenizer.c ds4.c \
 		ds4.h ds4_kvstore.h ds4_ssd.h ds4_profile.h ds4_gpu.h ds4_qwen.h \
 		ds4_qwen4exp_chat.h ds4_qwen_unicode.h \
 		runtime/ds4_qwen4exp_loader.inc runtime/ds4_qwen4exp_graph.h \
-		runtime/ds4_qwen4exp_graph.inc tests/qwen/qwen36_tokenizer_fixture.inc
+		runtime/ds4_qwen4exp_graph.inc runtime/ds4_qwen4exp_qsa.h \
+		runtime/ds4_qwen4exp_qsa.inc tests/qwen/qwen36_tokenizer_fixture.inc
 	@mkdir -p "$(@D)"
 	$(CC) $(CFLAGS) $(QWEN_CFLAGS) $(DEPFLAGS) -DDS4_NO_GPU \
 		-Wno-unused-function -Wno-unused-parameter -I. -c -o $@ $<
@@ -814,8 +846,16 @@ $(METAL_BINDIR)/test_qwen4exp_graph: \
 	@mkdir -p "$(@D)"
 	$(CC) $(QWEN4EXP_REF_CFLAGS) -o $@ $^ -lm
 
+$(METAL_BINDIR)/test_qwen4exp_qsa: tests/test_qwen4exp_qsa.c \
+		tests/qwen4exp/qwen4exp_qsa_golden.inc \
+		runtime/ds4_qwen4exp_qsa.h runtime/ds4_qwen4exp_qsa.inc
+	@mkdir -p "$(@D)"
+	$(CC) $(QWEN4EXP_REF_CFLAGS) -I. -o $@ tests/test_qwen4exp_qsa.c -lm
+
 $(METAL_BINDIR)/test_qwen4exp_metal: \
 		tests/qwen4exp/test_qwen4exp_metal.m \
+		tests/qwen4exp/qwen4exp_qsa_golden.inc \
+		runtime/ds4_qwen4exp_qsa.h runtime/ds4_qwen4exp_qsa.inc \
 		runtime/ds4_metal_qwen4exp.inc metal/qwen4exp.metal \
 		ds4_qwen4exp.c ds4_qwen4exp.h \
 		ds4_qwen4exp_ref.c ds4_qwen4exp_ref.h
@@ -938,10 +978,19 @@ qwen4exp-graph-test: qwen4exp-graph-fixture-check \
 		$(METAL_BINDIR)/test_qwen4exp_graph
 	$(METAL_BINDIR)/test_qwen4exp_graph
 
-qwen4exp-metal-test: $(METAL_BINDIR)/test_qwen4exp_metal
-	MTL_DEBUG_LAYER=1 MTL_SHADER_VALIDATION=1 $< metal/qwen4exp.metal
+qwen4exp-qsa-test: qwen4exp-qsa-fixture-check \
+		$(METAL_BINDIR)/test_qwen4exp_qsa
+	$(METAL_BINDIR)/test_qwen4exp_qsa
 
-qwen4exp-metal-sanitizer-test: tests/qwen4exp/test_qwen4exp_metal.m \
+qwen4exp-metal-test: qwen4exp-qsa-fixture-check \
+		$(METAL_BINDIR)/test_qwen4exp_metal
+	MTL_DEBUG_LAYER=1 MTL_SHADER_VALIDATION=1 \
+		$(METAL_BINDIR)/test_qwen4exp_metal metal/qwen4exp.metal
+
+qwen4exp-metal-sanitizer-test: qwen4exp-qsa-fixture-check \
+		tests/qwen4exp/test_qwen4exp_metal.m \
+		tests/qwen4exp/qwen4exp_qsa_golden.inc \
+		runtime/ds4_qwen4exp_qsa.h runtime/ds4_qwen4exp_qsa.inc \
 		runtime/ds4_metal_qwen4exp.inc metal/qwen4exp.metal \
 		ds4_qwen4exp.c ds4_qwen4exp.h \
 		ds4_qwen4exp_ref.c ds4_qwen4exp_ref.h
@@ -995,7 +1044,7 @@ model-free-test: metal ds4_test ds4_agent_test $(METAL_BINDIR)/test_q4k_dot \
 		$(METAL_BINDIR)/test_qwen_state \
 		qwen4exp-profile-test qwen4exp-reference-test \
 		qwen4exp-chat-test qwen4exp-tokenizer-test \
-		qwen4exp-graph-test qwen4exp-metal-test \
+		qwen4exp-graph-test qwen4exp-qsa-test qwen4exp-metal-test \
 		qwen4exp-converter-test qwen4exp-ple-store-test \
 		qwen4exp-admission-test \
 		$(METAL_BINDIR)/test_qwen_unicode \
@@ -1214,13 +1263,15 @@ ds4_cpu.o: ds4.c ds4.h ds4_ssd.h ds4_profile.h ds4_gpu.h ds4_qwen.h \
 		ds4_qwen4exp.h ds4_expert_store.h ds4_ple_store.h \
 		ds4_qwen4exp_chat.h ds4_qwen_unicode.h ds4_streaming_hotlist.inc \
 		runtime/ds4_qwen4exp_loader.inc runtime/ds4_qwen4exp_graph.h \
-		runtime/ds4_qwen4exp_graph.inc
+		runtime/ds4_qwen4exp_graph.inc runtime/ds4_qwen4exp_qsa.h \
+		runtime/ds4_qwen4exp_qsa.inc
 	$(CC) $(CFLAGS) $(QWEN_CFLAGS) -DDS4_NO_GPU -c -o $@ ds4.c
 
 ds4_test_core.o: ds4.c ds4.h ds4_ssd.h ds4_profile.h \
 		ds4_gpu.h ds4_qwen.h ds4_qwen4exp.h ds4_expert_store.h \
 		ds4_ple_store.h ds4_qwen4exp_chat.h ds4_qwen_unicode.h runtime/ds4_qwen4exp_loader.inc \
 		runtime/ds4_qwen4exp_graph.h runtime/ds4_qwen4exp_graph.inc \
+		runtime/ds4_qwen4exp_qsa.h runtime/ds4_qwen4exp_qsa.inc \
 		ds4_streaming_hotlist.inc tests/internal/ds4_qwen_cpu_test_hooks.h
 	$(CC) $(CFLAGS) $(QWEN_CFLAGS) -DDS4_NO_GPU -DDS4_TEST_HOOKS \
 		-Wno-unused-function -Wno-unused-parameter -c -o $@ ds4.c
@@ -1229,6 +1280,7 @@ ds4_qwen4exp_test_core.o: ds4.c ds4.h ds4_ssd.h ds4_profile.h \
 		ds4_gpu.h ds4_qwen.h ds4_qwen4exp.h ds4_expert_store.h \
 		ds4_ple_store.h ds4_qwen4exp_chat.h ds4_qwen_unicode.h runtime/ds4_qwen4exp_loader.inc \
 		runtime/ds4_qwen4exp_graph.h runtime/ds4_qwen4exp_graph.inc \
+		runtime/ds4_qwen4exp_qsa.h runtime/ds4_qwen4exp_qsa.inc \
 		ds4_streaming_hotlist.inc tests/internal/ds4_qwen_cpu_test_hooks.h
 	$(CC) $(CFLAGS) $(QWEN_CFLAGS) -DDS4_NO_GPU -DDS4_TEST_HOOKS \
 		-Wno-unused-function -Wno-unused-parameter -c -o $@ ds4.c
@@ -1267,6 +1319,7 @@ model-free-test: $(PROGRAMS) ds4_test ds4_agent_test q4k-dot-test \
 		tests/test_qwen_state tests/test_qwen_unicode \
 		qwen4exp-profile-test qwen4exp-reference-test \
 		qwen4exp-chat-test qwen4exp-tokenizer-test qwen4exp-graph-test \
+		qwen4exp-qsa-test \
 		qwen4exp-converter-test qwen4exp-ple-store-test \
 		qwen4exp-admission-test \
 		tests/test_qwen_expert_group \
@@ -1358,7 +1411,8 @@ tests/test_qwen_session: tests/test_qwen_session.c ds4.c ds4.h ds4_ssd.h ds4_pro
 		ds4_qwen_unicode.c ds4_qwen_unicode_data.inc \
 		ds4_streaming_hotlist.inc runtime/ds4_glm_graph.inc \
 		runtime/ds4_deepseek_cache_phase.inc runtime/ds4_qwen4exp_loader.inc \
-		runtime/ds4_qwen4exp_graph.h runtime/ds4_qwen4exp_graph.inc
+		runtime/ds4_qwen4exp_graph.h runtime/ds4_qwen4exp_graph.inc \
+		runtime/ds4_qwen4exp_qsa.h runtime/ds4_qwen4exp_qsa.inc
 	$(CC) $(CFLAGS) $(QWEN_CFLAGS) -DDS4_NO_GPU \
 		-Wno-unused-function -Wno-unused-parameter -I. -o $@ \
 		$(filter-out ds4.c,$(filter %.c %.o,$^)) $(LDLIBS)
@@ -1370,6 +1424,7 @@ tests/test_qwen_tokenizer: tests/test_qwen_tokenizer.c ds4.c ds4.h \
 		ds4_qwen.c ds4_qwen_unicode.c ds4_qwen_unicode_data.inc \
 		ds4_streaming_hotlist.inc runtime/ds4_qwen4exp_loader.inc \
 		runtime/ds4_qwen4exp_graph.h runtime/ds4_qwen4exp_graph.inc \
+		runtime/ds4_qwen4exp_qsa.h runtime/ds4_qwen4exp_qsa.inc \
 		tests/qwen/qwen36_tokenizer_fixture.inc
 	$(CC) $(CFLAGS) $(QWEN_CFLAGS) -DDS4_NO_GPU \
 		-Wno-unused-function -Wno-unused-parameter -I. -o $@ \
@@ -1431,6 +1486,11 @@ tests/test_qwen4exp_graph: tests/test_qwen4exp_graph.c \
 		tests/test_qwen4exp_graph.c ds4_qwen4exp.c \
 		ds4_qwen4exp_ref.c -lm
 
+tests/test_qwen4exp_qsa: tests/test_qwen4exp_qsa.c \
+		tests/qwen4exp/qwen4exp_qsa_golden.inc \
+		runtime/ds4_qwen4exp_qsa.h runtime/ds4_qwen4exp_qsa.inc
+	$(CC) $(QWEN4EXP_REF_CFLAGS) -I. -o $@ tests/test_qwen4exp_qsa.c -lm
+
 tests/test_ple_store: tests/test_ple_store.c ds4_ple_store.c ds4_ple_store.h
 	$(CC) $(QWEN4EXP_REF_CFLAGS) -I. -o $@ \
 		tests/test_ple_store.c ds4_ple_store.c -lm
@@ -1450,6 +1510,9 @@ qwen4exp-tokenizer-test: qwen4exp-tokenizer-fixture-check \
 
 qwen4exp-graph-test: qwen4exp-graph-fixture-check tests/test_qwen4exp_graph
 	./tests/test_qwen4exp_graph
+
+qwen4exp-qsa-test: qwen4exp-qsa-fixture-check tests/test_qwen4exp_qsa
+	./tests/test_qwen4exp_qsa
 
 qwen4exp-ple-store-test: tests/test_ple_store
 	./tests/test_ple_store
@@ -1689,6 +1752,7 @@ clean:
 		tests/test_qwen4exp_profile tests/test_qwen4exp_ref \
 		tests/test_qwen4exp_chat tests/test_qwen4exp_tokenizer \
 		tests/test_qwen4exp_graph \
+		tests/test_qwen4exp_qsa \
 		tests/test_ple_store \
 		tests/test_qwen_expert_group \
 		tests/test_expert_store \
